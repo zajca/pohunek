@@ -5,6 +5,183 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.37.0
+
+### 2026-10-24, acceptance harness starts D4 sessions on a project, #1112
+
+- A remote `pohunek session new` needs `--project` (or `--repo`), and a project
+  needs a git repository, which the Debian genericcloud image does not have.
+  The acceptance harness now stages `git` and the part of its dependency closure
+  the image lacks, with `dbus-user-session`, as pinned offline packages
+  (sha256-verified, snapshot.debian.org primary), creates a throwaway repository
+  with one commit on each VM, registers it with `pohunek project add` and starts
+  the D4 session on the peer's project. The zajcaair command shell session
+  is started under a project the operator names with `--macos-project` (no
+  default, so the owner's working checkout is never chosen implicitly).
+- The evidence helper tolerates IPv6 endpoint addresses in a status recording
+  (they used to leave invalid JSON and crash `assemble`) and reports an
+  unparsable recording as an error; the D7 hint check also reads the `recover`
+  text; the D7/D5 extras resolve the concrete daemon unit name before stopping
+  it. No product code changes.
+- The zajcaair control shell session is named `ph1112-<run time>`, its id is
+  read from the `session new` output or looked up by that exact name, and
+  teardown stops and removes it on every exit path (`session rm`); a session
+  whose id cannot be found makes the macOS leg inconclusive and prints the name
+  for manual cleanup. `--project` bumping that project's `last_used_at` is the
+  one known side effect on the owner's daemon.
+
+### 2026-10-24, acceptance harness stages dbus-user-session, #1112
+
+- The Debian 13 genericcloud image has no `dbus-user-session`, so its systemd
+  user manager has no session bus and `pohunek service install` fails with
+  `supervisor operation connect is unavailable`. The acceptance harness now
+  stages the pinned package offline (sha256-verified, snapshot.debian.org
+  primary), restarts the user manager and waits for `dbus.socket` before
+  installing the service; `docs/install.md` names the prerequisite for minimal
+  Debian and cloud images. No product code changes.
+
+### 2026-10-24, Tailscale overlay acceptance harness, #1112
+
+- `scripts/acceptance/tailscale-overlay` is the manual D9 acceptance run of the
+  Tailscale overlay provider: two qemu VMs with Headscale and a kernel-TUN
+  `tailscaled` (D4 in both directions over the CLI, attach and the SDK control
+  path), the absent-`overlays.toml` NetBird default on a throwaway daemon, and a
+  non-root macOS leg (D6 trusted-CLI lookup and the userspace-networking
+  fail-closed path). `scripts/acceptance/overlay_evidence.py` interprets the
+  recorded steps into `docs/acceptance/1112-tailscale-overlay.json`; the
+  procedure, pins, resource budget and network exposure are in
+  `docs/acceptance/README.md`. Nothing here changes product behaviour.
+- `crates/client/examples/overlay_probe.rs` is a public-API consumer of
+  `pohunek-client` (registry from configuration, `resolve_host_target_in`,
+  `Client::connect_with_registry`, handshake, `session.list`, `daemon_doctor`,
+  `session_screen`). The harness builds it static for
+  `x86_64-unknown-linux-musl`; it is not shipped in a release archive.
+- The harness never removes a macOS root it did not create (one flag per root,
+  set only after that root's own `mkdir`), runs Homebrew without auto-update or
+  cleanup, treats an unexpected `brew list` answer, a Mac step timeout or a
+  different Tailscale version as inconclusive, and records the `netbird` and
+  `macos` legs through an allow-list so the public evidence carries no owner
+  peer names, domains or Mac paths.
+
+### 2026-10-24, tailscale docs, #1112
+
+- New guide [Tailscale overlay](guides/tailscale.md): enabling the provider,
+  installing the client on Linux (macOS is not supported in 0.37, see #1583),
+  the selectors that name a peer, the `ShareeNode` rule, an ACL example and
+  troubleshooting by error code.
+- Tailscale is supported on Linux in this release; **macOS is not**. The stock
+  Apple-Silicon Homebrew directory `/opt/homebrew/bin` is admin group-writable
+  and the trusted-executable policy refuses a `tailscale` binary there
+  (`tailscale_cli_missing`). Tracked in
+  [#1583](https://github.com/zajca/pohunek/issues/1583).
+- Acceptance evidence: two Linux nodes on a Headscale v0.29.5 tailnet ran the
+  direct owner path in both directions, and the NetBird default with an absent
+  `overlays.toml` was checked unchanged. The redacted run is
+  `docs/acceptance/1112-tailscale-overlay.json`; the macOS leg is recorded
+  as failed under the limitation above, and its userspace sub-step did not run.
+- NetBird is the default overlay and Tailscale a supported opt-in overlay in
+  the product constraints, the architecture and the public API. The listener
+  authenticates nothing beyond overlay reachability, so the overlay's policy
+  (NetBird policies, tailnet ACLs) is the access control. A host runs one
+  overlay.
+- `pohunek doctor` names why a Tailscale node has no usable address
+  (userspace networking, a backend that is not running, or no IPv4 address) in
+  `tailscale_cli` and `overlay_tailscale_listener`; the
+  `tailscale_listener_address_missing` message carries the same reason.
+- The TypeScript SDK `hostUnreachable` message reads "could not open an overlay
+  connection to host '<host>'" instead of naming NetBird, matching the Rust
+  client and the protocol. Match on the `hostUnreachable` kind, not the text.
+- Rust API: `OverlayError::ListenerAddressMissing` is a struct variant with
+  `overlay` and an optional `reason`; code matching the old tuple form needs
+  `ListenerAddressMissing { .. }`.
+
+### 2026-10-24, audit exception RUSTSEC-2026-0387, #1574
+
+- `.cargo/audit.toml` ignores RUSTSEC-2026-0387 (crypto-bigint 0.5.5, tracked
+  in #1575). The crate is locked only through `pohunek-relay` ->
+  `openidconnect` 4.0.1 -> p256/p384 0.13, which the relay uses solely to
+  verify ID-token ECDSA signatures over public keys and public data; no secret
+  EC scalar, signing or ECDH path is reachable. No other shipped binary links it.
+- `xtask`'s `dependency_policy` test pins the exact parent edges into
+  crypto-bigint 0.5 and the curve stack, and reports the ignore as removable
+  once no 0.5 release is locked. `.clippy.toml` bans the p256/p384 secret-key,
+  secret-scalar, signing-key and ECDH APIs, so the relay cannot start using
+  them.
+- Remove the ignore, the policy test and the clippy bans once `openidconnect`
+  moves to p256/p384 0.14 (crypto-bigint >= 0.7.6).
+
+### 2026-10-23, overlay diagnostics, #1112
+
+- `pohunek doctor` checks the configured overlay instead of NetBird
+  unconditionally: one `<overlay>_cli` check per configured overlay, in the place
+  `netbird_cli` held, so `netbird_cli` keeps its name. A provider CLI that is
+  missing or untrusted is a `fail` with a fix hint when `overlays.toml` lists the
+  provider; for the NetBird default of an absent file it stays a `warn`. The CLI
+  doctor adds `overlay_config`, which fails on an unusable `overlays.toml` and
+  warns "restart the daemon to apply" when the running daemon serves another
+  overlay or port.
+- `daemon.doctor` reports one `overlay_<overlay>_listener` check per configured
+  overlay: its port and the listener address the provider reports. Checks are
+  `{name, status, detail}`, so the wire shape is unchanged; a daemon of an
+  earlier release reports none, and the CLI then does not compare.
+- `host_unreachable` names the overlay, the address and the port that were
+  dialled and, when the overlay is known, hints that the remote host's
+  `overlays.toml` must list it. `ClientError::HostUnreachable` of
+  `pohunek-client` gains `overlay`, `address` and `port` (a pinned Rust client
+  adopts the change when it bumps its tag).
+- `pohunek-hostcheck` no longer depends on `pohunek-netbird`; the doctor probes
+  the configured overlay through the same provider transport the daemon and the
+  client use, bounded by the overlay probe budget that now counts toward the
+  `daemon.doctor` request timeout.
+- `pohunek doctor` also flags a present `overlays.toml` when the daemon answers
+  without any overlay check, as a daemon that predates the file does.
+  `DaemonState::new` and `new_with_discovery` of `pohunek-daemon` take an
+  `OverlaySource` argument.
+
+### 2026-10-23, overlays.toml, #1112
+
+- A host's overlay provider and remote control port come from the optional
+  owner-private file `<config>/pohunek/overlays.toml` (`providers`, `port`).
+  Without it the host works over NetBird on port 18722, as before. The CLI, the
+  daemon and external Rust clients share one loader in `pohunek-client`; the
+  daemon validates the file before it takes a lock, migrates its store or adopts
+  a worker. The guide [Remote hosts](guides/remote-hosts.md) describes the
+  file.
+- One overlay per host: `providers` takes exactly one known id (`netbird`), and
+  several entries fail with `overlay_configuration_invalid`, pointing to #1113.
+- CLI `--json` error code change: an unusable `POHUNEK_REMOTE_PORT` reports
+  `overlay_configuration_invalid` instead of `netbird_configuration_invalid`,
+  and every problem with `overlays.toml` or its directory (permissions, owner,
+  symlink, size, encoding, syntax, unknown key, port range) reports the same
+  code. `netbird_configuration_invalid` is no longer emitted.
+- A service-started daemon never received `POHUNEK_REMOTE_PORT`, so it bound
+  port 18722 whatever the CLI dialed; the port in `overlays.toml` reaches both.
+  Upgrade the daemon of a remote host and restart it before setting `port`
+  there: an older daemon ignores the file.
+- Help text of `host` and `--host` names the configured overlay instead of
+  NetBird, and `host_unreachable` of the CLI client reads "could not open an
+  overlay connection".
+
+### 2026-10-23, tailscale provider, #1112
+
+- `overlays.toml` accepts `providers = ["tailscale"]`. The new compiled crate
+  `pohunek-overlay-tailscale` reads `tailscale status --json` through the
+  trusted executable lookup, listens on the node's IPv4 address and routes to
+  tailnet peers on IPv4 or IPv6. See [Remote hosts](guides/remote-hosts.md).
+- The listener has no address, and discovery and resolution fail with
+  `tailscale_state_unavailable`, unless Tailscale is `Running` on a kernel
+  interface; userspace networking is not supported. Peers that are expired,
+  outside the network map or flagged `ShareeNode` (nodes of users this tailnet
+  shared a machine to) are not selectable. A machine another tailnet shared into
+  this one carries no flag and is selectable like any other peer.
+- The daemon refuses to bind an overlay address that is not a unicast address
+  or differs from the address its provider reports at bind time.
+- A provider listed in `overlays.toml` whose CLI is missing is retried by the
+  daemon with its listener backoff instead of staying disabled until a restart.
+  Without the file, the NetBird default is still disabled, as before.
+- New error codes: `tailscale_cli_missing`, `tailscale_state_unavailable`,
+  `tailscale_listener_address_missing`.
+
 ## 0.36.0
 
 ### 2026-10-23, zbus 6 and unmaintained dependencies, #1406
