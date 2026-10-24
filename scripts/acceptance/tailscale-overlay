@@ -52,20 +52,44 @@ debian_image_version=20261021-2638
 debian_image_url=https://cloud.debian.org/images/cloud/trixie/20261021-2638/debian-13-genericcloud-amd64-20261021-2638.qcow2
 debian_image_sha512=16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c
 
-# The genericcloud image has no `dbus-user-session`, so the systemd user manager
-# has no session bus socket and `pohunek service install` cannot connect. The
-# guests have no network egress, so the package is staged offline. Its only
-# dependencies (dbus-daemon and dbus-session-bus-common 1.16.2-2, libpam-systemd,
-# systemd) are in the image: checked against the image's package manifest
-# (`debian-13-genericcloud-amd64-20261021-2638.json`, sha512
+# Offline Debian packages for the guests (they have no network egress). The
+# genericcloud image lacks two things the run needs:
+#  - `dbus-user-session`: without it the systemd user manager has no session bus
+#    socket and `pohunek service install` cannot connect;
+#  - `git`: `pohunek project add` needs a git repository, and a remote
+#    `session new` needs a project.
+# The set is exactly these two packages plus the part of their Depends closure
+# that the image does not already have. It was computed against the image's
+# package manifest (`debian-13-genericcloud-amd64-20261021-2638.json`, sha512
 # 614b8865e7496c6e6380b491a8f4121bd7ac654dd570a889f0684c70a946c847c0591edf223f3535afe3572e31370459310b8c7ffaba859ee5f40465c4062911
-# from the dated `SHA512SUMS`). Primary source: snapshot.debian.org, whose URLs
-# are immutable; the pool URL is only a fallback and must match the same sha256
-# (the Debian `Packages` index of trixie).
-dbus_user_session_version=1.16.2-2
-dbus_user_session_url=https://snapshot.debian.org/archive/debian/20261021T000000Z/pool/main/d/dbus/dbus-user-session_1.16.2-2_amd64.deb
-dbus_user_session_fallback_url=https://deb.debian.org/debian/pool/main/d/dbus/dbus-user-session_1.16.2-2_amd64.deb
-dbus_user_session_sha256=0f9aa775a708b28b1a3ad784e9d1f0c96227521bc29e99ddbfe05ff008b5d246
+# from the dated `SHA512SUMS`; its 322 packages equal the image's dpkg status)
+# and the trixie `Packages` index of snapshot 20261021T000000Z: a dependency is
+# satisfied when any alternative is installed or provided, otherwise the first
+# alternative joins the set, repeated for each new member; no versioned
+# dependency of the members is unmet by the image (dpkg re-checks at install).
+# Each entry is `<pool path>|<sha256 of the Packages index>`. The source is
+# snapshot.debian.org (immutable URLs); the pool URL is only a fallback and must
+# match the same sha256.
+offline_debs="
+  pool/main/d/dbus/dbus-user-session_1.16.2-2_amd64.deb|0f9aa775a708b28b1a3ad784e9d1f0c96227521bc29e99ddbfe05ff008b5d246
+  pool/main/g/git/git_2.47.3-0+deb13u1_amd64.deb|3e35662fd5c46add561703e54031a1d8ad9df45811927689f0a51122b13be722
+  pool/main/g/git/git-man_2.47.3-0+deb13u1_all.deb|b58306b60e1dff920e1e18bc7e1e499f2ef75184190ab3d98657b165969bf7c9
+  pool/main/c/curl/libcurl3t64-gnutls_8.14.1-2+deb13u5_amd64.deb|19da93544615a4c9a3d7df473f5bf8ebca99442454622e9b0460168dadf7b8ae
+  pool/main/libe/liberror-perl/liberror-perl_0.17030-1_all.deb|06110a972bdc52f6c6d6615dddbe97f836c61d0e36c685ef4107c2eaa81f871f
+  pool/main/g/gdbm/libgdbm-compat4t64_1.24-2_amd64.deb|2cbd43cf2dfbf57ff48188b5d79d29cf7ea8f0dedaa61ab0bcc02eceff50ea01
+  pool/main/n/ngtcp2/libngtcp2-16_1.11.0-1+deb13u1_amd64.deb|627eec81ebbd48c4e6091f5cd9dc5070b792b7075000eed60ab08c7daa961caf
+  pool/main/n/ngtcp2/libngtcp2-crypto-gnutls8_1.11.0-1+deb13u1_amd64.deb|2a7f109c0c4db6a800e4661c5e5e34e1f1f83c8162482276183d1ada9da7c96c
+  pool/main/p/perl/libperl5.40_5.40.1-6+deb13u1_amd64.deb|e44777ff47ad248d1debd57e1f96ab5e89061a341008ae39880ba3b5fc15f273
+  pool/main/p/perl/perl_5.40.1-6+deb13u1_amd64.deb|ef145c247787d6f40dcdefd5b417502484827cde0d555998c17fd5b27ec1e1dd
+  pool/main/p/perl/perl-modules-5.40_5.40.1-6+deb13u1_all.deb|4c46cdd8f3135aa1c95f07e817f8e5d9be590687441ac1c27e3a8c49400f35ce
+"
+offline_deb_snapshot_base=https://snapshot.debian.org/archive/debian/20261021T000000Z
+offline_deb_fallback_base=https://deb.debian.org/debian
+
+# Throwaway git repository and project registered on each VM so that
+# `pohunek session new --project` has a target.
+d4_repo_dir=ph1112-repo
+d4_project_name=ph1112-d4
 
 # Highest glibc the Debian 13 image provides; CI binaries must not need more.
 guest_glibc_max=2.41
@@ -115,10 +139,17 @@ mac_capture_bytes=1048576
 key_expiration=15m
 # Throwaway roots of the NetBird-only check (host) and of the macOS leg.
 netbird_root=/dev/shm/ph1112
-macos_session_name=ph-macos-op1112acc
+# Unique per run (ph1112-<run time>); set when the macOS leg starts.
+macos_session_name=
 macos_session_cwd=/tmp/ph-macos-cache
 macos_runtime_root=/private/tmp/ph1112
 macos_comm_root=/private/tmp/ph1112c
+# Project reference on the Mac that the shell session is started under (a remote
+# `session new` needs one; --macos-project, no default so the operator names a
+# project that is not the owner's working checkout). The session runs in
+# macos_session_cwd and only carries the commands; the pohunek binaries under
+# test talk to their own throwaway daemon.
+macos_project=
 macos_brew=/opt/homebrew/bin/brew
 # Homebrew must neither update itself nor clean up the owner's other formulae.
 macos_brew_cmd="env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 $macos_brew"
@@ -176,6 +207,10 @@ Options for run:
   --macos-host NAME      NetBird host name of the Mac (default: $macos_host).
   --macos-bin-dir DIR    Directory ON the Mac with pohunek, pohunekd and
                          pohunek-sessiond built for the commit under test.
+  --macos-project REF    Project (id or label) on the Mac under which the
+                         command shell session is started (macos leg; required,
+                         no default; its checkout is not used, the session runs
+                         in /tmp/ph-macos-cache).
   --output FILE          Evidence document (default: $output).
   --cache-dir DIR        Download cache (default: $cache_dir).
   --run-root DIR         Parent of the per-run directories (default: $run_root).
@@ -525,7 +560,10 @@ prepare_cache() {
   fetch_pinned "$debian_image_url" "$cache_dir/debian-$debian_image_version.qcow2" sha512 "$debian_image_sha512" || return 1
   fetch_pinned "$headscale_url" "$cache_dir/headscale-$headscale_version" sha256 "$headscale_sha256" || return 1
   fetch_pinned "$tailscale_url" "$cache_dir/tailscale-$tailscale_version.tgz" sha256 "$tailscale_sha256" || return 1
-  fetch_pinned "$dbus_user_session_url" "$cache_dir/dbus-user-session_${dbus_user_session_version}_amd64.deb" sha256 "$dbus_user_session_sha256" "$dbus_user_session_fallback_url" || return 1
+  for fo_entry in $offline_debs; do
+    fo_path=${fo_entry%%|*}
+    fetch_pinned "$offline_deb_snapshot_base/$fo_path" "$cache_dir/${fo_path##*/}" sha256 "${fo_entry##*|}" "$offline_deb_fallback_base/$fo_path" || return 1
+  done
   rm -rf "$cache_dir/tailscale-$tailscale_version"
   mkdir -p "$cache_dir/tailscale-$tailscale_version"
   tar -xzf "$cache_dir/tailscale-$tailscale_version.tgz" --strip-components=1 -C "$cache_dir/tailscale-$tailscale_version" || {
@@ -880,14 +918,19 @@ join_tailnet() {
   prov "$jt_vm" "remove the key file" vm_ssh "$jt_vm" 'sudo rm -f /run/ts/authkey' || return 1
 }
 
-# install_dbus_session VM: installs the pinned dbus-user-session offline and
-# restarts the user manager, which then listens on dbus.socket. Any failure is
-# a provisioning problem of the guest, not a product result.
-install_dbus_session() {
+# install_offline_packages VM: installs the pinned packages in one `dpkg -i`
+# (dpkg refuses to configure one with an unmet dependency), restarts the user
+# manager, which then listens on dbus.socket, and waits for the bus socket. Any
+# failure is a provisioning problem of the guest, not a product result.
+install_offline_packages() {
   ds_vm=$1
-  ds_deb="$cache_dir/dbus-user-session_${dbus_user_session_version}_amd64.deb"
-  prov "$ds_vm" "stage dbus-user-session" vm_ssh_stdin "$ds_vm" 'cat >/tmp/dbus-user-session.deb' <"$ds_deb" || return 1
-  prov "$ds_vm" "install dbus-user-session" vm_ssh "$ds_vm" 'sudo dpkg -i /tmp/dbus-user-session.deb' || return 1
+  prov "$ds_vm" "create the package directory" vm_ssh "$ds_vm" 'rm -rf /tmp/ph1112-debs && mkdir /tmp/ph1112-debs' || return 1
+  for fo_entry in $offline_debs; do
+    fo_file=${fo_entry%%|*}
+    fo_file=${fo_file##*/}
+    prov "$ds_vm" "stage $fo_file" vm_ssh_stdin "$ds_vm" "cat >/tmp/ph1112-debs/$fo_file" <"$cache_dir/$fo_file" || return 1
+  done
+  prov "$ds_vm" "install the offline packages" vm_ssh "$ds_vm" 'sudo dpkg -i /tmp/ph1112-debs/*.deb && rm -rf /tmp/ph1112-debs' || return 1
   # shellcheck disable=SC2016 # the VM expands its own uid
   prov "$ds_vm" "restart the user manager" vm_ssh "$ds_vm" 'sudo systemctl restart "user@$(id -u).service"' || return 1
   ds_waited=0
@@ -900,6 +943,23 @@ install_dbus_session() {
     sleep "$poll_s"
     ds_waited=$((ds_waited + poll_s))
   done
+}
+
+# create_d4_project VM: a tiny git repository with one commit under the ph
+# user's home, registered as a project; its id is kept for `session new`.
+create_d4_project() {
+  cp_vm=$1
+  prov "$cp_vm" "create the throwaway git repository" vm_ssh "$cp_vm" "rm -rf ~/$d4_repo_dir && git init -q ~/$d4_repo_dir && cd ~/$d4_repo_dir && echo ph1112 >README && git add README && git -c user.name=ph1112 -c user.email=ph1112@lab.invalid commit -q -m init" || return 1
+  step pre "project-add-$cp_vm" vm_ssh "$cp_vm" "pohunek project add ~/$d4_repo_dir --name $d4_project_name --json"
+  cp_id=
+  if [ "$step_rc" -eq 0 ]; then
+    cp_id=$(helper json-field "$step_dir/stdout" id 2>/dev/null || true)
+  fi
+  if [ -z "$cp_id" ]; then
+    inconclude provisioning_failed "VM-$cp_vm: the throwaway project could not be registered"
+    return 1
+  fi
+  printf '%s\n' "$cp_id" >"$state/project-id-$cp_vm"
 }
 
 # install_pohunek VM: stages the CI binaries, writes overlays.toml and installs
@@ -971,7 +1031,8 @@ d4() {
   step "$d4_leg" health-fqdn vm_ssh "$d4_src" "pohunek --host $d4_dn.$lab_domain health --json"
   step "$d4_leg" health-peer-id vm_ssh "$d4_src" "pohunek --host tailscale:peer~$d4_idb64 health --json"
   step "$d4_leg" session-list-qualified vm_ssh "$d4_src" "pohunek --host tailscale:$d4_dn session list --json"
-  step "$d4_leg" session-new vm_ssh "$d4_src" "pohunek session new --host $d4_dn --agent shell --name d4-$d4_src-to-$d4_dst --yes --json"
+  d4_project=$(cat "$state/project-id-$d4_dst")
+  step "$d4_leg" session-new vm_ssh "$d4_src" "pohunek session new --host $d4_dn --project $d4_project --agent shell --name d4-$d4_src-to-$d4_dst --yes --json"
   d4_sid=
   if [ "$step_rc" -eq 0 ]; then
     d4_sid=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
@@ -995,9 +1056,13 @@ extras() {
   ex_other=$2
   ex_node=$(vm_node "$ex_side")
   say "D7 and D5 on VM-$ex_side"
-  vm_ssh "$ex_side" "systemctl --user stop '$unit_glob'" >/dev/null 2>&1 || true
+  # A glob matches loaded units only, and a stopped unit is unloaded, so the
+  # concrete unit name is resolved while the unit is running.
+  ex_unit=$(vm_ssh "$ex_side" "systemctl --user list-units --plain --no-legend '$unit_glob' | awk '{print \$1}' | head -n 1")
+  [ -n "$ex_unit" ] || return 0
+  vm_ssh "$ex_side" "systemctl --user stop '$ex_unit'" >/dev/null 2>&1 || true
   step extra "d7-health-$ex_side" vm_ssh "$ex_other" "pohunek --host $ex_node health --json"
-  vm_ssh "$ex_side" "systemctl --user start '$unit_glob'" >/dev/null 2>&1 || true
+  vm_ssh "$ex_side" "systemctl --user start '$ex_unit'" >/dev/null 2>&1 || true
   waited=0
   until vm_ssh "$ex_other" "pohunek --host $ex_node health --json" >/dev/null 2>&1; do
     [ "$waited" -lt "$service_timeout_s" ] || return 0
@@ -1243,7 +1308,10 @@ mac_cleanup() {
     step macos cl-health "$owner_pohunek" --host "$macos_host" health --json
     mac_final_clean
   fi
-  "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
+  # `rm` stops a live session first; the explicit stop keeps the order readable
+  # in the recorded steps. The record only leaves the owner's daemon with `rm`.
+  step macos cl-session-stop "$owner_pohunek" session stop "$(mac_target)" --json
+  step macos cl-session-rm "$owner_pohunek" session rm "$(mac_target)" --json
 }
 
 # Removes the throwaway roots this run created and the communication directory,
@@ -1283,11 +1351,26 @@ brew_shows_pin() {
 macos_leg() {
   say "zajcaair (no root)"
   helper cgnat "$netbird_address" || die "--netbird-address must be an address in 100.64.0.0/10"
-  step macos session-new "$owner_pohunek" session new --host "$macos_host" --agent shell --name "$macos_session_name" --cwd "$macos_session_cwd" --yes --json
+  macos_session_name="ph1112-$run_ts"
+  helper set-meta "$state" "macos_project=$macos_project"
+  step macos session-new "$owner_pohunek" session new --host "$macos_host" --project "$macos_project" --agent shell --name "$macos_session_name" --cwd "$macos_session_cwd" --yes --json
+  mac_new_rc=$step_rc
   mac_session_id=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
   if [ -z "$mac_session_id" ]; then
-    inconclude macos_provisioning_failed "the $macos_host shell session could not be started"
-    return 1
+    # The id is not in the output: the run's unique session name finds it.
+    step macos session-lookup "$owner_pohunek" --host "$macos_host" session list --json
+    mac_session_id=$(helper session-by-name "$step_dir/stdout" "$macos_session_name" 2>/dev/null || true)
+    if [ -z "$mac_session_id" ]; then
+      inconclude macos_provisioning_failed "no id for the $macos_host control session named $macos_session_name; if it exists remove it by hand: pohunek --host $macos_host session rm <id>"
+      printf 'tailscale-overlay: control session %s on %s may exist and must be removed by hand\n' "$macos_session_name" "$macos_host" >&2
+      return 1
+    fi
+    mac_started=1
+    helper set-meta "$state" "macos_session=$mac_session_id"
+    if [ "$mac_new_rc" -ne 0 ]; then
+      inconclude macos_provisioning_failed "session new on $macos_host failed (rc=$mac_new_rc) but left the session $macos_session_name; it is removed at teardown"
+      return 1
+    fi
   fi
   mac_started=1
   helper set-meta "$state" "macos_session=$mac_session_id"
@@ -1514,6 +1597,7 @@ parse_run_options() {
       --pohunek) [ "$#" -ge 2 ] || die "--pohunek needs a value"; owner_pohunek=$2; shift 2 ;;
       --macos-host) [ "$#" -ge 2 ] || die "--macos-host needs a value"; macos_host=$2; shift 2 ;;
       --macos-bin-dir) [ "$#" -ge 2 ] || die "--macos-bin-dir needs a value"; macos_bin_dir=$2; shift 2 ;;
+      --macos-project) [ "$#" -ge 2 ] || die "--macos-project needs a value"; macos_project=$2; shift 2 ;;
       --output) [ "$#" -ge 2 ] || die "--output needs a value"; output=$2; shift 2 ;;
       --cache-dir) [ "$#" -ge 2 ] || die "--cache-dir needs a value"; cache_dir=$2; shift 2 ;;
       --run-root) [ "$#" -ge 2 ] || die "--run-root needs a value"; run_root=$2; shift 2 ;;
@@ -1553,6 +1637,9 @@ validate_options() {
   fi
   if has_leg macos && ! has_leg vms; then
     die "the macos leg needs the vms leg (Headscale runs in VM-A)"
+  fi
+  if has_leg macos && [ -z "$macos_project" ]; then
+    die "the macos leg needs --macos-project (a project on $macos_host other than the owner's working checkout)"
   fi
   if has_leg vms; then
     [ -n "$probe" ] || die "the vms leg needs --probe PATH"
@@ -1598,9 +1685,11 @@ tailscale_version=$tailscale_version
 tailscale_sha256=$tailscale_sha256
 debian_image_version=$debian_image_version
 debian_image_sha512=$debian_image_sha512
-dbus_user_session_version=$dbus_user_session_version
-dbus_user_session_sha256=$dbus_user_session_sha256
 EOF
+  for fo_entry in $offline_debs; do
+    fo_path=${fo_entry%%|*}
+    printf '%s.sha256=%s\n' "${fo_path##*/}" "${fo_entry##*|}"
+  done
 }
 
 main_run() {
@@ -1644,10 +1733,12 @@ main_run() {
     provision_headscale || return 1
     join_tailnet a || return 1
     join_tailnet b || return 1
-    install_dbus_session a || return 1
-    install_dbus_session b || return 1
+    install_offline_packages a || return 1
+    install_offline_packages b || return 1
     install_pohunek a || return 1
     install_pohunek b || return 1
+    create_d4_project a || return 1
+    create_d4_project b || return 1
     vms_leg || return 1
   fi
   if has_leg netbird; then

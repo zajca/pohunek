@@ -93,7 +93,7 @@ MAX_RECORDED_BYTES = 16384
 WIREGUARD_KEY = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{43}=(?![A-Za-z0-9+/=])")
 TAILSCALE_KEY = re.compile(r"\b(?:nodekey|mkey|discokey|privkey):[0-9a-f]{64}\b")
 STATUS_STRING_FIELDS = re.compile(r'("(?:PublicKey|AuthURL|QR|CurAddr|Relay|PeerRelay)"\s*:\s*)"[^"]*"')
-STATUS_ADDRS_FIELD = re.compile(r'("Addrs"\s*:\s*)\[[^\]]*\]')
+STATUS_ADDRS_FIELD = re.compile(r'("Addrs"\s*:\s*)\[(?:\s*"[^"]*"\s*,?)*\s*\]')
 CGNAT_ADDRESS = re.compile(r"(?<![0-9.])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9])")
 
 # Home directories name a person.
@@ -361,6 +361,12 @@ def error_message(step: Step) -> str:
     return str(error.get("msg", "")) if error else ""
 
 
+def error_recover(step: Step) -> str:
+    """Return the `recover` hint of a `--json` error envelope."""
+    error = step.error()
+    return str(error.get("recover", "")) if error else ""
+
+
 def succeeded(step: Step) -> Tuple[bool, str]:
     """A command that exited 0 with an `ok` payload."""
     document = step.document()
@@ -559,7 +565,7 @@ def evaluate_extras(state: State, checks: Checks) -> None:
                 and error_code(step) == "host_unreachable"
                 and "tailscale" in message
                 and str(port) in message
-                and "overlays.toml" in message
+                and "overlays.toml" in message + error_recover(step)
             )
             return ok, "code={} msg={}".format(error_code(step), message[:200])
 
@@ -804,6 +810,7 @@ def evaluate_macos(state: State, checks: Checks) -> None:
         checks.with_step(leg, "cleanup-homebrew-restored", "cl-brew-uninstall", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
     checks.with_step(leg, "cleanup-removed-roots", "cl-rm", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
     checks.with_step(leg, "cleanup-owner-health", "cl-health", succeeded)
+    checks.with_step(leg, "cleanup-session-removed", "cl-session-rm", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
 
 
 def evaluate(state: State) -> Dict[str, Any]:
@@ -1019,8 +1026,15 @@ class Redactor:
     the same placeholder.
     """
 
-    def __init__(self, netbird_addresses: Iterable[str] = (), roots: Iterable[Tuple[str, str]] = ()) -> None:
+    def __init__(
+        self, netbird_addresses: Iterable[str] = (), roots: Iterable[Tuple[str, str]] = (), project: str = ""
+    ) -> None:
         self.netbird_addresses = [a for a in netbird_addresses if a]
+        # The owner's project reference only counts where it is named as a
+        # project; a bare substring match would also hit the command name.
+        self.project = (
+            re.compile(r"(--project(?:=|\s+)|\bproject\W{0,4})" + re.escape(project) + r"(?![\w.-])") if project else None
+        )
         self.placeholders: Dict[str, str] = {}
         # (path, placeholder) pairs, longest path first so a root never
         # shadows the longer root it prefixes.
@@ -1030,6 +1044,8 @@ class Redactor:
         """Replace the throwaway roots of the owner's machines, then any path left."""
         for path, placeholder in self.roots:
             text = text.replace(path, placeholder)
+        if self.project is not None:
+            text = self.project.sub(lambda match: match.group(1) + "<macos-project>", text)
         return text
 
     def prose(self, text: str, netbird_leg: bool) -> str:
@@ -1082,7 +1098,7 @@ def step_record(redactor: Redactor, leg: str, step: Step) -> Dict[str, Any]:
     """Return one step as recorded in the evidence document."""
     netbird = leg in NETBIRD_LEGS
     out, out_cut = clip(redactor.text(redactor.private(project_step_text(leg, step)), netbird))
-    err, err_cut = clip(WITHHELD if netbird and step.stderr.strip() else redactor.text(step.stderr, netbird))
+    err, err_cut = clip(WITHHELD if netbird and step.stderr.strip() else redactor.text(redactor.private(step.stderr), netbird))
     return {
         "name": step.name,
         "argv": redactor.text(redactor.private(step.argv), netbird),
@@ -1101,7 +1117,10 @@ def recordings(state: State, redactor: Redactor) -> Dict[str, Any]:
     for name, leg, step_name in sources:
         step = state.step(leg, step_name)
         if step is not None and step.document() is not None:
-            found[name] = json.loads(redactor.text(step.stdout, leg in NETBIRD_LEGS))
+            try:
+                found[name] = json.loads(redactor.text(step.stdout, leg in NETBIRD_LEGS))
+            except json.JSONDecodeError as error:
+                raise EvidenceError("the {} status recording is not JSON after redaction: {}".format(name, error)) from error
     return found
 
 
@@ -1128,7 +1147,7 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
     leaks = scan_directory(state_dir)
     if leaks:
         raise EvidenceError("secret key prefix in the run state: {}".format("; ".join(leaks)))
-    redactor = Redactor([state.meta.get("netbird_address", "")], private_roots(state))
+    redactor = Redactor([state.meta.get("netbird_address", "")], private_roots(state), state.meta.get("macos_project", ""))
     for entry in result["inconclusive"]:
         entry["detail"] = redactor.prose(entry["detail"], True)
     for item in result["checks"]:
@@ -1140,7 +1159,7 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
         "generated": utc_now(),
         "started": state.run.get("started"),
         "legs": state.legs,
-        "meta": {k: redactor.prose(v, True) for k, v in state.meta.items() if k != "netbird_address"},
+        "meta": {k: redactor.prose(v, True) for k, v in state.meta.items() if k not in ("netbird_address", "macos_project")},
         "verdict": result["verdict"],
         "inconclusive": result["inconclusive"],
         "checks": result["checks"],
@@ -1241,6 +1260,20 @@ def command_session_id(args: argparse.Namespace) -> int:
     if found is None:
         raise EvidenceError("{} has no session id".format(args.file))
     print(found)
+    return 0
+
+
+def command_session_by_name(args: argparse.Namespace) -> int:
+    """Print the id of the one session of a `session list --json` result with this exact name."""
+    payload = Step_from_file(Path(args.file)).payload()
+    if isinstance(payload, dict) and isinstance(payload.get("sessions"), list):
+        payload = payload["sessions"]
+    if not isinstance(payload, list):
+        raise EvidenceError("{} is not a session list".format(args.file))
+    found = [s["id"] for s in payload if isinstance(s, dict) and s.get("name") == args.name and isinstance(s.get("id"), str)]
+    if len(found) != 1:
+        raise EvidenceError("{} sessions are named {!r}".format(len(found), args.name))
+    print(found[0])
     return 0
 
 
@@ -1419,6 +1452,10 @@ def parser() -> argparse.ArgumentParser:
     field.add_argument("field")
     field.set_defaults(handler=command_status_field)
 
+    byname = commands.add_parser("session-by-name", help="print the id of the one session with this exact name")
+    byname.add_argument("file")
+    byname.add_argument("name")
+    byname.set_defaults(handler=command_session_by_name)
     sid = commands.add_parser("session-id", help="print a created session's id")
     sid.add_argument("file")
     sid.set_defaults(handler=command_session_id)
