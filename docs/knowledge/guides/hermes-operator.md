@@ -182,7 +182,7 @@ The owner selects exactly one access mode:
   unavailable in every other mode.
 
 Policy contains an explicit host allowlist. A host-qualified target is allowed
-only when its exact host is listed; Pohunek reaches it directly over its overlay.
+only when its exact host is listed; Pohunek reaches it directly over NetBird.
 The plugin never discovers or scans hosts implicitly. A wildcard host policy
 requires the installer's explicit wildcard confirmation and is still a delegated
 tool guardrail, not a network or same-user security boundary.
