@@ -105,23 +105,31 @@ The listener authenticates nothing beyond overlay reachability. The tailnet
 policy is the access control: allow TCP on the configured port only between the
 devices you own, and nothing else reaches the daemon.
 
+Add rules like these to the `acls` of your existing policy file (do not replace
+the file: a policy that holds only this rule cuts every other tailnet service,
+SSH included). `autogroup:self` covers only devices owned by a user, never
+tagged ones, so a tagged host needs its own rule with a narrow `src`:
+
 ```json
 {
-  "acls": [
-    {
-      "action": "accept",
-      "src": ["autogroup:member"],
-      "dst": ["autogroup:self:18722"]
-    }
-  ]
+  "action": "accept",
+  "proto": "tcp",
+  "src": ["autogroup:member"],
+  "dst": ["autogroup:self:18722"]
+},
+{
+  "action": "accept",
+  "proto": "tcp",
+  "src": ["tag:pohunek-clients"],
+  "dst": ["tag:pohunek-hosts:18722"]
 }
 ```
 
-Replace `18722` with the `port` of `overlays.toml`. A tailnet with the default
-allow-all policy already reaches the port from every device, including devices
-of other members and shared machines: tighten it before you rely on it. Headscale
-policy files use a different dialect; consult its documentation for the same
-rule.
+Replace `18722` with the `port` of `overlays.toml` and the tags with your own.
+Without `"proto"` a rule also opens UDP. A tailnet with the default allow-all
+policy already reaches the port from every device, including devices of other
+members and shared machines: tighten it before you rely on it. Headscale policy
+files use a different dialect; consult its documentation for the same rules.
 
 ## One overlay per host
 

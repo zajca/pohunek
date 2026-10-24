@@ -98,7 +98,7 @@ ceiling; a violation makes the daemon refuse startup with the named
 configuration error. A daemon started without `service.toml` uses the same
 5 min and 30 min.
 Three optional `[waits]` keys set the TCP keepalive of every connection the
-daemon accepts on an overlay (NetBird) address: `keepalive_idle_ms = 30000`,
+daemon accepts on an overlay (NetBird or Tailscale) address: `keepalive_idle_ms = 30000`,
 `keepalive_interval_ms = 10000` and `keepalive_count = 3`. A client host that
 vanishes without closing its connection (network loss, suspend) then frees the
 waiter slot of its in-flight `session.wait_turn` within

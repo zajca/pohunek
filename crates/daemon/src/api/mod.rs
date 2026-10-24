@@ -561,7 +561,7 @@ const CANCEL_ON_HANGUP: &[&str] = &[
 /// each, and write back one response line per request.
 ///
 /// Generic over the underlying stream so the same logic serves a local Unix
-/// connection ([`ControlServer`]) and a `NetBird` TCP connection ([`RemoteServer`])
+/// connection ([`ControlServer`]) and an overlay TCP connection ([`RemoteServer`])
 /// without divergence.
 ///
 /// Requests are answered strictly in order. While a [`CANCEL_ON_HANGUP`] method

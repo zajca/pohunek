@@ -72,7 +72,7 @@
   affected dynamic value completers (especially `--host` and session `target`
   arguments), and keep the completion scenarios current where the change adds
   or alters completable behavior (see the linked testing policy). Preserve the completion
-  safety contract: static generation performs no daemon or NetBird I/O, while
+  safety contract: static generation performs no daemon or overlay I/O, while
   dynamic lookups are opt-in, deadline-bounded, do not autostart the daemon, and
   fail silently. In the same change, update the CLI tables/examples in
   `docs/cli.md`, matching `docs/knowledge/` guidance and source map entries, and

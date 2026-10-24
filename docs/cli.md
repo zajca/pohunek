@@ -651,7 +651,7 @@ pohunek integration install --agent hermes \
 `read_only` registers observation tools; `manage` adds constrained session
 management; `full` alone registers stop and remove. Remote host access is
 restricted by the explicit allowlist and goes directly to that daemon over
-NetBird, never through SSH. `*` needs `--confirm-wildcard`. Use
+its overlay, never through SSH. `*` needs `--confirm-wildcard`. Use
 `integration update` for a version/policy refresh and `integration uninstall`
 to remove only managed assets; add `--confirm-modified` when the ownership
 check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are

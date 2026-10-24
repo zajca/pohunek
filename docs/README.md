@@ -27,7 +27,7 @@ This directory turns the product idea into implementation-oriented planning.
 
 The shipped protocol v4 product is an **owner-operated personal multi-host
 tool**: durable coding-agent sessions across the owner's machines locally or on
-a NetBird (WireGuard) network. The accepted, not-yet-implemented
+a NetBird (default) or Tailscale network. The accepted, not-yet-implemented
 [team relay RFC](design/team-relay-control-plane-rfc.md) adds an optional public
 multi-team control plane without replacing either owner path.
 

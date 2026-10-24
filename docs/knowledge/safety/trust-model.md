@@ -73,7 +73,7 @@ The assistant must:
   nonces, signatures, retired state, or relay credentials. A governance failure
   is unavailable state, not permission to reuse a previous snapshot.
 - Treat worker control sockets and journals as owner-private runtime authority.
-  Never proxy a worker endpoint over NetBird, unlink a failed socket without
+  Never proxy a worker endpoint over an overlay, unlink a failed socket without
   proving unit inactivity and exact identity, or edit worker/runtime ids by
   hand.
 - Treat kernel peer identity as the only source of a caller's process identity

@@ -62,9 +62,9 @@ typed API, credential set, state adapter, and origin. Presentation components ma
 cross-mode fallback or session aggregation.
 
 The accepted design adds one optional public Rust `pohunek-relayd` authority.
-Standalone and direct NetBird operation remain first-class and never depend on
+Standalone and direct overlay operation remain first-class and never depend on
 the relay. A host may use either owner mode, enroll with the relay, or use both
-at the same time after enrollment is implemented. NetBird is neither replaced
+at the same time after enrollment is implemented. An overlay (NetBird or Tailscale) is neither replaced
 nor required by the relay.
 
 ## Foundation authentication and native credentials
@@ -240,7 +240,7 @@ Recovery uses one host-scoped subscription and the relay must discard its live
 cache after a gap, overflow, epoch change, malformed event, or reconnect. The
 ordered-writer, bounded in-flight, cancellation, fairness, snapshot installation,
 and convergence rules are in RFC §§11 and 16. A snapshot is not offline history.
-Relay outages do not stop host sessions or affect local and NetBird owner
+Relay outages do not stop host sessions or affect local and overlay owner
 operation; revoked-share sessions continue permanently as owner-only.
 
 ## Planned unattended factory extension (design only)
