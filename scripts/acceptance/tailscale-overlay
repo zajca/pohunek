@@ -139,7 +139,8 @@ mac_capture_bytes=1048576
 key_expiration=15m
 # Throwaway roots of the NetBird-only check (host) and of the macOS leg.
 netbird_root=/dev/shm/ph1112
-macos_session_name=ph-macos-op1112acc
+# Unique per run (ph1112-<run time>); set when the macOS leg starts.
+macos_session_name=
 macos_session_cwd=/tmp/ph-macos-cache
 macos_runtime_root=/private/tmp/ph1112
 macos_comm_root=/private/tmp/ph1112c
@@ -1307,7 +1308,10 @@ mac_cleanup() {
     step macos cl-health "$owner_pohunek" --host "$macos_host" health --json
     mac_final_clean
   fi
-  "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
+  # `rm` stops a live session first; the explicit stop keeps the order readable
+  # in the recorded steps. The record only leaves the owner's daemon with `rm`.
+  step macos cl-session-stop "$owner_pohunek" session stop "$(mac_target)" --json
+  step macos cl-session-rm "$owner_pohunek" session rm "$(mac_target)" --json
 }
 
 # Removes the throwaway roots this run created and the communication directory,
@@ -1347,11 +1351,25 @@ brew_shows_pin() {
 macos_leg() {
   say "zajcaair (no root)"
   helper cgnat "$netbird_address" || die "--netbird-address must be an address in 100.64.0.0/10"
+  macos_session_name="ph1112-$run_ts"
   step macos session-new "$owner_pohunek" session new --host "$macos_host" --project "$macos_project" --agent shell --name "$macos_session_name" --cwd "$macos_session_cwd" --yes --json
+  mac_new_rc=$step_rc
   mac_session_id=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
   if [ -z "$mac_session_id" ]; then
-    inconclude macos_provisioning_failed "the $macos_host shell session could not be started"
-    return 1
+    # The id is not in the output: the run's unique session name finds it.
+    step macos session-lookup "$owner_pohunek" --host "$macos_host" session list --json
+    mac_session_id=$(helper session-by-name "$step_dir/stdout" "$macos_session_name" 2>/dev/null || true)
+    if [ -z "$mac_session_id" ]; then
+      inconclude macos_provisioning_failed "no id for the $macos_host control session named $macos_session_name; if it exists remove it by hand: pohunek --host $macos_host session rm <id>"
+      printf 'tailscale-overlay: control session %s on %s may exist and must be removed by hand\n' "$macos_session_name" "$macos_host" >&2
+      return 1
+    fi
+    mac_started=1
+    helper set-meta "$state" "macos_session=$mac_session_id"
+    if [ "$mac_new_rc" -ne 0 ]; then
+      inconclude macos_provisioning_failed "session new on $macos_host failed (rc=$mac_new_rc) but left the session $macos_session_name; it is removed at teardown"
+      return 1
+    fi
   fi
   mac_started=1
   helper set-meta "$state" "macos_session=$mac_session_id"

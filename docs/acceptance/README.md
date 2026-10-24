@@ -359,12 +359,17 @@ download 5 min the first time, boot 2 min, provisioning 4 min, D4 and the extras
   with `env -i` under `/dev/shm/ph1112`, and the leg refuses to start when that
   directory already exists.
 - On zajcaair all commands run in a named shell session
-  (`ph-macos-op1112acc`, `--cwd /tmp/ph-macos-cache`). The session is the only
+  (`ph1112-<run time>`, `--cwd /tmp/ph-macos-cache`). The session is the only
   channel to the Mac, so it is started through the owner's own daemon there; a
   remote `session new` needs a project, which the operator names with
   `--macos-project` (no default; the session runs in the cache directory, not in
   that project's checkout, and nothing else is done through the owner's daemon
-  except a final `health`). The pohunek binaries under test talk only to their
+  except a final `health`; the one known side effect on the owner's daemon is that
+  `--project` bumps that project's `last_used_at`). The session id is read from
+  the `session new` output, or looked up by the exact session name; when neither
+  works the macOS leg is `macos_provisioning_failed` and the name is printed for
+  manual cleanup. Teardown stops and removes the session on every exit path
+  (`cleanup-session-removed`). The pohunek binaries under test talk only to their
   own throwaway daemon, under a throwaway
   `HOME`-relative root and `/private/tmp/ph1112`, with `XDG_RUNTIME_DIR` set so
   the owner's live daemon path is never used. The guard compares the doctor

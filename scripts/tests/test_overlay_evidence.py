@@ -274,6 +274,7 @@ class Run:
         self.step(leg, "us-hostfwd-closed", "")
         self.step(leg, "cl-rm", "")
         self.step(leg, "cl-health", envelope({}))
+        self.step(leg, "cl-session-rm", envelope({}))
 
     def full(self):
         if "vms" in self.legs:
@@ -617,10 +618,19 @@ class DbusUserSessionTest(unittest.TestCase):
 class MacLegTest(unittest.TestCase):
     """The macOS leg against a fake `pohunek` session and a fake `brew`, on temp roots."""
 
-    FAKE = MacStepProtocolTest.FAKE.replace(
+    FAKE = MacStepProtocolTest.FAKE.replace('case "$1 $2" in', 'if [ "$1" = --host ]; then shift 2; fi\n        case "$1 $2" in').replace(
         "*) exit 2 ;;",
-        """"session new") printf '{"cli_version":"x","ok":{"session":{"id":"s-fake"}}}\\n' ;;
-          "session stop") printf '{"cli_version":"x","ok":{}}\\n' ;;
+        """"session new")
+            prev=
+            for a in "$@"; do [ "$prev" != --name ] || printf %s "$a" >"$FAKE_DIR/session-name"; prev=$a; done
+            printf 'new\\n' >>"$FAKE_DIR/ops.log"
+            if [ "${FAKE_NEW_BAD:-0}" = 1 ]; then printf '{"cli_version":"x","ok":{}}\\n'; exit "${FAKE_NEW_RC:-0}"; fi
+            printf '{"cli_version":"x","ok":{"session":{"id":"s-fake"}}}\\n' ;;
+          "session list")
+            if [ "${FAKE_LIST_EMPTY:-0}" = 1 ]; then printf '{"cli_version":"x","ok":[]}\\n'; exit 0; fi
+            printf '{"cli_version":"x","ok":[{"id":"s-other","name":"other"},{"id":"s-fake","name":"%s"}]}\\n' "$(cat "$FAKE_DIR/session-name" 2>/dev/null)" ;;
+          "session stop") printf 'stop %s\\n' "$3" >>"$FAKE_DIR/ops.log"; printf '{"cli_version":"x","ok":{}}\\n' ;;
+          "session rm") printf 'rm %s\\n' "$3" >>"$FAKE_DIR/ops.log"; printf '{"cli_version":"x","ok":{}}\\n' ;;
           *) exit 2 ;;""",
     )
     BREW = textwrap.dedent(
@@ -672,7 +682,7 @@ class MacLegTest(unittest.TestCase):
             macos_runtime_root={runtime}
             owner_pohunek={fake}
             macos_host=zajcaair
-            macos_session_name=n
+            run_ts=20261024T000000Z
             macos_session_cwd=/tmp
             netbird_address=100.80.1.5
             macos_bin_dir=/nonexistent
@@ -693,6 +703,37 @@ class MacLegTest(unittest.TestCase):
     def codes(self):
         directory = self.dir / "state" / "inconclusive"
         return sorted(p.name for p in directory.iterdir()) if directory.is_dir() else []
+
+    def ops(self):
+        path = self.dir / "ops.log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_the_control_session_has_a_unique_name_and_is_stopped_then_removed_at_teardown(self):
+        self.run_leg(env={"FAKE_BREW_LIST_RC": "3"})
+        self.assertEqual((self.dir / "session-name").read_text(), "ph1112-20261024T000000Z")
+        self.assertEqual(self.ops(), ["new", "stop zajcaair/s-fake", "rm zajcaair/s-fake"])
+
+    def test_the_session_is_removed_when_the_leg_stops_early_too(self):
+        self.run_leg(pre_existing=[self.comm])
+        self.assertEqual(self.ops()[-2:], ["stop zajcaair/s-fake", "rm zajcaair/s-fake"])
+
+    def test_an_unparsable_new_result_finds_the_session_by_its_exact_name(self):
+        self.run_leg(env={"FAKE_NEW_BAD": "1", "FAKE_BREW_LIST_RC": "3"})
+        self.assertNotIn("macos_provisioning_failed", self.codes())
+        self.assertEqual(self.ops()[-2:], ["stop zajcaair/s-fake", "rm zajcaair/s-fake"])
+
+    def test_a_failed_new_that_left_a_session_is_removed_and_inconclusive(self):
+        self.run_leg(env={"FAKE_NEW_BAD": "1", "FAKE_NEW_RC": "1"})
+        self.assertEqual(self.codes(), ["macos_provisioning_failed"])
+        self.assertEqual(self.ops()[-2:], ["stop zajcaair/s-fake", "rm zajcaair/s-fake"])
+
+    def test_no_id_and_no_lookup_hit_is_inconclusive_and_prints_the_name(self):
+        result = self.run_leg(env={"FAKE_NEW_BAD": "1", "FAKE_LIST_EMPTY": "1"})
+        self.assertEqual(self.codes(), ["macos_provisioning_failed"])
+        self.assertIn("ph1112-20261024T000000Z", result.stderr)
+        self.assertEqual(self.ops(), ["new"])
+        reason = (self.dir / "state" / "inconclusive" / "macos_provisioning_failed").read_text()
+        self.assertIn("ph1112-20261024T000000Z", reason)
 
     def test_an_absent_comm_root_is_created_and_removed_again(self):
         self.run_leg(env={"FAKE_BREW_LIST_RC": "3"})
@@ -993,6 +1034,10 @@ class EvidenceTest(unittest.TestCase):
         if code:
             self.run_.inconclude(code)
         return self.run_.evaluate()["verdict"]
+
+    def test_a_session_record_left_on_the_owners_daemon_is_a_failure(self):
+        self.run_.step("macos", "cl-session-rm", "", rc=1)
+        self.assertEqual(self.run_.failed(), ["macos/cleanup-session-removed"])
 
     def test_a_clean_homebrew_failure_is_inconclusive_with_the_restore_passed(self):
         for code in ("macos_homebrew_failed", "macos_tailscale_pin_mismatch"):
@@ -1402,6 +1447,23 @@ class DiagnosticsScanTest(unittest.TestCase):
 
     def test_scan_delete_of_a_missing_directory_is_clean(self):
         self.assertEqual(helper("scan", "/nonexistent-ph1112-dir", "--delete").returncode, 0)
+
+
+class SessionByNameTest(unittest.TestCase):
+    def lookup(self, payload, name="ph1112-x"):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "l.json"
+            path.write_text(json.dumps({"ok": payload}))
+            return helper("session-by-name", path, name)
+
+    def test_an_exact_name_gives_its_id(self):
+        result = self.lookup([{"id": "s-1", "name": "ph1112-x"}, {"id": "s-2", "name": "ph1112-xy"}])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "s-1"))
+
+    def test_no_match_and_an_ambiguous_match_are_refused(self):
+        self.assertEqual(self.lookup([{"id": "s-2", "name": "ph1112-xy"}]).returncode, 3)
+        self.assertEqual(self.lookup([{"id": "s-1", "name": "ph1112-x"}, {"id": "s-3", "name": "ph1112-x"}]).returncode, 3)
+        self.assertEqual(self.lookup({"unexpected": 1}).returncode, 3)
 
 
 class MarkerSeenTest(unittest.TestCase):

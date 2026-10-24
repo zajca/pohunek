@@ -810,6 +810,7 @@ def evaluate_macos(state: State, checks: Checks) -> None:
         checks.with_step(leg, "cleanup-homebrew-restored", "cl-brew-uninstall", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
     checks.with_step(leg, "cleanup-removed-roots", "cl-rm", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
     checks.with_step(leg, "cleanup-owner-health", "cl-health", succeeded)
+    checks.with_step(leg, "cleanup-session-removed", "cl-session-rm", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
 
 
 def evaluate(state: State) -> Dict[str, Any]:
@@ -1253,6 +1254,20 @@ def command_session_id(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_session_by_name(args: argparse.Namespace) -> int:
+    """Print the id of the one session of a `session list --json` result with this exact name."""
+    payload = Step_from_file(Path(args.file)).payload()
+    if isinstance(payload, dict) and isinstance(payload.get("sessions"), list):
+        payload = payload["sessions"]
+    if not isinstance(payload, list):
+        raise EvidenceError("{} is not a session list".format(args.file))
+    found = [s["id"] for s in payload if isinstance(s, dict) and s.get("name") == args.name and isinstance(s.get("id"), str)]
+    if len(found) != 1:
+        raise EvidenceError("{} sessions are named {!r}".format(len(found), args.name))
+    print(found[0])
+    return 0
+
+
 def command_register_id(args: argparse.Namespace) -> int:
     """Print the registration id of a `tailscale up --json` AuthURL."""
     text = read_text(Path(args.file)) or ""
@@ -1428,6 +1443,10 @@ def parser() -> argparse.ArgumentParser:
     field.add_argument("field")
     field.set_defaults(handler=command_status_field)
 
+    byname = commands.add_parser("session-by-name", help="print the id of the one session with this exact name")
+    byname.add_argument("file")
+    byname.add_argument("name")
+    byname.set_defaults(handler=command_session_by_name)
     sid = commands.add_parser("session-id", help="print a created session's id")
     sid.add_argument("file")
     sid.set_defaults(handler=command_session_id)

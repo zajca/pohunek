@@ -14,3 +14,9 @@
   unparsable recording as an error; the D7 hint check also reads the `recover`
   text; the D7/D5 extras resolve the concrete daemon unit name before stopping
   it. No product code changes.
+- The zajcaair control shell session is named `ph1112-<run time>`, its id is
+  read from the `session new` output or looked up by that exact name, and
+  teardown stops and removes it on every exit path (`session rm`); a session
+  whose id cannot be found makes the macOS leg inconclusive and prints the name
+  for manual cleanup. `--project` bumping that project's `last_used_at` is the
+  one known side effect on the owner's daemon.
