@@ -92,7 +92,7 @@ MAX_RECORDED_BYTES = 16384
 # Wireguard and Tailscale public keys are 32 bytes of standard base64.
 WIREGUARD_KEY = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{43}=(?![A-Za-z0-9+/=])")
 TAILSCALE_KEY = re.compile(r"\b(?:nodekey|mkey|discokey|privkey):[0-9a-f]{64}\b")
-STATUS_STRING_FIELDS = re.compile(r'("(?:PublicKey|AuthURL|CurAddr|Relay|PeerRelay)"\s*:\s*)"[^"]*"')
+STATUS_STRING_FIELDS = re.compile(r'("(?:PublicKey|AuthURL|QR|CurAddr|Relay|PeerRelay)"\s*:\s*)"[^"]*"')
 STATUS_ADDRS_FIELD = re.compile(r'("Addrs"\s*:\s*)\[[^\]]*\]')
 CGNAT_ADDRESS = re.compile(r"(?<![0-9.])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9])")
 
@@ -613,16 +613,13 @@ def evaluate_netbird(state: State, checks: Checks) -> None:
     if before is None or after is None:
         checks.missing(leg, "owner-netbird-untouched", "owner-peers-before/after")
     else:
+        first = peers_summary(before) or ("?", "?")
+        last = peers_summary(after) or ("?", "?")
         checks.add(
             leg,
             "owner-netbird-untouched",
-            peers_summary(before) is not None and peers_summary(before)[0] == peers_summary(after)[0],
-            "peer totals {} -> {}; connected {} -> {} (recorded, not gating)".format(
-                (peers_summary(before) or ("?", "?"))[0],
-                (peers_summary(after) or ("?", "?"))[0],
-                (peers_summary(before) or ("?", "?"))[1],
-                (peers_summary(after) or ("?", "?"))[1],
-            ),
+            peers_summary(before) is not None and peers_summary(after) is not None and first[0] == last[0],
+            "peer totals {} -> {}; connected {} -> {} (recorded, not gating)".format(first[0], last[0], first[1], last[1]),
         )
     for name in ("owner-health-before", "owner-health-after"):
         checks.with_step(leg, name, name, succeeded)
@@ -835,7 +832,22 @@ def verdict(state: State, items: List[Dict[str, Any]]) -> Dict[str, Any]:
     sub_codes = {c: r for c, r in codes.items() if c in SUBSTEP_INCONCLUSIVE}
     voided = {SUBSTEP_INCONCLUSIVE[c][0] for c in sub_codes}
     gating = [i for i in items if i["gating"]]
-    live = [i for i in gating if i["substep"] not in voided and i["leg"] not in voided]
+    # A leg-wide code voids the leg's checks, except a failed exposure-window or
+    # cleanup check: those report harm to the owner's machines and are never
+    # hidden (only an unresponsive session voids the cleanup checks).
+    def hidden(item: Dict[str, Any]) -> bool:
+        if item["substep"] in voided:
+            return True
+        if item["leg"] not in voided:
+            return False
+        if item["status"] == "failed":
+            if item["name"].startswith("exposure-window-"):
+                return False
+            if item["name"].startswith("cleanup-") and "macos_unresponsive" not in sub_codes:
+                return False
+        return True
+
+    live = [i for i in gating if not hidden(i)]
     failed = [i for i in live if i["status"] == "failed"]
     missing = [i for i in live if i["status"] == "missing"]
     if run_codes:
@@ -892,7 +904,7 @@ def project_doctor(step: Step) -> str:
 def project_hosts(step: Step) -> str:
     error = step.error()
     if error is not None:
-        return json.dumps({"err": {"code": error.get("code"), "msg": scrub_paths(str(error.get("msg", "")))}}, indent=2) + "\n"
+        return json.dumps({"err": {"code": error.get("code")}}, indent=2) + "\n"
     others = 0
     records = []
     for record in host_records(step):

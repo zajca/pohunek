@@ -611,6 +611,11 @@ class MacLegTest(unittest.TestCase):
         self.assertNotIn("uninstall", log)
         self.assertEqual((self.dir / "installed").read_text(), "1.50.0")
 
+    def test_several_installed_versions_are_not_the_pin(self):
+        (self.dir / "installed").write_text("1.104.2 1.100.0")
+        self.run_leg()
+        self.assertEqual(self.codes(), ["macos_tailscale_pin_mismatch"])
+
     def test_the_uninstall_is_skipped_when_the_re_check_does_not_show_the_formula(self):
         # `install` succeeds but the formula is never listed, so the pin check
         # fails and the cleanup re-check finds nothing to remove.
@@ -732,6 +737,10 @@ class EvidenceTest(unittest.TestCase):
 
     def test_owner_netbird_peer_count_change_fails(self):
         self.run_.step("netbird", "owner-peers-after", '{"peers":4,"connected":4}\n')
+        self.assertEqual(self.run_.failed(), ["netbird/owner-netbird-untouched"])
+
+    def test_an_unreadable_owner_netbird_after_the_leg_fails_the_check_instead_of_crashing(self):
+        self.run_.step("netbird", "owner-peers-after", "netbird: daemon not running\n", rc=1)
         self.assertEqual(self.run_.failed(), ["netbird/owner-netbird-untouched"])
 
     def test_owner_netbird_connected_count_is_recorded_but_does_not_gate(self):
@@ -882,13 +891,28 @@ class InconclusiveTest(unittest.TestCase):
             run_ = Run().full()
             try:
                 run_.step("macos", "d6-host-list", envelope([]), rc=0)
-                run_.step("macos", "cl-rm", "", rc=1)
+                run_.step("macos", "d6-lsof", "tcp\n", rc=0)
                 run_.inconclude(code)
                 self.assertEqual(run_.evaluate()["verdict"], "inconclusive", code)
                 run_.step("ab", "attach", "", rc=1)
                 self.assertEqual(run_.evaluate()["verdict"], "failed", code)
             finally:
                 run_.close()
+
+    def test_a_failed_exposure_or_cleanup_check_is_never_hidden_by_a_macos_code(self):
+        for name, step, rc, out in (("exposure", "us-hostfwd-closed", 0, "LISTEN 0 4096 1.2.3.4:1 0.0.0.0:*\n"), ("cleanup", "cl-rm", 1, "")):
+            run_ = Run().full()
+            try:
+                run_.step("macos", step, out, rc=rc)
+                run_.inconclude("macos_homebrew_failed")
+                self.assertEqual(run_.evaluate()["verdict"], "failed", name)
+            finally:
+                run_.close()
+
+    def test_an_unresponsive_session_does_void_the_cleanup_checks(self):
+        self.run_.step("macos", "cl-rm", "", rc=1)
+        self.run_.inconclude("macos_unresponsive")
+        self.assertEqual(self.run_.evaluate()["verdict"], "inconclusive")
 
     def test_an_unknown_code_is_refused(self):
         self.run_.inconclude("made_up")
@@ -1029,6 +1053,11 @@ class AssembleTest(unittest.TestCase):
         step = [s for s in document["steps"]["macos"] if s["name"] == "mac-roots"][0]
         self.assertEqual(step["argv"], "mkdir -p <macos-root>/home && mkdir <macos-runtime-root> && mkdir <macos-comm-root>/out")
         self.assertNotIn(MAC_ROOT, json.dumps(document["meta"]))
+
+    def test_the_registration_qr_code_is_redacted(self):
+        self.run_.step("macos", "us-register", json.dumps({"AuthURL": "http://x/register/abc", "QR": "data:image/png;base64,QQQQ"}))
+        helper("assemble", self.run_.root, self.out)
+        self.assertNotIn("QQQQ", self.out.read_text())
 
     def test_status_recordings_are_redacted_and_embedded(self):
         helper("assemble", self.run_.root, self.out)

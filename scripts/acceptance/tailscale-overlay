@@ -1227,7 +1227,7 @@ mac_daemon_start_cmd() {
 
 # True when the pinned Tailscale is the only formula version `brew list` shows.
 brew_shows_pin() {
-  awk -v v="$tailscale_version" '$1 == "tailscale" { n = $2; sub(/_[0-9]+$/, "", n); if (n == v) found = 1 } END { exit found ? 0 : 1 }' "$1"
+  awk -v v="$tailscale_version" '$1 == "tailscale" && NF == 2 { n = $2; sub(/_[0-9]+$/, "", n); if (n == v) found = 1 } END { exit found ? 0 : 1 }' "$1"
 }
 
 macos_leg() {
@@ -1335,7 +1335,6 @@ macos_leg() {
   mac_step macos d6-doctor-before "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   mac_step macos d6-host-list "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek host list --json"
   mac_step macos d6-daemon-start "$mac_timeout_s" "$(mac_daemon_start_cmd /usr/bin:/bin)"
-  mac_daemon_pid=$(sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p' "$step_dir/stdout" | head -n 1)
   mac_step macos d6-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
   mac_step macos d6-doctor-after "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   mac_step macos d6-daemon-log "$mac_timeout_s" "grep -rhI 'overlay state unavailable; serving local-only' $mac_root; true"
@@ -1396,13 +1395,12 @@ macos_userspace() {
     return 1
   fi
   mac_step macos us-wrapper "$mac_timeout_s" "printf '#!/bin/sh\nexec /opt/homebrew/bin/tailscale --socket=$sub_socket \"\$@\"\n' >$mac_bin/tailscale && chmod 0700 $mac_bin/tailscale"
-  mac_step macos us-stop-daemon "$mac_timeout_s" "if ps -p $mac_daemon_pid -o command= | grep -F -q $mac_bin/pohunekd; then kill $mac_daemon_pid; fi; for i in 1 2 3 4 5 6 7 8 9 10; do ps -p $mac_daemon_pid >/dev/null 2>&1 || exit 0; sleep 1; done; exit 1"
+  mac_step macos us-stop-daemon "$mac_timeout_s" "pid=\$(cat $mac_root/daemon.pid 2>/dev/null); [ -n \"\$pid\" ] || exit 1; if ps -p \$pid -o command= | grep -F -q $mac_bin/pohunekd; then kill \$pid; fi; for i in 1 2 3 4 5 6 7 8 9 10; do ps -p \$pid >/dev/null 2>&1 || exit 0; sleep 1; done; exit 1"
   if [ "$step_rc" -ne 0 ]; then
     close_window
     return 1
   fi
   mac_step macos us-restart "$mac_timeout_s" "$(mac_daemon_start_cmd "$mac_bin:/usr/bin:/bin")"
-  mac_daemon_pid=$(sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p' "$step_dir/stdout" | head -n 1)
   mac_step macos us-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
   if [ "$step_rc" -ne 0 ]; then
     close_window

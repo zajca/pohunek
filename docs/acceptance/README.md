@@ -359,7 +359,7 @@ Run-wide inconclusive codes: `checksum_mismatch`, `artifact_missing`,
 no verdict): `headscale_unreachable_from_macos`, `macos_userspace_refused` and
 `macos_userspace_not_running` void the userspace sub-step; `macos_unresponsive`
 (any Mac step timed out), `macos_provisioning_failed`, `macos_homebrew_failed`
-and `macos_tailscale_pin_mismatch` void the whole macOS leg.
+and `macos_tailscale_pin_mismatch` void the whole macOS leg. A failed exposure-window or cleanup check is never hidden by these codes (only `macos_unresponsive` voids the cleanup checks).
 
 A daemon that fails `health` (after `service install` on a VM, or the restarted
 daemon on the Mac) is a product failure, not an inconclusive condition. The
