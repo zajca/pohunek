@@ -372,8 +372,12 @@ class DriverScriptTest(unittest.TestCase):
         self.assertRegex(pins["headscale_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(pins["tailscale_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(pins["debian_image_sha512"], r"^[0-9a-f]{128}$")
-        self.assertRegex(pins["dbus_user_session_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(pins["dbus_user_session_version"], "1.16.2-2")
+        debs = {key: value for key, value in pins.items() if key.endswith(".deb.sha256")}
+        self.assertEqual(len(debs), 11)
+        self.assertIn("dbus-user-session_1.16.2-2_amd64.deb.sha256", debs)
+        self.assertIn("git_2.47.3-0+deb13u1_amd64.deb.sha256", debs)
+        for value in debs.values():
+            self.assertRegex(value, r"^[0-9a-f]{64}$")
 
     def test_the_readme_records_the_pins_the_driver_uses(self):
         readme = README.read_text()
@@ -478,7 +482,7 @@ class MacStepProtocolTest(unittest.TestCase):
 
 
 class DbusUserSessionTest(unittest.TestCase):
-    """`install_dbus_session` and the pinned download, with stand-in VM commands."""
+    """The offline packages, the throwaway project and the pinned download, with stand-in VM commands."""
 
     def run_script(self, body, env=None):
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,25 +506,61 @@ class DbusUserSessionTest(unittest.TestCase):
     STUBS = """\
         vm_ssh() {{ shift; printf 'ssh %s\\n' "$*" >>TMP/calls.log; case "$*" in *dpkg*) return ${{DPKG_RC:-0}};; *is-active*) return ${{ACTIVE_RC:-0}};; esac; return 0; }}
         vm_ssh_stdin() {{ shift; printf 'stdin %s\\n' "$*" >>TMP/calls.log; cat >/dev/null; }}
-        printf deb >"$cache_dir/dbus-user-session_${{dbus_user_session_version}}_amd64.deb"
+        for e in $offline_debs; do p=${{e%%|*}}; printf deb >"$cache_dir/${{p##*/}}"; done
         """
 
     def test_the_package_is_installed_before_the_user_manager_restart_and_the_wait(self):
-        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_dbus_session a\n")
+        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_offline_packages a\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(codes, [])
         order = [log.index(token) for token in ("dpkg -i", "systemctl restart", "is-active dbus.socket")]
         self.assertEqual(order, sorted(order))
+        self.assertEqual(log.count("stdin cat >/tmp/ph1112-debs/"), 11)
+        self.assertIn("git_2.47.3-0+deb13u1_amd64.deb", log)
+        self.assertIn("dbus-user-session_1.16.2-2_amd64.deb", log)
 
     def test_a_failing_dpkg_is_a_provisioning_failure_and_stops_before_the_restart(self):
-        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_dbus_session a || true\n", env={"DPKG_RC": "1"})
+        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_offline_packages a || true\n", env={"DPKG_RC": "1"})
         self.assertEqual(codes, ["provisioning_failed"])
         self.assertNotIn("systemctl restart", log)
 
     def test_a_socket_that_never_comes_up_is_a_bounded_provisioning_failure(self):
-        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_dbus_session a || true\n", env={"ACTIVE_RC": "1"})
+        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_offline_packages a || true\n", env={"ACTIVE_RC": "1"})
         self.assertEqual(codes, ["provisioning_failed"])
         self.assertGreaterEqual(log.count("is-active dbus.socket"), 2)
+
+    PROJECT_STUBS = """\
+        vm_ssh() {{ shift; printf 'ssh %s\\n' "$*" >>TMP/calls.log; case "$*" in *"project add"*) printf '{{"cli_version":"x","ok":{{"id":"%s","label":"ph1112-d4"}}}}\\n' "${{PROJECT_ID:-p-123}}"; return ${{ADD_RC:-0}};; esac; return ${{GIT_RC:-0}}; }}
+        """.replace("{{", "{").replace("}}", "}")
+
+    def test_the_throwaway_repo_is_created_before_it_is_registered_and_the_id_is_kept(self):
+        result, codes, log = self.run_script(self.PROJECT_STUBS + "create_d4_project a\ncat \"$state/project-id-a\" >TMP/id\n")
+        self.assertEqual((result.returncode, codes), (0, []), result.stderr)
+        self.assertLess(log.index("git init"), log.index("project add"))
+        self.assertIn("commit", log)
+        self.assertIn("--name ph1112-d4", log)
+
+    def test_a_failing_git_or_project_add_is_a_provisioning_failure(self):
+        result, codes, log = self.run_script(self.PROJECT_STUBS + "create_d4_project a || true\n", env={"GIT_RC": "1"})
+        self.assertEqual(codes, ["provisioning_failed"])
+        self.assertNotIn("project add", log)
+        result, codes, log = self.run_script(self.PROJECT_STUBS + "create_d4_project a || true\n", env={"ADD_RC": "1"})
+        self.assertEqual(codes, ["provisioning_failed"])
+
+    def test_d4_starts_the_session_on_the_peers_project(self):
+        script = """\
+            vm_ssh() {{ shift; printf 'ssh %s\\n' "$*" >>TMP/calls.log; return 1; }}
+            step() {{ shift 2; printf 'step %s\\n' "$*" >>TMP/calls.log; step_rc=1; }}
+            vm_node() {{ printf 'ph-%s' "$1"; }}
+            helper() {{ printf ID; }}
+            mkdir -p "$state/steps/pre/001-hostname-b" "$state/steps/pre/002-status-b"
+            printf lab-b >"$state/steps/pre/001-hostname-b/stdout"
+            printf p-on-b >"$state/project-id-b"
+            d4 ab a b
+            """.replace("{{", "{").replace("}}", "}")
+        result, codes, log = self.run_script(script)
+        line = [l for l in log.splitlines() if "session new" in l][0]
+        self.assertIn("--host ph-b --project p-on-b", line)
 
     FETCH = """\
         curl() {{
@@ -872,6 +912,16 @@ class EvidenceTest(unittest.TestCase):
         result = self.run_.evaluate()
         probe = [c for c in result["checks"] if c["name"] == "sdk-probe" and c["leg"] == "ab"][0]
         self.assertIn("handshake", probe["detail"])
+
+    def test_the_d7_hint_may_be_in_the_recover_text(self):
+        recover = "check that its overlays.toml lists 'tailscale' as its provider"
+        envelope_text = json.dumps({"err": {"class": "transport", "code": "host_unreachable", "msg": "could not open an overlay connection to host 'ph-a' (overlay tailscale at 100.64.0.1:18733): refused", "recover": recover}})
+        self.run_.step("extra", "d7-health-a", envelope_text, rc=1)
+        checks = {c["name"]: c["status"] for c in self.run_.evaluate()["checks"]}
+        self.assertEqual(checks["d7-unreachable-hint-a"], "passed")
+        self.run_.step("extra", "d7-health-a", envelope_text.replace("overlays.toml", "config"), rc=1)
+        checks = {c["name"]: c["status"] for c in self.run_.evaluate()["checks"]}
+        self.assertEqual(checks["d7-unreachable-hint-a"], "failed")
 
     def test_extras_never_gate(self):
         self.run_.step("extra", "d7-health-a", error_envelope("other", "x"), rc=1)
@@ -1231,6 +1281,30 @@ class AssembleTest(unittest.TestCase):
         step = [s for s in document["steps"]["macos"] if s["name"] == "mac-roots"][0]
         self.assertEqual(step["argv"], "mkdir -p <macos-root>/home && mkdir <macos-runtime-root> && mkdir <macos-comm-root>/out")
         self.assertNotIn(MAC_ROOT, json.dumps(document["meta"]))
+
+    def test_ipv6_endpoint_addresses_in_a_status_recording_leave_valid_json(self):
+        document = json.loads(status_json("a"))
+        document["Peer"] = {"nodekey:x": {"Addrs": ["[fe80::1]:41641", "10.0.0.1:41641", "[2001:db8::2]:5"], "CurAddr": "[fe80::1]:41641"}}
+        self.run_.step("pre", "status-a", json.dumps(document, indent=2))
+        result = helper("assemble", self.run_.root, self.out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.out.read_text()
+        self.assertNotIn("fe80::1", text)
+        self.assertNotIn("2001:db8", text)
+        self.assertIsInstance(json.loads(text)["recordings"]["linux-kernel-tun"], dict)
+
+    def test_an_unparsable_recording_is_a_clear_error_not_a_traceback(self):
+        class Broken:
+            def text(self, text, netbird_leg):
+                return text + "}"
+
+        with self.assertRaises(overlay_evidence.EvidenceError) as caught:
+            overlay_evidence.recordings(overlay_evidence.State(self.run_.root), Broken())
+        self.assertIn("not JSON after redaction", str(caught.exception))
+        self.run_.step("pre", "status-a", json.dumps(json.loads(status_json("a"))))
+        result = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import overlay_evidence as o; o.Redactor.text = lambda self, t, n: t + '}'; sys.exit(o.main(['assemble', sys.argv[2], sys.argv[3]]))", str(ACCEPTANCE), str(self.run_.root), str(self.out)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_the_registration_qr_code_is_redacted(self):
         self.run_.step("macos", "us-register", json.dumps({"AuthURL": "http://x/register/abc", "QR": "data:image/png;base64,QQQQ"}))

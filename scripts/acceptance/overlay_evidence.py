@@ -93,7 +93,7 @@ MAX_RECORDED_BYTES = 16384
 WIREGUARD_KEY = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{43}=(?![A-Za-z0-9+/=])")
 TAILSCALE_KEY = re.compile(r"\b(?:nodekey|mkey|discokey|privkey):[0-9a-f]{64}\b")
 STATUS_STRING_FIELDS = re.compile(r'("(?:PublicKey|AuthURL|QR|CurAddr|Relay|PeerRelay)"\s*:\s*)"[^"]*"')
-STATUS_ADDRS_FIELD = re.compile(r'("Addrs"\s*:\s*)\[[^\]]*\]')
+STATUS_ADDRS_FIELD = re.compile(r'("Addrs"\s*:\s*)\[(?:\s*"[^"]*"\s*,?)*\s*\]')
 CGNAT_ADDRESS = re.compile(r"(?<![0-9.])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9])")
 
 # Home directories name a person.
@@ -361,6 +361,12 @@ def error_message(step: Step) -> str:
     return str(error.get("msg", "")) if error else ""
 
 
+def error_recover(step: Step) -> str:
+    """Return the `recover` hint of a `--json` error envelope."""
+    error = step.error()
+    return str(error.get("recover", "")) if error else ""
+
+
 def succeeded(step: Step) -> Tuple[bool, str]:
     """A command that exited 0 with an `ok` payload."""
     document = step.document()
@@ -559,7 +565,7 @@ def evaluate_extras(state: State, checks: Checks) -> None:
                 and error_code(step) == "host_unreachable"
                 and "tailscale" in message
                 and str(port) in message
-                and "overlays.toml" in message
+                and "overlays.toml" in message + error_recover(step)
             )
             return ok, "code={} msg={}".format(error_code(step), message[:200])
 
@@ -1101,7 +1107,10 @@ def recordings(state: State, redactor: Redactor) -> Dict[str, Any]:
     for name, leg, step_name in sources:
         step = state.step(leg, step_name)
         if step is not None and step.document() is not None:
-            found[name] = json.loads(redactor.text(step.stdout, leg in NETBIRD_LEGS))
+            try:
+                found[name] = json.loads(redactor.text(step.stdout, leg in NETBIRD_LEGS))
+            except json.JSONDecodeError as error:
+                raise EvidenceError("the {} status recording is not JSON after redaction: {}".format(name, error)) from error
     return found
 
 
