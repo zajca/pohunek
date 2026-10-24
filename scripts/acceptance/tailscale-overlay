@@ -105,6 +105,8 @@ macos_session_cwd=/tmp/ph-macos-cache
 macos_runtime_root=/private/tmp/ph1112
 macos_comm_root=/private/tmp/ph1112c
 macos_brew=/opt/homebrew/bin/brew
+# Homebrew must neither update itself nor clean up the owner's other formulae.
+macos_brew_cmd="env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 $macos_brew"
 macos_user_node=ph-mac
 # Run and cache roots; the cache survives runs, the run directory does not.
 default_cache_dir=/mnt/m2_4t/t/ph1112-cache
@@ -292,6 +294,13 @@ netbird_dir=
 netbird_root_created=0
 diagnostics_done=0
 mac_brew_installed_by_us=0
+mac_dead=0
+mac_in_cleanup=0
+mac_comm_created=0
+mac_home_created=0
+mac_runtime_created=0
+mac_root_candidate=
+mac_make_result=
 mac_n=0
 mac_started=0
 teardown_done=0
@@ -454,6 +463,7 @@ collect_diagnostics() {
   if [ -S "$run/vm-a.mon" ]; then
     vm_ssh a 'sudo journalctl -u headscale --no-pager -n 200' >"$state/diagnostics/headscale.log" 2>&1 || true
   fi
+  helper scan "$state/diagnostics" --delete >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------------------
@@ -490,11 +500,12 @@ prepare_cache() {
   fetch_pinned "$debian_image_url" "$cache_dir/debian-$debian_image_version.qcow2" sha512 "$debian_image_sha512" || return 1
   fetch_pinned "$headscale_url" "$cache_dir/headscale-$headscale_version" sha256 "$headscale_sha256" || return 1
   fetch_pinned "$tailscale_url" "$cache_dir/tailscale-$tailscale_version.tgz" sha256 "$tailscale_sha256" || return 1
-  if [ ! -x "$cache_dir/tailscale-$tailscale_version/tailscale" ]; then
-    rm -rf "$cache_dir/tailscale-$tailscale_version"
-    mkdir -p "$cache_dir/tailscale-$tailscale_version"
-    tar -xzf "$cache_dir/tailscale-$tailscale_version.tgz" --strip-components=1 -C "$cache_dir/tailscale-$tailscale_version"
-  fi
+  rm -rf "$cache_dir/tailscale-$tailscale_version"
+  mkdir -p "$cache_dir/tailscale-$tailscale_version"
+  tar -xzf "$cache_dir/tailscale-$tailscale_version.tgz" --strip-components=1 -C "$cache_dir/tailscale-$tailscale_version" || {
+    inconclude artifact_unusable "the Tailscale tarball could not be extracted"
+    return 1
+  }
   for binary in tailscale tailscaled; do
     [ -x "$cache_dir/tailscale-$tailscale_version/$binary" ] || {
       inconclude artifact_missing "the Tailscale tarball holds no $binary"
@@ -857,13 +868,12 @@ install_pohunek() {
   prov "$ip_vm" "service install" vm_ssh "$ip_vm" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek service install --from ~/stage' || return 1
   waited=0
   until vm_ssh "$ip_vm" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek health --json' >/dev/null 2>&1; do
-    if [ "$waited" -ge "$service_timeout_s" ]; then
-      inconclude provisioning_failed "VM-$ip_vm: the daemon did not answer health"
-      return 1
-    fi
+    [ "$waited" -lt "$service_timeout_s" ] || break
     sleep "$poll_s"
     waited=$((waited + poll_s))
   done
+  step pre "service-health-$ip_vm" vm_ssh "$ip_vm" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek health --json'
+  [ "$step_rc" -eq 0 ] || return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1082,11 +1092,17 @@ mac_step() {
   ms_cmd=$4
   mac_n=$((mac_n + 1))
   ms_b64=$(printf '%s' "$ms_cmd" | base64 | tr -d '\n')
-  ms_line="umask 077; mkdir -p $macos_comm_root/out && printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc"
+  ms_line="umask 077; printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc"
   step_dir_for "$ms_leg" "$ms_name"
   printf '%s\n' "$ms_cmd" >"$step_dir/argv"
   now >"$step_dir/at"
   : >"$step_dir/stderr"
+  if [ "$mac_dead" = 1 ] && [ "$mac_in_cleanup" = 0 ]; then
+    : >"$step_dir/stdout"
+    printf '124\n' >"$step_dir/rc"
+    step_rc=124
+    return 0
+  fi
   "$owner_pohunek" session input "$(mac_target)" "$ms_line" --json >"$step_dir/input.json" 2>&1 || true
   ms_waited=0
   step_rc=124
@@ -1103,55 +1119,115 @@ mac_step() {
   [ -f "$step_dir/stdout" ] || : >"$step_dir/stdout"
   rm -f "$step_dir/capture.json" "$step_dir/input.json"
   printf '%s\n' "$step_rc" >"$step_dir/rc"
+  if [ "$step_rc" -eq 124 ] && [ "$mac_in_cleanup" = 0 ]; then
+    mac_dead=1
+    inconclude macos_unresponsive "the $macos_host shell session did not answer $ms_name within ${ms_timeout}s"
+  fi
+}
+
+# mac_terminal_wait MARKER...: polls the terminal until one of the markers
+# shows; prints it. Used for lines whose own capture file is not usable.
+mac_terminal_wait() {
+  mw_waited=0
+  while [ "$mw_waited" -lt "$mac_timeout_s" ]; do
+    sleep "$mac_poll_s"
+    mw_waited=$((mw_waited + mac_poll_s))
+    if "$owner_pohunek" session output "$(mac_target)" --max-bytes "$mac_capture_bytes" --json 2>/dev/null >"$state/mac-terminal.json"; then
+      if helper marker-seen "$state/mac-terminal.json" "$@"; then
+        rm -f "$state/mac-terminal.json"
+        return 0
+      fi
+    fi
+  done
+  rm -f "$state/mac-terminal.json"
+  return 1
+}
+
+# mac_make_root PATH [SUBDIR]: creates PATH with a plain mkdir, which fails when
+# PATH exists, and reads the answer from the terminal. mac_make_result is ok,
+# exists or timeout; a root counts as created only after "ok".
+mac_make_root() {
+  mac_n=$((mac_n + 1))
+  mk_sub=
+  [ -z "${2:-}" ] || mk_sub="; mkdir $1/$2"
+  mk_line="umask 077; if mkdir $1 2>/dev/null; then printf 'PHMK-%s-OK\\n' $mac_n$mk_sub; else printf 'PHMK-%s-NO\\n' $mac_n; fi"
+  "$owner_pohunek" session input "$(mac_target)" "$mk_line" --json >/dev/null 2>&1 || true
+  mac_make_result=timeout
+  if mk_seen=$(mac_terminal_wait "PHMK-$mac_n-OK" "PHMK-$mac_n-NO"); then
+    case $mk_seen in
+      *-OK) mac_make_result=ok ;;
+      *-NO) mac_make_result=exists ;;
+    esac
+  fi
+  if [ "$mac_make_result" = timeout ]; then
+    mac_dead=1
+    inconclude macos_unresponsive "the $macos_host shell session did not answer the creation of $1"
+  fi
 }
 
 mac_cleanup_done=0
-mac_roots_created=0
 
+# A root is removed only when its own mkdir created it in this run.
 mac_cleanup() {
   [ "$mac_cleanup_done" = 0 ] || return 0
   mac_cleanup_done=1
   [ -n "$mac_session_id" ] || return 0
   say "cleaning up zajcaair"
-  if [ -z "$mac_root" ] || [ "$mac_roots_created" = 0 ]; then
-    "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
-    return 0
+  mac_in_cleanup=1
+  if [ "$mac_comm_created" = 1 ]; then
+    if [ "$mac_home_created" = 1 ] && [ "$mac_runtime_created" = 1 ]; then
+      # SIGTERM first so the daemon can leave cleanly, SIGKILL only if it stays; the pid file is
+      # written by the start command itself and the process is matched by its command line.
+      mac_step macos cl-daemon-stop "$mac_timeout_s" "pid=\$(cat $mac_root/daemon.pid 2>/dev/null); if [ -n \"\$pid\" ] && ps -p \$pid -o command= | grep -F -q $macos_runtime_root/bin/pohunekd; then kill \$pid; for i in 1 2 3 4 5; do ps -p \$pid >/dev/null 2>&1 || break; sleep 1; done; if ps -p \$pid -o command= | grep -F -q $macos_runtime_root/bin/pohunekd; then kill -9 \$pid; fi; fi; true"
+      mac_step macos cl-kill-tsd "$mac_timeout_s" "pid=\$(cat $mac_root/tsd.pid 2>/dev/null); if [ -n \"\$pid\" ] && ps -p \$pid -o command= | grep -F -q -- --socket=$macos_runtime_root/ts.sock; then kill \$pid; fi; true"
+    fi
+    if [ "$mac_brew_installed_by_us" = 1 ]; then
+      mac_step macos cl-brew-recheck "$mac_timeout_s" "$macos_brew_cmd list --versions tailscale"
+      if [ "$step_rc" -eq 0 ] && grep -q '^tailscale ' "$step_dir/stdout"; then
+        mac_step macos cl-brew-uninstall "$mac_install_timeout_s" "$macos_brew_cmd uninstall tailscale"
+        mac_step macos cl-ls "$mac_timeout_s" 'ls /opt/homebrew/bin/tailscale* 2>&1; true'
+      else
+        note_step macos cl-brew-uninstall 1 "$macos_brew_cmd uninstall tailscale" "skipped: the re-check did not show the installed formula"
+      fi
+    fi
+    step macos cl-health "$owner_pohunek" --host "$macos_host" health --json
+    mac_final_clean
   fi
-  mac_step macos cl-daemon-stop "$mac_timeout_s" "pid=\$(cat $mac_root/daemon.pid 2>/dev/null); if [ -n \"\$pid\" ] && ps -p \$pid -o command= | grep -F -q $macos_runtime_root/bin/pohunekd; then kill \$pid; fi; true"
-  mac_step macos cl-kill-tsd "$mac_timeout_s" "pid=\$(cat $mac_root/tsd.pid 2>/dev/null); if [ -n \"\$pid\" ] && ps -p \$pid -o command= | grep -F -q -- --socket=$macos_runtime_root/ts.sock; then kill \$pid; fi; true"
-  if [ "$mac_brew_installed_by_us" = 1 ]; then
-    mac_step macos cl-brew-recheck "$mac_timeout_s" "$macos_brew list --versions tailscale"
-    mac_step macos cl-brew-uninstall "$mac_install_timeout_s" "$macos_brew uninstall tailscale"
-    mac_step macos cl-ls "$mac_timeout_s" 'ls /opt/homebrew/bin/tailscale* 2>&1; true'
-  fi
-  step macos cl-health "$owner_pohunek" --host "$macos_host" health --json
-  mac_final_clean
   "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
 }
 
-# Removes the throwaway roots and the communication directory with a command
-# whose result is read from the terminal, since its own capture file goes too.
+# Removes the throwaway roots this run created and the communication directory,
+# with a command whose result is read from the terminal, since its own capture
+# file goes too.
 mac_final_clean() {
-  mac_n=$((mac_n + 1))
-  mf_line="rm -rf $mac_root $macos_runtime_root $macos_comm_root; if [ ! -e $mac_root ] && [ ! -e $macos_runtime_root ] && [ ! -e $macos_comm_root ]; then printf 'PHCLEAN-%s-OK\\n' $mac_n; fi"
-  "$owner_pohunek" session input "$(mac_target)" "$mf_line" --json >/dev/null 2>&1 || true
-  mf_waited=0
-  mf_rc=1
-  while [ "$mf_waited" -lt "$mac_timeout_s" ]; do
-    sleep 2
-    mf_waited=$((mf_waited + 2))
-    if "$owner_pohunek" session output "$(mac_target)" --max-bytes "$mac_capture_bytes" --json 2>/dev/null |
-      "$python_bin" -c '
-import base64, json, sys
-doc = json.load(sys.stdin)["ok"]
-text = base64.b64decode(doc["data_base64"]).decode("utf-8", "replace")
-sys.exit(0 if ("PHCLEAN-%s-OK\n" % sys.argv[1]).replace("\n", "") in text.replace("\r", "").replace("\n", "") else 1)
-' "$mac_n"; then
-      mf_rc=0
-      break
-    fi
+  mf_roots=
+  [ "$mac_home_created" != 1 ] || mf_roots="$mf_roots $mac_root"
+  [ "$mac_runtime_created" != 1 ] || mf_roots="$mf_roots $macos_runtime_root"
+  mf_roots="$mf_roots $macos_comm_root"
+  mf_test=
+  for mf_path in $mf_roots; do
+    mf_test="$mf_test [ ! -e $mf_path ] &&"
   done
-  note_step macos cl-rm "$mf_rc" "rm -rf $mac_root $macos_runtime_root $macos_comm_root" ""
+  mac_n=$((mac_n + 1))
+  mf_line="rm -rf $mf_roots; if$mf_test true; then printf 'PHCLEAN-%s-OK\\n' $mac_n; fi"
+  "$owner_pohunek" session input "$(mac_target)" "$mf_line" --json >/dev/null 2>&1 || true
+  mf_rc=1
+  if mac_terminal_wait "PHCLEAN-$mac_n-OK" >/dev/null; then
+    mf_rc=0
+  fi
+  note_step macos cl-rm "$mf_rc" "rm -rf$mf_roots" ""
+}
+
+# mac_daemon_start_cmd PATH: the start command of a throwaway daemon. It writes
+# the daemon's pid file itself, so an interrupt right after the start still
+# leaves the pid for the cleanup.
+mac_daemon_start_cmd() {
+  printf '%s' "out=\$($me PATH=$1 $mac_bin/pohunek daemon start --dev-subprocess --detach 2>&1); rc=\$?; printf '%s\\n' \"\$out\"; pid=\$(printf '%s\\n' \"\$out\" | grep -o 'pid [0-9]*' | head -n 1 | tr -dc 0-9); [ -z \"\$pid\" ] || printf %s \"\$pid\" >$mac_root/daemon.pid; exit \$rc"
+}
+
+# True when the pinned Tailscale is the only formula version `brew list` shows.
+brew_shows_pin() {
+  awk -v v="$tailscale_version" '$1 == "tailscale" { n = $2; sub(/_[0-9]+$/, "", n); if (n == v) found = 1 } END { exit found ? 0 : 1 }' "$1"
 }
 
 macos_leg() {
@@ -1160,72 +1236,111 @@ macos_leg() {
   step macos session-new "$owner_pohunek" session new --host "$macos_host" --agent shell --name "$macos_session_name" --cwd "$macos_session_cwd" --yes --json
   mac_session_id=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
   if [ -z "$mac_session_id" ]; then
-    inconclude provisioning_failed "the $macos_host shell session could not be started"
+    inconclude macos_provisioning_failed "the $macos_host shell session could not be started"
     return 1
   fi
   mac_started=1
   helper set-meta "$state" "macos_session=$mac_session_id"
-  mac_step macos mac-fresh 30 "umask 077; mkdir $macos_comm_root && mkdir $macos_comm_root/out && mkdir $macos_runtime_root && test -O $macos_comm_root && test -O $macos_runtime_root"
-  if [ "$step_rc" -ne 0 ]; then
-    inconclude path_guard_violation "$macos_comm_root or $macos_runtime_root already exists on $macos_host or is not owned by the owner; nothing was removed"
-    mac_cleanup_done=1
-    "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
-    return 1
-  fi
-  mac_roots_created=1
+  mac_make_root "$macos_comm_root" out
+  case $mac_make_result in
+    ok) mac_comm_created=1 ;;
+    exists)
+      inconclude macos_provisioning_failed "$macos_comm_root already exists on $macos_host; nothing was removed"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
   "$owner_pohunek" session input "$(mac_target)" 'export PAGER=cat GIT_PAGER=cat' --json >/dev/null 2>&1 || true
   # shellcheck disable=SC2016 # $HOME must expand on the Mac
   mac_step macos mac-home 30 'printf %s "$HOME"'
   mac_home=$(cat "$step_dir/stdout")
   [ -n "$mac_home" ] || {
-    inconclude provisioning_failed "the Mac's HOME could not be read"
+    inconclude macos_provisioning_failed "the Mac's HOME could not be read"
     return 1
   }
-  mac_root="$mac_home/.ph1112"
+  mac_root_candidate="$mac_home/.ph1112"
+  mac_make_root "$mac_root_candidate"
+  case $mac_make_result in
+    ok)
+      mac_root=$mac_root_candidate
+      mac_home_created=1
+      ;;
+    exists)
+      inconclude macos_provisioning_failed "$mac_root_candidate already exists on $macos_host; nothing was removed"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+  mac_make_root "$macos_runtime_root"
+  case $mac_make_result in
+    ok) mac_runtime_created=1 ;;
+    exists)
+      inconclude macos_provisioning_failed "$macos_runtime_root already exists on $macos_host; nothing was removed"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
   helper set-meta "$state" "macos_root=$mac_root" "macos_runtime_root=$macos_runtime_root"
   mac_bin="$macos_runtime_root/bin"
   me=$(mac_env)
 
   say "zajcaair: install Tailscale"
-  mac_step macos brew-before "$mac_timeout_s" "$macos_brew list --versions tailscale"
+  mac_step macos brew-before "$mac_timeout_s" "$macos_brew_cmd list --versions tailscale"
+  [ "$mac_dead" = 0 ] || return 1
   if [ "$step_rc" -eq 1 ] && [ ! -s "$step_dir/stdout" ]; then
     mac_brew_installed_by_us=1
-    mac_step macos brew-install "$mac_install_timeout_s" "$macos_brew install tailscale"
+    helper set-meta "$state" "macos_brew_installed_by_us=1"
+    mac_step macos brew-install "$mac_install_timeout_s" "$macos_brew_cmd install tailscale"
+    [ "$mac_dead" = 0 ] || return 1
+    if [ "$step_rc" -ne 0 ]; then
+      inconclude macos_homebrew_failed "brew install tailscale on $macos_host exited $step_rc"
+      return 1
+    fi
   elif [ "$step_rc" -eq 0 ] && [ -s "$step_dir/stdout" ]; then
     note_step macos brew-install 0 "tailscale already installed; not reinstalled" ""
   else
-    inconclude provisioning_failed "brew list on $macos_host answered rc=$step_rc; whether Tailscale is installed is unknown"
+    inconclude macos_homebrew_failed "brew list on $macos_host answered rc=$step_rc; whether Tailscale is installed is unknown"
     return 1
   fi
-  mac_step macos brew-info "$mac_timeout_s" "$macos_brew info --json=v2 tailscale"
+  mac_step macos brew-version "$mac_timeout_s" "$macos_brew_cmd list --versions tailscale"
+  [ "$mac_dead" = 0 ] || return 1
+  if [ "$step_rc" -ne 0 ] || ! brew_shows_pin "$step_dir/stdout"; then
+    inconclude macos_tailscale_pin_mismatch "the Homebrew Tailscale on $macos_host is not the pinned $tailscale_version"
+    return 1
+  fi
+  mac_step macos brew-info "$mac_timeout_s" "$macos_brew_cmd info --json=v2 tailscale"
+  if [ "$step_rc" -ne 0 ]; then
+    inconclude macos_homebrew_failed "brew info tailscale on $macos_host exited $step_rc"
+    return 1
+  fi
   mac_step macos ls-bins "$mac_timeout_s" 'ls -l /opt/homebrew/bin/tailscale /opt/homebrew/bin/tailscaled'
-  mac_step macos brew-deps "$mac_timeout_s" "$macos_brew deps tailscale"
+  mac_step macos brew-deps "$mac_timeout_s" "$macos_brew_cmd deps tailscale"
+  [ "$mac_dead" = 0 ] || return 1
 
   say "zajcaair: throwaway roots"
-  mac_step macos mac-roots "$mac_timeout_s" "umask 077; mkdir $mac_root && mkdir -p $mac_root/home/.config/pohunek $mac_root/data $mac_root/state $macos_runtime_root/run $mac_bin && for b in pohunek pohunekd pohunek-sessiond; do cp $macos_bin_dir/\$b $mac_bin/\$b && chmod 0755 $mac_bin/\$b; done && printf 'providers = [\"tailscale\"]\nport = $overlay_port\n' >$mac_root/home/.config/pohunek/overlays.toml && chmod 0600 $mac_root/home/.config/pohunek/overlays.toml"
+  mac_step macos mac-roots "$mac_timeout_s" "umask 077; mkdir -p $mac_root/home/.config/pohunek $mac_root/data $mac_root/state $macos_runtime_root/run $mac_bin && for b in pohunek pohunekd pohunek-sessiond; do cp $macos_bin_dir/\$b $mac_bin/\$b && chmod 0755 $mac_bin/\$b; done && printf 'providers = [\"tailscale\"]\nport = $overlay_port\n' >$mac_root/home/.config/pohunek/overlays.toml && chmod 0600 $mac_root/home/.config/pohunek/overlays.toml"
   [ "$step_rc" -eq 0 ] || {
-    inconclude path_guard_violation "$mac_root could not be created fresh on $macos_host; nothing in it was removed"
-    mac_root=
+    [ "$mac_dead" = 1 ] || inconclude macos_provisioning_failed "the throwaway roots on $macos_host could not be filled"
     return 1
   }
   mac_step macos mac-bin-sha "$mac_timeout_s" "cd $mac_bin && shasum -a 256 pohunek pohunekd pohunek-sessiond"
   helper set-meta "$state" "macos_bin_sha256=$(tr '\n' ' ' <"$step_dir/stdout" | sed 's/  */ /g')"
   mac_step macos guard-doctor "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   if ! helper guard-paths "$step_dir/stdout" "$mac_root" "$macos_runtime_root"; then
-    inconclude path_guard_violation "the macOS throwaway environment resolved a path outside its roots"
+    [ "$mac_dead" = 1 ] || inconclude path_guard_violation "the macOS throwaway environment resolved a path outside its roots"
     return 1
   fi
 
   say "zajcaair: D6, no tailscaled"
   mac_step macos d6-doctor-before "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   mac_step macos d6-host-list "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek host list --json"
-  mac_step macos d6-daemon-start "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek daemon start --dev-subprocess --detach"
+  mac_step macos d6-daemon-start "$mac_timeout_s" "$(mac_daemon_start_cmd /usr/bin:/bin)"
   mac_daemon_pid=$(sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p' "$step_dir/stdout" | head -n 1)
   mac_step macos d6-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
   mac_step macos d6-doctor-after "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   mac_step macos d6-daemon-log "$mac_timeout_s" "grep -rhI 'overlay state unavailable; serving local-only' $mac_root; true"
   mac_step macos d6-lsof "$mac_timeout_s" "lsof -nP -iTCP:$overlay_port -sTCP:LISTEN"
-  mac_step macos d6-daemon-record "$mac_timeout_s" "printf %s $mac_daemon_pid >$mac_root/daemon.pid; ps -p $mac_daemon_pid -o command="
+  [ "$mac_dead" = 0 ] || return 1
 
   macos_userspace || true
 }
@@ -1237,7 +1352,7 @@ macos_userspace() {
   sub_socket="$macos_runtime_root/ts.sock"
   mac_step macos us-tailscaled-start "$mac_timeout_s" "mkdir -p $mac_root/ts; nohup /opt/homebrew/bin/tailscaled --tun=userspace-networking --socket=$sub_socket --statedir=$mac_root/ts --port=0 --no-logs-no-support >$macos_runtime_root/tsd.log 2>&1 </dev/null & echo \$! >$mac_root/tsd.pid; for i in 1 2 3 4 5 6 7 8 9 10; do [ -S $sub_socket ] && exit 0; sleep 1; done; cat $macos_runtime_root/tsd.log; exit 1"
   if [ "$step_rc" -ne 0 ]; then
-    inconclude macos_userspace_refused "userspace tailscaled did not create its socket"
+    [ "$mac_dead" = 1 ] || inconclude macos_userspace_refused "userspace tailscaled did not create its socket"
     return 1
   fi
   hostfwd_port=$(free_port tcp)
@@ -1252,14 +1367,14 @@ macos_userspace() {
   fi
   mac_step macos us-reach "$mac_timeout_s" "curl -sS -m 5 http://$netbird_address:$hostfwd_port/health"
   if [ "$step_rc" -ne 0 ]; then
-    inconclude headscale_unreachable_from_macos "$macos_host cannot reach $netbird_address:$hostfwd_port"
+    [ "$mac_dead" = 1 ] || inconclude headscale_unreachable_from_macos "$macos_host cannot reach $netbird_address:$hostfwd_port"
     close_window
     return 1
   fi
   mac_step macos us-register "$mac_timeout_s" "nohup /opt/homebrew/bin/tailscale --socket=$sub_socket up --login-server=http://$netbird_address:$hostfwd_port --hostname=$macos_user_node --accept-dns=false --json >$mac_root/up.json 2>&1 </dev/null & for i in 1 2 3 4 5 6 7 8 9 10; do grep -q AuthURL $mac_root/up.json 2>/dev/null && cat $mac_root/up.json && exit 0; sleep 2; done; cat $mac_root/up.json; exit 1"
   register_id=$(helper register-id "$step_dir/stdout" 2>/dev/null || true)
   if [ -z "$register_id" ]; then
-    inconclude headscale_unreachable_from_macos "no registration URL came back from the control server"
+    [ "$mac_dead" = 1 ] || inconclude headscale_unreachable_from_macos "no registration URL came back from the control server"
     close_window
     return 1
   fi
@@ -1270,27 +1385,26 @@ macos_userspace() {
     if helper check-status "$step_dir/stdout" >/dev/null 2>&1 || grep -q '"BackendState": *"Running"' "$step_dir/stdout" 2>/dev/null; then
       break
     fi
+    [ "$mac_dead" = 0 ] || break
     [ "$waited" -lt "$service_timeout_s" ] || break
     sleep "$poll_s"
     waited=$((waited + poll_s))
   done
   if ! grep -q '"BackendState": *"Running"' "$state/steps/macos/"[0-9][0-9][0-9]-us-status-json/stdout 2>/dev/null; then
-    inconclude macos_userspace_not_running "the userspace node did not reach Running after approval"
+    [ "$mac_dead" = 1 ] || inconclude macos_userspace_not_running "the userspace node did not reach Running after approval"
     close_window
     return 1
   fi
   mac_step macos us-wrapper "$mac_timeout_s" "printf '#!/bin/sh\nexec /opt/homebrew/bin/tailscale --socket=$sub_socket \"\$@\"\n' >$mac_bin/tailscale && chmod 0700 $mac_bin/tailscale"
   mac_step macos us-stop-daemon "$mac_timeout_s" "if ps -p $mac_daemon_pid -o command= | grep -F -q $mac_bin/pohunekd; then kill $mac_daemon_pid; fi; for i in 1 2 3 4 5 6 7 8 9 10; do ps -p $mac_daemon_pid >/dev/null 2>&1 || exit 0; sleep 1; done; exit 1"
   if [ "$step_rc" -ne 0 ]; then
-    inconclude macos_userspace_refused "the D6 daemon did not exit; the userspace checks would read it"
     close_window
     return 1
   fi
-  mac_step macos us-restart "$mac_timeout_s" "$me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek daemon start --dev-subprocess --detach"
+  mac_step macos us-restart "$mac_timeout_s" "$(mac_daemon_start_cmd "$mac_bin:/usr/bin:/bin")"
   mac_daemon_pid=$(sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p' "$step_dir/stdout" | head -n 1)
-  mac_step macos us-wait "$mac_timeout_s" "printf %s $mac_daemon_pid >$mac_root/daemon.pid; for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
+  mac_step macos us-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
   if [ "$step_rc" -ne 0 ]; then
-    inconclude macos_userspace_refused "the restarted daemon did not answer health"
     close_window
     return 1
   fi
@@ -1300,12 +1414,20 @@ macos_userspace() {
   close_window
 }
 
+# Clears window_open only once `ss` shows the forward gone; otherwise VM-A is
+# stopped, which drops every forward it holds.
 close_window() {
   if [ "$window_open" = 1 ]; then
     step macos us-hostfwd-remove monitor a "hostfwd_remove wan tcp:$netbird_address:$hostfwd_port"
-    window_open=0
     step macos us-hostfwd-closed ss -ltnH "sport = :$hostfwd_port"
-    say "exposure window closed"
+    if [ "$step_rc" -eq 0 ] && [ ! -s "$step_dir/stdout" ]; then
+      window_open=0
+      say "exposure window closed"
+    else
+      say "the forward is still listening; stopping VM-A"
+      monitor a quit >/dev/null 2>&1 || true
+      window_open=0
+    fi
   fi
 }
 
@@ -1443,7 +1565,7 @@ main_run() {
     --meta "overlay_port=$overlay_port" --meta "lab_domain=$lab_domain" \
     --meta "node_a=$node_a" --meta "node_b=$node_b" \
     --meta "netbird_address=$netbird_address" --meta "netbird_root=$netbird_root" \
-    --meta "macos_root=unset" --meta "macos_runtime_root=$macos_runtime_root" \
+    --meta "macos_root=unset" --meta "macos_runtime_root=$macos_runtime_root" --meta "macos_comm_root=$macos_comm_root" \
     --meta "headscale_version=$headscale_version" --meta "headscale_sha256=$headscale_sha256" \
     --meta "tailscale_version=$tailscale_version" --meta "tailscale_sha256=$tailscale_sha256" \
     --meta "debian_image_version=$debian_image_version" --meta "debian_image_sha512=$debian_image_sha512" \

@@ -14,3 +14,9 @@
   `Client::connect_with_registry`, handshake, `session.list`, `daemon_doctor`,
   `session_screen`). The harness builds it static for
   `x86_64-unknown-linux-musl`; it is not shipped in a release archive.
+- The harness never removes a macOS root it did not create (one flag per root,
+  set only after that root's own `mkdir`), runs Homebrew without auto-update or
+  cleanup, treats an unexpected `brew list` answer, a Mac step timeout or a
+  different Tailscale version as inconclusive, and records the `netbird` and
+  `macos` legs through an allow-list so the public evidence carries no owner
+  peer names, domains or Mac paths.

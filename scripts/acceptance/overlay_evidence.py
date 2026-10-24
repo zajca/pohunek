@@ -76,6 +76,10 @@ SUBSTEP_INCONCLUSIVE = {
         "macos.userspace",
         "the userspace node did not reach Running after Headscale approved it",
     ),
+    "macos_unresponsive": ("macos", "the zajcaair shell session stopped answering"),
+    "macos_provisioning_failed": ("macos", "zajcaair could not be prepared for the leg"),
+    "macos_homebrew_failed": ("macos", "Homebrew could not install or inspect Tailscale on zajcaair"),
+    "macos_tailscale_pin_mismatch": ("macos", "the Homebrew Tailscale on zajcaair is not the pinned version"),
 }
 
 # Pre-auth key prefixes of Tailscale and Headscale. A hit anywhere fails closed.
@@ -91,6 +95,22 @@ TAILSCALE_KEY = re.compile(r"\b(?:nodekey|mkey|discokey|privkey):[0-9a-f]{64}\b"
 STATUS_STRING_FIELDS = re.compile(r'("(?:PublicKey|AuthURL|CurAddr|Relay|PeerRelay)"\s*:\s*)"[^"]*"')
 STATUS_ADDRS_FIELD = re.compile(r'("Addrs"\s*:\s*)\[[^\]]*\]')
 CGNAT_ADDRESS = re.compile(r"(?<![0-9.])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9])")
+
+# Home directories name a person.
+USER_DIRECTORY = re.compile(r"(/(?:home|Users))/[^/\s'\"]+")
+
+# Any absolute path inside prose or a doctor detail.
+ABSOLUTE_PATH = re.compile(r"(?<![\w.])/(?:[\w.@+~=-]+/?)+")
+
+# Doctor checks whose detail is product text and may be recorded for the
+# NetBird and macOS legs; every other detail can name a runtime path or a
+# config home and is withheld.
+DETAIL_ALLOW = ("tailscale_cli", "overlay_tailscale_listener", "overlay_netbird_listener", "overlay_config")
+
+# The one host name the evidence may print; every other peer is a placeholder.
+PUBLIC_HOST = "zajcaair"
+
+WITHHELD = "<withheld: not in the evidence allow-list>"
 
 # Doctor checks whose detail names a directory of the daemon's environment.
 PATH_CHECK_NAME = re.compile(r"(_dir|_root|_writable|_private|socket_path)")
@@ -372,6 +392,12 @@ def evaluate_preconditions(state: State, checks: Checks) -> None:
         checks.with_step("pre", "daemon-units-" + side, "units-" + side, units)
         checks.with_step(
             "pre",
+            "service-install-health-" + side,
+            "service-health-" + side,
+            lambda step: (step.rc == 0, "health after `service install` rc={}".format(step.rc)),
+        )
+        checks.with_step(
+            "pre",
             "hostname-" + side,
             "hostname-" + side,
             lambda step: (step.rc == 0 and bool(step.stdout.strip()), step.stdout.strip()),
@@ -590,8 +616,13 @@ def evaluate_netbird(state: State, checks: Checks) -> None:
         checks.add(
             leg,
             "owner-netbird-untouched",
-            peers_summary(before) is not None and peers_summary(before) == peers_summary(after),
-            "peer counts {} -> {}".format(peers_summary(before), peers_summary(after)),
+            peers_summary(before) is not None and peers_summary(before)[0] == peers_summary(after)[0],
+            "peer totals {} -> {}; connected {} -> {} (recorded, not gating)".format(
+                (peers_summary(before) or ("?", "?"))[0],
+                (peers_summary(after) or ("?", "?"))[0],
+                (peers_summary(before) or ("?", "?"))[1],
+                (peers_summary(after) or ("?", "?"))[1],
+            ),
         )
     for name in ("owner-health-before", "owner-health-after"):
         checks.with_step(leg, name, name, succeeded)
@@ -628,7 +659,9 @@ def evaluate_netbird(state: State, checks: Checks) -> None:
         records = [r for r in host_records(step) if not r.get("local")]
         names = [r.get("name") for r in records]
         ok = bool(records) and all(r.get("overlay") == "netbird" for r in records) and "zajcaair" in names
-        return ok, "peers={}".format(names)
+        return ok, "{} remote record(s), all netbird: {}, zajcaair present: {}".format(
+            len(records), all(r.get("overlay") == "netbird" for r in records), "zajcaair" in names
+        )
 
     checks.with_step(leg, "host-list", "host-list", netbird_hosts)
     checks.with_step(leg, "host-discover", "discover", netbird_hosts)
@@ -700,6 +733,7 @@ def evaluate_macos(state: State, checks: Checks) -> None:
         substep="macos.d6",
     )
     checks.with_step(leg, "d6-daemon-start", "d6-daemon-start", lambda step: (step.rc == 0, "rc={}".format(step.rc)), substep="macos.d6")
+    checks.with_step(leg, "d6-daemon-health", "d6-wait", lambda step: (step.rc == 0, "rc={}".format(step.rc)), substep="macos.d6")
 
     def d6_listener(step: Step) -> Tuple[bool, str]:
         listener = doctor_checks(step).get("overlay_tailscale_listener", {})
@@ -725,6 +759,8 @@ def evaluate_macos(state: State, checks: Checks) -> None:
         )
 
     checks.with_step(leg, "userspace-status-recording", "us-status-json", recording, substep=sub)
+    checks.with_step(leg, "userspace-d6-daemon-stopped", "us-stop-daemon", lambda step: (step.rc == 0, "rc={}".format(step.rc)), substep=sub)
+    checks.with_step(leg, "userspace-daemon-health", "us-wait", lambda step: (step.rc == 0, "rc={}".format(step.rc)), substep=sub)
 
     def us_doctor(step: Step) -> Tuple[bool, str]:
         found = doctor_checks(step)
@@ -750,23 +786,25 @@ def evaluate_macos(state: State, checks: Checks) -> None:
         substep=sub,
     )
     checks.with_step(leg, "userspace-no-listener", "us-lsof", lambda step: (step.rc == 1 and not step.stdout.strip(), "lsof rc={}".format(step.rc)), substep=sub)
-    nb_address = state.require_meta("netbird_address")
+    if state.step(leg, "us-hostfwd-add") is not None:
+        nb_address = state.require_meta("netbird_address")
 
-    def window_address(step: Step) -> Tuple[bool, str]:
-        rows = listener_lines(step)
-        local = [row[3] for row in rows if len(row) >= 4]
-        ok = step.rc == 0 and len(local) == 1 and local[0].startswith(nb_address + ":")
-        return ok, "forward listeners {}".format(["<netbird-address>:" + a.rsplit(":", 1)[-1] if a.startswith(nb_address + ":") else a for a in local])
+        def window_address(step: Step) -> Tuple[bool, str]:
+            rows = listener_lines(step)
+            local = [row[3] for row in rows if len(row) >= 4]
+            ok = step.rc == 0 and len(local) == 1 and local[0].startswith(nb_address + ":")
+            return ok, "forward listeners {}".format(["<netbird-address>:" + a.rsplit(":", 1)[-1] if a.startswith(nb_address + ":") else a for a in local])
 
-    checks.with_step(leg, "exposure-window-bound-to-netbird-only", "us-hostfwd-bind", window_address, substep=sub)
-    checks.with_step(
-        leg,
-        "exposure-window-closed",
-        "us-hostfwd-closed",
-        lambda step: (step.rc == 0 and not step.stdout.strip(), "listeners after the forward was removed: {!r}".format(step.stdout.strip())),
-        substep=sub,
-    )
-    checks.with_step(leg, "exposure-window-removed", "us-hostfwd-remove", lambda step: (step.rc == 0, "rc={}".format(step.rc)), substep=sub)
+        checks.with_step(leg, "exposure-window-bound-to-netbird-only", "us-hostfwd-bind", window_address)
+        checks.with_step(
+            leg,
+            "exposure-window-closed",
+            "us-hostfwd-closed",
+            lambda step: (step.rc == 0 and not step.stdout.strip(), "listeners after the forward was removed: {!r}".format(step.stdout.strip())),
+        )
+        checks.with_step(leg, "exposure-window-removed", "us-hostfwd-remove", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
+    if state.meta.get("macos_brew_installed_by_us") == "1":
+        checks.with_step(leg, "cleanup-homebrew-restored", "cl-brew-uninstall", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
     checks.with_step(leg, "cleanup-removed-roots", "cl-rm", lambda step: (step.rc == 0, "rc={}".format(step.rc)))
     checks.with_step(leg, "cleanup-owner-health", "cl-health", succeeded)
 
@@ -797,7 +835,7 @@ def verdict(state: State, items: List[Dict[str, Any]]) -> Dict[str, Any]:
     sub_codes = {c: r for c, r in codes.items() if c in SUBSTEP_INCONCLUSIVE}
     voided = {SUBSTEP_INCONCLUSIVE[c][0] for c in sub_codes}
     gating = [i for i in items if i["gating"]]
-    live = [i for i in gating if i["substep"] not in voided]
+    live = [i for i in gating if i["substep"] not in voided and i["leg"] not in voided]
     failed = [i for i in live if i["status"] == "failed"]
     missing = [i for i in live if i["status"] == "missing"]
     if run_codes:
@@ -827,6 +865,141 @@ def verdict(state: State, items: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Redaction and the secret check
 
 
+def scrub_paths(text: str) -> str:
+    """Replace every absolute path in prose with a placeholder."""
+    return ABSOLUTE_PATH.sub("<path>", text)
+
+
+def phrases(*wanted: str):
+    """A projector that prints only the allow-listed phrases found in a step."""
+
+    def project(step: Step) -> str:
+        return "".join(phrase + "\n" for phrase in wanted if phrase in step.stdout)
+
+    return project
+
+
+def project_doctor(step: Step) -> str:
+    checks = []
+    for check in doctor_checks(step).values():
+        entry = {"name": check.get("name"), "status": check.get("status")}
+        if check.get("name") in DETAIL_ALLOW:
+            entry["detail"] = scrub_paths(str(check.get("detail", "")))
+        checks.append(entry)
+    return json.dumps({"checks": checks}, indent=2) + "\n"
+
+
+def project_hosts(step: Step) -> str:
+    error = step.error()
+    if error is not None:
+        return json.dumps({"err": {"code": error.get("code"), "msg": scrub_paths(str(error.get("msg", "")))}}, indent=2) + "\n"
+    others = 0
+    records = []
+    for record in host_records(step):
+        name = record.get("name")
+        if name != PUBLIC_HOST and not record.get("local"):
+            others += 1
+            name = "<peer-{}>".format(others)
+        elif record.get("local"):
+            name = "<local>"
+        records.append(
+            {
+                "name": name,
+                "overlay": record.get("overlay"),
+                "classification": record.get("classification"),
+                "local": bool(record.get("local")),
+                "port": record.get("port"),
+            }
+        )
+    return json.dumps(records, indent=2) + "\n"
+
+
+def project_peers(step: Step) -> str:
+    counts = peers_summary(step)
+    return json.dumps({"peers": counts[0], "connected": counts[1]}) + "\n" if counts else WITHHELD
+
+
+def project_digits(step: Step) -> str:
+    text = step.stdout.strip()
+    return text + "\n" if text.isdigit() else WITHHELD
+
+
+def project_brew_info(step: Step) -> str:
+    document = step.document()
+    formula = document["formulae"][0]
+    return json.dumps(
+        {"stable": formula["versions"]["stable"], "installed": [i.get("version") for i in formula.get("installed", [])]}
+    ) + "\n"
+
+
+def project_binaries(step: Step) -> str:
+    return "".join(name + "\n" for name in sorted(set(re.findall(r"/bin/(tailscaled?)\b", step.stdout))))
+
+
+def project_formula_lines(step: Step) -> str:
+    return "".join(line + "\n" for line in step.stdout.splitlines() if re.fullmatch(r"tailscale [0-9][^\s]*", line.strip()))
+
+
+def project_count(step: Step) -> str:
+    return "{} listener line(s)\n".format(len([line for line in step.stdout.splitlines() if line.strip()]))
+
+
+def project_verbatim(step: Step) -> str:
+    return step.stdout
+
+
+# Step name -> projector for the NetBird and macOS legs. The legs run against the
+# owner's machines, so a step that is not listed is recorded with its exit code
+# and size only.
+PROJECTORS = {
+    "owner-pid-before": project_digits,
+    "owner-pid-after": project_digits,
+    "owner-peers-before": project_peers,
+    "owner-peers-after": project_peers,
+    "guard-doctor": project_doctor,
+    "doctor": project_doctor,
+    "d6-doctor-before": project_doctor,
+    "d6-doctor-after": project_doctor,
+    "us-doctor": project_doctor,
+    "host-list": project_hosts,
+    "discover": project_hosts,
+    "d6-host-list": project_hosts,
+    "us-host-list": project_hosts,
+    "daemon-start": phrases("started pohunekd in background"),
+    "d6-daemon-start": phrases("started pohunekd in background"),
+    "us-restart": phrases("started pohunekd in background"),
+    "daemon-log": phrases("remote control listener not bound"),
+    "d6-daemon-log": phrases("overlay state unavailable; serving local-only"),
+    "brew-before": project_formula_lines,
+    "brew-version": project_formula_lines,
+    "cl-brew-recheck": project_formula_lines,
+    "brew-info": project_brew_info,
+    "ls-bins": project_binaries,
+    "cl-ls": project_binaries,
+    "mac-bin-sha": project_verbatim,
+    "d6-lsof": project_count,
+    "us-lsof": project_count,
+    "us-hostfwd-bind": project_verbatim,
+    "us-hostfwd-closed": project_verbatim,
+    "us-reach": project_verbatim,
+    "us-status-json": project_verbatim,
+    "us-register": project_verbatim,
+}
+
+
+def project_step_text(leg: str, step: Step) -> str:
+    """The stdout of a step as the evidence may record it."""
+    if leg not in NETBIRD_LEGS:
+        return step.stdout
+    projector = PROJECTORS.get(step.name)
+    if projector is None:
+        return WITHHELD if step.stdout.strip() else ""
+    try:
+        return projector(step)
+    except (EvidenceError, KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return WITHHELD
+
+
 class Redactor:
     """Removes key material and the owner's NetBird addresses from recorded text.
 
@@ -834,9 +1007,23 @@ class Redactor:
     the same placeholder.
     """
 
-    def __init__(self, netbird_addresses: Iterable[str] = ()) -> None:
+    def __init__(self, netbird_addresses: Iterable[str] = (), roots: Iterable[Tuple[str, str]] = ()) -> None:
         self.netbird_addresses = [a for a in netbird_addresses if a]
         self.placeholders: Dict[str, str] = {}
+        # (path, placeholder) pairs, longest path first so a root never
+        # shadows the longer root it prefixes.
+        self.roots = sorted([r for r in roots if r[0] and r[0] != "unset"], key=lambda r: -len(r[0]))
+
+    def private(self, text: str) -> str:
+        """Replace the throwaway roots of the owner's machines, then any path left."""
+        for path, placeholder in self.roots:
+            text = text.replace(path, placeholder)
+        return text
+
+    def prose(self, text: str, netbird_leg: bool) -> str:
+        """Redact a check detail or reason; in NetBird legs every path goes too."""
+        text = self.text(self.private(text), netbird_leg)
+        return scrub_paths(text) if netbird_leg else text
 
     def placeholder(self, address: str) -> str:
         """Return the stable placeholder of one NetBird address."""
@@ -846,6 +1033,7 @@ class Redactor:
         """Redact one recorded text; NetBird addresses only in NetBird legs."""
         text = STATUS_STRING_FIELDS.sub(r'\1"<redacted>"', text)
         text = STATUS_ADDRS_FIELD.sub(r'\1["<redacted>"]', text)
+        text = USER_DIRECTORY.sub(r"\1/<user>", text)
         text = TAILSCALE_KEY.sub("<redacted-key>", text)
         text = WIREGUARD_KEY.sub("<redacted-key>", text)
         if netbird_leg:
@@ -881,11 +1069,11 @@ def scan_directory(root: Path) -> List[str]:
 def step_record(redactor: Redactor, leg: str, step: Step) -> Dict[str, Any]:
     """Return one step as recorded in the evidence document."""
     netbird = leg in NETBIRD_LEGS
-    out, out_cut = clip(redactor.text(step.stdout, netbird))
-    err, err_cut = clip(redactor.text(step.stderr, netbird))
+    out, out_cut = clip(redactor.text(redactor.private(project_step_text(leg, step)), netbird))
+    err, err_cut = clip(WITHHELD if netbird and step.stderr.strip() else redactor.text(step.stderr, netbird))
     return {
         "name": step.name,
-        "argv": redactor.text(step.argv, netbird),
+        "argv": redactor.text(redactor.private(step.argv), netbird),
         "rc": step.rc,
         "at": step.at,
         "stdout": out,
@@ -905,6 +1093,18 @@ def recordings(state: State, redactor: Redactor) -> Dict[str, Any]:
     return found
 
 
+def private_roots(state: State) -> List[Tuple[str, str]]:
+    """The throwaway roots on the owner's machines and their placeholders."""
+    macos_root = state.meta.get("macos_root", "")
+    home = macos_root.rsplit("/", 1)[0] if macos_root.startswith("/") else ""
+    return [
+        (state.meta.get("macos_comm_root", ""), "<macos-comm-root>"),
+        (state.meta.get("macos_runtime_root", ""), "<macos-runtime-root>"),
+        (macos_root, "<macos-root>"),
+        (home, "<macos-home>"),
+    ]
+
+
 def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
     """Return the evidence document; refuse when a secret could be in it."""
     state = State(state_dir)
@@ -916,11 +1116,11 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
     leaks = scan_directory(state_dir)
     if leaks:
         raise EvidenceError("secret key prefix in the run state: {}".format("; ".join(leaks)))
-    redactor = Redactor([state.meta.get("netbird_address", "")])
+    redactor = Redactor([state.meta.get("netbird_address", "")], private_roots(state))
     for entry in result["inconclusive"]:
-        entry["detail"] = redactor.text(entry["detail"], True)
+        entry["detail"] = redactor.prose(entry["detail"], True)
     for item in result["checks"]:
-        item["detail"] = redactor.text(item["detail"], item["leg"] in NETBIRD_LEGS)
+        item["detail"] = redactor.prose(item["detail"], item["leg"] in NETBIRD_LEGS)
     document = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -928,7 +1128,7 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
         "generated": utc_now(),
         "started": state.run.get("started"),
         "legs": state.legs,
-        "meta": {k: redactor.text(v, True) for k, v in state.meta.items() if k != "netbird_address"},
+        "meta": {k: redactor.prose(v, True) for k, v in state.meta.items() if k != "netbird_address"},
         "verdict": result["verdict"],
         "inconclusive": result["inconclusive"],
         "checks": result["checks"],
@@ -1151,11 +1351,34 @@ def command_assemble(args: argparse.Namespace) -> int:
 
 
 def command_scan(args: argparse.Namespace) -> int:
-    """Exit 0 when no pre-auth key prefix appears under a directory."""
-    hits = scan_directory(Path(args.directory))
+    """Exit 0 when no pre-auth key prefix appears under a directory.
+
+    With --delete every file that holds a hit is removed and the exit code is 0
+    when the directory is clean afterwards.
+    """
+    root = Path(args.directory)
+    hits = scan_directory(root) if root.is_dir() else []
     for hit in hits:
         print(hit, file=sys.stderr)
+    if args.delete:
+        for hit in hits:
+            (root / hit.rsplit(": ", 1)[0]).unlink(missing_ok=True)
+        return 0 if not (scan_directory(root) if root.is_dir() else []) else 1
     return 1 if hits else 0
+
+
+def command_marker_seen(args: argparse.Namespace) -> int:
+    """Print the first marker that shows in a `session output --json` capture."""
+    capture = Step_from_file(Path(args.file)).payload()
+    if not isinstance(capture, dict) or "data_base64" not in capture:
+        raise EvidenceError("{} is not a session output capture".format(args.file))
+    text = base64.b64decode(capture["data_base64"]).decode("utf-8", errors="replace")
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r", "")
+    for marker in args.markers:
+        if re.search(r"(?<![\w-])" + re.escape(marker) + r"(?![\w-])", text):
+            print(marker)
+            return 0
+    return 1
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1234,7 +1457,12 @@ def parser() -> argparse.ArgumentParser:
 
     scan = commands.add_parser("scan", help="exit 0 when no pre-auth key prefix is under a directory")
     scan.add_argument("directory")
+    scan.add_argument("--delete", action="store_true", help="remove every file that holds a hit")
     scan.set_defaults(handler=command_scan)
+    seen = commands.add_parser("marker-seen", help="print the first marker visible in a terminal capture")
+    seen.add_argument("file")
+    seen.add_argument("markers", nargs="+")
+    seen.set_defaults(handler=command_marker_seen)
 
     build = commands.add_parser("assemble", help="write the evidence document")
     build.add_argument("state_dir")

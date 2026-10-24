@@ -270,7 +270,7 @@ were re-verified against their upstream checksum sources on 2026-10-24.
 |-----------|-----|-----------------|
 | Headscale | `v0.29.5`, asset `headscale_0.29.5_linux_amd64` | sha256 `e979d27fe17d924d33bb6ab7504f6338d0635989a0cfdcfbc0ceb637dbcbe980`, the release's `checksums.txt` |
 | Tailscale (VMs) | `1.104.2`, `https://pkgs.tailscale.com/stable/tailscale_1.104.2_amd64.tgz` | sha256 `512f613ed7d04fc7282f7dc5bd76aa105aae28168fbb9357eb749ebcbc29f0ae`, the vendor `.sha256` file next to the tarball |
-| Tailscale (zajcaair) | Homebrew `tailscale` | the Homebrew bottle checksum; `brew info` must report `1.104.2` |
+| Tailscale (zajcaair) | Homebrew `tailscale` | the Homebrew bottle checksum; the version is read with `brew list --versions` before anything uses it, and any other version makes the macOS leg inconclusive (`macos_tailscale_pin_mismatch`) |
 | VM image | Debian 13 genericcloud amd64 `20261021-2638` | SHA512 `16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c`, `SHA512SUMS` of the dated directory (identical in `latest`) |
 
 The download cache is `/mnt/m2_4t/t/ph1112-cache` (`--cache-dir`) and survives
@@ -322,8 +322,18 @@ download 5 min the first time, boot 2 min, provisioning 4 min, D4 and the extras
   (`ph-macos-op1112acc`, `--cwd /tmp/ph-macos-cache`), under a throwaway
   `HOME`-relative root and `/private/tmp/ph1112`, with `XDG_RUNTIME_DIR` set so
   the owner's live daemon path is never used. The guard compares the doctor
-  paths with the roots before anything starts. Only a Homebrew install the run
-  itself made is uninstalled, and the session is stopped at the end.
+  paths with the roots before anything starts. Each of the three roots (the
+  communication directory, the runtime root and `~/.ph1112`) is created with a
+  plain `mkdir`, so an existing one stops the macOS leg (`macos_provisioning_failed`)
+  and is never touched; a root is removed at the end only when its own `mkdir`
+  succeeded in this run. The throwaway daemon's pid is written by its start
+  command; the cleanup sends it SIGTERM, then SIGKILL, only while its command
+  line still names the run's binary. Every `brew` call sets
+  `HOMEBREW_NO_AUTO_UPDATE`, `HOMEBREW_NO_INSTALL_CLEANUP` and
+  `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK`. Tailscale is installed only when
+  `brew list` answers rc 1 with no output; any other answer is inconclusive. It is
+  uninstalled only when this run installed it and a re-check still lists the
+  formula. The session is stopped at the end.
 
 ### Teardown and failure
 
@@ -345,9 +355,16 @@ The run has one verdict:
 Run-wide inconclusive codes: `checksum_mismatch`, `artifact_missing`,
 `artifact_unusable` (a CI binary needs a newer glibc than 2.41),
 `slots_unavailable`, `provisioning_failed`, `no_direct_path`,
-`path_guard_violation`, `interrupted`. Sub-step codes (only the userspace
-sub-step has no verdict): `headscale_unreachable_from_macos`,
-`macos_userspace_refused`, `macos_userspace_not_running`.
+`path_guard_violation`, `interrupted`. Sub-step codes (only the named part has
+no verdict): `headscale_unreachable_from_macos`, `macos_userspace_refused` and
+`macos_userspace_not_running` void the userspace sub-step; `macos_unresponsive`
+(any Mac step timed out), `macos_provisioning_failed`, `macos_homebrew_failed`
+and `macos_tailscale_pin_mismatch` void the whole macOS leg.
+
+A daemon that fails `health` (after `service install` on a VM, or the restarted
+daemon on the Mac) is a product failure, not an inconclusive condition. The
+owner's NetBird peer total must not change during the `netbird` leg; the
+connected count is recorded but does not gate.
 
 ### Evidence
 
@@ -362,7 +379,18 @@ node.
 
 Secrets never reach the document. Node and WireGuard keys, `AuthURL` values and
 endpoint lists are redacted; the owner's NetBird addresses become
-`<netbird-ip-N>` placeholders in the `netbird` and `macos` legs. `assemble`
+`<netbird-ip-N>` placeholders in the `netbird` and `macos` legs. Those two legs
+run against the owner's machines and the repository is public, so their steps go
+through an allow-list projection: a step that is not listed is recorded with its
+exit code and size only (stderr is always withheld), host records keep only
+`overlay`, `classification`, `local` and `port` with every peer except `zajcaair`
+named `<peer-N>` (no FQDN, NetBird domain, address, peer id or daemon version),
+doctor reports keep a detail only for the Tailscale and NetBird listener, CLI and
+config checks, and the Mac roots and home directory are placeholders
+(`<macos-root>`, `<macos-runtime-root>`, `<macos-comm-root>`, `<macos-home>`).
+Journals and doctor reports collected into the state directory are scanned for key
+prefixes right after collection on every exit path, and a file with a hit is
+deleted. `assemble`
 refuses to write the document when a `tskey-` or `hskey-` prefix appears
 anywhere in the state directory or the document, and when VM-A, which keeps a
 copy of every key it issued, finds one of them in the evidence bundle (only the

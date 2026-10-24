@@ -35,6 +35,7 @@ NETBIRD_ADDRESS = "100.80.1.5"
 NETBIRD_ROOT = "/dev/shm/ph1112"
 MAC_ROOT = "/Users/u/.ph1112"
 MAC_RUNTIME = "/private/tmp/ph1112"
+MAC_COMM = "/private/tmp/ph1112c"
 NODES = {"a": "ph-a", "b": "ph-b"}
 IPS = {"a": "100.64.0.2", "b": "100.64.0.3"}
 IDS = {"a": "nAAA1CNTRL", "b": "nBBB2CNTRL"}
@@ -114,6 +115,7 @@ class Run:
             "netbird_root": NETBIRD_ROOT,
             "macos_root": MAC_ROOT,
             "macos_runtime_root": MAC_RUNTIME,
+            "macos_comm_root": MAC_COMM,
             "tailscale_version": "1.104.2",
         }
         (self.root / "run.json").write_text(json.dumps({"started": "2026-10-25T00:00:00Z", "legs": self.legs, "meta": meta}))
@@ -146,6 +148,7 @@ class Run:
             self.step("pre", "status-" + side, status_json(side))
             self.step("pre", "hostname-" + side, HOSTNAMES[side] + "\n")
             self.step("pre", "units-" + side, "active\n")
+            self.step("pre", "service-health-" + side, envelope({}))
             self.step("pre", "ping-" + side, "pong from ph via 10.77.0.2:41641 in 1ms\n")
         for leg, src, dst in (("ab", "a", "b"), ("ba", "b", "a")):
             self.step(leg, "doctor-src", vm_doctor(src))
@@ -246,6 +249,7 @@ class Run:
         self.step(leg, "d6-doctor-before", doctor([("tailscale_cli", "warn", "local tailscale state is unavailable: tailscale exited with status 1")]))
         self.step(leg, "d6-host-list", error_envelope("tailscale_state_unavailable", "local tailscale state is unavailable"), rc=1)
         self.step(leg, "d6-daemon-start", "started pohunekd in background (pid 99)\n")
+        self.step(leg, "d6-wait", "")
         self.step(leg, "d6-doctor-after", doctor([("overlay_tailscale_listener", "warn", "port=18733; the tailscale provider reports no listener address: unavailable")]))
         self.step(leg, "d6-daemon-log", "overlay state unavailable; serving local-only\n")
         self.step(leg, "d6-lsof", "", rc=1)
@@ -260,8 +264,11 @@ class Run:
                 ]
             ),
         )
+        self.step(leg, "us-stop-daemon", "")
+        self.step(leg, "us-wait", "")
         self.step(leg, "us-host-list", error_envelope("tailscale_state_unavailable", "Tailscale runs in userspace networking mode"), rc=1)
         self.step(leg, "us-lsof", "", rc=1)
+        self.step(leg, "us-hostfwd-add", "")
         self.step(leg, "us-hostfwd-bind", "LISTEN 0 4096 {}:41999 0.0.0.0:*\n".format(NETBIRD_ADDRESS))
         self.step(leg, "us-hostfwd-remove", "")
         self.step(leg, "us-hostfwd-closed", "")
@@ -415,7 +422,7 @@ class MacStepProtocolTest(unittest.TestCase):
         self.fake.chmod(0o755)
         (self.dir / "transcript").write_text("")
         (self.dir / "state").mkdir()
-        (self.dir / "comm").mkdir()
+        (self.dir / "comm" / "out").mkdir(parents=True)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -466,6 +473,159 @@ class MacStepProtocolTest(unittest.TestCase):
 
     def test_a_session_that_never_answers_times_out_with_status_124(self):
         self.assertEqual(self.run_step("true", timeout=2, drop=True), "RC=124\n")
+
+
+class MacLegTest(unittest.TestCase):
+    """The macOS leg against a fake `pohunek` session and a fake `brew`, on temp roots."""
+
+    FAKE = MacStepProtocolTest.FAKE.replace(
+        "*) exit 2 ;;",
+        """"session new") printf '{"cli_version":"x","ok":{"session":{"id":"s-fake"}}}\\n' ;;
+          "session stop") printf '{"cli_version":"x","ok":{}}\\n' ;;
+          *) exit 2 ;;""",
+    )
+    BREW = textwrap.dedent(
+        """\
+        #!/bin/sh
+        # Fake brew: `install` marks the formula installed at $FAKE_BREW_VERSION.
+        printf '%s %s %s %s\\n' "$HOMEBREW_NO_AUTO_UPDATE" "$HOMEBREW_NO_INSTALL_CLEANUP" "$HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" "$*" >>"$FAKE_DIR/brew.log"
+        case "$1" in
+          list)
+            [ "${FAKE_BREW_LIST_RC:-}" = "" ] || exit "$FAKE_BREW_LIST_RC"
+            if [ -e "$FAKE_DIR/installed" ]; then echo "tailscale $(cat "$FAKE_DIR/installed")"; exit 0; fi
+            exit 1 ;;
+          install) printf '%s' "$FAKE_BREW_VERSION" >"$FAKE_DIR/installed" ;;
+          uninstall) rm -f "$FAKE_DIR/installed" ;;
+          *) exit 0 ;;
+        esac
+        """
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.fake = self.dir / "pohunek"
+        self.fake.write_text(self.FAKE)
+        self.fake.chmod(0o755)
+        self.brew = self.dir / "brew"
+        self.brew.write_text(self.BREW)
+        self.brew.chmod(0o755)
+        (self.dir / "transcript").write_text("")
+        (self.dir / "state").mkdir()
+        (self.dir / "home").mkdir()
+        self.comm = self.dir / "comm"
+        self.runtime = self.dir / "runtime"
+        self.owner_root = self.dir / "home" / ".ph1112"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_leg(self, pre_existing=(), env=None):
+        for path in pre_existing:
+            Path(path).mkdir(parents=True)
+            (Path(path) / "owner-file").write_text("keep")
+        script = textwrap.dedent(
+            """\
+            set -eu
+            PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
+            state={state}
+            macos_comm_root={comm}
+            macos_runtime_root={runtime}
+            owner_pohunek={fake}
+            macos_host=zajcaair
+            macos_session_name=n
+            macos_session_cwd=/tmp
+            netbird_address=100.80.1.5
+            macos_bin_dir=/nonexistent
+            macos_brew_cmd="${{macos_brew_cmd%"$macos_brew"}}{brew}"
+            mac_timeout_s=4
+            mac_install_timeout_s=4
+            mac_poll_s=1
+            helper begin "$state" --leg macos --meta macos_root=unset
+            macos_leg || true
+            mac_cleanup || true
+            """
+        ).format(driver=DRIVER, state=self.dir / "state", comm=self.comm, runtime=self.runtime, fake=self.fake, brew=self.brew)
+        run_env = dict(os.environ, FAKE_DIR=str(self.dir), HOME=str(self.dir / "home"), PH1112_LIB_PATH=str(DRIVER), **(env or {}))
+        result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=run_env, timeout=240)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def codes(self):
+        directory = self.dir / "state" / "inconclusive"
+        return sorted(p.name for p in directory.iterdir()) if directory.is_dir() else []
+
+    def test_an_absent_comm_root_is_created_and_removed_again(self):
+        self.run_leg(env={"FAKE_BREW_LIST_RC": "3"})
+        self.assertFalse(self.comm.exists())
+        self.assertNotIn("macos_provisioning_failed", self.codes())
+
+    def test_an_existing_comm_root_stops_the_leg_and_is_left_alone(self):
+        self.run_leg(pre_existing=[self.comm])
+        self.assertEqual(self.codes(), ["macos_provisioning_failed"])
+        self.assertEqual((self.comm / "owner-file").read_text(), "keep")
+        self.assertFalse(self.runtime.exists())
+
+    def test_an_existing_home_root_is_never_removed(self):
+        self.run_leg(pre_existing=[self.owner_root])
+        self.assertEqual(self.codes(), ["macos_provisioning_failed"])
+        self.assertEqual((self.owner_root / "owner-file").read_text(), "keep")
+        self.assertFalse(self.comm.exists())
+        self.assertFalse(self.runtime.exists())
+
+    def test_an_existing_runtime_root_is_never_removed_and_the_home_root_this_run_made_is(self):
+        self.run_leg(pre_existing=[self.runtime])
+        self.assertEqual(self.codes(), ["macos_provisioning_failed"])
+        self.assertEqual((self.runtime / "owner-file").read_text(), "keep")
+        self.assertFalse(self.owner_root.exists())
+        self.assertFalse(self.comm.exists())
+
+    def test_an_ambiguous_brew_list_is_inconclusive_and_nothing_is_installed_or_removed(self):
+        self.run_leg(env={"FAKE_BREW_LIST_RC": "3"})
+        self.assertEqual(self.codes(), ["macos_homebrew_failed"])
+        log = (self.dir / "brew.log").read_text()
+        self.assertNotIn("install", log)
+        self.assertNotIn("uninstall", log)
+        self.assertFalse(self.owner_root.exists())
+        self.assertFalse(self.runtime.exists())
+
+    def test_every_brew_call_disables_auto_update_and_cleanup(self):
+        self.run_leg(env={"FAKE_BREW_LIST_RC": "3"})
+        for line in (self.dir / "brew.log").read_text().splitlines():
+            self.assertTrue(line.startswith("1 1 1 "), line)
+
+    def test_a_wrong_version_we_installed_is_inconclusive_and_removed_after_a_re_check(self):
+        self.run_leg(env={"FAKE_BREW_VERSION": "1.99.0"})
+        self.assertEqual(self.codes(), ["macos_tailscale_pin_mismatch"])
+        lines = (self.dir / "brew.log").read_text().splitlines()
+        self.assertTrue(any(line.endswith("install tailscale") for line in lines))
+        self.assertTrue(any(line.endswith("uninstall tailscale") for line in lines))
+        self.assertFalse((self.dir / "installed").exists())
+
+    def test_a_wrong_version_that_was_already_installed_is_left_alone(self):
+        (self.dir / "installed").write_text("1.50.0")
+        self.run_leg()
+        self.assertEqual(self.codes(), ["macos_tailscale_pin_mismatch"])
+        log = (self.dir / "brew.log").read_text()
+        self.assertNotIn("install tailscale", log)
+        self.assertNotIn("uninstall", log)
+        self.assertEqual((self.dir / "installed").read_text(), "1.50.0")
+
+    def test_the_uninstall_is_skipped_when_the_re_check_does_not_show_the_formula(self):
+        # `install` succeeds but the formula is never listed, so the pin check
+        # fails and the cleanup re-check finds nothing to remove.
+        self.brew.write_text(self.BREW.replace('install) printf', 'install) : ;; xinstall) printf'))
+        self.run_leg()
+        log = (self.dir / "brew.log").read_text()
+        self.assertNotIn("uninstall", log)
+        argv = [p.read_text() for p in (self.dir / "state" / "steps" / "macos").glob("*-cl-brew-uninstall/argv")]
+        self.assertEqual(len(argv), 1)
+        self.assertEqual(int((next((self.dir / "state" / "steps" / "macos").glob("*-cl-brew-uninstall")) / "rc").read_text()), 1)
+
+    def test_a_session_that_never_answers_ends_the_leg_as_unresponsive(self):
+        self.run_leg(env={"FAKE_DROP": "1"})
+        self.assertEqual(self.codes(), ["macos_unresponsive"])
+        self.assertFalse(self.owner_root.exists())
 
 
 class EvidenceTest(unittest.TestCase):
@@ -574,6 +734,47 @@ class EvidenceTest(unittest.TestCase):
         self.run_.step("netbird", "owner-peers-after", '{"peers":4,"connected":4}\n')
         self.assertEqual(self.run_.failed(), ["netbird/owner-netbird-untouched"])
 
+    def test_owner_netbird_connected_count_is_recorded_but_does_not_gate(self):
+        self.run_.step("netbird", "owner-peers-after", '{"peers":5,"connected":2}\n')
+        self.assertEqual(self.run_.failed(), [])
+        check = [c for c in self.run_.evaluate()["checks"] if c["name"] == "owner-netbird-untouched"][0]
+        self.assertIn("connected 4 -> 2", check["detail"])
+
+    def test_a_service_installed_daemon_that_fails_health_is_a_product_failure(self):
+        self.run_.step("pre", "service-health-b", error_envelope("daemon_unreachable", "no daemon"), rc=1)
+        self.assertEqual(self.run_.failed(), ["pre/service-install-health-b"])
+        self.assertEqual(self.run_.evaluate()["verdict"], "failed")
+
+    def test_a_userspace_daemon_that_fails_health_is_a_product_failure(self):
+        self.run_.step("macos", "us-wait", "", rc=1)
+        self.assertEqual(self.run_.failed(), ["macos/userspace-daemon-health"])
+        self.assertEqual(self.run_.evaluate()["verdict"], "failed")
+
+    def test_a_d6_daemon_that_fails_health_is_a_product_failure(self):
+        self.run_.step("macos", "d6-wait", "", rc=1)
+        self.assertEqual(self.run_.failed(), ["macos/d6-daemon-health"])
+
+    def test_the_exposure_checks_are_not_voided_by_a_userspace_code(self):
+        self.run_.inconclude("macos_userspace_refused")
+        self.run_.step("macos", "us-hostfwd-closed", "LISTEN 0 4096 {}:41999 0.0.0.0:*\n".format(NETBIRD_ADDRESS))
+        self.assertEqual(self.run_.evaluate()["verdict"], "failed")
+
+    def test_without_an_opened_window_no_exposure_check_is_required(self):
+        self.run_.inconclude("macos_userspace_refused")
+        for name in ("us-hostfwd-add", "us-hostfwd-bind", "us-hostfwd-remove", "us-hostfwd-closed"):
+            self.run_.remove_step("macos", name)
+        self.assertEqual(self.run_.evaluate()["verdict"], "inconclusive")
+        self.assertEqual(self.run_.missing(), [])
+
+    def test_homebrew_must_be_restored_only_when_this_run_installed_it(self):
+        self.assertNotIn("cleanup-homebrew-restored", [c["name"] for c in self.run_.evaluate()["checks"]])
+        meta = json.loads((self.run_.root / "run.json").read_text())
+        meta["meta"]["macos_brew_installed_by_us"] = "1"
+        (self.run_.root / "run.json").write_text(json.dumps(meta))
+        self.assertEqual(self.run_.missing(), ["macos/cleanup-homebrew-restored"])
+        self.run_.step("macos", "cl-brew-uninstall", "", rc=1)
+        self.assertEqual(self.run_.failed(), ["macos/cleanup-homebrew-restored"])
+
     def test_path_guard_rejects_a_path_outside_the_root(self):
         self.run_.step("netbird", "guard-doctor", doctor([("socket_dir_writable", "ok", "writable: /run/user/1000/pohunek")]))
         self.assertIn("netbird/path-guard", self.run_.failed())
@@ -676,6 +877,19 @@ class InconclusiveTest(unittest.TestCase):
         self.run_.step("ab", "attach", "", rc=1)
         self.assertEqual(self.run_.evaluate()["verdict"], "failed")
 
+    def test_a_macos_code_voids_every_macos_check_but_not_the_other_legs(self):
+        for code in ("macos_unresponsive", "macos_provisioning_failed", "macos_homebrew_failed", "macos_tailscale_pin_mismatch"):
+            run_ = Run().full()
+            try:
+                run_.step("macos", "d6-host-list", envelope([]), rc=0)
+                run_.step("macos", "cl-rm", "", rc=1)
+                run_.inconclude(code)
+                self.assertEqual(run_.evaluate()["verdict"], "inconclusive", code)
+                run_.step("ab", "attach", "", rc=1)
+                self.assertEqual(run_.evaluate()["verdict"], "failed", code)
+            finally:
+                run_.close()
+
     def test_an_unknown_code_is_refused(self):
         self.run_.inconclude("made_up")
         with self.assertRaises(overlay_evidence.EvidenceError):
@@ -731,6 +945,91 @@ class AssembleTest(unittest.TestCase):
         helper("assemble", self.run_.root, self.out)
         self.assertIn(IPS["b"], self.out.read_text())
 
+    LEAKS = (
+        "secretpeer-laptop",
+        "secretpeer-laptop.example-corp.netbird.cloud",
+        "example-corp.netbird.cloud",
+        "9.9.9-private",
+        "cfg-1234abcd",
+        "/Users/martin",
+        "/private/var/folders/xx/T/pohunek-agent",
+        "/home/martin",
+        "config_home_id",
+    )
+
+    def plant_owner_material(self):
+        records = envelope(
+            [
+                {"name": "zajcaair", "fqdn": "zajcaair.example-corp.netbird.cloud", "address": "100.80.9.9", "port": 18722, "overlay": "netbird", "peer_id": "p1", "classification": "reachable_daemon", "daemon_version": "9.9.9-private"},
+                {"name": "secretpeer-laptop", "fqdn": "secretpeer-laptop.example-corp.netbird.cloud", "address": "100.80.9.10", "port": 18722, "overlay": "netbird", "peer_id": "p2", "classification": "no_daemon", "daemon_version": "9.9.9-private"},
+            ]
+        )
+        for leg, names in (("netbird", ("host-list", "discover")),):
+            for name in names:
+                self.run_.step(leg, name, records, argv="/home/martin/bin/pohunek host list --json")
+        noisy = doctor(
+            [
+                ("socket_dir_writable", "ok", "writable: {}/run".format(NETBIRD_ROOT)),
+                ("agent_runtime", "ok", "/private/var/folders/xx/T/pohunek-agent config_home_id=cfg-1234abcd"),
+                ("tailscale_cli", "warn", "local tailscale state is unavailable: /Users/martin/.ph1112/ts.sock"),
+            ]
+        )
+        self.run_.step("macos", "d6-doctor-before", noisy, stderr="/Users/martin/.ph1112 failed")
+        self.run_.step("macos", "d6-host-list", error_envelope("tailscale_state_unavailable", "state is unavailable at /Users/martin/.ph1112/ts.sock"), rc=1)
+        self.run_.step("macos", "unlisted-step", "secretpeer-laptop.example-corp.netbird.cloud config_home_id cfg-1234abcd /Users/martin\n")
+        self.run_.step("macos", "mac-home", "/Users/martin\n")
+        self.run_.step("macos", "owner-note", "9.9.9-private", argv="cd /Users/martin/.ph1112 && true")
+
+    def test_netbird_and_macos_evidence_is_an_allow_list_projection(self):
+        self.plant_owner_material()
+        helper("assemble", self.run_.root, self.out)
+        text = self.out.read_text()
+        for leak in self.LEAKS:
+            self.assertNotIn(leak, text, leak)
+
+    def test_projected_host_records_keep_the_classification_with_placeholders(self):
+        self.plant_owner_material()
+        helper("assemble", self.run_.root, self.out)
+        document = json.loads(self.out.read_text())
+        step = [s for s in document["steps"]["netbird"] if s["name"] == "host-list"][0]
+        records = json.loads(step["stdout"])
+        self.assertEqual([r["name"] for r in records], ["zajcaair", "<peer-1>"])
+        self.assertEqual([r["classification"] for r in records], ["reachable_daemon", "no_daemon"])
+        self.assertTrue(all(set(r) == {"name", "overlay", "classification", "local", "port"} for r in records))
+
+    def test_steps_outside_the_allow_list_keep_only_their_exit_code(self):
+        self.plant_owner_material()
+        helper("assemble", self.run_.root, self.out)
+        document = json.loads(self.out.read_text())
+        step = [s for s in document["steps"]["macos"] if s["name"] == "unlisted-step"][0]
+        self.assertEqual(step["stdout"], overlay_evidence.WITHHELD)
+        self.assertEqual(step["rc"], 0)
+
+    def test_doctor_details_outside_the_allow_list_are_withheld(self):
+        self.plant_owner_material()
+        helper("assemble", self.run_.root, self.out)
+        document = json.loads(self.out.read_text())
+        step = [s for s in document["steps"]["macos"] if s["name"] == "d6-doctor-before"][0]
+        checks = {c["name"]: c for c in json.loads(step["stdout"])["checks"]}
+        self.assertNotIn("detail", checks["agent_runtime"])
+        self.assertIn("state is unavailable", checks["tailscale_cli"]["detail"])
+        self.assertIn("<path>", checks["tailscale_cli"]["detail"])
+
+    def test_check_details_never_carry_a_mac_path(self):
+        self.run_.step("macos", "guard-doctor", doctor([("socket_dir_writable", "ok", "writable: /Users/martin/elsewhere/run")]))
+        helper("assemble", self.run_.root, self.out)
+        text = self.out.read_text()
+        self.assertNotIn("/Users/martin", text)
+        self.assertNotIn("elsewhere", text)
+
+    def test_the_mac_roots_are_placeholders(self):
+        self.run_.step("macos", "mac-roots", "", argv="mkdir -p {r}/home && mkdir {m} && mkdir {c}/out".format(r=MAC_ROOT, m=MAC_RUNTIME, c=MAC_COMM))
+        helper("assemble", self.run_.root, self.out)
+        document = json.loads(self.out.read_text())
+        step = [s for s in document["steps"]["macos"] if s["name"] == "mac-roots"][0]
+        self.assertEqual(step["argv"], "mkdir -p <macos-root>/home && mkdir <macos-runtime-root> && mkdir <macos-comm-root>/out")
+        self.assertNotIn(MAC_ROOT, json.dumps(document["meta"]))
+
     def test_status_recordings_are_redacted_and_embedded(self):
         helper("assemble", self.run_.root, self.out)
         document = json.loads(self.out.read_text())
@@ -747,10 +1046,10 @@ class AssembleTest(unittest.TestCase):
         self.assertNotIn("k" * 43, self.out.read_text())
 
     def test_long_output_is_truncated_in_the_document(self):
-        self.run_.step("netbird", "daemon-log", "remote control listener not bound\n" + "x" * 40000)
+        self.run_.step("macos", "us-reach", '{"status":"pass"}\n' + "x" * 40000)
         helper("assemble", self.run_.root, self.out)
         document = json.loads(self.out.read_text())
-        log = [s for s in document["steps"]["netbird"] if s["name"] == "daemon-log"][0]
+        log = [s for s in document["steps"]["macos"] if s["name"] == "us-reach"][0]
         self.assertTrue(log["truncated"])
         self.assertLessEqual(len(log["stdout"]), overlay_evidence.MAX_RECORDED_BYTES)
 
@@ -797,6 +1096,40 @@ class SecretCheckTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("note", result.stderr)
         self.assertNotIn("secretvalue", result.stderr)
+
+
+class DiagnosticsScanTest(unittest.TestCase):
+    def test_scan_delete_removes_only_the_files_with_a_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "bad.log").write_text("x tskey-auth-secretvalue y")
+            (directory / "good.log").write_text("fine")
+            result = helper("scan", directory, "--delete")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((directory / "bad.log").exists())
+            self.assertTrue((directory / "good.log").exists())
+            self.assertNotIn("secretvalue", result.stderr)
+
+    def test_scan_delete_of_a_missing_directory_is_clean(self):
+        self.assertEqual(helper("scan", "/nonexistent-ph1112-dir", "--delete").returncode, 0)
+
+
+class MarkerSeenTest(unittest.TestCase):
+    def capture(self, text):
+        path = Path(tempfile.mkdtemp()) / "c.json"
+        path.write_text(json.dumps({"ok": {"data_base64": base64.b64encode(text.encode()).decode()}}))
+        return path
+
+    def test_prints_the_first_marker_that_shows(self):
+        result = helper("marker-seen", self.capture("noise\r\nPHMK-3-NO\r\n"), "PHMK-3-OK", "PHMK-3-NO")
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "PHMK-3-NO"))
+
+    def test_the_typed_echo_is_not_a_marker(self):
+        typed = "if mkdir x; then printf 'PHMK-%s-OK\\n' 3; else printf 'PHMK-%s-NO\\n' 3; fi\r\n"
+        self.assertEqual(helper("marker-seen", self.capture(typed), "PHMK-3-OK", "PHMK-3-NO").returncode, 1)
+
+    def test_a_longer_number_is_not_a_match(self):
+        self.assertEqual(helper("marker-seen", self.capture("PHMK-31-OK\r\n"), "PHMK-3-OK").returncode, 1)
 
 
 class QueryCommandTest(unittest.TestCase):
