@@ -120,6 +120,11 @@ slot_wait_s=1800
 boot_timeout_s=300
 # Wait for cloud-init, services and tailscale up (seconds).
 service_timeout_s=180
+# The daemon revalidates its overlay listener every 30 s (the reconcile interval
+# in crates/daemon/src/main.rs), so a dropped or rebound listener shows in the
+# journal only after the next reconcile; three intervals bound each wait.
+d5_drop_timeout_s=90
+d5_rebind_timeout_s=90
 # Seconds between polls.
 poll_s=3
 # Pings of the direct-path precondition (`tailscale ping` stops at the first
@@ -1055,7 +1060,7 @@ d4() {
   step "$d4_leg" attach attach_pipeline "$d4_src" "$d4_dst" "$d4_sid"
   step "$d4_leg" probe vm_ssh "$d4_src" "overlay_probe --host $d4_dn --session $d4_sid --mark D4-MARK"
   step "$d4_leg" session-stop vm_ssh "$d4_src" "pohunek session stop $d4_dn/$d4_sid --json"
-  step "$d4_leg" session-remove vm_ssh "$d4_src" "pohunek session remove $d4_dn/$d4_sid --json"
+  step "$d4_leg" session-remove vm_ssh "$d4_src" "pohunek session rm $d4_dn/$d4_sid --json"
 }
 
 unit_glob="pohunek-*-daemon.service"
@@ -1083,12 +1088,29 @@ extras() {
   step extra "d5-down-$ex_side" vm_ssh "$ex_side" 'sudo tailscale down'
   sleep "$poll_s"
   step extra "d5-doctor-down-$ex_side" vm_ssh "$ex_side" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek doctor --json'
+  waited=0
+  while :; do
+    step extra "d5-drop-$ex_side" vm_ssh "$ex_side" "journalctl --user --no-pager --since '$ex_since' | grep 'overlay state unavailable; serving local-only'"
+    [ "$step_rc" -ne 0 ] || break
+    [ "$waited" -lt "$d5_drop_timeout_s" ] || break
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  ex_since=$(vm_ssh "$ex_side" "date '+%Y-%m-%d %H:%M:%S'")
   step extra "d5-up-$ex_side" vm_ssh "$ex_side" "sudo tailscale up --login-server=http://$lab_net_a:$headscale_port --hostname=$ex_node --accept-dns=false --timeout=60s"
   waited=0
   while :; do
     step extra "d5-journal-$ex_side" vm_ssh "$ex_side" "journalctl --user --no-pager --since '$ex_since' | grep 'serving control protocol over overlay'"
     [ "$step_rc" -ne 0 ] || break
-    [ "$waited" -lt "$service_timeout_s" ] || break
+    [ "$waited" -lt "$d5_rebind_timeout_s" ] || break
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  waited=0
+  while :; do
+    step extra "d5-health-$ex_side" vm_ssh "$ex_other" "pohunek --host $ex_node health --json"
+    [ "$step_rc" -ne 0 ] || break
+    [ "$waited" -lt "$d5_rebind_timeout_s" ] || break
     sleep "$poll_s"
     waited=$((waited + poll_s))
   done

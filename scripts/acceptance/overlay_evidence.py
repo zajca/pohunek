@@ -578,9 +578,23 @@ def evaluate_extras(state: State, checks: Checks) -> None:
         checks.with_step(leg, "d5-listener-warn-" + side, "d5-doctor-down-" + side, rebind_warn, gating=False)
         checks.with_step(
             leg,
+            "d5-dropped-" + side,
+            "d5-drop-" + side,
+            lambda step: ("overlay state unavailable; serving local-only" in step.stdout, "journal after tailscale down"),
+            gating=False,
+        )
+        checks.with_step(
+            leg,
             "d5-rebound-" + side,
             "d5-journal-" + side,
             lambda step: ("serving control protocol over overlay" in step.stdout, "journal after tailscale up"),
+            gating=False,
+        )
+        checks.with_step(
+            leg,
+            "d5-health-after-" + side,
+            "d5-health-" + side,
+            lambda step: (step.rc == 0, "rc={}".format(step.rc)),
             gating=False,
         )
 

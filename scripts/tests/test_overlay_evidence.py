@@ -192,7 +192,9 @@ class Run:
                 "d5-doctor-down-" + side,
                 doctor([("overlay_tailscale_listener", "warn", "port=18733; the tailscale provider reports no listener address")]),
             )
+            self.step("extra", "d5-drop-" + side, "overlay state unavailable; serving local-only\n")
             self.step("extra", "d5-journal-" + side, "serving control protocol over overlay\n")
+            self.step("extra", "d5-health-" + side, envelope({}))
 
     def netbird(self):
         leg = "netbird"
@@ -817,6 +819,68 @@ class DbusUserSessionTest(unittest.TestCase):
         self.assertIn("https://pool.example/x", result.stdout)
 
 
+class DriverCliTest(unittest.TestCase):
+    def test_the_d4_cleanup_uses_the_real_session_subcommand(self):
+        text = DRIVER.read_text()
+        self.assertNotIn("session remove", text)
+        self.assertIn("pohunek session rm $d4_dn/$d4_sid", text)
+
+
+class D5ExtrasTest(unittest.TestCase):
+    """D5 waits for the listener drop before `tailscale up`, then for a fresh rebind and a remote health."""
+
+    def run_extras(self, drop_after):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = textwrap.dedent(
+                """\
+                set -eu
+                PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
+                state={tmp}/state
+                mkdir -p "$state"
+                helper begin "$state" --leg vms
+                poll_s=1
+                d5_drop_timeout_s=2
+                d5_rebind_timeout_s=2
+                unit_glob='x*'
+                lab_net_a=10.77.0.1
+                headscale_port=8080
+                vm_node() {{ printf 'ph-%s' "$1"; }}
+                clock=0
+                vm_ssh() {{
+                  side=$1; shift
+                  printf '%s %s\\n' "$side" "$*" >>{tmp}/calls.log
+                  case "$*" in
+                    *list-units*) echo x.service ;;
+                    date*) clock=$(cat {tmp}/clock 2>/dev/null || echo 0); clock=$((clock + 1)); echo $clock >{tmp}/clock; printf 'T%s' "$clock" ;;
+                    *"local-only"*) n=$(cat {tmp}/drops 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{tmp}/drops; [ "$n" -ge {drop_after} ] ;;
+                    *) return 0 ;;
+                  esac
+                }}
+                extras b a
+                """
+            ).format(driver=DRIVER, tmp=tmp, drop_after=drop_after)
+            subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=dict(os.environ, PH1112_LIB_PATH=str(DRIVER)), timeout=60, check=True)
+            return Path(tmp, "calls.log").read_text().splitlines()
+
+    def test_up_waits_for_the_drop_and_the_journal_is_read_from_the_up(self):
+        calls = self.run_extras(drop_after=2)
+
+        def last(key):
+            return max(i for i, c in enumerate(calls) if key in c)
+
+        order = [last("tailscale down"), last("local-only"), last("tailscale up"), last("control protocol over overlay"), last("health --json")]
+        self.assertEqual(order, sorted(order))
+        drops = [c for c in calls if "local-only" in c]
+        self.assertEqual(len(drops), 2)
+        self.assertTrue(all("--since 'T1'" in c for c in drops), drops)
+        self.assertTrue(all("--since 'T2'" in c for c in calls if "control protocol over overlay" in c), calls)
+
+    def test_an_unobserved_drop_is_waited_for_only_up_to_the_timeout_and_up_still_runs(self):
+        calls = self.run_extras(drop_after=99)
+        self.assertEqual(len([c for c in calls if "local-only" in c]), 3)
+        self.assertTrue(any("tailscale up" in c for c in calls))
+
+
 class MacLegTest(unittest.TestCase):
     """The macOS leg against a fake `pohunek` session and a fake `brew`, on temp roots."""
 
@@ -1189,6 +1253,18 @@ class EvidenceTest(unittest.TestCase):
         self.run_.step("extra", "d7-health-a", envelope_text.replace("overlays.toml", "config"), rc=1)
         checks = {c["name"]: c["status"] for c in self.run_.evaluate()["checks"]}
         self.assertEqual(checks["d7-unreachable-hint-a"], "failed")
+
+    def test_d5_needs_the_drop_the_rebind_and_a_remote_health_each(self):
+        for step, check in (
+            ("d5-drop-b", "extra/d5-dropped-b"),
+            ("d5-journal-b", "extra/d5-rebound-b"),
+        ):
+            with self.subTest(step=step):
+                self.run_.step("extra", step, "", rc=1)
+                self.assertIn(check, self.run_.failed())
+        self.run_.step("extra", "d5-health-b", error_envelope("host_unreachable", "x"), rc=1)
+        self.assertIn("extra/d5-health-after-b", self.run_.failed())
+        self.assertNotIn("extra/d5-dropped-a", self.run_.failed())
 
     def test_extras_never_gate(self):
         self.run_.step("extra", "d7-health-a", error_envelope("other", "x"), rc=1)
