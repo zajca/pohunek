@@ -917,6 +917,10 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
     if leaks:
         raise EvidenceError("secret key prefix in the run state: {}".format("; ".join(leaks)))
     redactor = Redactor([state.meta.get("netbird_address", "")])
+    for entry in result["inconclusive"]:
+        entry["detail"] = redactor.text(entry["detail"], True)
+    for item in result["checks"]:
+        item["detail"] = redactor.text(item["detail"], item["leg"] in NETBIRD_LEGS)
     document = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -1007,6 +1011,11 @@ def command_status_field(args: argparse.Namespace) -> int:
         if address is None:
             return 1
         print(address)
+    elif args.field == "idb64":
+        identifier = str(document["Self"].get("ID", ""))
+        if not identifier:
+            return 1
+        print(base64.urlsafe_b64encode(identifier.encode()).decode().rstrip("="))
     elif args.field == "dnsname":
         print(str(document["Self"].get("DNSName", "")).rstrip("."))
     else:

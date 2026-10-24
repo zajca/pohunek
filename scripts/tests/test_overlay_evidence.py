@@ -721,6 +721,12 @@ class AssembleTest(unittest.TestCase):
         self.assertNotIn("100.80.9.9", text)
         self.assertIn("<netbird-ip-", text)
 
+    def test_details_of_inconclusive_codes_and_netbird_checks_are_redacted(self):
+        self.run_.inconclude("path_guard_violation", "forward on {}:4000".format(NETBIRD_ADDRESS))
+        self.run_.step("netbird", "owner-health-after", envelope({}), rc=1)
+        helper("assemble", self.run_.root, self.out)
+        self.assertNotIn(NETBIRD_ADDRESS, self.out.read_text())
+
     def test_lab_addresses_stay_readable_in_the_vm_legs(self):
         helper("assemble", self.run_.root, self.out)
         self.assertIn(IPS["b"], self.out.read_text())
@@ -837,6 +843,12 @@ class QueryCommandTest(unittest.TestCase):
         path = self.write("up.json", '{"AuthURL": "http://100.64.1.1:8080/register/AbC_123-x"}\n')
         self.assertEqual(helper("register-id", path).stdout.strip(), "AbC_123-x")
         self.assertEqual(helper("register-id", self.write("none.json", "{}")).returncode, 3)
+
+    def test_status_field_idb64_is_unpadded_base64url_of_the_node_id(self):
+        path = self.write("s.json", status_json("b"))
+        encoded = helper("status-field", path, "idb64").stdout.strip()
+        self.assertNotIn("=", encoded)
+        self.assertEqual(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode(), IDS["b"])
 
     def test_cgnat(self):
         self.assertEqual(helper("cgnat", "100.64.0.1").returncode, 0)
