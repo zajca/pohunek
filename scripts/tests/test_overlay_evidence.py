@@ -498,9 +498,131 @@ class MacStepProtocolTest(unittest.TestCase):
     def test_a_shell_that_cannot_be_moved_to_the_cwd_runs_nothing(self):
         marker = self.dir / "ran"
         output = self.run_step("touch {}".format(marker), real="/nonexistent-real-path")
-        self.assertEqual(output, "RC=97\nPHCWD-REFUSED")
+        self.assertEqual(output, "RC=97\n")
         self.assertFalse(marker.exists())
         self.assertEqual(sorted(p.name for p in (self.dir / "state" / "inconclusive").glob("*")), ["macos_provisioning_failed"])
+
+    def run_body(self, body, real="/nonexistent-real-path"):
+        script = textwrap.dedent(
+            """\
+            set -eu
+            PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
+            state={state}
+            macos_comm_root={comm}
+            macos_session_cwd={cwd}
+            macos_session_cwd_real={real}
+            owner_pohunek={fake}
+            macos_host=zajcaair
+            mac_session_id=s-test
+            mac_poll_s=1
+            mac_timeout_s=3
+            """
+        ).format(driver=DRIVER, state=self.dir / "state", comm=self.dir / "comm", cwd=self.cwd, real=real, fake=self.fake) + textwrap.dedent(body)
+        env = dict(os.environ, FAKE_DIR=str(self.dir), PH1112_LIB_PATH=str(DRIVER), FAKE_DROP="0", FAKE_SHELL="sh")
+        result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def typed_lines(self):
+        return [line for line in (self.dir / "transcript").read_text().split("\r\n") if "pwd -P" in line]
+
+    def test_a_refusal_poisons_the_leg_and_nothing_more_is_typed(self):
+        output = self.run_body(
+            """\
+            mac_step macos first 3 'true'
+            first=$step_rc
+            mac_step macos second 3 'true'
+            second=$step_rc
+            mac_make_root /nowhere
+            mac_comm_created=1
+            mac_final_clean
+            printf 'first=%s second=%s refused=%s make=%s\\n' "$first" "$second" "$mac_refused" "$mac_make_result"
+            """
+        )
+        self.assertEqual(output.strip(), "first=97 second=124 refused=1 make=refused")
+        self.assertEqual(len(self.typed_lines()), 1)
+        self.assertEqual(sorted(p.name for p in (self.dir / "state" / "inconclusive").glob("*")), ["macos_provisioning_failed"])
+
+    def test_a_refusal_of_a_made_root_or_of_the_final_clean_is_read_from_the_terminal(self):
+        output = self.run_body(
+            """\
+            mac_make_root """ + str(self.dir / "newroot") + """
+            printf 'make=%s refused=%s\\n' "$mac_make_result" "$mac_refused"
+            """
+        )
+        self.assertEqual(output.strip(), "make=refused refused=1")
+        self.assertFalse((self.dir / "newroot").exists())
+        self.assertEqual(len(self.typed_lines()), 1)
+
+    def test_the_final_clean_refuses_paths_outside_the_allow_list_without_sending(self):
+        output = self.run_body(
+            """\
+            mac_comm_created=1
+            macos_comm_root=/Users/someone/Code
+            mac_final_clean
+            cat "$state/steps/macos/"*-cl-rm/stdout
+            printf 'rc=%s\\n' "$(cat "$state/steps/macos/"*-cl-rm/rc)"
+            """
+        )
+        self.assertIn("refused locally", output)
+        self.assertIn("rc=1", output)
+        self.assertEqual(self.typed_lines(), [])
+
+    def test_the_allow_list_accepts_only_the_roots_this_run_created(self):
+        output = self.run_body(
+            """\
+            macos_tmp_prefix=/private/tmp
+            macos_comm_root=/private/tmp/ph1112c
+            macos_runtime_root=/private/tmp/ph1112
+            mac_home=/Users/zajca
+            mac_root=/Users/zajca/.ph1112
+            check() { if mac_path_allowed "$1"; then printf 'yes '; else printf 'no '; fi; }
+            check /private/tmp/ph1112c
+            mac_comm_created=1; mac_runtime_created=1; mac_home_created=1; mac_home_valid=1
+            check /private/tmp/ph1112c
+            check /private/tmp/ph1112
+            check /Users/zajca/.ph1112
+            check /Users/zajca
+            check /private/tmp/ph1112c/../x
+            check '/private/tmp/ph1112c x'
+            check /private/tmp/ph-macos-cache
+            echo
+            """
+        )
+        self.assertEqual(output.strip(), "no yes yes yes no no no no")
+
+    def test_only_a_plain_users_name_is_accepted_as_the_mac_home(self):
+        output = self.run_body(
+            """\
+            for h in /Users/zajca PHCWD-REFUSED /Users /Users/ /Users/a/b /Users/Zajca ''; do
+              if mac_home_check "$h"; then printf 'yes '; else printf 'no '; fi
+            done
+            echo
+            """
+        )
+        self.assertEqual(output.strip(), "yes no no no no no no")
+
+    def test_a_step_command_that_removes_or_moves_or_uninstalls_is_refused_locally(self):
+        output = self.run_body(
+            """\
+            for c in 'rm -rf /' 'true; mv a b' 'brew uninstall tailscale' 'ls; true'; do
+              if mac_command_allowed probe "$c"; then printf 'yes '; else printf 'no '; fi
+            done
+            if mac_command_allowed cl-brew-uninstall 'brew uninstall tailscale'; then printf 'yes '; else printf 'no '; fi
+            mac_brew_installed_by_us=1
+            if mac_command_allowed cl-brew-uninstall 'brew uninstall tailscale'; then printf 'yes '; else printf 'no '; fi
+            echo
+            """
+        )
+        self.assertEqual(output.strip(), "no no no yes no yes")
+
+    def test_the_driver_types_into_the_mac_shell_only_in_mac_send(self):
+        lines = DRIVER.read_text().splitlines()
+        calls = [number for number, line in enumerate(lines, 1) if "session input" in line and "mac_target" in line]
+        start = next(number for number, line in enumerate(lines, 1) if line.startswith("mac_send() {"))
+        end = next(number for number, line in enumerate(lines, 1) if number > start and line == "}")
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(start < calls[0] < end, (calls, start, end))
 
     def test_a_session_that_never_answers_times_out_with_status_124(self):
         self.assertEqual(self.run_step("true", timeout=2, drop=True), "RC=124\n")
@@ -677,8 +799,9 @@ class MacLegTest(unittest.TestCase):
         (self.dir / "transcript").write_text("")
         (self.dir / "state").mkdir()
         (self.dir / "home").mkdir()
-        self.comm = self.dir / "comm"
-        self.runtime = self.dir / "runtime"
+        (self.dir / "tmp").mkdir()
+        self.comm = self.dir / "tmp" / "ph1112c"
+        self.runtime = self.dir / "tmp" / "ph1112"
         self.owner_root = self.dir / "home" / ".ph1112"
 
     def tearDown(self):
@@ -699,7 +822,9 @@ class MacLegTest(unittest.TestCase):
             macos_host=zajcaair
             run_ts=20261024T000000Z
             macos_session_cwd=/tmp
-            macos_session_cwd_real=$(cd /tmp && pwd -P)
+            macos_session_cwd_real=${{MAC_CWD_REAL:-$(cd /tmp && pwd -P)}}
+            macos_home_prefix={dir}
+            macos_tmp_prefix={dir}/tmp
             netbird_address=100.80.1.5
             macos_bin_dir=/nonexistent
             macos_brew_cmd="${{macos_brew_cmd%"$macos_brew"}}{brew}"
@@ -710,7 +835,7 @@ class MacLegTest(unittest.TestCase):
             macos_leg || true
             mac_cleanup || true
             """
-        ).format(driver=DRIVER, state=self.dir / "state", comm=self.comm, runtime=self.runtime, fake=self.fake, brew=self.brew)
+        ).format(driver=DRIVER, state=self.dir / "state", comm=self.comm, runtime=self.runtime, fake=self.fake, brew=self.brew, dir=self.dir)
         run_env = dict(os.environ, FAKE_DIR=str(self.dir), HOME=str(self.dir / "home"), PH1112_LIB_PATH=str(DRIVER), **(env or {}))
         result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=run_env, timeout=240)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -728,6 +853,15 @@ class MacLegTest(unittest.TestCase):
         self.run_leg(env={"FAKE_BREW_LIST_RC": "3"})
         self.assertEqual((self.dir / "session-name").read_text(), "ph1112-20261024T000000Z")
         self.assertEqual(self.ops(), ["new", "stop zajcaair/s-fake", "rm zajcaair/s-fake"])
+
+    def test_a_refused_shell_gets_one_guarded_line_and_nothing_else_but_the_session_removal(self):
+        self.run_leg(env={"MAC_CWD_REAL": "/nonexistent-real-path"})
+        typed = [line for line in (self.dir / "transcript").read_text().split("\r\n") if "pwd -P" in line]
+        self.assertEqual(len(typed), 1)
+        self.assertTrue(typed[0].startswith("if cd "), typed[0])
+        self.assertEqual(self.codes(), ["macos_provisioning_failed"])
+        self.assertEqual(self.ops(), ["new", "stop zajcaair/s-fake", "rm zajcaair/s-fake"])
+        self.assertFalse(self.owner_root.exists())
 
     def test_the_session_is_removed_when_the_leg_stops_early_too(self):
         self.run_leg(pre_existing=[self.comm])
