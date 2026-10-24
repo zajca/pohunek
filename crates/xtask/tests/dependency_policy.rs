@@ -604,3 +604,140 @@ fn legacy_zbus_policy_asks_for_the_ignores_to_go_once_the_chain_is_gone() {
         "{violations:?}"
     );
 }
+
+/// Packages allowed to link `crypto-bigint` 0.5 (RUSTSEC-2026-0387, ignored in
+/// `.cargo/audit.toml`): the `RustCrypto` 0.13 curve stack that `openidconnect`
+/// uses for public-key ECDSA verification, and the relay that consumes it.
+const CRYPTO_BIGINT_REVIEWED_CLOSURE: [&str; 7] = [
+    "ecdsa",
+    "elliptic-curve",
+    "openidconnect",
+    "p256",
+    "p384",
+    "pohunek-relay",
+    "primeorder",
+];
+
+/// Violations of the `crypto-bigint` 0.5 policy in `lock`: every package that
+/// reaches it, directly or transitively, must be in the reviewed closure.
+fn crypto_bigint_violations(lock: &Lockfile) -> Vec<String> {
+    let affected_versions = |dependency: &str| {
+        let mut parts = dependency.split_whitespace();
+        parts.next() == Some("crypto-bigint") && parts.next().is_none_or(|v| v.starts_with("0.5."))
+    };
+    let mut reaching: std::collections::BTreeSet<&str> = lock
+        .package
+        .iter()
+        .filter(|package| package.dependencies.iter().any(|d| affected_versions(d)))
+        .map(|package| package.name.as_str())
+        .collect();
+    loop {
+        let parents: Vec<&str> = lock
+            .package
+            .iter()
+            .filter(|package| {
+                package.dependencies.iter().any(|dependency| {
+                    dependency
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|name| reaching.contains(name))
+                })
+            })
+            .map(|package| package.name.as_str())
+            .collect();
+        let before = reaching.len();
+        reaching.extend(parents);
+        if reaching.len() == before {
+            break;
+        }
+    }
+    let mut violations: Vec<String> = reaching
+        .iter()
+        .filter(|name| !CRYPTO_BIGINT_REVIEWED_CLOSURE.contains(name))
+        .map(|name| {
+            format!("`{name}` reaches crypto-bigint 0.5, which is outside the reviewed closure")
+        })
+        .collect();
+    if reaching.is_empty() {
+        violations.push(
+            "crypto-bigint 0.5 is gone: remove the RUSTSEC-2026-0387 ignore from \
+             .cargo/audit.toml and this policy"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+fn synthetic_lock(packages: &[(&str, &[&str])]) -> Lockfile {
+    Lockfile {
+        package: packages
+            .iter()
+            .map(|(name, dependencies)| Package {
+                name: (*name).to_owned(),
+                version: "0.0.0".to_owned(),
+                checksum: None,
+                dependencies: dependencies.iter().map(|d| (*d).to_owned()).collect(),
+            })
+            .collect(),
+    }
+}
+
+fn reviewed_crypto_bigint_packages() -> Vec<(&'static str, &'static [&'static str])> {
+    vec![
+        ("crypto-bigint", &[]),
+        ("elliptic-curve", &["crypto-bigint"]),
+        ("ecdsa", &["elliptic-curve"]),
+        ("primeorder", &["elliptic-curve"]),
+        ("p256", &["ecdsa", "elliptic-curve", "primeorder"]),
+        ("p384", &["ecdsa", "elliptic-curve", "primeorder"]),
+        ("openidconnect", &["p256", "p384"]),
+        ("pohunek-relay", &["openidconnect"]),
+    ]
+}
+
+#[test]
+fn crypto_bigint_0_5_is_reachable_only_through_the_reviewed_curve_stack() {
+    let lock: Lockfile =
+        toml::from_str(include_str!("../../../Cargo.lock")).expect("workspace lockfile");
+    assert_eq!(
+        crypto_bigint_violations(&lock),
+        Vec::<String>::new(),
+        "a new crypto-bigint 0.5 consumer needs a new RUSTSEC-2026-0387 assessment"
+    );
+}
+
+#[test]
+fn crypto_bigint_policy_accepts_the_reviewed_closure() {
+    assert_eq!(
+        crypto_bigint_violations(&synthetic_lock(&reviewed_crypto_bigint_packages())),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn crypto_bigint_policy_rejects_any_other_consumer() {
+    for (parent, dependency) in [
+        ("pohunek-daemon", "crypto-bigint 0.5.5"),
+        ("pohunek-cli", "p256"),
+        ("other", "elliptic-curve"),
+        ("pohunek-session-worker", "openidconnect"),
+    ] {
+        let mut packages = reviewed_crypto_bigint_packages();
+        packages.push((parent, std::slice::from_ref(&dependency)));
+        let violations = crypto_bigint_violations(&synthetic_lock(&packages));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.starts_with(&format!("`{parent}` "))),
+            "{parent} -> {dependency} must be rejected; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn crypto_bigint_policy_ignores_fixed_versions_and_asks_for_removal_once_gone() {
+    let fixed = synthetic_lock(&[("crypto-bigint", &[]), ("other", &["crypto-bigint 0.7.6"])]);
+    let violations = crypto_bigint_violations(&fixed);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("remove the RUSTSEC-2026-0387 ignore"));
+}
