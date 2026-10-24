@@ -13,8 +13,8 @@ use crate::session::SessionRegistry;
 ///
 /// The snapshot is built fresh on each request (agent runtimes are probed
 /// against `PATH`), so it always reflects the host as it is now. Transport
-/// agnostic: the same handler answers over the local Unix socket and over a
-/// `NetBird` TCP connection. The reported protocol version is the one this
+/// agnostic: the same handler answers over the local Unix socket and over an
+/// overlay TCP connection. The reported protocol version is the one this
 /// connection negotiated.
 pub(super) fn handle_host_inspect(
     request: &Request,
@@ -30,7 +30,7 @@ pub(super) fn handle_host_inspect(
     ok_value(request, &capabilities)
 }
 
-/// `host.discover`: enumerate `NetBird` peers and classify each daemon.
+/// `host.discover`: enumerate overlay peers and classify each daemon.
 ///
 /// The daemon caches the shared discovery engine for a short TTL (see
 /// [`DiscoveryCache`]), so repeated calls return promptly; `force` bypasses

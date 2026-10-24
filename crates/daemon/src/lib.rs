@@ -2,7 +2,7 @@
 //!
 //! The daemon owns logical session state, supervises durable per-session PTY
 //! workers, and serves the control protocol over a local Unix socket and
-//! optional `NetBird` TCP. This crate exposes the control-plane runtime so the
+//! optional overlay TCP. This crate exposes the control-plane runtime so the
 //! `pohunekd` binary and integration tests can drive it.
 //!
 //! Current scope: bind the Unix socket with correct permissions,
@@ -10,7 +10,7 @@
 //! reconciliation, raw attach streaming over a separate connection, agents,
 //! detection (the state engine), worktree-per-session binding, a unified
 //! JSON-lines logical metadata store, an append-only event log, and direct
-//! remote transport over `NetBird`.
+//! remote transport over a configured overlay.
 
 // Unsafe is denied by default; the few FFI sites (advisory flock, socket chmod,
 // pidfd syscalls) opt back in with localized `#[expect(unsafe_code)]` and SAFETY

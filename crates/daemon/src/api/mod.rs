@@ -1,4 +1,4 @@
-//! Control server (local Unix socket + `NetBird` TCP).
+//! Control server (local Unix socket + overlay TCP).
 //!
 //! Binds the control socket with owner-private permissions, recovers from a
 //! stale socket left by a previous run, and serves newline-delimited JSON
@@ -8,7 +8,7 @@
 //! supervision").
 //!
 //! The same connection-serving code drives two transports: the local
-//! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over a `NetBird`
+//! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over an overlay
 //! TCP listener (milestone 11). Everything below the accept loop is generic over
 //! any `AsyncRead + AsyncWrite` stream, so the protocol and attach semantics are
 //! identical across transports.
@@ -470,7 +470,7 @@ impl RemoteServer {
         })
     }
 
-    /// Wrap an already-bound listener WITHOUT `NetBird` validation.
+    /// Wrap an already-bound listener WITHOUT overlay validation.
     ///
     /// For tests and internal use only: the loopback-TCP stand-in in CI binds
     /// `127.0.0.1:0` and wraps it here, which the production [`bind`](Self::bind)

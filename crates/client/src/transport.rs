@@ -229,7 +229,7 @@ pub struct Subscription {
 pub enum RawStream {
     /// Local Unix-socket transport.
     Local(UnixStream),
-    /// Remote `NetBird` TCP transport.
+    /// Remote overlay TCP transport.
     Remote(TcpStream),
 }
 
@@ -364,7 +364,7 @@ impl Client {
     /// Connect to a daemon, selecting local or remote transport from `host`.
     ///
     /// Empty `host` and `"local"` connect to `socket_path`; any other host is
-    /// resolved through `NetBird` and dialed over TCP.
+    /// resolved through the configured overlay and dialed over TCP.
     pub async fn connect(host: &str, socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
         Self::connect_with_options(host, socket_path, ClientOptions::default()).await
     }
