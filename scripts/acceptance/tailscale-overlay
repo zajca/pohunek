@@ -142,6 +142,8 @@ netbird_root=/dev/shm/ph1112
 # Unique per run (ph1112-<run time>); set when the macOS leg starts.
 macos_session_name=
 macos_session_cwd=/tmp/ph-macos-cache
+macos_session_cwd_real=/private/tmp/ph-macos-cache
+mac_cwd_refused=PHCWD-REFUSED
 macos_runtime_root=/private/tmp/ph1112
 macos_comm_root=/private/tmp/ph1112c
 # Project reference on the Mac that the shell session is started under (a remote
@@ -345,6 +347,14 @@ netbird_root_created=0
 diagnostics_done=0
 mac_brew_installed_by_us=0
 mac_dead=0
+# Set by the first refusal of the cwd guard; nothing more is typed afterwards.
+mac_refused=0
+macos_home_prefix=/Users
+macos_tmp_prefix=/private/tmp
+mac_home_valid=0
+mac_home=
+mac_daemon_started=0
+mac_tsd_started=0
 mac_in_cleanup=0
 mac_comm_created=0
 mac_home_created=0
@@ -1194,6 +1204,69 @@ mac_env() {
     "$mac_root" "$mac_root" "$mac_root" "$mac_root" "$macos_runtime_root"
 }
 
+# mac_send N BODY: the only place that types into the Mac's control shell. The
+# line changes into the cache directory and checks where the shell really is
+# (`pwd -P`) before BODY runs; elsewhere it prints the refusal markers and runs
+# nothing. After a refusal nothing is typed any more.
+mac_send() {
+  [ "$mac_refused" = 0 ] || return 1
+  sd_line="if cd $macos_session_cwd && [ \"\$(pwd -P)\" = $macos_session_cwd_real ]; then $2; else printf 'PHREF-%s-REFUSED\\n' $1; printf 'PHBEG-%s-\\n' $1; printf '%s' $mac_cwd_refused | base64 | tr -d '\\n'; printf '\\nPHEND-%s-97\\n' $1; fi"
+  "$owner_pohunek" session input "$(mac_target)" "$sd_line" --json >/dev/null 2>&1 || true
+}
+
+# mac_refuse WHAT: the shell was not in the cache directory. The leg ends as
+# macos_provisioning_failed, nothing more is typed, and the roots created so far
+# are listed for manual removal.
+mac_refuse() {
+  mac_refused=1
+  mac_dead=1
+  mr_left=
+  [ "$mac_comm_created" != 1 ] || mr_left="$mr_left $macos_comm_root"
+  [ "$mac_home_created" != 1 ] || mr_left="$mr_left $mac_root"
+  [ "$mac_runtime_created" != 1 ] || mr_left="$mr_left $macos_runtime_root"
+  [ "$mac_brew_installed_by_us" != 1 ] || mr_left="$mr_left (Homebrew formula tailscale)"
+  [ "$mac_daemon_started" != 1 ] || mr_left="$mr_left (pohunekd, pid file $mac_root/daemon.pid)"
+  [ "$mac_tsd_started" != 1 ] || mr_left="$mr_left (tailscaled, pid file $mac_root/tsd.pid)"
+  inconclude macos_provisioning_failed "the $macos_host shell is not in $macos_session_cwd ($macos_session_cwd_real); $1 was not run; may need manual cleanup:${mr_left:- nothing was created}"
+}
+
+# mac_path_allowed PATH: the only paths a destructive command on the Mac may
+# name. Absolute, built from the run's constants, and a root counts only when
+# this run created it.
+mac_path_allowed() {
+  case $1 in
+    *..* | *[!A-Za-z0-9_./-]*) return 1 ;;
+    "$macos_comm_root") [ "$mac_comm_created" = 1 ] || return 1 ;;
+    "$macos_runtime_root") [ "$mac_runtime_created" = 1 ] || return 1 ;;
+    "$mac_root") [ "$mac_home_created" = 1 ] && [ "$mac_home_valid" = 1 ] && [ "$mac_root" = "$mac_home/.ph1112" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case $1 in
+    "$macos_tmp_prefix"/ph1112*) return 0 ;;
+    "$mac_home"/.ph1112) [ "$mac_home_valid" = 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# mac_command_allowed NAME COMMAND: refuses locally a step command that removes
+# or moves something, or uninstalls, outside the cleanup steps built for it.
+mac_command_allowed() {
+  case " $2 " in
+    *[!A-Za-z0-9_-]rm[[:space:]]* | *[!A-Za-z0-9_-]mv[[:space:]]*) return 1 ;;
+    *" uninstall "*) [ "$1" = cl-brew-uninstall ] && [ "$mac_brew_installed_by_us" = 1 ] || return 1 ;;
+  esac
+  return 0
+}
+
+# mac_home_check PATH: $HOME of the Mac's owner, a plain /Users/<name> path.
+mac_home_check() {
+  case $1 in
+    "$macos_home_prefix"/*[!a-z0-9_]* | "$macos_home_prefix"/ | "$macos_home_prefix") return 1 ;;
+    "$macos_home_prefix"/?*) return 0 ;;
+  esac
+  return 1
+}
+
 # mac_step LEG NAME TIMEOUT COMMAND: runs COMMAND in the Mac's shell session and
 # records it like a local step. The command travels base64-encoded; its output is
 # written to a file, printed between markers (also base64) and decoded here, so
@@ -1205,18 +1278,25 @@ mac_step() {
   ms_cmd=$4
   mac_n=$((mac_n + 1))
   ms_b64=$(printf '%s' "$ms_cmd" | base64 | tr -d '\n')
-  ms_line="umask 077; printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc"
+  ms_body="umask 077; printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc"
   step_dir_for "$ms_leg" "$ms_name"
   printf '%s\n' "$ms_cmd" >"$step_dir/argv"
   now >"$step_dir/at"
   : >"$step_dir/stderr"
-  if [ "$mac_dead" = 1 ] && [ "$mac_in_cleanup" = 0 ]; then
+  if { [ "$mac_dead" = 1 ] && [ "$mac_in_cleanup" = 0 ]; } || [ "$mac_refused" = 1 ]; then
     : >"$step_dir/stdout"
     printf '124\n' >"$step_dir/rc"
     step_rc=124
     return 0
   fi
-  "$owner_pohunek" session input "$(mac_target)" "$ms_line" --json >"$step_dir/input.json" 2>&1 || true
+  if ! mac_command_allowed "$ms_name" "$ms_cmd"; then
+    : >"$step_dir/stdout"
+    printf '125\n' >"$step_dir/rc"
+    step_rc=125
+    inconclude path_guard_violation "the $ms_name command was refused locally: it removes something outside the allow-list; nothing was sent"
+    return 0
+  fi
+  mac_send "$mac_n" "$ms_body"
   ms_waited=0
   step_rc=124
   while [ "$ms_waited" -lt "$ms_timeout" ]; do
@@ -1230,9 +1310,12 @@ mac_step() {
     fi
   done
   [ -f "$step_dir/stdout" ] || : >"$step_dir/stdout"
-  rm -f "$step_dir/capture.json" "$step_dir/input.json"
+  rm -f "$step_dir/capture.json"
   printf '%s\n' "$step_rc" >"$step_dir/rc"
-  if [ "$step_rc" -eq 124 ] && [ "$mac_in_cleanup" = 0 ]; then
+  if [ "$step_rc" -eq 97 ] && [ "$(cat "$step_dir/stdout")" = "$mac_cwd_refused" ]; then
+    : >"$step_dir/stdout"
+    mac_refuse "$ms_name"
+  elif [ "$step_rc" -eq 124 ] && [ "$mac_in_cleanup" = 0 ]; then
     mac_dead=1
     inconclude macos_unresponsive "the $macos_host shell session did not answer $ms_name within ${ms_timeout}s"
   fi
@@ -1263,16 +1346,26 @@ mac_make_root() {
   mac_n=$((mac_n + 1))
   mk_sub=
   [ -z "${2:-}" ] || mk_sub="; mkdir $1/$2"
-  mk_line="umask 077; if mkdir $1 2>/dev/null; then printf 'PHMK-%s-OK\\n' $mac_n$mk_sub; else printf 'PHMK-%s-NO\\n' $mac_n; fi"
-  "$owner_pohunek" session input "$(mac_target)" "$mk_line" --json >/dev/null 2>&1 || true
+  mk_body="umask 077; if mkdir $1 2>/dev/null; then printf 'PHMK-%s-OK\\n' $mac_n$mk_sub; else printf 'PHMK-%s-NO\\n' $mac_n; fi"
   mac_make_result=timeout
-  if mk_seen=$(mac_terminal_wait "PHMK-$mac_n-OK" "PHMK-$mac_n-NO"); then
-    case $mk_seen in
-      *-OK) mac_make_result=ok ;;
-      *-NO) mac_make_result=exists ;;
-    esac
+  case $1 in
+    /*) ;;
+    *) mac_make_result=refused ;;
+  esac
+  [ "$mac_refused" = 0 ] || mac_make_result=refused
+  if [ "$mac_make_result" = timeout ] && mac_send "$mac_n" "$mk_body"; then
+    if mk_seen=$(mac_terminal_wait "PHMK-$mac_n-OK" "PHMK-$mac_n-NO" "PHREF-$mac_n-REFUSED"); then
+      case $mk_seen in
+        *-OK) mac_make_result=ok ;;
+        *-NO) mac_make_result=exists ;;
+        *-REFUSED)
+          mac_make_result=refused
+          mac_refuse "creating $1"
+          ;;
+      esac
+    fi
   fi
-  if [ "$mac_make_result" = timeout ]; then
+  if [ "$mac_make_result" = timeout ] && [ "$mac_refused" = 0 ]; then
     mac_dead=1
     inconclude macos_unresponsive "the $macos_host shell session did not answer the creation of $1"
   fi
@@ -1321,17 +1414,27 @@ mac_final_clean() {
   mf_roots=
   [ "$mac_home_created" != 1 ] || mf_roots="$mf_roots $mac_root"
   [ "$mac_runtime_created" != 1 ] || mf_roots="$mf_roots $macos_runtime_root"
-  mf_roots="$mf_roots $macos_comm_root"
+  [ "$mac_comm_created" != 1 ] || mf_roots="$mf_roots $macos_comm_root"
   mf_test=
   for mf_path in $mf_roots; do
+    if ! mac_path_allowed "$mf_path"; then
+      note_step macos cl-rm 1 "rm -rf$mf_roots" "refused locally: $mf_path is not on the allow-list; nothing was sent"
+      return 0
+    fi
     mf_test="$mf_test [ ! -e $mf_path ] &&"
   done
+  if [ "$mac_refused" = 1 ]; then
+    note_step macos cl-rm 1 "rm -rf$mf_roots" "not sent: the shell was refused; remove by hand"
+    return 0
+  fi
   mac_n=$((mac_n + 1))
-  mf_line="rm -rf $mf_roots; if$mf_test true; then printf 'PHCLEAN-%s-OK\\n' $mac_n; fi"
-  "$owner_pohunek" session input "$(mac_target)" "$mf_line" --json >/dev/null 2>&1 || true
+  mf_body="rm -rf $mf_roots; if$mf_test true; then printf 'PHCLEAN-%s-OK\\n' $mac_n; fi"
   mf_rc=1
-  if mac_terminal_wait "PHCLEAN-$mac_n-OK" >/dev/null; then
-    mf_rc=0
+  if mac_send "$mac_n" "$mf_body" && mf_seen=$(mac_terminal_wait "PHCLEAN-$mac_n-OK" "PHREF-$mac_n-REFUSED"); then
+    case $mf_seen in
+      *-OK) mf_rc=0 ;;
+      *-REFUSED) mac_refuse "removing the throwaway roots" ;;
+    esac
   fi
   note_step macos cl-rm "$mf_rc" "rm -rf$mf_roots" ""
 }
@@ -1383,14 +1486,15 @@ macos_leg() {
       ;;
     *) return 1 ;;
   esac
-  "$owner_pohunek" session input "$(mac_target)" 'export PAGER=cat GIT_PAGER=cat' --json >/dev/null 2>&1 || true
   # shellcheck disable=SC2016 # $HOME must expand on the Mac
   mac_step macos mac-home 30 'printf %s "$HOME"'
+  [ "$mac_refused" = 0 ] || return 1
   mac_home=$(cat "$step_dir/stdout")
-  [ -n "$mac_home" ] || {
-    inconclude macos_provisioning_failed "the Mac's HOME could not be read"
+  if ! mac_home_check "$mac_home"; then
+    mac_refuse "reading HOME (it answered something that is not a $macos_home_prefix/<name> path)"
     return 1
-  }
+  fi
+  mac_home_valid=1
   mac_root_candidate="$mac_home/.ph1112"
   mac_make_root "$mac_root_candidate"
   case $mac_make_result in
@@ -1443,7 +1547,7 @@ macos_leg() {
   fi
   mac_step macos brew-info "$mac_timeout_s" "$macos_brew_cmd info --json=v2 tailscale"
   if [ "$step_rc" -ne 0 ]; then
-    inconclude macos_homebrew_failed "brew info tailscale on $macos_host exited $step_rc"
+    [ "$mac_dead" = 1 ] || inconclude macos_homebrew_failed "brew info tailscale on $macos_host exited $step_rc"
     return 1
   fi
   mac_step macos ls-bins "$mac_timeout_s" 'ls -l /opt/homebrew/bin/tailscale /opt/homebrew/bin/tailscaled'
@@ -1467,6 +1571,7 @@ macos_leg() {
   say "zajcaair: D6, no tailscaled"
   mac_step macos d6-doctor-before "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   mac_step macos d6-host-list "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek host list --json"
+  mac_daemon_started=1
   mac_step macos d6-daemon-start "$mac_timeout_s" "$(mac_daemon_start_cmd /usr/bin:/bin)"
   mac_step macos d6-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
   mac_step macos d6-doctor-after "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
@@ -1482,6 +1587,7 @@ macos_leg() {
 macos_userspace() {
   say "zajcaair: userspace tailscaled"
   sub_socket="$macos_runtime_root/ts.sock"
+  mac_tsd_started=1
   mac_step macos us-tailscaled-start "$mac_timeout_s" "mkdir -p $mac_root/ts; nohup /opt/homebrew/bin/tailscaled --tun=userspace-networking --socket=$sub_socket --statedir=$mac_root/ts --port=0 --no-logs-no-support >$macos_runtime_root/tsd.log 2>&1 </dev/null & echo \$! >$mac_root/tsd.pid; for i in 1 2 3 4 5 6 7 8 9 10; do [ -S $sub_socket ] && exit 0; sleep 1; done; cat $macos_runtime_root/tsd.log; exit 1"
   if [ "$step_rc" -ne 0 ]; then
     [ "$mac_dead" = 1 ] || inconclude macos_userspace_refused "userspace tailscaled did not create its socket"
