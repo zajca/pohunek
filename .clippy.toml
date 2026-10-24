@@ -1,9 +1,37 @@
+# RUSTSEC-2026-0387 (crypto-bigint 0.5) is accepted only because the relay reaches
+# p256/p384 solely for ECDSA public-key verification. Secret-scalar types and
+# Diffie-Hellman on those curves would invalidate the exception.
 # RUSTSEC-2023-0071 is accepted only for public-key OIDC signature verification.
 # Private RSA operations would invalidate that exception and need a new review.
 disallowed-types = [
+    { path = "p256::SecretKey", reason = "RUSTSEC-2026-0387: EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "p256::NonZeroScalar", reason = "RUSTSEC-2026-0387: EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "p256::ecdsa::SigningKey", reason = "RUSTSEC-2026-0387: EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "p384::SecretKey", reason = "RUSTSEC-2026-0387: EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "p384::NonZeroScalar", reason = "RUSTSEC-2026-0387: EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "p384::ecdsa::SigningKey", reason = "RUSTSEC-2026-0387: EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::SecretKey", reason = "RUSTSEC-2026-0387: EC secret keys on crypto-bigint 0.5 are outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::NonZeroScalar", reason = "RUSTSEC-2026-0387: EC secret scalars on crypto-bigint 0.5 are outside the reviewed verify-only exception" },
+    { path = "ecdsa::SigningKey", reason = "RUSTSEC-2026-0387: ECDSA signing on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::ecdh::EphemeralSecret", reason = "RUSTSEC-2026-0387: ECDH on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::ecdh::SharedSecret", reason = "RUSTSEC-2026-0387: ECDH on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
     { path = "rsa::RsaPrivateKey", reason = "RUSTSEC-2023-0071: private RSA operations are outside the reviewed public-verification exception" },
     { path = "openidconnect::core::CoreRsaPrivateSigningKey", reason = "RUSTSEC-2023-0071: relay OIDC verifies signatures and must not hold private RSA signing keys" },
 ]
 disallowed-methods = [
+    { path = "elliptic_curve::SecretKey::random", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::SecretKey::from_bytes", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::SecretKey::from_slice", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::SecretKey::from_sec1_der", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::SecretKey::from_sec1_pem", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::SecretKey::from_jwk", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception", allow-invalid = true },
+    { path = "elliptic_curve::SecretKey::from_jwk_str", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception", allow-invalid = true },
+    { path = "elliptic_curve::NonZeroScalar::random", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::NonZeroScalar::from_repr", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::NonZeroScalar::from_uint", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "ecdsa::SigningKey::random", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "ecdsa::SigningKey::from_bytes", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "ecdsa::SigningKey::from_slice", reason = "RUSTSEC-2026-0387: constructing EC secret material on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
+    { path = "elliptic_curve::ecdh::diffie_hellman", reason = "RUSTSEC-2026-0387: ECDH on crypto-bigint 0.5 is outside the reviewed verify-only exception" },
     { path = "openidconnect::core::CoreRsaPrivateSigningKey::from_pem", reason = "RUSTSEC-2023-0071: importing private RSA material invalidates the audit exception" },
 ]

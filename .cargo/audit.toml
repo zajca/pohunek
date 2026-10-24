@@ -39,8 +39,9 @@ ignore = [
     # (invert_vartime on the signature's s, public-point lincomb). Every operand
     # is public, so timing variability leaks nothing secret; no EC signing, ECDH
     # or secret-scalar path exists in openidconnect or the relay. No shipped
-    # binary except pohunek-relay links it, and xtask's dependency_policy test
-    # fails if any other crate reaches crypto-bigint 0.5. Remove this ignore once
+    # binary except pohunek-relay links it; xtask's dependency_policy test pins the
+    # exact parent edges into it and .clippy.toml bans the p256/p384 secret-key,
+    # signing and ECDH APIs. Remove this ignore, that test and those bans once
     # openidconnect releases on p256/p384 0.14 (crypto-bigint >= 0.7.6).
     "RUSTSEC-2026-0387",
 ]
