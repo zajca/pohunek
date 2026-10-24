@@ -27,7 +27,7 @@ This directory turns the product idea into implementation-oriented planning.
 
 The shipped protocol v4 product is an **owner-operated personal multi-host
 tool**: durable coding-agent sessions across the owner's machines locally or on
-a NetBird (WireGuard) network. The accepted, not-yet-implemented
+a NetBird (default) or Tailscale network. The accepted, not-yet-implemented
 [team relay RFC](design/team-relay-control-plane-rfc.md) adds an optional public
 multi-team control plane without replacing either owner path.
 
@@ -41,14 +41,15 @@ multi-team control plane without replacing either owner path.
   profile or custom owner-private home; it provides typed tools, generated
   skill, and best-effort lifecycle reporting without reading Hermes
   `state.db`.
-- Remote transport is **direct over NetBird**, not an SSH bridge.
-- Discovery is **tokenless NetBird-local** + live capability query (no signed
+- Remote transport is **direct over the configured overlay** (NetBird by
+  default, Tailscale opt-in), not an SSH bridge.
+- Discovery is **tokenless overlay-local** + live capability query (no signed
   manifests, no mesh crypto).
 - Control protocol: newline-delimited JSON over a Unix socket (local) and a TCP
-  listener bound to the NetBird interface (remote). Attach uses a **separate
+  listener bound to the overlay's address (remote). Attach uses a **separate
   raw-byte connection** per PTY.
-- Protocol v4 has no multi-user authorization; socket permissions and NetBird
-  are its owner trust boundary. The planned relay owns principals, service
+- Protocol v4 has no multi-user authorization; socket permissions and the
+  configured overlay are its owner trust boundary. The planned relay owns principals, service
   accounts, teams, roles, and session ACLs, while `pohunekd` enforces only the
   enrolled relay and host-approved `HostShare` ceilings.
 - The Rust SDK, native desktop app, and optional owner-path browser control

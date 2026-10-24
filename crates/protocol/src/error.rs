@@ -31,12 +31,12 @@ pub enum ErrorClass {
     Configuration,
     /// Daemon-level failures: unavailable, version mismatch, framing.
     Daemon,
-    /// Transport failures: `NetBird` unreachable, connection lost.
+    /// Transport failures: overlay unreachable, connection lost.
     Transport,
     /// Runtime failures: agent binary missing, PTY allocation, process exit,
     /// worktree conflict.
     Runtime,
-    /// Discovery failures: `NetBird` CLI missing, local state unavailable.
+    /// Discovery failures: overlay CLI missing, local state unavailable.
     Discovery,
     /// A class a newer daemon sent that this build does not know. Only the
     /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
@@ -717,7 +717,7 @@ impl ProtocolError {
 
     /// The canonical `daemon/remote_daemon_unavailable` error.
     ///
-    /// Raised when a `NetBird` TCP connection to the host opened, but no compatible
+    /// Raised when an overlay TCP connection to the host opened, but no compatible
     /// pohunek daemon answered on the control port. Names the host so the
     /// operator can investigate that specific peer. Code is stable:
     /// `remote_daemon_unavailable`.

@@ -20,20 +20,22 @@ Pohunek has two explicit trust domains:
 
 - **Owner paths, shipped today.** One operator controls a host through its
   owner-private Unix socket or directly through a configured private overlay.
-  NetBird is the production overlay. These paths require no central service and
-  remain supported when no relay is configured.
+  NetBird is the default overlay and Tailscale a supported opt-in overlay. These
+  paths require no central service and remain supported when no relay is
+  configured.
 - **Optional team relay, reduced foundation implemented.** `pohunek-relayd`
   provides PostgreSQL-backed fenced authority, recovery, protected local
   provisioning, generic OIDC authentication, and bounded HTTPS account and
   credential operations. Host enrollment, shares, routing, attach, team clients,
   and team administration remain deferred. Enrolling does not replace or require
-  NetBird.
+  an overlay.
 
 The following invariants span both domains:
 
 - **Host authority remains local.** Each `pohunekd` is authoritative for its own
   logical sessions, workers, PTYs, processes, worktrees, and host policy.
-- **Remote owner transport is direct over NetBird**, not an SSH bridge or relay
+- **Remote owner transport is direct over the configured overlay** (NetBird by
+  default, Tailscale opt-in), not an SSH bridge or relay
   fallback.
 - **Agents run PTY/TUI-first** in real terminals. Pohunek does not re-render an
   agent-specific protocol as its execution model.
@@ -105,7 +107,7 @@ The following invariants span both domains:
 - Treating direct-host execution under the daemon owner's Unix account as a
   hostile-workload sandbox. Container and VM execution profiles are tracked by
   [#88](https://github.com/zajca/pohunek/issues/88).
-- SSH bridging as the remote transport (NetBird direct transport replaces it).
+- SSH bridging as the remote transport (direct overlay transport replaces it).
 - A cryptographic owner mesh: signed manifests and replicated mesh state.
 - In-tree provider adapters in the core path (shell-out instead).
 - ACP as the first agent runtime (deferred; PTY/TUI-first).
@@ -118,8 +120,8 @@ The following invariants span both domains:
 ```text
   CLI (local)                         CLI (remote)
        |                                   |
-       | Unix socket                       | TCP over NetBird/WireGuard
-       | (resolved private runtime root)   | (daemon binds ONLY to 100.x iface)
+       | Unix socket                       | TCP over the configured overlay
+       | (resolved private runtime root)   | (daemon binds ONLY to the overlay IP)
        v                                   v
  +-----------------------------------------------------------+
  |               host control plane (pohunekd)               |
@@ -143,7 +145,7 @@ The host-local Pohunek service is authoritative for live work. `pohunekd` is the
 logical-session authority and public control plane; a `pohunek-sessiond` worker
 is authoritative for one live PTY generation. Owner paths have no shared mesh
 state or coordinator. A remote owner reaches a host daemon directly over
-NetBird using the same public protocol as the local Unix socket. Workers are
+the configured overlay using the same public protocol as the local Unix socket. Workers are
 never remotely addressable.
 
 ### Client boundary
@@ -205,7 +207,7 @@ from hostile same-UID control or replacement of the complete XDG state root:
 that remains within the owner trust domain.
 
 This host-local foundation does not change session ownership. Local Unix,
-direct NetBird/WireGuard owner access and owner-path browser clients
+direct overlay owner access and owner-path browser clients
 remain available. Local unenrollment does not stop PTYs, revoke those
 owner paths, or create a relay-local mode.
 
@@ -220,7 +222,7 @@ owner client -- Unix socket --> pohunekd --> pohunek-sessiond
 
 2. Direct owner mesh
 
-owner client -- NetBird TCP --> pohunekd --> pohunek-sessiond
+owner client -- overlay TCP --> pohunekd --> pohunek-sessiond
 
 3. Standalone host plus optional relay
 
@@ -410,7 +412,8 @@ Core responsibilities:
 - Record immutable launch-native references for explicit recovery.
 - Serve two listeners with one protocol:
   - a **Unix socket** for local clients;
-  - a **TCP listener bound to the NetBird interface** for remote clients.
+  - a **TCP listener bound to the configured overlay's address** for remote
+    clients.
 
 The daemon must not depend on libghostty and never owns or receives a PTY file
 descriptor. It proxies attach, input, resize, bounded screen/output observation,
@@ -643,7 +646,7 @@ transport classes:
 - **Remote:** one TCP listener per configured overlay, bound **only** to the
   provider's validated current local member address and per-overlay port, never
   `0.0.0.0`. Reachability and authentication are provided by that overlay;
-  NetBird/WireGuard is the default production provider.
+  NetBird is the default provider and Tailscale a supported opt-in provider.
 
 The control protocol is **newline-delimited JSON**: one JSON request per line,
 one JSON response line for ordinary requests. Long-lived subscriptions keep the
@@ -674,7 +677,7 @@ serves release N-1's public protocol next to its own (today `3..=4`). The Rust
 client and the CLI advertise the same window: `CLIENT_PROTOCOL_VERSIONS` is
 `SUPPORTED_PROTOCOL_VERSIONS`, so the window has one definition. A client of
 release N against a daemon that only speaks N-1 (a staggered multi-host
-upgrade over NetBird) therefore negotiates N-1 and translates through the same
+upgrade over an overlay) therefore negotiates N-1 and translates through the same
 adapter the daemon uses, in the opposite direction. The TypeScript SDK
 advertises the same window (its constants are generated from the Rust ones) and
 carries a port of the adapter in `sdk/ts/sdk/src/compat.ts`. The port is checked
@@ -924,7 +927,7 @@ connection. Attach uses a **separate connection**:
    attached without escaping the byte stream.
 
 This keeps JSON as JSON and bytes as bytes, is trivial to debug, and maps cleanly
-onto both the Unix socket and the NetBird TCP transport. Multiple clients may
+onto both the Unix socket and the overlay TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
 
@@ -1445,7 +1448,7 @@ can still bypass or alter same-user files. The plugin accepts no raw argv,
 arbitrary daemon method, arbitrary endpoint, raw attach stream, force flag, or
 environment map. It invokes a single fixed-argv CLI JSON runner and passes
 untrusted prompt/input text only on standard input. Remote requests remain
-direct connections to the selected host daemon over NetBird; no plugin listener,
+direct connections to the selected host daemon over its overlay; no plugin listener,
 proxy, SSH bridge, or central service is introduced.
 
 Read tools expose hosts, sessions, inspect, rendered screen, bounded output,
@@ -1896,9 +1899,10 @@ that remain are cheap, free-by-default, or inherited:
 
 - **Local socket** in a `0700` directory with mode `0600`: owner-private, no
   authorization system needed.
-- **Remote listener bound only to the NetBird interface**, never `0.0.0.0`.
-  NetBird/WireGuard provides encryption and network authentication; NetBird
-  policies decide which peers can reach the daemon port.
+- **Remote listener bound only to the configured overlay's address**, never
+  `0.0.0.0`. The overlay (WireGuard in both NetBird and Tailscale) provides
+  encryption and network authentication; the overlay's policy (NetBird policies,
+  tailnet ACLs) decides which peers can reach the daemon port.
 - **Origin-session guard.** Requests from managed children carry paired
   `origin_session_id` and `origin_daemon_id` envelope markers. When both identify
   the target as the caller's origin, the daemon rejects exactly `session.stop`,
@@ -1974,13 +1978,13 @@ terminal content. Useful signals:
   loss/conflict, and explicit native recovery.
 - PTY allocation, resize, stream errors, worker protocol versions, and
   controller reconnect latency.
-- NetBird discovery runs and candidate/capability results. The CLI can discover
+- Overlay discovery runs and candidate/capability results. The CLI can discover
   locally without `pohunekd`; daemon discovery remains available for browser and other RPC consumers.
 - Agent state transitions with their `source`.
 - Latency for CLI commands, attach, discovery, and remote connections.
 
-`pohunek doctor` reports environment, daemon, NetBird, agent CLI, and storage
-health for humans and operator agents.
+`pohunek doctor` reports environment, daemon, each configured overlay, agent CLI,
+and storage health for humans and operator agents.
 
 ## Error Handling
 
@@ -1990,9 +1994,9 @@ health for humans and operator agents.
 - Provide suggested recovery commands when known.
 - Return structured error data for `--json` commands.
 - Distinguish error classes: configuration, daemon (unavailable, version
-  mismatch, framing), transport (NetBird unreachable, connection lost), runtime
+  mismatch, framing), transport (overlay unreachable, connection lost), runtime
   (agent binary missing, PTY allocation, process exit, worktree conflict), and
-  discovery (NetBird CLI missing, local state unavailable).
+  discovery (overlay CLI missing, local state unavailable).
 
 ### Unknown enum values from a newer daemon
 
@@ -2114,9 +2118,10 @@ Integration and E2E obligations:
   output, and exit status.
 - Local daemon + CLI full session lifecycle driving the real `pohunekd`,
   `pohunek-sessiond`, and `pohunek` binaries.
-- Remote daemon over NetBird (or a loopback TCP stand-in) reusing the same
+- Remote daemon over an overlay (or a loopback TCP stand-in) reusing the same
   protocol; attach/detach without killing the remote process.
-- Tokenless NetBird discovery from `netbird status --json` fixtures, with
+- Tokenless NetBird and Tailscale discovery from `netbird status --json` and
+  `tailscale status --json` fixtures, with
   graceful degradation when the CLI/state is absent.
 - Structured logs and event-log records for important transitions.
 
@@ -2133,8 +2138,13 @@ Integration and E2E obligations:
   automatically kill an ambiguous live worker.
 - **NetBird local state format drift.** Mitigation: defensive parsing + recorded
   fixtures; shell out to the documented `status --json` rather than internals.
-- **Daemon as a network server on NetBird.** Mitigation: bind only to the NetBird
-  interface; rely on NetBird policies; no `0.0.0.0`.
+- **Tailscale status format drift.** Mitigation: the `tailscale status --json`
+  format is documented upstream as subject to change; the parser reads only the
+  fields it needs, tolerates unknown fields, and is pinned with spec-derived
+  fixtures.
+- **Daemon as a network server on an overlay.** Mitigation: bind only to the
+  overlay's address; rely on the overlay's policy (NetBird policies, tailnet
+  ACLs); no `0.0.0.0`.
 - **Worktree cleanup conflicts.** Mitigation: explicit session ownership and
   recorded bindings; ownership checks before reuse/cleanup.
 - **Embedded terminal maturity.** Mitigation: the CLI attach path needs no embedded terminal; the native GUI
@@ -2147,8 +2157,8 @@ Integration and E2E obligations:
 | Area | Original plan | This revision |
 |------|---------------|---------------|
 | Scope | Multi-host, team-capable | Owner-first direct operation plus an accepted optional multi-team relay |
-| Remote transport | SSH bridge | Direct over NetBird/WireGuard |
-| Discovery | Tailscale + NetBird + signed manifests | NetBird-local + live capability query |
+| Remote transport | SSH bridge | Direct over the configured overlay (NetBird default, Tailscale opt-in) |
+| Discovery | Tailscale + NetBird + signed manifests | Overlay-local status + live capability query |
 | Mesh trust | Signed manifests, key rotation, snapshot sync | Owner paths use overlay + filesystem permissions; relay uses explicit enrollment and local `HostShare` ceilings |
 | Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation implemented in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity for parent state; hooks capture recovery identity and durable Claude/Codex subagent lifecycle |

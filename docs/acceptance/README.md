@@ -206,14 +206,14 @@ judged by the shell script and no evidence is written by hand.
 |-----|----------------|
 | `vms` | Two qemu VMs on a closed lab link, one running Headscale, both running a kernel-TUN `tailscaled` and a service-installed daemon with `providers = ["tailscale"]` and `port = 18733`. D4 in both directions: `doctor`, the single listener on the node's own address, `host list`, `host discover`, `host inspect`, `--host` with the short name, the FQDN, `tailscale:<name>` and `tailscale:peer~<unpadded base64url of the node id>`, `session new/input/screen`, `attach`, the SDK control path (`crates/client/examples/overlay_probe.rs`: registry, `resolve_host_target_in`, `Client::connect_with_registry`, handshake, `session.list`, `daemon_doctor`, `session_screen`), and `session stop/rm`. Recorded, never gating: the D7 unreachable hint (peer daemon stopped) and the D5 rebind (`tailscale down` then `up`, no daemon restart): after `down` the harness waits up to 90 s for the daemon's "overlay state unavailable; serving local-only" journal line, only then runs `up`, waits up to 180 s (the daemon rebinds on a retry backoff of 5 s doubling) for a fresh "serving control protocol over overlay" line and for a remote `health` from the peer. The rebind and the peer health gate the run; the drop line is recorded without gating. The daemon revalidates its listener every 30 s, so a short outage between two checks is, correctly, not logged. |
 | `netbird` | The absent `overlays.toml` default (NetBird, port 18722) with a throwaway daemon in a clean environment under `/dev/shm/ph1112`, a path guard before anything starts, and the owner's daemon PID, NetBird peer counts and `health` checked unchanged before and after. |
-| `macos` | zajcaair without root: the D6 trusted-CLI lookup with no `tailscaled` (found through `/opt/homebrew/bin`, state unavailable, `host list` fails, no listener on 18733) and the userspace-networking fail-closed path (`BackendState=Running`, `TUN=false`: doctor warns, `host list` fails with `tailscale_state_unavailable`, no listener). Needs `vms` because Headscale runs in VM-A. |
+| `macos` | zajcaair without root. Designed to prove the D6 trusted-CLI lookup with no `tailscaled` and the userspace-networking fail-closed path (`BackendState=Running`, `TUN=false`: doctor warns, `host list` fails with `tailscale_state_unavailable`, no listener). What the recorded run proved is narrower: Tailscale is **not supported on macOS in 0.37**. The stock Apple-Silicon Homebrew directory `/opt/homebrew/bin` is admin group-writable, so the trusted-executable policy refuses the `tailscale` binary there: `host list` fails with `tailscale_cli_missing`, the doctor reports `tailscale_cli` as `fail`, and the daemon binds no listener (tracked in [#1583](https://github.com/zajca/pohunek/issues/1583)). The userspace sub-step did not run (`headscale_unreachable_from_macos`), so the evidence holds no macOS status recording, and its overall verdict is `failed` for that leg alone. Needs `vms` because Headscale runs in VM-A. |
 
 The userspace sub-step reaches the Tailscale CLI through a test shim: the CLI
 has no environment override for its socket, and only root can create the
 default darwin socket, so an owner-private wrapper in the throwaway `bin`
 directory runs `tailscale --socket=<throwaway>`. The evidence labels it as
 such. A full macOS tailnet node with a root `tailscaled` is not part of this
-run.
+run, and macOS is not a supported Tailscale platform in 0.37.
 
 ### Prerequisites
 
@@ -428,8 +428,8 @@ binary, the qemu and kernel versions), `verdict`, `inconclusive`, `checks`
 (`leg`, `name`, `status` of `passed`, `failed` or `missing`, `detail`, `gating`,
 `substep`), `steps` (per leg: `argv`, `rc`, `at`, `stdout`, `stderr` and
 `truncated`, each stream cut at 16 KiB) and `recordings`, the redacted real
-`tailscale status --json` of a Linux kernel-TUN node and of the macOS userspace
-node.
+`tailscale status --json` of a Linux kernel-TUN node (a macOS userspace recording
+exists only when that sub-step ran).
 
 Secrets never reach the document. Node and WireGuard keys, `AuthURL` values and
 endpoint lists are redacted; the owner's NetBird addresses become

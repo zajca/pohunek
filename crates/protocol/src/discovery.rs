@@ -1,13 +1,13 @@
 //! Host discovery payloads.
 //!
 //! These types define the JSON shape carried by `host.discover` (see
-//! `crate::method::HOST_DISCOVER`). Discovery enumerates the local host's `NetBird`
-//! peers and classifies each by probing its daemon control port, so the operator
+//! `crate::method::HOST_DISCOVER`). Discovery enumerates the peers of the host's
+//! configured overlay and classifies each by probing its daemon control port, so the operator
 //! (and any host-switching client) sees which peers run a compatible daemon.
 //!
 //! The CLI performs peer enumeration plus bounded concurrent probing directly,
 //! using a short owner-private persistent cache; it therefore needs local
-//! `NetBird` state but not a local daemon. The daemon retains this RPC and its
+//! overlay state but not a local daemon. The daemon retains this RPC and its
 //! own memory cache for web and other protocol clients.
 //!
 //! Like every other protocol payload these are additive: unknown fields are
@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How a `NetBird` peer is classified for `host.discover`.
+/// How an overlay peer is classified for `host.discover`.
 ///
 /// Serializes with an internal `classification` tag so a `--json` consumer
 /// can branch on it, e.g.
@@ -38,10 +38,10 @@ pub enum HostClass {
         /// The protocol version the peer's daemon reported.
         daemon_protocol_version: u32,
     },
-    /// The peer advertises a NetBird-range IP but its daemon port could not be
+    /// The peer advertises an overlay-range IP but its daemon port could not be
     /// reached, or it returned no usable health response.
     Unreachable,
-    /// The peer had no NetBird-range IP to dial, so it was not probed.
+    /// The peer had no overlay-range IP to dial, so it was not probed.
     Candidate,
 }
 
@@ -62,7 +62,8 @@ pub struct HostRecord {
     pub port: u16,
     /// Which overlay transport discovered this peer (e.g. `"netbird"`).
     pub overlay: String,
-    /// The overlay's stable provider peer identity (e.g. a `NetBird` public key).
+    /// The overlay's stable provider peer identity (e.g. a `NetBird` public key or
+    /// a Tailscale node ID).
     pub peer_id: Option<String>,
     /// Whether this record is the machine that enumerated the hosts rather than
     /// a peer. Omitted when `false`, so a peer record is unchanged on the wire
@@ -99,7 +100,7 @@ pub struct HostDiscoverParams {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostResolveParams.ts"))]
 pub struct HostResolveParams {
-    /// The host route as `--host` accepts it: a short name, an FQDN, a `NetBird`
+    /// The host route as `--host` accepts it: a short name, an FQDN, an overlay
     /// IP, an identity selector (`peer~<id>`, `fqdn~<name>`), an
     /// `<overlay>:`-qualified form, each optionally followed by `@<port>`.
     pub route: String,

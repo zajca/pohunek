@@ -158,7 +158,7 @@ only in `zajca/pohunek-work`.
 Pohunek has an [optional team-relay design](team-relay.md) with an implemented
 reduced foundation. The PostgreSQL-backed relay provides fencing, recovery,
 protected initial provisioning, generic OIDC browser/device authentication, and
-bounded HTTPS account and credential lifecycle. Standalone and direct NetBird
+bounded HTTPS account and credential lifecycle. Standalone and direct overlay
 modes remain independent. Host links, `HostShare`, session origin, routing,
 attach, team administration, and the team WebUI remain deferred. The relay has
 no local mode; its future team WebUI and any owner-path browser client use

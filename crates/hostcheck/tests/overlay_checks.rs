@@ -98,7 +98,10 @@ fn a_missing_cli_fails_only_for_an_overlay_the_file_lists() {
         failed(
             "headscale",
             18722,
-            OverlayError::ListenerAddressMissing(id("headscale")),
+            OverlayError::ListenerAddressMissing {
+                overlay: id("headscale"),
+                reason: None,
+            },
         ),
     ];
 
@@ -127,7 +130,10 @@ fn listener_checks_round_trip_their_overlay_and_port() {
         failed(
             "tailscale",
             9732,
-            OverlayError::ListenerAddressMissing(id("tailscale")),
+            OverlayError::ListenerAddressMissing {
+                overlay: id("tailscale"),
+                reason: None,
+            },
         ),
     ];
     let mut checks = overlay_checks::listener_checks(OverlayChecks {

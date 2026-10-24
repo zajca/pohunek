@@ -66,8 +66,8 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    to change this result.
 6. For remote hosts, run `pohunek host inspect <host> --json` and confirm the
    host daemon responds through the remote transport.
-   If the remote daemon started before NetBird was ready, allow one retry
-   interval for its NetBird-only listener to become available, then repeat the
+   If the remote daemon started before the overlay was ready, allow one retry
+   interval for its overlay-only listener to become available, then repeat the
    inspection and check its logs for `serving control protocol over overlay`.
    A daemon restart is not required for this startup ordering. If a listener
    supervisor exits or panics unexpectedly, the daemon logs

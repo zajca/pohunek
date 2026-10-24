@@ -52,7 +52,7 @@ try {
 }
 ```
 
-For a direct NetBird TCP daemon address, preserve the logical host name in the
+For a direct overlay TCP daemon address, preserve the logical host name in the
 first argument and pass the dial address separately:
 
 ```ts
@@ -297,7 +297,7 @@ only; against a daemon of the previous release the calls fail with
 ## WebSocket Relay
 
 Browsers use the relay transport because they cannot dial daemon sockets or
-NetBird TCP directly:
+overlay TCP directly:
 
 ```ts
 import { Client, attachRawWs } from "@pohunek/sdk";

@@ -570,10 +570,13 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
             format!("{overlay} configuration is invalid: {detail}"),
             Some("fix the overlay configuration and restart the command".to_owned()),
         ),
-        overlay::OverlayError::ListenerAddressMissing(_) => ProtocolError::new(
+        overlay::OverlayError::ListenerAddressMissing { reason, .. } => ProtocolError::new(
             ErrorClass::Discovery,
             format!("{overlay}_listener_address_missing"),
-            format!("{overlay} has no safe local listener address"),
+            match reason {
+                Some(reason) => format!("{overlay} has no safe local listener address: {reason}"),
+                None => format!("{overlay} has no safe local listener address"),
+            },
             Some(format!(
                 "ensure {overlay} is connected and has a current member address; run `pohunek doctor`"
             )),

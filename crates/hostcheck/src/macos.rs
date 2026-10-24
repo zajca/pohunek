@@ -2234,7 +2234,10 @@ mod tests {
             overlay: netbird.clone(),
             port: 18722,
             listener: None,
-            error: Some(overlay::OverlayError::ListenerAddressMissing(netbird)),
+            error: Some(overlay::OverlayError::ListenerAddressMissing {
+                overlay: netbird,
+                reason: None,
+            }),
         }];
         let inputs = StandardCheckInputs {
             socket_dir: &base.join("runtime"),

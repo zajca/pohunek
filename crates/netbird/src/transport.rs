@@ -52,7 +52,10 @@ impl OverlayTransport for NetbirdTransport {
             let status = load_status(self.id()).await?;
             status
                 .self_netbird_ip()
-                .ok_or_else(|| OverlayError::ListenerAddressMissing(self.id.clone()))
+                .ok_or_else(|| OverlayError::ListenerAddressMissing {
+                    overlay: self.id.clone(),
+                    reason: None,
+                })
         })
     }
 

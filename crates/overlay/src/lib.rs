@@ -77,8 +77,17 @@ pub enum OverlayError {
         detail: String,
     },
     /// Current provider state has no safe local listener address.
-    #[error("overlay {0} has no safe local listener address")]
-    ListenerAddressMissing(OverlayId),
+    #[error(
+        "overlay {overlay} has no safe local listener address{}",
+        reason_suffix(reason.as_deref())
+    )]
+    ListenerAddressMissing {
+        /// Stable overlay identifier.
+        overlay: OverlayId,
+        /// Bounded, non-secret reason the provider gives for having no address,
+        /// when it knows one.
+        reason: Option<String>,
+    },
 }
 
 impl OverlayError {
@@ -91,9 +100,14 @@ impl OverlayError {
             | Self::StateUnavailable { overlay, .. }
             | Self::InvalidConfig { overlay, .. }
             | Self::CliMissing(overlay)
-            | Self::ListenerAddressMissing(overlay) => overlay,
+            | Self::ListenerAddressMissing { overlay, .. } => overlay,
         }
     }
+}
+
+/// Renders an optional reason as the `: <reason>` tail of an error message.
+fn reason_suffix(reason: Option<&str>) -> String {
+    reason.map_or_else(String::new, |reason| format!(": {reason}"))
 }
 
 /// Errors raised while constructing or querying a registry.

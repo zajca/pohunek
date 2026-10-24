@@ -127,6 +127,26 @@ impl Host {
         })
     }
 
+    /// The detail of the daemon's `overlay_tailscale_listener` check, once the
+    /// daemon answers `daemon.doctor` with its overlay report.
+    fn listener_check_detail(&self) -> String {
+        poll_until("the daemon to report its listener check", || {
+            let output = self
+                .env
+                .command(bin_exe("pohunek"))
+                .env("PATH", self.fake.bin_dir())
+                .args(["doctor", "--json"])
+                .output()
+                .expect("run doctor");
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+            document["ok"]["checks"]
+                .as_array()?
+                .iter()
+                .find(|check| check["name"] == "overlay_tailscale_listener")
+                .and_then(|check| check["detail"].as_str().map(str::to_owned))
+        })
+    }
+
     fn log_text(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -271,6 +291,41 @@ fn an_unsafe_listener_address_is_never_bound() {
             });
         }
     });
+}
+
+/// The daemon's listener check names why a node has no address, and nothing is
+/// bound, for each state that cannot carry overlay traffic.
+#[test]
+fn the_listener_check_names_why_the_node_has_no_address() {
+    let ipv6_only = Node::peer("self-box", "nSELF00001CNTRL", &["fd7a:115c:a1e0::7"]);
+    let cases: Vec<(&str, Status, &str)> = vec![
+        (
+            "userspace networking",
+            unsafe_state().userspace(),
+            "userspace networking",
+        ),
+        (
+            "a stopped node",
+            unsafe_state().with_state("Stopped"),
+            "not running (state: Stopped)",
+        ),
+        (
+            "no IPv4 address",
+            usable().with_this(ipv6_only),
+            "no IPv4 node address",
+        ),
+    ];
+    for (label, status, reason) in cases {
+        let host = Host::new(true);
+        host.fake.install(&status);
+        let _daemon = host.start();
+        let detail = host.listener_check_detail();
+        assert!(
+            detail.contains(&format!("port={PORT};")) && detail.contains(reason),
+            "{label}: {detail}"
+        );
+        assert!(host.binds().is_empty(), "{label}: nothing is bound");
+    }
 }
 
 /// An overlay the owner listed keeps retrying while its CLI is missing, binds

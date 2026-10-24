@@ -141,7 +141,7 @@ export class ClientError extends Error {
 
   public static hostUnreachable(host: string, source: unknown): ClientError {
     const detail = messageFromUnknown(source);
-    const msg = `could not open a NetBird connection to host '${host}': ${detail}`;
+    const msg = `could not open an overlay connection to host '${host}': ${detail}`;
     return new ClientError(
       "hostUnreachable",
       msg,

@@ -30,7 +30,8 @@ Start here:
   pinned upstream runtime releases are installed and verified from the
   compatibility locks and committed npm lockfiles.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
-  and [remote hosts](guides/remote-hosts.md)
+  [remote hosts](guides/remote-hosts.md), and the
+  [Tailscale overlay](guides/tailscale.md)
   cover common configuration paths. The
   [runtime packages guide](guides/runtime-packages.md) covers installing,
   updating, selecting, disabling, and removing runtime packages with

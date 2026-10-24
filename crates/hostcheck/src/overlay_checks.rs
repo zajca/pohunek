@@ -139,7 +139,15 @@ fn cli_check(diagnostic: &OverlayDiagnostic, from_file: bool) -> DoctorCheck {
                  optional (remote hosts need it)"
             ),
         ),
-        Some(OverlayError::ListenerAddressMissing(_)) => DoctorCheck::new(
+        Some(OverlayError::ListenerAddressMissing {
+            reason: Some(reason),
+            ..
+        }) => DoctorCheck::new(
+            name,
+            DoctorStatus::Warn,
+            format!("the {id} CLI answered, but no {id} address can be used: {reason}"),
+        ),
+        Some(OverlayError::ListenerAddressMissing { reason: None, .. }) => DoctorCheck::new(
             name,
             DoctorStatus::Warn,
             format!("the {id} CLI answered, but no {id} address resolved (not logged in or daemon down)"),

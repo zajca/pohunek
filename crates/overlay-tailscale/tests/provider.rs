@@ -107,7 +107,7 @@ async fn the_listener_address_is_the_nodes_ipv4_address_or_nothing() {
         assert!(
             matches!(
                 transport.listener_addr().await,
-                Err(OverlayError::ListenerAddressMissing(_))
+                Err(OverlayError::ListenerAddressMissing { .. })
             ),
             "{label}: no listener address"
         );

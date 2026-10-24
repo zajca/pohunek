@@ -56,8 +56,9 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   there is no coordinator, no SaaS, no state sync.
 - Remote transport is one TCP listener per configured overlay, bound **only**
   to that provider's validated member address and port, never `0.0.0.0`.
-  NetBird/WireGuard is the default provider; local access is an owner-only Unix
-  socket.
+  NetBird is the default provider and Tailscale a supported opt-in provider
+  (see the [Tailscale guide](knowledge/guides/tailscale.md)); local access is an
+  owner-only Unix socket.
 - **Tokenless discovery**: `pohunek host discover` aggregates configured
   overlay peers and probes which run a reachable daemon. It needs provider-local
   state but not local `pohunekd`, and uses a short owner-private cache;
@@ -155,8 +156,8 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
 ```text
   CLI / client (local)                CLI / client (remote)
        |                                   |
-       | Unix socket                       | TCP over NetBird/WireGuard
-       | (resolved private runtime root)   | (daemon binds ONLY to the 100.x iface)
+       | Unix socket                       | TCP over the configured overlay
+       | (resolved private runtime root)   | (daemon binds ONLY to the overlay IP)
        v                                   v
  +-----------------------------------------------------------+
  |                    host daemon (pohunekd)                  |
@@ -193,7 +194,7 @@ recovery metadata.
 pohunek is built for **one operator on machines they own**:
 
 - Local access control is owner-only socket and file permissions.
-- Remote access control is your NetBird/WireGuard network and its policies;
+- Remote access control is your overlay's policy (NetBird policies, tailnet ACLs);
   the daemon never binds a public interface.
 - There is no multi-user auth, no hosted control plane, and no tenant model —
   by design, not omission.

@@ -22,7 +22,7 @@ of the current release speak `3..=4`, so they also work against a daemon that on
 speaks v3, and so do TypeScript SDK clients (see "Mixed releases across hosts"
 below). A client and a daemon more than one release apart are refused.
 Before replacing any component, inventory every CLI, SDK, custom client, managed
-hook and local or NetBird-reachable daemon that must talk to another peer. Drain
+hook and local or overlay-reachable daemon that must talk to another peer. Drain
 cross-host automation, upgrade the daemons first, and then verify every host with
 `pohunek health --json` and `pohunek host inspect <host> --json`. The reported
 `protocol_version` is the version negotiated for that connection (`4` for a
@@ -123,7 +123,7 @@ start or a launch.
 ## Mixed releases across hosts
 
 During a staggered multi-host upgrade a CLI of the current release may talk to a
-daemon of the previous release on another host over NetBird. Nothing has to be
+daemon of the previous release on another host over an overlay. Nothing has to be
 upgraded in one pass for that pair. The CLI and Rust client advertise the protocol
 window `3..=4`; the older daemon answers in protocol 3 and the client translates
 requests, results and subscription events through the same shape-only adapter the

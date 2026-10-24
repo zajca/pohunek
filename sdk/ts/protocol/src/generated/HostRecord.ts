@@ -28,7 +28,8 @@ export type HostRecord =
      */
     overlay: string;
     /**
-     * The overlay's stable provider peer identity (e.g. a `NetBird` public key).
+     * The overlay's stable provider peer identity (e.g. a `NetBird` public key or
+     * a Tailscale node ID).
      */
     peer_id: string | null;
     /**

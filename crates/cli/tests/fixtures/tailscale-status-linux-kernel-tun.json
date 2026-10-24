@@ -1,0 +1,130 @@
+{
+  "Version": "1.104.2-tc3430f0d2-g598b63867",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "<redacted>",
+  "TailscaleIPs": [
+    "100.64.0.1",
+    "fd7a:115c:a1e0::1"
+  ],
+  "Self": {
+    "ID": "1",
+    "NodeID": 1,
+    "PublicKey": "<redacted>",
+    "HostName": "ph-a",
+    "DNSName": "ph-a.ts.lab.internal.",
+    "OS": "linux",
+    "UserID": 1,
+    "TailscaleIPs": [
+      "100.64.0.1",
+      "fd7a:115c:a1e0::1"
+    ],
+    "AllowedIPs": [
+      "100.64.0.1/32",
+      "fd7a:115c:a1e0::1/128"
+    ],
+    "Addrs": [
+      "<redacted>"
+    ],
+    "CurAddr": "<redacted>",
+    "Relay": "<redacted>",
+    "PeerRelay": "<redacted>",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "2026-10-24T10:08:44.236894699Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "Active": false,
+    "PeerAPIURL": [
+      "http://100.64.0.1:58436",
+      "http://[fd7a:115c:a1e0::1]:59780"
+    ],
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "Capabilities": [
+      "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+      "default-auto-update",
+      "https://tailscale.com/cap/file-sharing",
+      "https://tailscale.com/cap/is-admin",
+      "https://tailscale.com/cap/ssh"
+    ],
+    "CapMap": {
+      "default-auto-update": [
+        false
+      ],
+      "https://tailscale.com/cap/file-sharing": [],
+      "https://tailscale.com/cap/is-admin": [],
+      "https://tailscale.com/cap/ssh": []
+    },
+    "InNetworkMap": true,
+    "InMagicSock": false,
+    "InEngine": false
+  },
+  "Health": [
+    "Tailscale could not connect to the 'ph lab embedded' relay server. Your Internet connection might be down, or the server might be temporarily unavailable."
+  ],
+  "MagicDNSSuffix": "ts.lab.internal",
+  "CurrentTailnet": {
+    "Name": "10.77.0.1",
+    "StableID": "",
+    "MagicDNSSuffix": "ts.lab.internal",
+    "MagicDNSEnabled": true
+  },
+  "CertDomains": null,
+  "ExtraRecords": null,
+  "Peer": {
+    "<redacted-key>": {
+      "ID": "2",
+      "NodeID": 2,
+      "PublicKey": "<redacted>",
+      "HostName": "ph-b",
+      "DNSName": "ph-b.ts.lab.internal.",
+      "OS": "linux",
+      "UserID": 1,
+      "TailscaleIPs": [
+        "100.64.0.2",
+        "fd7a:115c:a1e0::2"
+      ],
+      "AllowedIPs": [
+        "100.64.0.2/32",
+        "fd7a:115c:a1e0::2/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "<redacted>",
+      "Relay": "<redacted>",
+      "PeerRelay": "<redacted>",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-10-24T10:08:47.720659101Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.0.2:46590",
+        "http://[fd7a:115c:a1e0::2]:47166"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false
+    }
+  },
+  "User": {
+    "1": {
+      "ID": 1,
+      "LoginName": "ph",
+      "DisplayName": "ph"
+    }
+  },
+  "ClientVersion": null
+}

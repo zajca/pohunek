@@ -78,7 +78,7 @@ same fail-closed repository behavior applies on APFS. Runtime cleanup never
 removes the host directory or its records.
 
 Local unenrollment does not stop a PTY, remove the owner Unix socket, disable a
-direct NetBird/WireGuard owner route, or prevent an owner-path client from
+direct overlay owner route, or prevent an owner-path client from
 continuing to inspect and operate their existing owner surfaces.
 
 ## Doctor and recovery
@@ -96,7 +96,7 @@ Exact signed projection evidence can restore only a
 lifecycle rather than assuming `active`. `HostIdentityClone` and
 `EnrollmentConflict` remain quarantined until explicit local unenrollment or a
 future authoritative resolution; neither outcome changes existing local Unix or
-direct NetBird owner access, live sessions, or PTYs. The relay has no local mode
+direct overlay owner access, live sessions, or PTYs. The relay has no local mode
 and no authority over those owner paths.
 
 For daemon startup and storage diagnostics, use [debug daemon](../runbooks/debug-daemon.md).
