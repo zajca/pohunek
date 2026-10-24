@@ -9777,6 +9777,8 @@ mod tests {
     )]
     /// Sends `frames` as attach input to a PTY whose program prints a probe and
     /// dumps the next `count` bytes of its input as hex, and returns the dump.
+    /// The program then blocks on input, so the stream stays open until the
+    /// test has seen every ack and `:END`.
     async fn attach_input_dump(frames: &[&[u8]], count: usize) -> String {
         let owner = crate::LeaseOwner {
             daemon_id: "daemon-probe".to_owned(),
@@ -9788,7 +9790,7 @@ mod tests {
         config.answer_program_status_probe = true;
         let script = format!(
             "stty raw -echo; printf '\\033]7501;?\\033\\\\'; printf ARMED; printf 'DUMP:'; \
-             head -c {count} | od -An -v -tx1 | tr -d ' \\n'; printf ':END'"
+             head -c {count} | od -An -v -tx1 | tr -d ' \\n'; printf ':END'; cat >/dev/null"
         );
         let pty = super::spawn_pty(
             crate::Command {
@@ -9834,7 +9836,12 @@ mod tests {
         let mut output = Vec::new();
         let mut read_until =
             async |client_out: &mut tokio::io::DuplexStream,
-                   done: &dyn Fn(&[u8], &FrameKind) -> bool| {
+                   done: &dyn Fn(&[u8], Option<&FrameKind>) -> bool| {
+                // The output collected by an earlier wait can already satisfy
+                // `done`, and the program prints nothing after `:END`.
+                if done(&output, None) {
+                    return;
+                }
                 loop {
                     let frame = tokio::time::timeout(
                         Duration::from_secs(10),
@@ -9850,7 +9857,7 @@ mod tests {
                     ) {
                         output.extend_from_slice(frame.payload());
                     }
-                    if done(&output, &frame.header().kind) {
+                    if done(&output, Some(&frame.header().kind)) {
                         return;
                     }
                 }
@@ -9883,7 +9890,7 @@ mod tests {
             .expect("encode input frame");
             client_in.write_all(&encoded).await.expect("send input");
             read_until(&mut client_out, &|_, kind| {
-                matches!(kind, FrameKind::InputAck { write_id: acked, .. } if *acked == write_id)
+                matches!(kind, Some(FrameKind::InputAck { write_id: acked, .. }) if *acked == write_id)
             })
             .await;
         }
