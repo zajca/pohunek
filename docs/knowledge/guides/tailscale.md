@@ -2,7 +2,7 @@
 type: Guide
 id: guide/tailscale
 title: Tailscale overlay
-description: Run Pohunek hosts over a tailnet instead of NetBird, with the Tailscale client on Linux or macOS, the selectors that name a peer, and the error codes that explain a failure.
+description: Run Pohunek hosts over a tailnet instead of NetBird, on Linux (macOS is not supported yet), the selectors that name a peer, and the error codes that explain a failure.
 source_kind: manual
 intents: [setup, debug, help]
 ---
@@ -45,18 +45,20 @@ Pohunek never starts, stops or logs in Tailscale. It only runs
   of its service manager: when the client lives in `/usr/local/bin`, make sure
   that directory is on it, and check the `tailscale_cli` entry of `pohunek
   doctor`, which reports what the daemon itself finds.
-- **macOS.** Install the client with Homebrew (`brew install tailscale`). Pohunek
-  finds `/opt/homebrew/bin/tailscale` after the process `PATH` (the trusted
-  install directories include `/opt/homebrew/bin` and `/usr/local/bin`), and refuses a binary or directory another account can write. The
-  Homebrew client needs a running `tailscaled` with a kernel interface: starting
-  it as root (for example `sudo brew services start tailscale`) is your choice,
-  and Pohunek does not do it. The App Store and standalone builds are not
-  supported: their command-line tool lives inside an application bundle that the
-  trusted lookup does not accept.
+- **macOS is not supported in 0.37.** Pohunek runs only a `tailscale` binary
+  from a directory that no other account can write. The stock Apple-Silicon
+  Homebrew directory `/opt/homebrew/bin` is writable by the admin group, so the
+  binary there is refused: `host list` fails with `tailscale_cli_missing`, the
+  doctor reports `tailscale_cli` as `fail`, and the daemon binds no listener. The
+  App Store and standalone builds are refused too, because their command-line
+  tool lives inside an application bundle. A Mac keeps working over NetBird and
+  reaches Tailscale hosts only through a Linux host. Support is tracked in
+  [#1583](https://github.com/zajca/pohunek/issues/1583).
 - **Headscale and other control servers.** Pohunek reads only the local client's
   status, so a self-hosted control server needs no Pohunek setting. Point the
   client at it (`tailscale up --login-server=<url>`) and keep the rest of this
-  guide.
+  guide. The 0.37 acceptance run used Headscale v0.29.5 with Tailscale 1.104.2
+  clients on Linux (`docs/acceptance/1112-tailscale-overlay.json`).
 
 ## What the host must look like
 
@@ -144,7 +146,7 @@ and `overlay_config`, and names the reason a node has no usable address.
 
 | Code or check | Cause | Fix |
 |---|---|---|
-| `tailscale_cli_missing` | no trusted `tailscale` on the search path | install the client; on Linux put it on the daemon's `PATH`; on macOS use Homebrew or fix the ownership of the directory |
+| `tailscale_cli_missing` | no trusted `tailscale` on the search path | install the client; on Linux put it on the daemon's `PATH`; macOS is not supported in 0.37 |
 | `tailscale_state_unavailable` | `tailscale status` failed, printed something unreadable, or the node is not running on a kernel interface | read the message: start `tailscaled`, log in, or stop using userspace networking |
 | `tailscale_listener_address_missing` | the node has no IPv4 address Pohunek may bind | the same causes; the message names the reason |
 | `host_unknown` | the peer is expired, not in the network map or a `ShareeNode` | check `tailscale status` on this host |

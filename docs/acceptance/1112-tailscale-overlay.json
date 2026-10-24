@@ -1,0 +1,1879 @@
+{
+  "schema": "pohunek.acceptance.tailscale-overlay",
+  "schema_version": 1,
+  "issue": 1112,
+  "generated": "2026-10-24T10:12:15Z",
+  "started": "2026-10-24T10:07:25Z",
+  "legs": [
+    "vms",
+    "netbird",
+    "macos"
+  ],
+  "meta": {
+    "overlay_port": "18733",
+    "lab_domain": "ts.lab.internal",
+    "node_a": "ph-a",
+    "node_b": "ph-b",
+    "netbird_root": "<path>",
+    "macos_root": "<macos-root>",
+    "macos_runtime_root": "<macos-runtime-root>",
+    "macos_comm_root": "<macos-comm-root>",
+    "headscale_version": "0.29.5",
+    "headscale_sha256": "e979d27fe17d924d33bb6ab7504f6338d0635989a0cfdcfbc0ceb637dbcbe980",
+    "tailscale_version": "1.104.2",
+    "tailscale_sha256": "512f613ed7d04fc7282f7dc5bd76aa105aae28168fbb9357eb749ebcbc29f0ae",
+    "debian_image_version": "20261021-2638",
+    "debian_image_sha512": "16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c",
+    "qemu_version": "QEMU emulator version 11.1.2",
+    "host_kernel": "Linux 7.2.9-arch1-1",
+    "probe_sha256": "94f40441f510a1ec9487c6cf6503b4dfa17b5d7bc634bb36b4d303b951832456",
+    "ci_run": "40046261986",
+    "ci_head_sha": "3522c2560d99bea7f46a1a337d631e596b25662c",
+    "bin_sha256_pohunek": "7cba13a66440681154a8458ac03513e90dbf3dc112cc8fcd61bb7169a6a2e765",
+    "bin_sha256_pohunekd": "b2df8d662e8980938b009e4f5ccf0f6df899a4cad4ec8b0b248d3485ae345e18",
+    "bin_sha256_pohunek-sessiond": "e6527281c5d998019d28d39cee42fc9c98247dcbacd22976a4adf7d66652b667",
+    "macos_session": "s-01M5PP8PQ7HG4S5D9ZVF1RCVPA",
+    "macos_brew_installed_by_us": "1",
+    "macos_bin_sha256": "9cbad64c1e91820dba8c942b37b14dccc9311755ca42c74470aa1e0b8f0ce55a pohunek a1be8857e702b807753ad003a198453f8616296a4ccb882ef45f94335050bacb pohunekd f914c7a8e7d23f2fefa2387882b9c7406b7c8ac5c10a56ef390565b06770502e pohunek-sessiond "
+  },
+  "verdict": "failed",
+  "inconclusive": [
+    {
+      "code": "headscale_unreachable_from_macos",
+      "scope": "macos.userspace",
+      "reason": "Headscale is not reachable from zajcaair (NetBird policy or firewall)",
+      "detail": "zajcaair cannot reach <netbird-ip-1>:41501"
+    }
+  ],
+  "checks": [
+    {
+      "leg": "pre",
+      "name": "status-a",
+      "status": "passed",
+      "detail": "Running, TUN, one IPv4",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "direct-path-a",
+      "status": "passed",
+      "detail": "tailscale ping to b rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "daemon-units-a",
+      "status": "passed",
+      "detail": "active",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "service-install-health-a",
+      "status": "passed",
+      "detail": "health after `service install` rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "hostname-a",
+      "status": "passed",
+      "detail": "lab-a",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "status-b",
+      "status": "passed",
+      "detail": "Running, TUN, one IPv4",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "direct-path-b",
+      "status": "passed",
+      "detail": "tailscale ping to a rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "daemon-units-b",
+      "status": "passed",
+      "detail": "active",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "service-install-health-b",
+      "status": "passed",
+      "detail": "health after `service install` rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "pre",
+      "name": "hostname-b",
+      "status": "passed",
+      "detail": "lab-b",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "doctor-src",
+      "status": "passed",
+      "detail": "tailscale_cli, listener port and overlay_config as expected",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "listener-src",
+      "status": "passed",
+      "detail": "listeners=['100.64.0.1:18733'] expected=100.64.0.1:18733",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "doctor-dst",
+      "status": "passed",
+      "detail": "tailscale_cli, listener port and overlay_config as expected",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "listener-dst",
+      "status": "passed",
+      "detail": "listeners=['100.64.0.2:18733'] expected=100.64.0.2:18733",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "host-list",
+      "status": "passed",
+      "detail": "ph-b.ts.lab.internal listed",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "host-discover",
+      "status": "passed",
+      "detail": "reachable_daemon",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "inspect-short",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "health-fqdn",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "health-peer-id",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "session-list-qualified",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "session-new",
+      "status": "passed",
+      "detail": "s-01M5PP5D5MH7JHEDS7VP4V21Y9",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "session-input",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "session-screen-mark",
+      "status": "passed",
+      "detail": "screen holds 'D4-MARK-lab-b': True",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "attach",
+      "status": "passed",
+      "detail": "rc=0 output holds 'ATTACH-MARK-lab-b': True",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "sdk-probe",
+      "status": "passed",
+      "detail": "resolved, connected, listed, doctored and read the screen",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "session-stop",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ab",
+      "name": "session-remove",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "doctor-src",
+      "status": "passed",
+      "detail": "tailscale_cli, listener port and overlay_config as expected",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "listener-src",
+      "status": "passed",
+      "detail": "listeners=['100.64.0.2:18733'] expected=100.64.0.2:18733",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "doctor-dst",
+      "status": "passed",
+      "detail": "tailscale_cli, listener port and overlay_config as expected",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "listener-dst",
+      "status": "passed",
+      "detail": "listeners=['100.64.0.1:18733'] expected=100.64.0.1:18733",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "host-list",
+      "status": "passed",
+      "detail": "ph-a.ts.lab.internal listed",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "host-discover",
+      "status": "passed",
+      "detail": "reachable_daemon",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "inspect-short",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "health-fqdn",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "health-peer-id",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "session-list-qualified",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "session-new",
+      "status": "passed",
+      "detail": "s-01M5PP5KV4DWZ4SXR2D7WMYBQ9",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "session-input",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "session-screen-mark",
+      "status": "passed",
+      "detail": "screen holds 'D4-MARK-lab-a': True",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "attach",
+      "status": "passed",
+      "detail": "rc=0 output holds 'ATTACH-MARK-lab-a': True",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "sdk-probe",
+      "status": "passed",
+      "detail": "resolved, connected, listed, doctored and read the screen",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "session-stop",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "ba",
+      "name": "session-remove",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d7-unreachable-hint-a",
+      "status": "passed",
+      "detail": "code=host_unreachable msg=could not open an overlay connection to host 'ph-a' (overlay tailscale at 100.64.0.1:18733): Connection refused (os error 111)",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-listener-warn-a",
+      "status": "passed",
+      "detail": "status=warn",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-dropped-a",
+      "status": "passed",
+      "detail": "journal after tailscale down",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-rebound-a",
+      "status": "passed",
+      "detail": "journal after tailscale up",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-health-after-a",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d7-unreachable-hint-b",
+      "status": "passed",
+      "detail": "code=host_unreachable msg=could not open an overlay connection to host 'ph-b' (overlay tailscale at 100.64.0.2:18733): Connection refused (os error 111)",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-listener-warn-b",
+      "status": "passed",
+      "detail": "status=warn",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-dropped-b",
+      "status": "passed",
+      "detail": "journal after tailscale down",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-rebound-b",
+      "status": "passed",
+      "detail": "journal after tailscale up",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "extra",
+      "name": "d5-health-after-b",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "owner-daemon-untouched",
+      "status": "passed",
+      "detail": "MainPID 322699 -> 322699",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "owner-netbird-untouched",
+      "status": "passed",
+      "detail": "peer totals 207 -> 207; connected 6 -> 6 (recorded, not gating)",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "owner-health-before",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "owner-health-after",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "path-guard",
+      "status": "passed",
+      "detail": "all paths under <path>",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "daemon-start",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "doctor",
+      "status": "passed",
+      "detail": "netbird_cli, listener and the default configuration",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "bind-attempt-logged",
+      "status": "passed",
+      "detail": "daemon log line recorded",
+      "gating": false,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "host-list",
+      "status": "passed",
+      "detail": "207 remote record(s), all netbird: True, zajcaair present: True",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "host-discover",
+      "status": "passed",
+      "detail": "207 remote record(s), all netbird: True, zajcaair present: True",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "inspect-zajcaair",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "netbird",
+      "name": "daemon-stop",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "brew-install",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": "macos.install"
+    },
+    {
+      "leg": "macos",
+      "name": "brew-version",
+      "status": "passed",
+      "detail": "brew info reports the pinned 1.104.2",
+      "gating": true,
+      "substep": "macos.install"
+    },
+    {
+      "leg": "macos",
+      "name": "brew-binaries",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": "macos.install"
+    },
+    {
+      "leg": "macos",
+      "name": "path-guard",
+      "status": "passed",
+      "detail": "offenders []",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "d6-cli-found-state-unavailable",
+      "status": "failed",
+      "detail": "tailscale_cli fail: the tailscale CLI is not installed or not trusted, but overlays.toml configures this overlay; install it, or remove tailscale from providers in overlays.toml and restart the daemon",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "d6-host-list-fails",
+      "status": "failed",
+      "detail": "code=tailscale_cli_missing",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "d6-daemon-start",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "d6-daemon-health",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "d6-listener-warn",
+      "status": "passed",
+      "detail": "listener warn: port=18733; the tailscale provider reports no listener address: overlay CLI for tailscale is not installed",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "d6-serving-local-only",
+      "status": "failed",
+      "detail": "daemon log",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "d6-no-listener",
+      "status": "passed",
+      "detail": "lsof rc=1",
+      "gating": true,
+      "substep": "macos.d6"
+    },
+    {
+      "leg": "macos",
+      "name": "userspace-status-recording",
+      "status": "missing",
+      "detail": "step us-status-json was not recorded",
+      "gating": true,
+      "substep": "macos.userspace"
+    },
+    {
+      "leg": "macos",
+      "name": "userspace-d6-daemon-stopped",
+      "status": "missing",
+      "detail": "step us-stop-daemon was not recorded",
+      "gating": true,
+      "substep": "macos.userspace"
+    },
+    {
+      "leg": "macos",
+      "name": "userspace-daemon-health",
+      "status": "missing",
+      "detail": "step us-wait was not recorded",
+      "gating": true,
+      "substep": "macos.userspace"
+    },
+    {
+      "leg": "macos",
+      "name": "userspace-doctor-fails-closed",
+      "status": "missing",
+      "detail": "step us-doctor was not recorded",
+      "gating": true,
+      "substep": "macos.userspace"
+    },
+    {
+      "leg": "macos",
+      "name": "userspace-host-list-fails",
+      "status": "missing",
+      "detail": "step us-host-list was not recorded",
+      "gating": true,
+      "substep": "macos.userspace"
+    },
+    {
+      "leg": "macos",
+      "name": "userspace-no-listener",
+      "status": "missing",
+      "detail": "step us-lsof was not recorded",
+      "gating": true,
+      "substep": "macos.userspace"
+    },
+    {
+      "leg": "macos",
+      "name": "exposure-window-bound-to-netbird-only",
+      "status": "passed",
+      "detail": "forward listeners ['<netbird-address>:41501']",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "exposure-window-closed",
+      "status": "passed",
+      "detail": "listeners after the forward was removed: ''",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "exposure-window-removed",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "cleanup-homebrew-restored",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "cleanup-removed-roots",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "cleanup-owner-health",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    },
+    {
+      "leg": "macos",
+      "name": "cleanup-session-removed",
+      "status": "passed",
+      "detail": "rc=0",
+      "gating": true,
+      "substep": null
+    }
+  ],
+  "steps": {
+    "ab": [
+      {
+        "name": "doctor-src",
+        "argv": "vm_ssh a pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"checks\": [\n      {\n        \"name\": \"bin:git\",\n        \"status\": \"ok\",\n        \"detail\": \"found at /usr/bin/git\"\n      },\n      {\n        \"name\": \"bin:codex\",\n        \"status\": \"warn\",\n        \"detail\": \"'codex' not found on PATH\"\n      },\n      {\n        \"name\": \"bin:claude\",\n        \"status\": \"warn\",\n        \"detail\": \"'claude' not found on PATH\"\n      },\n      {\n        \"name\": \"socket_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /run/user/1000/pohunek\"\n      },\n      {\n        \"name\": \"state_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/share/pohunek\"\n      },\n      {\n        \"name\": \"log_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/state/pohunek/logs\"\n      },\n      {\n        \"name\": \"tailscale_cli\",\n        \"status\": \"ok\",\n        \"detail\": \"found; this host's tailscale address is 100.64.0.1\"\n      },\n      {\n        \"name\": \"schema_version\",\n        \"status\": \"warn\",\n        \"detail\": \"not available yet (SQLite store is a later milestone)\"\n      },\n      {\n        \"name\": \"service_config_unknown_keys\",\n        \"status\": \"ok\",\n        \"detail\": \"service.toml holds no keys this version does not know\"\n      },\n      {\n        \"name\": \"overlay_config\",\n        \"status\": \"ok\",\n        \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n      },\n      {\n        \"name\": \"worker_executable\",\n        \"status\": \"ok\",\n        \"detail\": \"The active session worker reports a readable journal schema and overlapping worker protocol.\"\n      },\n      {\n        \"name\": \"overlay_tailscale_listener\",\n        \"status\": \"ok\",\n        \"detail\": \"port=18733; the tailscale provider reports listener address 100.64.0.1:18733\"\n      },\n      {\n        \"name\": \"agent_manifest_embedded_shell\",\n        \"status\": \"ok\",\n        \"detail\": \"Embedded detection manifest is valid.\"\n      },\n      {\n        \"name\": \"agent_runtime_codex\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_claude\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_hermes\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"host_governance_durability\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host governance is durably loaded.\"\n      },\n      {\n        \"name\": \"host_identity_stable\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host identity matches the retained durable state.\"\n      },\n      {\n        \"name\": \"host_state_private_storage\",\n        \"status\": \"ok\",\n        \"detail\": \"Host-state storage remains owner-private and link-safe.\"\n      },\n      {\n        \"name\": \"host_governance_consistency\",\n        \"status\": \"ok\",\n        \"detail\": \"Governance records are mutually consistent.\"\n      },\n      {\n        \"name\": \"host_approval_key\",\n        \"status\": \"ok\",\n        \"detail\": \"Approval signing material remains separate and verifies locally.\"\n      },\n      {\n        \"name\": \"host_governance_quarantine\",\n        \"status\": \"ok\",\n        \"detail\": \"Host governance is not quarantined.\"\n      },\n      {\n        \"name\": \"catalog_trust_anchor\",\n        \"status\": \"warn\",\n        \"detail\": \"This installation ships no catalog trust anchor; official packages cannot be installed.\"\n      }\n    ],\n    \"overall\": \"warn\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "doctor-dst",
+        "argv": "vm_ssh b pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"checks\": [\n      {\n        \"name\": \"bin:git\",\n        \"status\": \"ok\",\n        \"detail\": \"found at /usr/bin/git\"\n      },\n      {\n        \"name\": \"bin:codex\",\n        \"status\": \"warn\",\n        \"detail\": \"'codex' not found on PATH\"\n      },\n      {\n        \"name\": \"bin:claude\",\n        \"status\": \"warn\",\n        \"detail\": \"'claude' not found on PATH\"\n      },\n      {\n        \"name\": \"socket_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /run/user/1000/pohunek\"\n      },\n      {\n        \"name\": \"state_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/share/pohunek\"\n      },\n      {\n        \"name\": \"log_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/state/pohunek/logs\"\n      },\n      {\n        \"name\": \"tailscale_cli\",\n        \"status\": \"ok\",\n        \"detail\": \"found; this host's tailscale address is 100.64.0.2\"\n      },\n      {\n        \"name\": \"schema_version\",\n        \"status\": \"warn\",\n        \"detail\": \"not available yet (SQLite store is a later milestone)\"\n      },\n      {\n        \"name\": \"service_config_unknown_keys\",\n        \"status\": \"ok\",\n        \"detail\": \"service.toml holds no keys this version does not know\"\n      },\n      {\n        \"name\": \"overlay_config\",\n        \"status\": \"ok\",\n        \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n      },\n      {\n        \"name\": \"worker_executable\",\n        \"status\": \"ok\",\n        \"detail\": \"The active session worker reports a readable journal schema and overlapping worker protocol.\"\n      },\n      {\n        \"name\": \"overlay_tailscale_listener\",\n        \"status\": \"ok\",\n        \"detail\": \"port=18733; the tailscale provider reports listener address 100.64.0.2:18733\"\n      },\n      {\n        \"name\": \"agent_manifest_embedded_shell\",\n        \"status\": \"ok\",\n        \"detail\": \"Embedded detection manifest is valid.\"\n      },\n      {\n        \"name\": \"agent_runtime_codex\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_claude\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_hermes\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"host_governance_durability\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host governance is durably loaded.\"\n      },\n      {\n        \"name\": \"host_identity_stable\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host identity matches the retained durable state.\"\n      },\n      {\n        \"name\": \"host_state_private_storage\",\n        \"status\": \"ok\",\n        \"detail\": \"Host-state storage remains owner-private and link-safe.\"\n      },\n      {\n        \"name\": \"host_governance_consistency\",\n        \"status\": \"ok\",\n        \"detail\": \"Governance records are mutually consistent.\"\n      },\n      {\n        \"name\": \"host_approval_key\",\n        \"status\": \"ok\",\n        \"detail\": \"Approval signing material remains separate and verifies locally.\"\n      },\n      {\n        \"name\": \"host_governance_quarantine\",\n        \"status\": \"ok\",\n        \"detail\": \"Host governance is not quarantined.\"\n      },\n      {\n        \"name\": \"catalog_trust_anchor\",\n        \"status\": \"warn\",\n        \"detail\": \"This installation ships no catalog trust anchor; official packages cannot be installed.\"\n      }\n    ],\n    \"overall\": \"warn\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ss-src",
+        "argv": "vm_ssh a ss -ltnH 'sport = :18733'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "LISTEN 0      128    100.64.0.1:18733 0.0.0.0:*\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ss-dst",
+        "argv": "vm_ssh b ss -ltnH 'sport = :18733'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "LISTEN 0      128    100.64.0.2:18733 0.0.0.0:*\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "host-list",
+        "argv": "vm_ssh a pohunek host list --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": [\n    {\n      \"name\": \"ph-a\",\n      \"fqdn\": \"ph-a.ts.lab.internal\",\n      \"address\": \"100.64.0.1\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": null,\n      \"local\": true,\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    },\n    {\n      \"name\": \"ph-b\",\n      \"fqdn\": \"ph-b.ts.lab.internal\",\n      \"address\": \"100.64.0.2\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": \"2\",\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "discover",
+        "argv": "vm_ssh a pohunek host discover --refresh --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": [\n    {\n      \"name\": \"ph-a\",\n      \"fqdn\": \"ph-a.ts.lab.internal\",\n      \"address\": \"100.64.0.1\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": null,\n      \"local\": true,\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    },\n    {\n      \"name\": \"ph-b\",\n      \"fqdn\": \"ph-b.ts.lab.internal\",\n      \"address\": \"100.64.0.2\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": \"2\",\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "inspect-short",
+        "argv": "vm_ssh a pohunek host inspect ph-b --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4,\n    \"supported_agents\": [\n      \"shell\"\n    ],\n    \"runtimes\": [\n      {\n        \"agent\": \"shell\",\n        \"agent_base\": \"shell\",\n        \"available\": true\n      }\n    ],\n    \"git_available\": true,\n    \"worktree_supported\": true,\n    \"terminal_read_supported\": true,\n    \"output_read_supported\": true,\n    \"session_wait_supported\": true,\n    \"session_wait_turn_supported\": true,\n    \"session_new_cwd_supported\": true,\n    \"session_new_branch_source_supported\": true,\n    \"session_new_input_ack_supported\": true,\n    \"session_idle_stop_supported\": true\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "health-fqdn",
+        "argv": "vm_ssh a pohunek --host ph-b.ts.lab.internal health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:07Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "health-peer-id",
+        "argv": "vm_ssh a pohunek --host tailscale:peer~Mg health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:08Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-list-qualified",
+        "argv": "vm_ssh a pohunek --host tailscale:ph-b session list --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:08Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": []\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-new",
+        "argv": "vm_ssh a pohunek session new --host ph-b --project p-bac38513 --agent shell --name d4-a-to-b --yes --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:08Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"agent\": \"shell\",\n    \"agent_base\": \"shell\",\n    \"capabilities\": {\n      \"fork\": false,\n      \"resume\": false\n    },\n    \"cols\": 80,\n    \"created_at\": \"2026-10-24T10:09:07.813567683Z\",\n    \"cwd\": \"/home/<user>/ph1112-repo\",\n    \"cwd_source\": \"launch\",\n    \"external\": false,\n    \"id\": \"s-01M5PP5D5MH7JHEDS7VP4V21Y9\",\n    \"is_linked_worktree\": false,\n    \"name\": \"d4-a-to-b\",\n    \"pid\": 1833,\n    \"project_id\": \"p-bac38513\",\n    \"rows\": 24,\n    \"runtime\": {\n      \"last_connected_at\": \"2026-10-24T10:09:07.957239351Z\",\n      \"runtime_generation\": \"1\",\n      \"runtime_id\": \"runtime-f325e3f4674cb9ea0761f2cc499cc72d\",\n      \"started_at\": \"2026-10-24T10:09:07.957239351Z\",\n      \"state\": \"live\",\n      \"worker_id\": \"worker-71f5f992e6437c39b2f2715ffedaf4ed\",\n      \"worker_instance_id\": \"runtime-f325e3f4674cb9ea0761f2cc499cc72d\"\n    },\n    \"state\": \"running\",\n    \"state_source\": \"process\",\n    \"updated_at\": \"2026-10-24T10:09:07.957280041Z\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-input",
+        "argv": "vm_ssh a pohunek session input ph-b/s-01M5PP5D5MH7JHEDS7VP4V21Y9 'echo D4-MARK-$(hostname)' --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:08Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"accepted\": true\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-screen",
+        "argv": "vm_ssh a pohunek session screen ph-b/s-01M5PP5D5MH7JHEDS7VP4V21Y9 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:08Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"session_id\": \"s-01M5PP5D5MH7JHEDS7VP4V21Y9\",\n    \"worker_id\": \"worker-71f5f992e6437c39b2f2715ffedaf4ed\",\n    \"worker_instance_id\": \"runtime-f325e3f4674cb9ea0761f2cc499cc72d\",\n    \"runtime_generation\": \"1\",\n    \"watermark\": \"222\",\n    \"dimensions\": {\n      \"cols\": 80,\n      \"rows\": 24\n    },\n    \"cursor\": {\n      \"row\": 2,\n      \"col\": 24,\n      \"visible\": true\n    },\n    \"alternate_screen\": false,\n    \"title\": \"ph@lab-b: ~/ph1112-repo\",\n    \"visible_lines\": [\n      \"ph@lab-b:~/ph1112-repo$ echo D4-MARK-$(hostname)\",\n      \"D4-MARK-lab-b\",\n      \"ph@lab-b:~/ph1112-repo$ \"\n    ]\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "attach",
+        "argv": "attach_pipeline a b s-01M5PP5D5MH7JHEDS7VP4V21Y9",
+        "rc": 0,
+        "at": "2026-10-24T10:09:08Z",
+        "stdout": "echo ATTACH-MARK-$(hostname)\n\u001b[2J\u001b[H\u001b>\u001b[?1l\u001b[?2004h\u001b[?25h\u001b[m\u001b[H\u001b[J\u001b[32;1mph@lab-b\u001b[m:\u001b[34;1m~/ph1112-repo\u001b[m$ echo D4-MARK-$(hostname)\nD4-MARK-lab-b\n\u001b[32;1mph@lab-b\u001b[m:\u001b[34;1m~/ph1112-repo\u001b[m$ \u001b[?25h\u001b[3;25Hecho ATTACH-MARK-$(hostname)\n\u001b[?2004l\nATTACH-MARK-lab-b\n\u001b[?2004h\u001b]0;ph@lab-b: ~/ph1112-repo\u0007\u001b[01;32mph@lab-b\u001b[00m:\u001b[01;34m~/ph1112-repo\u001b[00m$ \u001b[?1000l\u001b[?1001l\u001b[?1002l\u001b[?1003l\u001b[?1004l\u001b[?1005l\u001b[?1006l\u001b[?1015l\u001b[?1016l\u001b[?2004l\u001b[?2026l\u001b[?1049l\u001b[?1047l\u001b[?47l\u001b[?1l\u001b>\u001b[?6l\u001b[?7h\u001b[r\u001b[0m\u001b[?25h",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "probe",
+        "argv": "vm_ssh a overlay_probe --host ph-b --session s-01M5PP5D5MH7JHEDS7VP4V21Y9 --mark D4-MARK",
+        "rc": 0,
+        "at": "2026-10-24T10:09:12Z",
+        "stdout": "{\"listener_checks\":[{\"detail\":\"port=18733; the tailscale provider reports listener address 100.64.0.2:18733\",\"name\":\"overlay_tailscale_listener\",\"status\":\"ok\"}],\"ok\":true,\"protocol_version\":4,\"route\":{\"address\":\"100.64.0.2\",\"fqdn\":\"ph-b.ts.lab.internal\",\"overlay\":\"tailscale\",\"peer_id\":\"2\",\"pinned_route\":\"tailscale:peer~Mg@18733\",\"port\":18733},\"screen\":{\"mark_line\":\"D4-MARK-lab-b\",\"session_id\":\"s-01M5PP5D5MH7JHEDS7VP4V21Y9\"},\"session_list\":{\"contains_session\":true,\"count\":1}}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-stop",
+        "argv": "vm_ssh a pohunek session stop ph-b/s-01M5PP5D5MH7JHEDS7VP4V21Y9 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:12Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"stopped\": true\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-remove",
+        "argv": "vm_ssh a pohunek session rm ph-b/s-01M5PP5D5MH7JHEDS7VP4V21Y9 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:13Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"removed\": true,\n    \"stopped\": false,\n    \"worktrees_removed\": 0,\n    \"worktrees_failed\": 0\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      }
+    ],
+    "ba": [
+      {
+        "name": "doctor-src",
+        "argv": "vm_ssh b pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:13Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"checks\": [\n      {\n        \"name\": \"bin:git\",\n        \"status\": \"ok\",\n        \"detail\": \"found at /usr/bin/git\"\n      },\n      {\n        \"name\": \"bin:codex\",\n        \"status\": \"warn\",\n        \"detail\": \"'codex' not found on PATH\"\n      },\n      {\n        \"name\": \"bin:claude\",\n        \"status\": \"warn\",\n        \"detail\": \"'claude' not found on PATH\"\n      },\n      {\n        \"name\": \"socket_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /run/user/1000/pohunek\"\n      },\n      {\n        \"name\": \"state_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/share/pohunek\"\n      },\n      {\n        \"name\": \"log_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/state/pohunek/logs\"\n      },\n      {\n        \"name\": \"tailscale_cli\",\n        \"status\": \"ok\",\n        \"detail\": \"found; this host's tailscale address is 100.64.0.2\"\n      },\n      {\n        \"name\": \"schema_version\",\n        \"status\": \"warn\",\n        \"detail\": \"not available yet (SQLite store is a later milestone)\"\n      },\n      {\n        \"name\": \"service_config_unknown_keys\",\n        \"status\": \"ok\",\n        \"detail\": \"service.toml holds no keys this version does not know\"\n      },\n      {\n        \"name\": \"overlay_config\",\n        \"status\": \"ok\",\n        \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n      },\n      {\n        \"name\": \"worker_executable\",\n        \"status\": \"ok\",\n        \"detail\": \"The active session worker reports a readable journal schema and overlapping worker protocol.\"\n      },\n      {\n        \"name\": \"overlay_tailscale_listener\",\n        \"status\": \"ok\",\n        \"detail\": \"port=18733; the tailscale provider reports listener address 100.64.0.2:18733\"\n      },\n      {\n        \"name\": \"agent_manifest_embedded_shell\",\n        \"status\": \"ok\",\n        \"detail\": \"Embedded detection manifest is valid.\"\n      },\n      {\n        \"name\": \"agent_runtime_codex\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_claude\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_hermes\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"host_governance_durability\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host governance is durably loaded.\"\n      },\n      {\n        \"name\": \"host_identity_stable\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host identity matches the retained durable state.\"\n      },\n      {\n        \"name\": \"host_state_private_storage\",\n        \"status\": \"ok\",\n        \"detail\": \"Host-state storage remains owner-private and link-safe.\"\n      },\n      {\n        \"name\": \"host_governance_consistency\",\n        \"status\": \"ok\",\n        \"detail\": \"Governance records are mutually consistent.\"\n      },\n      {\n        \"name\": \"host_approval_key\",\n        \"status\": \"ok\",\n        \"detail\": \"Approval signing material remains separate and verifies locally.\"\n      },\n      {\n        \"name\": \"host_governance_quarantine\",\n        \"status\": \"ok\",\n        \"detail\": \"Host governance is not quarantined.\"\n      },\n      {\n        \"name\": \"catalog_trust_anchor\",\n        \"status\": \"warn\",\n        \"detail\": \"This installation ships no catalog trust anchor; official packages cannot be installed.\"\n      }\n    ],\n    \"overall\": \"warn\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "doctor-dst",
+        "argv": "vm_ssh a pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"checks\": [\n      {\n        \"name\": \"bin:git\",\n        \"status\": \"ok\",\n        \"detail\": \"found at /usr/bin/git\"\n      },\n      {\n        \"name\": \"bin:codex\",\n        \"status\": \"warn\",\n        \"detail\": \"'codex' not found on PATH\"\n      },\n      {\n        \"name\": \"bin:claude\",\n        \"status\": \"warn\",\n        \"detail\": \"'claude' not found on PATH\"\n      },\n      {\n        \"name\": \"socket_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /run/user/1000/pohunek\"\n      },\n      {\n        \"name\": \"state_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/share/pohunek\"\n      },\n      {\n        \"name\": \"log_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/state/pohunek/logs\"\n      },\n      {\n        \"name\": \"tailscale_cli\",\n        \"status\": \"ok\",\n        \"detail\": \"found; this host's tailscale address is 100.64.0.1\"\n      },\n      {\n        \"name\": \"schema_version\",\n        \"status\": \"warn\",\n        \"detail\": \"not available yet (SQLite store is a later milestone)\"\n      },\n      {\n        \"name\": \"service_config_unknown_keys\",\n        \"status\": \"ok\",\n        \"detail\": \"service.toml holds no keys this version does not know\"\n      },\n      {\n        \"name\": \"overlay_config\",\n        \"status\": \"ok\",\n        \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n      },\n      {\n        \"name\": \"worker_executable\",\n        \"status\": \"ok\",\n        \"detail\": \"The active session worker reports a readable journal schema and overlapping worker protocol.\"\n      },\n      {\n        \"name\": \"overlay_tailscale_listener\",\n        \"status\": \"ok\",\n        \"detail\": \"port=18733; the tailscale provider reports listener address 100.64.0.1:18733\"\n      },\n      {\n        \"name\": \"agent_manifest_embedded_shell\",\n        \"status\": \"ok\",\n        \"detail\": \"Embedded detection manifest is valid.\"\n      },\n      {\n        \"name\": \"agent_runtime_codex\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_claude\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_hermes\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"host_governance_durability\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host governance is durably loaded.\"\n      },\n      {\n        \"name\": \"host_identity_stable\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host identity matches the retained durable state.\"\n      },\n      {\n        \"name\": \"host_state_private_storage\",\n        \"status\": \"ok\",\n        \"detail\": \"Host-state storage remains owner-private and link-safe.\"\n      },\n      {\n        \"name\": \"host_governance_consistency\",\n        \"status\": \"ok\",\n        \"detail\": \"Governance records are mutually consistent.\"\n      },\n      {\n        \"name\": \"host_approval_key\",\n        \"status\": \"ok\",\n        \"detail\": \"Approval signing material remains separate and verifies locally.\"\n      },\n      {\n        \"name\": \"host_governance_quarantine\",\n        \"status\": \"ok\",\n        \"detail\": \"Host governance is not quarantined.\"\n      },\n      {\n        \"name\": \"catalog_trust_anchor\",\n        \"status\": \"warn\",\n        \"detail\": \"This installation ships no catalog trust anchor; official packages cannot be installed.\"\n      }\n    ],\n    \"overall\": \"warn\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ss-src",
+        "argv": "vm_ssh b ss -ltnH 'sport = :18733'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "LISTEN 0      128    100.64.0.2:18733 0.0.0.0:*\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ss-dst",
+        "argv": "vm_ssh a ss -ltnH 'sport = :18733'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "LISTEN 0      128    100.64.0.1:18733 0.0.0.0:*\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "host-list",
+        "argv": "vm_ssh b pohunek host list --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": [\n    {\n      \"name\": \"ph-b\",\n      \"fqdn\": \"ph-b.ts.lab.internal\",\n      \"address\": \"100.64.0.2\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": null,\n      \"local\": true,\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    },\n    {\n      \"name\": \"ph-a\",\n      \"fqdn\": \"ph-a.ts.lab.internal\",\n      \"address\": \"100.64.0.1\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": \"1\",\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "discover",
+        "argv": "vm_ssh b pohunek host discover --refresh --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": [\n    {\n      \"name\": \"ph-b\",\n      \"fqdn\": \"ph-b.ts.lab.internal\",\n      \"address\": \"100.64.0.2\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": null,\n      \"local\": true,\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    },\n    {\n      \"name\": \"ph-a\",\n      \"fqdn\": \"ph-a.ts.lab.internal\",\n      \"address\": \"100.64.0.1\",\n      \"port\": 18733,\n      \"overlay\": \"tailscale\",\n      \"peer_id\": \"1\",\n      \"classification\": \"reachable_daemon\",\n      \"daemon_version\": \"0.36.0\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "inspect-short",
+        "argv": "vm_ssh b pohunek host inspect ph-a --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4,\n    \"supported_agents\": [\n      \"shell\"\n    ],\n    \"runtimes\": [\n      {\n        \"agent\": \"shell\",\n        \"agent_base\": \"shell\",\n        \"available\": true\n      }\n    ],\n    \"git_available\": true,\n    \"worktree_supported\": true,\n    \"terminal_read_supported\": true,\n    \"output_read_supported\": true,\n    \"session_wait_supported\": true,\n    \"session_wait_turn_supported\": true,\n    \"session_new_cwd_supported\": true,\n    \"session_new_branch_source_supported\": true,\n    \"session_new_input_ack_supported\": true,\n    \"session_idle_stop_supported\": true\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "health-fqdn",
+        "argv": "vm_ssh b pohunek --host ph-a.ts.lab.internal health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "health-peer-id",
+        "argv": "vm_ssh b pohunek --host tailscale:peer~MQ health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-list-qualified",
+        "argv": "vm_ssh b pohunek --host tailscale:ph-a session list --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:14Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": []\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-new",
+        "argv": "vm_ssh b pohunek session new --host ph-a --project p-bac38513 --agent shell --name d4-b-to-a --yes --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:15Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"agent\": \"shell\",\n    \"agent_base\": \"shell\",\n    \"capabilities\": {\n      \"fork\": false,\n      \"resume\": false\n    },\n    \"cols\": 80,\n    \"created_at\": \"2026-10-24T10:09:14.632606486Z\",\n    \"cwd\": \"/home/<user>/ph1112-repo\",\n    \"cwd_source\": \"launch\",\n    \"external\": false,\n    \"id\": \"s-01M5PP5KV4DWZ4SXR2D7WMYBQ9\",\n    \"is_linked_worktree\": false,\n    \"name\": \"d4-b-to-a\",\n    \"pid\": 2534,\n    \"project_id\": \"p-bac38513\",\n    \"rows\": 24,\n    \"runtime\": {\n      \"last_connected_at\": \"2026-10-24T10:09:14.781042326Z\",\n      \"runtime_generation\": \"1\",\n      \"runtime_id\": \"runtime-4ee0a8ab2e656dd7c1205d259ddc6716\",\n      \"started_at\": \"2026-10-24T10:09:14.781042326Z\",\n      \"state\": \"live\",\n      \"worker_id\": \"worker-d473f440641bba699e05ae536a02693c\",\n      \"worker_instance_id\": \"runtime-4ee0a8ab2e656dd7c1205d259ddc6716\"\n    },\n    \"state\": \"running\",\n    \"state_source\": \"process\",\n    \"updated_at\": \"2026-10-24T10:09:14.781082486Z\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-input",
+        "argv": "vm_ssh b pohunek session input ph-a/s-01M5PP5KV4DWZ4SXR2D7WMYBQ9 'echo D4-MARK-$(hostname)' --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:15Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"accepted\": true\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-screen",
+        "argv": "vm_ssh b pohunek session screen ph-a/s-01M5PP5KV4DWZ4SXR2D7WMYBQ9 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:15Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"session_id\": \"s-01M5PP5KV4DWZ4SXR2D7WMYBQ9\",\n    \"worker_id\": \"worker-d473f440641bba699e05ae536a02693c\",\n    \"worker_instance_id\": \"runtime-4ee0a8ab2e656dd7c1205d259ddc6716\",\n    \"runtime_generation\": \"1\",\n    \"watermark\": \"222\",\n    \"dimensions\": {\n      \"cols\": 80,\n      \"rows\": 24\n    },\n    \"cursor\": {\n      \"row\": 2,\n      \"col\": 24,\n      \"visible\": true\n    },\n    \"alternate_screen\": false,\n    \"title\": \"ph@lab-a: ~/ph1112-repo\",\n    \"visible_lines\": [\n      \"ph@lab-a:~/ph1112-repo$ echo D4-MARK-$(hostname)\",\n      \"D4-MARK-lab-a\",\n      \"ph@lab-a:~/ph1112-repo$ \"\n    ]\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "attach",
+        "argv": "attach_pipeline b a s-01M5PP5KV4DWZ4SXR2D7WMYBQ9",
+        "rc": 0,
+        "at": "2026-10-24T10:09:15Z",
+        "stdout": "echo ATTACH-MARK-$(hostname)\n\u001b[2J\u001b[H\u001b>\u001b[?1l\u001b[?2004h\u001b[?25h\u001b[m\u001b[H\u001b[J\u001b[32;1mph@lab-a\u001b[m:\u001b[34;1m~/ph1112-repo\u001b[m$ echo D4-MARK-$(hostname)\nD4-MARK-lab-a\n\u001b[32;1mph@lab-a\u001b[m:\u001b[34;1m~/ph1112-repo\u001b[m$ \u001b[?25h\u001b[3;25Hecho ATTACH-MARK-$(hostname)\n\u001b[?2004l\nATTACH-MARK-lab-a\n\u001b[?2004h\u001b]0;ph@lab-a: ~/ph1112-repo\u0007\u001b[01;32mph@lab-a\u001b[00m:\u001b[01;34m~/ph1112-repo\u001b[00m$ \u001b[?1000l\u001b[?1001l\u001b[?1002l\u001b[?1003l\u001b[?1004l\u001b[?1005l\u001b[?1006l\u001b[?1015l\u001b[?1016l\u001b[?2004l\u001b[?2026l\u001b[?1049l\u001b[?1047l\u001b[?47l\u001b[?1l\u001b>\u001b[?6l\u001b[?7h\u001b[r\u001b[0m\u001b[?25h",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "probe",
+        "argv": "vm_ssh b overlay_probe --host ph-a --session s-01M5PP5KV4DWZ4SXR2D7WMYBQ9 --mark D4-MARK",
+        "rc": 0,
+        "at": "2026-10-24T10:09:19Z",
+        "stdout": "{\"listener_checks\":[{\"detail\":\"port=18733; the tailscale provider reports listener address 100.64.0.1:18733\",\"name\":\"overlay_tailscale_listener\",\"status\":\"ok\"}],\"ok\":true,\"protocol_version\":4,\"route\":{\"address\":\"100.64.0.1\",\"fqdn\":\"ph-a.ts.lab.internal\",\"overlay\":\"tailscale\",\"peer_id\":\"1\",\"pinned_route\":\"tailscale:peer~MQ@18733\",\"port\":18733},\"screen\":{\"mark_line\":\"D4-MARK-lab-a\",\"session_id\":\"s-01M5PP5KV4DWZ4SXR2D7WMYBQ9\"},\"session_list\":{\"contains_session\":true,\"count\":1}}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-stop",
+        "argv": "vm_ssh b pohunek session stop ph-a/s-01M5PP5KV4DWZ4SXR2D7WMYBQ9 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:19Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"stopped\": true\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "session-remove",
+        "argv": "vm_ssh b pohunek session rm ph-a/s-01M5PP5KV4DWZ4SXR2D7WMYBQ9 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:20Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"removed\": true,\n    \"stopped\": false,\n    \"worktrees_removed\": 0,\n    \"worktrees_failed\": 0\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      }
+    ],
+    "extra": [
+      {
+        "name": "d7-health-a",
+        "argv": "vm_ssh b pohunek --host ph-a health --json",
+        "rc": 1,
+        "at": "2026-10-24T10:09:20Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"err\": {\n    \"class\": \"transport\",\n    \"code\": \"host_unreachable\",\n    \"msg\": \"could not open an overlay connection to host 'ph-a' (overlay tailscale at 100.64.0.1:18733): Connection refused (os error 111)\",\n    \"recover\": \"check that the host is online, that its pohunek daemon is running and that its overlays.toml lists 'tailscale' as its provider; a daemon started with another provider does not listen on tailscale\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-down-a",
+        "argv": "vm_ssh a sudo tailscale down",
+        "rc": 0,
+        "at": "2026-10-24T10:09:21Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-doctor-down-a",
+        "argv": "vm_ssh a PATH=/usr/local/bin:/usr/bin:/bin pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:24Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"checks\": [\n      {\n        \"name\": \"bin:git\",\n        \"status\": \"ok\",\n        \"detail\": \"found at /usr/bin/git\"\n      },\n      {\n        \"name\": \"bin:codex\",\n        \"status\": \"warn\",\n        \"detail\": \"'codex' not found on PATH\"\n      },\n      {\n        \"name\": \"bin:claude\",\n        \"status\": \"warn\",\n        \"detail\": \"'claude' not found on PATH\"\n      },\n      {\n        \"name\": \"socket_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /run/user/1000/pohunek\"\n      },\n      {\n        \"name\": \"state_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/share/pohunek\"\n      },\n      {\n        \"name\": \"log_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/state/pohunek/logs\"\n      },\n      {\n        \"name\": \"tailscale_cli\",\n        \"status\": \"warn\",\n        \"detail\": \"the tailscale CLI answered, but no tailscale address resolved (not logged in or daemon down)\"\n      },\n      {\n        \"name\": \"schema_version\",\n        \"status\": \"warn\",\n        \"detail\": \"not available yet (SQLite store is a later milestone)\"\n      },\n      {\n        \"name\": \"service_config_unknown_keys\",\n        \"status\": \"ok\",\n        \"detail\": \"service.toml holds no keys this version does not know\"\n      },\n      {\n        \"name\": \"overlay_config\",\n        \"status\": \"ok\",\n        \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n      },\n      {\n        \"name\": \"worker_executable\",\n        \"status\": \"ok\",\n        \"detail\": \"The active session worker reports a readable journal schema and overlapping worker protocol.\"\n      },\n      {\n        \"name\": \"overlay_tailscale_listener\",\n        \"status\": \"warn\",\n        \"detail\": \"port=18733; the tailscale provider reports no listener address: overlay tailscale has no safe local listener address\"\n      },\n      {\n        \"name\": \"agent_manifest_embedded_shell\",\n        \"status\": \"ok\",\n        \"detail\": \"Embedded detection manifest is valid.\"\n      },\n      {\n        \"name\": \"agent_runtime_codex\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_claude\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_hermes\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"host_governance_durability\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host governance is durably loaded.\"\n      },\n      {\n        \"name\": \"host_identity_stable\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host identity matches the retained durable state.\"\n      },\n      {\n        \"name\": \"host_state_private_storage\",\n        \"status\": \"ok\",\n        \"detail\": \"Host-state storage remains owner-private and link-safe.\"\n      },\n      {\n        \"name\": \"host_governance_consistency\",\n        \"status\": \"ok\",\n        \"detail\": \"Governance records are mutually consistent.\"\n      },\n      {\n        \"name\": \"host_approval_key\",\n        \"status\": \"ok\",\n        \"detail\": \"Approval signing material remains separate and verifies locally.\"\n      },\n      {\n        \"name\": \"host_governance_quarantine\",\n        \"status\": \"ok\",\n        \"detail\": \"Host governance is not quarantined.\"\n      },\n      {\n        \"name\": \"catalog_trust_anchor\",\n        \"status\": \"warn\",\n        \"detail\": \"This installation ships no catalog trust anchor; official packages cannot be installed.\"\n      }\n    ],\n    \"overall\": \"warn\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-drop-a",
+        "argv": "vm_ssh a journalctl --user --no-pager --since '2026-10-24 10:09:20' | grep 'overlay state unavailable; serving local-only'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:52Z",
+        "stdout": "Oct 24 10:09:50 lab-a pohunekd[2588]: {\"timestamp\":\"2026-10-24T10:09:50.594152Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"overlay state unavailable; serving local-only\",\"overlay\":\"tailscale\",\"port\":18733,\"reason\":\"overlay tailscale has no safe local listener address\"},\"target\":\"pohunekd\"}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-up-a",
+        "argv": "vm_ssh a sudo tailscale up --login-server=http://10.77.0.1:8080 --hostname=ph-a --accept-dns=false --timeout=60s",
+        "rc": 0,
+        "at": "2026-10-24T10:09:53Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-journal-a",
+        "argv": "vm_ssh a journalctl --user --no-pager --since '2026-10-24 10:09:52' | grep 'serving control protocol over overlay'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:56Z",
+        "stdout": "Oct 24 10:09:55 lab-a pohunekd[2588]: {\"timestamp\":\"2026-10-24T10:09:55.604328Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"serving control protocol over overlay\",\"overlay\":\"tailscale\",\"addr\":\"100.64.0.1:18733\"},\"target\":\"pohunekd\"}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-health-a",
+        "argv": "vm_ssh b pohunek --host ph-a health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:04Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d7-health-b",
+        "argv": "vm_ssh a pohunek --host ph-b health --json",
+        "rc": 1,
+        "at": "2026-10-24T10:10:04Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"err\": {\n    \"class\": \"transport\",\n    \"code\": \"host_unreachable\",\n    \"msg\": \"could not open an overlay connection to host 'ph-b' (overlay tailscale at 100.64.0.2:18733): Connection refused (os error 111)\",\n    \"recover\": \"check that the host is online, that its pohunek daemon is running and that its overlays.toml lists 'tailscale' as its provider; a daemon started with another provider does not listen on tailscale\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-down-b",
+        "argv": "vm_ssh b sudo tailscale down",
+        "rc": 0,
+        "at": "2026-10-24T10:10:05Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-doctor-down-b",
+        "argv": "vm_ssh b PATH=/usr/local/bin:/usr/bin:/bin pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:08Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"checks\": [\n      {\n        \"name\": \"bin:git\",\n        \"status\": \"ok\",\n        \"detail\": \"found at /usr/bin/git\"\n      },\n      {\n        \"name\": \"bin:codex\",\n        \"status\": \"warn\",\n        \"detail\": \"'codex' not found on PATH\"\n      },\n      {\n        \"name\": \"bin:claude\",\n        \"status\": \"warn\",\n        \"detail\": \"'claude' not found on PATH\"\n      },\n      {\n        \"name\": \"socket_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /run/user/1000/pohunek\"\n      },\n      {\n        \"name\": \"state_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/share/pohunek\"\n      },\n      {\n        \"name\": \"log_dir_writable\",\n        \"status\": \"ok\",\n        \"detail\": \"writable: /home/<user>/.local/state/pohunek/logs\"\n      },\n      {\n        \"name\": \"tailscale_cli\",\n        \"status\": \"warn\",\n        \"detail\": \"the tailscale CLI answered, but no tailscale address resolved (not logged in or daemon down)\"\n      },\n      {\n        \"name\": \"schema_version\",\n        \"status\": \"warn\",\n        \"detail\": \"not available yet (SQLite store is a later milestone)\"\n      },\n      {\n        \"name\": \"service_config_unknown_keys\",\n        \"status\": \"ok\",\n        \"detail\": \"service.toml holds no keys this version does not know\"\n      },\n      {\n        \"name\": \"overlay_config\",\n        \"status\": \"ok\",\n        \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n      },\n      {\n        \"name\": \"worker_executable\",\n        \"status\": \"ok\",\n        \"detail\": \"The active session worker reports a readable journal schema and overlapping worker protocol.\"\n      },\n      {\n        \"name\": \"overlay_tailscale_listener\",\n        \"status\": \"warn\",\n        \"detail\": \"port=18733; the tailscale provider reports no listener address: overlay tailscale has no safe local listener address\"\n      },\n      {\n        \"name\": \"agent_manifest_embedded_shell\",\n        \"status\": \"ok\",\n        \"detail\": \"Embedded detection manifest is valid.\"\n      },\n      {\n        \"name\": \"agent_runtime_codex\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_claude\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"agent_runtime_hermes\",\n        \"status\": \"warn\",\n        \"detail\": \"Optional provider is not installed; install it only if you use this agent.\"\n      },\n      {\n        \"name\": \"host_governance_durability\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host governance is durably loaded.\"\n      },\n      {\n        \"name\": \"host_identity_stable\",\n        \"status\": \"ok\",\n        \"detail\": \"Stable host identity matches the retained durable state.\"\n      },\n      {\n        \"name\": \"host_state_private_storage\",\n        \"status\": \"ok\",\n        \"detail\": \"Host-state storage remains owner-private and link-safe.\"\n      },\n      {\n        \"name\": \"host_governance_consistency\",\n        \"status\": \"ok\",\n        \"detail\": \"Governance records are mutually consistent.\"\n      },\n      {\n        \"name\": \"host_approval_key\",\n        \"status\": \"ok\",\n        \"detail\": \"Approval signing material remains separate and verifies locally.\"\n      },\n      {\n        \"name\": \"host_governance_quarantine\",\n        \"status\": \"ok\",\n        \"detail\": \"Host governance is not quarantined.\"\n      },\n      {\n        \"name\": \"catalog_trust_anchor\",\n        \"status\": \"warn\",\n        \"detail\": \"This installation ships no catalog trust anchor; official packages cannot be installed.\"\n      }\n    ],\n    \"overall\": \"warn\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-drop-b",
+        "argv": "vm_ssh b journalctl --user --no-pager --since '2026-10-24 10:10:04' | grep 'overlay state unavailable; serving local-only'",
+        "rc": 0,
+        "at": "2026-10-24T10:10:36Z",
+        "stdout": "Oct 24 10:10:34 lab-b pohunekd[2456]: {\"timestamp\":\"2026-10-24T10:10:34.563557Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"overlay state unavailable; serving local-only\",\"overlay\":\"tailscale\",\"port\":18733,\"reason\":\"overlay tailscale has no safe local listener address\"},\"target\":\"pohunekd\"}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-up-b",
+        "argv": "vm_ssh b sudo tailscale up --login-server=http://10.77.0.1:8080 --hostname=ph-b --accept-dns=false --timeout=60s",
+        "rc": 0,
+        "at": "2026-10-24T10:10:37Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-journal-b",
+        "argv": "vm_ssh b journalctl --user --no-pager --since '2026-10-24 10:10:36' | grep 'serving control protocol over overlay'",
+        "rc": 0,
+        "at": "2026-10-24T10:10:40Z",
+        "stdout": "Oct 24 10:10:39 lab-b pohunekd[2456]: {\"timestamp\":\"2026-10-24T10:10:39.572745Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"serving control protocol over overlay\",\"overlay\":\"tailscale\",\"addr\":\"100.64.0.2:18733\"},\"target\":\"pohunekd\"}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d5-health-b",
+        "argv": "vm_ssh a pohunek --host ph-b health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:48Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      }
+    ],
+    "macos": [
+      {
+        "name": "session-new",
+        "argv": "/home/<user>/.local/bin/pohunek session new --host zajcaair --project <macos-project> --agent shell --name ph1112-20261024T100725Z --cwd /tmp/ph-macos-cache --yes --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:55Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "mac-home",
+        "argv": "printf %s \"$HOME\"",
+        "rc": 0,
+        "at": "2026-10-24T10:10:58Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "brew-before",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew list --versions tailscale",
+        "rc": 1,
+        "at": "2026-10-24T10:11:05Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "brew-install",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew install tailscale",
+        "rc": 0,
+        "at": "2026-10-24T10:11:07Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "brew-version",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew list --versions tailscale",
+        "rc": 0,
+        "at": "2026-10-24T10:11:18Z",
+        "stdout": "tailscale 1.104.2\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "brew-info",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew info --json=v2 tailscale",
+        "rc": 0,
+        "at": "2026-10-24T10:11:20Z",
+        "stdout": "{\"stable\": \"1.104.2\", \"installed\": [\"1.104.2\"]}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ls-bins",
+        "argv": "ls -l /opt/homebrew/bin/tailscale /opt/homebrew/bin/tailscaled",
+        "rc": 0,
+        "at": "2026-10-24T10:11:23Z",
+        "stdout": "tailscale\ntailscaled\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "brew-deps",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew deps tailscale",
+        "rc": 0,
+        "at": "2026-10-24T10:11:25Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "mac-roots",
+        "argv": "umask 077; mkdir -p <macos-root>/home/<user>/pohunek <macos-root>/data <macos-root>/state <macos-runtime-root>/run <macos-runtime-root>/bin && for b in pohunek pohunekd pohunek-sessiond; do cp /tmp/ph-macos-cache/ph1112-bins/$b <macos-runtime-root>/bin/$b && chmod 0755 <macos-runtime-root>/bin/$b; done && printf 'providers = [\"tailscale\"]\\nport = 18733\\n' ><macos-root>/home/<user>/pohunek/overlays.toml && chmod 0600 <macos-root>/home/<user>/pohunek/overlays.toml",
+        "rc": 0,
+        "at": "2026-10-24T10:11:27Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "mac-bin-sha",
+        "argv": "cd <macos-runtime-root>/bin && shasum -a 256 pohunek pohunekd pohunek-sessiond",
+        "rc": 0,
+        "at": "2026-10-24T10:11:29Z",
+        "stdout": "9cbad64c1e91820dba8c942b37b14dccc9311755ca42c74470aa1e0b8f0ce55a  pohunek\na1be8857e702b807753ad003a198453f8616296a4ccb882ef45f94335050bacb  pohunekd\nf914c7a8e7d23f2fefa2387882b9c7406b7c8ac5c10a56ef390565b06770502e  pohunek-sessiond\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "guard-doctor",
+        "argv": "env -i HOME=<macos-root>/home XDG_CONFIG_HOME=<macos-root>/home/<user> XDG_DATA_HOME=<macos-root>/data XDG_STATE_HOME=<macos-root>/state XDG_RUNTIME_DIR=<macos-runtime-root>/run TERM=dumb PATH=/usr/bin:/bin <macos-runtime-root>/bin/pohunek doctor --json",
+        "rc": 1,
+        "at": "2026-10-24T10:11:32Z",
+        "stdout": "{\n  \"checks\": [\n    {\n      \"name\": \"bin:git\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:codex\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"bin:claude\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"runtime_dir_private\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_path_length\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"state_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"log_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"worker_runtime_root\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"worker_state_root\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"filesystem_access\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"tailscale_cli\",\n      \"status\": \"fail\",\n      \"detail\": \"the tailscale CLI is not installed or not trusted, but overlays.toml configures this overlay; install it, or remove tailscale from providers in overlays.toml and restart the daemon\"\n    },\n    {\n      \"name\": \"schema_version\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"worker_executable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"login_shell\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"desktop_notifications\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"keychain\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"launchd_domain\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_definitions_dir\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_log_dir\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_agents_dir\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_job\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"overlay_config\",\n      \"status\": \"ok\",\n      \"detail\": \"overlays.toml configures tailscale on port 18733\"\n    },\n    {\n      \"name\": \"host_governance_inspection\",\n      \"status\": \"warn\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-doctor-before",
+        "argv": "env -i HOME=<macos-root>/home XDG_CONFIG_HOME=<macos-root>/home/<user> XDG_DATA_HOME=<macos-root>/data XDG_STATE_HOME=<macos-root>/state XDG_RUNTIME_DIR=<macos-runtime-root>/run TERM=dumb PATH=/usr/bin:/bin <macos-runtime-root>/bin/pohunek doctor --json",
+        "rc": 1,
+        "at": "2026-10-24T10:11:34Z",
+        "stdout": "{\n  \"checks\": [\n    {\n      \"name\": \"bin:git\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:codex\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"bin:claude\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"runtime_dir_private\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_path_length\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"state_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"log_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"worker_runtime_root\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"worker_state_root\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"filesystem_access\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"tailscale_cli\",\n      \"status\": \"fail\",\n      \"detail\": \"the tailscale CLI is not installed or not trusted, but overlays.toml configures this overlay; install it, or remove tailscale from providers in overlays.toml and restart the daemon\"\n    },\n    {\n      \"name\": \"schema_version\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"worker_executable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"login_shell\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"desktop_notifications\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"keychain\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"launchd_domain\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_definitions_dir\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_log_dir\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_agents_dir\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"launchd_job\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"overlay_config\",\n      \"status\": \"ok\",\n      \"detail\": \"overlays.toml configures tailscale on port 18733\"\n    },\n    {\n      \"name\": \"host_governance_inspection\",\n      \"status\": \"warn\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-host-list",
+        "argv": "env -i HOME=<macos-root>/home XDG_CONFIG_HOME=<macos-root>/home/<user> XDG_DATA_HOME=<macos-root>/data XDG_STATE_HOME=<macos-root>/state XDG_RUNTIME_DIR=<macos-runtime-root>/run TERM=dumb PATH=/usr/bin:/bin <macos-runtime-root>/bin/pohunek host list --json",
+        "rc": 1,
+        "at": "2026-10-24T10:11:36Z",
+        "stdout": "{\n  \"err\": {\n    \"code\": \"tailscale_cli_missing\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-daemon-start",
+        "argv": "out=$(env -i HOME=<macos-root>/home XDG_CONFIG_HOME=<macos-root>/home/<user> XDG_DATA_HOME=<macos-root>/data XDG_STATE_HOME=<macos-root>/state XDG_RUNTIME_DIR=<macos-runtime-root>/run TERM=dumb PATH=/usr/bin:/bin <macos-runtime-root>/bin/pohunek daemon start --dev-subprocess --detach 2>&1); rc=$?; printf '%s\\n' \"$out\"; pid=$(printf '%s\\n' \"$out\" | grep -o 'pid [0-9]*' | head -n 1 | tr -dc 0-9); [ -z \"$pid\" ] || printf %s \"$pid\" ><macos-root>/daemon.pid; exit $rc",
+        "rc": 0,
+        "at": "2026-10-24T10:11:39Z",
+        "stdout": "started pohunekd in background\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-wait",
+        "argv": "for i in 1 2 3 4 5 6 7 8 9 10; do env -i HOME=<macos-root>/home XDG_CONFIG_HOME=<macos-root>/home/<user> XDG_DATA_HOME=<macos-root>/data XDG_STATE_HOME=<macos-root>/state XDG_RUNTIME_DIR=<macos-runtime-root>/run TERM=dumb PATH=/usr/bin:/bin <macos-runtime-root>/bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1",
+        "rc": 0,
+        "at": "2026-10-24T10:11:41Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-doctor-after",
+        "argv": "env -i HOME=<macos-root>/home XDG_CONFIG_HOME=<macos-root>/home/<user> XDG_DATA_HOME=<macos-root>/data XDG_STATE_HOME=<macos-root>/state XDG_RUNTIME_DIR=<macos-runtime-root>/run TERM=dumb PATH=/usr/bin:/bin <macos-runtime-root>/bin/pohunek doctor --json",
+        "rc": 1,
+        "at": "2026-10-24T10:11:43Z",
+        "stdout": "{\n  \"checks\": [\n    {\n      \"name\": \"bin:git\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:codex\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"bin:claude\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"runtime_dir_private\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_path_length\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"state_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"log_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"worker_runtime_root\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"worker_state_root\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"filesystem_access\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"tailscale_cli\",\n      \"status\": \"fail\",\n      \"detail\": \"the tailscale CLI is not installed or not trusted, but overlays.toml configures this overlay; install it, or remove tailscale from providers in overlays.toml and restart the daemon\"\n    },\n    {\n      \"name\": \"schema_version\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"worker_executable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"login_shell\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"desktop_notifications\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"keychain\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"overlay_config\",\n      \"status\": \"ok\",\n      \"detail\": \"overlays.toml configures tailscale on port 18733, as the running daemon serves\"\n    },\n    {\n      \"name\": \"overlay_tailscale_listener\",\n      \"status\": \"warn\",\n      \"detail\": \"port=18733; the tailscale provider reports no listener address: overlay CLI for tailscale is not installed\"\n    },\n    {\n      \"name\": \"agent_manifest_embedded_shell\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"agent_runtime_codex\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"agent_runtime_claude\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"agent_runtime_hermes\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"host_governance_durability\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_identity_stable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_state_private_storage\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_governance_consistency\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_approval_key\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_governance_quarantine\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"catalog_trust_anchor\",\n      \"status\": \"warn\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-daemon-log",
+        "argv": "grep -rhI 'overlay state unavailable; serving local-only' <macos-root>; true",
+        "rc": 0,
+        "at": "2026-10-24T10:11:46Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "d6-lsof",
+        "argv": "lsof -nP -iTCP:18733 -sTCP:LISTEN",
+        "rc": 1,
+        "at": "2026-10-24T10:11:48Z",
+        "stdout": "0 listener line(s)\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "us-tailscaled-start",
+        "argv": "mkdir -p <macos-root>/ts; nohup /opt/homebrew/bin/tailscaled --tun=userspace-networking --socket=<macos-runtime-root>/ts.sock --statedir=<macos-root>/ts --port=0 --no-logs-no-support ><macos-runtime-root>/tsd.log 2>&1 </dev/null & echo $! ><macos-root>/tsd.pid; for i in 1 2 3 4 5 6 7 8 9 10; do [ -S <macos-runtime-root>/ts.sock ] && exit 0; sleep 1; done; cat <macos-runtime-root>/tsd.log; exit 1",
+        "rc": 0,
+        "at": "2026-10-24T10:11:50Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "us-hostfwd-add",
+        "argv": "monitor a hostfwd_add wan tcp:<netbird-ip-1>:41501-:8080",
+        "rc": 0,
+        "at": "2026-10-24T10:11:52Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "us-hostfwd-bind",
+        "argv": "ss -ltnH sport = :41501",
+        "rc": 0,
+        "at": "2026-10-24T10:11:52Z",
+        "stdout": "LISTEN 0      1      <netbird-ip-1>:41501 0.0.0.0:*\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "us-reach",
+        "argv": "curl -sS -m 5 http://<netbird-ip-1>:41501/health",
+        "rc": 28,
+        "at": "2026-10-24T10:11:52Z",
+        "stdout": "curl: (28) Operation timed out after 5002 milliseconds with 0 bytes received\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "us-hostfwd-remove",
+        "argv": "monitor a hostfwd_remove wan tcp:<netbird-ip-1>:41501",
+        "rc": 0,
+        "at": "2026-10-24T10:11:59Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "us-hostfwd-closed",
+        "argv": "ss -ltnH sport = :41501",
+        "rc": 0,
+        "at": "2026-10-24T10:11:59Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-daemon-stop",
+        "argv": "pid=$(cat <macos-root>/daemon.pid 2>/dev/null); if [ -n \"$pid\" ] && ps -p $pid -o command= | grep -F -q <macos-runtime-root>/bin/pohunekd; then kill $pid; for i in 1 2 3 4 5; do ps -p $pid >/dev/null 2>&1 || break; sleep 1; done; if ps -p $pid -o command= | grep -F -q <macos-runtime-root>/bin/pohunekd; then kill -9 $pid; fi; fi; true",
+        "rc": 0,
+        "at": "2026-10-24T10:11:59Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-kill-tsd",
+        "argv": "pid=$(cat <macos-root>/tsd.pid 2>/dev/null); if [ -n \"$pid\" ] && ps -p $pid -o command= | grep -F -q -- --socket=<macos-runtime-root>/ts.sock; then kill $pid; fi; true",
+        "rc": 0,
+        "at": "2026-10-24T10:12:01Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-brew-recheck",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew list --versions tailscale",
+        "rc": 0,
+        "at": "2026-10-24T10:12:04Z",
+        "stdout": "tailscale 1.104.2\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-brew-uninstall",
+        "argv": "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 /opt/homebrew/bin/brew uninstall tailscale",
+        "rc": 0,
+        "at": "2026-10-24T10:12:06Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-ls",
+        "argv": "ls /opt/homebrew/bin/tailscale* 2>&1; true",
+        "rc": 0,
+        "at": "2026-10-24T10:12:08Z",
+        "stdout": "tailscale\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-health",
+        "argv": "/home/<user>/.local/bin/pohunek --host zajcaair health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:12:10Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-rm",
+        "argv": "rm -rf <macos-root> <macos-runtime-root> <macos-comm-root>",
+        "rc": 0,
+        "at": "2026-10-24T10:12:13Z",
+        "stdout": "",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-session-stop",
+        "argv": "/home/<user>/.local/bin/pohunek session stop zajcaair/s-01M5PP8PQ7HG4S5D9ZVF1RCVPA --json",
+        "rc": 0,
+        "at": "2026-10-24T10:12:13Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "cl-session-rm",
+        "argv": "/home/<user>/.local/bin/pohunek session rm zajcaair/s-01M5PP8PQ7HG4S5D9ZVF1RCVPA --json",
+        "rc": 0,
+        "at": "2026-10-24T10:12:13Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      }
+    ],
+    "netbird": [
+      {
+        "name": "owner-pid-before",
+        "argv": "owner_pid",
+        "rc": 0,
+        "at": "2026-10-24T10:10:48Z",
+        "stdout": "322699\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "owner-peers-before",
+        "argv": "owner_peers",
+        "rc": 0,
+        "at": "2026-10-24T10:10:48Z",
+        "stdout": "{\"peers\": 207, \"connected\": 6}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "owner-health-before",
+        "argv": "/home/<user>/.local/bin/pohunek health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:48Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "guard-doctor",
+        "argv": "nb_run pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:48Z",
+        "stdout": "{\n  \"checks\": [\n    {\n      \"name\": \"bin:git\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:codex\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:claude\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"state_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"log_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"netbird_cli\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"schema_version\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"overlay_config\",\n      \"status\": \"ok\",\n      \"detail\": \"the default (no overlays.toml) configures netbird on port 18722\"\n    },\n    {\n      \"name\": \"host_governance_inspection\",\n      \"status\": \"warn\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "daemon-start",
+        "argv": "nb_run pohunek daemon start --dev-subprocess --detach",
+        "rc": 0,
+        "at": "2026-10-24T10:10:48Z",
+        "stdout": "started pohunekd in background\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "doctor",
+        "argv": "nb_run pohunek doctor --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:51Z",
+        "stdout": "{\n  \"checks\": [\n    {\n      \"name\": \"bin:git\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:codex\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"bin:claude\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"socket_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"state_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"log_dir_writable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"netbird_cli\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"schema_version\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"overlay_config\",\n      \"status\": \"ok\",\n      \"detail\": \"the default (no overlays.toml) configures netbird on port 18722, as the running daemon serves\"\n    },\n    {\n      \"name\": \"worker_executable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"overlay_netbird_listener\",\n      \"status\": \"ok\",\n      \"detail\": \"port=18722; the netbird provider reports listener address <netbird-ip-1>:18722\"\n    },\n    {\n      \"name\": \"agent_manifest_embedded_shell\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"agent_runtime_codex\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"agent_runtime_claude\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"agent_runtime_hermes\",\n      \"status\": \"warn\"\n    },\n    {\n      \"name\": \"host_governance_durability\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_identity_stable\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_state_private_storage\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_governance_consistency\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_approval_key\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"host_governance_quarantine\",\n      \"status\": \"ok\"\n    },\n    {\n      \"name\": \"catalog_trust_anchor\",\n      \"status\": \"warn\"\n    }\n  ]\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "daemon-log",
+        "argv": "grep -rhI --exclude-dir=bin remote control listener not bound /dev/shm/ph1112",
+        "rc": 0,
+        "at": "2026-10-24T10:10:51Z",
+        "stdout": "remote control listener not bound\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "host-list",
+        "argv": "nb_run pohunek host list --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:51Z",
+        "stdout": "[\n  {\n    \"name\": \"<local>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"reachable_daemon\",\n    \"local\": true,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-1>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-2>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-3>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-4>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-5>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-6>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-7>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-8>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-9>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-10>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-11>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-12>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-13>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-14>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-15>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-16>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-17>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-18>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-19>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-20>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-21>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-22>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-23>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-24>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-25>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-26>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-27>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-28>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-29>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-30>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-31>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-32>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-33>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-34>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-35>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-36>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-37>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-38>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-39>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-40>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-41>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-42>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-43>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-44>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-45>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-46>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-47>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-48>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-49>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-50>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-51>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-52>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-53>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-54>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"zajcaair\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"reachable_daemon\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-55>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-56>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-57>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-58>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-59>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-60>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-61>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-62>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-63>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-64>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-65>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-66>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-67>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-68>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-69>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-70>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-71>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-72>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-73>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-74>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-75>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-76>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-77>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-78>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-79>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-80>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"reachable_daemon\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-81>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-82>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-83>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-84>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-85>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-86>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-87>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-88>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-89>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-90>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-91>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-92>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-93>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-94>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-95>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-96>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-97>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-98>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-99>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-100>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-101>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-102>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-103>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-104>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-105>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-106>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-107>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-108>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-109>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-110>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-111>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-112>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-113>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-114>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-115>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-116>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-117>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-118>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-119>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-12",
+        "stderr": "",
+        "truncated": true
+      },
+      {
+        "name": "discover",
+        "argv": "nb_run pohunek host discover --refresh --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:52Z",
+        "stdout": "[\n  {\n    \"name\": \"<local>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"reachable_daemon\",\n    \"local\": true,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-1>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-2>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-3>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-4>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-5>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-6>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-7>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-8>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-9>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-10>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-11>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-12>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-13>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-14>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-15>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-16>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-17>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-18>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-19>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-20>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-21>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-22>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-23>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-24>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-25>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-26>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-27>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-28>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-29>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-30>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-31>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-32>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-33>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-34>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-35>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-36>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-37>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-38>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-39>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-40>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-41>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-42>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-43>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-44>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-45>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-46>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-47>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-48>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-49>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-50>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-51>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-52>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-53>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-54>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"zajcaair\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"reachable_daemon\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-55>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-56>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-57>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-58>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-59>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-60>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-61>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-62>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-63>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-64>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-65>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-66>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-67>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-68>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-69>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-70>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-71>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-72>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-73>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-74>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-75>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-76>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-77>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-78>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-79>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-80>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"reachable_daemon\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-81>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-82>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-83>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-84>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-85>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-86>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-87>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-88>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-89>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-90>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-91>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-92>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-93>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-94>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-95>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-96>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-97>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-98>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-99>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-100>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-101>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-102>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-103>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-104>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-105>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-106>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-107>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-108>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-109>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-110>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-111>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-112>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-113>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-114>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-115>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-116>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-117>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-118>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-119>\",\n    \"overlay\": \"netbird\",\n    \"classification\": \"unreachable\",\n    \"local\": false,\n    \"port\": 18722\n  },\n  {\n    \"name\": \"<peer-12",
+        "stderr": "",
+        "truncated": true
+      },
+      {
+        "name": "inspect-zajcaair",
+        "argv": "nb_run pohunek host inspect zajcaair --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:53Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "daemon-stop",
+        "argv": "kill the processes of /dev/shm/ph1112/bin (exact pids)",
+        "rc": 0,
+        "at": "2026-10-24T10:10:55Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "owner-pid-after",
+        "argv": "owner_pid",
+        "rc": 0,
+        "at": "2026-10-24T10:10:55Z",
+        "stdout": "322699\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "owner-peers-after",
+        "argv": "owner_peers",
+        "rc": 0,
+        "at": "2026-10-24T10:10:55Z",
+        "stdout": "{\"peers\": 207, \"connected\": 6}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "owner-health-after",
+        "argv": "/home/<user>/.local/bin/pohunek health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:10:55Z",
+        "stdout": "<withheld: not in the evidence allow-list>",
+        "stderr": "",
+        "truncated": false
+      }
+    ],
+    "pre": [
+      {
+        "name": "service-health-a",
+        "argv": "vm_ssh a PATH=/usr/local/bin:/usr/bin:/bin pohunek health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:01Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "service-health-b",
+        "argv": "vm_ssh b PATH=/usr/local/bin:/usr/bin:/bin pohunek health --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:05Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"status\": \"ok\",\n    \"daemon_version\": \"0.36.0\",\n    \"protocol_version\": 4\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "project-add-a",
+        "argv": "vm_ssh a pohunek project add ~/ph1112-repo --name ph1112-d4 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:05Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"id\": \"p-bac38513\",\n    \"label\": \"ph1112-d4\",\n    \"repo_root\": \"/home/<user>/ph1112-repo\",\n    \"git_common_dir\": \"/home/<user>/ph1112-repo/.git\",\n    \"source\": \"manual\",\n    \"is_bare\": false,\n    \"added_at\": \"2026-10-24T10:09:05.103283179Z\",\n    \"last_used_at\": \"2026-10-24T10:09:05.103283179Z\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "project-add-b",
+        "argv": "vm_ssh b pohunek project add ~/ph1112-repo --name ph1112-d4 --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:05Z",
+        "stdout": "{\n  \"cli_version\": \"0.36.0\",\n  \"protocol\": {\n    \"minimum\": 3,\n    \"maximum\": 4\n  },\n  \"ok\": {\n    \"id\": \"p-bac38513\",\n    \"label\": \"ph1112-d4\",\n    \"repo_root\": \"/home/<user>/ph1112-repo\",\n    \"git_common_dir\": \"/home/<user>/ph1112-repo/.git\",\n    \"source\": \"manual\",\n    \"is_bare\": false,\n    \"added_at\": \"2026-10-24T10:09:05.435576681Z\",\n    \"last_used_at\": \"2026-10-24T10:09:05.435576681Z\"\n  }\n}\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "status-a",
+        "argv": "vm_ssh a tailscale status --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "{\n  \"Version\": \"1.104.2-tc3430f0d2-g598b63867\",\n  \"TUN\": true,\n  \"BackendState\": \"Running\",\n  \"HaveNodeKey\": true,\n  \"AuthURL\": \"<redacted>\",\n  \"TailscaleIPs\": [\n    \"100.64.0.1\",\n    \"fd7a:115c:a1e0::1\"\n  ],\n  \"Self\": {\n    \"ID\": \"1\",\n    \"NodeID\": 1,\n    \"PublicKey\": \"<redacted>\",\n    \"HostName\": \"ph-a\",\n    \"DNSName\": \"ph-a.ts.lab.internal.\",\n    \"OS\": \"linux\",\n    \"UserID\": 1,\n    \"TailscaleIPs\": [\n      \"100.64.0.1\",\n      \"fd7a:115c:a1e0::1\"\n    ],\n    \"AllowedIPs\": [\n      \"100.64.0.1/32\",\n      \"fd7a:115c:a1e0::1/128\"\n    ],\n    \"Addrs\": [\"<redacted>\"],\n    \"CurAddr\": \"<redacted>\",\n    \"Relay\": \"<redacted>\",\n    \"PeerRelay\": \"<redacted>\",\n    \"RxBytes\": 0,\n    \"TxBytes\": 0,\n    \"Created\": \"2026-10-24T10:08:44.236894699Z\",\n    \"LastWrite\": \"0001-01-01T00:00:00Z\",\n    \"LastSeen\": \"0001-01-01T00:00:00Z\",\n    \"LastHandshake\": \"0001-01-01T00:00:00Z\",\n    \"Online\": true,\n    \"ExitNode\": false,\n    \"ExitNodeOption\": false,\n    \"Active\": false,\n    \"PeerAPIURL\": [\n      \"http://100.64.0.1:58436\",\n      \"http://[fd7a:115c:a1e0::1]:59780\"\n    ],\n    \"TaildropTarget\": 0,\n    \"NoFileSharingReason\": \"\",\n    \"Capabilities\": [\n      \"HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508\",\n      \"default-auto-update\",\n      \"https://tailscale.com/cap/file-sharing\",\n      \"https://tailscale.com/cap/is-admin\",\n      \"https://tailscale.com/cap/ssh\"\n    ],\n    \"CapMap\": {\n      \"default-auto-update\": [\n        false\n      ],\n      \"https://tailscale.com/cap/file-sharing\": [],\n      \"https://tailscale.com/cap/is-admin\": [],\n      \"https://tailscale.com/cap/ssh\": []\n    },\n    \"InNetworkMap\": true,\n    \"InMagicSock\": false,\n    \"InEngine\": false\n  },\n  \"Health\": [\n    \"Tailscale could not connect to the 'ph lab embedded' relay server. Your Internet connection might be down, or the server might be temporarily unavailable.\"\n  ],\n  \"MagicDNSSuffix\": \"ts.lab.internal\",\n  \"CurrentTailnet\": {\n    \"Name\": \"10.77.0.1\",\n    \"StableID\": \"\",\n    \"MagicDNSSuffix\": \"ts.lab.internal\",\n    \"MagicDNSEnabled\": true\n  },\n  \"CertDomains\": null,\n  \"ExtraRecords\": null,\n  \"Peer\": {\n    \"<redacted-key>\": {\n      \"ID\": \"2\",\n      \"NodeID\": 2,\n      \"PublicKey\": \"<redacted>\",\n      \"HostName\": \"ph-b\",\n      \"DNSName\": \"ph-b.ts.lab.internal.\",\n      \"OS\": \"linux\",\n      \"UserID\": 1,\n      \"TailscaleIPs\": [\n        \"100.64.0.2\",\n        \"fd7a:115c:a1e0::2\"\n      ],\n      \"AllowedIPs\": [\n        \"100.64.0.2/32\",\n        \"fd7a:115c:a1e0::2/128\"\n      ],\n      \"Addrs\": null,\n      \"CurAddr\": \"<redacted>\",\n      \"Relay\": \"<redacted>\",\n      \"PeerRelay\": \"<redacted>\",\n      \"RxBytes\": 0,\n      \"TxBytes\": 0,\n      \"Created\": \"2026-10-24T10:08:47.720659101Z\",\n      \"LastWrite\": \"0001-01-01T00:00:00Z\",\n      \"LastSeen\": \"0001-01-01T00:00:00Z\",\n      \"LastHandshake\": \"0001-01-01T00:00:00Z\",\n      \"Online\": true,\n      \"ExitNode\": false,\n      \"ExitNodeOption\": false,\n      \"Active\": false,\n      \"PeerAPIURL\": [\n        \"http://100.64.0.2:46590\",\n        \"http://[fd7a:115c:a1e0::2]:47166\"\n      ],\n      \"TaildropTarget\": 1,\n      \"NoFileSharingReason\": \"\",\n      \"InNetworkMap\": true,\n      \"InMagicSock\": true,\n      \"InEngine\": false\n    }\n  },\n  \"User\": {\n    \"1\": {\n      \"ID\": 1,\n      \"LoginName\": \"ph\",\n      \"DisplayName\": \"ph\"\n    }\n  },\n  \"ClientVersion\": null\n}",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "hostname-a",
+        "argv": "vm_ssh a hostname",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "lab-a\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "units-a",
+        "argv": "vm_ssh a systemctl --user is-active 'pohunek-*-daemon.service'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "active\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "status-b",
+        "argv": "vm_ssh b tailscale status --json",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "{\n  \"Version\": \"1.104.2-tc3430f0d2-g598b63867\",\n  \"TUN\": true,\n  \"BackendState\": \"Running\",\n  \"HaveNodeKey\": true,\n  \"AuthURL\": \"<redacted>\",\n  \"TailscaleIPs\": [\n    \"100.64.0.2\",\n    \"fd7a:115c:a1e0::2\"\n  ],\n  \"Self\": {\n    \"ID\": \"2\",\n    \"NodeID\": 2,\n    \"PublicKey\": \"<redacted>\",\n    \"HostName\": \"ph-b\",\n    \"DNSName\": \"ph-b.ts.lab.internal.\",\n    \"OS\": \"linux\",\n    \"UserID\": 1,\n    \"TailscaleIPs\": [\n      \"100.64.0.2\",\n      \"fd7a:115c:a1e0::2\"\n    ],\n    \"AllowedIPs\": [\n      \"100.64.0.2/32\",\n      \"fd7a:115c:a1e0::2/128\"\n    ],\n    \"Addrs\": [\"<redacted>\"],\n    \"CurAddr\": \"<redacted>\",\n    \"Relay\": \"<redacted>\",\n    \"PeerRelay\": \"<redacted>\",\n    \"RxBytes\": 0,\n    \"TxBytes\": 0,\n    \"Created\": \"2026-10-24T10:08:47.720659101Z\",\n    \"LastWrite\": \"0001-01-01T00:00:00Z\",\n    \"LastSeen\": \"0001-01-01T00:00:00Z\",\n    \"LastHandshake\": \"0001-01-01T00:00:00Z\",\n    \"Online\": true,\n    \"ExitNode\": false,\n    \"ExitNodeOption\": false,\n    \"Active\": false,\n    \"PeerAPIURL\": [\n      \"http://100.64.0.2:46590\",\n      \"http://[fd7a:115c:a1e0::2]:47166\"\n    ],\n    \"TaildropTarget\": 0,\n    \"NoFileSharingReason\": \"\",\n    \"Capabilities\": [\n      \"HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508\",\n      \"default-auto-update\",\n      \"https://tailscale.com/cap/file-sharing\",\n      \"https://tailscale.com/cap/is-admin\",\n      \"https://tailscale.com/cap/ssh\"\n    ],\n    \"CapMap\": {\n      \"default-auto-update\": [\n        false\n      ],\n      \"https://tailscale.com/cap/file-sharing\": [],\n      \"https://tailscale.com/cap/is-admin\": [],\n      \"https://tailscale.com/cap/ssh\": []\n    },\n    \"InNetworkMap\": true,\n    \"InMagicSock\": false,\n    \"InEngine\": false\n  },\n  \"Health\": [\n    \"Tailscale could not connect to the 'ph lab embedded' relay server. Your Internet connection might be down, or the server might be temporarily unavailable.\"\n  ],\n  \"MagicDNSSuffix\": \"ts.lab.internal\",\n  \"CurrentTailnet\": {\n    \"Name\": \"10.77.0.1\",\n    \"StableID\": \"\",\n    \"MagicDNSSuffix\": \"ts.lab.internal\",\n    \"MagicDNSEnabled\": true\n  },\n  \"CertDomains\": null,\n  \"ExtraRecords\": null,\n  \"Peer\": {\n    \"<redacted-key>\": {\n      \"ID\": \"1\",\n      \"NodeID\": 1,\n      \"PublicKey\": \"<redacted>\",\n      \"HostName\": \"ph-a\",\n      \"DNSName\": \"ph-a.ts.lab.internal.\",\n      \"OS\": \"linux\",\n      \"UserID\": 1,\n      \"TailscaleIPs\": [\n        \"100.64.0.1\",\n        \"fd7a:115c:a1e0::1\"\n      ],\n      \"AllowedIPs\": [\n        \"100.64.0.1/32\",\n        \"fd7a:115c:a1e0::1/128\"\n      ],\n      \"Addrs\": null,\n      \"CurAddr\": \"<redacted>\",\n      \"Relay\": \"<redacted>\",\n      \"PeerRelay\": \"<redacted>\",\n      \"RxBytes\": 0,\n      \"TxBytes\": 0,\n      \"Created\": \"2026-10-24T10:08:44.236894699Z\",\n      \"LastWrite\": \"0001-01-01T00:00:00Z\",\n      \"LastSeen\": \"0001-01-01T00:00:00Z\",\n      \"LastHandshake\": \"0001-01-01T00:00:00Z\",\n      \"Online\": true,\n      \"ExitNode\": false,\n      \"ExitNodeOption\": false,\n      \"Active\": false,\n      \"PeerAPIURL\": [\n        \"http://100.64.0.1:58436\",\n        \"http://[fd7a:115c:a1e0::1]:59780\"\n      ],\n      \"TaildropTarget\": 1,\n      \"NoFileSharingReason\": \"\",\n      \"InNetworkMap\": true,\n      \"InMagicSock\": true,\n      \"InEngine\": false\n    }\n  },\n  \"User\": {\n    \"1\": {\n      \"ID\": 1,\n      \"LoginName\": \"ph\",\n      \"DisplayName\": \"ph\"\n    }\n  },\n  \"ClientVersion\": null\n}",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "hostname-b",
+        "argv": "vm_ssh b hostname",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "lab-b\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "units-b",
+        "argv": "vm_ssh b systemctl --user is-active 'pohunek-*-daemon.service'",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "active\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ping-a",
+        "argv": "vm_ssh a tailscale ping -c 20 100.64.0.2",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "pong from ph-b (100.64.0.2) via 10.77.0.2:41641 in 1ms\n",
+        "stderr": "",
+        "truncated": false
+      },
+      {
+        "name": "ping-b",
+        "argv": "vm_ssh b tailscale ping -c 20 100.64.0.1",
+        "rc": 0,
+        "at": "2026-10-24T10:09:06Z",
+        "stdout": "pong from ph-a (100.64.0.1) via 10.77.0.1:41641 in 0s\n",
+        "stderr": "",
+        "truncated": false
+      }
+    ]
+  },
+  "recordings": {
+    "linux-kernel-tun": {
+      "Version": "1.104.2-tc3430f0d2-g598b63867",
+      "TUN": true,
+      "BackendState": "Running",
+      "HaveNodeKey": true,
+      "AuthURL": "<redacted>",
+      "TailscaleIPs": [
+        "100.64.0.1",
+        "fd7a:115c:a1e0::1"
+      ],
+      "Self": {
+        "ID": "1",
+        "NodeID": 1,
+        "PublicKey": "<redacted>",
+        "HostName": "ph-a",
+        "DNSName": "ph-a.ts.lab.internal.",
+        "OS": "linux",
+        "UserID": 1,
+        "TailscaleIPs": [
+          "100.64.0.1",
+          "fd7a:115c:a1e0::1"
+        ],
+        "AllowedIPs": [
+          "100.64.0.1/32",
+          "fd7a:115c:a1e0::1/128"
+        ],
+        "Addrs": [
+          "<redacted>"
+        ],
+        "CurAddr": "<redacted>",
+        "Relay": "<redacted>",
+        "PeerRelay": "<redacted>",
+        "RxBytes": 0,
+        "TxBytes": 0,
+        "Created": "2026-10-24T10:08:44.236894699Z",
+        "LastWrite": "0001-01-01T00:00:00Z",
+        "LastSeen": "0001-01-01T00:00:00Z",
+        "LastHandshake": "0001-01-01T00:00:00Z",
+        "Online": true,
+        "ExitNode": false,
+        "ExitNodeOption": false,
+        "Active": false,
+        "PeerAPIURL": [
+          "http://100.64.0.1:58436",
+          "http://[fd7a:115c:a1e0::1]:59780"
+        ],
+        "TaildropTarget": 0,
+        "NoFileSharingReason": "",
+        "Capabilities": [
+          "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+          "default-auto-update",
+          "https://tailscale.com/cap/file-sharing",
+          "https://tailscale.com/cap/is-admin",
+          "https://tailscale.com/cap/ssh"
+        ],
+        "CapMap": {
+          "default-auto-update": [
+            false
+          ],
+          "https://tailscale.com/cap/file-sharing": [],
+          "https://tailscale.com/cap/is-admin": [],
+          "https://tailscale.com/cap/ssh": []
+        },
+        "InNetworkMap": true,
+        "InMagicSock": false,
+        "InEngine": false
+      },
+      "Health": [
+        "Tailscale could not connect to the 'ph lab embedded' relay server. Your Internet connection might be down, or the server might be temporarily unavailable."
+      ],
+      "MagicDNSSuffix": "ts.lab.internal",
+      "CurrentTailnet": {
+        "Name": "10.77.0.1",
+        "StableID": "",
+        "MagicDNSSuffix": "ts.lab.internal",
+        "MagicDNSEnabled": true
+      },
+      "CertDomains": null,
+      "ExtraRecords": null,
+      "Peer": {
+        "<redacted-key>": {
+          "ID": "2",
+          "NodeID": 2,
+          "PublicKey": "<redacted>",
+          "HostName": "ph-b",
+          "DNSName": "ph-b.ts.lab.internal.",
+          "OS": "linux",
+          "UserID": 1,
+          "TailscaleIPs": [
+            "100.64.0.2",
+            "fd7a:115c:a1e0::2"
+          ],
+          "AllowedIPs": [
+            "100.64.0.2/32",
+            "fd7a:115c:a1e0::2/128"
+          ],
+          "Addrs": null,
+          "CurAddr": "<redacted>",
+          "Relay": "<redacted>",
+          "PeerRelay": "<redacted>",
+          "RxBytes": 0,
+          "TxBytes": 0,
+          "Created": "2026-10-24T10:08:47.720659101Z",
+          "LastWrite": "0001-01-01T00:00:00Z",
+          "LastSeen": "0001-01-01T00:00:00Z",
+          "LastHandshake": "0001-01-01T00:00:00Z",
+          "Online": true,
+          "ExitNode": false,
+          "ExitNodeOption": false,
+          "Active": false,
+          "PeerAPIURL": [
+            "http://100.64.0.2:46590",
+            "http://[fd7a:115c:a1e0::2]:47166"
+          ],
+          "TaildropTarget": 1,
+          "NoFileSharingReason": "",
+          "InNetworkMap": true,
+          "InMagicSock": true,
+          "InEngine": false
+        }
+      },
+      "User": {
+        "1": {
+          "ID": 1,
+          "LoginName": "ph",
+          "DisplayName": "ph"
+        }
+      },
+      "ClientVersion": null
+    }
+  }
+}

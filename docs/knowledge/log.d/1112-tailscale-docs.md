@@ -3,6 +3,16 @@
 - New guide [Tailscale overlay](guides/tailscale.md): enabling the provider,
   installing the client on Linux and macOS, the selectors that name a peer,
   the `ShareeNode` rule, an ACL example and troubleshooting by error code.
+- Tailscale is supported on Linux in this release; **macOS is not**. The stock
+  Apple-Silicon Homebrew directory `/opt/homebrew/bin` is admin group-writable
+  and the trusted-executable policy refuses a `tailscale` binary there
+  (`tailscale_cli_missing`). Tracked in
+  [#1583](https://github.com/zajca/pohunek/issues/1583).
+- Acceptance evidence: two Linux nodes on a Headscale v0.29.5 tailnet ran the
+  direct owner path in both directions, and the NetBird default with an absent
+  `overlays.toml` was checked unchanged. The redacted run is
+  `docs/acceptance/1112-tailscale-overlay.json`; the macOS leg is recorded
+  as failed under the limitation above, and its userspace sub-step did not run.
 - NetBird is the default overlay and Tailscale a supported opt-in overlay in
   the product constraints, the architecture and the public API. The listener
   authenticates nothing beyond overlay reachability, so the overlay's policy

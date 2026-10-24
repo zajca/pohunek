@@ -445,6 +445,66 @@ fn an_unusable_backend_state_fails_closed_without_dialing() {
     }
 }
 
+/// The redacted `tailscale status --json` of a real kernel-TUN node (Tailscale
+/// 1.104.2 against Headscale, from the #1112 acceptance run) drives the same
+/// listing, selector, dial and doctor paths as the spec-derived documents.
+#[test]
+fn a_recording_of_a_real_kernel_tun_node_is_parsed_and_routed() {
+    let recording: Value = serde_json::from_str(include_str!(
+        "fixtures/tailscale-status-linux-kernel-tun.json"
+    ))
+    .expect("the recording is JSON");
+    let fixture = Fixture::new(&tailnet());
+    // The CLI prints one line, so the recording is compacted.
+    fixture.fake.set_status_text(&recording.to_string());
+
+    for command in ["list", "discover"] {
+        let (peers, local) = records(&fixture.run(&["host", command, "--refresh", "--json"]));
+        assert_eq!(names(&peers), ["ph-b"], "{command}");
+        let peer = record(&peers, "ph-b");
+        assert_eq!(peer["overlay"], "tailscale", "{command}");
+        assert_eq!(peer["peer_id"], "2", "{command}");
+        assert_eq!(
+            peer["fqdn"], "ph-b.ts.lab.internal",
+            "{command}: no trailing dot"
+        );
+        assert_eq!(
+            peer["address"], "100.64.0.2",
+            "{command}: IPv4 is preferred"
+        );
+        let local = local.unwrap_or_else(|| panic!("{command}: this host is listed"));
+        assert_eq!(local["name"], "ph-a", "{command}");
+        assert_eq!(local["address"], "100.64.0.1", "{command}");
+    }
+    for selector in [
+        "ph-b",
+        "ph-b.ts.lab.internal",
+        "tailscale:ph-b",
+        "2",
+        "100.64.0.2",
+        &peer_selector("2"),
+    ] {
+        let (output, targets) = fixture.dial(selector);
+        assert_eq!(error_code(&output), "host_unreachable", "{selector}");
+        assert_eq!(targets, [format!("100.64.0.2:{PORT}")], "{selector}");
+    }
+
+    let output = fixture.run(&["doctor", "--json"]);
+    let document = json(&output);
+    let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+    let cli = checks
+        .iter()
+        .find(|check| check["name"] == "tailscale_cli")
+        .expect("tailscale_cli check");
+    assert_eq!(cli["status"], "ok", "{cli}");
+    assert!(
+        cli["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("100.64.0.1")),
+        "{cli}"
+    );
+}
+
 /// The doctor names the reason the node has no usable address: userspace
 /// networking, a backend that is not running, or no IPv4 address.
 #[test]

@@ -4,8 +4,8 @@
 //! `tailscale/tailscale@v1.104.2` (`ipn/ipnstate/ipnstate.go`): the field
 //! names, a Go `nil` slice as `null`, `Tags`, `Expired` and `ShareeNode` only
 //! when set (`omitempty`), the peer map keyed by the node public key, and a
-//! `DNSName` with a trailing dot. The values are synthetic, so a recording of
-//! a real client replaces or extends them in the acceptance run of #1112.
+//! `DNSName` with a trailing dot. The values are synthetic, so the
+//! redacted recording of a real client in `tests/fixtures/` stands next to them.
 
 // Rust guideline compliant 2026-10-23
 

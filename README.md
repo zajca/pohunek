@@ -102,7 +102,7 @@ handles it once, for every agent CLI:
   bots, and manager agents talk to one contract instead of every harness.
 - **Multihost from the start.** Every host is authoritative for its own
   sessions. The CLI and SDKs talk directly to each host's daemon: an owner-only
-  Unix socket locally, a NetBird (default) or Tailscale overlay remotely, bound
+  Unix socket locally, a NetBird (default) or Tailscale (Linux hosts) overlay remotely, bound
   only to the overlay address ([Tailscale guide](docs/knowledge/guides/tailscale.md)). No central server, no SaaS, no state sync. `--host buildbox`
   or a `buildbox/<session-id>` target is all it takes, and a machine's own
   overlay name selects its local daemon, so one host name works everywhere
