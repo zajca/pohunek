@@ -116,6 +116,7 @@ class Run:
             "macos_root": MAC_ROOT,
             "macos_runtime_root": MAC_RUNTIME,
             "macos_comm_root": MAC_COMM,
+            "macos_project": "owner-secret-project",
             "tailscale_version": "1.104.2",
         }
         (self.root / "run.json").write_text(json.dumps({"started": "2026-10-25T00:00:00Z", "legs": self.legs, "meta": meta}))
@@ -1335,6 +1336,21 @@ class AssembleTest(unittest.TestCase):
         step = [s for s in document["steps"]["macos"] if s["name"] == "mac-roots"][0]
         self.assertEqual(step["argv"], "mkdir -p <macos-root>/home && mkdir <macos-runtime-root> && mkdir <macos-comm-root>/out")
         self.assertNotIn(MAC_ROOT, json.dumps(document["meta"]))
+
+    def test_the_owner_project_reference_is_a_placeholder(self):
+        self.run_.step(
+            "macos",
+            "session-new",
+            "",
+            argv="pohunek session new --host zajcaair --project owner-secret-project --agent shell",
+            stderr="project owner-secret-project is unknown",
+        )
+        helper("assemble", self.run_.root, self.out)
+        text = self.out.read_text()
+        self.assertNotIn("owner-secret-project", text)
+        step = [s for s in json.loads(text)["steps"]["macos"] if s["name"] == "session-new"][0]
+        self.assertEqual(step["argv"], "pohunek session new --host zajcaair --project <macos-project> --agent shell")
+        self.assertEqual(step["stderr"], overlay_evidence.WITHHELD)
 
     def test_ipv6_endpoint_addresses_in_a_status_recording_leave_valid_json(self):
         document = json.loads(status_json("a"))

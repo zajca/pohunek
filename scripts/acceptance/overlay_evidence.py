@@ -1026,8 +1026,15 @@ class Redactor:
     the same placeholder.
     """
 
-    def __init__(self, netbird_addresses: Iterable[str] = (), roots: Iterable[Tuple[str, str]] = ()) -> None:
+    def __init__(
+        self, netbird_addresses: Iterable[str] = (), roots: Iterable[Tuple[str, str]] = (), project: str = ""
+    ) -> None:
         self.netbird_addresses = [a for a in netbird_addresses if a]
+        # The owner's project reference only counts where it is named as a
+        # project; a bare substring match would also hit the command name.
+        self.project = (
+            re.compile(r"(--project(?:=|\s+)|\bproject\W{0,4})" + re.escape(project) + r"(?![\w.-])") if project else None
+        )
         self.placeholders: Dict[str, str] = {}
         # (path, placeholder) pairs, longest path first so a root never
         # shadows the longer root it prefixes.
@@ -1037,6 +1044,8 @@ class Redactor:
         """Replace the throwaway roots of the owner's machines, then any path left."""
         for path, placeholder in self.roots:
             text = text.replace(path, placeholder)
+        if self.project is not None:
+            text = self.project.sub(lambda match: match.group(1) + "<macos-project>", text)
         return text
 
     def prose(self, text: str, netbird_leg: bool) -> str:
@@ -1089,7 +1098,7 @@ def step_record(redactor: Redactor, leg: str, step: Step) -> Dict[str, Any]:
     """Return one step as recorded in the evidence document."""
     netbird = leg in NETBIRD_LEGS
     out, out_cut = clip(redactor.text(redactor.private(project_step_text(leg, step)), netbird))
-    err, err_cut = clip(WITHHELD if netbird and step.stderr.strip() else redactor.text(step.stderr, netbird))
+    err, err_cut = clip(WITHHELD if netbird and step.stderr.strip() else redactor.text(redactor.private(step.stderr), netbird))
     return {
         "name": step.name,
         "argv": redactor.text(redactor.private(step.argv), netbird),
@@ -1138,7 +1147,7 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
     leaks = scan_directory(state_dir)
     if leaks:
         raise EvidenceError("secret key prefix in the run state: {}".format("; ".join(leaks)))
-    redactor = Redactor([state.meta.get("netbird_address", "")], private_roots(state))
+    redactor = Redactor([state.meta.get("netbird_address", "")], private_roots(state), state.meta.get("macos_project", ""))
     for entry in result["inconclusive"]:
         entry["detail"] = redactor.prose(entry["detail"], True)
     for item in result["checks"]:
@@ -1150,7 +1159,7 @@ def assemble(state_dir: Path, known_key_hits: Optional[int]) -> Dict[str, Any]:
         "generated": utc_now(),
         "started": state.run.get("started"),
         "legs": state.legs,
-        "meta": {k: redactor.prose(v, True) for k, v in state.meta.items() if k != "netbird_address"},
+        "meta": {k: redactor.prose(v, True) for k, v in state.meta.items() if k not in ("netbird_address", "macos_project")},
         "verdict": result["verdict"],
         "inconclusive": result["inconclusive"],
         "checks": result["checks"],

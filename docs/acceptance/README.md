@@ -250,7 +250,7 @@ scripts/acceptance/tailscale-overlay run \
   --probe <path>/overlay_probe \
   --netbird-address <this host's NetBird address> \
   --owner-unit pohunek-<id>-daemon.service \
-  --macos-bin-dir <dir on the Mac> \\
+  --macos-bin-dir <dir on the Mac> \
   --macos-project <project on the Mac, not the owner's working checkout>
 ```
 

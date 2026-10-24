@@ -1352,6 +1352,7 @@ macos_leg() {
   say "zajcaair (no root)"
   helper cgnat "$netbird_address" || die "--netbird-address must be an address in 100.64.0.0/10"
   macos_session_name="ph1112-$run_ts"
+  helper set-meta "$state" "macos_project=$macos_project"
   step macos session-new "$owner_pohunek" session new --host "$macos_host" --project "$macos_project" --agent shell --name "$macos_session_name" --cwd "$macos_session_cwd" --yes --json
   mac_new_rc=$step_rc
   mac_session_id=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
