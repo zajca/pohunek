@@ -1524,7 +1524,9 @@ validate_options() {
     for tool in qemu-system-x86_64 qemu-img genisoimage ssh ssh-keygen socat objdump; do
       command -v "$tool" >/dev/null || die "$tool is required"
     done
-    [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "/dev/kvm is not accessible"
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+      die "/dev/kvm is not accessible"
+    fi
   fi
   if [ -n "$ci_run" ]; then
     command -v gh >/dev/null || die "gh is required for --ci-run"
