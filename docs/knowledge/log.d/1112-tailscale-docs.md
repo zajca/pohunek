@@ -1,8 +1,9 @@
 ## Unreleased (2026-10-24, tailscale docs, #1112)
 
 - New guide [Tailscale overlay](guides/tailscale.md): enabling the provider,
-  installing the client on Linux and macOS, the selectors that name a peer,
-  the `ShareeNode` rule, an ACL example and troubleshooting by error code.
+  installing the client on Linux (macOS is not supported in 0.37, see #1583),
+  the selectors that name a peer, the `ShareeNode` rule, an ACL example and
+  troubleshooting by error code.
 - Tailscale is supported on Linux in this release; **macOS is not**. The stock
   Apple-Silicon Homebrew directory `/opt/homebrew/bin` is admin group-writable
   and the trusted-executable policy refuses a `tailscale` binary there
