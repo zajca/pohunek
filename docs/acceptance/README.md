@@ -368,7 +368,7 @@ download 5 min the first time, boot 2 min, provisioning 4 min, D4 and the extras
   `--project` bumps that project's `last_used_at`). The session id is read from
   the `session new` output, or looked up by the exact session name; when neither
   works the macOS leg is `macos_provisioning_failed` and the name is printed for
-  manual cleanup. Teardown stops and removes the session on every exit path
+  manual cleanup. The daemon starts that shell in the project checkout whatever `--cwd` says, so every command first runs `cd /tmp/ph-macos-cache` and checks that `pwd -P` is `/private/tmp/ph-macos-cache`; when it is not, the command is not run and the leg is `macos_provisioning_failed`. Teardown stops and removes the session on every exit path
   (`cleanup-session-removed`). The pohunek binaries under test talk only to their
   own throwaway daemon, under a throwaway
   `HOME`-relative root and `/private/tmp/ph1112`, with `XDG_RUNTIME_DIR` set so

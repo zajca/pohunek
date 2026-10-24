@@ -440,17 +440,21 @@ class MacStepProtocolTest(unittest.TestCase):
         (self.dir / "transcript").write_text("")
         (self.dir / "state").mkdir()
         (self.dir / "comm" / "out").mkdir(parents=True)
+        self.cwd = Path(os.path.realpath(self.dir)) / "cwd"
+        self.cwd.mkdir()
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_step(self, command, timeout=10, drop=False, shell="sh"):
+    def run_step(self, command, timeout=10, drop=False, shell="sh", real=None):
         script = textwrap.dedent(
             """\
             set -eu
             PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
             state={state}
             macos_comm_root={comm}
+            macos_session_cwd={cwd}
+            macos_session_cwd_real={real}
             owner_pohunek={fake}
             macos_host=zajcaair
             mac_session_id=s-test
@@ -459,7 +463,7 @@ class MacStepProtocolTest(unittest.TestCase):
             printf 'RC=%s\\n' "$step_rc"
             cat "$step_dir/stdout"
             """
-        ).format(driver=DRIVER, state=self.dir / "state", comm=self.dir / "comm", fake=self.fake, timeout=timeout)
+        ).format(driver=DRIVER, state=self.dir / "state", comm=self.dir / "comm", fake=self.fake, timeout=timeout, cwd=self.cwd, real=real or self.cwd)
         env = dict(os.environ, FAKE_DIR=str(self.dir), PH1112_LIB_PATH=str(DRIVER), FAKE_DROP="1" if drop else "0", FAKE_SHELL=shell)
         result = subprocess.run(["sh", "-c", script, "sh", command], capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -487,6 +491,16 @@ class MacStepProtocolTest(unittest.TestCase):
                 continue
             with self.subTest(shell=shell):
                 self.assertEqual(self.run_step("printf 'a b'; exit 4", shell=shell), "RC=4\na b")
+
+    def test_commands_run_in_the_session_cwd(self):
+        self.assertEqual(self.run_step("pwd -P"), "RC=0\n{}\n".format(self.cwd))
+
+    def test_a_shell_that_cannot_be_moved_to_the_cwd_runs_nothing(self):
+        marker = self.dir / "ran"
+        output = self.run_step("touch {}".format(marker), real="/nonexistent-real-path")
+        self.assertEqual(output, "RC=97\nPHCWD-REFUSED")
+        self.assertFalse(marker.exists())
+        self.assertEqual(sorted(p.name for p in (self.dir / "state" / "inconclusive").glob("*")), ["macos_provisioning_failed"])
 
     def test_a_session_that_never_answers_times_out_with_status_124(self):
         self.assertEqual(self.run_step("true", timeout=2, drop=True), "RC=124\n")
@@ -685,6 +699,7 @@ class MacLegTest(unittest.TestCase):
             macos_host=zajcaair
             run_ts=20261024T000000Z
             macos_session_cwd=/tmp
+            macos_session_cwd_real=$(cd /tmp && pwd -P)
             netbird_address=100.80.1.5
             macos_bin_dir=/nonexistent
             macos_brew_cmd="${{macos_brew_cmd%"$macos_brew"}}{brew}"

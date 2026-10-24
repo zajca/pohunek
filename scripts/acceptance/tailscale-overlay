@@ -142,6 +142,8 @@ netbird_root=/dev/shm/ph1112
 # Unique per run (ph1112-<run time>); set when the macOS leg starts.
 macos_session_name=
 macos_session_cwd=/tmp/ph-macos-cache
+macos_session_cwd_real=/private/tmp/ph-macos-cache
+mac_cwd_refused=PHCWD-REFUSED
 macos_runtime_root=/private/tmp/ph1112
 macos_comm_root=/private/tmp/ph1112c
 # Project reference on the Mac that the shell session is started under (a remote
@@ -1205,7 +1207,7 @@ mac_step() {
   ms_cmd=$4
   mac_n=$((mac_n + 1))
   ms_b64=$(printf '%s' "$ms_cmd" | base64 | tr -d '\n')
-  ms_line="umask 077; printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc"
+  ms_line="if cd $macos_session_cwd && [ \"\$(pwd -P)\" = $macos_session_cwd_real ]; then umask 077; printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc; else printf 'PHBEG-%s-\\n' $mac_n; printf '%s' $mac_cwd_refused | base64 | tr -d '\\n'; printf '\\nPHEND-%s-97\\n' $mac_n; fi"
   step_dir_for "$ms_leg" "$ms_name"
   printf '%s\n' "$ms_cmd" >"$step_dir/argv"
   now >"$step_dir/at"
@@ -1232,7 +1234,10 @@ mac_step() {
   [ -f "$step_dir/stdout" ] || : >"$step_dir/stdout"
   rm -f "$step_dir/capture.json" "$step_dir/input.json"
   printf '%s\n' "$step_rc" >"$step_dir/rc"
-  if [ "$step_rc" -eq 124 ] && [ "$mac_in_cleanup" = 0 ]; then
+  if [ "$step_rc" -eq 97 ] && [ "$(cat "$step_dir/stdout")" = "$mac_cwd_refused" ]; then
+    mac_dead=1
+    inconclude macos_provisioning_failed "the $macos_host shell is not in $macos_session_cwd ($macos_session_cwd_real); $ms_name was not run"
+  elif [ "$step_rc" -eq 124 ] && [ "$mac_in_cleanup" = 0 ]; then
     mac_dead=1
     inconclude macos_unresponsive "the $macos_host shell session did not answer $ms_name within ${ms_timeout}s"
   fi
