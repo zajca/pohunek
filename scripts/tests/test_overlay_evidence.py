@@ -372,6 +372,8 @@ class DriverScriptTest(unittest.TestCase):
         self.assertRegex(pins["headscale_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(pins["tailscale_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(pins["debian_image_sha512"], r"^[0-9a-f]{128}$")
+        self.assertRegex(pins["dbus_user_session_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(pins["dbus_user_session_version"], "1.16.2-2")
 
     def test_the_readme_records_the_pins_the_driver_uses(self):
         readme = README.read_text()
@@ -473,6 +475,74 @@ class MacStepProtocolTest(unittest.TestCase):
 
     def test_a_session_that_never_answers_times_out_with_status_124(self):
         self.assertEqual(self.run_step("true", timeout=2, drop=True), "RC=124\n")
+
+
+class DbusUserSessionTest(unittest.TestCase):
+    """`install_dbus_session` and the pinned download, with stand-in VM commands."""
+
+    def run_script(self, body, env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = textwrap.dedent(
+                """\
+                set -eu
+                PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
+                state={tmp}/state
+                cache_dir={tmp}/cache
+                mkdir -p "$state" "$cache_dir"
+                helper begin "$state" --leg vms
+                poll_s=1
+                service_timeout_s=2
+                """
+            ).format(driver=DRIVER, tmp=tmp) + textwrap.dedent(body).replace("TMP", tmp)
+            result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=dict(os.environ, PH1112_LIB_PATH=str(DRIVER), **(env or {})), timeout=60)
+            codes = sorted(p.name for p in Path(tmp, "state", "inconclusive").glob("*")) if Path(tmp, "state", "inconclusive").is_dir() else []
+            log = Path(tmp, "calls.log").read_text() if Path(tmp, "calls.log").exists() else ""
+            return result, codes, log
+
+    STUBS = """\
+        vm_ssh() {{ shift; printf 'ssh %s\\n' "$*" >>TMP/calls.log; case "$*" in *dpkg*) return ${{DPKG_RC:-0}};; *is-active*) return ${{ACTIVE_RC:-0}};; esac; return 0; }}
+        vm_ssh_stdin() {{ shift; printf 'stdin %s\\n' "$*" >>TMP/calls.log; cat >/dev/null; }}
+        printf deb >"$cache_dir/dbus-user-session_${{dbus_user_session_version}}_amd64.deb"
+        """
+
+    def test_the_package_is_installed_before_the_user_manager_restart_and_the_wait(self):
+        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_dbus_session a\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(codes, [])
+        order = [log.index(token) for token in ("dpkg -i", "systemctl restart", "is-active dbus.socket")]
+        self.assertEqual(order, sorted(order))
+
+    def test_a_failing_dpkg_is_a_provisioning_failure_and_stops_before_the_restart(self):
+        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_dbus_session a || true\n", env={"DPKG_RC": "1"})
+        self.assertEqual(codes, ["provisioning_failed"])
+        self.assertNotIn("systemctl restart", log)
+
+    def test_a_socket_that_never_comes_up_is_a_bounded_provisioning_failure(self):
+        result, codes, log = self.run_script(self.STUBS.replace("{{", "{").replace("}}", "}") + "install_dbus_session a || true\n", env={"ACTIVE_RC": "1"})
+        self.assertEqual(codes, ["provisioning_failed"])
+        self.assertGreaterEqual(log.count("is-active dbus.socket"), 2)
+
+    def test_the_fallback_url_is_used_only_after_the_primary_fails_and_is_verified_too(self):
+        body = """\
+            curl() {{
+              for last; do :; done
+              printf 'curl %s\\n' "$last" >>TMP/calls.log
+              out=
+              while [ "$#" -gt 0 ]; do [ "$1" != --output ] || out=$2; shift; done
+              case "$last" in
+                *snapshot*) return 22 ;;
+                *) printf %s "${{PAYLOAD:-good}}" >"$out" ;;
+              esac
+            }}
+            expected=$(printf good | sha256sum | awk '{{print $1}}')
+            fetch_pinned https://snapshot.example/x "$cache_dir/x" sha256 "$expected" https://pool.example/x || true
+            """.replace("{{", "{").replace("}}", "}")
+        result, codes, log = self.run_script(body)
+        self.assertEqual(codes, [])
+        self.assertIn("snapshot.example", log)
+        self.assertIn("pool.example", log)
+        result, codes, log = self.run_script(body, env={"PAYLOAD": "tampered"})
+        self.assertEqual(codes, ["checksum_mismatch"])
 
 
 class MacLegTest(unittest.TestCase):

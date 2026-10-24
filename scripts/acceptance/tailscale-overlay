@@ -52,6 +52,21 @@ debian_image_version=20261021-2638
 debian_image_url=https://cloud.debian.org/images/cloud/trixie/20261021-2638/debian-13-genericcloud-amd64-20261021-2638.qcow2
 debian_image_sha512=16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c
 
+# The genericcloud image has no `dbus-user-session`, so the systemd user manager
+# has no session bus socket and `pohunek service install` cannot connect. The
+# guests have no network egress, so the package is staged offline. Its only
+# dependencies (dbus-daemon and dbus-session-bus-common 1.16.2-2, libpam-systemd,
+# systemd) are in the image: checked against the image's package manifest
+# (`debian-13-genericcloud-amd64-20261021-2638.json`, sha512
+# 614b8865e7496c6e6380b491a8f4121bd7ac654dd570a889f0684c70a946c847c0591edf223f3535afe3572e31370459310b8c7ffaba859ee5f40465c4062911
+# from the dated `SHA512SUMS`). Primary source: snapshot.debian.org, whose URLs
+# are immutable; the pool URL is only a fallback and must match the same sha256
+# (the Debian `Packages` index of trixie).
+dbus_user_session_version=1.16.2-2
+dbus_user_session_url=https://snapshot.debian.org/archive/debian/20261021T000000Z/pool/main/d/dbus/dbus-user-session_1.16.2-2_amd64.deb
+dbus_user_session_fallback_url=https://deb.debian.org/debian/pool/main/d/dbus/dbus-user-session_1.16.2-2_amd64.deb
+dbus_user_session_sha256=0f9aa775a708b28b1a3ad784e9d1f0c96227521bc29e99ddbfe05ff008b5d246
+
 # Highest glibc the Debian 13 image provides; CI binaries must not need more.
 guest_glibc_max=2.41
 
@@ -476,17 +491,25 @@ fetch_pinned() {
   fp_dest=$2
   fp_algo=$3
   fp_expected=$4
+  fp_fallback=${5:-}
   if [ -f "$fp_dest" ] && [ "$("${fp_algo}sum" <"$fp_dest" | awk '{print $1}')" = "$fp_expected" ]; then
     return 0
   fi
-  rm -f "$fp_dest.part"
-  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 1800 --output "$fp_dest.part" "$fp_url"; then
+  fp_got=0
+  for fp_try in "$fp_url" $fp_fallback; do
+    rm -f "$fp_dest.part"
+    if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 1800 --output "$fp_dest.part" "$fp_try"; then
+      fp_got=1
+      break
+    fi
+  done
+  if [ "$fp_got" = 0 ]; then
     inconclude artifact_missing "download of $fp_url failed"
     return 1
   fi
   if [ "$("${fp_algo}sum" <"$fp_dest.part" | awk '{print $1}')" != "$fp_expected" ]; then
     rm -f "$fp_dest.part"
-    inconclude checksum_mismatch "$fp_url does not match its pinned $fp_algo"
+    inconclude checksum_mismatch "$fp_try does not match its pinned $fp_algo"
     return 1
   fi
   mv "$fp_dest.part" "$fp_dest"
@@ -500,6 +523,7 @@ prepare_cache() {
   fetch_pinned "$debian_image_url" "$cache_dir/debian-$debian_image_version.qcow2" sha512 "$debian_image_sha512" || return 1
   fetch_pinned "$headscale_url" "$cache_dir/headscale-$headscale_version" sha256 "$headscale_sha256" || return 1
   fetch_pinned "$tailscale_url" "$cache_dir/tailscale-$tailscale_version.tgz" sha256 "$tailscale_sha256" || return 1
+  fetch_pinned "$dbus_user_session_url" "$cache_dir/dbus-user-session_${dbus_user_session_version}_amd64.deb" sha256 "$dbus_user_session_sha256" "$dbus_user_session_fallback_url" || return 1
   rm -rf "$cache_dir/tailscale-$tailscale_version"
   mkdir -p "$cache_dir/tailscale-$tailscale_version"
   tar -xzf "$cache_dir/tailscale-$tailscale_version.tgz" --strip-components=1 -C "$cache_dir/tailscale-$tailscale_version" || {
@@ -852,6 +876,28 @@ join_tailnet() {
   fi
   prov "$jt_vm" "tailscale up" vm_ssh "$jt_vm" "sudo tailscale up --login-server=http://$lab_net_a:$headscale_port --auth-key=file:/run/ts/authkey --hostname=$jt_node --accept-dns=false --timeout=60s" || return 1
   prov "$jt_vm" "remove the key file" vm_ssh "$jt_vm" 'sudo rm -f /run/ts/authkey' || return 1
+}
+
+# install_dbus_session VM: installs the pinned dbus-user-session offline and
+# restarts the user manager, which then listens on dbus.socket. Any failure is
+# a provisioning problem of the guest, not a product result.
+install_dbus_session() {
+  ds_vm=$1
+  ds_deb="$cache_dir/dbus-user-session_${dbus_user_session_version}_amd64.deb"
+  prov "$ds_vm" "stage dbus-user-session" vm_ssh_stdin "$ds_vm" 'cat >/tmp/dbus-user-session.deb' <"$ds_deb" || return 1
+  prov "$ds_vm" "install dbus-user-session" vm_ssh "$ds_vm" 'sudo dpkg -i /tmp/dbus-user-session.deb' || return 1
+  # shellcheck disable=SC2016 # the VM expands its own uid
+  prov "$ds_vm" "restart the user manager" vm_ssh "$ds_vm" 'sudo systemctl restart "user@$(id -u).service"' || return 1
+  ds_waited=0
+  # shellcheck disable=SC2016 # the VM expands its own uid
+  until vm_ssh "$ds_vm" 'test -S "/run/user/$(id -u)/bus" && systemctl --user is-active dbus.socket' >>"$state/provision/$ds_vm.log" 2>&1; do
+    if [ "$ds_waited" -ge "$service_timeout_s" ]; then
+      inconclude provisioning_failed "VM-$ds_vm: the user manager's dbus.socket did not become active"
+      return 1
+    fi
+    sleep "$poll_s"
+    ds_waited=$((ds_waited + poll_s))
+  done
 }
 
 # install_pohunek VM: stages the CI binaries, writes overlays.toml and installs
@@ -1550,6 +1596,8 @@ tailscale_version=$tailscale_version
 tailscale_sha256=$tailscale_sha256
 debian_image_version=$debian_image_version
 debian_image_sha512=$debian_image_sha512
+dbus_user_session_version=$dbus_user_session_version
+dbus_user_session_sha256=$dbus_user_session_sha256
 EOF
 }
 
@@ -1594,6 +1642,8 @@ main_run() {
     provision_headscale || return 1
     join_tailnet a || return 1
     join_tailnet b || return 1
+    install_dbus_session a || return 1
+    install_dbus_session b || return 1
     install_pohunek a || return 1
     install_pohunek b || return 1
     vms_leg || return 1
