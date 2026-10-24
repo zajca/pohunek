@@ -78,7 +78,7 @@ same fail-closed repository behavior applies on APFS. Runtime cleanup never
 removes the host directory or its records.
 
 Local unenrollment does not stop a PTY, remove the owner Unix socket, disable a
-direct NetBird/WireGuard owner route, or prevent an owner-path client from
+direct overlay owner route, or prevent an owner-path client from
 continuing to inspect and operate their existing owner surfaces.
 
 ## Doctor and recovery

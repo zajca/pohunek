@@ -15,3 +15,6 @@
 - The TypeScript SDK `hostUnreachable` message reads "could not open an overlay
   connection to host '<host>'" instead of naming NetBird, matching the Rust
   client and the protocol. Match on the `hostUnreachable` kind, not the text.
+- Rust API: `OverlayError::ListenerAddressMissing` is a struct variant with
+  `overlay` and an optional `reason`; code matching the old tuple form needs
+  `ListenerAddressMissing { .. }`.

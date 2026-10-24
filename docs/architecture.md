@@ -28,7 +28,7 @@ Pohunek has two explicit trust domains:
   provisioning, generic OIDC authentication, and bounded HTTPS account and
   credential operations. Host enrollment, shares, routing, attach, team clients,
   and team administration remain deferred. Enrolling does not replace or require
-  NetBird.
+  an overlay.
 
 The following invariants span both domains:
 
@@ -2121,7 +2121,7 @@ Integration and E2E obligations:
 - Remote daemon over an overlay (or a loopback TCP stand-in) reusing the same
   protocol; attach/detach without killing the remote process.
 - Tokenless NetBird and Tailscale discovery from `netbird status --json` and
-  `tailscale status --json` fixtures, including recordings of real nodes, with
+  `tailscale status --json` fixtures, with
   graceful degradation when the CLI/state is absent.
 - Structured logs and event-log records for important transitions.
 
@@ -2141,7 +2141,7 @@ Integration and E2E obligations:
 - **Tailscale status format drift.** Mitigation: the `tailscale status --json`
   format is documented upstream as subject to change; the parser reads only the
   fields it needs, tolerates unknown fields, and is pinned with spec-derived
-  and recorded fixtures.
+  fixtures.
 - **Daemon as a network server on an overlay.** Mitigation: bind only to the
   overlay's address; rely on the overlay's policy (NetBird policies, tailnet
   ACLs); no `0.0.0.0`.

@@ -140,7 +140,7 @@ and `overlay_config`, and names the reason a node has no usable address.
 | `tailscale_state_unavailable` | `tailscale status` failed, printed something unreadable, or the node is not running on a kernel interface | read the message: start `tailscaled`, log in, or stop using userspace networking |
 | `tailscale_listener_address_missing` | the node has no IPv4 address Pohunek may bind | the same causes; the message names the reason |
 | `host_unknown` | the peer is expired, not in the network map or a `ShareeNode` | check `tailscale status` on this host |
-| `overlay_peer_collision` | two peers match the name | use the node ID or the full name |
+| `overlay_host_ambiguous` | two peers match the name | use the node ID or the full name |
 | `host_unreachable` | the peer was resolved but its daemon port did not answer | start the daemon on the peer, check the peer's `overlays.toml` port and the tailnet policy |
 | `overlay_configuration_invalid` | `overlays.toml` is unsafe or malformed | the message names the file and the line |
 | `overlay_config` warning | the running daemon uses another overlay or port than the file | restart the daemon |
