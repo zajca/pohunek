@@ -426,6 +426,14 @@ class MacStepProtocolTest(unittest.TestCase):
             printf '{"cli_version":"x","ok":{}}\\n'
             ;;
           "session output")
+            prev=
+            for a in "$@"; do
+              if [ "$prev" = --max-bytes ] && { [ "$a" -lt 1 ] || [ "$a" -gt 783240 ]; }; then
+                printf '{"cli_version":"x","err":{"class":"configuration","code":"cli_usage","msg":"error: invalid value '"'"'%s'"'"' for '"'"'--max-bytes <MAX_BYTES>'"'"': --max-bytes must be between 1 and 783240"}}\\n' "$a"
+                exit 2
+              fi
+              prev=$a
+            done
             data=$(base64 <"$log" | tr -d '\\n')
             printf '{"cli_version":"x","protocol":{"min":4,"max":4},"ok":{"data_base64":"%s"}}\\n' "$data"
             ;;
@@ -495,6 +503,20 @@ class MacStepProtocolTest(unittest.TestCase):
             with self.subTest(shell=shell):
                 self.assertEqual(self.run_step("printf 'a b'; exit 4", shell=shell), "RC=4\na b")
 
+    def test_the_capture_size_is_within_the_cli_bound_and_the_fake_enforces_the_bound(self):
+        script = textwrap.dedent(
+            """\
+            set -eu
+            PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
+            printf '%s\\n' "$mac_capture_bytes"
+            """
+        ).format(driver=DRIVER)
+        out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=dict(os.environ, PH1112_LIB_PATH=str(DRIVER)), timeout=30)
+        self.assertLessEqual(int(out.stdout), 783240)
+        for size, code in ((783240, 0), (783241, 2), (1048576, 2)):
+            result = subprocess.run([str(self.fake), "session", "output", "x/s", "--max-bytes", str(size), "--json"], capture_output=True, text=True, env=dict(os.environ, FAKE_DIR=str(self.dir)))
+            self.assertEqual(result.returncode, code, (size, result.stdout))
+
     def test_commands_run_in_the_session_cwd(self):
         self.assertEqual(self.run_step("pwd -P"), "RC=0\n{}\n".format(self.cwd))
 
@@ -505,7 +527,7 @@ class MacStepProtocolTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(sorted(p.name for p in (self.dir / "state" / "inconclusive").glob("*")), ["macos_provisioning_failed"])
 
-    def run_body(self, body, real="/nonexistent-real-path"):
+    def run_body(self, body, real="/nonexistent-real-path", drop=False):
         script = textwrap.dedent(
             """\
             set -eu
@@ -521,7 +543,7 @@ class MacStepProtocolTest(unittest.TestCase):
             mac_timeout_s=3
             """
         ).format(driver=DRIVER, state=self.dir / "state", comm=self.dir / "comm", cwd=self.cwd, real=real, fake=self.fake) + textwrap.dedent(body)
-        env = dict(os.environ, FAKE_DIR=str(self.dir), PH1112_LIB_PATH=str(DRIVER), FAKE_DROP="0", FAKE_SHELL="sh")
+        env = dict(os.environ, FAKE_DIR=str(self.dir), PH1112_LIB_PATH=str(DRIVER), FAKE_DROP="1" if drop else "0", FAKE_SHELL="sh")
         result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
@@ -620,6 +642,20 @@ class MacStepProtocolTest(unittest.TestCase):
             """
         )
         self.assertIn("may need manual cleanup: nothing was created", output)
+
+    def test_a_root_whose_creation_is_not_answered_is_reported_as_possibly_existing(self):
+        output = self.run_body(
+            """\
+            mac_timeout_s=2
+            mac_make_root /private/tmp/ph1112c out
+            printf 'result=%s created=%s\\n' "$mac_make_result" "${mac_comm_created:-0}"
+            cat "$state/inconclusive/macos_unresponsive"
+            """,
+            real=str(self.cwd),
+            drop=True,
+        )
+        self.assertIn("result=timeout created=0", output)
+        self.assertIn("/private/tmp/ph1112c may exist, check by hand (it is not removed)", output)
 
     def test_the_final_clean_refuses_paths_outside_the_allow_list_without_sending(self):
         output = self.run_body(

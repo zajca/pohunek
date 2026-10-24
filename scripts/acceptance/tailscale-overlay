@@ -139,8 +139,11 @@ mac_timeout_s=120
 mac_poll_s=2
 # Longer wait for the Homebrew install (seconds).
 mac_install_timeout_s=900
-# Largest terminal capture read back from the macOS session (bytes).
-mac_capture_bytes=1048576
+# Terminal capture read back from the macOS session (bytes). `session output`
+# refuses --max-bytes above MAX_SESSION_OUTPUT_BYTES (783240, from
+# crates/protocol/src/limits.rs:133 through the bound in
+# crates/cli/src/commands/session.rs:59-70), so the value stays well below it.
+mac_capture_bytes=524288
 # Pre-auth key lifetime handed to `headscale preauthkeys create`.
 key_expiration=15m
 # Throwaway roots of the NetBird-only check (host) and of the macOS leg.
@@ -1390,7 +1393,7 @@ mac_make_root() {
   fi
   if [ "$mac_make_result" = timeout ] && [ "$mac_refused" = 0 ]; then
     mac_dead=1
-    inconclude macos_unresponsive "the $macos_host shell session did not answer the creation of $1"
+    inconclude macos_unresponsive "the $macos_host shell session did not answer the creation of $1; $1 may exist, check by hand (it is not removed)"
   fi
 }
 
