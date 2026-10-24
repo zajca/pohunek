@@ -333,7 +333,10 @@ download 5 min the first time, boot 2 min, provisioning 4 min, D4 and the extras
   `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK`. Tailscale is installed only when
   `brew list` answers rc 1 with no output; any other answer is inconclusive. It is
   uninstalled only when this run installed it and a re-check still lists the
-  formula. The session is stopped at the end.
+  formula; a re-check that lists nothing means there is nothing to restore. A
+  forward that still listens after three removals is left to teardown, which removes
+  it and stops VM-A only after the issued-key scan, and the evidence then fails
+  `exposure-window-closed`. The session is stopped at the end.
 
 ### Teardown and failure
 

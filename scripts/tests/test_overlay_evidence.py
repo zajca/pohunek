@@ -616,21 +616,82 @@ class MacLegTest(unittest.TestCase):
         self.run_leg()
         self.assertEqual(self.codes(), ["macos_tailscale_pin_mismatch"])
 
-    def test_the_uninstall_is_skipped_when_the_re_check_does_not_show_the_formula(self):
-        # `install` succeeds but the formula is never listed, so the pin check
-        # fails and the cleanup re-check finds nothing to remove.
+    def uninstall_step(self):
+        directory = next((self.dir / "state" / "steps" / "macos").glob("*-cl-brew-uninstall"))
+        return int((directory / "rc").read_text())
+
+    def test_an_install_that_installs_nothing_leaves_nothing_to_restore(self):
+        # `install` exits 0 but never lists the formula, so the pin check fails
+        # and the cleanup re-check finds nothing to uninstall.
         self.brew.write_text(self.BREW.replace('install) printf', 'install) : ;; xinstall) printf'))
         self.run_leg()
-        log = (self.dir / "brew.log").read_text()
-        self.assertNotIn("uninstall", log)
-        argv = [p.read_text() for p in (self.dir / "state" / "steps" / "macos").glob("*-cl-brew-uninstall/argv")]
-        self.assertEqual(len(argv), 1)
-        self.assertEqual(int((next((self.dir / "state" / "steps" / "macos").glob("*-cl-brew-uninstall")) / "rc").read_text()), 1)
+        self.assertEqual(self.codes(), ["macos_tailscale_pin_mismatch"])
+        self.assertNotIn("uninstall", (self.dir / "brew.log").read_text())
+        self.assertEqual(self.uninstall_step(), 0)
+
+    def test_a_failing_install_that_installs_nothing_is_inconclusive_and_restores_cleanly(self):
+        self.brew.write_text(self.BREW.replace('install) printf', 'install) exit 1 ;; xinstall) printf'))
+        self.run_leg()
+        self.assertEqual(self.codes(), ["macos_homebrew_failed"])
+        self.assertNotIn("uninstall", (self.dir / "brew.log").read_text())
+        self.assertEqual(self.uninstall_step(), 0)
+
+    def test_an_ambiguous_re_check_after_our_install_is_a_failed_restore(self):
+        self.brew.write_text(
+            self.BREW.replace(
+                "  list)\n",
+                '  list)\n            [ ! -e "$FAKE_DIR/attempted" ] || exit 3\n',
+            ).replace("install) printf", 'install) : >"$FAKE_DIR/attempted"; printf')
+        )
+        self.run_leg()
+        self.assertEqual(self.uninstall_step(), 1)
 
     def test_a_session_that_never_answers_ends_the_leg_as_unresponsive(self):
         self.run_leg(env={"FAKE_DROP": "1"})
         self.assertEqual(self.codes(), ["macos_unresponsive"])
         self.assertFalse(self.owner_root.exists())
+
+
+class CloseWindowTest(unittest.TestCase):
+    """`close_window` with a stand-in monitor and a real listening socket."""
+
+    def run_close(self, listen):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = textwrap.dedent(
+                """\
+                set -eu
+                PH1112_LIB_ONLY=1 PH1112_LIB_PATH={driver} . {driver}
+                state={tmp}/state
+                mkdir -p "$state"
+                netbird_address=100.80.1.5
+                hostfwd_port=$(free_port tcp)
+                monitor() {{ printf '%s\n' "$*" >>{tmp}/monitor.log; }}
+                if [ {listen} = 1 ]; then
+                  python3 -c 'import socket,sys,time; s=socket.socket(); s.bind(("0.0.0.0", int(sys.argv[1]))); s.listen(); time.sleep(20)' "$hostfwd_port" &
+                  listener=$!
+                  sleep 1
+                fi
+                window_open=1
+                close_window
+                printf 'WINDOW=%s\n' "$window_open"
+                [ {listen} != 1 ] || kill "$listener"
+                """
+            ).format(driver=DRIVER, tmp=tmp, listen=1 if listen else 0)
+            result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=dict(os.environ, PH1112_LIB_PATH=str(DRIVER)), timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log = Path(tmp, "monitor.log").read_text()
+            return result.stdout, log
+
+    def test_a_closed_forward_clears_the_flag(self):
+        out, log = self.run_close(listen=False)
+        self.assertIn("WINDOW=0", out)
+        self.assertNotIn("quit", log)
+
+    def test_a_forward_that_stays_never_stops_vm_a_before_the_scan(self):
+        out, log = self.run_close(listen=True)
+        self.assertIn("WINDOW=1", out)
+        self.assertNotIn("quit", log)
+        self.assertEqual(log.count("hostfwd_remove"), 3)
 
 
 class EvidenceTest(unittest.TestCase):
@@ -775,6 +836,24 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(self.run_.evaluate()["verdict"], "inconclusive")
         self.assertEqual(self.run_.missing(), [])
 
+    def homebrew_run(self, uninstall_rc, code=None):
+        meta = json.loads((self.run_.root / "run.json").read_text())
+        meta["meta"]["macos_brew_installed_by_us"] = "1"
+        (self.run_.root / "run.json").write_text(json.dumps(meta))
+        self.run_.step("macos", "cl-brew-uninstall", "", rc=uninstall_rc)
+        if code:
+            self.run_.inconclude(code)
+        return self.run_.evaluate()["verdict"]
+
+    def test_a_clean_homebrew_failure_is_inconclusive_with_the_restore_passed(self):
+        for code in ("macos_homebrew_failed", "macos_tailscale_pin_mismatch"):
+            self.assertEqual(self.homebrew_run(0, code), "inconclusive", code)
+        self.assertEqual(self.run_.failed(), [])
+
+    def test_a_failed_restore_of_a_listed_formula_is_a_failure(self):
+        self.assertEqual(self.homebrew_run(1, "macos_homebrew_failed"), "failed")
+        self.assertEqual(self.run_.failed(), ["macos/cleanup-homebrew-restored"])
+
     def test_homebrew_must_be_restored_only_when_this_run_installed_it(self):
         self.assertNotIn("cleanup-homebrew-restored", [c["name"] for c in self.run_.evaluate()["checks"]])
         meta = json.loads((self.run_.root / "run.json").read_text())
@@ -826,6 +905,15 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(self.run_.failed(), ["macos/exposure-window-bound-to-netbird-only"])
         self.run_.step("macos", "us-hostfwd-bind", "LISTEN 0 4096 {a}:41999 0.0.0.0:*\nLISTEN 0 4096 127.0.0.1:41999 0.0.0.0:*\n".format(a=NETBIRD_ADDRESS))
         self.assertEqual(self.run_.failed(), ["macos/exposure-window-bound-to-netbird-only"])
+
+    def test_a_forward_that_stays_open_yields_a_failed_verdict_and_a_document(self):
+        self.run_.step("macos", "us-hostfwd-closed", "LISTEN 0 4096 {}:41999 0.0.0.0:*\n".format(NETBIRD_ADDRESS))
+        out = self.run_.root / "out.json"
+        result = helper("assemble", self.run_.root, out)
+        self.assertEqual(result.returncode, 1)
+        document = json.loads(out.read_text())
+        self.assertEqual(document["verdict"], "failed")
+        self.assertIn("exposure-window-closed", [c["name"] for c in document["checks"] if c["status"] == "failed"])
 
     def test_the_exposure_window_must_be_closed_afterwards(self):
         self.run_.step("macos", "us-hostfwd-closed", "LISTEN 0 4096 {}:41999 0.0.0.0:*\n".format(NETBIRD_ADDRESS))
@@ -1144,8 +1232,14 @@ class DiagnosticsScanTest(unittest.TestCase):
 
 
 class MarkerSeenTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     def capture(self, text):
-        path = Path(tempfile.mkdtemp()) / "c.json"
+        path = Path(self.tmp.name) / "c.json"
         path.write_text(json.dumps({"ok": {"data_base64": base64.b64encode(text.encode()).decode()}}))
         return path
 

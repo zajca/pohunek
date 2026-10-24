@@ -1186,8 +1186,10 @@ mac_cleanup() {
       if [ "$step_rc" -eq 0 ] && grep -q '^tailscale ' "$step_dir/stdout"; then
         mac_step macos cl-brew-uninstall "$mac_install_timeout_s" "$macos_brew_cmd uninstall tailscale"
         mac_step macos cl-ls "$mac_timeout_s" 'ls /opt/homebrew/bin/tailscale* 2>&1; true'
+      elif [ "$step_rc" -eq 1 ] && [ ! -s "$step_dir/stdout" ]; then
+        note_step macos cl-brew-uninstall 0 "$macos_brew_cmd uninstall tailscale" "nothing installed; nothing to restore"
       else
-        note_step macos cl-brew-uninstall 1 "$macos_brew_cmd uninstall tailscale" "skipped: the re-check did not show the installed formula"
+        note_step macos cl-brew-uninstall 1 "$macos_brew_cmd uninstall tailscale" "skipped: the re-check was ambiguous"
       fi
     fi
     step macos cl-health "$owner_pohunek" --host "$macos_host" health --json
@@ -1412,21 +1414,25 @@ macos_userspace() {
   close_window
 }
 
-# Clears window_open only once `ss` shows the forward gone; otherwise VM-A is
-# stopped, which drops every forward it holds.
+# Removes the forward and clears window_open only once `ss` shows it gone. A
+# forward that stays is retried; if it still listens, window_open stays set so
+# teardown removes it and stops VM-A after the issued-key scan has run, and the
+# recorded `us-hostfwd-closed` step fails the evidence.
 close_window() {
-  if [ "$window_open" = 1 ]; then
+  [ "$window_open" = 1 ] || return 0
+  cw_try=0
+  while [ "$cw_try" -lt 3 ]; do
+    cw_try=$((cw_try + 1))
     step macos us-hostfwd-remove monitor a "hostfwd_remove wan tcp:$netbird_address:$hostfwd_port"
     step macos us-hostfwd-closed ss -ltnH "sport = :$hostfwd_port"
     if [ "$step_rc" -eq 0 ] && [ ! -s "$step_dir/stdout" ]; then
       window_open=0
       say "exposure window closed"
-    else
-      say "the forward is still listening; stopping VM-A"
-      monitor a quit >/dev/null 2>&1 || true
-      window_open=0
+      return 0
     fi
-  fi
+    sleep 1
+  done
+  say "the forward is still listening after $cw_try attempts; teardown removes it after the evidence is assembled"
 }
 
 # ---------------------------------------------------------------------------
