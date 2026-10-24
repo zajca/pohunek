@@ -1,0 +1,1524 @@
+#!/bin/sh
+# Manual acceptance procedure for issue #1112 (D9): Tailscale as an opt-in
+# overlay next to NetBird.
+#
+# One unprivileged run on a Linux host with KVM proves, with real binaries:
+#
+#   vms      two qemu VMs on a closed lab link, a Headscale control server and a
+#            kernel-TUN tailscaled on each; D4 (CLI, attach and SDK control path)
+#            in both directions, plus the recorded D5/D7 observations
+#   netbird  the absent-overlays.toml default (NetBird) with a throwaway daemon,
+#            without touching the owner's daemon or NetBird
+#   macos    zajcaair, no root: the D6 trusted-CLI lookup without a tailscaled and
+#            the userspace-networking fail-closed path (needs the vms leg for
+#            Headscale)
+#
+# Every command is recorded as a step directory in the state directory and is
+# interpreted only by overlay_evidence.py, which writes the evidence document
+# (docs/acceptance/1112-tailscale-overlay.json). Nothing here is judged by this
+# script; a failed precondition is recorded as an inconclusive code instead.
+# See docs/acceptance/README.md for the procedure, prerequisites, resource budget
+# and the exposure statement.
+#
+# Secrets: pre-auth keys travel only through pipes between the two VMs. They are
+# never written on the host, printed, or echoed; no `set -x`.
+
+set -eu
+
+# PH1112_LIB_PATH lets the scenario tests source this file (with
+# PH1112_LIB_ONLY=1) and exercise its functions with a fake pohunek.
+self=${PH1112_LIB_PATH:-$0}
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$self")" && pwd -P)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
+helper="$script_dir/overlay_evidence.py"
+
+# ---------------------------------------------------------------------------
+# Pins. Re-verified 2026-10-24 against the upstream checksum source named next
+# to each value; the downloads are verified against them on every run.
+
+# Headscale: GitHub release v0.29.5, asset `checksums.txt`.
+headscale_version=0.29.5
+headscale_url=https://github.com/juanfont/headscale/releases/download/v0.29.5/headscale_0.29.5_linux_amd64
+headscale_sha256=e979d27fe17d924d33bb6ab7504f6338d0635989a0cfdcfbc0ceb637dbcbe980
+
+# Tailscale client for the VMs: vendor `.sha256` file next to the tarball.
+tailscale_version=1.104.2
+tailscale_url=https://pkgs.tailscale.com/stable/tailscale_1.104.2_amd64.tgz
+tailscale_sha256=512f613ed7d04fc7282f7dc5bd76aa105aae28168fbb9357eb749ebcbc29f0ae
+
+# Debian 13 genericcloud image: `SHA512SUMS` of the dated directory (identical in
+# the `latest` directory).
+debian_image_version=20261021-2638
+debian_image_url=https://cloud.debian.org/images/cloud/trixie/20261021-2638/debian-13-genericcloud-amd64-20261021-2638.qcow2
+debian_image_sha512=16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c
+
+# Highest glibc the Debian 13 image provides; CI binaries must not need more.
+guest_glibc_max=2.41
+
+# ---------------------------------------------------------------------------
+# Constants. Each value is a limit of this lab, not a product setting.
+
+# Overlay port written to overlays.toml on the VMs (not the NetBird default, so
+# it also proves a service-installed daemon honours `port`).
+overlay_port=18733
+# The NetBird default port the absent-file check expects.
+netbird_default_port=18722
+# MagicDNS suffix of the lab tailnet; differs from the server_url host.
+lab_domain=ts.lab.internal
+# Closed lab link between the VMs (UDP datagrams through loopback sockets).
+lab_net_a=10.77.0.1
+lab_net_b=10.77.0.2
+# Headscale control port inside VM-A; plain HTTP on the closed link only.
+headscale_port=8080
+# Tailscale node names (the OS hostnames differ: lab-a and lab-b).
+node_a=ph-a
+node_b=ph-b
+# VM size: 4 vCPU and 3 GiB in total with both VMs.
+vm_cpus=2
+vm_memory_mib=1536
+vm_disk=8G
+# Wait for both heavy-run slots before giving up (seconds).
+slot_wait_s=1800
+# Wait for a VM to answer SSH after the slots are held (seconds).
+boot_timeout_s=300
+# Wait for cloud-init, services and tailscale up (seconds).
+service_timeout_s=180
+# Seconds between polls.
+poll_s=3
+# Pings of the direct-path precondition (`tailscale ping` stops at the first
+# direct reply; this bounds the attempts).
+ping_count=20
+# Wait for output to reach a screen or a journal (seconds).
+screen_timeout_s=40
+# Wait for a command run on zajcaair through its shell session (seconds).
+mac_timeout_s=120
+# Seconds between polls of the Mac session's output.
+mac_poll_s=2
+# Longer wait for the Homebrew install (seconds).
+mac_install_timeout_s=900
+# Largest terminal capture read back from the macOS session (bytes).
+mac_capture_bytes=1048576
+# Pre-auth key lifetime handed to `headscale preauthkeys create`.
+key_expiration=15m
+# Throwaway roots of the NetBird-only check (host) and of the macOS leg.
+netbird_root=/dev/shm/ph1112
+macos_session_name=ph-macos-op1112acc
+macos_session_cwd=/tmp/ph-macos-cache
+macos_runtime_root=/private/tmp/ph1112
+macos_comm_root=/private/tmp/ph1112c
+macos_brew=/opt/homebrew/bin/brew
+macos_user_node=ph-mac
+# Run and cache roots; the cache survives runs, the run directory does not.
+default_cache_dir=/mnt/m2_4t/t/ph1112-cache
+default_run_root=/mnt/m2_4t/t
+default_repo=zajca/pohunek
+
+# ---------------------------------------------------------------------------
+# Options and state
+
+slot_wrapper=
+no_slot_wrapper=0
+ci_run=
+bins_dir=
+probe=
+netbird_address=
+owner_unit=
+owner_pohunek=pohunek
+macos_host=zajcaair
+macos_bin_dir=
+legs=
+output="$repo_root/docs/acceptance/1112-tailscale-overlay.json"
+cache_dir=$default_cache_dir
+run_root=$default_run_root
+repo=$default_repo
+python_bin=python3
+
+usage() {
+  cat <<EOF
+Usage: $(basename -- "$0") [options] run
+       $(basename -- "$0") pins
+
+Commands:
+  run    Execute the selected legs and write the evidence document.
+  pins   Print the pinned versions and checksums.
+
+Options for run:
+  --leg LEG              vms, netbird or macos (repeatable, at least one).
+                         macos needs vms (Headscale runs in VM-A).
+  --slot-wrapper PATH    Wrapper that takes one heavy-run slot for a command
+                         (for example /tmp/heavy-run.sh).
+  --no-slot-wrapper      Run qemu without a slot wrapper. Exactly one of the two
+                         slot options is required; there is no default.
+  --ci-run ID            CI run whose pohunek-bins artifact to use (vms, netbird
+                         and macos legs; the run of the merge commit under test).
+  --bins-dir DIR         Directory that already holds pohunekd, pohunek-sessiond
+                         and pohunek, in place of --ci-run.
+  --probe PATH           Static musl overlay_probe binary (vms leg).
+  --netbird-address IP   This host's NetBird address (netbird and macos legs).
+  --owner-unit UNIT      The owner's daemon user unit, for the untouched checks
+                         (netbird leg).
+  --pohunek BIN          The owner's pohunek CLI (default: pohunek on PATH).
+  --macos-host NAME      NetBird host name of the Mac (default: $macos_host).
+  --macos-bin-dir DIR    Directory ON the Mac with pohunek, pohunekd and
+                         pohunek-sessiond built for the commit under test.
+  --output FILE          Evidence document (default: $output).
+  --cache-dir DIR        Download cache (default: $cache_dir).
+  --run-root DIR         Parent of the per-run directories (default: $run_root).
+  --repo OWNER/NAME      GitHub repository of the CI run (default: $repo).
+EOF
+}
+
+die() {
+  printf 'tailscale-overlay: %s\n' "$*" >&2
+  exit 2
+}
+
+say() {
+  printf '\n==> %s\n' "$*"
+}
+
+now() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+helper() {
+  "$python_bin" "$helper" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Step recording
+
+state=
+step_seq=0
+step_dir=
+step_rc=0
+
+# Sets step_dir to the directory of leg/name, reusing an existing one so a
+# polled step keeps its slot.
+step_dir_for() {
+  leg_dir="$state/steps/$1"
+  mkdir -p "$leg_dir"
+  step_dir=
+  for existing in "$leg_dir"/[0-9][0-9][0-9]-"$2"; do
+    if [ -d "$existing" ]; then
+      step_dir=$existing
+    fi
+  done
+  if [ -z "$step_dir" ]; then
+    step_seq=$((step_seq + 1))
+    step_dir="$leg_dir/$(printf '%03d' "$step_seq")-$2"
+    mkdir -p "$step_dir"
+  fi
+}
+
+# step LEG NAME COMMAND...: runs the command, records argv, rc and both output
+# streams, and sets step_rc and step_dir. It never fails the script.
+step() {
+  step_dir_for "$1" "$2"
+  shift 2
+  printf '%s\n' "$*" >"$step_dir/argv"
+  now >"$step_dir/at"
+  if "$@" >"$step_dir/stdout" 2>"$step_dir/stderr" </dev/null; then
+    step_rc=0
+  else
+    step_rc=$?
+  fi
+  printf '%s\n' "$step_rc" >"$step_dir/rc"
+}
+
+# note_step LEG NAME RC ARGV-TEXT [STDOUT-TEXT]: records a step whose command
+# ran elsewhere (a pipeline that carries a secret, a remote capture).
+note_step() {
+  step_dir_for "$1" "$2"
+  printf '%s\n' "$4" >"$step_dir/argv"
+  now >"$step_dir/at"
+  printf '%s\n' "${5:-}" >"$step_dir/stdout"
+  : >"$step_dir/stderr"
+  printf '%s\n' "$3" >"$step_dir/rc"
+  step_rc=$3
+}
+
+inconclude() {
+  helper inconclude "$state" "$1" "$2" || true
+}
+
+# ---------------------------------------------------------------------------
+# Process safety: only processes of this run are signalled, by exact PID.
+
+# pid_matches PID NEEDLE: the live process's command line contains NEEDLE.
+pid_matches() {
+  [ -r "/proc/$1/cmdline" ] || return 1
+  tr '\0' ' ' <"/proc/$1/cmdline" | grep -F -q -- "$2"
+}
+
+# kill_exact PID NEEDLE: stops PID only while its command line names NEEDLE.
+kill_exact() {
+  kill_pid=$1
+  kill_needle=$2
+  pid_matches "$kill_pid" "$kill_needle" || return 0
+  kill "$kill_pid" 2>/dev/null || true
+  kill_waited=0
+  while [ "$kill_waited" -lt 10 ] && pid_matches "$kill_pid" "$kill_needle"; do
+    sleep 1
+    kill_waited=$((kill_waited + 1))
+  done
+  if pid_matches "$kill_pid" "$kill_needle"; then
+    kill -KILL "$kill_pid" 2>/dev/null || true
+  fi
+}
+
+# Stops every process whose command line runs a binary of the throwaway NetBird
+# root. Each PID is read from /proc and re-verified before it is signalled.
+kill_throwaway_daemon() {
+  for entry in /proc/[0-9]*; do
+    ktd_pid=${entry#/proc/}
+    if pid_matches "$ktd_pid" "$netbird_root/bin/"; then
+      kill_exact "$ktd_pid" "$netbird_root/bin/"
+    fi
+  done
+  nb_daemon_pid=
+}
+
+# ---------------------------------------------------------------------------
+# Run directory, ports, VMs
+
+run=
+run_ts=
+vm_ssh_port_a=
+vm_ssh_port_b=
+window_open=0
+hostfwd_port=
+nb_daemon_pid=
+mac_session_id=
+mac_root=
+netbird_dir=
+netbird_root_created=0
+diagnostics_done=0
+mac_brew_installed_by_us=0
+mac_n=0
+mac_started=0
+teardown_done=0
+keys_issued=0
+
+free_port() {
+  "$python_bin" -c '
+import socket, sys
+kind = socket.SOCK_DGRAM if sys.argv[1] == "udp" else socket.SOCK_STREAM
+s = socket.socket(socket.AF_INET, kind)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+' "$1"
+}
+
+vm_node() {
+  case $1 in
+    a) printf '%s' "$node_a" ;;
+    b) printf '%s' "$node_b" ;;
+  esac
+}
+
+vm_lab_ip() {
+  case $1 in
+    a) printf '%s' "$lab_net_a" ;;
+    b) printf '%s' "$lab_net_b" ;;
+  esac
+}
+
+vm_port() {
+  case $1 in
+    a) printf '%s' "$vm_ssh_port_a" ;;
+    b) printf '%s' "$vm_ssh_port_b" ;;
+  esac
+}
+
+ssh_options() {
+  printf '%s' "-F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o LogLevel=ERROR -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$run/known_hosts -i $run/id_ed25519"
+}
+
+# vm_ssh VM COMMAND: runs COMMAND in the VM as user ph, without stdin.
+vm_ssh() {
+  vm_name=$1
+  shift
+  # shellcheck disable=SC2046 # the option string is split into words on purpose
+  ssh $(ssh_options) -n -p "$(vm_port "$vm_name")" ph@127.0.0.1 "$@"
+}
+
+# vm_ssh_stdin VM COMMAND: like vm_ssh but forwards stdin.
+vm_ssh_stdin() {
+  vm_name=$1
+  shift
+  # shellcheck disable=SC2046 # the option string is split into words on purpose
+  ssh $(ssh_options) -p "$(vm_port "$vm_name")" ph@127.0.0.1 "$@"
+}
+
+# vm_install VM MODE DEST: installs stdin as DEST with MODE, as root.
+vm_install() {
+  vm_ssh_stdin "$1" "sudo install -D -m $2 /dev/stdin $3"
+}
+
+# monitor VM COMMAND: sends one HMP command to the VM's monitor socket.
+monitor() {
+  printf '%s\n' "$2" | socat -T3 - "UNIX-CONNECT:$run/vm-$1.mon"
+}
+
+teardown() {
+  if [ "$teardown_done" = 1 ]; then
+    return 0
+  fi
+  teardown_done=1
+  say "teardown"
+  if [ "$window_open" = 1 ] && [ -S "$run/vm-a.mon" ]; then
+    monitor a "hostfwd_remove wan tcp:$netbird_address:$hostfwd_port" >/dev/null 2>&1 || true
+    window_open=0
+  fi
+  if [ "$mac_started" = 1 ]; then
+    mac_cleanup || true
+  fi
+  kill_throwaway_daemon
+  if [ "$netbird_root_created" = 1 ] && [ -d "$netbird_root" ]; then
+    rm -rf "$netbird_root"
+    netbird_root_created=0
+  fi
+  if [ -n "$run" ] && [ -d "$run" ]; then
+    collect_diagnostics || true
+    for vm in a b; do
+      if [ -S "$run/vm-$vm.mon" ]; then
+        monitor "$vm" quit >/dev/null 2>&1 || true
+      fi
+    done
+    touch "$run/abort"
+    for vm in a b; do
+      teardown_wait "$vm"
+    done
+    for wrapper in "$run"/wrapper-*.pid; do
+      if [ -f "$wrapper" ]; then
+        kill_exact "$(cat "$wrapper")" "$run/vm-"
+      fi
+    done
+    leftovers=0
+    for entry in /proc/[0-9]*; do
+      pid=${entry#/proc/}
+      if pid_matches "$pid" "$run/"; then
+        printf 'tailscale-overlay: process %s of this run is still alive\n' "$pid" >&2
+        leftovers=$((leftovers + 1))
+      fi
+    done
+    case $run in
+      "$run_root"/ph1112-run-*) rm -rf "$run" ;;
+      *) printf 'tailscale-overlay: refusing to delete %s\n' "$run" >&2 ;;
+    esac
+    printf 'teardown complete; %s run process(es) left\n' "$leftovers"
+  fi
+}
+
+# teardown_wait VM: waits for the VM's qemu to exit, then stops it by exact PID.
+teardown_wait() {
+  pidfile="$run/vm-$1.pid"
+  [ -f "$pidfile" ] || return 0
+  qemu_pid=$(cat "$pidfile")
+  tw_waited=0
+  while [ "$tw_waited" -lt 15 ] && pid_matches "$qemu_pid" "$run/"; do
+    sleep 1
+    tw_waited=$((tw_waited + 1))
+  done
+  kill_exact "$qemu_pid" "$run/"
+}
+
+on_exit() {
+  exit_rc=$?
+  trap - EXIT INT TERM
+  set +e
+  teardown || true
+  exit "$exit_rc"
+}
+
+on_signal() {
+  if [ -n "$state" ]; then
+    inconclude interrupted "run stopped by a signal"
+  fi
+  exit 130
+}
+
+# Journals and doctor reports of the VMs, kept in the state directory so a
+# failed run can be diagnosed after the VMs are gone. They pass the same
+# secret scan as the evidence.
+collect_diagnostics() {
+  [ -n "$state" ] || return 0
+  [ "$diagnostics_done" = 0 ] || return 0
+  diagnostics_done=1
+  mkdir -p "$state/diagnostics"
+  for vm in a b; do
+    [ -S "$run/vm-$vm.mon" ] || continue
+    vm_ssh "$vm" 'sudo journalctl -u tailscaled --no-pager -n 200' >"$state/diagnostics/tailscaled-$vm.log" 2>&1 || true
+    vm_ssh "$vm" 'journalctl --user --no-pager -n 200' >"$state/diagnostics/pohunek-$vm.log" 2>&1 || true
+    vm_ssh "$vm" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek doctor --json' >"$state/diagnostics/doctor-$vm.json" 2>&1 || true
+  done
+  if [ -S "$run/vm-a.mon" ]; then
+    vm_ssh a 'sudo journalctl -u headscale --no-pager -n 200' >"$state/diagnostics/headscale.log" 2>&1 || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Pinned downloads
+
+# fetch_pinned URL DEST ALGORITHM EXPECTED: reuses a cached file that matches,
+# otherwise downloads and verifies it. A mismatch is inconclusive.
+fetch_pinned() {
+  fp_url=$1
+  fp_dest=$2
+  fp_algo=$3
+  fp_expected=$4
+  if [ -f "$fp_dest" ] && [ "$("${fp_algo}sum" <"$fp_dest" | awk '{print $1}')" = "$fp_expected" ]; then
+    return 0
+  fi
+  rm -f "$fp_dest.part"
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 1800 --output "$fp_dest.part" "$fp_url"; then
+    inconclude artifact_missing "download of $fp_url failed"
+    return 1
+  fi
+  if [ "$("${fp_algo}sum" <"$fp_dest.part" | awk '{print $1}')" != "$fp_expected" ]; then
+    rm -f "$fp_dest.part"
+    inconclude checksum_mismatch "$fp_url does not match its pinned $fp_algo"
+    return 1
+  fi
+  mv "$fp_dest.part" "$fp_dest"
+}
+
+# Downloads and verifies everything the VMs need, extracting the Tailscale
+# tarball into the cache.
+prepare_cache() {
+  mkdir -p "$cache_dir"
+  chmod 0700 "$cache_dir"
+  fetch_pinned "$debian_image_url" "$cache_dir/debian-$debian_image_version.qcow2" sha512 "$debian_image_sha512" || return 1
+  fetch_pinned "$headscale_url" "$cache_dir/headscale-$headscale_version" sha256 "$headscale_sha256" || return 1
+  fetch_pinned "$tailscale_url" "$cache_dir/tailscale-$tailscale_version.tgz" sha256 "$tailscale_sha256" || return 1
+  if [ ! -x "$cache_dir/tailscale-$tailscale_version/tailscale" ]; then
+    rm -rf "$cache_dir/tailscale-$tailscale_version"
+    mkdir -p "$cache_dir/tailscale-$tailscale_version"
+    tar -xzf "$cache_dir/tailscale-$tailscale_version.tgz" --strip-components=1 -C "$cache_dir/tailscale-$tailscale_version"
+  fi
+  for binary in tailscale tailscaled; do
+    [ -x "$cache_dir/tailscale-$tailscale_version/$binary" ] || {
+      inconclude artifact_missing "the Tailscale tarball holds no $binary"
+      return 1
+    }
+  done
+}
+
+# Takes the pohunek binaries from the CI artifact (or --bins-dir), records their
+# checksums and refuses binaries that need a newer glibc than the guests have.
+prepare_binaries() {
+  mkdir -p "$run/bins"
+  if [ -n "$ci_run" ]; then
+    if ! gh run download "$ci_run" --repo "$repo" --name pohunek-bins --dir "$run/download" >/dev/null 2>"$run/download.err"; then
+      inconclude artifact_missing "gh run download $ci_run (pohunek-bins) failed"
+      return 1
+    fi
+    source_dir="$run/download"
+    helper set-meta "$state" "ci_run=$ci_run" "ci_head_sha=$(gh run view "$ci_run" --repo "$repo" --json headSha --jq .headSha 2>/dev/null || printf unknown)"
+  else
+    source_dir=$bins_dir
+  fi
+  for binary in pohunek pohunekd pohunek-sessiond; do
+    found=$(find "$source_dir" -type f -name "$binary" | head -n 2)
+    if [ -z "$found" ] || [ "$(printf '%s\n' "$found" | wc -l)" -ne 1 ]; then
+      inconclude artifact_missing "expected exactly one $binary under $source_dir"
+      return 1
+    fi
+    install -m 0755 "$found" "$run/bins/$binary"
+    helper set-meta "$state" "bin_sha256_$binary=$(sha256sum <"$run/bins/$binary" | awk '{print $1}')"
+    if ! objdump -T "$run/bins/$binary" 2>/dev/null | helper glibc-check "$guest_glibc_max" >/dev/null; then
+      inconclude artifact_unusable "$binary needs glibc newer than $guest_glibc_max"
+      return 1
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# VMs
+
+# write_seed VM: builds the NoCloud seed (cloud-init) for one VM.
+write_seed() {
+  ws_vm=$1
+  ws_dir="$run/seed-$ws_vm"
+  mkdir -p "$ws_dir" || return 1
+  ssh-keygen -q -t ed25519 -N '' -C "ph1112-host-$ws_vm" -f "$run/hostkey-$ws_vm" || return 1
+  if [ ! -f "$run/id_ed25519" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C ph1112-client -f "$run/id_ed25519" || return 1
+  fi
+  {
+    printf '#cloud-config\n'
+    printf 'users:\n'
+    printf '  - name: ph\n'
+    printf '    sudo: ALL=(ALL) NOPASSWD:ALL\n'
+    printf '    shell: /bin/bash\n'
+    printf '    lock_passwd: true\n'
+    printf '    ssh_authorized_keys:\n'
+    printf '      - %s\n' "$(cat "$run/id_ed25519.pub")"
+    printf 'ssh_pwauth: false\n'
+    printf 'ssh_deletekeys: true\n'
+    printf 'ssh_genkeytypes: [ed25519]\n'
+    printf 'ssh_keys:\n'
+    printf '  ed25519_private: |\n'
+    sed 's/^/    /' "$run/hostkey-$ws_vm"
+    printf '  ed25519_public: %s\n' "$(cat "$run/hostkey-$ws_vm.pub")"
+    printf 'runcmd:\n'
+    printf '  - [loginctl, enable-linger, ph]\n'
+  } >"$ws_dir/user-data"
+  {
+    printf 'instance-id: ph1112-%s-%s\n' "$run_ts" "$ws_vm"
+    printf 'local-hostname: lab-%s\n' "$ws_vm"
+  } >"$ws_dir/meta-data"
+  {
+    printf 'version: 2\n'
+    printf 'ethernets:\n'
+    printf '  wan:\n'
+    printf '    match: {macaddress: "52:54:00:11:00:0%s"}\n' "$(vm_index "$ws_vm")"
+    printf '    set-name: eth0\n'
+    printf '    dhcp4: true\n'
+    printf '  lan:\n'
+    printf '    match: {macaddress: "52:54:00:77:00:0%s"}\n' "$(vm_index "$ws_vm")"
+    printf '    set-name: eth1\n'
+    printf '    addresses: ["%s/24"]\n' "$(vm_lab_ip "$ws_vm")"
+  } >"$ws_dir/network-config"
+  (cd "$ws_dir" && genisoimage -quiet -output "$run/seed-$ws_vm.iso" -volid cidata -joliet -rock user-data meta-data network-config) || return 1
+  qemu-img create -q -f qcow2 -F qcow2 -b "$cache_dir/debian-$debian_image_version.qcow2" "$run/vm-$ws_vm.qcow2" "$vm_disk" || return 1
+  printf '[127.0.0.1]:%s %s\n' "$(vm_port "$ws_vm")" "$(cut -d' ' -f1,2 "$run/hostkey-$ws_vm.pub")" >>"$run/known_hosts"
+}
+
+vm_index() {
+  case $1 in
+    a) printf 1 ;;
+    b) printf 2 ;;
+  esac
+}
+
+# write_vm_runner VM LOCAL-UDP-PORT REMOTE-UDP-PORT: the script a slot wrapper
+# runs. It signals that the slot is held, waits for `go`, then execs qemu in the
+# foreground so the slot lasts as long as the VM.
+write_vm_runner() {
+  wr_vm=$1
+  cat >"$run/vm-$wr_vm.sh" <<EOF
+#!/bin/sh
+set -eu
+: >"$run/slot-$wr_vm.held"
+while [ ! -e "$run/go" ]; do
+  [ ! -e "$run/abort" ] || exit 1
+  sleep 1
+done
+exec qemu-system-x86_64 \\
+  -name ph1112-$run_ts-$wr_vm \\
+  -machine q35,accel=kvm -cpu host -smp $vm_cpus -m $vm_memory_mib \\
+  -display none -serial file:$run/vm-$wr_vm.console -no-reboot \\
+  -pidfile $run/vm-$wr_vm.pid \\
+  -monitor unix:$run/vm-$wr_vm.mon,server,nowait \\
+  -drive file=$run/vm-$wr_vm.qcow2,if=virtio,format=qcow2 \\
+  -drive file=$run/seed-$wr_vm.iso,if=virtio,format=raw,readonly=on \\
+  -netdev user,id=wan,net=10.0.$(( $(vm_index "$wr_vm") + 1 )).0/24,restrict=on,hostfwd=tcp:127.0.0.1:$(vm_port "$wr_vm")-:22 \\
+  -device virtio-net-pci,netdev=wan,mac=52:54:00:11:00:0$(vm_index "$wr_vm") \\
+  -netdev dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$2,remote.type=inet,remote.host=127.0.0.1,remote.port=$3 \\
+  -device virtio-net-pci,netdev=lan,mac=52:54:00:77:00:0$(vm_index "$wr_vm")
+EOF
+  chmod 0700 "$run/vm-$wr_vm.sh"
+}
+
+# Starts both VM runners behind the slot handshake: each takes its slot and
+# writes slot-X.held; `go` is written only once both are held, so one VM never
+# idles while the other waits for a slot.
+start_vms() {
+  lan_port_a=$(free_port udp)
+  lan_port_b=$(free_port udp)
+  while [ "$lan_port_b" = "$lan_port_a" ]; do
+    lan_port_b=$(free_port udp)
+  done
+  vm_ssh_port_a=$(free_port tcp)
+  vm_ssh_port_b=$(free_port tcp)
+  while [ "$vm_ssh_port_b" = "$vm_ssh_port_a" ]; do
+    vm_ssh_port_b=$(free_port tcp)
+  done
+  : >"$run/known_hosts"
+  write_seed a || return 1
+  write_seed b || return 1
+  write_vm_runner a "$lan_port_a" "$lan_port_b" || return 1
+  write_vm_runner b "$lan_port_b" "$lan_port_a" || return 1
+  for vm in a b; do
+    if [ "$no_slot_wrapper" = 1 ]; then
+      /bin/sh "$run/vm-$vm.sh" >"$run/vm-$vm.runner.log" 2>&1 &
+    else
+      "$slot_wrapper" /bin/sh "$run/vm-$vm.sh" >"$run/vm-$vm.runner.log" 2>&1 &
+    fi
+    printf '%s\n' "$!" >"$run/wrapper-$vm.pid"
+  done
+  waited=0
+  while [ ! -e "$run/slot-a.held" ] || [ ! -e "$run/slot-b.held" ]; do
+    if [ "$waited" -ge "$slot_wait_s" ]; then
+      touch "$run/abort"
+      inconclude slots_unavailable "both heavy-run slots were not held within ${slot_wait_s}s"
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  : >"$run/go"
+  for vm in a b; do
+    waited=0
+    until vm_ssh "$vm" true >/dev/null 2>&1; do
+      if [ "$waited" -ge "$boot_timeout_s" ]; then
+        inconclude provisioning_failed "VM-$vm did not answer SSH within ${boot_timeout_s}s"
+        return 1
+      fi
+      sleep "$poll_s"
+      waited=$((waited + poll_s))
+    done
+  done
+}
+
+# prov VM DESCRIPTION COMMAND...: a provisioning command; a failure makes the
+# run inconclusive.
+prov() {
+  prov_vm=$1
+  prov_what=$2
+  shift 2
+  mkdir -p "$state/provision"
+  if ! "$@" >>"$state/provision/$prov_vm.log" 2>&1; then
+    inconclude provisioning_failed "VM-$prov_vm: $prov_what failed"
+    return 1
+  fi
+}
+
+render_headscale_config() {
+  cat <<EOF
+server_url: http://$lab_net_a:$headscale_port
+listen_addr: 0.0.0.0:$headscale_port
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "ph"
+    region_name: "ph lab embedded"
+    verify_clients: true
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+    ipv4: $lab_net_a
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 3h
+disable_check_updates: true
+node:
+  expiry: 0
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+log:
+  level: info
+  format: text
+policy:
+  mode: file
+  path: ""
+dns:
+  magic_dns: true
+  base_domain: $lab_domain
+  override_local_dns: false
+  nameservers:
+    global: []
+    split: {}
+  search_domains: []
+  extra_records: []
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+logtail:
+  enabled: false
+EOF
+}
+
+render_headscale_unit() {
+  cat <<'EOF'
+[Unit]
+Description=headscale (acceptance lab)
+After=network-online.target
+
+[Service]
+User=headscale
+Group=headscale
+ExecStart=/usr/local/bin/headscale serve -c /etc/headscale/config.yaml
+Restart=on-failure
+RuntimeDirectory=headscale
+StateDirectory=headscale
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_tailscaled_unit() {
+  cat <<EOF
+[Unit]
+Description=tailscaled (acceptance lab)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --port=41641 --no-logs-no-support
+Restart=on-failure
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+StateDirectory=tailscale
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+wait_cloud_init() {
+  vm_ssh "$1" 'sudo cloud-init status --wait' >/dev/null 2>&1 || true
+  vm_ssh "$1" 'loginctl show-user ph -p Linger' 2>/dev/null | grep -q 'Linger=yes'
+}
+
+provision_headscale() {
+  say "Headscale on VM-A"
+  prov a "install headscale" vm_install a 0755 /usr/local/bin/headscale <"$cache_dir/headscale-$headscale_version" || return 1
+  prov a "create headscale user" vm_ssh a 'sudo id headscale >/dev/null 2>&1 || sudo useradd --system --home-dir /var/lib/headscale --shell /usr/sbin/nologin headscale' || return 1
+  render_headscale_config | prov a "write headscale config" vm_install a 0644 /etc/headscale/config.yaml || return 1
+  render_headscale_unit | prov a "write headscale unit" vm_install a 0644 /etc/systemd/system/headscale.service || return 1
+  prov a "headscale configtest" vm_ssh a 'sudo /usr/local/bin/headscale configtest -c /etc/headscale/config.yaml' || return 1
+  prov a "start headscale" vm_ssh a 'sudo systemctl daemon-reload && sudo systemctl enable --now headscale' || return 1
+  waited=0
+  until vm_ssh a "curl -fsS -m 3 http://127.0.0.1:$headscale_port/health" >/dev/null 2>&1; do
+    if [ "$waited" -ge "$service_timeout_s" ]; then
+      inconclude provisioning_failed "Headscale did not become healthy"
+      return 1
+    fi
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  prov a "create the lab user" vm_ssh a 'sudo headscale users create ph' || return 1
+  prov a "create the issued-keys register" vm_ssh a 'sudo install -m 0600 /dev/null /var/lib/headscale/issued-keys' || return 1
+}
+
+# issue_key FROM-VM TO-VM DEST: creates a single-use pre-auth key on VM-A and
+# pipes it into DEST on TO-VM. The key never reaches the host disk or output; VM-A
+# keeps a copy in issued-keys so the evidence scan can look for it.
+issue_key() {
+  keys_issued=1
+  : >"$state/keys-issued"
+  if vm_ssh a "id=\$(sudo headscale users list -o json | python3 -c 'import json,sys; print([u[\"id\"] for u in json.load(sys.stdin) if u[\"name\"] == \"ph\"][0])') && sudo sh -c \"headscale preauthkeys create --user \$id --expiration $key_expiration | tee -a /var/lib/headscale/issued-keys\"" |
+    vm_ssh_stdin "$2" "sudo install -d -m 0700 /run/ts && sudo install -m 0600 /dev/stdin $3"; then
+    vm_ssh "$2" "sudo test -s $3" || return 1
+    return 0
+  fi
+  return 1
+}
+
+# join_tailnet VM: starts tailscaled and brings the node up with a pipe-fed key.
+join_tailnet() {
+  jt_vm=$1
+  jt_node=$(vm_node "$jt_vm")
+  for binary in tailscale tailscaled; do
+    prov "$jt_vm" "install $binary" vm_install "$jt_vm" 0755 "/usr/local/bin/$binary" <"$cache_dir/tailscale-$tailscale_version/$binary" || return 1
+  done
+  render_tailscaled_unit | prov "$jt_vm" "write the tailscaled unit" vm_install "$jt_vm" 0644 /etc/systemd/system/tailscaled.service || return 1
+  prov "$jt_vm" "start tailscaled" vm_ssh "$jt_vm" 'sudo systemctl daemon-reload && sudo systemctl enable --now tailscaled' || return 1
+  if ! issue_key a "$jt_vm" /run/ts/authkey; then
+    inconclude provisioning_failed "VM-$jt_vm: the pre-auth key could not be issued"
+    return 1
+  fi
+  prov "$jt_vm" "tailscale up" vm_ssh "$jt_vm" "sudo tailscale up --login-server=http://$lab_net_a:$headscale_port --auth-key=file:/run/ts/authkey --hostname=$jt_node --accept-dns=false --timeout=60s" || return 1
+  prov "$jt_vm" "remove the key file" vm_ssh "$jt_vm" 'sudo rm -f /run/ts/authkey' || return 1
+}
+
+# install_pohunek VM: stages the CI binaries, writes overlays.toml and installs
+# the daemon as a systemd user service from an SSH login session.
+install_pohunek() {
+  ip_vm=$1
+  prov "$ip_vm" "stage directory" vm_ssh "$ip_vm" 'mkdir -p ~/stage' || return 1
+  for binary in pohunek pohunekd pohunek-sessiond; do
+    prov "$ip_vm" "stage $binary" vm_ssh_stdin "$ip_vm" "cat >~/stage/$binary && chmod 0755 ~/stage/$binary" <"$run/bins/$binary" || return 1
+  done
+  prov "$ip_vm" "install the CLI" vm_install "$ip_vm" 0755 /usr/local/bin/pohunek <"$run/bins/pohunek" || return 1
+  prov "$ip_vm" "install the probe" vm_install "$ip_vm" 0755 /usr/local/bin/overlay_probe <"$probe" || return 1
+  prov "$ip_vm" "write overlays.toml" vm_ssh "$ip_vm" "umask 077 && mkdir -p ~/.config/pohunek && printf 'providers = [\"tailscale\"]\nport = $overlay_port\n' >~/.config/pohunek/overlays.toml && chmod 0600 ~/.config/pohunek/overlays.toml" || return 1
+  prov "$ip_vm" "service install" vm_ssh "$ip_vm" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek service install --from ~/stage' || return 1
+  waited=0
+  until vm_ssh "$ip_vm" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek health --json' >/dev/null 2>&1; do
+    if [ "$waited" -ge "$service_timeout_s" ]; then
+      inconclude provisioning_failed "VM-$ip_vm: the daemon did not answer health"
+      return 1
+    fi
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+}
+
+# ---------------------------------------------------------------------------
+# D4
+
+# wait_screen LEG NAME SID DST-HOSTNAME-MARK SRC: polls `session screen` until
+# the mark shows or the wait ends; the last attempt stays recorded.
+wait_screen() {
+  waited=0
+  while :; do
+    step "$1" "$2" vm_ssh "$5" "pohunek session screen $(vm_node "$6")/$3 --json"
+    if [ "$step_rc" -eq 0 ] && helper screen-has "$step_dir/stdout" "$4"; then
+      return 0
+    fi
+    [ "$waited" -lt "$screen_timeout_s" ] || return 0
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+attach_pipeline() {
+  {
+    printf 'echo ATTACH-MARK-$(hostname)\r'
+    sleep 3
+    printf '\035'
+    sleep 1
+  } | vm_ssh_stdin "$1" "timeout 20 script -qec 'pohunek attach $(vm_node "$2")/$3' /dev/null"
+}
+
+# d4 LEG SRC DST: the command list of the design, section 2.3.
+d4() {
+  d4_leg=$1
+  d4_src=$2
+  d4_dst=$3
+  d4_dn=$(vm_node "$d4_dst")
+  d4_hostname=$(cat "$state/steps/pre/"[0-9][0-9][0-9]-hostname-"$d4_dst"/stdout | tr -d '\n')
+  d4_id=$(helper status-field "$state/steps/pre/"[0-9][0-9][0-9]-status-"$d4_dst"/stdout id)
+  say "D4 $d4_src -> $d4_dst"
+  step "$d4_leg" doctor-src vm_ssh "$d4_src" 'pohunek doctor --json'
+  step "$d4_leg" doctor-dst vm_ssh "$d4_dst" 'pohunek doctor --json'
+  step "$d4_leg" ss-src vm_ssh "$d4_src" "ss -ltnH 'sport = :$overlay_port'"
+  step "$d4_leg" ss-dst vm_ssh "$d4_dst" "ss -ltnH 'sport = :$overlay_port'"
+  step "$d4_leg" host-list vm_ssh "$d4_src" 'pohunek host list --json'
+  step "$d4_leg" discover vm_ssh "$d4_src" 'pohunek host discover --refresh --json'
+  step "$d4_leg" inspect-short vm_ssh "$d4_src" "pohunek host inspect $d4_dn --json"
+  step "$d4_leg" health-fqdn vm_ssh "$d4_src" "pohunek --host $d4_dn.$lab_domain health --json"
+  step "$d4_leg" health-peer-id vm_ssh "$d4_src" "pohunek --host tailscale:peer~$d4_id health --json"
+  step "$d4_leg" session-list-qualified vm_ssh "$d4_src" "pohunek --host tailscale:$d4_dn session list --json"
+  step "$d4_leg" session-new vm_ssh "$d4_src" "pohunek session new --host $d4_dn --agent shell --name d4-$d4_src-to-$d4_dst --yes --json"
+  d4_sid=
+  if [ "$step_rc" -eq 0 ]; then
+    d4_sid=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
+  fi
+  if [ -z "$d4_sid" ]; then
+    return 0
+  fi
+  step "$d4_leg" session-input vm_ssh "$d4_src" "pohunek session input $d4_dn/$d4_sid 'echo D4-MARK-\$(hostname)' --json"
+  wait_screen "$d4_leg" session-screen "$d4_sid" "D4-MARK-$d4_hostname" "$d4_src" "$d4_dst"
+  step "$d4_leg" attach attach_pipeline "$d4_src" "$d4_dst" "$d4_sid"
+  step "$d4_leg" probe vm_ssh "$d4_src" "overlay_probe --host $d4_dn --session $d4_sid --mark D4-MARK"
+  step "$d4_leg" session-stop vm_ssh "$d4_src" "pohunek session stop $d4_dn/$d4_sid --json"
+  step "$d4_leg" session-remove vm_ssh "$d4_src" "pohunek session remove $d4_dn/$d4_sid --json"
+}
+
+unit_glob="pohunek-*-daemon.service"
+
+# extras SIDE OTHER: the recorded-only D7 hint and D5 rebind observations.
+extras() {
+  ex_side=$1
+  ex_other=$2
+  ex_node=$(vm_node "$ex_side")
+  say "D7 and D5 on VM-$ex_side"
+  vm_ssh "$ex_side" "systemctl --user stop '$unit_glob'" >/dev/null 2>&1 || true
+  step extra "d7-health-$ex_side" vm_ssh "$ex_other" "pohunek --host $ex_node health --json"
+  vm_ssh "$ex_side" "systemctl --user start '$unit_glob'" >/dev/null 2>&1 || true
+  waited=0
+  until vm_ssh "$ex_other" "pohunek --host $ex_node health --json" >/dev/null 2>&1; do
+    [ "$waited" -lt "$service_timeout_s" ] || return 0
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  ex_since=$(vm_ssh "$ex_side" "date '+%Y-%m-%d %H:%M:%S'")
+  step extra "d5-down-$ex_side" vm_ssh "$ex_side" 'sudo tailscale down'
+  sleep "$poll_s"
+  step extra "d5-doctor-down-$ex_side" vm_ssh "$ex_side" 'PATH=/usr/local/bin:/usr/bin:/bin pohunek doctor --json'
+  step extra "d5-up-$ex_side" vm_ssh "$ex_side" "sudo tailscale up --login-server=http://$lab_net_a:$headscale_port --hostname=$ex_node --accept-dns=false --timeout=60s"
+  waited=0
+  while :; do
+    step extra "d5-journal-$ex_side" vm_ssh "$ex_side" "journalctl --user --no-pager --since '$ex_since' | grep 'serving control protocol over overlay'"
+    [ "$step_rc" -ne 0 ] || break
+    [ "$waited" -lt "$service_timeout_s" ] || break
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+}
+
+vms_leg() {
+  say "preconditions"
+  for vm in a b; do
+    step pre "status-$vm" vm_ssh "$vm" 'tailscale status --json'
+    if ! helper check-status "$step_dir/stdout" >/dev/null 2>&1; then
+      inconclude provisioning_failed "VM-$vm: tailscale is not a running kernel-TUN node with one IPv4 address"
+      return 1
+    fi
+    step pre "hostname-$vm" vm_ssh "$vm" 'hostname'
+    step pre "units-$vm" vm_ssh "$vm" "systemctl --user is-active '$unit_glob'"
+  done
+  for vm in a b; do
+    peer=b
+    [ "$vm" = a ] || peer=a
+    peer_ip=$(helper status-field "$state/steps/pre/"[0-9][0-9][0-9]-status-"$peer"/stdout ipv4)
+    step pre "ping-$vm" vm_ssh "$vm" "tailscale ping -c $ping_count $peer_ip"
+    if [ "$step_rc" -ne 0 ]; then
+      inconclude no_direct_path "VM-$vm has no direct path to VM-$peer"
+      return 1
+    fi
+  done
+  d4 ab a b
+  d4 ba b a
+  extras a b
+  extras b a
+}
+
+# ---------------------------------------------------------------------------
+# NetBird-only absent-file check (host, throwaway daemon)
+
+# nb_run COMMAND...: runs a command in the throwaway environment with a clean
+# environment (no POHUNEK_* variables of the owner's session).
+nb_run() {
+  env -i "HOME=$netbird_root/home" "XDG_CONFIG_HOME=$netbird_root/cfg" "XDG_DATA_HOME=$netbird_root/data" \
+    "XDG_STATE_HOME=$netbird_root/state" "XDG_RUNTIME_DIR=$netbird_root/run" "TERM=dumb" \
+    "PATH=$netbird_root/bin:$netbird_dir:/usr/bin:/bin" "$@"
+}
+
+owner_pid() {
+  systemctl --user show -p MainPID --value "$owner_unit"
+}
+
+owner_peers() {
+  netbird status --json | jq -c '{peers: .peers.total, connected: .peers.connected}'
+}
+
+netbird_leg() {
+  say "NetBird-only check (absent overlays.toml)"
+  if [ -e "$netbird_root" ]; then
+    die "$netbird_root already exists; remove it after checking that nothing of yours uses it"
+  fi
+  netbird_dir=$(dirname -- "$(command -v netbird)")
+  step netbird owner-pid-before owner_pid
+  step netbird owner-peers-before owner_peers
+  step netbird owner-health-before "$owner_pohunek" health --json
+  mkdir -m 0700 "$netbird_root" || return 1
+  netbird_root_created=1
+  mkdir -m 0700 "$netbird_root/home" "$netbird_root/cfg" "$netbird_root/data" "$netbird_root/state" "$netbird_root/run" "$netbird_root/bin"
+  for binary in pohunek pohunekd pohunek-sessiond; do
+    install -m 0755 "$run/bins/$binary" "$netbird_root/bin/$binary"
+  done
+  step netbird guard-doctor nb_run pohunek doctor --json
+  if ! helper guard-paths "$step_dir/stdout" "$netbird_root"; then
+    inconclude path_guard_violation "the throwaway environment resolved a path outside $netbird_root"
+    return 1
+  fi
+  step netbird daemon-start nb_run pohunek daemon start --dev-subprocess --detach
+  waited=0
+  until nb_run pohunek health --json >/dev/null 2>&1; do
+    [ "$waited" -lt "$service_timeout_s" ] || break
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  step netbird doctor nb_run pohunek doctor --json
+  step netbird daemon-log grep -rhI --exclude-dir=bin 'remote control listener not bound' "$netbird_root"
+  step netbird host-list nb_run pohunek host list --json
+  step netbird discover nb_run pohunek host discover --refresh --json
+  step netbird inspect-zajcaair nb_run pohunek host inspect "$macos_host" --json
+  kill_throwaway_daemon
+  nb_alive=0
+  for entry in /proc/[0-9]*; do
+    if pid_matches "${entry#/proc/}" "$netbird_root/bin/"; then
+      nb_alive=1
+    fi
+  done
+  if [ "$nb_alive" = 0 ]; then
+    note_step netbird daemon-stop 0 "kill the processes of $netbird_root/bin (exact pids)" "stopped"
+  else
+    note_step netbird daemon-stop 1 "kill the processes of $netbird_root/bin (exact pids)" "still alive"
+  fi
+  rm -rf "$netbird_root"
+  netbird_root_created=0
+  step netbird owner-pid-after owner_pid
+  step netbird owner-peers-after owner_peers
+  step netbird owner-health-after "$owner_pohunek" health --json
+}
+
+# ---------------------------------------------------------------------------
+# zajcaair leg (no root; commands go through a pohunek shell session)
+
+mac_target() {
+  printf '%s/%s' "$macos_host" "$mac_session_id"
+}
+
+mac_env() {
+  printf 'env -i HOME=%s/home XDG_CONFIG_HOME=%s/home/.config XDG_DATA_HOME=%s/data XDG_STATE_HOME=%s/state XDG_RUNTIME_DIR=%s/run TERM=dumb' \
+    "$mac_root" "$mac_root" "$mac_root" "$mac_root" "$macos_runtime_root"
+}
+
+# mac_step LEG NAME TIMEOUT COMMAND: runs COMMAND in the Mac's shell session and
+# records it like a local step. The command travels base64-encoded; its output is
+# written to a file, printed between markers (also base64) and decoded here, so
+# quoting, wrapping and echo never alter it.
+mac_step() {
+  ms_leg=$1
+  ms_name=$2
+  ms_timeout=$3
+  ms_cmd=$4
+  mac_n=$((mac_n + 1))
+  ms_b64=$(printf '%s' "$ms_cmd" | base64 | tr -d '\n')
+  ms_line="umask 077; mkdir -p $macos_comm_root/out; printf '%s' '$ms_b64' | base64 -d | sh >$macos_comm_root/out/$mac_n.raw 2>&1; rc=\$?; printf 'PHBEG-%s-\\n' $mac_n; base64 <$macos_comm_root/out/$mac_n.raw | tr -d '\\n'; printf '\\nPHEND-%s-%s\\n' $mac_n \$rc"
+  step_dir_for "$ms_leg" "$ms_name"
+  printf '%s\n' "$ms_cmd" >"$step_dir/argv"
+  now >"$step_dir/at"
+  : >"$step_dir/stderr"
+  "$owner_pohunek" session input "$(mac_target)" "$ms_line" --json >"$step_dir/input.json" 2>&1 || true
+  ms_waited=0
+  step_rc=124
+  while [ "$ms_waited" -lt "$ms_timeout" ]; do
+    sleep "$mac_poll_s"
+    ms_waited=$((ms_waited + mac_poll_s))
+    if "$owner_pohunek" session output "$(mac_target)" --max-bytes "$mac_capture_bytes" --json >"$step_dir/capture.json" 2>/dev/null; then
+      if ms_rc=$(helper mac-extract "$step_dir/capture.json" "$mac_n" "$step_dir/stdout" 2>/dev/null); then
+        step_rc=$ms_rc
+        break
+      fi
+    fi
+  done
+  [ -f "$step_dir/stdout" ] || : >"$step_dir/stdout"
+  rm -f "$step_dir/capture.json" "$step_dir/input.json"
+  printf '%s\n' "$step_rc" >"$step_dir/rc"
+}
+
+mac_cleanup_done=0
+
+mac_cleanup() {
+  [ "$mac_cleanup_done" = 0 ] || return 0
+  mac_cleanup_done=1
+  [ -n "$mac_session_id" ] || return 0
+  say "cleaning up zajcaair"
+  if [ -z "$mac_root" ]; then
+    "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
+    return 0
+  fi
+  mac_step macos cl-daemon-stop "$mac_timeout_s" "pid=\$(cat $mac_root/daemon.pid 2>/dev/null); if [ -n \"\$pid\" ] && ps -p \$pid -o command= | grep -F -q $macos_runtime_root/bin/pohunekd; then kill \$pid; fi; true"
+  mac_step macos cl-kill-tsd "$mac_timeout_s" "pid=\$(cat $mac_root/tsd.pid 2>/dev/null); if [ -n \"\$pid\" ] && ps -p \$pid -o command= | grep -F -q -- --socket=$macos_runtime_root/ts.sock; then kill \$pid; fi; true"
+  if [ "$mac_brew_installed_by_us" = 1 ]; then
+    mac_step macos cl-brew-uninstall "$mac_install_timeout_s" "$macos_brew uninstall tailscale"
+    mac_step macos cl-ls "$mac_timeout_s" 'ls /opt/homebrew/bin/tailscale* 2>&1; true'
+  fi
+  step macos cl-health "$owner_pohunek" --host "$macos_host" health --json
+  mac_final_clean
+  "$owner_pohunek" session stop "$(mac_target)" --json >"$state/mac-session-stop.json" 2>&1 || true
+}
+
+# Removes the throwaway roots and the communication directory with a command
+# whose result is read from the terminal, since its own capture file goes too.
+mac_final_clean() {
+  mac_n=$((mac_n + 1))
+  mf_line="rm -rf $mac_root $macos_runtime_root $macos_comm_root; if [ ! -e $mac_root ] && [ ! -e $macos_runtime_root ] && [ ! -e $macos_comm_root ]; then printf 'PHCLEAN-%s-OK\\n' $mac_n; fi"
+  "$owner_pohunek" session input "$(mac_target)" "$mf_line" --json >/dev/null 2>&1 || true
+  mf_waited=0
+  mf_rc=1
+  while [ "$mf_waited" -lt "$mac_timeout_s" ]; do
+    sleep 2
+    mf_waited=$((mf_waited + 2))
+    if "$owner_pohunek" session output "$(mac_target)" --max-bytes "$mac_capture_bytes" --json 2>/dev/null |
+      "$python_bin" -c '
+import base64, json, sys
+doc = json.load(sys.stdin)["ok"]
+text = base64.b64decode(doc["data_base64"]).decode("utf-8", "replace")
+sys.exit(0 if ("PHCLEAN-%s-OK\n" % sys.argv[1]).replace("\n", "") in text.replace("\r", "").replace("\n", "") else 1)
+' "$mac_n"; then
+      mf_rc=0
+      break
+    fi
+  done
+  note_step macos cl-rm "$mf_rc" "rm -rf $mac_root $macos_runtime_root $macos_comm_root" ""
+}
+
+macos_leg() {
+  say "zajcaair (no root)"
+  helper cgnat "$netbird_address" || die "--netbird-address must be an address in 100.64.0.0/10"
+  step macos session-new "$owner_pohunek" session new --host "$macos_host" --agent shell --name "$macos_session_name" --cwd "$macos_session_cwd" --yes --json
+  mac_session_id=$(helper session-id "$step_dir/stdout" 2>/dev/null || true)
+  if [ -z "$mac_session_id" ]; then
+    inconclude provisioning_failed "the $macos_host shell session could not be started"
+    return 1
+  fi
+  mac_started=1
+  helper set-meta "$state" "macos_session=$mac_session_id"
+  "$owner_pohunek" session input "$(mac_target)" 'export PAGER=cat GIT_PAGER=cat' --json >/dev/null 2>&1 || true
+  mac_step macos mac-home 30 'printf %s "$HOME"'
+  mac_home=$(cat "$step_dir/stdout")
+  [ -n "$mac_home" ] || {
+    inconclude provisioning_failed "the Mac's HOME could not be read"
+    return 1
+  }
+  mac_root="$mac_home/.ph1112"
+  helper set-meta "$state" "macos_root=$mac_root" "macos_runtime_root=$macos_runtime_root"
+  mac_bin="$macos_runtime_root/bin"
+  me=$(mac_env)
+
+  say "zajcaair: install Tailscale"
+  mac_step macos brew-before "$mac_timeout_s" "$macos_brew list --versions tailscale"
+  if [ "$step_rc" -ne 0 ]; then
+    mac_brew_installed_by_us=1
+    mac_step macos brew-install "$mac_install_timeout_s" "$macos_brew install tailscale"
+  else
+    note_step macos brew-install 0 "tailscale already installed; not reinstalled" ""
+  fi
+  mac_step macos brew-info "$mac_timeout_s" "$macos_brew info --json=v2 tailscale"
+  mac_step macos ls-bins "$mac_timeout_s" 'ls -l /opt/homebrew/bin/tailscale /opt/homebrew/bin/tailscaled'
+  mac_step macos brew-deps "$mac_timeout_s" "$macos_brew deps tailscale"
+
+  say "zajcaair: throwaway roots"
+  mac_step macos mac-roots "$mac_timeout_s" "umask 077; mkdir -p $mac_root/home/.config/pohunek $mac_root/data $mac_root/state $macos_runtime_root/run $mac_bin && for b in pohunek pohunekd pohunek-sessiond; do cp $macos_bin_dir/\$b $mac_bin/\$b && chmod 0755 $mac_bin/\$b; done && printf 'providers = [\"tailscale\"]\nport = $overlay_port\n' >$mac_root/home/.config/pohunek/overlays.toml && chmod 0600 $mac_root/home/.config/pohunek/overlays.toml"
+  [ "$step_rc" -eq 0 ] || {
+    inconclude provisioning_failed "the throwaway roots on $macos_host could not be prepared"
+    return 1
+  }
+  mac_step macos guard-doctor "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
+  if ! helper guard-paths "$step_dir/stdout" "$mac_root" "$macos_runtime_root"; then
+    inconclude path_guard_violation "the macOS throwaway environment resolved a path outside its roots"
+    return 1
+  fi
+
+  say "zajcaair: D6, no tailscaled"
+  mac_step macos d6-doctor-before "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
+  mac_step macos d6-host-list "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek host list --json"
+  mac_step macos d6-daemon-start "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek daemon start --dev-subprocess --detach"
+  mac_daemon_pid=$(sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p' "$step_dir/stdout" | head -n 1)
+  mac_step macos d6-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
+  mac_step macos d6-doctor-after "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
+  mac_step macos d6-daemon-log "$mac_timeout_s" "grep -rhI 'overlay state unavailable; serving local-only' $mac_root; true"
+  mac_step macos d6-lsof "$mac_timeout_s" "lsof -nP -iTCP:$overlay_port -sTCP:LISTEN"
+  mac_step macos d6-daemon-record "$mac_timeout_s" "printf %s $mac_daemon_pid >$mac_root/daemon.pid; ps -p $mac_daemon_pid -o command="
+
+  macos_userspace || true
+}
+
+# Userspace tailscaled on the Mac, registered with Headscale through a runtime
+# port forward that listens only on this host's NetBird address.
+macos_userspace() {
+  say "zajcaair: userspace tailscaled"
+  sub_socket="$macos_runtime_root/ts.sock"
+  mac_step macos us-tailscaled-start "$mac_timeout_s" "mkdir -p $mac_root/ts; nohup /opt/homebrew/bin/tailscaled --tun=userspace-networking --socket=$sub_socket --statedir=$mac_root/ts --port=0 --no-logs-no-support >$macos_runtime_root/tsd.log 2>&1 </dev/null & echo \$! >$mac_root/tsd.pid; for i in 1 2 3 4 5 6 7 8 9 10; do [ -S $sub_socket ] && exit 0; sleep 1; done; cat $macos_runtime_root/tsd.log; exit 1"
+  if [ "$step_rc" -ne 0 ]; then
+    inconclude macos_userspace_refused "userspace tailscaled did not create its socket"
+    return 1
+  fi
+  hostfwd_port=$(free_port tcp)
+  say "exposure window opens: Headscale on $netbird_address:$hostfwd_port"
+  step macos us-hostfwd-add monitor a "hostfwd_add wan tcp:$netbird_address:$hostfwd_port-:$headscale_port"
+  window_open=1
+  step macos us-hostfwd-bind ss -ltnH "sport = :$hostfwd_port"
+  if [ "$(awk '{print $4}' "$step_dir/stdout" | tr '\n' ' ')" != "$netbird_address:$hostfwd_port " ]; then
+    close_window
+    inconclude headscale_unreachable_from_macos "the forward is not bound only to $netbird_address:$hostfwd_port; the window was closed"
+    return 1
+  fi
+  mac_step macos us-reach "$mac_timeout_s" "curl -sS -m 5 http://$netbird_address:$hostfwd_port/health"
+  if [ "$step_rc" -ne 0 ]; then
+    inconclude headscale_unreachable_from_macos "$macos_host cannot reach $netbird_address:$hostfwd_port"
+    close_window
+    return 1
+  fi
+  mac_step macos us-register "$mac_timeout_s" "nohup /opt/homebrew/bin/tailscale --socket=$sub_socket up --login-server=http://$netbird_address:$hostfwd_port --hostname=$macos_user_node --accept-dns=false --json >$mac_root/up.json 2>&1 </dev/null & for i in 1 2 3 4 5 6 7 8 9 10; do grep -q AuthURL $mac_root/up.json 2>/dev/null && cat $mac_root/up.json && exit 0; sleep 2; done; cat $mac_root/up.json; exit 1"
+  register_id=$(helper register-id "$step_dir/stdout" 2>/dev/null || true)
+  if [ -z "$register_id" ]; then
+    inconclude headscale_unreachable_from_macos "no registration URL came back from the control server"
+    close_window
+    return 1
+  fi
+  step macos us-approve vm_ssh a "sudo headscale auth register --auth-id $register_id --user ph"
+  waited=0
+  while :; do
+    mac_step macos us-status-json "$mac_timeout_s" "tailscale() { /opt/homebrew/bin/tailscale --socket=$sub_socket \"\$@\"; }; tailscale status --json"
+    if helper check-status "$step_dir/stdout" >/dev/null 2>&1 || grep -q '"BackendState": *"Running"' "$step_dir/stdout" 2>/dev/null; then
+      break
+    fi
+    [ "$waited" -lt "$service_timeout_s" ] || break
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  if ! grep -q '"BackendState": *"Running"' "$state/steps/macos/"[0-9][0-9][0-9]-us-status-json/stdout 2>/dev/null; then
+    inconclude macos_userspace_not_running "the userspace node did not reach Running after approval"
+    close_window
+    return 1
+  fi
+  mac_step macos us-wrapper "$mac_timeout_s" "printf '#!/bin/sh\nexec /opt/homebrew/bin/tailscale --socket=$sub_socket \"\$@\"\n' >$mac_bin/tailscale && chmod 0700 $mac_bin/tailscale"
+  mac_step macos us-stop-daemon "$mac_timeout_s" "if ps -p $mac_daemon_pid -o command= | grep -F -q $mac_bin/pohunekd; then kill $mac_daemon_pid; fi; sleep 2; true"
+  mac_step macos us-restart "$mac_timeout_s" "$me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek daemon start --dev-subprocess --detach"
+  mac_daemon_pid=$(sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p' "$step_dir/stdout" | head -n 1)
+  mac_step macos us-wait "$mac_timeout_s" "printf %s $mac_daemon_pid >$mac_root/daemon.pid; for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
+  mac_step macos us-doctor "$mac_timeout_s" "$me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek doctor --json"
+  mac_step macos us-host-list "$mac_timeout_s" "$me PATH=$mac_bin:/usr/bin:/bin $mac_bin/pohunek host list --json"
+  mac_step macos us-lsof "$mac_timeout_s" "lsof -nP -iTCP:$overlay_port -sTCP:LISTEN"
+  close_window
+}
+
+close_window() {
+  if [ "$window_open" = 1 ]; then
+    step macos us-hostfwd-remove monitor a "hostfwd_remove wan tcp:$netbird_address:$hostfwd_port"
+    window_open=0
+    step macos us-hostfwd-closed ss -ltnH "sport = :$hostfwd_port"
+    say "exposure window closed"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+
+parse_run_options() {
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --leg)
+        [ "$#" -ge 2 ] || die "--leg needs a value"
+        case $2 in
+          vms | netbird | macos) legs="$legs $2" ;;
+          *) die "unknown leg $2" ;;
+        esac
+        shift 2
+        ;;
+      --slot-wrapper)
+        [ "$#" -ge 2 ] || die "--slot-wrapper needs a value"
+        slot_wrapper=$2
+        shift 2
+        ;;
+      --no-slot-wrapper)
+        no_slot_wrapper=1
+        shift
+        ;;
+      --ci-run) [ "$#" -ge 2 ] || die "--ci-run needs a value"; ci_run=$2; shift 2 ;;
+      --bins-dir) [ "$#" -ge 2 ] || die "--bins-dir needs a value"; bins_dir=$2; shift 2 ;;
+      --probe) [ "$#" -ge 2 ] || die "--probe needs a value"; probe=$2; shift 2 ;;
+      --netbird-address) [ "$#" -ge 2 ] || die "--netbird-address needs a value"; netbird_address=$2; shift 2 ;;
+      --owner-unit) [ "$#" -ge 2 ] || die "--owner-unit needs a value"; owner_unit=$2; shift 2 ;;
+      --pohunek) [ "$#" -ge 2 ] || die "--pohunek needs a value"; owner_pohunek=$2; shift 2 ;;
+      --macos-host) [ "$#" -ge 2 ] || die "--macos-host needs a value"; macos_host=$2; shift 2 ;;
+      --macos-bin-dir) [ "$#" -ge 2 ] || die "--macos-bin-dir needs a value"; macos_bin_dir=$2; shift 2 ;;
+      --output) [ "$#" -ge 2 ] || die "--output needs a value"; output=$2; shift 2 ;;
+      --cache-dir) [ "$#" -ge 2 ] || die "--cache-dir needs a value"; cache_dir=$2; shift 2 ;;
+      --run-root) [ "$#" -ge 2 ] || die "--run-root needs a value"; run_root=$2; shift 2 ;;
+      --repo) [ "$#" -ge 2 ] || die "--repo needs a value"; repo=$2; shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+}
+
+has_leg() {
+  case " $legs " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_options() {
+  [ -n "$legs" ] || die "at least one --leg is required"
+  if [ -n "$slot_wrapper" ] && [ "$no_slot_wrapper" = 1 ]; then
+    die "--slot-wrapper and --no-slot-wrapper exclude each other"
+  fi
+  if [ -z "$slot_wrapper" ] && [ "$no_slot_wrapper" = 0 ] && has_leg vms; then
+    die "the vms leg needs --slot-wrapper PATH or an explicit --no-slot-wrapper"
+  fi
+  if [ -n "$slot_wrapper" ] && [ ! -x "$slot_wrapper" ]; then
+    die "--slot-wrapper $slot_wrapper is not an executable file"
+  fi
+  if [ -n "$ci_run" ] && [ -n "$bins_dir" ]; then
+    die "--ci-run and --bins-dir exclude each other"
+  fi
+  if [ -z "$ci_run" ] && [ -z "$bins_dir" ]; then
+    die "one of --ci-run and --bins-dir is required"
+  fi
+  if [ -n "$bins_dir" ] && [ ! -d "$bins_dir" ]; then
+    die "--bins-dir $bins_dir is not a directory"
+  fi
+  if has_leg macos && ! has_leg vms; then
+    die "the macos leg needs the vms leg (Headscale runs in VM-A)"
+  fi
+  if has_leg vms; then
+    [ -n "$probe" ] || die "the vms leg needs --probe PATH"
+    [ -f "$probe" ] || die "--probe $probe is not a file"
+    file "$probe" | grep -Eq 'statically linked|static-pie linked' || die "--probe $probe is not a static binary"
+  fi
+  if has_leg netbird || has_leg macos; then
+    [ -n "$netbird_address" ] || die "the netbird and macos legs need --netbird-address"
+    helper cgnat "$netbird_address" || die "--netbird-address must be an address in 100.64.0.0/10"
+    ip -4 -o addr show | grep -q " $netbird_address/" || die "$netbird_address is not an address of this host"
+  fi
+  if has_leg netbird; then
+    [ -n "$owner_unit" ] || die "the netbird leg needs --owner-unit"
+    command -v netbird >/dev/null || die "the netbird leg needs the netbird CLI"
+  fi
+  if has_leg macos; then
+    [ -n "$macos_bin_dir" ] || die "the macos leg needs --macos-bin-dir"
+  fi
+  for tool in python3 curl sha256sum sha512sum tar find install file; do
+    command -v "$tool" >/dev/null || die "$tool is required"
+  done
+  if has_leg vms; then
+    for tool in qemu-system-x86_64 qemu-img genisoimage ssh ssh-keygen socat objdump; do
+      command -v "$tool" >/dev/null || die "$tool is required"
+    done
+    [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "/dev/kvm is not accessible"
+  fi
+  if [ -n "$ci_run" ]; then
+    command -v gh >/dev/null || die "gh is required for --ci-run"
+  fi
+  if has_leg netbird; then
+    command -v jq >/dev/null || die "jq is required for the netbird leg"
+  fi
+}
+
+print_pins() {
+  cat <<EOF
+headscale_version=$headscale_version
+headscale_sha256=$headscale_sha256
+tailscale_version=$tailscale_version
+tailscale_sha256=$tailscale_sha256
+debian_image_version=$debian_image_version
+debian_image_sha512=$debian_image_sha512
+EOF
+}
+
+main_run() {
+  parse_run_options "$@"
+  validate_options
+  run_ts=$(date -u '+%Y%m%dT%H%M%SZ')
+  run="$run_root/ph1112-run-$run_ts"
+  state="$run_root/ph1112-state-$run_ts"
+  mkdir -m 0700 "$run" "$state" || die "cannot create the run directories under $run_root"
+  trap on_exit EXIT
+  trap on_signal INT TERM
+  leg_args=
+  for leg in $legs; do
+    leg_args="$leg_args --leg $leg"
+  done
+  # shellcheck disable=SC2086 # one --leg word pair per selected leg
+  helper begin "$state" $leg_args \
+    --meta "overlay_port=$overlay_port" --meta "lab_domain=$lab_domain" \
+    --meta "node_a=$node_a" --meta "node_b=$node_b" \
+    --meta "netbird_address=$netbird_address" --meta "netbird_root=$netbird_root" \
+    --meta "macos_root=unset" --meta "macos_runtime_root=$macos_runtime_root" \
+    --meta "headscale_version=$headscale_version" --meta "headscale_sha256=$headscale_sha256" \
+    --meta "tailscale_version=$tailscale_version" --meta "tailscale_sha256=$tailscale_sha256" \
+    --meta "debian_image_version=$debian_image_version" --meta "debian_image_sha512=$debian_image_sha512" \
+    --meta "qemu_version=$(qemu-system-x86_64 --version 2>/dev/null | head -n 1 || printf none)" \
+    --meta "host_kernel=$(uname -sr)"
+  say "state directory: $state"
+  if [ -n "$probe" ]; then
+    helper set-meta "$state" "probe_sha256=$(sha256sum <"$probe" | awk '{print $1}')"
+  fi
+  prepare_binaries || return 1
+  if has_leg vms; then
+    prepare_cache || return 1
+    start_vms || return 1
+    for vm in a b; do
+      wait_cloud_init "$vm" || {
+        inconclude provisioning_failed "VM-$vm: cloud-init or linger did not finish"
+        return 1
+      }
+    done
+    provision_headscale || return 1
+    join_tailnet a || return 1
+    join_tailnet b || return 1
+    install_pohunek a || return 1
+    install_pohunek b || return 1
+    vms_leg || return 1
+  fi
+  if has_leg netbird; then
+    netbird_leg || return 1
+  fi
+  if has_leg macos; then
+    macos_leg || return 1
+  fi
+  return 0
+}
+
+# The scan VM-A runs against the evidence bundle: it prints how many files hold
+# any key value VM-A issued, so no key value leaves VM-A.
+render_scan_script() {
+  cat <<'SCAN'
+#!/bin/sh
+set -eu
+dir=$(mktemp -d)
+tar -xf - -C "$dir"
+grep -v '^$' /var/lib/headscale/issued-keys >"$dir/.patterns" || true
+count=0
+if [ -s "$dir/.patterns" ]; then
+  count=$(grep -r -l -F -f "$dir/.patterns" --exclude=.patterns "$dir" | wc -l)
+fi
+rm -rf "$dir"
+echo "$count"
+SCAN
+}
+
+assemble_evidence() {
+  known_hits=
+  if [ "$keys_issued" = 1 ]; then
+    if [ -S "$run/vm-a.mon" ]; then
+      render_scan_script | vm_install a 0755 /usr/local/bin/ph-scan >/dev/null 2>&1 || true
+      known_hits=$(tar -C "$state" -cf - . | vm_ssh_stdin a 'sudo ph-scan' 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    [ -n "$known_hits" ] || known_hits=unknown
+  fi
+  if [ "$keys_issued" = 1 ] && [ "$known_hits" = unknown ]; then
+    die "the issued-key scan could not run; the evidence was not written"
+  fi
+  mkdir -p "$(dirname -- "$output")"
+  if [ "$keys_issued" = 1 ]; then
+    helper assemble "$state" "$output" --known-key-hits "$known_hits"
+  else
+    helper assemble "$state" "$output"
+  fi
+}
+
+command_run() {
+  if main_run "$@"; then
+    run_status=0
+  else
+    run_status=1
+  fi
+  if [ -z "$state" ]; then
+    return "$run_status"
+  fi
+  if [ "$mac_started" = 1 ]; then
+    mac_cleanup || true
+  fi
+  collect_diagnostics || true
+  assemble_rc=0
+  assemble_evidence || assemble_rc=$?
+  printf 'state directory (raw observations): %s\n' "$state"
+  if [ "$run_status" -ne 0 ] && [ "$assemble_rc" -eq 0 ]; then
+    return 1
+  fi
+  return "$assemble_rc"
+}
+
+if [ "${PH1112_LIB_ONLY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+[ "$#" -ge 1 ] || {
+  usage >&2
+  exit 2
+}
+command=$1
+shift
+case $command in
+  run) command_run "$@" ;;
+  pins) print_pins ;;
+  -h | --help | help) usage ;;
+  *) die "unknown command $command" ;;
+esac

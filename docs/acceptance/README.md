@@ -9,6 +9,7 @@ procedure on real hardware. Never write or edit an evidence file by hand.
 | Evidence | Procedure | Issue |
 |----------|-----------|-------|
 | `100-launchd-lifetime.json` | `scripts/acceptance/macos-launchd-lifetime` | [#100](https://github.com/zajca/pohunek/issues/100) |
+| `1112-tailscale-overlay.json` (added by the acceptance run, not by the change that adds the procedure) | `scripts/acceptance/tailscale-overlay` | [#1112](https://github.com/zajca/pohunek/issues/1112) |
 
 ## macOS launchd worker lifetime (#100)
 
@@ -190,3 +191,181 @@ Interrupted installs and upgrades at every journaled step are covered by the
 service engine tests, not by this script. Run it locally on a Mac with
 `PKG_ACCEPT_ARCHIVE` and `PKG_ACCEPT_UPGRADE_ARCHIVE` set; it exits 2 when no
 `gui/<uid>` domain exists.
+
+## Tailscale as an opt-in overlay (#1112)
+
+`scripts/acceptance/tailscale-overlay` is the D9 acceptance run of the Tailscale
+overlay provider. It needs no root on any machine and runs real binaries over
+real tunnels. The pohunek binaries come from the `pohunek-bins` artifact of a CI
+run of the commit under test (`--ci-run`), never from a host build, because the
+guests carry Debian 13's glibc 2.41. Every command it runs is recorded as a step
+and interpreted only by `scripts/acceptance/overlay_evidence.py`; nothing is
+judged by the shell script and no evidence is written by hand.
+
+| Leg | What it proves |
+|-----|----------------|
+| `vms` | Two qemu VMs on a closed lab link, one running Headscale, both running a kernel-TUN `tailscaled` and a service-installed daemon with `providers = ["tailscale"]` and `port = 18733`. D4 in both directions: `doctor`, the single listener on the node's own address, `host list`, `host discover`, `host inspect`, `--host` with the short name, the FQDN, `tailscale:<name>` and `tailscale:peer~<node id>`, `session new/input/screen`, `attach`, the SDK control path (`crates/client/examples/overlay_probe.rs`: registry, `resolve_host_target_in`, `Client::connect_with_registry`, handshake, `session.list`, `daemon_doctor`, `session_screen`), and `session stop/remove`. Recorded, never gating: the D7 unreachable hint (peer daemon stopped) and the D5 rebind (`tailscale down` then `up`, no daemon restart). |
+| `netbird` | The absent `overlays.toml` default (NetBird, port 18722) with a throwaway daemon in a clean environment under `/dev/shm/ph1112`, a path guard before anything starts, and the owner's daemon PID, NetBird peer counts and `health` checked unchanged before and after. |
+| `macos` | zajcaair without root: the D6 trusted-CLI lookup with no `tailscaled` (found through `/opt/homebrew/bin`, state unavailable, `host list` fails, no listener on 18733) and the userspace-networking fail-closed path (`BackendState=Running`, `TUN=false`: doctor warns, `host list` fails with `tailscale_state_unavailable`, no listener). Needs `vms` because Headscale runs in VM-A. |
+
+The userspace sub-step reaches the Tailscale CLI through a test shim: the CLI
+has no environment override for its socket, and only root can create the
+default darwin socket, so an owner-private wrapper in the throwaway `bin`
+directory runs `tailscale --socket=<throwaway>`. The evidence labels it as
+such. A full macOS tailnet node with a root `tailscaled` is not part of this
+run.
+
+### Prerequisites
+
+- Linux x86_64 with KVM (`/dev/kvm` readable and writable), `qemu-system-x86_64`,
+  `qemu-img`, `genisoimage`, `ssh`, `ssh-keygen`, `socat`, `objdump`, `curl`,
+  `gh` (logged in), `python3`, `file`, `tar`; `jq` and the `netbird` CLI for the
+  `netbird` leg. Nothing is installed by the script.
+- A static `overlay_probe` for the guests, built under the heavy-run slots:
+  `cargo build --release -p pohunek-client --example overlay_probe --target x86_64-unknown-linux-musl`.
+  The script refuses a probe that `file` does not report as statically linked.
+- For `netbird` and `macos`: the host's own NetBird address (`--netbird-address`,
+  an address in `100.64.0.0/10` that this host holds), the owner's daemon unit
+  (`--owner-unit`, only read), and the owner's `pohunek` CLI. For `macos`
+  additionally a directory on the Mac with `pohunek`, `pohunekd` and
+  `pohunek-sessiond` built for the commit under test (`--macos-bin-dir`), and the
+  NetBird policy admitting the Mac to one extra TCP port on this host's NetBird
+  address for the window below. If the policy or a firewall blocks it, the
+  userspace sub-step is inconclusive and changing the policy is the owner's
+  decision; the D6 sub-step does not need the port.
+- A heavy-run slot wrapper (`--slot-wrapper /tmp/heavy-run.sh`) or an explicit
+  `--no-slot-wrapper`. There is no default. Each `qemu` runs in the foreground
+  under the wrapper, so the slot lasts as long as the VM. Each runner writes
+  `slot-<vm>.held` once it holds its slot and waits for `go`, which is written
+  only when both are held, so one VM never idles while the other waits. After 30
+  minutes without both slots the run stops as inconclusive with nothing booted.
+
+### Running
+
+```sh
+scripts/acceptance/tailscale-overlay run \
+  --leg vms --leg netbird --leg macos \
+  --slot-wrapper /tmp/heavy-run.sh \
+  --ci-run <run id of the merge commit> \
+  --probe <path>/overlay_probe \
+  --netbird-address <this host's NetBird address> \
+  --owner-unit pohunek-<id>-daemon.service \
+  --macos-bin-dir <dir on the Mac>
+```
+
+`pins` prints the pinned versions and checksums. The command prints the verdict
+and each failed, missing or inconclusive check, writes the evidence document to
+`docs/acceptance/1112-tailscale-overlay.json` (`--output`), and keeps the raw
+observations in `<run root>/ph1112-state-<UTC time>` (no key material; it passes
+the same secret scan as the evidence). The VM disks, seeds and keys live in
+`<run root>/ph1112-run-<UTC time>` and are deleted at teardown.
+
+### Pins
+
+Each pin sits at the top of the script and is re-verified on every run
+(downloads are checked before use; a mismatch makes the run inconclusive). They
+were re-verified against their upstream checksum sources on 2026-10-24.
+
+| Component | Pin | Checksum source |
+|-----------|-----|-----------------|
+| Headscale | `v0.29.5`, asset `headscale_0.29.5_linux_amd64` | sha256 `e979d27fe17d924d33bb6ab7504f6338d0635989a0cfdcfbc0ceb637dbcbe980`, the release's `checksums.txt` |
+| Tailscale (VMs) | `1.104.2`, `https://pkgs.tailscale.com/stable/tailscale_1.104.2_amd64.tgz` | sha256 `512f613ed7d04fc7282f7dc5bd76aa105aae28168fbb9357eb749ebcbc29f0ae`, the vendor `.sha256` file next to the tarball |
+| Tailscale (zajcaair) | Homebrew `tailscale` | the Homebrew bottle checksum; `brew info` must report `1.104.2` |
+| VM image | Debian 13 genericcloud amd64 `20261021-2638` | SHA512 `16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c`, `SHA512SUMS` of the dated directory (identical in `latest`) |
+
+The download cache is `/mnt/m2_4t/t/ph1112-cache` (`--cache-dir`) and survives
+runs.
+
+### Resource budget
+
+At most 2 vCPU and 1.5 GiB per VM (4 vCPU and 3 GiB together), both heavy-run
+slots for roughly 25 minutes, about 1 GiB of overlay writes per VM, and a cache of
+about 400 MB for the image plus about 110 MB of tarballs. Rough wall time:
+download 5 min the first time, boot 2 min, provisioning 4 min, D4 and the extras
+10 min, the NetBird check 3 min, the zajcaair leg 15 min.
+
+### Network and exposure
+
+- The VMs have no internet: `restrict=on` removes all guest egress while the
+  forwarded SSH port keeps working. Every binary is copied in over SSH. SSH host
+  keys are generated per run and pinned in a per-run `known_hosts`.
+- VM-to-VM traffic uses one UDP datagram link through loopback sockets (no
+  TCP-over-TCP under WireGuard). The embedded DERP region exists only because
+  Headscale refuses an empty map; it cannot work over plain HTTP, so the two
+  VMs need a direct path. If `tailscale ping` does not reach one, the run is
+  inconclusive, not a product failure.
+- Headscale serves its control protocol over plain HTTP. The control server's
+  Noise key is therefore fetched without server authentication (trust on first
+  use). That is acceptable only on the closed lab link and on the owner's NetBird
+  network, and it is a lab-only property: a plain-HTTP control plane is the only
+  one a non-root macOS user can use, because trusting a private CA there needs an
+  administrator.
+- Headscale's gRPC listener is bound to loopback inside VM-A and no API key
+  exists. Every host-side port is bound to `127.0.0.1`.
+- The one exception is the macOS window. For the userspace sub-step the script
+  adds a runtime `hostfwd` through the qemu monitor that listens only on this
+  host's NetBird address and forwards to Headscale's HTTP port. It exposes
+  nothing but that control endpoint, joining needs an explicit approval on VM-A
+  (`headscale auth register`), and no pre-auth key ever leaves VM-A. The script
+  verifies with `ss` that the forward is bound to exactly that address, closes it
+  right after the sub-step (or on any failure), and it dies with VM-A.
+- Pre-auth keys are single-use, expire after 15 minutes, and travel through a
+  pipe from VM-A to the joining VM. They are never written on the host or
+  printed; the script never uses `set -x`.
+- The script signals only processes of its own run, by exact PID taken from the
+  qemu pidfile or `/proc` and re-checked against the run directory in the
+  command line before each signal, and never uses `pkill`. It does not touch the
+  owner's daemon unit or NetBird: the throwaway daemon of the `netbird` leg runs
+  with `env -i` under `/dev/shm/ph1112`, and the leg refuses to start when that
+  directory already exists.
+- On zajcaair all commands run in a named shell session
+  (`ph-macos-op1112acc`, `--cwd /tmp/ph-macos-cache`), under a throwaway
+  `HOME`-relative root and `/private/tmp/ph1112`, with `XDG_RUNTIME_DIR` set so
+  the owner's live daemon path is never used. The guard compares the doctor
+  paths with the roots before anything starts. Only a Homebrew install the run
+  itself made is uninstalled, and the session is stopped at the end.
+
+### Teardown and failure
+
+A trap on exit, interrupt and termination removes the port forward, cleans the
+Mac, stops the throwaway NetBird daemon, collects the journals and doctor reports
+into the state directory, sends `quit` to each monitor, stops a leftover `qemu`
+by exact PID, deletes the run directory and lists any remaining process of the
+run.
+
+The run has one verdict:
+
+| Verdict | Meaning |
+|---------|---------|
+| `passed` | Every gating check of every requested leg passed and nothing is inconclusive. |
+| `failed` | A gating check failed while its preconditions held (a D4, D6 or NetBird-check step). |
+| `incomplete` | A requested leg lacks a recorded step. |
+| `inconclusive` | An environment condition stopped the run or one sub-step; no product verdict exists for it. |
+
+Run-wide inconclusive codes: `checksum_mismatch`, `artifact_missing`,
+`artifact_unusable` (a CI binary needs a newer glibc than 2.41),
+`slots_unavailable`, `provisioning_failed`, `no_direct_path`,
+`path_guard_violation`, `interrupted`. Sub-step codes (only the userspace
+sub-step has no verdict): `headscale_unreachable_from_macos`,
+`macos_userspace_refused`, `macos_userspace_not_running`.
+
+### Evidence
+
+Schema `pohunek.acceptance.tailscale-overlay`, version 1. Top level: `generated`,
+`started`, `legs`, `meta` (the pins, the CI run and head, the SHA-256 of each
+binary, the qemu and kernel versions), `verdict`, `inconclusive`, `checks`
+(`leg`, `name`, `status` of `passed`, `failed` or `missing`, `detail`, `gating`,
+`substep`), `steps` (per leg: `argv`, `rc`, `at`, `stdout`, `stderr` and
+`truncated`, each stream cut at 16 KiB) and `recordings`, the redacted real
+`tailscale status --json` of a Linux kernel-TUN node and of the macOS userspace
+node.
+
+Secrets never reach the document. Node and WireGuard keys, `AuthURL` values and
+endpoint lists are redacted; the owner's NetBird addresses become
+`<netbird-ip-N>` placeholders in the `netbird` and `macos` legs. `assemble`
+refuses to write the document when a `tskey-` or `hskey-` prefix appears
+anywhere in the state directory or the document, and when VM-A, which keeps a
+copy of every key it issued, finds one of them in the evidence bundle (only the
+number of matching files comes back). The interpretation logic is unit-tested in
+`scripts/tests/test_overlay_evidence.py`; the script itself is a manual
+acceptance tool and is never run in CI.
