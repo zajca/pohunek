@@ -61,8 +61,6 @@ guest_glibc_max=2.41
 # Overlay port written to overlays.toml on the VMs (not the NetBird default, so
 # it also proves a service-installed daemon honours `port`).
 overlay_port=18733
-# The NetBird default port the absent-file check expects.
-netbird_default_port=18722
 # MagicDNS suffix of the lab tailnet; differs from the server_url host.
 lab_domain=ts.lab.internal
 # Closed lab link between the VMs (UDP datagrams through loopback sockets).
@@ -277,7 +275,6 @@ kill_throwaway_daemon() {
       "$netbird_root/bin/"*) kill_exact "$ktd_pid" "$netbird_root/bin/" ;;
     esac
   done
-  nb_daemon_pid=
 }
 
 # ---------------------------------------------------------------------------
@@ -289,7 +286,6 @@ vm_ssh_port_a=
 vm_ssh_port_b=
 window_open=0
 hostfwd_port=
-nb_daemon_pid=
 mac_session_id=
 mac_root=
 netbird_dir=
@@ -890,6 +886,7 @@ wait_screen() {
 
 attach_pipeline() {
   {
+    # shellcheck disable=SC2016 # the Mac shell expands $(hostname), not this one
     printf 'echo ATTACH-MARK-$(hostname)\r'
     sleep 3
     printf '\035'
@@ -1177,6 +1174,7 @@ macos_leg() {
   fi
   mac_roots_created=1
   "$owner_pohunek" session input "$(mac_target)" 'export PAGER=cat GIT_PAGER=cat' --json >/dev/null 2>&1 || true
+  # shellcheck disable=SC2016 # $HOME must expand on the Mac
   mac_step macos mac-home 30 'printf %s "$HOME"'
   mac_home=$(cat "$step_dir/stdout")
   [ -n "$mac_home" ] || {
@@ -1542,6 +1540,7 @@ command_run() {
 }
 
 if [ "${PH1112_LIB_ONLY:-0}" = 1 ]; then
+  # shellcheck disable=SC2317 # exit is the fallback when not sourced
   return 0 2>/dev/null || exit 0
 fi
 
