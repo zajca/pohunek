@@ -272,6 +272,22 @@ were re-verified against their upstream checksum sources on 2026-10-24.
 | Tailscale (VMs) | `1.104.2`, `https://pkgs.tailscale.com/stable/tailscale_1.104.2_amd64.tgz` | sha256 `512f613ed7d04fc7282f7dc5bd76aa105aae28168fbb9357eb749ebcbc29f0ae`, the vendor `.sha256` file next to the tarball |
 | Tailscale (zajcaair) | Homebrew `tailscale` | the Homebrew bottle checksum; the version is read with `brew list --versions` before anything uses it, and any other version makes the macOS leg inconclusive (`macos_tailscale_pin_mismatch`) |
 | VM image | Debian 13 genericcloud amd64 `20261021-2638` | SHA512 `16e0965312c56feb331049d45d2b1b5778f3f942a33d4300eedbb97527707f2bea87c0006f3e4cc7a25fadbff739c4e235a51fb9bcd1b66fd554f7f8e80ba45c`, `SHA512SUMS` of the dated directory (identical in `latest`) |
+| `dbus-user-session` (VMs) | `1.16.2-2`, `https://snapshot.debian.org/archive/debian/20261021T000000Z/pool/main/d/dbus/dbus-user-session_1.16.2-2_amd64.deb` (fallback: the same file in the `deb.debian.org` pool) | sha256 `0f9aa775a708b28b1a3ad784e9d1f0c96227521bc29e99ddbfe05ff008b5d246`, the trixie `Packages` index; the file is verified before use whichever source served it |
+
+The genericcloud image has no `dbus-user-session`, so the systemd user manager
+has no session bus socket and `pohunek service install` cannot connect to it
+(`service install` fails with `supervisor operation connect is unavailable`:
+the session bus socket does not exist). Debian's `libpam-systemd` only
+recommends the package, so it is missing on installs made without
+recommended packages. The guests have no network
+egress, so the run stages that one package offline: its other dependencies are
+in the image (checked against the image's package manifest,
+`debian-13-genericcloud-amd64-20261021-2638.json`, SHA512
+`614b8865e7496c6e6380b491a8f4121bd7ac654dd570a889f0684c70a946c847c0591edf223f3535afe3572e31370459310b8c7ffaba859ee5f40465c4062911`),
+`dpkg -i` exits non-zero when a dependency is unmet (it unpacks the package but
+leaves it unconfigured, and the run stops there), and the run then restarts
+`user@<uid>.service` and waits (bounded) until `dbus.socket` is active and
+`/run/user/<uid>/bus` exists. A failure there is `provisioning_failed`.
 
 The download cache is `/mnt/m2_4t/t/ph1112-cache` (`--cache-dir`) and survives
 runs.
