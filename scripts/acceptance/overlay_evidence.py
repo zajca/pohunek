@@ -588,14 +588,12 @@ def evaluate_extras(state: State, checks: Checks) -> None:
             "d5-rebound-" + side,
             "d5-journal-" + side,
             lambda step: ("serving control protocol over overlay" in step.stdout, "journal after tailscale up"),
-            gating=False,
         )
         checks.with_step(
             leg,
             "d5-health-after-" + side,
             "d5-health-" + side,
             lambda step: (step.rc == 0, "rc={}".format(step.rc)),
-            gating=False,
         )
 
 

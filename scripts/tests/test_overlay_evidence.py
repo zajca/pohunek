@@ -1266,13 +1266,25 @@ class EvidenceTest(unittest.TestCase):
         self.assertIn("extra/d5-health-after-b", self.run_.failed())
         self.assertNotIn("extra/d5-dropped-a", self.run_.failed())
 
-    def test_extras_never_gate(self):
+    def test_a_missing_rebind_or_a_failed_peer_health_fails_the_run_with_its_reason(self):
+        self.run_.step("extra", "d5-journal-b", "", rc=1)
+        result = self.run_.evaluate()
+        self.assertEqual(result["verdict"], "failed")
+        self.assertIn("extra/d5-rebound-b", self.run_.failed())
+        self.run_.step("extra", "d5-journal-b", "serving control protocol over overlay\n")
+        self.run_.step("extra", "d5-health-b", error_envelope("host_unreachable", "x"), rc=1)
+        self.assertEqual(self.run_.evaluate()["verdict"], "failed")
+        self.assertEqual([f for f in self.run_.failed() if "d5" in f], ["extra/d5-health-after-b"])
+
+    def test_the_drop_line_and_the_d7_hint_are_recorded_without_gating(self):
         self.run_.step("extra", "d7-health-a", error_envelope("other", "x"), rc=1)
-        self.run_.step("extra", "d5-journal-b", "")
+        self.run_.step("extra", "d5-drop-b", "", rc=1)
         result = self.run_.evaluate()
         self.assertEqual(result["verdict"], "passed")
-        gated = [c for c in result["checks"] if c["leg"] == "extra"]
-        self.assertTrue(gated and not any(c["gating"] for c in gated))
+        by_name = {c["name"]: c for c in result["checks"] if c["leg"] == "extra"}
+        self.assertFalse(by_name["d5-dropped-b"]["gating"])
+        self.assertFalse(by_name["d7-unreachable-hint-a"]["gating"])
+        self.assertTrue(by_name["d5-rebound-b"]["gating"] and by_name["d5-health-after-b"]["gating"])
         self.assertIn("extra/d7-unreachable-hint-a", self.run_.failed())
 
     def test_owner_daemon_pid_change_fails(self):

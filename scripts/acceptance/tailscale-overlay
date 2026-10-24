@@ -120,11 +120,12 @@ slot_wait_s=1800
 boot_timeout_s=300
 # Wait for cloud-init, services and tailscale up (seconds).
 service_timeout_s=180
-# The daemon revalidates its overlay listener every 30 s (the reconcile interval
-# in crates/daemon/src/main.rs), so a dropped or rebound listener shows in the
-# journal only after the next reconcile; three intervals bound each wait.
+# After `tailscale down` the daemon notices on its next listener revalidation
+# (30 s, crates/daemon/src/main.rs:155), so three intervals bound the drop wait.
+# After `up` it rebinds on its retry backoff, which starts at 5 s and doubles
+# (main.rs:141-148): retries at about 5, 15, 35, 75 and 155 s after the drop.
 d5_drop_timeout_s=90
-d5_rebind_timeout_s=90
+d5_rebind_timeout_s=180
 # Seconds between polls.
 poll_s=3
 # Pings of the direct-path precondition (`tailscale ping` stops at the first
