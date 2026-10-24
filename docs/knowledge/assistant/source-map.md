@@ -109,6 +109,7 @@ verification, and team clients remain deferred:
 - `docs/knowledge/concepts/team-relay.md`
 - `docs/knowledge/safety/trust-model.md`
 - `docs/knowledge/guides/remote-hosts.md`
+- `docs/knowledge/guides/tailscale.md`
 - `docs/knowledge/guides/ts-sdk.md`
 - `crates/relay-protocol/src/`
 - `crates/relay-protocol/src/link.rs` — typed account-link contracts: channel,

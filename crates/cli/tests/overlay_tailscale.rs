@@ -445,6 +445,45 @@ fn an_unusable_backend_state_fails_closed_without_dialing() {
     }
 }
 
+/// The doctor names the reason the node has no usable address: userspace
+/// networking, a backend that is not running, or no IPv4 address.
+#[test]
+fn the_doctor_names_why_the_node_has_no_listener_address() {
+    let ipv6_only = Node::peer("self-box", "nSELF00001CNTRL", &["fd7a:115c:a1e0::7"]);
+    let cases: [(&str, Status, &str); 3] = [
+        (
+            "userspace networking",
+            tailnet().userspace(),
+            "userspace networking",
+        ),
+        (
+            "a stopped node",
+            tailnet().with_state("Stopped"),
+            "not running (state: Stopped)",
+        ),
+        (
+            "no IPv4 address",
+            tailnet().with_this(ipv6_only),
+            "no IPv4 node address",
+        ),
+    ];
+    for (label, status, reason) in cases {
+        let fixture = Fixture::new(&status);
+        let output = fixture.run(&["doctor", "--json"]);
+        let document = json(&output);
+        let checks = document["ok"]["checks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: doctor checks in {document}"));
+        let check = checks
+            .iter()
+            .find(|check| check["name"] == "tailscale_cli")
+            .unwrap_or_else(|| panic!("{label}: tailscale_cli in {checks:?}"));
+        assert_eq!(check["status"], "warn", "{label}: {check}");
+        let detail = check["detail"].as_str().expect("check detail");
+        assert!(detail.contains(reason), "{label}: {detail}");
+    }
+}
+
 /// A missing, failing or garbled CLI each has a distinct, non-guessing result.
 #[test]
 fn a_missing_or_failing_cli_is_reported_by_cause() {

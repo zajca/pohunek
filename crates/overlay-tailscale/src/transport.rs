@@ -13,6 +13,9 @@ use crate::status::{Node, TailscaleError, TailscaleStatus};
 /// Stable identifier used by every Tailscale route and wire record.
 pub const TAILSCALE_OVERLAY_ID: &str = "tailscale";
 
+/// Why a running Tailscale node still has no listener address.
+const MISSING_NODE_ADDRESS: &str = "Tailscale reports no IPv4 node address for this host";
+
 /// Tailscale provider adapter.
 #[derive(Debug)]
 pub struct TailscaleTransport {
@@ -51,8 +54,10 @@ impl OverlayTransport for TailscaleTransport {
     fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
         Box::pin(async move {
             let status = load_status(self.id()).await?;
-            listener_from_status(&status)
-                .ok_or_else(|| OverlayError::ListenerAddressMissing(self.id.clone()))
+            listener_from_status(&status).map_err(|reason| OverlayError::ListenerAddressMissing {
+                overlay: self.id.clone(),
+                reason: Some(reason),
+            })
         })
     }
 
@@ -151,15 +156,18 @@ fn map_error(error: TailscaleError, id: &OverlayId) -> OverlayError {
 }
 
 /// This host's IPv4 node address, only while Tailscale runs on a kernel
-/// interface.
-fn listener_from_status(status: &TailscaleStatus) -> Option<IpAddr> {
-    if status.unusable_reason().is_some() {
-        return None;
+/// interface; otherwise the reason there is none.
+fn listener_from_status(status: &TailscaleStatus) -> Result<IpAddr, String> {
+    if let Some(reason) = status.unusable_reason() {
+        return Err(reason);
     }
     status
-        .self_node()?
-        .addresses()
-        .find(|address| address.is_ipv4() && crate::is_tailscale_node_addr(*address))
+        .self_node()
+        .and_then(|own| {
+            own.addresses()
+                .find(|address| address.is_ipv4() && crate::is_tailscale_node_addr(*address))
+        })
+        .ok_or_else(|| MISSING_NODE_ADDRESS.to_owned())
 }
 
 /// This machine's identity from its own status: the `MagicDNS` name and node

@@ -2220,7 +2220,10 @@ async fn bind_requires_the_address_the_overlay_reports_now() {
 
     // A provider that reports no address cannot vouch for any bind.
     for failure in [
-        overlay::OverlayError::ListenerAddressMissing(transport.id.clone()),
+        overlay::OverlayError::ListenerAddressMissing {
+            overlay: transport.id.clone(),
+            reason: None,
+        },
         overlay::OverlayError::CliMissing(transport.id.clone()),
         overlay::OverlayError::StateUnavailable {
             overlay: transport.id.clone(),

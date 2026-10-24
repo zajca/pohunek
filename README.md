@@ -37,7 +37,7 @@ attention.
 ## Two machines, one minute
 
 ```bash
-# Which of your NetBird peers already run a daemon? No tokens, no server.
+# Which of your overlay peers already run a daemon? No tokens, no server.
 pohunek host discover
 
 # Start Codex on the build box, in a fresh worktree, with its first prompt.
@@ -102,8 +102,8 @@ handles it once, for every agent CLI:
   bots, and manager agents talk to one contract instead of every harness.
 - **Multihost from the start.** Every host is authoritative for its own
   sessions. The CLI and SDKs talk directly to each host's daemon: an owner-only
-  Unix socket locally, a NetBird/WireGuard overlay remotely, bound only to the
-  overlay address. No central server, no SaaS, no state sync. `--host buildbox`
+  Unix socket locally, a NetBird (default) or Tailscale overlay remotely, bound
+  only to the overlay address ([Tailscale guide](docs/knowledge/guides/tailscale.md)). No central server, no SaaS, no state sync. `--host buildbox`
   or a `buildbox/<session-id>` target is all it takes, and a machine's own
   overlay name selects its local daemon, so one host name works everywhere
   ([resolution order](docs/cli.md#commands)).
@@ -126,7 +126,7 @@ pohunek assistant "why does attach fail on my laptop?"
         your tooling: agents, scripts, launchers, GUIs, dashboards
                  |  pohunek CLI --json  ·  protocol  ·  SDKs
      +-----------+---------------+---------------------+
-     | Unix socket               | NetBird/WireGuard   | NetBird/WireGuard
+     | Unix socket               | overlay (WireGuard) | overlay (WireGuard)
      v                           v                     v
   laptop: pohunekd         workstation: pohunekd    buildbox: pohunekd
      |                           |                     |
@@ -182,7 +182,7 @@ Rules:
 6. Run `pohunek agent-skill` and save its output as a skill or instruction file
    in your own harness, so later sessions know how to drive pohunek. Tell me
    where you saved it.
-7. If this machine is in a NetBird network, run
+7. If this machine is in a NetBird or Tailscale network, run
    `pohunek host discover --refresh --json` and list the hosts that already run
    pohunek.
 8. Never put secrets into commands, logs, or your summary. End with the
@@ -190,7 +190,8 @@ Rules:
 ```
 
 Repeat it on every machine that should host sessions. Each host needs its own
-daemon, and remote hosts must be members of the same NetBird network. Once the
+daemon, and remote hosts must be members of the same NetBird (default) or Tailscale
+network; [Tailscale setup](docs/knowledge/guides/tailscale.md) is opt-in. Once the
 daemon runs, `pohunek assistant setup` starts an agent session with the offline
 knowledge bundle and a redacted snapshot of your hosts. Use it to finish
 projects, agent profiles, and remote hosts.
@@ -249,7 +250,7 @@ everything domain-specific to clients like these.
 ## Use, extend, contribute
 
 - **Use Pohunek** to keep agent terminals durable across daemon restarts,
-  operate sessions directly across your NetBird hosts, or drive the public
+  operate sessions directly across your NetBird or Tailscale hosts, or drive the public
   `--json` interface from scripts. Start with the
   [manual installation](docs/install.md) and [CLI guide](docs/cli.md).
 - **Extend Pohunek** with a Rust or TypeScript client, scripts over the CLI,

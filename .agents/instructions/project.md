@@ -4,8 +4,8 @@
 across the operator's own machines. A Rust daemon (`pohunekd`) owns the logical
 session registry and public API on each host; one isolated
 `pohunek-sessiond` worker owns each live PTY and agent process. The Rust CLI
-(`pohunek`) drives the daemon locally over a Unix socket and remotely over a
-NetBird/WireGuard address. This repository ships no user interface: every GUI,
+(`pohunek`) drives the daemon locally over a Unix socket and remotely over the
+configured overlay address (NetBird by default, Tailscale opt-in). This repository ships no user interface: every GUI,
 web control center, and launcher is a separate client in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). The accepted
 future direction adds an optional trusted team relay without replacing these
@@ -122,7 +122,8 @@ Hard constraints, decided on purpose — respect them in every change:
 - **Direct owner operation stays first-class.** Standalone and direct-overlay
   clients keep talking to each host daemon without a relay dependency. Their
   trust boundary remains owner-only socket/file permissions plus the configured
-  overlay, with NetBird as the production provider.
+  overlay. NetBird is the default provider and Tailscale a supported opt-in
+  provider; a host runs one overlay.
 - **The owner browser path stays first-class.** The web control center is an
   external client (`zajca/pohunek-work`) that reaches the owner protocol through
   a private local/NetBird gateway. It is not replaced by the relay and must
@@ -141,7 +142,8 @@ Hard constraints, decided on purpose — respect them in every change:
 - **PTY/TUI-first.** Agents run in real terminals (Codex, Claude Code, and the
   pinned local Hermes Agent runtime are first-class). Not a re-rendered control
   plane.
-- **Remote owner transport is direct over NetBird**, never SSH bridging. Relay
+- **Remote owner transport is direct over the configured overlay** (NetBird by
+  default, Tailscale opt-in), never SSH bridging. Relay
   transport is the separate host-initiated path defined by the accepted RFC.
 - **Core ships no UI.** The deliverables are the daemon (`pohunekd`), the
   session worker (`pohunek-sessiond`), the CLI (`pohunek`), the relay

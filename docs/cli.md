@@ -192,7 +192,8 @@ not, so put a port that both sides must use in the file. Upgrade every
 client and restart every daemon before you set `port`: a daemon or client of an
 earlier release (another host's CLI, a Rust client pinned to an earlier tag)
 ignores the file and keeps the environment value or 18722. See
-[Remote hosts](knowledge/guides/remote-hosts.md). The only filesystem path the CLI
+[Remote hosts](knowledge/guides/remote-hosts.md) and, for `providers = ["tailscale"]`, the
+[Tailscale guide](knowledge/guides/tailscale.md). The only filesystem path the CLI
 sends is an explicit absolute `session new --cwd`, which the target host
 resolves on its own filesystem.
 
