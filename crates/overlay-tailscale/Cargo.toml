@@ -1,0 +1,27 @@
+[package]
+name = "pohunek-overlay-tailscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tailscale status parsing, peer resolution, and bind-address validation for pohunek remote hosts."
+
+[lib]
+name = "overlay_tailscale"
+path = "src/lib.rs"
+
+[dependencies]
+overlay = { workspace = true }
+pohunek-platform = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pohunek-test-support = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

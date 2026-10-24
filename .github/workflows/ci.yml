@@ -346,9 +346,9 @@ jobs:
         run: /bin/launchctl print "gui/$(id -u)" >/dev/null
 
       - name: Build macOS tier archive
-        run: cargo nextest archive --locked --profile macos -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck -p pohunek-client -p pohunek-netbird -p pohunek-package -p xtask --archive-file "$RUNNER_TEMP/macos-all.tar.zst"
+        run: cargo nextest archive --locked --profile macos -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck -p pohunek-client -p pohunek-netbird -p pohunek-overlay-tailscale -p pohunek-package -p xtask --archive-file "$RUNNER_TEMP/macos-all.tar.zst"
 
-      # Covers all 13 macOS packages: the lane's nine and the tier's four.
+      # Covers all 14 macOS packages: the lane's nine and the tier's five.
       - name: Check macOS partition
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-all.tar.zst" check-macos --scope all
 
@@ -1025,6 +1025,7 @@ jobs:
               - 'crates/hostcheck/**'
               - 'crates/netbird/**'
               - 'crates/overlay/**'
+              - 'crates/overlay-tailscale/**'
               - 'crates/prompt/**'
               - 'crates/assistant/**'
               - 'crates/package/**'

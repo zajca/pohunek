@@ -2095,6 +2095,176 @@ async fn bind_rejects_non_netbird_address() {
     }
 }
 
+/// A provider whose range check accepts every address and whose reported
+/// listener address the scenario sets, so only the core checks of
+/// `RemoteServer::bind_with` can refuse a bind.
+#[derive(Debug)]
+struct ScriptedOverlay {
+    id: overlay::OverlayId,
+    listener: std::sync::Mutex<Result<IpAddr, overlay::OverlayError>>,
+}
+
+impl ScriptedOverlay {
+    fn reporting(address: IpAddr) -> Self {
+        let id = overlay::OverlayId::new("scripted").expect("overlay id");
+        Self {
+            id,
+            listener: std::sync::Mutex::new(Ok(address)),
+        }
+    }
+
+    fn report(&self, listener: Result<IpAddr, overlay::OverlayError>) {
+        *self.listener.lock().expect("listener lock") = listener;
+    }
+}
+
+impl overlay::OverlayTransport for ScriptedOverlay {
+    fn id(&self) -> &overlay::OverlayId {
+        &self.id
+    }
+
+    fn validate_bind_addr(&self, _addr: IpAddr) -> Result<(), overlay::BindAddrError> {
+        Ok(())
+    }
+
+    fn listener_addr(&self) -> overlay::OverlayFuture<'_, IpAddr> {
+        let listener = self.listener.lock().expect("listener lock").clone();
+        Box::pin(async move { listener })
+    }
+
+    fn resolve_peer<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> overlay::OverlayFuture<'a, overlay::ResolvedPeer> {
+        let error = overlay::OverlayError::HostUnknown {
+            host: host.to_owned(),
+            overlay: self.id.clone(),
+        };
+        Box::pin(async move { Err(error) })
+    }
+
+    fn resolve_peer_identity<'a>(
+        &'a self,
+        identity: &'a overlay::ExternalIdentity,
+    ) -> overlay::OverlayFuture<'a, overlay::ResolvedPeer> {
+        let error = overlay::OverlayError::HostUnknown {
+            host: identity.value().to_owned(),
+            overlay: self.id.clone(),
+        };
+        Box::pin(async move { Err(error) })
+    }
+
+    fn discover_peers(&self) -> overlay::OverlayFuture<'_, Vec<overlay::DiscoveredPeer>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// What `RemoteServer::bind_with` did for one target: the outcome and whether
+/// the socket opener was reached.
+async fn bind_scripted(
+    transport: &ScriptedOverlay,
+    target: SocketAddr,
+) -> (Result<RemoteServer, DaemonError>, bool) {
+    let root = temp_dir("remote-bind-check");
+    let state = DaemonState::new(
+        HealthInfo::new("0.0.0"),
+        SessionRegistry::new(support::hermetic_registry_config()),
+        Arc::new(
+            HostGovernanceService::open(root.path().join("state"))
+                .await
+                .expect("open real isolated host-governance service"),
+        ),
+        support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
+    );
+    // The overlay address is not bindable here; a loopback socket stands in.
+    let stand_in = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stand-in listener");
+    let opened = std::sync::atomic::AtomicBool::new(false);
+    let result = RemoteServer::bind_with(target, state, transport, |_| async {
+        opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(pohunek_daemon::api::OpenedListener::os_bound(stand_in))
+    })
+    .await;
+    (result, opened.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// The listener binds only the address its overlay reports at bind time.
+#[tokio::test]
+async fn bind_requires_the_address_the_overlay_reports_now() {
+    let address: IpAddr = "100.64.0.7".parse().expect("overlay address");
+    let moved: IpAddr = "100.64.0.8".parse().expect("moved overlay address");
+    let target = SocketAddr::new(address, 18722);
+    let transport = ScriptedOverlay::reporting(address);
+
+    let (result, opened) = bind_scripted(&transport, target).await;
+    result.expect("the reported address binds");
+    assert!(opened, "the opener is reached for the reported address");
+
+    // The provider's state changed after the caller queried it: the range
+    // check still passes, the equality does not.
+    transport.report(Ok(moved));
+    let (result, opened) = bind_scripted(&transport, target).await;
+    match result {
+        Err(DaemonError::OverlayBind { addr, reason }) => {
+            assert_eq!(addr, address);
+            assert!(reason.contains(&moved.to_string()), "{reason}");
+        }
+        other => panic!(
+            "a stale address must be refused, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+    assert!(!opened, "no socket is opened for a stale address");
+
+    // A provider that reports no address cannot vouch for any bind.
+    for failure in [
+        overlay::OverlayError::ListenerAddressMissing(transport.id.clone()),
+        overlay::OverlayError::CliMissing(transport.id.clone()),
+        overlay::OverlayError::StateUnavailable {
+            overlay: transport.id.clone(),
+            detail: "down".to_owned(),
+        },
+    ] {
+        transport.report(Err(failure));
+        let (result, opened) = bind_scripted(&transport, target).await;
+        assert!(
+            matches!(result, Err(DaemonError::OverlayBind { .. })),
+            "an address-less provider refuses the bind"
+        );
+        assert!(!opened);
+    }
+}
+
+/// Unspecified, loopback, link-local, multicast and broadcast targets are
+/// refused by the core even when the provider accepts and reports them.
+#[tokio::test]
+async fn bind_refuses_non_unicast_targets_whatever_the_provider_says() {
+    for literal in [
+        "0.0.0.0",
+        "::",
+        "127.0.0.1",
+        "::1",
+        "169.254.1.1",
+        "fe80::1",
+        "224.0.0.1",
+        "ff02::1",
+        "255.255.255.255",
+        "::ffff:127.0.0.1",
+        "::ffff:0.0.0.0",
+    ] {
+        let address: IpAddr = literal.parse().expect("valid IP literal");
+        let transport = ScriptedOverlay::reporting(address);
+        let (result, opened) = bind_scripted(&transport, SocketAddr::new(address, 18722)).await;
+        match result {
+            Err(DaemonError::OverlayBind { addr, .. }) => assert_eq!(addr, address, "{literal}"),
+            other => panic!("{literal} must be refused, got {:?}", other.map(|_| ())),
+        }
+        assert!(!opened, "{literal}: no socket is opened");
+    }
+}
+
 /// Daemon log lines captured in memory, shared by the keepalive scenarios.
 static CAPTURED_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 

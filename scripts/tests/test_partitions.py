@@ -1141,13 +1141,13 @@ class MacosLaneTests(ScriptScenario):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("lane: 9 tests", result.stdout)
-        self.assertIn("tier: 4 tests", result.stdout)
+        self.assertIn("tier: 5 tests", result.stdout)
         self.assertIn("root: 1 tests", result.stdout)
         self.assertIn("fixture: 2 tests", result.stdout)
         self.assertIn("owned-elsewhere: 1 tests", result.stdout)
         self.assertIn("manual: 2 tests", result.stdout)
         self.assertIn(
-            "macOS coverage OK: 19 tests selected exactly once (including ignored tests)",
+            "macOS coverage OK: 20 tests selected exactly once (including ignored tests)",
             result.stdout,
         )
 
@@ -1252,12 +1252,12 @@ class MacosLaneTests(ScriptScenario):
         self.assertEqual(result.returncode, 1)
         self.assertIn("empty buckets=['root']", result.stderr)
 
-    def test_all_scope_requires_every_package_of_the_thirteen(self):
+    def test_all_scope_requires_every_package_of_the_fourteen(self):
         self.set_macos_inventory(self.lane_only())
         result = self.check()
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "absent packages=['pohunek-client', 'pohunek-netbird', 'pohunek-package', 'xtask']",
+            "absent packages=['pohunek-client', 'pohunek-netbird', 'pohunek-overlay-tailscale', 'pohunek-package', 'xtask']",
             result.stderr,
         )
 

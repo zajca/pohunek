@@ -648,7 +648,12 @@ async fn run() -> Result<(), DaemonError> {
         unix_shutdown.cancelled().await;
     });
     let remote_shutdown_sessions = sessions.clone();
-    let remote_serve = serve_remote(remote_state, &registry, shutdown, move || {
+    let missing_cli = if overlay_config.from_file() {
+        MissingCli::Retry
+    } else {
+        MissingCli::Disable
+    };
+    let remote_serve = serve_remote(remote_state, &registry, missing_cli, shutdown, move || {
         remote_shutdown_sessions.begin_daemon_shutdown();
     });
     let ((), remote_result) = tokio::join!(unix_serve, remote_serve);
@@ -1179,6 +1184,7 @@ fn next_retry_interval(current: Duration) -> Duration {
 async fn serve_remote<F>(
     state: DaemonState,
     registry: &OverlayRegistry,
+    missing_cli: MissingCli,
     shutdown: CancellationToken,
     begin_daemon_shutdown: F,
 ) -> Result<(), DaemonError>
@@ -1197,6 +1203,7 @@ where
                     bind_remote_server(
                         state.clone(),
                         configured.clone(),
+                        missing_cli,
                         current_addr,
                         |addr| async move {
                             tokio::net::TcpListener::bind(addr)
@@ -1269,13 +1276,14 @@ where
 /// Bind one overlay's TCP control listener once.
 ///
 /// Queries the overlay for its explicit listener address and binds a
-/// [`RemoteServer`] on that overlay's configured port. Missing CLI disables
-/// that listener; unavailable state, a missing self address, and bind failures
+/// [`RemoteServer`] on that overlay's configured port. A missing CLI follows
+/// `missing_cli`; unavailable state, a missing self address, and bind failures
 /// are retried by the caller. `open` supplies the listening socket for the
 /// validated address; production binds the address with the OS.
 async fn bind_remote_server<O, Fut>(
     state: DaemonState,
     configured: ConfiguredTransport,
+    missing_cli: MissingCli,
     current_addr: Option<std::net::SocketAddr>,
     open: O,
 ) -> RemoteBind
@@ -1289,8 +1297,16 @@ where
     let address = match transport.listener_addr().await {
         Ok(address) => address,
         Err(overlay::OverlayError::CliMissing(_)) => {
-            info!(overlay = %overlay_id, port, "overlay CLI missing; listener disabled");
-            return RemoteBind::Disabled;
+            return match missing_cli {
+                MissingCli::Disable => {
+                    info!(overlay = %overlay_id, port, "overlay CLI missing; listener disabled");
+                    RemoteBind::Disabled
+                }
+                MissingCli::Retry => {
+                    warn!(overlay = %overlay_id, port, "overlay CLI missing; serving local-only and retrying");
+                    RemoteBind::Retry
+                }
+            };
         }
         Err(error) => {
             info!(overlay = %overlay_id, port, reason = %error, "overlay state unavailable; serving local-only");
@@ -1314,6 +1330,17 @@ where
             RemoteBind::Retry
         }
     }
+}
+
+/// What a missing provider CLI means for one overlay listener.
+#[derive(Debug, Clone, Copy)]
+enum MissingCli {
+    /// The overlay is the built-in default that nobody configured, so a host
+    /// without its CLI stays local-only until the daemon restarts.
+    Disable,
+    /// The owner listed the overlay in `overlays.toml`, so its CLI is expected
+    /// to appear and the listener keeps retrying.
+    Retry,
 }
 
 /// Result of one remote-listener bind attempt.
@@ -1385,7 +1412,7 @@ mod tests {
 
     use super::{
         bind_remote_server, next_retry_interval, serve_remote_with_retry, supervise_remote_tasks,
-        RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
+        MissingCli, RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
 
     /// A `NetBird` registry on the default port that reads no configuration file
@@ -1541,6 +1568,11 @@ mod tests {
         }
     }
 
+    /// Overlay-range addresses the supervisor tests bind; the core refuses to
+    /// bind loopback, so the opener answers with a loopback socket instead.
+    const FIRST_OVERLAY_ADDRESS: &str = "100.64.0.1";
+    const SECOND_OVERLAY_ADDRESS: &str = "100.64.0.2";
+
     /// A loopback address distinct from `127.0.0.1`. Linux routes all of
     /// `127.0.0.0/8` to `lo`; Darwin configures only `127.0.0.1` on `lo0`,
     /// so the IPv6 loopback is its second local address.
@@ -1580,6 +1612,17 @@ mod tests {
         panic!("no port free on both loopback addresses after {RESERVE_ATTEMPTS} attempts");
     }
 
+    /// The overlay-range bind target of the first supervisor-test address.
+    fn overlay_target(port: u16) -> std::net::SocketAddr {
+        (
+            FIRST_OVERLAY_ADDRESS
+                .parse::<std::net::IpAddr>()
+                .expect("first overlay IP"),
+            port,
+        )
+            .into()
+    }
+
     /// Run `bind_with` for `first_ip:port` with an opener that returns `listener`.
     async fn bind_with_returned_listener(
         listener: TcpListener,
@@ -1611,7 +1654,7 @@ mod tests {
         let (port, mut reserved) = reserve_port_on_both(first_ip, second_ip).await;
         let wrong = reserved.remove(&second_ip).expect("second listener");
         let result =
-            bind_with_returned_listener(wrong, OpenedListener::held, (first_ip, port).into()).await;
+            bind_with_returned_listener(wrong, OpenedListener::held, overlay_target(port)).await;
         match result {
             Err(DaemonError::OverlayBind { addr, .. }) => assert_eq!(addr, second_ip),
             Err(other) => panic!("expected OverlayBind, got: {other}"),
@@ -1626,7 +1669,7 @@ mod tests {
         let (port, mut reserved) = reserve_port_on_both(first_ip, second_ip).await;
         let other = reserved.remove(&second_ip).expect("second listener");
         let server =
-            bind_with_returned_listener(other, OpenedListener::os_bound, (first_ip, port).into())
+            bind_with_returned_listener(other, OpenedListener::os_bound, overlay_target(port))
                 .await
                 .expect("an OS-bound listener is not compared with the requested address");
         assert_eq!(server.local_addr(), (second_ip, port).into());
@@ -1640,9 +1683,12 @@ mod tests {
             .expect("ephemeral listener");
         let wrong_port = wrong.local_addr().expect("listener address").port();
         let requested_port = wrong_port.checked_add(1).unwrap_or(wrong_port - 1);
-        let result =
-            bind_with_returned_listener(wrong, OpenedListener::held, (ip, requested_port).into())
-                .await;
+        let result = bind_with_returned_listener(
+            wrong,
+            OpenedListener::held,
+            overlay_target(requested_port),
+        )
+        .await;
         match result {
             Err(DaemonError::OverlayBind { addr, reason }) => {
                 assert_eq!(addr, ip);
@@ -1694,12 +1740,27 @@ mod tests {
         let (_state_root, governance) = governance_service().await;
         let first_ip = "127.0.0.1".parse().expect("first IP");
         let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
-        let (port, reserved) = reserve_port_on_both(first_ip, second_ip).await;
-        let reserved = Arc::new(Mutex::new(reserved));
+        let (port, mut sockets) = reserve_port_on_both(first_ip, second_ip).await;
+        // The core refuses loopback bind targets, so the supervisor binds
+        // overlay-range addresses and the opener substitutes a loopback socket.
+        let reserved = Arc::new(Mutex::new(HashMap::from([
+            (
+                FIRST_OVERLAY_ADDRESS
+                    .parse::<std::net::IpAddr>()
+                    .expect("first overlay IP"),
+                sockets.remove(&first_ip).expect("first socket"),
+            ),
+            (
+                SECOND_OVERLAY_ADDRESS.parse().expect("second overlay IP"),
+                sockets.remove(&second_ip).expect("second socket"),
+            ),
+        ])));
         // Real socket I/O runs while the clock is paused; only the explicit
         // `advance` below may move virtual time.
         let inhibitor = pohunek_test_support::time::AutoAdvanceInhibitor::new();
-        let address = Arc::new(RwLock::new(first_ip));
+        let address = Arc::new(RwLock::new(
+            FIRST_OVERLAY_ADDRESS.parse().expect("first overlay IP"),
+        ));
         let transport = Arc::new(MutableListenerTransport {
             id: OverlayId::new("mutable").expect("overlay id"),
             address: Arc::clone(&address),
@@ -1721,13 +1782,14 @@ mod tests {
                 bind_remote_server(
                     state.clone(),
                     configured.clone(),
+                    MissingCli::Disable,
                     current_addr,
                     move |addr| async move {
                         reserved
                             .lock()
                             .expect("reserved listener lock")
                             .remove(&addr.ip())
-                            .map(OpenedListener::held)
+                            .map(OpenedListener::os_bound)
                             .ok_or_else(|| {
                                 std::io::Error::other("no reserved listener for address")
                             })
@@ -1742,7 +1804,8 @@ mod tests {
         tokio::task::yield_now().await;
         assert_serves_health((first_ip, port).into()).await;
 
-        *address.write().expect("listener address write lock") = second_ip;
+        *address.write().expect("listener address write lock") =
+            SECOND_OVERLAY_ADDRESS.parse().expect("second overlay IP");
         tokio::time::advance(reconcile_interval).await;
         tokio::task::yield_now().await;
         assert_serves_health((second_ip, port).into()).await;

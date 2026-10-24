@@ -1620,7 +1620,22 @@ discovered port, never the cached probe IP. A browser relay forces a fresh local
 daemon discovery before each remote tunnel upgrade and accepts the cached route
 only if the requested identity still owns it. Active daemon overlay listeners
 revalidate their provider-owned local address periodically; an address change
-binds the replacement before the stale listener is dropped.
+binds the replacement before the stale listener is dropped. The bind itself is
+checked in the daemon core: the target must be a unicast address, valid for the
+provider's range, and equal to the address the provider reports at that moment,
+so a shared address range never decides a bind by itself. A missing provider
+CLI disables the listener of the default overlay of an absent
+`overlays.toml`; for a provider the owner listed it is logged and retried with
+the listener backoff.
+
+The Tailscale adapter (`crates/overlay-tailscale`) is the second compiled
+provider. It reads `tailscale status --json` through the same trusted
+executable lookup and cancellable subprocess as NetBird, parses only the fields
+it needs from the unstable format, and treats the stable node `ID` as the peer
+identity. The listener binds the node's IPv4 address and only while Tailscale
+runs on a kernel interface; `ShareeNode` peers, expired peers and
+peers outside the network map are not selectable, and the ChromeOS and service
+addresses of the CGNAT range are never node addresses.
 
 The production NetBird adapter remains tokenless and local. There is no signed
 manifest exchange. NetBird `publicKey` or legacy `pubKey` is the stable peer

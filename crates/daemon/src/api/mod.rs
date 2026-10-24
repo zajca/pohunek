@@ -126,7 +126,8 @@ impl Drop for PendingSocket<'_> {
 }
 
 impl ControlServer {
-    /// Bind the control socket at `socket_path` with a validated overlay registry.
+    /// Bind the control socket at `socket_path` with a validated overlay registry
+    /// and the [`OverlaySource`] that registry was built from.
     ///
     /// The parent directory is created (mode `0700`) if missing. If a socket
     /// file already exists, it is probed: a live daemon there is a hard error
@@ -142,6 +143,7 @@ impl ControlServer {
         health: HealthInfo,
         governance: Arc<HostGovernanceService>,
         registry: pohunek_client::OverlayRegistry,
+        overlay_source: crate::api::OverlaySource,
     ) -> Result<Self, DaemonError> {
         Self::bind_with_state(
             socket_path,
@@ -150,7 +152,7 @@ impl ControlServer {
                 SessionRegistry::default(),
                 governance,
                 registry,
-                crate::api::OverlaySource::Default,
+                overlay_source,
             ),
         )
         .await
@@ -352,16 +354,18 @@ pub struct RemoteServer {
 impl RemoteServer {
     /// Bind a TCP control listener at `addr`.
     ///
-    /// FAILS CLOSED: `addr.ip()` is validated against the overlay's trusted
-    /// range ([`OverlayTransport::validate_bind_addr`]) **before** the socket is
-    /// opened, so an invalid or non-member address never reaches the OS bind. This is the
-    /// authoritative gate that keeps the control port off public, RFC1918, and
-    /// loopback interfaces.
+    /// FAILS CLOSED: `addr.ip()` must be a unicast address, inside the overlay's
+    /// trusted range ([`OverlayTransport::validate_bind_addr`]) and equal to the
+    /// overlay's current [`OverlayTransport::listener_addr`] **before** the
+    /// socket is opened, so an invalid or non-member address never reaches the
+    /// OS bind. This is the authoritative gate that keeps the control port off
+    /// public, RFC1918, and loopback interfaces.
     ///
     /// # Errors
     ///
     /// Returns [`DaemonError::OverlayBind`] when the address is not a valid
-    /// member of the overlay's range, or [`DaemonError::Socket`] on bind failure.
+    /// member of the overlay's range or differs from its current listener
+    /// address, or [`DaemonError::Socket`] on bind failure.
     pub async fn bind(
         addr: SocketAddr,
         state: DaemonState,
@@ -388,7 +392,8 @@ impl RemoteServer {
     /// # Errors
     ///
     /// Returns [`DaemonError::OverlayBind`] when the address is not a valid
-    /// member of the overlay's range or when `open` returns a listener bound
+    /// member of the overlay's range, differs from the overlay's current
+    /// listener address, or when `open` returns a listener bound
     /// to a different address or port, or [`DaemonError::Socket`] when `open`
     /// fails or the listener's local address cannot be read.
     pub async fn bind_with<F, Fut>(
@@ -401,11 +406,39 @@ impl RemoteServer {
         F: FnOnce(SocketAddr) -> Fut,
         Fut: std::future::Future<Output = std::io::Result<OpenedListener>>,
     {
+        if let Some(category) = forbidden_bind_category(addr.ip()) {
+            return Err(DaemonError::OverlayBind {
+                addr: addr.ip(),
+                reason: format!("{category} addresses are never valid for the remote listener"),
+            });
+        }
         if let Err(err) = transport.validate_bind_addr(addr.ip()) {
             return Err(DaemonError::OverlayBind {
                 addr: addr.ip(),
                 reason: err.to_string(),
             });
+        }
+        // The provider's range check cannot tell this host's address from any
+        // other member of a shared range, so the address must also be the one
+        // the provider reports now. A state change between the caller's query
+        // and this bind is refused here and retried by the caller.
+        match transport.listener_addr().await {
+            Ok(current) if current == addr.ip() => {}
+            Ok(current) => {
+                return Err(DaemonError::OverlayBind {
+                    addr: addr.ip(),
+                    reason: format!(
+                        "the overlay now reports {current} as its listener address, not {}",
+                        addr.ip()
+                    ),
+                });
+            }
+            Err(err) => {
+                return Err(DaemonError::OverlayBind {
+                    addr: addr.ip(),
+                    reason: format!("the overlay reports no listener address: {err}"),
+                });
+            }
         }
 
         let OpenedListener { listener, verify } =
@@ -625,6 +658,28 @@ where
         }
     }
     Ok(())
+}
+
+/// Names the address category that is never a remote listener address:
+/// unspecified, loopback, link-local, multicast or the IPv4 broadcast.
+fn forbidden_bind_category(ip: std::net::IpAddr) -> Option<&'static str> {
+    use std::net::IpAddr;
+    // An IPv4-mapped IPv6 address binds as the IPv4 address it wraps.
+    let ip = ip.to_canonical();
+    if ip.is_unspecified() {
+        Some("unspecified")
+    } else if ip.is_loopback() {
+        Some("loopback")
+    } else if ip.is_multicast() {
+        Some("multicast")
+    } else {
+        match ip {
+            IpAddr::V4(v4) if v4.is_link_local() => Some("link-local"),
+            IpAddr::V4(v4) if v4.is_broadcast() => Some("broadcast"),
+            IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => Some("link-local"),
+            _ => None,
+        }
+    }
 }
 
 /// Maps one read from the control codec to the next request line.

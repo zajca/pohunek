@@ -22,6 +22,7 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
 | `crates/terminal` | VT screen tracking and attach compositing. |
 | `crates/netbird` | NetBird status parsing, host resolution, bind validation, and overlay adapter. |
+| `crates/overlay-tailscale` | Tailscale status parsing, peer selection, bind validation, and overlay adapter. |
 | `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |

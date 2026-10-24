@@ -265,9 +265,15 @@ async fn spawn_server_with_overlay(
     overlay: overlay::OverlayRegistry,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let health = HealthInfo::new(version);
-    let server = ControlServer::bind(socket, health, governance_service(socket).await, overlay)
-        .await
-        .expect("server binds");
+    let server = ControlServer::bind(
+        socket,
+        health,
+        governance_service(socket).await,
+        overlay,
+        pohunek_daemon::api::OverlaySource::Default,
+    )
+    .await
+    .expect("server binds");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server
@@ -2604,6 +2610,7 @@ async fn hostile_socket_entry_is_rejected_without_mutation() {
         HealthInfo::new("0.0.0"),
         governance_service(&socket).await,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     )
     .await
     .expect_err("regular file must not be treated as a stale socket");
@@ -2632,6 +2639,7 @@ async fn wrong_mode_stale_socket_is_rejected_without_removal() {
         HealthInfo::new("0.0.0"),
         governance_service(&socket).await,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     )
     .await
     .expect_err("wrong-mode stale socket must fail closed");

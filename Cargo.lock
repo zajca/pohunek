@@ -2950,6 +2950,7 @@ dependencies = [
  "libc",
  "pohunek-netbird",
  "pohunek-overlay",
+ "pohunek-overlay-tailscale",
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-protocol",
@@ -3068,6 +3069,20 @@ version = "0.36.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "pohunek-overlay-tailscale"
+version = "0.36.0"
+dependencies = [
+ "pohunek-overlay",
+ "pohunek-platform",
+ "pohunek-test-support",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

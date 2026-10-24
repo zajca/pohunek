@@ -262,10 +262,6 @@ fn the_environment_override_wins_over_the_file() {
 /// names the file, quotes no file value, and is reported before any provider
 /// call.
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one flat row per case keeps the failure table in one place"
-)]
 fn an_unusable_file_content_fails_before_any_provider_call() {
     let oversized = format!("# {}\n", "x".repeat(OVERSIZED_FILE_BYTES));
     let cases: Vec<Case> = vec![
@@ -274,12 +270,6 @@ fn an_unusable_file_content_fails_before_any_provider_call() {
             b"providers = [\"zzz-unknown\"]\n".to_vec(),
             &["unknown overlay id", "netbird"],
             &["zzz-unknown"],
-        ),
-        (
-            "tailscale is unknown in this release",
-            b"providers = [\"tailscale\"]\n".to_vec(),
-            &["unknown overlay id"],
-            &["tailscale"],
         ),
         (
             "duplicate",

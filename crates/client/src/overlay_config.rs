@@ -36,6 +36,7 @@ use netbird::{NetbirdTransport, NETBIRD_OVERLAY_ID};
 use overlay::{
     ConfiguredTransport, OverlayDiagnostic, OverlayError, OverlayRegistry, OverlayTransport,
 };
+use overlay_tailscale::{TailscaleTransport, TAILSCALE_OVERLAY_ID};
 use pohunek_platform::filesystem::{FsError, TrustedDir};
 use serde::Deserialize;
 
@@ -70,18 +71,20 @@ const FILE_MODE: u32 = 0o600;
 const FORBIDDEN_DIRECTORY_BITS: u32 = 0o022;
 
 /// Overlay ids the loader can build a provider for.
-const KNOWN_PROVIDER_IDS: [&str; 1] = [NETBIRD_OVERLAY_ID];
+const KNOWN_PROVIDER_IDS: [&str; 2] = [NETBIRD_OVERLAY_ID, TAILSCALE_OVERLAY_ID];
 
 /// A provider the loader knows how to construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provider {
     Netbird,
+    Tailscale,
 }
 
 impl Provider {
     fn from_id(id: &str) -> Option<Self> {
         match id {
             NETBIRD_OVERLAY_ID => Some(Self::Netbird),
+            TAILSCALE_OVERLAY_ID => Some(Self::Tailscale),
             _ => None,
         }
     }
@@ -89,12 +92,14 @@ impl Provider {
     fn id(self) -> &'static str {
         match self {
             Self::Netbird => NETBIRD_OVERLAY_ID,
+            Self::Tailscale => TAILSCALE_OVERLAY_ID,
         }
     }
 
     fn transport(self) -> Arc<dyn OverlayTransport> {
         match self {
             Self::Netbird => Arc::new(NetbirdTransport::new()),
+            Self::Tailscale => Arc::new(TailscaleTransport::new()),
         }
     }
 }
@@ -141,19 +146,20 @@ impl OverlayConfig {
             .collect()
     }
 
+    /// True when the providers came from `overlays.toml`, false for the
+    /// `NetBird` default of an absent file.
+    ///
+    /// A provider the owner listed is expected to appear, so the daemon keeps
+    /// retrying while its CLI is missing; the default stays disabled then.
+    #[must_use]
+    pub fn from_file(&self) -> bool {
+        self.from_file
+    }
+
     /// TCP port of the remote control listener on every configured overlay.
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
-    }
-
-    /// Whether the providers were listed in `overlays.toml`.
-    ///
-    /// `false` means the file is absent and the `NetBird` default applies, where
-    /// a missing provider CLI is not an error.
-    #[must_use]
-    pub fn from_file(&self) -> bool {
-        self.from_file
     }
 
     /// Load the configuration from the XDG config directory of this process.

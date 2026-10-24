@@ -10,6 +10,7 @@ description = "pohunek SDK client: typed client errors and daemon transport cont
 futures = { workspace = true }
 pohunek-netbird = { workspace = true }
 overlay = { workspace = true }
+overlay-tailscale = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-platform = { workspace = true }
 pohunek-protocol = { workspace = true }
