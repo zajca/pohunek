@@ -417,6 +417,7 @@ class MacStepProtocolTest(unittest.TestCase):
           "session input")
             [ "${FAKE_DROP:-0}" != 1 ] || { printf '{"cli_version":"x","ok":{}}\\n'; exit 0; }
             line=$4
+            printf '%s\\n' "$*" >>"$FAKE_DIR/inputs.log"
             printf '%s\\r\\n' "$line" >>"$log"
             ${FAKE_SHELL:-sh} -c "$line" >"$FAKE_DIR/run.out" 2>&1 || true
             sed 's/$/\\r/' "$FAKE_DIR/run.out" >>"$log"
@@ -523,8 +524,18 @@ class MacStepProtocolTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
+    def inputs(self):
+        path = self.dir / "inputs.log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    GUARDED = re.compile(r'^session input \S+ if cd \S+ && \[ "\$\(pwd -P\)" = \S+ \]; then .* --json$')
+
+    def assert_all_guarded(self, records):
+        for record in records:
+            self.assertRegex(record, self.GUARDED)
+
     def typed_lines(self):
-        return [line for line in (self.dir / "transcript").read_text().split("\r\n") if "pwd -P" in line]
+        return self.inputs()
 
     def test_a_refusal_poisons_the_leg_and_nothing_more_is_typed(self):
         output = self.run_body(
@@ -541,6 +552,7 @@ class MacStepProtocolTest(unittest.TestCase):
         )
         self.assertEqual(output.strip(), "first=97 second=124 refused=1 make=refused")
         self.assertEqual(len(self.typed_lines()), 1)
+        self.assert_all_guarded(self.inputs())
         self.assertEqual(sorted(p.name for p in (self.dir / "state" / "inconclusive").glob("*")), ["macos_provisioning_failed"])
 
     def test_a_refusal_of_a_made_root_or_of_the_final_clean_is_read_from_the_terminal(self):
@@ -553,6 +565,59 @@ class MacStepProtocolTest(unittest.TestCase):
         self.assertEqual(output.strip(), "make=refused refused=1")
         self.assertFalse((self.dir / "newroot").exists())
         self.assertEqual(len(self.typed_lines()), 1)
+
+    def test_a_refusal_of_the_final_clean_is_the_first_refusal_and_the_roots_stay_listed(self):
+        output = self.run_body(
+            """\
+            macos_tmp_prefix=""" + str(self.dir) + """
+            macos_comm_root=""" + str(self.dir) + """/ph1112c
+            mac_comm_created=1
+            mac_final_clean
+            printf 'refused=%s rc=%s\\n' "$mac_refused" "$(cat "$state/steps/macos/"*-cl-rm/rc)"
+            cat "$state/inconclusive/macos_provisioning_failed"
+            """
+        )
+        self.assertIn("refused=1 rc=1", output)
+        self.assertIn("may need manual cleanup: " + str(self.dir / "ph1112c"), output)
+        self.assertEqual(len(self.inputs()), 1)
+        self.assert_all_guarded(self.inputs())
+
+    def test_a_cleanup_step_that_is_refused_poisons_the_leg_too(self):
+        output = self.run_body(
+            """\
+            mac_in_cleanup=1
+            mac_step macos cl-first 3 'true'
+            first=$step_rc
+            mac_step macos cl-second 3 'true'
+            printf 'first=%s second=%s refused=%s\\n' "$first" "$step_rc" "$mac_refused"
+            """
+        )
+        self.assertEqual(output.strip(), "first=97 second=124 refused=1")
+        self.assertEqual(len(self.inputs()), 1)
+        self.assert_all_guarded(self.inputs())
+
+    def test_the_manual_cleanup_list_names_everything_this_run_made(self):
+        output = self.run_body(
+            """\
+            mac_comm_created=1; mac_brew_installed_by_us=1; mac_daemon_started=1; mac_tsd_started=1
+            mac_root=/Users/u/.ph1112
+            mac_refuse late
+            cat "$state/inconclusive/macos_provisioning_failed"
+            """
+        )
+        self.assertIn("(Homebrew formula tailscale)", output)
+        self.assertIn("(pohunekd, pid file /Users/u/.ph1112/daemon.pid)", output)
+        self.assertIn("(tailscaled, pid file /Users/u/.ph1112/tsd.pid)", output)
+        self.assertNotIn("nothing was created", output)
+
+    def test_the_manual_cleanup_list_is_empty_when_nothing_was_made(self):
+        output = self.run_body(
+            """\
+            mac_refuse early
+            cat "$state/inconclusive/macos_provisioning_failed"
+            """
+        )
+        self.assertIn("may need manual cleanup: nothing was created", output)
 
     def test_the_final_clean_refuses_paths_outside_the_allow_list_without_sending(self):
         output = self.run_body(
@@ -618,7 +683,7 @@ class MacStepProtocolTest(unittest.TestCase):
 
     def test_the_driver_types_into_the_mac_shell_only_in_mac_send(self):
         lines = DRIVER.read_text().splitlines()
-        calls = [number for number, line in enumerate(lines, 1) if "session input" in line and "mac_target" in line]
+        calls = [number for number, line in enumerate(lines, 1) if "session input" in line and "vm_ssh" not in line and not line.lstrip().startswith("#") and "mac_send" not in line]
         start = next(number for number, line in enumerate(lines, 1) if line.startswith("mac_send() {"))
         end = next(number for number, line in enumerate(lines, 1) if number > start and line == "}")
         self.assertEqual(len(calls), 1, calls)
@@ -856,9 +921,11 @@ class MacLegTest(unittest.TestCase):
 
     def test_a_refused_shell_gets_one_guarded_line_and_nothing_else_but_the_session_removal(self):
         self.run_leg(env={"MAC_CWD_REAL": "/nonexistent-real-path"})
-        typed = [line for line in (self.dir / "transcript").read_text().split("\r\n") if "pwd -P" in line]
+        typed = (self.dir / "inputs.log").read_text().splitlines()
         self.assertEqual(len(typed), 1)
-        self.assertTrue(typed[0].startswith("if cd "), typed[0])
+        self.assertRegex(typed[0], MacStepProtocolTest.GUARDED)
+        reason = (self.dir / "state" / "inconclusive" / "macos_provisioning_failed").read_text()
+        self.assertIn("may need manual cleanup: nothing was created", reason)
         self.assertEqual(self.codes(), ["macos_provisioning_failed"])
         self.assertEqual(self.ops(), ["new", "stop zajcaair/s-fake", "rm zajcaair/s-fake"])
         self.assertFalse(self.owner_root.exists())

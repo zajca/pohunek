@@ -353,6 +353,8 @@ macos_home_prefix=/Users
 macos_tmp_prefix=/private/tmp
 mac_home_valid=0
 mac_home=
+mac_daemon_started=0
+mac_tsd_started=0
 mac_in_cleanup=0
 mac_comm_created=0
 mac_home_created=0
@@ -1218,7 +1220,14 @@ mac_send() {
 mac_refuse() {
   mac_refused=1
   mac_dead=1
-  inconclude macos_provisioning_failed "the $macos_host shell is not in $macos_session_cwd ($macos_session_cwd_real); $1 was not run; check by hand: ${mac_comm_created:+$macos_comm_root }${mac_home_created:+$mac_root }${mac_runtime_created:+$macos_runtime_root}"
+  mr_left=
+  [ "$mac_comm_created" != 1 ] || mr_left="$mr_left $macos_comm_root"
+  [ "$mac_home_created" != 1 ] || mr_left="$mr_left $mac_root"
+  [ "$mac_runtime_created" != 1 ] || mr_left="$mr_left $macos_runtime_root"
+  [ "$mac_brew_installed_by_us" != 1 ] || mr_left="$mr_left (Homebrew formula tailscale)"
+  [ "$mac_daemon_started" != 1 ] || mr_left="$mr_left (pohunekd, pid file $mac_root/daemon.pid)"
+  [ "$mac_tsd_started" != 1 ] || mr_left="$mr_left (tailscaled, pid file $mac_root/tsd.pid)"
+  inconclude macos_provisioning_failed "the $macos_host shell is not in $macos_session_cwd ($macos_session_cwd_real); $1 was not run; may need manual cleanup:${mr_left:- nothing was created}"
 }
 
 # mac_path_allowed PATH: the only paths a destructive command on the Mac may
@@ -1233,7 +1242,7 @@ mac_path_allowed() {
     *) return 1 ;;
   esac
   case $1 in
-    "$macos_tmp_prefix"/ph1112* | "$macos_tmp_prefix"/ph-macos-cache/ph1112-bins) return 0 ;;
+    "$macos_tmp_prefix"/ph1112*) return 0 ;;
     "$mac_home"/.ph1112) [ "$mac_home_valid" = 1 ] ;;
     *) return 1 ;;
   esac
@@ -1538,7 +1547,7 @@ macos_leg() {
   fi
   mac_step macos brew-info "$mac_timeout_s" "$macos_brew_cmd info --json=v2 tailscale"
   if [ "$step_rc" -ne 0 ]; then
-    inconclude macos_homebrew_failed "brew info tailscale on $macos_host exited $step_rc"
+    [ "$mac_dead" = 1 ] || inconclude macos_homebrew_failed "brew info tailscale on $macos_host exited $step_rc"
     return 1
   fi
   mac_step macos ls-bins "$mac_timeout_s" 'ls -l /opt/homebrew/bin/tailscale /opt/homebrew/bin/tailscaled'
@@ -1562,6 +1571,7 @@ macos_leg() {
   say "zajcaair: D6, no tailscaled"
   mac_step macos d6-doctor-before "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
   mac_step macos d6-host-list "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek host list --json"
+  mac_daemon_started=1
   mac_step macos d6-daemon-start "$mac_timeout_s" "$(mac_daemon_start_cmd /usr/bin:/bin)"
   mac_step macos d6-wait "$mac_timeout_s" "for i in 1 2 3 4 5 6 7 8 9 10; do $me PATH=/usr/bin:/bin $mac_bin/pohunek health --json >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
   mac_step macos d6-doctor-after "$mac_timeout_s" "$me PATH=/usr/bin:/bin $mac_bin/pohunek doctor --json"
@@ -1577,6 +1587,7 @@ macos_leg() {
 macos_userspace() {
   say "zajcaair: userspace tailscaled"
   sub_socket="$macos_runtime_root/ts.sock"
+  mac_tsd_started=1
   mac_step macos us-tailscaled-start "$mac_timeout_s" "mkdir -p $mac_root/ts; nohup /opt/homebrew/bin/tailscaled --tun=userspace-networking --socket=$sub_socket --statedir=$mac_root/ts --port=0 --no-logs-no-support >$macos_runtime_root/tsd.log 2>&1 </dev/null & echo \$! >$mac_root/tsd.pid; for i in 1 2 3 4 5 6 7 8 9 10; do [ -S $sub_socket ] && exit 0; sleep 1; done; cat $macos_runtime_root/tsd.log; exit 1"
   if [ "$step_rc" -ne 0 ]; then
     [ "$mac_dead" = 1 ] || inconclude macos_userspace_refused "userspace tailscaled did not create its socket"
