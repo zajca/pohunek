@@ -122,6 +122,8 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
     for lint in ["disallowed_types", "disallowed_methods"] {
         lints[lint] = toml::Value::String("forbid".to_owned());
     }
+    let reviewed_lock: Lockfile =
+        toml::from_str(include_str!("../../../Cargo.lock")).expect("reviewed resolution");
     let env = TestEnv::new().expect("hermetic test environment");
     // The environment's private working directory is the isolated fixture crate.
     let fixture = env.cwd();
@@ -139,7 +141,15 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
     );
     assert_member_features(&env, &root);
     dependency["version"] = toml::Value::String("=4.0.1".to_owned());
-    let manifest = fixture_manifest(dependency, lints);
+    let curves = ["p256", "p384"].map(|name| {
+        let locked = reviewed_lock
+            .package
+            .iter()
+            .find(|package| package.name == name)
+            .expect("reviewed curve crate");
+        (name, format!("={}", locked.version))
+    });
+    let manifest = fixture_manifest(dependency, &curves, lints);
     fs::write(
         fixture.join("Cargo.toml"),
         toml::to_string(&manifest).expect("fixture manifest"),
@@ -161,17 +171,7 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
         String::from_utf8_lossy(&resolution.stderr)
     );
     assert_reviewed_resolution(&fixture.join("Cargo.lock"));
-    for (source, expected) in [
-        (
-            include_str!("fixtures/rsa_direct.rs"),
-            &["clippy::disallowed_types", "clippy::disallowed_methods"][..],
-        ),
-        (
-            include_str!("fixtures/rsa_alias.rs"),
-            &["clippy::disallowed_types", "clippy::disallowed_methods"][..],
-        ),
-        (include_str!("fixtures/rsa_alias_allow.rs"), &["E0453"][..]),
-    ] {
+    for (source, expected) in policy_fixtures() {
         fs::write(fixture.join("src/main.rs"), source).expect("write negative fixture");
         let output = host_cargo(&env)
             .current_dir(fixture)
@@ -187,8 +187,35 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
             .env("CARGO_TARGET_DIR", root.join("target/rsa-policy"))
             .output()
             .expect("run production Clippy policy in isolated target");
-        assert_diagnostics(&output, expected);
+        assert_diagnostics(&output, expected, source);
     }
+}
+
+/// Negative fixtures and the Clippy diagnostics each must raise.
+fn policy_fixtures() -> Vec<(&'static str, &'static [&'static str])> {
+    vec![
+        (
+            include_str!("fixtures/rsa_direct.rs"),
+            &["clippy::disallowed_types", "clippy::disallowed_methods"][..],
+        ),
+        (
+            include_str!("fixtures/rsa_alias.rs"),
+            &["clippy::disallowed_types", "clippy::disallowed_methods"][..],
+        ),
+        (include_str!("fixtures/rsa_alias_allow.rs"), &["E0453"][..]),
+        (
+            include_str!("fixtures/p256_secret_key.rs"),
+            &["clippy::disallowed_methods"][..],
+        ),
+        (
+            include_str!("fixtures/p256_signing_key.rs"),
+            &["clippy::disallowed_methods"][..],
+        ),
+        (
+            include_str!("fixtures/p384_nonzero_scalar.rs"),
+            &["clippy::disallowed_types"][..],
+        ),
+    ]
 }
 
 fn assert_reviewed_resolution(path: &std::path::Path) {
@@ -274,7 +301,11 @@ fn assert_member_features(env: &TestEnv, root: &std::path::Path) {
     assert_eq!(consumers, ["pohunek-relay"]);
 }
 
-fn fixture_manifest(dependency: toml::Value, lints: toml::Value) -> toml::Value {
+fn fixture_manifest(
+    dependency: toml::Value,
+    curves: &[(&str, String)],
+    lints: toml::Value,
+) -> toml::Value {
     toml::Value::Table(toml::map::Map::from_iter([
         (
             "package".to_owned(),
@@ -296,10 +327,11 @@ fn fixture_manifest(dependency: toml::Value, lints: toml::Value) -> toml::Value 
         ),
         (
             "dependencies".to_owned(),
-            toml::Value::Table(toml::map::Map::from_iter([(
-                "openidconnect".to_owned(),
-                dependency,
-            )])),
+            toml::Value::Table(toml::map::Map::from_iter(
+                std::iter::once(("openidconnect".to_owned(), dependency)).chain(curves.iter().map(
+                    |(name, version)| ((*name).to_owned(), toml::Value::String(version.clone())),
+                )),
+            )),
         ),
         (
             "lints".to_owned(),
@@ -308,10 +340,11 @@ fn fixture_manifest(dependency: toml::Value, lints: toml::Value) -> toml::Value 
     ]))
 }
 
-fn assert_diagnostics(output: &std::process::Output, expected: &[&str]) {
+fn assert_diagnostics(output: &std::process::Output, expected: &[&str], source: &str) {
     assert!(
         !output.status.success(),
-        "private RSA must not compile under production policy"
+        "the banned private-key API must not compile under production policy: {source}\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let codes: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -601,6 +634,218 @@ fn legacy_zbus_policy_asks_for_the_ignores_to_go_once_the_chain_is_gone() {
         violations
             .iter()
             .any(|violation| violation.contains("no legacy zbus consumer remains")),
+        "{violations:?}"
+    );
+}
+
+/// Reviewed parents of each curve-stack crate that links `crypto-bigint` 0.5
+/// (RUSTSEC-2026-0387, ignored in `.cargo/audit.toml`). These are the exact
+/// edges of the `RustCrypto` 0.13 stack `openidconnect` uses for public-key
+/// ECDSA verification; the relay and every other workspace crate may not
+/// depend on any of them directly.
+const CRYPTO_BIGINT_REVIEWED_PARENTS: [(&str, &[&str]); 6] = [
+    ("crypto-bigint", &["elliptic-curve"]),
+    ("elliptic-curve", &["ecdsa", "p256", "p384", "primeorder"]),
+    ("ecdsa", &["p256", "p384"]),
+    ("primeorder", &["p256", "p384"]),
+    ("p256", &["openidconnect"]),
+    ("p384", &["openidconnect"]),
+];
+
+/// The locked package a `dependencies` entry of `Cargo.lock` names. Cargo
+/// writes the bare crate name when exactly one version of it is locked.
+fn resolve_dependency<'a>(lock: &'a Lockfile, dependency: &str) -> Option<&'a Package> {
+    let mut parts = dependency.split_whitespace();
+    let name = parts.next()?;
+    let version = parts.next();
+    let mut candidates = lock
+        .package
+        .iter()
+        .filter(|package| package.name == name && version.is_none_or(|v| package.version == v));
+    let first = candidates.next()?;
+    candidates.next().is_none().then_some(first)
+}
+
+/// Violations of the `crypto-bigint` 0.5 policy in `lock`.
+///
+/// While a 0.5 release is locked, only the reviewed parent edges may reach it
+/// and the curve-stack crates may only be used by their reviewed parents. Once
+/// no 0.5 release is locked, the ignore is obsolete.
+fn crypto_bigint_violations(lock: &Lockfile) -> Vec<String> {
+    let affected: Vec<&Package> = lock
+        .package
+        .iter()
+        .filter(|package| package.name == "crypto-bigint" && package.version.starts_with("0.5."))
+        .collect();
+    if affected.is_empty() {
+        return vec![
+            "crypto-bigint 0.5 is gone: remove the RUSTSEC-2026-0387 ignore from \
+             .cargo/audit.toml and this policy"
+                .to_owned(),
+        ];
+    }
+    let mut violations = Vec::new();
+    for parent in &lock.package {
+        for dependency in &parent.dependencies {
+            let Some(child) = resolve_dependency(lock, dependency) else {
+                continue;
+            };
+            let reviewed = CRYPTO_BIGINT_REVIEWED_PARENTS
+                .iter()
+                .find(|(name, _)| *name == child.name)
+                .is_some_and(|(_, parents)| parents.contains(&parent.name.as_str()));
+            let reaches_affected = affected.iter().any(|package| std::ptr::eq(*package, child));
+            let curve_stack = child.name != "crypto-bigint"
+                && CRYPTO_BIGINT_REVIEWED_PARENTS
+                    .iter()
+                    .any(|(name, _)| *name == child.name);
+            if (reaches_affected || curve_stack) && !reviewed {
+                violations.push(format!(
+                    "`{}` depends on `{}` {}, which is outside the reviewed crypto-bigint 0.5 edges",
+                    parent.name, child.name, child.version
+                ));
+            }
+        }
+    }
+    violations
+}
+
+fn synthetic_lock(packages: &[(&str, &str, &[&str])]) -> Lockfile {
+    Lockfile {
+        package: packages
+            .iter()
+            .map(|(name, version, dependencies)| Package {
+                name: (*name).to_owned(),
+                version: (*version).to_owned(),
+                checksum: None,
+                dependencies: dependencies.iter().map(|d| (*d).to_owned()).collect(),
+            })
+            .collect(),
+    }
+}
+
+fn reviewed_crypto_bigint_packages() -> Vec<(&'static str, &'static str, &'static [&'static str])> {
+    vec![
+        ("crypto-bigint", "0.5.5", &[]),
+        ("elliptic-curve", "0.13.8", &["crypto-bigint"]),
+        ("ecdsa", "0.16.9", &["elliptic-curve"]),
+        ("primeorder", "0.13.6", &["elliptic-curve"]),
+        ("p256", "0.13.2", &["ecdsa", "elliptic-curve", "primeorder"]),
+        ("p384", "0.13.1", &["ecdsa", "elliptic-curve", "primeorder"]),
+        ("openidconnect", "4.0.1", &["p256", "p384"]),
+        ("pohunek-relay", "0.1.0", &["openidconnect"]),
+    ]
+}
+
+#[test]
+fn crypto_bigint_0_5_is_reachable_only_through_the_reviewed_curve_stack() {
+    let lock: Lockfile =
+        toml::from_str(include_str!("../../../Cargo.lock")).expect("workspace lockfile");
+    assert_eq!(
+        crypto_bigint_violations(&lock),
+        Vec::<String>::new(),
+        "a new crypto-bigint 0.5 edge needs a new RUSTSEC-2026-0387 assessment"
+    );
+}
+
+#[test]
+fn crypto_bigint_policy_accepts_the_reviewed_edges() {
+    assert_eq!(
+        crypto_bigint_violations(&synthetic_lock(&reviewed_crypto_bigint_packages())),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn crypto_bigint_policy_rejects_edges_outside_the_reviewed_set() {
+    for (parent, dependency, expected) in [
+        ("pohunek-relay", "p256", "`pohunek-relay` depends on `p256`"),
+        ("pohunek-relay", "p384", "`pohunek-relay` depends on `p384`"),
+        (
+            "pohunek-relay",
+            "ecdsa",
+            "`pohunek-relay` depends on `ecdsa`",
+        ),
+        (
+            "pohunek-relay",
+            "elliptic-curve",
+            "`pohunek-relay` depends on `elliptic-curve`",
+        ),
+        (
+            "pohunek-relay",
+            "primeorder",
+            "`pohunek-relay` depends on `primeorder`",
+        ),
+        (
+            "pohunek-relay",
+            "crypto-bigint",
+            "`pohunek-relay` depends on `crypto-bigint`",
+        ),
+        (
+            "pohunek-daemon",
+            "crypto-bigint 0.5.5",
+            "`pohunek-daemon` depends on `crypto-bigint`",
+        ),
+        (
+            "other",
+            "elliptic-curve",
+            "`other` depends on `elliptic-curve`",
+        ),
+        (
+            "openidconnect",
+            "ecdsa",
+            "`openidconnect` depends on `ecdsa`",
+        ),
+        ("p256", "crypto-bigint", "`p256` depends on `crypto-bigint`"),
+    ] {
+        let mut lock = synthetic_lock(&reviewed_crypto_bigint_packages());
+        // `parent` may be a reviewed package that gains an extra edge.
+        match lock
+            .package
+            .iter_mut()
+            .find(|package| package.name == parent)
+        {
+            Some(existing) => existing.dependencies.push(dependency.to_owned()),
+            None => lock
+                .package
+                .extend(synthetic_lock(&[(parent, "1.0.0", &[dependency])]).package),
+        }
+        let violations = crypto_bigint_violations(&lock);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.starts_with(expected)),
+            "{parent} -> {dependency} must be rejected as `{expected}`; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn crypto_bigint_policy_resolves_bare_entries_by_the_locked_version() {
+    // After the upgrade only 0.7.x is locked and Cargo writes bare entries.
+    let upgraded = synthetic_lock(&[
+        ("crypto-bigint", "0.7.6", &[]),
+        ("elliptic-curve", "0.14.1", &["crypto-bigint"]),
+        ("other", "1.0.0", &["crypto-bigint"]),
+    ]);
+    let violations = crypto_bigint_violations(&upgraded);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("remove the RUSTSEC-2026-0387 ignore"));
+
+    // With both versions locked, versioned entries tell them apart.
+    let mut both = reviewed_crypto_bigint_packages();
+    both.push(("crypto-bigint", "0.7.6", &[]));
+    both.push(("other", "1.0.0", &["crypto-bigint 0.7.6"]));
+    assert_eq!(
+        crypto_bigint_violations(&synthetic_lock(&both)),
+        Vec::<String>::new()
+    );
+    both.push(("another", "1.0.0", &["crypto-bigint 0.5.5"]));
+    let violations = crypto_bigint_violations(&synthetic_lock(&both));
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.starts_with("`another` depends on `crypto-bigint`")),
         "{violations:?}"
     );
 }

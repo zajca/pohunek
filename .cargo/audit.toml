@@ -29,4 +29,19 @@ ignore = [
     # Remove this ignore once ts-rs drops the dependency or the bindings
     # are formatted another way.
     "RUSTSEC-2026-0249",
+    # Dated 2026-10-24, tracked in #1575. crypto-bigint 0.5.5 is locked only
+    # through pohunek-relay -> openidconnect 4.0.1 -> p256 0.13 / p384 0.13 ->
+    # ecdsa 0.16 / primeorder 0.13 -> elliptic-curve 0.13. The relay reaches it
+    # only to verify ID-token signatures: auth/oidc.rs:626 and :649 call
+    # IdToken::claims, which runs openidconnect's core/crypto.rs:100
+    # verify_ec_signature (VerifyingKey::from_sec1_bytes over the public JWK
+    # x/y, then verify) and ecdsa's hazmat.rs:281 verify_prehashed
+    # (invert_vartime on the signature's s, public-point lincomb). Every operand
+    # is public, so timing variability leaks nothing secret; no EC signing, ECDH
+    # or secret-scalar path exists in openidconnect or the relay. No shipped
+    # binary except pohunek-relay links it; xtask's dependency_policy test pins the
+    # exact parent edges into it and .clippy.toml bans the p256/p384 secret-key,
+    # signing and ECDH APIs. Remove this ignore, that test and those bans once
+    # openidconnect releases on p256/p384 0.14 (crypto-bigint >= 0.7.6).
+    "RUSTSEC-2026-0387",
 ]
