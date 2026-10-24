@@ -276,12 +276,16 @@ were re-verified against their upstream checksum sources on 2026-10-24.
 
 The genericcloud image has no `dbus-user-session`, so the systemd user manager
 has no session bus socket and `pohunek service install` cannot connect to it
-(`supervisor operation connect is unavailable`). The guests have no network
+(`service install` fails with `supervisor operation connect is unavailable`:
+the session bus socket does not exist). Debian's `libpam-systemd` only
+recommends the package, so it is missing on installs made without
+recommended packages. The guests have no network
 egress, so the run stages that one package offline: its other dependencies are
 in the image (checked against the image's package manifest,
 `debian-13-genericcloud-amd64-20261021-2638.json`, SHA512
 `614b8865e7496c6e6380b491a8f4121bd7ac654dd570a889f0684c70a946c847c0591edf223f3535afe3572e31370459310b8c7ffaba859ee5f40465c4062911`),
-`dpkg -i` refuses an install with an unmet dependency, and the run then restarts
+`dpkg -i` exits non-zero when a dependency is unmet (it unpacks the package but
+leaves it unconfigured, and the run stops there), and the run then restarts
 `user@<uid>.service` and waits (bounded) until `dbus.socket` is active and
 `/run/user/<uid>/bus` exists. A failure there is `provisioning_failed`.
 

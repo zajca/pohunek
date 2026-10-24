@@ -484,8 +484,10 @@ collect_diagnostics() {
 # ---------------------------------------------------------------------------
 # Pinned downloads
 
-# fetch_pinned URL DEST ALGORITHM EXPECTED: reuses a cached file that matches,
-# otherwise downloads and verifies it. A mismatch is inconclusive.
+# fetch_pinned URL DEST ALGORITHM EXPECTED [FALLBACK]: reuses a cached file that
+# matches, otherwise downloads and verifies it. FALLBACK is tried only when the
+# download from URL fails, never after a wrong checksum: bytes that do not match
+# the pin are inconclusive (checksum_mismatch) whichever source served them.
 fetch_pinned() {
   fp_url=$1
   fp_dest=$2
@@ -504,7 +506,7 @@ fetch_pinned() {
     fi
   done
   if [ "$fp_got" = 0 ]; then
-    inconclude artifact_missing "download of $fp_url failed"
+    inconclude artifact_missing "download of $fp_url failed${fp_fallback:+, and of the fallback $fp_fallback}"
     return 1
   fi
   if [ "$("${fp_algo}sum" <"$fp_dest.part" | awk '{print $1}')" != "$fp_expected" ]; then

@@ -522,27 +522,47 @@ class DbusUserSessionTest(unittest.TestCase):
         self.assertEqual(codes, ["provisioning_failed"])
         self.assertGreaterEqual(log.count("is-active dbus.socket"), 2)
 
-    def test_the_fallback_url_is_used_only_after_the_primary_fails_and_is_verified_too(self):
-        body = """\
-            curl() {{
-              for last; do :; done
-              printf 'curl %s\\n' "$last" >>TMP/calls.log
-              out=
-              while [ "$#" -gt 0 ]; do [ "$1" != --output ] || out=$2; shift; done
-              case "$last" in
-                *snapshot*) return 22 ;;
-                *) printf %s "${{PAYLOAD:-good}}" >"$out" ;;
-              esac
-            }}
-            expected=$(printf good | sha256sum | awk '{{print $1}}')
-            fetch_pinned https://snapshot.example/x "$cache_dir/x" sha256 "$expected" https://pool.example/x || true
-            """.replace("{{", "{").replace("}}", "}")
-        result, codes, log = self.run_script(body)
+    FETCH = """\
+        curl() {{
+          for last; do :; done
+          printf 'curl %s\\n' "$last" >>TMP/calls.log
+          out=
+          while [ "$#" -gt 0 ]; do [ "$1" != --output ] || out=$2; shift; done
+          case "$last" in
+            *snapshot*) [ "${{PRIMARY_RC:-0}}" = 0 ] || return "$PRIMARY_RC"; printf %s "${{PRIMARY_PAYLOAD:-good}}" >"$out" ;;
+            *) [ "${{POOL_RC:-0}}" = 0 ] || return "$POOL_RC"; printf %s "${{POOL_PAYLOAD:-good}}" >"$out" ;;
+          esac
+        }}
+        expected=$(printf good | sha256sum | awk '{{print $1}}')
+        fetch_pinned https://snapshot.example/x "$cache_dir/x" sha256 "$expected" https://pool.example/x || true
+        cat "$state"/inconclusive/* 2>/dev/null || true
+        """.replace("{{", "{").replace("}}", "}")
+
+    def requests(self, log):
+        return [line.split()[1] for line in log.splitlines() if line.startswith("curl ")]
+
+    def test_a_working_primary_never_touches_the_pool_url(self):
+        result, codes, log = self.run_script(self.FETCH)
         self.assertEqual(codes, [])
-        self.assertIn("snapshot.example", log)
-        self.assertIn("pool.example", log)
-        result, codes, log = self.run_script(body, env={"PAYLOAD": "tampered"})
+        self.assertEqual(self.requests(log), ["https://snapshot.example/x"])
+
+    def test_the_pool_url_is_tried_after_a_failed_primary_download_and_verified_too(self):
+        result, codes, log = self.run_script(self.FETCH, env={"PRIMARY_RC": "22"})
+        self.assertEqual(codes, [])
+        self.assertEqual(self.requests(log), ["https://snapshot.example/x", "https://pool.example/x"])
+        result, codes, log = self.run_script(self.FETCH, env={"PRIMARY_RC": "22", "POOL_PAYLOAD": "tampered"})
         self.assertEqual(codes, ["checksum_mismatch"])
+
+    def test_wrong_bytes_from_the_primary_are_never_retried_from_the_pool(self):
+        result, codes, log = self.run_script(self.FETCH, env={"PRIMARY_PAYLOAD": "tampered"})
+        self.assertEqual(codes, ["checksum_mismatch"])
+        self.assertEqual(self.requests(log), ["https://snapshot.example/x"])
+
+    def test_when_both_sources_fail_the_reason_names_both_urls(self):
+        result, codes, log = self.run_script(self.FETCH, env={"PRIMARY_RC": "22", "POOL_RC": "22"})
+        self.assertEqual(codes, ["artifact_missing"])
+        self.assertIn("https://snapshot.example/x", result.stdout)
+        self.assertIn("https://pool.example/x", result.stdout)
 
 
 class MacLegTest(unittest.TestCase):

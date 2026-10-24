@@ -109,7 +109,9 @@ already installed and no interrupted install is pending), which:
 - registers the daemon as the only login service: the systemd user unit
   `pohunek-<ns>-daemon.service` and slice `pohunek-<ns>-sessions.slice` on Linux
   (systemd 255 or newer; the user manager must offer a session bus, which on
-  minimal Debian and cloud images needs the `dbus-user-session` package), or the launchd agent
+  Debian-family systems installed without recommended packages, for example the
+  Debian genericcloud images, needs the `dbus-user-session` package; without it
+  the install fails with `supervisor operation connect is unavailable`), or the launchd agent
   `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS;
 - waits until the daemon job's own process answers on the socket, and journals
   every step in `~/.local/state/pohunek/service-install.json` so an interrupted
