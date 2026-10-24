@@ -250,7 +250,8 @@ scripts/acceptance/tailscale-overlay run \
   --probe <path>/overlay_probe \
   --netbird-address <this host's NetBird address> \
   --owner-unit pohunek-<id>-daemon.service \
-  --macos-bin-dir <dir on the Mac>
+  --macos-bin-dir <dir on the Mac> \\
+  --macos-project <project on the Mac, not the owner's working checkout>
 ```
 
 `pins` prints the pinned versions and checksums. The command prints the verdict
@@ -358,7 +359,13 @@ download 5 min the first time, boot 2 min, provisioning 4 min, D4 and the extras
   with `env -i` under `/dev/shm/ph1112`, and the leg refuses to start when that
   directory already exists.
 - On zajcaair all commands run in a named shell session
-  (`ph-macos-op1112acc`, `--cwd /tmp/ph-macos-cache`), under a throwaway
+  (`ph-macos-op1112acc`, `--cwd /tmp/ph-macos-cache`). The session is the only
+  channel to the Mac, so it is started through the owner's own daemon there; a
+  remote `session new` needs a project, which the operator names with
+  `--macos-project` (no default; the session runs in the cache directory, not in
+  that project's checkout, and nothing else is done through the owner's daemon
+  except a final `health`). The pohunek binaries under test talk only to their
+  own throwaway daemon, under a throwaway
   `HOME`-relative root and `/private/tmp/ph1112`, with `XDG_RUNTIME_DIR` set so
   the owner's live daemon path is never used. The guard compares the doctor
   paths with the roots before anything starts. Each of the three roots (the

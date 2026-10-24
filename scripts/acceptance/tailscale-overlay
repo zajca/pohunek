@@ -143,9 +143,12 @@ macos_session_name=ph-macos-op1112acc
 macos_session_cwd=/tmp/ph-macos-cache
 macos_runtime_root=/private/tmp/ph1112
 macos_comm_root=/private/tmp/ph1112c
-# Project label on the Mac that the shell session is started under (a remote
-# `session new` needs a project); the session itself runs in --cwd.
-macos_project=pohunek
+# Project reference on the Mac that the shell session is started under (a remote
+# `session new` needs one; --macos-project, no default so the operator names a
+# project that is not the owner's working checkout). The session runs in
+# macos_session_cwd and only carries the commands; the pohunek binaries under
+# test talk to their own throwaway daemon.
+macos_project=
 macos_brew=/opt/homebrew/bin/brew
 # Homebrew must neither update itself nor clean up the owner's other formulae.
 macos_brew_cmd="env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 $macos_brew"
@@ -203,6 +206,10 @@ Options for run:
   --macos-host NAME      NetBird host name of the Mac (default: $macos_host).
   --macos-bin-dir DIR    Directory ON the Mac with pohunek, pohunekd and
                          pohunek-sessiond built for the commit under test.
+  --macos-project REF    Project (id or label) on the Mac under which the
+                         command shell session is started (macos leg; required,
+                         no default; its checkout is not used, the session runs
+                         in /tmp/ph-macos-cache).
   --output FILE          Evidence document (default: $output).
   --cache-dir DIR        Download cache (default: $cache_dir).
   --run-root DIR         Parent of the per-run directories (default: $run_root).
@@ -1571,6 +1578,7 @@ parse_run_options() {
       --pohunek) [ "$#" -ge 2 ] || die "--pohunek needs a value"; owner_pohunek=$2; shift 2 ;;
       --macos-host) [ "$#" -ge 2 ] || die "--macos-host needs a value"; macos_host=$2; shift 2 ;;
       --macos-bin-dir) [ "$#" -ge 2 ] || die "--macos-bin-dir needs a value"; macos_bin_dir=$2; shift 2 ;;
+      --macos-project) [ "$#" -ge 2 ] || die "--macos-project needs a value"; macos_project=$2; shift 2 ;;
       --output) [ "$#" -ge 2 ] || die "--output needs a value"; output=$2; shift 2 ;;
       --cache-dir) [ "$#" -ge 2 ] || die "--cache-dir needs a value"; cache_dir=$2; shift 2 ;;
       --run-root) [ "$#" -ge 2 ] || die "--run-root needs a value"; run_root=$2; shift 2 ;;
@@ -1610,6 +1618,9 @@ validate_options() {
   fi
   if has_leg macos && ! has_leg vms; then
     die "the macos leg needs the vms leg (Headscale runs in VM-A)"
+  fi
+  if has_leg macos && [ -z "$macos_project" ]; then
+    die "the macos leg needs --macos-project (a project on $macos_host other than the owner's working checkout)"
   fi
   if has_leg vms; then
     [ -n "$probe" ] || die "the vms leg needs --probe PATH"

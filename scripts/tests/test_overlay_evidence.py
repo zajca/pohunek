@@ -355,6 +355,15 @@ class DriverScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("needs the vms leg", result.stderr)
 
+    def test_the_macos_leg_needs_an_explicit_project_for_its_shell_session(self):
+        result = self.run_driver(
+            "run", "--leg", "vms", "--leg", "macos", "--no-slot-wrapper", "--bins-dir", "/", "--probe", "/bin/true",
+            "--netbird-address", "100.80.1.5", "--owner-unit", "x", "--macos-bin-dir", "/x",
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--macos-project", result.stderr)
+        self.assertNotIn("pohunek project", result.stderr)
+
     def test_unknown_options_and_legs_are_refused(self):
         self.assertEqual(self.run_driver("run", "--leg", "bogus").returncode, 2)
         self.assertEqual(self.run_driver("run", "--frobnicate").returncode, 2)

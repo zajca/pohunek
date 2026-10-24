@@ -6,8 +6,9 @@
   the image lacks, with `dbus-user-session`, as pinned offline packages
   (sha256-verified, snapshot.debian.org primary), creates a throwaway repository
   with one commit on each VM, registers it with `pohunek project add` and starts
-  the D4 session on the peer's project. The zajcaair shell session is started
-  under the `pohunek` project label as well.
+  the D4 session on the peer's project. The zajcaair command shell session
+  is started under a project the operator names with `--macos-project` (no
+  default, so the owner's working checkout is never chosen implicitly).
 - The evidence helper tolerates IPv6 endpoint addresses in a status recording
   (they used to leave invalid JSON and crash `assemble`) and reports an
   unparsable recording as an error; the D7 hint check also reads the `recover`
