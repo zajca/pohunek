@@ -511,9 +511,11 @@ background transaction that `SessionRegistry::settle_transactions` waits for. A
 test that opens a second registry over the same store or workers calls
 `SessionRegistry::shutdown` on the first one before it does, instead of holding
 `persist_lock` or waiting for the registry to drop; after `shutdown` a store
-write through the old registry aborts the test process (SIGABRT in nextest), and
-a write over a sealed terminal worker journal aborts a debug worker, so a late
-writer fails every run instead of some. `crates/xtask/tests/lifecycle_result_ratchet.rs`
+write through the old registry aborts the test process in the daemon's unit
+tests (SIGABRT in nextest; integration tests under `crates/daemon/tests` get the
+`registry_shut_down` error instead), and a write over a sealed terminal worker
+journal aborts a debug worker, so a late writer fails every run instead of some.
+A helper asserts `shutdown().is_quiescent()` on the report it gets. `crates/xtask/tests/lifecycle_result_ratchet.rs`
 counts `let _ = <x>.stop|remove|resume|restart|kill|shutdown|retire(..).await;`
 in test code per file against `lifecycle_result_ratchet_baseline.txt`, and
 `crates/xtask/tests/detached_spawn_ratchet.rs` counts bare `tokio::spawn` in the

@@ -239,7 +239,7 @@ pub(super) fn spawn_agent_state_hook_dispatcher(
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let spawner = registry.clone();
-    spawner.spawn_cooperative("agent_state_hook_dispatcher", async move {
+    spawner.spawn_background("agent_state_hook_dispatcher", async move {
         let mut last_fired: HashMap<SessionId, AgentActivity> = HashMap::new();
         let mut pending: HashMap<SessionId, (AgentActivity, tokio::time::Instant)> = HashMap::new();
         let mut in_flight: HashSet<SessionId> = HashSet::new();

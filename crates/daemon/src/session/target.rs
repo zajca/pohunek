@@ -550,7 +550,12 @@ impl SessionRegistry {
                 "the daemon is not configured for worktree binding",
             ));
         };
-        tokio::task::spawn_blocking(move || manager.bind(&request))
+        // The manager writes the registry's store itself, so the write gate is
+        // taken here and the write is tracked like the registry's own.
+        self.store_for_write()?;
+        self.inner
+            .background
+            .spawn_blocking(move || manager.bind(&request))
             .await
             .map_err(|_join_error| {
                 runtime_error("worktree_bind_failed", "worktree bind task panicked")
@@ -649,8 +654,18 @@ impl SessionRegistry {
             Box::pin(registry.run_pty_registration(spec, guard)).await
         })
         .await
-        .map_err(|_join_error| {
-            runtime_error("session_launch_failed", "session launch task panicked")
+        .map_err(|join_error| {
+            if join_error.is_cancelled() {
+                // Only a refused spawn is cancelled: the registry has shut down.
+                ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "daemon_shutting_down",
+                    "the daemon is shutting down and accepts no new sessions",
+                    Some("retry once the daemon is running again".to_owned()),
+                )
+            } else {
+                runtime_error("session_launch_failed", "session launch task panicked")
+            }
         })?
     }
 

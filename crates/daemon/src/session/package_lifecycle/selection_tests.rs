@@ -703,7 +703,8 @@ async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_v
                 .expect("worker watch identity before restart"),
         )
     };
-    v.fixture.registry.shutdown().await;
+    let report = v.fixture.registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     let restarted = v.fixture.reopen_with_workers().await;
     let old_reconnect = v
         .fixture
@@ -797,7 +798,8 @@ async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_
     install(&v.fixture, &new, true).await;
     assert_held_back(&v.fixture, &new, &v.old).await;
 
-    v.fixture.registry.shutdown().await;
+    let report = v.fixture.registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     let restarted = v.fixture.reopen_with_workers().await;
     if let Err(error) = restarted.registry.reconcile_workers().await {
         let inventory = restarted.registry.runtime_inventory().await;

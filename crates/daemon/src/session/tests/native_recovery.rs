@@ -237,7 +237,8 @@ impl Rig {
     }
 
     async fn detach_daemon(&mut self) {
-        self.registry.shutdown().await;
+        let report = self.registry.shutdown().await;
+        assert!(report.is_quiescent(), "{report:?}");
         let entry = self
             .registry
             .inner

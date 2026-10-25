@@ -25,8 +25,8 @@ pub(super) enum OnShutdown {
     /// The task is aborted at its next await point. For work blocked on I/O
     /// that has no cancellation of its own, and for waiters on other tasks.
     Abort,
-    /// The task watches a token that shutdown cancels (the root token's
-    /// children, or a daemon-wide shutdown token) and ends by itself; shutdown
+    /// The task watches a token that shutdown cancels (a child of the root
+    /// token, or the daemon-wide shutdown token) and ends by itself; shutdown
     /// waits for it instead of cutting it off mid-commit.
     Cooperative,
     /// The task is a finite transaction with the worker or the store that must
@@ -36,6 +36,7 @@ pub(super) enum OnShutdown {
 }
 
 /// What [`BackgroundTasks::shutdown`] found.
+#[must_use = "a report that is not quiescent means a task outlived the deadline"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShutdownReport {
     /// Names of the tasks still running when the deadline passed.

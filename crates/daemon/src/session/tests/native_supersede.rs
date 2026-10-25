@@ -534,7 +534,8 @@ impl Rig {
         // The replaced registry stands for the dead daemon: shutdown waits for
         // its in-flight projection write, and a late write of its own would
         // abort the test instead of removing the binding the new daemon owns.
-        self.registry.shutdown().await;
+        let report = self.registry.shutdown().await;
+        assert!(report.is_quiescent(), "{report:?}");
         let entry = self
             .registry
             .inner
@@ -1394,7 +1395,8 @@ impl Rig {
     /// agent switch to `reference` while no daemon runs, then starts a new
     /// daemon over the same store and workers.
     async fn restart_with(&mut self, while_down: Option<&str>) -> SessionRegistry {
-        self.registry.shutdown().await;
+        let report = self.registry.shutdown().await;
+        assert!(report.is_quiescent(), "{report:?}");
         // Every session of the dead daemon lets go of its worker, forks
         // included, or a worker would keep serving its former controller.
         self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
@@ -1428,7 +1430,8 @@ impl Rig {
     /// The agent switches to `reference` and exits while no daemon runs; the
     /// new daemon then finds an ended worker.
     async fn restart_down_then_exit(&mut self, reference: &str) {
-        self.registry.shutdown().await;
+        let report = self.registry.shutdown().await;
+        assert!(report.is_quiescent(), "{report:?}");
         self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
         let entries: Vec<_> = self
             .registry
@@ -1937,7 +1940,8 @@ async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journ
 
     // The daemon restarts while the worker is still draining the PTY of a
     // launch process that has already ended.
-    rig.registry.shutdown().await;
+    let report = rig.registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     let entries: Vec<_> = rig
         .registry
         .inner
