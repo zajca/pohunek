@@ -7340,10 +7340,53 @@ fn control_error_message(code: ControlCode, message: &str, retryable: bool) -> C
     }
 }
 
+/// Writes `record` as the worker journal.
+///
+/// A committed `Terminal` record seals the journal ([`Journal::check_seal`]):
+/// every later writer runs under the state lock on a clone of the sealed
+/// record, so the only legitimate replacement is the terminal acknowledgement
+/// (`acknowledge_request`). Any other write would change a runtime outcome the
+/// daemon may already have read; it is refused and logged, and debug builds
+/// abort so a test cannot miss it (a panic in a spawned task would only be
+/// printed).
 async fn persist(journal: Journal, record: JournalRecord) -> Result<(), WorkerError> {
+    if let Err(refusal) = journal.check_seal(&record) {
+        let changed_fields = refusal.changed_fields.join(",");
+        event!(
+            name: "worker.journal.sealed_write_refused",
+            Level::ERROR,
+            journal.attempted_phase = ?refusal.attempted_phase,
+            journal.changed_fields = %changed_fields,
+            "refused a write over the sealed terminal journal: changed {{journal.changed_fields}}",
+        );
+        #[cfg(debug_assertions)]
+        {
+            eprintln!(
+                "worker.journal.sealed_write_refused: attempted {:?}, changed {changed_fields}",
+                refusal.attempted_phase
+            );
+            std::process::abort();
+        }
+        #[cfg(not(debug_assertions))]
+        return Err(WorkerError::Protocol(format!(
+            "the terminal journal is sealed; refused a write that changes {changed_fields}"
+        )));
+    }
+    let sealing = record.phase == JournalPhase::Terminal;
+    let sealed_record = sealing.then(|| record.clone());
+    let sealed_journal = journal.clone();
     let result = tokio::task::spawn_blocking(move || journal.write(&record))
         .await
         .map_err(|_join_error| WorkerError::Protocol("journal writer task failed".to_owned()))?;
+    if let Some(record) = sealed_record {
+        let committed = match &result {
+            Ok(()) => true,
+            Err(error) => error.committed_durability_uncertain(),
+        };
+        if committed {
+            sealed_journal.seal(&record);
+        }
+    }
     match result {
         Ok(()) => Ok(()),
         Err(error) if error.committed_durability_uncertain() => {
