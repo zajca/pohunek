@@ -296,6 +296,16 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         &["crates"],
         "scan of every crate's Rust sources against the timing baseline",
     ),
+    (
+        "crates/xtask/tests/timing_deadline_ratchet.rs",
+        &["crates"],
+        "scan of every crate's Rust sources against the deadline baseline",
+    ),
+    (
+        "crates/xtask/tests/sdk_timing_ratchet.rs",
+        &["sdk/ts"],
+        "scan of the SDK workspace's TypeScript tests against the SDK timing baseline",
+    ),
 ];
 
 /// Resolved reads that are not reads, as `(file, path, why)`.

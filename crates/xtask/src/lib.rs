@@ -18,6 +18,7 @@ mod package_affected;
 mod package_baseline;
 mod package_bump;
 mod package_evidence;
+pub mod ratchet;
 mod release;
 mod release_inventory;
 mod release_policy;
