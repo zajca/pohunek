@@ -75,9 +75,14 @@ changed tests N times under `scripts/stress-run` (4 pinned CPUs, no retries).
 Counts are lane suggestions, not defaults: 50 for heavy, 20 for relay-db; pick
 the deadline from the measured cost of one iteration. On macOS there is no CPU
 affinity, so the run needs `--unpinned` and the contention is host-wide; say so
-in the report. `--print` shows the selection without running anything. A test
-the script cannot map or list fails the step by name (for example a test
-compiled out on this host: run the step on the host that builds it).
+in the report. Both cargo calls build with `--all-features`, like CI's test
+archive, so feature-gated tests (relay `postgres-tests`) run. `--print` shows the selection without running anything. A test
+the script cannot map or list fails the step by name; a `macro_rules!` that
+generates tests fails by the macro's name (stress the whole partition then). A
+diff that changes tests for two operating systems cannot pass on one host: run
+the step on each host with `--allow-missing-on-host`, which names every test the
+host does not build as NOT STRESSED, and carry those names to the host that
+builds them in the report.
 
 A failure is a FLAKY result under the flaky-test policy: open or reuse an issue
 with the root cause, fix the test or the product race, and run the step again.

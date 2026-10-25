@@ -34,6 +34,8 @@ argv = sys.argv[1:]
 if argv[:1] == ["metadata"]:
     sys.stdout.write(open(os.environ["FAKE_METADATA"]).read())
 elif argv[:2] == ["nextest", "list"]:
+    with open(os.environ["FAKE_LOG"], "a") as stream:
+        stream.write(json.dumps(argv) + "\n")
     sys.stdout.write(open(os.environ["FAKE_LIST"]).read())
 elif argv[:2] == ["nextest", "run"]:
     with open(os.environ["FAKE_LOG"], "a") as stream:
@@ -74,6 +76,16 @@ mod tests {
 
     #[test]
     fn gets_moved() {
+        assert!(true);
+    }
+
+    #[test]
+    fn middle_case() {
+        assert!(true);
+    }
+
+    #[test]
+    fn below_middle() {
         assert!(true);
     }
 }
@@ -385,16 +397,21 @@ class Listing(Fixture):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("tests::comment_edit", result.stderr)
         self.assertIn("excluded by profile 'fast'", result.stderr)
-        self.assertFalse(self.log.exists(), "no stress run may start")
+        self.assertNotIn('"run"', self.log.read_text(), "no stress run may start")
 
     def test_the_stress_run_uses_the_exact_filter_without_retries(self):
         result = self.run_script(
             list_json=listing({"demo": {"tests::comment_edit": "matches"}}))
         self.assertEqual(result.returncode, 0, result.stderr)
         recorded = [json.loads(line) for line in self.log.read_text().splitlines()]
-        self.assertEqual(len(recorded), 1)
-        argv = recorded[0]
-        self.assertEqual(argv[:6], ["nextest", "run", "--profile", "heavy", "-p", "demo"])
+        self.assertEqual([r[1] for r in recorded], ["list", "run"])
+        # The list and the run build with CI's feature set, so feature-gated
+        # tests (relay postgres-tests) are compiled.
+        for argv in recorded:
+            self.assertIn("--all-features", argv)
+        argv = recorded[1]
+        self.assertEqual(argv[:7], ["nextest", "run", "--profile", "heavy", "--all-features",
+                                    "-p", "demo"])
         self.assertEqual(argv[argv.index("--stress-count") + 1], "3")
         self.assertEqual(argv[argv.index("--retries") + 1], "0")
         self.assertIn("--no-tests=fail", argv)
@@ -407,6 +424,97 @@ class Listing(Fixture):
         result = self.run_script(
             list_json=listing({"demo": {"tests::comment_edit": "matches"}}), run_rc=100)
         self.assertEqual(result.returncode, 100, result.stderr)
+
+
+MACRO_BLOCK = '''    macro_rules! gen_case {
+        ($name:ident) => {
+            #[test]
+            fn $name() {
+                assert!(true);
+            }
+        };
+    }
+
+    gen_case!(generated_one);
+
+'''
+
+
+class GeneratedTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.edit("crates/demo/src/lib.rs", "    #[test]\n    fn middle_case() {",
+                  MACRO_BLOCK + "    #[test]\n    fn middle_case() {")
+        self.commit("add macro")
+
+    def test_a_changed_macro_template_fails_by_name(self):
+        self.edit("crates/demo/src/lib.rs", "            fn $name() {\n                assert!(true);",
+                  "            fn $name() {\n                assert!(1 == 1);")
+        self.commit()
+        self.assert_macro_failure_from("HEAD~1")
+
+    def test_an_added_invocation_fails_by_name(self):
+        self.edit("crates/demo/src/lib.rs", "    gen_case!(generated_one);",
+                  "    gen_case!(generated_one);\n    gen_case!(generated_two);")
+        self.commit()
+        self.assert_macro_failure_from("HEAD~1")
+
+    def test_an_unrelated_change_next_to_the_macro_is_not_a_failure(self):
+        self.edit("crates/demo/src/lib.rs", "pub fn helper() -> u32 {\n    1\n}",
+                  "pub fn helper() -> u32 {\n    3\n}")
+        self.commit()
+        result = self.run_script("--print", base="HEAD~1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assert_macro_failure_from(self, base):
+        result = self.run_script("--print", base=base)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("gen_case!", result.stderr)
+        self.assertIn("generates tests", result.stderr)
+
+
+class DeletionRule(Fixture):
+    def test_deleting_a_middle_test_does_not_select_its_neighbour(self):
+        self.edit("crates/demo/src/lib.rs",
+                  "    #[test]\n    fn middle_case() {\n        assert!(true);\n    }\n\n", "")
+        self.commit()
+        result = self.run_script("--print")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("nothing to stress", result.stdout)
+
+
+class HostShare(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.edit("crates/demo/src/lib.rs", "// original comment", "// edit")
+        self.edit("crates/demo/tests/flow.rs", "assert!(true);", "assert!(!false);")
+        self.commit()
+
+    def test_a_test_the_host_does_not_build_fails_by_default(self):
+        result = self.run_script(list_json=listing({"demo": {"tests::comment_edit": "matches"}}))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("flow_case", result.stderr)
+        self.assertIn("--allow-missing-on-host", result.stderr)
+
+    def test_the_opt_in_flag_names_it_and_stresses_the_rest(self):
+        result = self.run_script(
+            "--allow-missing-on-host",
+            list_json=listing({"demo": {"tests::comment_edit": "matches"}}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NOT STRESSED on this host", result.stderr)
+        self.assertIn("flow_case", result.stderr)
+        argv = [json.loads(line) for line in self.log.read_text().splitlines()][-1]
+        expression = argv[argv.index("-E") + 1]
+        self.assertIn("tests::comment_edit", expression)
+        self.assertNotIn("flow_case", expression)
+
+    def test_nothing_runs_when_the_host_builds_none_of_them(self):
+        result = self.run_script("--allow-missing-on-host", list_json=listing({}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NOT STRESSED", result.stderr)
+        self.assertIn("nothing stressed here", result.stdout)
+        run_calls = [line for line in self.log.read_text().splitlines() if '"run"' in line]
+        self.assertEqual(run_calls, [])
 
 
 class Arguments(Fixture):

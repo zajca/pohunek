@@ -38,14 +38,17 @@ One filterset selects every test exactly (`test(=name)`); a file compiled into
 several binaries yields one identity per binary.
 
 Nothing is dropped silently. A changed test that cannot be mapped (a file no
-target reaches, a test inside a macro or function body, `rstest`/`test_case`
+target reaches, a test inside a function body, a `macro_rules!` that generates
+tests (its definition or an invocation changed), `rstest`/`test_case`
 variants, `#[path]` inside an inline module) fails the run and names the test.
 Every selected test is then checked against `cargo nextest list` for the
 profile, which also builds the test binaries before the pinned run starts: a
 test missing from the list (compiled out on this host, for example a macOS
-`cfg`) or excluded by the profile's filter fails by name, and an `#[ignore]`d
+`cfg`; `--allow-missing-on-host` names it as NOT STRESSED and stresses the rest)
+or excluded by the profile's filter fails by name, and an `#[ignore]`d
 test is reported as skipped because nextest does not run it. Both cargo
-invocations are limited to the packages of the selected tests (`-p`). The
+invocations use `--all-features`, as CI's test archive does, and are limited
+to the packages of the selected tests (`-p`). The
 stress run is `scripts/stress-run --cpus 4 -- cargo nextest run --stress-count
 N ...`.
 
@@ -76,10 +79,14 @@ STRESS_CPUS = 4
 # exact-name filter cannot select, so they fail the run by name.
 TEST_ATTRIBUTE = "test"
 VARIANT_ATTRIBUTES = ("rstest", "test_case", "bench")
+# CI builds every test lane from one `--all-features` archive, so feature-gated
+# tests (for example relay `postgres-tests`) exist only with it.
+BUILD_FLAGS = ("--all-features",)
 STRESS_RUN = Path(__file__).resolve().parent / "stress-run"
 EXIT_UNMAPPED = 1
 EXIT_USAGE = 2
 
+TEST_ATTRIBUTE_PATTERN = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b")
 ATTRIBUTE_START = re.compile(r"#\s*!?\s*\[")
 FN_PATTERN = re.compile(r"\bfn\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)")
 MOD_BLOCK_TAIL = re.compile(r"(?:^|[\s;{}\]])mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*$")
@@ -211,7 +218,7 @@ class Item:
 class Module:
     """Parsed facts about one source file."""
 
-    def __init__(self, text):
+    def __init__(self, text, scan=True):
         self.text = text
         self.skeleton = blank_literals(text)
         self.line_starts = [0]
@@ -219,7 +226,8 @@ class Module:
             self.line_starts.append(match.end())
         self.items = []
         self.declarations = []  # (name, inline mod chain, path attr or None)
-        self.scan()
+        if scan:
+            self.scan()
 
     def line_of(self, offset):
         low, high = 0, len(self.line_starts)
@@ -247,6 +255,33 @@ class Module:
                 cursor = len(before) - len("pub")
             else:
                 return cursor
+
+    def test_macro_definitions(self):
+        """`[(name, first line, last line)]` of `macro_rules!` bodies that hold a test attribute."""
+        found = []
+        for match in re.finditer(r"\bmacro_rules\s*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*([({\[])",
+                                 self.skeleton):
+            closer = {"(": ")", "{": "}", "[": "]"}[match.group(2)]
+            end = matching(self.skeleton, match.end() - 1, match.group(2), closer)
+            end = len(self.skeleton) - 1 if end == -1 else end
+            if TEST_ATTRIBUTE_PATTERN.search(self.skeleton[match.end():end]):
+                found.append((match.group(1), self.line_of(match.start()), self.line_of(end)))
+        return found
+
+    def macro_invocations(self, names):
+        """`[(name, first line, last line)]` of `name!(..)` calls for the given macro names."""
+        found = []
+        if not names:
+            return found
+        pattern = re.compile(r"\b(" + "|".join(map(re.escape, names)) + r")\s*!\s*([({\[])")
+        for match in pattern.finditer(self.skeleton):
+            if self.skeleton[:match.start()].rstrip().endswith("macro_rules!"):
+                continue
+            closer = {"(": ")", "{": "}", "[": "]"}[match.group(2)]
+            end = matching(self.skeleton, match.end() - 1, match.group(2), closer)
+            end = len(self.skeleton) - 1 if end == -1 else end
+            found.append((match.group(1), self.line_of(match.start()), self.line_of(end)))
+        return found
 
     def attributes_before(self, offset):
         """Attributes directly above `offset`: (list of attr dicts, first offset)."""
@@ -354,10 +389,12 @@ def run(argv, cwd, check=True):
 
 
 def changed_lines(root, base):
-    """`{path: [(start, end)]}` of changed 1-based line spans (end inclusive).
+    """`{path: [(start, end, attrs_only)]}` of changed 1-based line spans.
 
-    A pure deletion is a zero-width span `(c + 0.5, c + 0.5)` between lines c
-    and c + 1.
+    `end` is inclusive. A pure deletion is a zero-width span `(c + 0.5, c +
+    0.5)` between lines c and c + 1; `attrs_only` says that every removed line
+    was an attribute or comment line, which is the only deletion that selects
+    the test right below it.
     """
     merge_base = run(["git", "merge-base", base, "HEAD"], root).stdout.strip()
     diff = run(
@@ -368,34 +405,51 @@ def changed_lines(root, base):
     ).stdout
     spans = {}
     current = None
+    pending = None  # [start, removed lines] of the hunk being read
+    def close_hunk():
+        if pending and current and pending[2] == 0:
+            attrs_only = bool(pending[1]) and all(
+                text.lstrip().startswith(("#[", "#!", "//")) for text in pending[1])
+            spans.setdefault(current, []).append((pending[0] + 0.5, pending[0] + 0.5, attrs_only))
     for line in diff.splitlines():
         if line.startswith("+++ "):
+            close_hunk()
+            pending = None
             current = line[6:] if line.startswith("+++ b/") else None
             continue
         match = HUNK_HEADER.match(line)
-        if match and current:
-            start = int(match.group(1))
-            count = 1 if match.group(2) is None else int(match.group(2))
-            if count == 0:
-                spans.setdefault(current, []).append((start + 0.5, start + 0.5))
-            else:
-                spans.setdefault(current, []).append((start, start + count - 1))
+        if match:
+            close_hunk()
+            pending = None
+            if current:
+                start = int(match.group(1))
+                count = 1 if match.group(2) is None else int(match.group(2))
+                if count == 0:
+                    pending = [start, [], count]
+                else:
+                    spans.setdefault(current, []).append((start, start + count - 1, False))
+            continue
+        if pending is not None and line.startswith("-") and not line.startswith("---"):
+            pending[1].append(line[1:])
+    close_hunk()
     untracked = run(
         ["git", "ls-files", "--others", "--exclude-standard", "--", f"{SOURCE_ROOT}/"],
         root,
     ).stdout.split("\n")
     for path in filter(None, untracked):
         text = (root / path).read_text(errors="replace")
-        spans[path] = [(1, max(1, text.count("\n") + 1))]
+        spans[path] = [(1, max(1, text.count("\n") + 1), False)]
     return {path: s for path, s in spans.items() if path.endswith(".rs")}
 
 
 def intersects(span, item):
-    start, end = span
+    start, end, attrs_only = span
     if start != int(start):  # a deletion between two lines
-        # One line of slack above the range: a deleted first attribute (for
-        # example `#[ignore]`) leaves the remaining range starting right below.
-        return item.first_line - 1 <= start - 0.5 and start + 0.5 <= item.last_line
+        # A removed first attribute (for example `#[ignore]`) leaves the item
+        # starting right below the deletion; any other removal there belongs
+        # to a neighbour.
+        slack = 1 if attrs_only else 0
+        return item.first_line - slack <= start - 0.5 and start + 0.5 <= item.last_line
     return start <= item.last_line and end >= item.first_line
 
 
@@ -484,6 +538,20 @@ class ModuleTree:
             self.walk(target, child, modpath + chain + (name,), child_mod_rs, seen)
 
 
+def workspace_test_macros(root):
+    """Names of every `macro_rules!` under the source root whose body holds a test attribute."""
+    names = set()
+    for directory, dirs, files in os.walk(root / SOURCE_ROOT):
+        dirs[:] = [d for d in dirs if d != "target"]
+        for filename in files:
+            if not filename.endswith(".rs"):
+                continue
+            text = (Path(directory) / filename).read_text(errors="replace")
+            if "macro_rules" in text:
+                names.update(name for name, _, _ in Module(text, scan=False).test_macro_definitions())
+    return names
+
+
 def select(root, base):
     """Return `(identities, skipped)` for the diff, or raise SelectionError.
 
@@ -494,6 +562,7 @@ def select(root, base):
     targets = load_targets(root)
     modules = {}
     tree = ModuleTree(targets, modules)
+    test_macros = workspace_test_macros(root)
     selected = []
     skipped = []
     problems = []
@@ -502,6 +571,13 @@ def select(root, base):
         if not path.exists():
             continue  # deleted file
         module = tree.parse(path)
+        for name, first, last in module.test_macro_definitions() + module.macro_invocations(
+                test_macros):
+            probe = Item(name, [], first, last, (), False)
+            if any(intersects(span, probe) for span in file_spans):
+                problems.append(
+                    f"{rel}:{first}: `{name}!` generates tests, so the changed lines here "
+                    "cannot be mapped to test names; stress the whole partition instead")
         for item in module.items:
             if not any(intersects(span, item) for span in file_spans):
                 continue
@@ -557,25 +633,36 @@ def package_args(selected):
     return args
 
 
-def verify_listed(root, profile, expression, selected):
-    """Check every selected test against `cargo nextest list`; builds the binaries."""
+def verify_listed(root, profile, expression, selected, allow_missing):
+    """Check every selected test against `cargo nextest list`; builds the binaries.
+
+    Returns the tests the run will stress. A test missing from the list
+    fails the check, unless `allow_missing` names it as not stressed here.
+    """
     result = run(
-        ["cargo", "nextest", "list", "--profile", profile, *package_args(selected),
-         "-E", expression, "--message-format", "json"],
+        ["cargo", "nextest", "list", "--profile", profile, *BUILD_FLAGS,
+         *package_args(selected), "-E", expression, "--message-format", "json"],
         root, check=False)
     if result.returncode != 0:
         raise SelectionError(
             f"`cargo nextest list` failed ({result.returncode}):\n{result.stderr.strip()}")
     suites = json.loads(result.stdout)["rust-suites"]
     missing = []
+    runnable = []
     for target, name, rel, line in selected:
         suite = suites.get(target.binary_id)
         case = suite["testcases"].get(name) if suite else None
         if case is None:
+            if allow_missing:
+                print(f"stress-changed-tests: NOT STRESSED on this host: {rel}:{line} `{name}` "
+                      f"({target.binary_id}) is not built here; it must be stressed on a host "
+                      "that builds it, and the report must say so", file=sys.stderr)
+                continue
             missing.append(
                 f"{rel}:{line}: `{name}` ({target.binary_id}) is not in the nextest list: "
                 "not built on this host (for example a cfg for another OS; run the gate "
-                "there) or the identity is wrong")
+                "there, or pass --allow-missing-on-host to stress only this host's share) "
+                "or the identity is wrong")
         elif case.get("ignored"):
             print(f"stress-changed-tests: skipped {rel} `{name}`: ignored in the nextest "
                   "list, so nextest does not run it", file=sys.stderr)
@@ -584,8 +671,11 @@ def verify_listed(root, profile, expression, selected):
                 f"{rel}:{line}: `{name}` ({target.binary_id}) is excluded by profile "
                 f"{profile!r} ({case['filter-match'].get('reason', 'filtered')}); pick the "
                 "profile that owns the test")
+        else:
+            runnable.append((target, name, rel, line))
     if missing:
         raise SelectionError("\n".join(missing))
+    return runnable
 
 
 def positive_int(text):
@@ -620,6 +710,10 @@ def build_parser():
                         help="nextest profile that owns the tests (heavy, relay-db, macos, ...)")
     parser.add_argument("--unpinned", action="store_true",
                         help="pass --unpinned to stress-run (required on macOS)")
+    parser.add_argument("--allow-missing-on-host", action="store_true",
+                        help="stress only the tests this host builds; name each one it does "
+                        "not build (for example another OS's cfg) as NOT STRESSED, which the "
+                        "report must carry to a host that builds it")
     parser.add_argument("--print", dest="print_only", action="store_true",
                         help="print the selection and filterset, then exit")
     return parser
@@ -645,14 +739,19 @@ def main(argv):
         print(f"filter: {expression}")
         return 0
     try:
-        verify_listed(root, args.profile, expression, selected)
+        selected = verify_listed(root, args.profile, expression, selected,
+                                 args.allow_missing_on_host)
     except SelectionError as error:
         print(f"stress-changed-tests: {error}", file=sys.stderr)
         return EXIT_UNMAPPED
+    if not selected:
+        print("stress-changed-tests: no selected test runs on this host; nothing stressed here")
+        return 0
+    expression = build_filter(selected)
     command = [
         str(STRESS_RUN), "--deadline", args.deadline, "--cpus", str(STRESS_CPUS),
         *(["--unpinned"] if args.unpinned else []),
-        "--", "cargo", "nextest", "run", "--profile", args.profile,
+        "--", "cargo", "nextest", "run", "--profile", args.profile, *BUILD_FLAGS,
         *package_args(selected), "--stress-count", str(args.count), "--retries", "0", "--no-tests=fail",
         "-E", expression,
     ]
