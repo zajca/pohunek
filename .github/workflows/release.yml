@@ -771,6 +771,17 @@ jobs:
           test -n "$have"
           test "$want" = "$have"
 
+      # The draft's body is checked before it becomes public, so a mismatch stops
+      # the run while the release is still a draft. `releases/tags/<tag>` does not
+      # return drafts, hence the list. `gh --jq` prints the string followed by one
+      # newline, which the notes file (it ends in a newline) is compared against.
+      - name: Verify the draft body
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG and .draft) | .body' > "$RUNNER_TEMP/draft-body.txt"
+          cmp "$RUNNER_TEMP/draft-body.txt" <(cat "$RUNNER_TEMP/release-notes/release-notes.md"; echo)
+
       - name: Publish the draft
         shell: bash
         run: |
@@ -787,14 +798,6 @@ jobs:
           have="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG and (.draft | not)) | .assets[] | select(.state == "uploaded") | "\(.name) \(.digest) \(.size)"' | LC_ALL=C sort)"
           test -n "$have"
           test "$want" = "$have"
-
-      # The body is the notes file byte for byte, so the markers reach pohunek.dev
-      # exactly as the tagged CHANGELOG.md rendered them.
-      - name: Verify the published release body
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .body)" = "$(cat "$RUNNER_TEMP/release-notes/release-notes.md")"
 
       # Only a draft this run created and left unpublished is removed; a
       # published release is never touched.

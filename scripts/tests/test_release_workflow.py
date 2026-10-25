@@ -275,6 +275,11 @@ PUBLISH_SCRIPTS = {
     ),
     (
         'set -euo pipefail',
+        'gh api --paginate "repos/$GH_REPO/releases" --jq \'.[] | select(.tag_name == env.TAG and .draft) | .body\' > "$RUNNER_TEMP/draft-body.txt"',
+        'cmp "$RUNNER_TEMP/draft-body.txt" <(cat "$RUNNER_TEMP/release-notes/release-notes.md"; echo)',
+    ),
+    (
+        'set -euo pipefail',
         'cd "$RUNNER_TEMP/bundle"',
         'gh release upload "$TAG" ./*',
     ),
@@ -298,10 +303,6 @@ PUBLISH_SCRIPTS = {
         'have="$(gh api --paginate "repos/$GH_REPO/releases" --jq \'.[] | select(.tag_name == env.TAG and (.draft | not)) | .assets[] | select(.state == "uploaded") | "\\(.name) \\(.digest) \\(.size)"\' | LC_ALL=C sort)"',
         'test -n "$have"',
         'test "$want" = "$have"',
-    ),
-    (
-        'set -euo pipefail',
-        'test "$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .body)" = "$(cat "$RUNNER_TEMP/release-notes/release-notes.md")"',
     ),
     (
         'set -euo pipefail',
@@ -650,10 +651,15 @@ class ReleaseNotesTests(ReleaseWorkflowFiles):
         self.assertNotIn('--notes ""', block)
         self.assertLess(block.index("Download the release notes"), block.index("Create the draft release"))
 
-    def test_the_published_body_is_compared_with_the_notes_after_publication(self):
+    def test_the_draft_body_is_verified_before_publication(self):
         block = self.release_jobs[WRITER]
-        self.assertLess(block.index("Publish the draft"), block.index("Verify the published release body"))
-        self.assertLess(block.index("Verify the published release body"), block.index("Remove an unpublished draft"))
+        self.assertIn("Verify the draft body", block)
+        self.assertLess(block.index("Verify the draft against the inventory"), block.index("Verify the draft body"))
+        self.assertLess(block.index("Verify the draft body"), block.index("Publish the draft"))
+        self.assertNotIn("Verify the published release body", block)
+        self.assertNotIn("releases/tags/$TAG", block)
+        self.assertIn('select(.tag_name == env.TAG and .draft) | .body', block)
+        self.assertIn('cmp "$RUNNER_TEMP/draft-body.txt"', block)
 
     def test_the_notes_never_enter_the_bundle_or_its_inventory(self):
         self.assertNotIn("release-notes", self.build + self.evidence + self.scenarios)
