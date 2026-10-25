@@ -701,7 +701,8 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     let created = registry.create(params()).await.expect("create session");
 
     // From here the clock moves only through `advance`: the waiters' budgets
-    // are virtual, while the worker and its child stay real.
+    // and the in-process worker's timers are virtual. Only the PTY, the child
+    // and the sockets are real.
     let inhibitor = AutoAdvanceInhibitor::new();
     tokio::time::pause();
 

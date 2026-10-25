@@ -464,6 +464,42 @@ tokio timers (and `.elapsed()` when the file uses `tokio::time::Instant`
 alone); `thread::sleep` and `Timer::after` stay counted. An unavoidable real-time wait
 carries `// timing-allowed: #<issue> <reason>` on or directly above its line.
 
+A wall-clock budget handed to the code under test races the host like a sleep
+does, and lengthening it never held (#494, #590). Two more ratchets count them,
+each per file against its own baseline that may only go down:
+
+- `crates/xtask/tests/timing_deadline_ratchet.rs` (Rust,
+  `timing_deadline_baseline.txt`) counts a
+  `Duration::from_{nanos,micros,millis,secs}(<literal>)` below `HANG_GUARD`, or
+  an integer literal below `HANG_GUARD` in milliseconds given to a name ending
+  `_ms`/`_MS`, in test code when it is the first argument of
+  `tokio::time::timeout`, or the value of a struct field (in a struct literal or
+  as `x.field = value`) or of a `const`/`static` whose name contains `timeout`,
+  `deadline`, `grace`, `budget`, `wait`, `bound`, `stall` or `limit`. Zero is
+  not counted. A `start_paused = true` test is exempt.
+- `crates/xtask/tests/sdk_timing_ratchet.rs` (TypeScript,
+  `sdk_timing_baseline.txt`) counts, in `sdk/ts/**/test/**/*.ts`, an integer
+  literal below `HANG_GUARD` in milliseconds (directly or through a
+  module-level `const NAME = <integer>`) that is the value of
+  `requestTimeoutMs:` or `timeoutMs:`, the `ms:` of an object holding
+  `kind: "delay"` (a mock-daemon delayed reply), or the second argument of
+  `setTimeout`. Only the stretch of a `test`/`it` callback from
+  `jest.useFakeTimers()` to the next `jest.useRealTimers()` (or the end of the
+  callback) is exempt; a budget given before the call or after the restore is
+  counted.
+
+Both accept `// timing-allowed: #<issue> <reason>` on or directly above the
+line, and a malformed marker is a failure (reported by `timing_ratchet` for
+Rust). Lowering a count means removing
+the budget, then rewriting the baseline with the ignored
+`regenerate_timing_deadline_baseline` or `regenerate_sdk_timing_baseline` test
+(`cargo nextest run -p xtask --run-ignored only -E 'test(<name>)'`); neither
+raises a count. Remove a budget instead of widening it: virtual time (add
+`pohunek_test_support::time::AutoAdvanceInhibitor` when the test also awaits
+real I/O), a gate or barrier the fixture holds (the mock daemon's `gate` step
+holds a reply until the test releases it), or, for an incidental bound,
+`HANG_GUARD`.
+
 Test binary layout: the integration tests of `pohunek-cli` are modules of one
 test binary, `all` (`crates/cli/tests/all.rs`, `autotests = false`), so the
 dependency graph links once for the crate (#1228). A new test file there gets a

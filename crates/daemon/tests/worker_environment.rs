@@ -33,7 +33,7 @@ use pohunek_worker_protocol::{
 
 /// Hang guard for every wait on the worker socket, the child's exit and the
 /// streams. The scenarios synchronize on readiness signals, never on this
-/// bound.
+/// bound. Whether `await_pty_echo` can miss the echo is open in #1596.
 const DEADLINE: Duration = HANG_GUARD;
 /// Output page size; an environment listing fits in a few pages.
 const PAGE_BYTES: u32 = 16 * 1024;
