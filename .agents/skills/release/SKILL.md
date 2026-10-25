@@ -49,10 +49,10 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    ```
 
    This prints the current and next version, the tag, the knowledge-log
-   fragments the release would file, and whether the release notes cover any
-   changed compatibility constants. It also describes the
-   commit, evidence checks, and pushes it would perform. Confirm that matches
-   intent.
+   fragments the release would file, the folded `CHANGELOG.md` section that
+   becomes the release body, and whether the release notes cover any changed
+   compatibility constants. It also describes the commit, evidence checks, and
+   pushes it would perform. Confirm that matches intent.
 
 4. **Cut the release.** Run the real thing:
 
@@ -61,9 +61,11 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    ```
 
    The script files the `docs/knowledge/log.d/` fragments under `## X.Y.Z` in
-   `docs/knowledge/log.md` and removes them (`cargo xtask docs log fold`), bumps
-   `version` in `[workspace.package]` in `Cargo.toml`, refreshes `Cargo.lock`,
-   commits all of it as `Release vX.Y.Z`, and requires successful main and
+   `docs/knowledge/log.md` and removes them (`cargo xtask docs log fold`),
+   folds the `changelog.d/` fragments into a `## X.Y.Z - <UTC date>` section of
+   the committed `CHANGELOG.md` and removes them (`scripts/changelog fold`),
+   bumps `version` in `[workspace.package]` in `Cargo.toml`, refreshes
+   `Cargo.lock`, commits all of it as `Release vX.Y.Z`, and requires successful main and
    nightly CI evidence for that commit before creating an annotated tag
    `vX.Y.Z`. Evidence is a run on the commit itself or a `workflow_dispatch`
    run that tested the same git tree; `scripts/ci-evidence` prints which run

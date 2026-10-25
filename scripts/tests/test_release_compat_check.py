@@ -14,6 +14,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "release"
+CHANGELOG_TOOL = Path(__file__).resolve().parents[1] / "changelog"
 
 STORE_FILE = "crates/daemon/src/store/schema.rs"
 PROTOCOL_FILE = "crates/protocol/src/version.rs"
@@ -34,6 +35,10 @@ class ReleaseCompatCheckTest(unittest.TestCase):
         self.repo = self.tmp / "repo"
         (self.repo / "scripts").mkdir(parents=True)
         shutil.copy(SCRIPT, self.repo / "scripts" / "release")
+        shutil.copy(CHANGELOG_TOOL, self.repo / "scripts" / "changelog")
+        write(self.repo, ".github/changelog.json", '{"repository": "example/pohunek", "changelog": "CHANGELOG.md"}\n')
+        write(self.repo, "CHANGELOG.md", "# Changelog\n\nUser-facing changes of pohunek.\n")
+        write(self.repo, "changelog.d/.gitkeep", "")
         write(self.repo, "Cargo.toml", CARGO_TOML)
         self.set_constants(store=2, protocol=4)
         stub_bin = self.tmp / "bin"
