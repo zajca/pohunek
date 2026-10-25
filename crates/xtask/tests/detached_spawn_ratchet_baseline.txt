@@ -1,0 +1,29 @@
+# Ratchet baseline for tests/detached_spawn_ratchet.rs: bare tokio::spawn
+# calls in the production code of crates/daemon and crates/session-worker, per file.
+# Format: `<workspace-relative path> <count>`. Counts may only go down;
+# regenerate with the ignored `regenerate_detached_spawn_baseline` test.
+crates/daemon/src/api/mod.rs 2
+crates/daemon/src/events/mod.rs 1
+crates/daemon/src/external/mod.rs 1
+crates/daemon/src/external/watch.rs 1
+crates/daemon/src/main.rs 2
+crates/daemon/src/notifications/coordinator.rs 1
+crates/daemon/src/notifications/projector.rs 1
+crates/daemon/src/notifications/retention.rs 1
+crates/daemon/src/runtime/client.rs 1
+crates/daemon/src/runtime/launcher.rs 1
+crates/daemon/src/session/detector.rs 1
+crates/daemon/src/session/forward.rs 2
+crates/daemon/src/session/hooks.rs 2
+crates/daemon/src/session/idle_stop.rs 1
+crates/daemon/src/session/input.rs 4
+crates/daemon/src/session/mod.rs 2
+crates/daemon/src/session/package_lifecycle/mod.rs 2
+crates/daemon/src/session/packages.rs 1
+crates/daemon/src/session/procwatch.rs 3
+crates/daemon/src/session/retention.rs 2
+crates/daemon/src/session/supervision.rs 6
+crates/daemon/src/session/target.rs 2
+crates/daemon/src/session/terminal_ack.rs 1
+crates/session-worker/src/input.rs 1
+crates/session-worker/src/server.rs 3

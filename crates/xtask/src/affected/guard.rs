@@ -306,6 +306,16 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         &["sdk/ts"],
         "scan of the SDK workspace's TypeScript tests against the SDK timing baseline",
     ),
+    (
+        "crates/xtask/tests/lifecycle_result_ratchet.rs",
+        &["crates"],
+        "scan of every crate's test code against the discarded-lifecycle-result baseline",
+    ),
+    (
+        "crates/xtask/tests/detached_spawn_ratchet.rs",
+        &["crates"],
+        "scan of the daemon and session-worker sources against the detached-spawn baseline",
+    ),
 ];
 
 /// Resolved reads that are not reads, as `(file, path, why)`.
