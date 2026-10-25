@@ -531,11 +531,10 @@ impl Rig {
     /// A restarted daemon: a second registry over the same store, roots and
     /// workers adopts the live session after the first one is gone.
     async fn restart(&mut self) -> SessionRegistry {
-        // The replaced registry stands for the dead daemon: once its last
-        // in-flight projection write is done, the lock stays held so a late
-        // write of its own cannot remove the binding the new daemon owns.
-        let barrier = self.registry.inner.persist_lock.lock().await;
-        std::mem::forget(barrier);
+        // The replaced registry stands for the dead daemon: shutdown waits for
+        // its in-flight projection write, and a late write of its own would
+        // abort the test instead of removing the binding the new daemon owns.
+        self.registry.shutdown().await;
         let entry = self
             .registry
             .inner
@@ -572,7 +571,7 @@ impl Rig {
     }
 
     async fn finish(&self, registry: &SessionRegistry) {
-        let _ = registry.stop(self.id()).await;
+        registry.stop(self.id()).await.expect("stop the session");
     }
 }
 
@@ -751,7 +750,7 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
         forked.native_session_id, None,
         "a fork learns its own reference"
     );
-    let _ = restarted.stop(&forked.id).await;
+    restarted.stop(&forked.id).await.expect("stop the session");
     rig.finish(&restarted).await;
 }
 
@@ -901,7 +900,10 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         rig.launch_argv(2),
         ["--model", "fast", "--fork", "conversation-two"]
     );
-    let _ = rig.registry.stop(&forked.id).await;
+    rig.registry
+        .stop(&forked.id)
+        .await
+        .expect("stop the session");
     rig.finish(&rig.registry).await;
 }
 
@@ -1392,8 +1394,7 @@ impl Rig {
     /// agent switch to `reference` while no daemon runs, then starts a new
     /// daemon over the same store and workers.
     async fn restart_with(&mut self, while_down: Option<&str>) -> SessionRegistry {
-        let barrier = self.registry.inner.persist_lock.lock().await;
-        std::mem::forget(barrier);
+        self.registry.shutdown().await;
         // Every session of the dead daemon lets go of its worker, forks
         // included, or a worker would keep serving its former controller.
         self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
@@ -1427,8 +1428,7 @@ impl Rig {
     /// The agent switches to `reference` and exits while no daemon runs; the
     /// new daemon then finds an ended worker.
     async fn restart_down_then_exit(&mut self, reference: &str) {
-        let barrier = self.registry.inner.persist_lock.lock().await;
-        std::mem::forget(barrier);
+        self.registry.shutdown().await;
         self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
         let entries: Vec<_> = self
             .registry
@@ -1678,7 +1678,10 @@ async fn run_history(seed: u64, history: &[Step]) {
                     ["--model", "fast", "--fork", latest.as_str()],
                     "fork uses the latest reference: {at}"
                 );
-                let _ = rig.registry.stop(&forked.id).await;
+                rig.registry
+                    .stop(&forked.id)
+                    .await
+                    .expect("stop the session");
             }
         }
         let (memory, durable, conflict) = held_reference(&rig).await;
@@ -1913,7 +1916,7 @@ async fn a_launch_process_that_already_exited_still_hands_over_its_journaled_ref
         Some("journaled-after-exit"),
         "the exited process's journaled reference is its own"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1934,8 +1937,7 @@ async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journ
 
     // The daemon restarts while the worker is still draining the PTY of a
     // launch process that has already ended.
-    let barrier = rig.registry.inner.persist_lock.lock().await;
-    std::mem::forget(barrier);
+    rig.registry.shutdown().await;
     let entries: Vec<_> = rig
         .registry
         .inner
@@ -1972,7 +1974,7 @@ async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journ
         info.native_session_id.as_deref(),
         Some("conversation-before-exit")
     );
-    let _ = restarted.stop(rig.id()).await;
+    restarted.stop(rig.id()).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2211,6 +2213,16 @@ async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_when_the_worke
     rig.block_worker_imports(true);
     rig.report("switched-before-the-crash").await;
     let (worker, identity) = live_worker_and_identity(&rig.registry, rig.id()).await;
+    // The daemon's own watcher must not observe the crash and move the session
+    // itself while the transition under test runs.
+    rig.registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(rig.id())
+        .expect("session entry")
+        .cancel_runtime_watchers();
     crash_worker(&rig).await;
     // The watcher has lost the connection: the entry holds no worker handle.
     drop(worker);
@@ -2233,10 +2245,10 @@ async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_when_the_worke
         )
         .await;
 
-    assert!(matches!(
-        outcome,
-        super::super::RuntimeTransitionOutcome::Applied(_)
-    ));
+    assert!(
+        matches!(outcome, super::super::RuntimeTransitionOutcome::Applied(_)),
+        "{outcome:?}"
+    );
     assert_eq!(
         rig.durable_record()
             .recovery

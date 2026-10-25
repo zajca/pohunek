@@ -237,8 +237,7 @@ impl Rig {
     }
 
     async fn detach_daemon(&mut self) {
-        let barrier = self.registry.inner.persist_lock.lock().await;
-        std::mem::forget(barrier);
+        self.registry.shutdown().await;
         let entry = self
             .registry
             .inner
@@ -312,8 +311,16 @@ impl Rig {
         .await;
     }
 
+    /// Stops the session and waits for the acknowledgement of its terminal
+    /// outcome, which the stop leaves to a background transaction: the worker
+    /// rewrites its journal and the daemon retires the generation. A caller
+    /// that corrupts or reads the journal first races that rewrite.
     async fn finish(&self) {
-        let _ = self.registry.stop(&self.session.id).await;
+        self.registry
+            .stop(&self.session.id)
+            .await
+            .expect("stop the fixture session");
+        self.registry.settle_transactions().await;
     }
 
     async fn remove(&self) {
@@ -401,6 +408,41 @@ async fn an_unreadable_codex_generation_journal_is_not_classified_as_a_missing_c
 
     fs::write(&journal, original).expect("restore fixture journal");
     rig.remove().await;
+}
+
+/// The acknowledgement a stop leaves behind rewrites the worker journal: a
+/// journal corrupted while that acknowledgement is still pending is replaced by
+/// the worker's valid one, and a resume then finds no claim instead of an
+/// unreadable journal. `finish` therefore must not return before the
+/// acknowledgement is done.
+#[tokio::test]
+async fn finish_waits_for_the_terminal_acknowledgement_it_scheduled() {
+    let rig = Rig::new("codex-finish-waits", true).await;
+    let gate = rig
+        .registry
+        .hold_next_terminal_acknowledgement(&rig.session.id);
+    let finish = rig.finish();
+    tokio::pin!(finish);
+    tokio::select! {
+        biased;
+        () = gate.entered.notified() => {}
+        () = &mut finish => panic!("finish returned before the acknowledgement was held"),
+    }
+    tokio::select! {
+        biased;
+        () = &mut finish => panic!("finish returned while its acknowledgement was held"),
+        () = std::future::ready(()) => {}
+    }
+    gate.release.notify_one();
+    finish.await;
+
+    let journal = pohunek_session_worker::Journal::new(rig.session_journal())
+        .load()
+        .expect("terminal worker journal");
+    assert!(
+        journal.terminal_acknowledged,
+        "the acknowledgement reached the worker before finish returned"
+    );
 }
 
 #[tokio::test]
