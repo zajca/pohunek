@@ -55,6 +55,16 @@
   bundle is treated like stale code, not a follow-up. If unsure whether a change
   is assistant-visible, check whether any file under `docs/knowledge/` mentions
   the surface you changed.
+- **Record a changelog fragment for every user-visible change.** A change that
+  alters what a user sees or does (a command, flag, output, behaviour, a fixed
+  defect, a removed or deprecated surface) adds `changelog.d/<issue>-<slug>.md`
+  with a `kind` (`added`, `changed`, `deprecated`, `removed`, `fixed`,
+  `security`), `breaking: true` when users must act, and one paragraph of one to
+  three sentences written for users in the present tense. A change with no
+  user-visible effect (CI, tests, refactors, internal docs, release preparation)
+  carries the `no-changelog` label instead; the Changelog check requires one or
+  the other. Run `scripts/changelog check` before pushing. Format and rules:
+  [docs/development.md](../../docs/development.md#changelog).
 - **Record the knowledge-log entry as a fragment.** A change adds its entry as
   `docs/knowledge/log.d/<issue>-<slug>.md` and never edits
   `docs/knowledge/log.md`: one heading line

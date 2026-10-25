@@ -504,7 +504,8 @@ so it never waits for the bundle) runs them with
 
 User-facing changes are recorded as fragments, not in the knowledge log. A pull
 request with a user-visible effect adds one `changelog.d/<issue>-<slug>.md` per
-change; a pull request with none carries the `no-changelog` label.
+change; a pull request with none carries the `no-changelog` label. The check in
+`.github/workflows/changelog.yml` enforces both and validates every fragment.
 
 A fragment starts with a header and then one paragraph written for users:
 

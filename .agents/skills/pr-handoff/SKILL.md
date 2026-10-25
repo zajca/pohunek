@@ -56,6 +56,9 @@ bottom-up. For each slice, from the bottom:
   DoD items this slice satisfies.
 - Non-final PRs reference the issue with `Refs #N`; only the final PR uses
   `Closes #N`, so the issue cannot close before the whole stack lands.
+- Every PR of the stack either adds a `changelog.d/<issue>-<slug>.md` fragment
+  for its user-visible change or carries the `no-changelog` label; the
+  Changelog check fails otherwise. Check the label exists before applying it.
 - A review fix to a lower slice is committed on that slice's branch; restack
   the branches above it with `git rebase --update-refs` from the top branch,
   re-run the applicable gates on every rebased slice (its inputs changed with

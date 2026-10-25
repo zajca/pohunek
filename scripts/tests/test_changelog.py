@@ -7,6 +7,7 @@ contract are written here as fragment bytes and must each be refused by
 `check`, and by `fold`, which must then leave the tree untouched.
 """
 
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "scripts" / "changelog"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "changelog"
+CHECK_WORKFLOW = ROOT / ".github" / "workflows" / "changelog.yml"
+CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 
 VALID_BODY = "---\nkind: added\n---\nText.\n"
 
@@ -161,6 +164,49 @@ class InvalidFragments(ChangelogScenarios):
                 result = run(root, "check")
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(b"changelog: changelog.d/40-case.md", result.stderr)
+
+
+def run_script_lines(text: str) -> list[str]:
+    """The lines of every `run:` script of a workflow, inline or block."""
+    kept, indent = [], None
+    for line in text.splitlines():
+        if indent is not None:
+            if not line.strip() or len(line) - len(line.lstrip()) > indent:
+                kept.append(line)
+                continue
+            indent = None
+        if re.fullmatch(r"\s+(- )?run: \|", line):
+            indent = len(line) - len(line.lstrip())
+        elif re.fullmatch(r"\s+(- )?run: .+", line):
+            kept.append(line)
+    return kept
+
+
+class CheckWorkflow(unittest.TestCase):
+    """The pull-request check: a read-only `pull_request` run that trusts no event value in a script."""
+
+    def setUp(self):
+        self.text = CHECK_WORKFLOW.read_text()
+
+    def test_it_runs_on_pull_requests_and_the_label_events_only(self):
+        self.assertIn(
+            "on:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]\n",
+            self.text,
+        )
+        self.assertNotRegex(self.text, r"(?m)^\s*pull_request_target:")
+
+    def test_the_token_is_read_only_and_the_checkout_is_pinned(self):
+        self.assertIn("\npermissions: {}\n", self.text)
+        self.assertEqual(self.text.count("      contents: read\n"), 1)
+        self.assertEqual(re.findall(r"uses: (\S+)", self.text), [CHECKOUT])
+        self.assertIn("persist-credentials: false", self.text)
+
+    def test_scripts_read_event_values_only_through_the_environment(self):
+        scripts = "\n".join(run_script_lines(self.text))
+        self.assertNotIn("${{", scripts)
+        self.assertIn("python3 scripts/changelog check", scripts)
+        self.assertIn('"$BASE_SHA...$HEAD_SHA"', scripts)
+        self.assertIn('"$NO_CHANGELOG" = true', scripts)
 
 
 class ReleaseRules(ChangelogScenarios):

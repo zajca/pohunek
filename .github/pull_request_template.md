@@ -16,6 +16,10 @@ Describe the outcome and any scope change from the issue. Link the issue's stabl
 
 Evidence below applies to this exact candidate. Update it after every change to the candidate head.
 
+## Changelog
+
+- [ ] Added `changelog.d/<issue>-<slug>.md` for the user-visible change (see [docs/development.md](../docs/development.md#changelog)), or applied the `no-changelog` label because the change has no user-visible effect.
+
 ## Definition-of-done evidence
 
 | Criterion | Result and evidence |
