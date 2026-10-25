@@ -487,6 +487,22 @@ invoke native resume. A job whose worker is proven dead has its generation's
 leftover processes swept by ownership marker before the session is reported
 `lost`; unavailable or ambiguous supervisor evidence never kills anything.
 
+The daemon stops its own background work in one place. The session registry
+spawns every watcher, exit committer, forwarder and retry through a tracker it
+owns, and runs its blocking store writes through the same tracker. At shutdown
+the daemon first drains the creates still running, stops the tasks that drive the
+registry from outside, and then calls `SessionRegistry::shutdown`. That refuses
+new background tasks, cancels the per-session tokens, aborts the work that has no
+cancellation of its own, and waits, bounded by `shutdown_timeout`, until nothing
+tracked is left; tasks still running at the deadline are named in the log. After
+that the registry writes nothing: a store write through it is refused with
+`registry_shut_down` and logged at ERROR with its location. The worker seals its
+journal in the same spirit: once the terminal record is committed, the only
+replacement it accepts is the terminal acknowledgement (`terminal_acknowledged`
+turning true). Any other write is refused and logged as
+`worker.journal.sealed_write_refused`, because it would change an outcome the
+daemon may already have read.
+
 The private worker protocol is local-only and owner-private. It uses bounded
 newline-delimited JSON for control requests and binary-safe framed data
 connections for output and attach traffic. A worker accepts one leased daemon
