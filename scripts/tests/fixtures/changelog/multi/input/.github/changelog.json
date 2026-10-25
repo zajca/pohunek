@@ -1,0 +1,7 @@
+{
+  "repository": "example/work",
+  "surfaces": {
+    "plugin": "plugin/CHANGELOG.md",
+    "web": "web/CHANGELOG.md"
+  }
+}

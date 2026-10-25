@@ -500,6 +500,31 @@ so it never waits for the bundle) runs them with
   tests still in the suite are #671 migration work, not everyday additions.
   The protocol and state machines have rich suites — extend them first.
 
+## Changelog
+
+User-facing changes are recorded as fragments, not in the knowledge log. A pull
+request with a user-visible effect adds one `changelog.d/<issue>-<slug>.md` per
+change; a pull request with none carries the `no-changelog` label.
+
+A fragment starts with a header and then one paragraph written for users:
+
+```
+---
+kind: changed
+breaking: true
+---
+`pohunek attach` attaches read-only by default.
+```
+
+`kind` is one of `added`, `changed`, `deprecated`, `removed`, `fixed`,
+`security`; `breaking` is optional. `surfaces: web, plugin` is required only in
+a multi-surface repository. `scripts/changelog check` validates the fragments,
+`fold VERSION [--surface S] [--date YYYY-MM-DD]` writes the version section into
+the committed `CHANGELOG.md` and deletes the released fragments, and
+`notes VERSION [--surface S]` prints the marked release-notes block for a folded
+version. The repository layout is declared in `.github/changelog.json`; the
+contract fixtures in `scripts/tests/fixtures/changelog` pin the byte-exact output.
+
 ## Release
 
 `scripts/release` bumps the workspace version and refreshes the lockfile, then
