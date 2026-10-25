@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Validate user-facing changelog fragments, fold them into CHANGELOG.md, print release notes.
+
+Fragments live in `changelog.d/` at the repository root; `docs/development.md`
+("Changelog") states the rules. The repository declares its layout in
+`.github/changelog.json`: `changelog` names the one changelog file of a
+single-product repository, `surfaces` maps each surface of a multi-surface
+repository to its own changelog file. The changelog file is committed by hand
+and this tool never creates it.
+
+Usage:
+  scripts/changelog check
+  scripts/changelog fold VERSION [--surface SURFACE] [--date YYYY-MM-DD]
+  scripts/changelog notes VERSION [--surface SURFACE]
+
+`--root` names another repository tree and defaults to the one holding this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+CONFIG_IN_TREE = ".github/changelog.json"
+FRAGMENT_DIR = "changelog.d"
+CHANGELOG_TITLE = "# Changelog"
+KINDS = ("added", "changed", "deprecated", "removed", "fixed", "security")
+HEADER_KEYS = ("kind", "breaking", "surfaces")
+FRAGMENT_NAME = re.compile(r"([1-9][0-9]*)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
+HEADER_LINE = re.compile(r"([a-z]+): (\S(?:.*\S)?)")
+REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SURFACE_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-pre\.[0-9]+)?")
+DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+UTF8_BOM = b"\xef\xbb\xbf"
+SURFACE_SEPARATOR = ", "
+NO_CHANGES = "No user-facing changes."
+NOTES_START = "<!-- pohunek-changelog:start -->"
+NOTES_END = "<!-- pohunek-changelog:end -->"
+
+
+class ChangelogError(Exception):
+    """A problem the author must fix; the message names the file it concerns."""
+
+
+@dataclass(frozen=True)
+class Layout:
+    """The changelog files of a repository, from `.github/changelog.json`."""
+
+    repository: str
+    changelog: str | None
+    surfaces: dict[str, str]
+
+    def surface_for(self, surface: str | None) -> str | None:
+        """Checks the --surface argument against the layout and returns it."""
+        if self.changelog is not None:
+            if surface is not None:
+                raise ChangelogError("--surface does not apply to a single-product repository")
+            return None
+        if surface is None:
+            raise ChangelogError(f"a multi-surface repository needs --surface, one of: {', '.join(sorted(self.surfaces))}")
+        if surface not in self.surfaces:
+            raise ChangelogError(f"unknown surface {surface!r}; declared: {', '.join(sorted(self.surfaces))}")
+        return surface
+
+    def changelog_for(self, surface: str | None) -> str:
+        return self.changelog if surface is None else self.surfaces[surface]
+
+
+@dataclass(frozen=True)
+class Fragment:
+    path: Path
+    label: str
+    number: int
+    slug: str
+    kind: str
+    breaking: bool
+    surfaces: tuple[str, ...] | None
+    text: str
+    raw: str
+
+
+def read_text(path: Path, label: str) -> str:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ChangelogError(f"{label}: cannot read: {error.strerror}") from error
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ChangelogError(f"{label}: not valid UTF-8") from error
+
+
+def load_layout(root: Path) -> Layout:
+    label = CONFIG_IN_TREE
+    try:
+        data = json.loads(read_text(root / CONFIG_IN_TREE, label))
+    except json.JSONDecodeError as error:
+        raise ChangelogError(f"{label}: not valid JSON: {error.msg}") from error
+    if not isinstance(data, dict) or not set(data) <= {"repository", "changelog", "surfaces"}:
+        raise ChangelogError(f"{label}: expected an object with repository, changelog and surfaces only")
+    repository = data.get("repository")
+    if not isinstance(repository, str) or REPOSITORY.fullmatch(repository) is None:
+        raise ChangelogError(f"{label}: repository must be OWNER/REPO")
+    changelog = data.get("changelog")
+    surfaces = data.get("surfaces")
+    if (changelog is None) == (surfaces is None):
+        raise ChangelogError(f"{label}: declare exactly one of changelog and surfaces")
+    if changelog is not None:
+        if not isinstance(changelog, str):
+            raise ChangelogError(f"{label}: changelog must be a path")
+        return Layout(repository, changelog, {})
+    if not isinstance(surfaces, dict) or not surfaces:
+        raise ChangelogError(f"{label}: surfaces must map at least one name to a changelog path")
+    for name, path in surfaces.items():
+        if SURFACE_NAME.fullmatch(name) is None or not isinstance(path, str):
+            raise ChangelogError(f"{label}: surface {name!r} needs a lowercase name and a changelog path")
+    return Layout(repository, None, dict(surfaces))
+
+
+def parse_fragment(path: Path, surfaces: frozenset[str] | None) -> Fragment:
+    """Validates one fragment; `surfaces` is None in a single-product repository."""
+    label = f"{FRAGMENT_DIR}/{path.name}"
+    match = FRAGMENT_NAME.fullmatch(path.name)
+    if match is None:
+        raise ChangelogError(f"{label}: the file name must be <issue>-<slug>.md")
+    if not path.is_file():
+        raise ChangelogError(f"{label}: a fragment must be a regular file")
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as error:
+        raise ChangelogError(f"{label}: cannot read: {error.strerror}") from error
+    if raw_bytes.startswith(UTF8_BOM):
+        raise ChangelogError(f"{label}: a byte order mark is not allowed")
+    raw = read_text(path, label)
+    if "\r" in raw:
+        raise ChangelogError(f"{label}: CR characters are not allowed; use LF line endings")
+    lines = raw.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    if not lines or lines[0] != "---":
+        raise ChangelogError(f"{label}: the first line must be ---")
+    try:
+        end = lines.index("---", 1)
+    except ValueError as error:
+        raise ChangelogError(f"{label}: no closing --- line") from error
+    header: dict[str, str] = {}
+    for line in lines[1:end]:
+        header_match = HEADER_LINE.fullmatch(line)
+        if header_match is None:
+            raise ChangelogError(f"{label}: malformed header line {line!r}")
+        key, value = header_match.groups()
+        if key not in HEADER_KEYS:
+            raise ChangelogError(f"{label}: unknown key {key!r}")
+        if key in header:
+            raise ChangelogError(f"{label}: duplicate key {key!r}")
+        header[key] = value
+    kind = header.get("kind")
+    if kind is None:
+        raise ChangelogError(f"{label}: missing kind")
+    if kind not in KINDS:
+        raise ChangelogError(f"{label}: unknown kind {kind!r}")
+    breaking = header.get("breaking", "false")
+    if breaking not in ("true", "false"):
+        raise ChangelogError(f"{label}: breaking must be true or false")
+    fragment_surfaces: tuple[str, ...] | None = None
+    if surfaces is None:
+        if "surfaces" in header:
+            raise ChangelogError(f"{label}: surfaces is only for a multi-surface repository")
+    else:
+        if "surfaces" not in header:
+            raise ChangelogError(f"{label}: missing surfaces in a multi-surface repository")
+        names = tuple(header["surfaces"].split(SURFACE_SEPARATOR))
+        if len(set(names)) != len(names) or not set(names) <= surfaces:
+            raise ChangelogError(f"{label}: surfaces must name declared surfaces, each once")
+        fragment_surfaces = names
+    body = lines[end + 1 :]
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    if not body:
+        raise ChangelogError(f"{label}: the body is empty")
+    if any(not line.strip() for line in body):
+        raise ChangelogError(f"{label}: the body must be one paragraph without blank lines")
+    if any(line.startswith("#") for line in body):
+        raise ChangelogError(f"{label}: a body line starts with #")
+    return Fragment(
+        path=path,
+        label=label,
+        number=int(match.group(1)),
+        slug=match.group(2),
+        kind=kind,
+        breaking=breaking == "true",
+        surfaces=fragment_surfaces,
+        text=" ".join(line.strip() for line in body),
+        raw=raw,
+    )
+
+
+def scan_fragments(root: Path, layout: Layout) -> tuple[list[Fragment], list[str]]:
+    """Every fragment of the tree, plus one message per invalid one."""
+    directory = root / FRAGMENT_DIR
+    if not directory.is_dir():
+        raise ChangelogError(f"{FRAGMENT_DIR}/ is missing")
+    surfaces = None if layout.changelog is not None else frozenset(layout.surfaces)
+    fragments: list[Fragment] = []
+    problems: list[str] = []
+    for path in sorted(directory.iterdir()):
+        if path.name.startswith("."):
+            continue
+        try:
+            fragments.append(parse_fragment(path, surfaces))
+        except ChangelogError as error:
+            problems.append(str(error))
+    return fragments, problems
+
+
+def selected(fragments: list[Fragment], surface: str | None) -> list[Fragment]:
+    return [f for f in fragments if surface is None or surface in (f.surfaces or ())]
+
+
+def render_section(fragments: list[Fragment], repository: str) -> str:
+    if not fragments:
+        return NO_CHANGES
+    blocks = []
+    for kind in KINDS:
+        items = sorted(
+            (f for f in fragments if f.kind == kind),
+            key=lambda f: (not f.breaking, f.number, f.slug),
+        )
+        if not items:
+            continue
+        entries = [
+            f"- {'**Breaking:** ' if f.breaking else ''}{f.text}"
+            f" ([#{f.number}](https://github.com/{repository}/issues/{f.number}))"
+            for f in items
+        ]
+        blocks.append(f"### {kind.capitalize()}\n\n" + "\n".join(entries))
+    return "\n\n".join(blocks)
+
+
+def fold(root: Path, layout: Layout, version: str, surface: str | None, date: str) -> int:
+    fragments, problems = scan_fragments(root, layout)
+    if problems:
+        return fail(problems)
+    relative = layout.changelog_for(surface)
+    path = root / relative
+    text = read_text(path, relative)
+    if not text.startswith(CHANGELOG_TITLE + "\n"):
+        raise ChangelogError(f"{relative}: must start with {CHANGELOG_TITLE!r}")
+    if re.search(rf"^## {re.escape(version)} - ", text, re.MULTILINE):
+        raise ChangelogError(f"{relative}: a section for {version} already exists")
+    chosen = selected(fragments, surface)
+    block = f"## {version} - {date}\n\n{render_section(chosen, layout.repository)}\n"
+    first_section = re.search(r"^## ", text, re.MULTILINE)
+    if first_section is None:
+        text = text.rstrip("\n") + "\n\n" + block
+    else:
+        text = text[: first_section.start()] + block + "\n" + text[first_section.start() :]
+    path.write_bytes(text.rstrip("\n").encode("utf-8") + b"\n")
+    for fragment in chosen:
+        remaining = [s for s in (fragment.surfaces or ()) if s != surface]
+        if not remaining:
+            fragment.path.unlink()
+            continue
+        fragment.path.write_bytes(rewrite_surfaces(fragment.raw, remaining).encode("utf-8"))
+    print(f"changelog: folded {len(chosen)} fragment(s) into {relative} as {version}")
+    return 0
+
+
+def rewrite_surfaces(raw: str, remaining: list[str]) -> str:
+    """Drops the released surface from the header line and keeps every other byte."""
+    lines = raw.split("\n")
+    closing = lines.index("---", 1)
+    for index in range(1, closing):
+        if lines[index].startswith("surfaces: "):
+            lines[index] = "surfaces: " + SURFACE_SEPARATOR.join(remaining)
+    return "\n".join(lines)
+
+
+def notes(root: Path, layout: Layout, version: str, surface: str | None) -> int:
+    fragments, problems = scan_fragments(root, layout)
+    if problems:
+        return fail(problems)
+    unfolded = selected(fragments, surface)
+    if unfolded:
+        names = ", ".join(f.label for f in unfolded)
+        raise ChangelogError(f"unfolded fragments remain, fold them before the release: {names}")
+    relative = layout.changelog_for(surface)
+    lines = read_text(root / relative, relative).split("\n")
+    heading = f"## {version} - "
+    start = next((i for i, line in enumerate(lines) if line.startswith(heading)), None)
+    if start is None:
+        raise ChangelogError(f"{relative}: no section for {version}")
+    if start + 1 >= len(lines) or lines[start + 1] != "":
+        raise ChangelogError(f"{relative}: the {version} heading must be followed by a blank line")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    content = lines[start + 2 : end]
+    while content and not content[-1].strip():
+        content.pop()
+    print(NOTES_START)
+    if content:
+        print("\n".join(content))
+    print(NOTES_END)
+    return 0
+
+
+def fail(problems: list[str]) -> int:
+    for problem in problems:
+        print(f"changelog: {problem}", file=sys.stderr)
+    return 1
+
+
+def check(root: Path, layout: Layout) -> int:
+    fragments, problems = scan_fragments(root, layout)
+    files = [layout.changelog] if layout.changelog is not None else list(layout.surfaces.values())
+    for relative in files:
+        try:
+            text = read_text(root / relative, relative)
+        except ChangelogError as error:
+            problems.append(str(error))
+            continue
+        if not text.startswith(CHANGELOG_TITLE + "\n"):
+            problems.append(f"{relative}: must start with {CHANGELOG_TITLE!r}")
+    if problems:
+        return fail(problems)
+    print(f"changelog: {len(fragments)} fragment(s) valid")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("check", help="validate every fragment")
+    fold_parser = commands.add_parser("fold", help="fold the fragments into a version section")
+    fold_parser.add_argument("version")
+    fold_parser.add_argument("--surface")
+    fold_parser.add_argument("--date", help="UTC date of the section, YYYY-MM-DD (default: today)")
+    notes_parser = commands.add_parser("notes", help="print the release notes block of a version")
+    notes_parser.add_argument("version")
+    notes_parser.add_argument("--surface")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    root = args.root.resolve()
+    try:
+        layout = load_layout(root)
+        if args.command == "check":
+            return check(root, layout)
+        version = getattr(args, "version", None)
+        if version is not None and VERSION.fullmatch(version) is None:
+            raise ChangelogError(f"not a version: {version!r}")
+        surface = layout.surface_for(args.surface)
+        if args.command == "fold":
+            date = args.date or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+            if DATE.fullmatch(date) is None:
+                raise ChangelogError(f"not a date: {date!r}")
+            try:
+                datetime.date.fromisoformat(date)
+            except ValueError as error:
+                raise ChangelogError(f"not a calendar date: {date!r}") from error
+            return fold(root, layout, version, surface, date)
+        return notes(root, layout, version, surface)
+    except ChangelogError as error:
+        return fail([str(error)])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
