@@ -101,7 +101,7 @@ fn is_detached_spawn(skeleton: &str, offset: usize) -> bool {
     // `segments` runs from the nearest segment outwards.
     matches!(
         segments.as_slice(),
-        ["tokio"] | ["task"] | ["task", "tokio"]
+        ["tokio" | "task"] | ["task", "tokio"]
     )
 }
 
