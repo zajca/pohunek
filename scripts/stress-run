@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""Run a command under bounded, self-terminating CPU contention (issue #892).
+
+    scripts/stress-run --deadline DURATION [--cpus N] [--load-per-cpu K]
+                       [--unpinned] [--memory-max SIZE] -- COMMAND [ARG...]
+
+The sanctioned way to reproduce a timing-related failure under CI-like load.
+A timing race shows up when the test gets too little CPU, not when the host is
+busy, so the command and its load are confined to N CPUs (default 4, the
+vCPUs of CI's Linux runner) and the rest of the host stays free.
+
+Contract:
+
+* `--deadline` is mandatory (`90s`, `30m`, `2h`, `1h30m`). When it passes the
+  command's process group gets SIGTERM, then SIGKILL after the grace period,
+  the load stops, and the wrapper exits 124 (the `timeout(1)` convention).
+* The load is N x K busy-loop processes started by this script (no `stress`
+  or `stress-ng` needed). Each exits on its own when the wrapper is gone
+  (Linux: `PR_SET_PDEATHSIG` = SIGKILL; elsewhere a parent-PID poll), when
+  the deadline has passed, or on SIGTERM. A SIGKILLed wrapper leaves no load.
+* The command runs in its own process group, pinned to the same CPU set
+  (the N highest-numbered CPUs of the inherited affinity mask; descendants
+  inherit it, and Rust's `available_parallelism` honours it, so nextest
+  defaults to N test threads). On Linux it gets SIGTERM when the wrapper
+  dies; its descendants rely on the command forwarding it, which cargo and
+  nextest do. Standard streams are inherited.
+* SIGINT and SIGTERM to the wrapper are forwarded to the command's group with
+  the same grace and kill sequence; the wrapper exits with the command's
+  status. On exit it stops and reaps every load worker and SIGKILLs whatever
+  is left in the command's group.
+* Platforms without CPU affinity (macOS) refuse to run unless `--unpinned`
+  is given; then nothing is pinned, N x K workers load the whole host and the
+  wrapper says so. Nothing degrades silently.
+* `--memory-max SIZE` (Linux) re-executes the wrapper inside
+  `systemd-run --user --scope --collect` with `MemoryMax=SIZE` and
+  `RuntimeMaxSec` = deadline + grace, so the whole tree is charged to one
+  cgroup and systemd kills what is left at the limit. It fails before
+  starting anything when no user manager is reachable.
+
+Building is not done under the wrapper (a pinned build is slow): build first,
+then wrap only the run.
+
+    cargo nextest run -p pohunek-daemon --no-run
+    scripts/stress-run --deadline 45m -- \\
+        cargo nextest run -p pohunek-daemon --stress-count 100 \\
+        -E 'test(/profile_freeze_tests/)'
+
+Exit codes: the command's exit status (128 + n when it died of signal n);
+124 deadline reached; 2 usage error or unusable environment (nothing was
+started); 1 internal failure to start the command.
+
+Never start a load detached (`nohup`, a trailing `&`, `setsid`, `disown`)
+and never load every host CPU. A process you started is yours to stop.
+"""
+
+import argparse
+import ctypes
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+# CI's Linux test jobs run on `ubuntu-latest`, 4 vCPUs for a public
+# repository, with 4 test threads; pinning to the same count reproduces that
+# contention without loading the rest of the host.
+DEFAULT_CPUS = 4
+# Two busy loops per CPU keep the pinned CPUs saturated even while one worker
+# is descheduled, so the command always competes for its share.
+DEFAULT_LOAD_PER_CPU = 2
+# Time the command's group gets between SIGTERM and SIGKILL. Long enough for
+# cargo and nextest to forward the signal and for a test binary to unwind;
+# short enough that a command ignoring SIGTERM does not stall the caller.
+KILL_GRACE_SECONDS = 5.0
+# Time load workers get between SIGTERM and SIGKILL at exit. A worker only
+# runs a loop, so it dies on SIGTERM at once; the margin covers scheduling
+# delay on a saturated CPU set.
+WORKER_STOP_GRACE_SECONDS = 2.0
+# Extra seconds on the scope's runtime limit beyond deadline + grace, so
+# systemd's limit fires only when the wrapper's own sequence failed.
+SCOPE_RUNTIME_MARGIN_SECONDS = 10.0
+# Wrapper poll period for command exit, signals and the deadline. 50 ms keeps
+# the exit latency invisible to a caller without a measurable idle cost.
+POLL_INTERVAL_SECONDS = 0.05
+# Busy-loop iterations between clock and parent checks in a load worker; at
+# interpreter speed this is a few milliseconds of pure CPU work.
+WORKER_SPIN_ITERATIONS = 200_000
+# Without PR_SET_PDEATHSIG a worker polls its parent at this period, which
+# bounds how long it can outlive a killed wrapper.
+WORKER_PARENT_POLL_SECONDS = 0.5
+# `timeout(1)` status for a command stopped by its deadline.
+EXIT_DEADLINE = 124
+# Usage error or unusable environment; nothing was started.
+EXIT_USAGE = 2
+# The command could not be started at all.
+EXIT_START_FAILED = 1
+# Linux prctl(2) options used here.
+PR_SET_PDEATHSIG = 1
+PR_SET_NAME = 15
+# Process name of a load worker, visible in `ps` and `/proc/<pid>/comm`.
+WORKER_NAME = b"stress-load"
+# `--deadline` grammar: one or more `<number><unit>` groups.
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600}
+DURATION_PATTERN = re.compile(r"(\d+)([smh])")
+# systemd size grammar accepted for `--memory-max`: bytes with an optional
+# binary suffix.
+MEMORY_PATTERN = re.compile(r"\d+[KMGT]?")
+HAS_AFFINITY = hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity")
+
+
+class UsageError(Exception):
+    """Invalid arguments or an unusable environment; nothing was started."""
+
+
+def parse_duration(text):
+    """Seconds in `text` (`90s`, `30m`, `1h30m`); raises UsageError otherwise."""
+    position = 0
+    total = 0
+    for match in DURATION_PATTERN.finditer(text):
+        if match.start() != position:
+            break
+        total += int(match.group(1)) * DURATION_UNITS[match.group(2)]
+        position = match.end()
+    if not text or position != len(text) or total <= 0:
+        raise UsageError(
+            f"--deadline {text!r} is not a positive duration such as 90s, 30m, 2h or 1h30m"
+        )
+    return total
+
+
+def format_cpus(cpus):
+    """`20-23,30` style rendering of a CPU set."""
+    ordered = sorted(cpus)
+    ranges = []
+    for cpu in ordered:
+        if ranges and ranges[-1][1] == cpu - 1:
+            ranges[-1][1] = cpu
+        else:
+            ranges.append([cpu, cpu])
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="stress-run",
+        description=(
+            "Run a command under bounded, self-terminating CPU contention. "
+            "The load and the command are confined to --cpus CPUs, the load "
+            "cannot outlive this wrapper, and --deadline is mandatory."
+        ),
+        usage="%(prog)s --deadline DURATION [options] -- COMMAND [ARG...]",
+        epilog=(
+            "Build first, then wrap only the run:\n"
+            "  cargo nextest run -p pohunek-daemon --no-run\n"
+            "  scripts/stress-run --deadline 45m -- cargo nextest run -p pohunek-daemon "
+            "--stress-count 100 -E 'test(/profile_freeze_tests/)'\n\n"
+            "Exit codes: the command's status (128+n for signal n); 124 deadline "
+            "reached; 2 usage error or unusable environment (nothing started); "
+            "1 the command could not be started.\n"
+            "Never start a detached load (nohup, trailing &, setsid, disown); a "
+            "process you started is yours to stop."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        # An abbreviated --memory-max would survive the re-exec's token filter
+        # and loop through systemd-run forever.
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--deadline",
+        required=True,
+        metavar="DURATION",
+        help="hard limit for the command, e.g. 90s, 30m, 2h, 1h30m (required)",
+    )
+    parser.add_argument(
+        "--cpus",
+        type=int,
+        default=DEFAULT_CPUS,
+        metavar="N",
+        help=f"CPUs to pin to: the N highest-numbered of the inherited mask "
+        f"(default {DEFAULT_CPUS}, CI's Linux runner)",
+    )
+    parser.add_argument(
+        "--load-per-cpu",
+        type=int,
+        default=DEFAULT_LOAD_PER_CPU,
+        metavar="K",
+        help=f"busy-loop workers per CPU (default {DEFAULT_LOAD_PER_CPU})",
+    )
+    parser.add_argument(
+        "--unpinned",
+        action="store_true",
+        help="do not pin; the load then contends host-wide. Required on "
+        "platforms without CPU affinity (macOS)",
+    )
+    parser.add_argument(
+        "--memory-max",
+        metavar="SIZE",
+        help="Linux: run the whole tree in a transient systemd user scope with "
+        "MemoryMax=SIZE (e.g. 4G) and a runtime limit of deadline + grace; "
+        "fails when no user manager is reachable",
+    )
+    return parser
+
+
+def validate(args):
+    """Return `(deadline_seconds, cpu_set)`; raise UsageError before any start."""
+    deadline = parse_duration(args.deadline)
+    if args.cpus < 1:
+        raise UsageError("--cpus must be at least 1")
+    if args.load_per_cpu < 1:
+        raise UsageError("--load-per-cpu must be at least 1")
+    if args.memory_max is not None:
+        if not sys.platform.startswith("linux"):
+            raise UsageError("--memory-max needs Linux and a systemd user manager")
+        if not MEMORY_PATTERN.fullmatch(args.memory_max):
+            raise UsageError(
+                f"--memory-max {args.memory_max!r} is not a size such as 512M or 4G"
+            )
+    if not HAS_AFFINITY:
+        if not args.unpinned:
+            raise UsageError(
+                "this platform has no CPU affinity, so the command cannot be "
+                "pinned; pass --unpinned to run it with host-wide contention"
+            )
+        return deadline, None
+    available = sorted(os.sched_getaffinity(0))
+    if args.cpus > len(available):
+        raise UsageError(
+            f"--cpus {args.cpus} exceeds the {len(available)} CPUs in the "
+            "inherited affinity mask"
+        )
+    if args.unpinned:
+        return deadline, None
+    return deadline, set(available[-args.cpus:])
+
+
+def libc():
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def run_in_scope(args, deadline, options, command):
+    """Re-execute inside a transient user scope with the memory cap; no return."""
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        raise UsageError("--memory-max needs systemd-run, which was not found")
+    probe = subprocess.run(
+        [systemd_run, "--user", "--scope", "--collect", "--quiet", "--", "true"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        detail = probe.stderr.strip().splitlines()
+        raise UsageError(
+            "--memory-max needs a reachable systemd user manager: "
+            + (detail[-1] if detail else f"systemd-run exited {probe.returncode}")
+        )
+    runtime = int(deadline + KILL_GRACE_SECONDS + SCOPE_RUNTIME_MARGIN_SECONDS)
+    inner = []
+    skip = False
+    for token in options:
+        if skip:
+            skip = False
+        elif token == "--memory-max":
+            skip = True
+        elif not token.startswith("--memory-max="):
+            inner.append(token)
+    argv = [
+        systemd_run, "--user", "--scope", "--collect", "--quiet",
+        "-p", f"MemoryMax={args.memory_max}",
+        "-p", f"RuntimeMaxSec={runtime}",
+        "--", sys.executable, os.path.abspath(__file__), *inner, "--", *command,
+    ]
+    # systemd-run replaces itself with the wrapper once the scope exists, so
+    # signals and the exit status pass through unchanged.
+    os.execv(argv[0], argv)
+
+
+class Wrapper:
+    """One run: load workers, the command, and the shutdown sequence."""
+
+    def __init__(self, args, deadline, cpus, command):
+        self.args = args
+        self.deadline_seconds = deadline
+        self.cpus = cpus
+        self.command = command
+        self.workers = []
+        self.process = None
+        self.pgid = None
+        self.received = None
+        self.started = time.monotonic()
+        self.end = self.started + deadline
+        self.owner_pid = os.getpid()
+
+    def on_signal(self, number, _frame):
+        if self.received is None:
+            self.received = number
+
+    def spawn_workers(self):
+        count = self.args.cpus * self.args.load_per_cpu
+        for _ in range(count):
+            pid = os.fork()
+            if pid == 0:
+                self.worker_main()
+            self.workers.append(pid)
+
+    def worker_main(self):
+        """Busy loop in a forked child; never returns."""
+        status = 0
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if sys.platform.startswith("linux"):
+                lib = libc()
+                lib.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+                lib.prctl(PR_SET_NAME, WORKER_NAME, 0, 0, 0)
+            # The wrapper may have died before the death signal was armed.
+            if os.getppid() != self.owner_pid:
+                os._exit(0)
+            if self.cpus is not None:
+                os.sched_setaffinity(0, self.cpus)
+            next_parent_check = time.monotonic() + WORKER_PARENT_POLL_SECONDS
+            while True:
+                for _ in range(WORKER_SPIN_ITERATIONS):
+                    pass
+                now = time.monotonic()
+                if now >= self.end:
+                    break
+                if now >= next_parent_check:
+                    if os.getppid() != self.owner_pid:
+                        break
+                    next_parent_check = now + WORKER_PARENT_POLL_SECONDS
+        except BaseException:
+            status = 1
+        finally:
+            os._exit(status)
+
+    def command_preexec(self):
+        """Runs in the forked command child before exec."""
+        if sys.platform.startswith("linux"):
+            libc().prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+            # The wrapper may have died before the death signal was armed.
+            # The inherited Python SIGTERM handler would only set a flag, so
+            # the child ends itself instead of reaching exec.
+            if os.getppid() != self.owner_pid:
+                os._exit(128 + signal.SIGTERM)
+        if self.cpus is not None:
+            os.sched_setaffinity(0, self.cpus)
+
+    def start_command(self):
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                process_group=0,
+                preexec_fn=self.command_preexec,
+            )
+        except OSError as error:
+            print(f"stress-run: cannot start {self.command[0]!r}: {error}", file=sys.stderr)
+            return False
+        self.pgid = self.process.pid
+        return True
+
+    def command_exited(self):
+        """True once the command's leader has exited (without reaping it)."""
+        if hasattr(os, "waitid"):
+            try:
+                return os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+            except ChildProcessError:
+                return True
+        return self.process.poll() is not None
+
+    def signal_group(self, number):
+        try:
+            os.killpg(self.pgid, number)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # macOS answers EPERM for a group whose only member is a zombie.
+            pass
+
+    def stop_command(self):
+        """SIGTERM the group, wait the grace period, then SIGKILL the group."""
+        self.signal_group(signal.SIGTERM)
+        grace_end = time.monotonic() + KILL_GRACE_SECONDS
+        while time.monotonic() < grace_end and not self.command_exited():
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    def stop_workers(self):
+        for pid in self.workers:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        grace_end = time.monotonic() + WORKER_STOP_GRACE_SECONDS
+        pending = list(self.workers)
+        while pending and time.monotonic() < grace_end:
+            pending = [pid for pid in pending if os.waitpid(pid, os.WNOHANG) == (0, 0)]
+            if pending:
+                time.sleep(POLL_INTERVAL_SECONDS)
+        for pid in pending:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+        self.workers = []
+
+    def run(self):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(number, self.on_signal)
+        if self.cpus is None:
+            print(
+                f"stress-run: unpinned; {self.args.cpus * self.args.load_per_cpu} load "
+                "workers contend host-wide",
+                file=sys.stderr,
+            )
+        self.spawn_workers()
+        if not self.start_command():
+            self.stop_workers()
+            return EXIT_START_FAILED
+        timed_out = False
+        while True:
+            if self.command_exited():
+                break
+            if self.received is not None:
+                self.stop_command()
+                break
+            if time.monotonic() >= self.end:
+                timed_out = True
+                print(
+                    f"stress-run: deadline {self.args.deadline} reached; stopping the command",
+                    file=sys.stderr,
+                )
+                self.stop_command()
+                break
+            time.sleep(POLL_INTERVAL_SECONDS)
+        # The leader is still unreaped here, so its PID cannot be recycled and
+        # the group signal cannot reach an unrelated process.
+        self.signal_group(signal.SIGKILL)
+        returncode = self.process.wait()
+        self.stop_workers()
+        if timed_out:
+            status = EXIT_DEADLINE
+        elif returncode < 0:
+            status = 128 - returncode
+        else:
+            status = returncode
+        cpus = "unpinned" if self.cpus is None else format_cpus(self.cpus)
+        wall = time.monotonic() - self.started
+        print(
+            f"stress-run: cpus={cpus} load_workers={self.args.cpus * self.args.load_per_cpu} "
+            f"wall={wall:.1f}s status={status}",
+            file=sys.stderr,
+        )
+        return status
+
+
+def main(argv):
+    parser = build_parser()
+    # Options end at the first `--`; argparse reports its own errors with 2.
+    split = argv.index("--") if "--" in argv else len(argv)
+    options, command = argv[:split], argv[split + 1:]
+    args = parser.parse_args(options)
+    try:
+        if not command:
+            raise UsageError("a command is required after `--`")
+        deadline, cpus = validate(args)
+        if args.memory_max is not None:
+            run_in_scope(args, deadline, options, command)
+    except UsageError as error:
+        print(f"stress-run: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    return Wrapper(args, deadline, cpus, command).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

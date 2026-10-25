@@ -134,6 +134,8 @@ python3 scripts/test-partitions check      # verify all tests belong to exactly 
 # macOS only, from a nextest archive: `check-macos` (`--scope lane` for the PR lane archive) and `run-macos` (PR lane), `run-macos-tier` (main/nightly); see verification.md, Fast loops
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
     --event pull_request --conclusion success   # reproduce CI timing evidence
+scripts/stress-run --deadline 45m -- cargo nextest run -p pohunek-daemon --stress-count 100 -E 'test(/profile_freeze_tests/)'  # reproduce a timing failure under pinned CPU load (build first with --no-run)
+scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy  # stress the tests this diff adds or changes
 ```
 
 Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11

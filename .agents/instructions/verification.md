@@ -490,6 +490,19 @@ flaky and failed tests in the job summary. A FLAKY result means opening a bug is
 the root cause. A per-test `flaky-result = "pass"` override is allowed only
 with a linked issue and a reason in a comment next to it.
 
+Reproducing a timing failure: `scripts/stress-run` is the only sanctioned way
+to put a test under CPU contention. It pins the command and a self-terminating
+load to 4 CPUs (CI's Linux runner width), enforces a mandatory `--deadline`,
+and leaves no load behind even when it is killed. Build first
+(`cargo nextest run ... --no-run`), then wrap only the run:
+`scripts/stress-run --deadline 45m -- cargo nextest run ... --stress-count N`.
+Never start a detached load or test process (`nohup`, a trailing `&`, `setsid`,
+`disown`) and never load every host CPU; a process you started is yours to stop
+before you finish. Before push, `scripts/stress-changed-tests` stress-runs the
+tests a diff adds or changes in the heavy, relay-db and macOS lanes (the
+"Stress the changed tests" step of the gates skill); a failure there is a FLAKY
+result, never retried to green.
+
 Hermetic tests: a test owns its fixtures and never touches host state.
 Directories come from `pohunek_test_support::tempdir()` or
 `pohunek_test_support::env::TestEnv` (private root, cwd, HOME/XDG/TMPDIR, scrubbed

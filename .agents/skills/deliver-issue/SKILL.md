@@ -192,7 +192,10 @@ readback is a safety check, not a permanent substitute for them.
      ordering bug exposed by CI load; non-hermetic test (depends on the
      host's processes, paths, timing); pre-existing flake (check the test's
      history on this branch and `main` with `gh run list`). Reproduce locally
-     under CI-like conditions when it is timing-related (`stress --cpu N`,
+     under CI-like conditions when it is timing-related (build first with
+     `cargo nextest run ... --no-run`, then wrap only the run in
+     `scripts/stress-run --deadline <D> -- cargo nextest run ... --stress-count
+     N`, never a detached load or one that uses every host CPU;
      slow fsync via `strace -f -e inject=fsync,fdatasync:delay_enter=<µs>`,
      a helper spawning non-dumpable processes, a symlinked/long `TMPDIR`).
    - Fix the root cause. A test is aligned only to the product's real
