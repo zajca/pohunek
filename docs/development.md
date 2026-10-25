@@ -527,9 +527,9 @@ contract fixtures in `scripts/tests/fixtures/changelog` pin the byte-exact outpu
 
 ## Release
 
-`scripts/release` bumps the workspace version and refreshes the lockfile, then
-requires successful main and nightly CI evidence for the exact release commit
-before tagging `vX.Y.Z`. By default it pushes the release branch before waiting
+`scripts/release` bumps the workspace version and refreshes the lockfile, folds the
+changelog fragments into `CHANGELOG.md`, then requires successful main and nightly
+CI evidence for the exact release commit before tagging `vX.Y.Z`. By default it pushes the release branch before waiting
 for that evidence and pushes the tag after verification. `--no-push` checks
 already-existing evidence and leaves the commit and tag local; it does not
 dispatch CI or push either ref. The Release workflow

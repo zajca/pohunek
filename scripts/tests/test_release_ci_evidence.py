@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "release"
 EVIDENCE = ROOT / "scripts" / "ci-evidence"
+CHANGELOG_TOOL = ROOT / "scripts" / "changelog"
 CONFIG = ROOT / "scripts" / "ci-evidence.json"
 
 
@@ -181,6 +182,10 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.write_copy("scripts/release", SCRIPT.read_text(), executable=True)
         self.write_copy("scripts/ci-evidence", EVIDENCE.read_text(), executable=True)
         self.write_copy("scripts/ci-evidence.json", json.dumps(self.config))
+        self.write_copy("scripts/changelog", CHANGELOG_TOOL.read_text(), executable=True)
+        self.write_copy(".github/changelog.json", '{"repository": "example/pohunek", "changelog": "CHANGELOG.md"}\n')
+        self.write_copy("CHANGELOG.md", "# Changelog\n\nUser-facing changes of pohunek.\n")
+        self.write_copy("changelog.d/.gitkeep", "")
         self.write_copy("bin/git", FAKE_GIT, executable=True)
         self.write_copy("bin/cargo", FAKE_CARGO, executable=True)
         self.write_copy("bin/gh", FAKE_GH, executable=True)
@@ -195,7 +200,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
         # writing into .git while the fixture repository is removed.
         self.git("config", "maintenance.auto", "false")
         self.git("config", "gc.auto", "0")
-        self.git("add", "Cargo.toml", "Cargo.lock", "scripts", "bin")
+        self.git("add", "Cargo.toml", "Cargo.lock", "scripts", "bin", ".github", "CHANGELOG.md", "changelog.d")
         self.git("commit", "-m", "Initial state")
         self.git("remote", "add", "origin", "https://github.com/example/pohunek.git")
         self.state.write_text(json.dumps({"sha": "", "runs": []}))
@@ -244,7 +249,11 @@ class ReleaseEvidenceTests(unittest.TestCase):
 
     def prepare_existing_candidate(self):
         (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.1"\n')
-        self.git("add", "Cargo.toml")
+        (self.repo / "CHANGELOG.md").write_text(
+            "# Changelog\n\nUser-facing changes of pohunek.\n\n"
+            "## 0.1.1 - 2026-10-24\n\nNo user-facing changes.\n"
+        )
+        self.git("add", "Cargo.toml", "CHANGELOG.md")
         self.git("commit", "-m", "Prepare release candidate")
         sha = subprocess.check_output(
             [shutil.which("git"), "-C", str(self.repo), "rev-parse", "HEAD"], text=True
