@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use pohunek_daemon::runtime::{DataStream, Worker, WorkerError};
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::wait::wait_until;
+use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
     is_denylisted, read_frame, write_frame, AttachStart, BaseEnv, ControlCode, DaemonId, DataFrame,
@@ -31,8 +31,10 @@ use pohunek_worker_protocol::{
     MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
 };
 
-/// Bounds waiting for the worker socket and the child's exit.
-const DEADLINE: Duration = Duration::from_secs(15);
+/// Hang guard for every wait on the worker socket, the child's exit and the
+/// streams. The scenarios synchronize on readiness signals, never on this
+/// bound.
+const DEADLINE: Duration = HANG_GUARD;
 /// Output page size; an environment listing fits in a few pages.
 const PAGE_BYTES: u32 = 16 * 1024;
 /// Short observation wait, because the child has already exited.
@@ -396,6 +398,7 @@ async fn previous_version_child_gets_the_base_environment_without_service_manage
 /// Input stall bound the silent-child scenarios initialize with. It is short
 /// so the stall arrives quickly, and the write waits for it on a child that
 /// never reads.
+// timing-allowed: #1592 the worker's input stall policy is the behavior under test
 const SILENT_CHILD_STALL_MS: u64 = 300;
 
 /// Lines in the oversized write, about 134 KB in all. A PTY whose program does

@@ -622,29 +622,99 @@ async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() 
     );
 }
 
+/// Budget of the waiters that must be woken by an event, on the paused clock.
+/// Only an explicit `advance` can reach it, so it never decides an outcome.
+// timing-allowed: #1592 virtual budget, the test pauses the clock after create
+const WAKE_BUDGET_MS: u32 = 1_000;
+
+/// Budget of the waiter whose timeout is the behavior under test, on the paused
+/// clock. The test advances the clock past it.
+// timing-allowed: #1592 virtual budget, the test pauses the clock after create
+const TIMEOUT_BUDGET_MS: u32 = 10;
+
+/// Yields until every waiter in `waiters` holds a waiter permit for `id`, or has
+/// already returned.
+///
+/// A permit is taken after the waiter subscribed to the event stream and took
+/// its second snapshot, so a mutation made once this returns reaches the
+/// waiter as an event. A waiter that returned before it registered saw its
+/// predicate already true; its result is asserted by the caller. The paused,
+/// inhibited clock leaves no timer to poll with; the real-time ceiling is a
+/// hang guard.
+async fn await_registered_waiters<T>(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    waiters: &[&tokio::task::JoinHandle<T>],
+) {
+    let started = Instant::now();
+    loop {
+        let registered = registry
+            .inner
+            .observation_session_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .copied()
+            .unwrap_or(0);
+        let pending = waiters
+            .iter()
+            .filter(|waiter| !waiter.is_finished())
+            .count();
+        if registered >= pending {
+            return;
+        }
+        assert!(
+            started.elapsed() < HANG_GUARD,
+            "hang guard elapsed waiting for {pending} registered waiters, found {registered}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Wait parameters that carry only the predicates the caller names.
+fn wait_params(
+    id: &SessionId,
+    runtime: Option<SessionRuntimeIdentity>,
+    after_updated_at: Option<String>,
+    states: Option<Vec<SessionState>>,
+    timeout_ms: u32,
+) -> SessionWaitParams {
+    SessionWaitParams::new(
+        id.clone(),
+        runtime,
+        after_updated_at,
+        None,
+        None,
+        states,
+        None,
+        timeout_ms,
+    )
+    .expect("wait params")
+}
+
 #[tokio::test]
 async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
     let created = registry.create(params()).await.expect("create session");
 
-    let metadata_params = SessionWaitParams::new(
-        created.id.clone(),
+    // From here the clock moves only through `advance`: the waiters' budgets
+    // are virtual, while the worker and its child stay real.
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
+
+    let metadata_params = wait_params(
+        &created.id,
         None,
         Some(created.updated_at.clone()),
         None,
-        None,
-        None,
-        None,
-        1_000,
-    )
-    .expect("metadata wait params");
+        WAKE_BUDGET_MS,
+    );
     let metadata_registry = registry.clone();
     let metadata_wait = tokio::spawn(async move { metadata_registry.wait(&metadata_params).await });
-    tokio::task::yield_now().await;
+    await_registered_waiters(&registry, &created.id, &[&metadata_wait]).await;
     registry
         .set_metadata(
             &created.id,
@@ -658,35 +728,30 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
         .expect("metadata waiter result");
     assert_eq!(metadata.reason, SessionWaitReason::SessionUpdated);
 
-    let timeout = registry
-        .wait(
-            &SessionWaitParams::new(
-                created.id.clone(),
-                None,
-                None,
-                None,
-                None,
-                Some(vec![SessionState::Failed]),
-                None,
-                10,
-            )
-            .expect("timeout params"),
-        )
+    let timeout_params = wait_params(
+        &created.id,
+        None,
+        None,
+        Some(vec![SessionState::Failed]),
+        TIMEOUT_BUDGET_MS,
+    );
+    let timeout_registry = registry.clone();
+    let timeout_wait = tokio::spawn(async move { timeout_registry.wait(&timeout_params).await });
+    await_registered_waiters(&registry, &created.id, &[&timeout_wait]).await;
+    tokio::time::advance(Duration::from_millis(u64::from(TIMEOUT_BUDGET_MS)) + TIMER_TICK).await;
+    let timeout = timeout_wait
         .await
+        .expect("timeout waiter task")
         .expect("timeout is a normal wait result");
     assert_eq!(timeout.reason, SessionWaitReason::Timeout);
 
-    let state_params = SessionWaitParams::new(
-        created.id.clone(),
-        None,
-        None,
+    let state_params = wait_params(
+        &created.id,
         None,
         None,
         Some(vec![SessionState::Stopped]),
-        None,
-        1_000,
-    )
-    .expect("state wait params");
+        WAKE_BUDGET_MS,
+    );
     let state_registry = registry.clone();
     let state_wait = tokio::spawn(async move { state_registry.wait(&state_params).await });
     let live_runtime = created
@@ -700,20 +765,10 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
         })
         .expect("live runtime identity")
         .expect("valid runtime identity");
-    let runtime_params = SessionWaitParams::new(
-        created.id.clone(),
-        Some(live_runtime),
-        None,
-        None,
-        None,
-        None,
-        None,
-        1_000,
-    )
-    .expect("runtime wait params");
+    let runtime_params = wait_params(&created.id, Some(live_runtime), None, None, WAKE_BUDGET_MS);
     let runtime_registry = registry.clone();
     let runtime_wait = tokio::spawn(async move { runtime_registry.wait(&runtime_params).await });
-    tokio::task::yield_now().await;
+    await_registered_waiters(&registry, &created.id, &[&state_wait, &runtime_wait]).await;
     registry.stop(&created.id).await.expect("stop session");
     let state = state_wait
         .await
@@ -725,6 +780,9 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
         .expect("runtime waiter task")
         .expect("runtime waiter result");
     assert_eq!(runtime.reason, SessionWaitReason::RuntimeChanged);
+
+    tokio::time::resume();
+    inhibitor.release().await;
 }
 
 async fn assert_runtime_change_precedes_cursor_access(

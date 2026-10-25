@@ -46,7 +46,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 
-use xtask::test_code::{classify, is_ident, read_sources, skip_whitespace, SourceFile};
+use xtask::ratchet::{
+    contains_word, end_of_ident, expect_token, ident_before, is_allowed, markers, matching_close,
+    on_virtual_time, parse_baseline, starts_word, top_level_arguments,
+};
+use xtask::test_code::{classify, is_ident, read_sources, skip_whitespace};
 
 /// Workspace-relative path of the committed baseline.
 const BASELINE_PATH: &str = "crates/xtask/tests/timing_ratchet_baseline.txt";
@@ -63,9 +67,6 @@ const ASSERT_MACROS: [&str; 6] = [
     "debug_assert_eq",
     "debug_assert_ne",
 ];
-
-/// Attribute text (whitespace removed) that puts a test on virtual time.
-const PAUSED_ATTRIBUTE: &str = "start_paused=true";
 
 /// Header written at the top of the baseline file.
 const BASELINE_HEADER: &str =
@@ -114,70 +115,6 @@ struct MalformedMarker {
 struct Scan {
     counted: Vec<Occurrence>,
     malformed: Vec<MalformedMarker>,
-}
-
-/// Index of the byte matching the opener at `open` in `bytes`, or the length.
-fn matching_close(bytes: &[u8], open: usize) -> usize {
-    let (opener, closer) = match bytes[open] {
-        b'[' => (b'[', b']'),
-        b'(' => (b'(', b')'),
-        _ => (b'{', b'}'),
-    };
-    let mut depth = 0_usize;
-    for (i, &byte) in bytes.iter().enumerate().skip(open) {
-        if byte == opener {
-            depth += 1;
-        } else if byte == closer {
-            depth -= 1;
-            if depth == 0 {
-                return i;
-            }
-        }
-    }
-    bytes.len()
-}
-
-/// Index one past the identifier that starts at `start`.
-fn end_of_ident(bytes: &[u8], start: usize) -> usize {
-    let mut end = start;
-    while bytes.get(end).copied().is_some_and(is_ident) {
-        end += 1;
-    }
-    end
-}
-
-/// Whether `bytes[offset..]` starts an identifier-bounded word.
-fn starts_word(bytes: &[u8], offset: usize) -> bool {
-    offset == 0 || !is_ident(bytes[offset - 1])
-}
-
-/// The identifier that ends right before `end`, skipping whitespace first.
-fn ident_before(bytes: &[u8], end: usize) -> &str {
-    let mut stop = end;
-    while stop > 0 && bytes[stop - 1].is_ascii_whitespace() {
-        stop -= 1;
-    }
-    let mut start = stop;
-    while start > 0 && is_ident(bytes[start - 1]) {
-        start -= 1;
-    }
-    std::str::from_utf8(&bytes[start..stop]).unwrap_or("")
-}
-
-/// Index just past `token` when it follows `from` after optional whitespace.
-fn expect_token(bytes: &[u8], from: usize, token: &str) -> Option<usize> {
-    let at = skip_whitespace(bytes, from);
-    bytes[at..]
-        .starts_with(token.as_bytes())
-        .then_some(at + token.len())
-}
-
-/// Whether `text` contains `word` bounded by non-identifier bytes.
-fn contains_word(text: &str, word: &str) -> bool {
-    let bytes = text.as_bytes();
-    text.match_indices(word).any(|(at, _)| {
-        starts_word(bytes, at) && !bytes.get(at + word.len()).copied().is_some_and(is_ident)
-    })
 }
 
 /// Kinds of the sleep functions that `use` statements import by bare name.
@@ -268,26 +205,6 @@ fn timer_candidates(skeleton: &str) -> Vec<(usize, Kind)> {
         .collect()
 }
 
-/// Splits `body` at top-level commas.
-fn top_level_arguments(body: &str) -> Vec<&str> {
-    let mut depth = 0_usize;
-    let mut start = 0;
-    let mut arguments = Vec::new();
-    for (i, c) in body.char_indices() {
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                arguments.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    arguments.push(&body[start..]);
-    arguments
-}
-
 /// Whether `text` holds a comparison operator (`<`, `>`, `<=`, `>=`).
 fn has_comparison(text: &str) -> bool {
     let bytes = text.as_bytes();
@@ -349,89 +266,6 @@ fn elapsed_candidates(skeleton: &str) -> Vec<(usize, Kind)> {
         }
     }
     found
-}
-
-/// Byte offsets of the `//` that begin a line comment, outside block comments,
-/// strings and char literals.
-///
-/// `Views::code` blanks line and block comments alike, so a blanked,
-/// non-whitespace byte starts a comment and the text there tells the kind.
-fn line_comment_starts(text: &str, code: &str) -> Vec<usize> {
-    let (text, code) = (text.as_bytes(), code.as_bytes());
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i < text.len() {
-        if code[i] != b' ' || text[i].is_ascii_whitespace() {
-            i += 1;
-        } else if text[i..].starts_with(b"//") {
-            starts.push(i);
-            i += text[i..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(text.len() - i);
-        } else {
-            let mut depth = 0_usize;
-            while i < text.len() {
-                if text[i..].starts_with(b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if text[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        }
-    }
-    starts
-}
-
-/// Lines (one-based) carrying a valid marker and the malformed marker lines.
-fn markers(file: &SourceFile, text: &str) -> (Vec<usize>, Vec<usize>) {
-    let mut valid = Vec::new();
-    let mut malformed = Vec::new();
-    for at in line_comment_starts(text, &file.views().code) {
-        let rest = &text[at + 2..];
-        let rest = &rest[..rest.find('\n').unwrap_or(rest.len())];
-        if rest.starts_with(['/', '!']) {
-            continue;
-        }
-        if let Some(body) = rest.trim_start().strip_prefix(MARKER) {
-            let line = file.line_of(at);
-            if is_valid_marker(body) {
-                valid.push(line);
-            } else {
-                malformed.push(line);
-            }
-        }
-    }
-    (valid, malformed)
-}
-
-/// Whether the text after `timing-allowed` is `: #<digits> <reason>`.
-fn is_valid_marker(body: &str) -> bool {
-    let Some(rest) = body.strip_prefix(':') else {
-        return false;
-    };
-    let Some(rest) = rest.trim().strip_prefix('#') else {
-        return false;
-    };
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    digits > 0
-        && rest[digits..].starts_with(char::is_whitespace)
-        && !rest[digits..].trim().is_empty()
-}
-
-/// Whether the byte `offset` sits in a test item declared on virtual time.
-fn on_virtual_time(file: &SourceFile, offset: usize) -> bool {
-    file.test_attributes_at(offset).iter().any(|attribute| {
-        let squeezed: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
-        squeezed.contains(PAUSED_ATTRIBUTE)
-    })
 }
 
 /// Whether every `Instant` the file names is `tokio::time::Instant`, so an
@@ -502,7 +336,7 @@ fn scan_files(files: &BTreeMap<String, String>) -> Scan {
     let mut scan = Scan::default();
     for (path, file) in classify(files) {
         let text = &files[&path];
-        let (valid, malformed) = markers(&file, text);
+        let (valid, malformed) = markers(&file, text, MARKER);
         scan.malformed
             .extend(malformed.into_iter().map(|line| MalformedMarker {
                 path: path.clone(),
@@ -516,7 +350,7 @@ fn scan_files(files: &BTreeMap<String, String>) -> Scan {
         candidates.sort_by_key(|&(offset, _)| offset);
         for (offset, kind) in candidates {
             let line = file.line_of(offset);
-            let allowed = valid.contains(&line) || valid.contains(&(line.saturating_sub(1)));
+            let allowed = is_allowed(&valid, line);
             let virtual_time =
                 is_virtual(kind, only_tokio_instant) && on_virtual_time(&file, offset);
             if file.in_test_code(offset) && !virtual_time && !allowed {
@@ -540,37 +374,9 @@ fn counts(scan: &Scan) -> BTreeMap<String, usize> {
     counts
 }
 
-/// Parses the baseline text: `<path> <count>` per line, `#` starts a comment
-/// line.
-fn parse_baseline(text: &str) -> BTreeMap<String, usize> {
-    let mut baseline = BTreeMap::new();
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (path, count) = line
-            .rsplit_once(' ')
-            .unwrap_or_else(|| panic!("baseline line {}: expected `<path> <count>`", index + 1));
-        let count = count
-            .parse()
-            .unwrap_or_else(|e| panic!("baseline line {}: bad count: {e}", index + 1));
-        assert!(
-            baseline.insert(path.trim().to_owned(), count).is_none(),
-            "baseline line {}: duplicate path {path}",
-            index + 1
-        );
-    }
-    baseline
-}
-
 /// Renders `counts` as baseline file text.
 fn format_baseline(counts: &BTreeMap<String, usize>) -> String {
-    let mut text = BASELINE_HEADER.to_owned();
-    for (path, count) in counts {
-        writeln!(text, "{path} {count}").expect("writing to a String cannot fail");
-    }
-    text
+    xtask::ratchet::format_baseline(BASELINE_HEADER, counts)
 }
 
 /// Failure messages for `scan` measured against `baseline`; empty when the

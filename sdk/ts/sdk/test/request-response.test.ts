@@ -36,17 +36,38 @@ import {
 } from "./mock-daemon";
 
 // The dedicated-routing scenarios prove that a call on a dedicated connection
-// outlives the shared connection's request timeout. The shared timeout must
-// still fit a direct round trip, which exceeded 20 ms on a loaded runner
-// (#494), and each delayed daemon reply outlasts it while staying inside the
-// dedicated deadline (the wire wait plus the SDK's 1 s headroom).
+// outlives the shared connection's request timeout. They run on the virtual
+// clock: the daemon holds each reply behind a gate, the test advances the
+// clock past the shared timeout once the request reached the daemon, and then
+// releases the reply. The dedicated deadline is the wire wait plus the SDK's 1 s
+// headroom, so the reply still lands inside it.
 const SHARED_REQUEST_TIMEOUT_MS = 1_000;
+// Virtual time that passes before the held reply is released; it exceeds the
+// shared request timeout.
 const DEDICATED_REPLY_DELAY_MS = 1_500;
 // Wire wait of the generic-routing scenario; with the headroom it sizes a 4 s
 // dedicated deadline, 2.5 s beyond `DEDICATED_REPLY_DELAY_MS`.
 const DEDICATED_WIRE_WAIT_MS = 3_000;
-// Bun's per-test timeout for a scenario with two delayed replies.
-const DEDICATED_SCENARIO_TIMEOUT_MS = 10_000;
+
+/** A reply gate: the daemon answers once `release` is called. */
+function replyGate(): { ready: Promise<void>; release: () => void } {
+  let release: () => void = () => undefined;
+  const ready = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { ready, release };
+}
+
+/**
+ * The next request line the daemon receives. It fails when `call` settles
+ * first, so a call that never reaches the daemon cannot hang the test.
+ */
+function requestReaching(daemon: MockDaemon, call: Promise<unknown>): Promise<string> {
+  return Promise.race([
+    daemon.nextRequest(),
+    call.then(() => { throw new Error("the call settled before reaching the daemon"); }),
+  ]);
+}
 
 /**
  * The `daemon.health` reply that selects the current protocol version. A
@@ -662,10 +683,11 @@ describe("Client request/response", () => {
       activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
+    const inputReply = replyGate();
     const daemon = await startUnixDaemon([
       {
-        kind: "delay",
-        ms: DEDICATED_REPLY_DELAY_MS,
+        kind: "gate",
+        ready: inputReply.ready,
         line: (line) => okResponseLine(requestIdFromLine(line), input),
       },
       {
@@ -678,33 +700,41 @@ describe("Client request/response", () => {
       },
     ]);
     try {
-      const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
+      jest.useFakeTimers();
+      try {
+        const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
+        const waiting = client.sessionInput({
+          session_id: "s-target",
+          text: "hello",
+          wait: { until: ["idle"] },
+        });
+        const waitingRequest = parseRequestLine(await requestReaching(daemon, waiting));
+        jest.advanceTimersByTime(DEDICATED_REPLY_DELAY_MS);
+        inputReply.release();
 
-      expect(await client.sessionInput({
-        session_id: "s-target",
-        text: "hello",
-        wait: { until: ["idle"] },
-      })).toEqual(input);
-      expect(await client.call("daemon.health", null)).toEqual({
-        status: "ok",
-        daemon_version: "test",
-        protocol_version: PROTOCOL_VERSION,
-      });
+        expect(await waiting).toEqual(input);
+        expect(waitingRequest["method"]).toBe("session.input");
+        expect(waitingRequest["params"]).toEqual({
+          session_id: "s-target",
+          text: "hello",
+          wait: { until: ["idle"] },
+        });
+        expect(await client.call("daemon.health", null)).toEqual({
+          status: "ok",
+          daemon_version: "test",
+          protocol_version: PROTOCOL_VERSION,
+        });
 
-      const waiting = parseRequestLine(await daemon.nextRequest());
-      expect(waiting["method"]).toBe("session.input");
-      expect(waiting["params"]).toEqual({
-        session_id: "s-target",
-        text: "hello",
-        wait: { until: ["idle"] },
-      });
-      const followUp = parseRequestLine(await daemon.nextRequest());
-      expect(followUp["method"]).toBe("daemon.health");
-      await client.close();
+        const followUp = parseRequestLine(await daemon.nextRequest());
+        expect(followUp["method"]).toBe("daemon.health");
+        await client.close();
+      } finally {
+        jest.useRealTimers();
+      }
     } finally {
       await daemon.close();
     }
-  }, DEDICATED_SCENARIO_TIMEOUT_MS);
+  });
 
   test("generic calls route session.wait and a waiting session.output through dedicated connections", async () => {
     const wait = { reason: "timeout", session: minimalSessionInfo() } as const;
@@ -721,8 +751,11 @@ describe("Client request/response", () => {
       timed_out: true,
     } as const;
     // The health reply selects the protocol version the dedicated connections
-    // inherit. Each daemon-side wait outlasts the shared connection's request
-    // timeout and ends within the dedicated deadline sized to the requested wait.
+    // inherit. Each daemon-side wait is held past the shared connection's
+    // request timeout, on the virtual clock, and released within the dedicated
+    // deadline sized to the requested wait.
+    const waitReply = replyGate();
+    const outputReply = replyGate();
     const daemon = await startUnixDaemon([
       {
         kind: "reply",
@@ -732,35 +765,46 @@ describe("Client request/response", () => {
           protocol_version: PROTOCOL_VERSION,
         }),
       },
-      { kind: "delay", ms: DEDICATED_REPLY_DELAY_MS, line: (line) => okResponseLine(requestIdFromLine(line), wait) },
-      { kind: "delay", ms: DEDICATED_REPLY_DELAY_MS, line: (line) => okResponseLine(requestIdFromLine(line), output) },
+      { kind: "gate", ready: waitReply.ready, line: (line) => okResponseLine(requestIdFromLine(line), wait) },
+      { kind: "gate", ready: outputReply.ready, line: (line) => okResponseLine(requestIdFromLine(line), output) },
     ]);
     try {
-      const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
-      await client.call("daemon.health", null);
+      jest.useFakeTimers();
+      try {
+        const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
+        const health = client.call("daemon.health", null);
+        expect(parseRequestLine(await requestReaching(daemon, health))["method"]).toBe("daemon.health");
+        await health;
 
-      expect(await client.call("session.wait", {
-        session_id: "s-target",
-        after_updated_at: "2026-08-04T00:00:00Z",
-        timeout_ms: DEDICATED_WIRE_WAIT_MS,
-      })).toEqual(wait);
-      expect(await client.call("session.output", {
-        session_id: "s-target",
-        runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
-        after_offset: "0",
-        max_bytes: 128,
-        wait_ms: DEDICATED_WIRE_WAIT_MS,
-      })).toEqual(output);
+        const waiting = client.call("session.wait", {
+          session_id: "s-target",
+          after_updated_at: "2026-08-04T00:00:00Z",
+          timeout_ms: DEDICATED_WIRE_WAIT_MS,
+        });
+        expect(parseRequestLine(await requestReaching(daemon, waiting))["method"]).toBe("session.wait");
+        jest.advanceTimersByTime(DEDICATED_REPLY_DELAY_MS);
+        waitReply.release();
+        expect(await waiting).toEqual(wait);
 
-      for (const method of ["daemon.health", "session.wait", "session.output"]) {
-        const sent = parseRequestLine(await daemon.nextRequest());
-        expect(sent["method"]).toBe(method);
+        const reading = client.call("session.output", {
+          session_id: "s-target",
+          runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
+          after_offset: "0",
+          max_bytes: 128,
+          wait_ms: DEDICATED_WIRE_WAIT_MS,
+        });
+        expect(parseRequestLine(await requestReaching(daemon, reading))["method"]).toBe("session.output");
+        jest.advanceTimersByTime(DEDICATED_REPLY_DELAY_MS);
+        outputReply.release();
+        expect(await reading).toEqual(output);
+        await client.close();
+      } finally {
+        jest.useRealTimers();
       }
-      await client.close();
     } finally {
       await daemon.close();
     }
-  }, DEDICATED_SCENARIO_TIMEOUT_MS);
+  });
 
   test("session.new with initial input has a dedicated response budget", async () => {
     const created = { ...minimalSessionInfo(), applied_input: true };
