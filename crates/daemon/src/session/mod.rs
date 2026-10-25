@@ -71,6 +71,7 @@ use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
 
 mod attach;
+mod background;
 mod claim;
 mod conflict_stop;
 mod detector;
@@ -106,6 +107,7 @@ mod turn_events;
 mod turn_wait;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use background::ShutdownReport;
 pub use idle_stop::{SessionIdleStopTask, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
 pub use package_lifecycle::ensure::{
     detect_official_runtimes, ensure_official_runtimes, plan_official_runtimes, EnsureError,
@@ -188,6 +190,15 @@ const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// so the remaining shutdown steps still fit. A create still running at the
 /// deadline is recovered by startup reconciliation from its durable record.
 const DEFAULT_CREATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default bound on how long [`SessionRegistry::shutdown`] waits for the
+/// registry's background tasks and in-flight store writes
+/// ([`SessionRegistryConfig::shutdown_timeout`]).
+///
+/// The tasks are cancelled or aborted first, so the wait covers a blocking
+/// store write that cannot be interrupted. It matches the bound the other
+/// daemon background tasks use at shutdown.
+const DEFAULT_REGISTRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default per-session raw-output history cap (10 MB), replayed on attach.
 ///
@@ -572,6 +583,10 @@ pub struct SessionRegistryConfig {
     /// create transactions still running when daemon shutdown starts.
     /// Defaults to [`DEFAULT_CREATE_DRAIN_TIMEOUT`].
     pub create_drain_timeout: Duration,
+    /// Bound on how long [`SessionRegistry::shutdown`] waits for background
+    /// tasks and in-flight store writes after cancelling them.
+    /// Defaults to [`DEFAULT_REGISTRY_SHUTDOWN_TIMEOUT`].
+    pub shutdown_timeout: Duration,
 }
 
 impl SessionRegistryConfig {
@@ -662,6 +677,7 @@ impl Default for SessionRegistryConfig {
             supervision: None,
             supervision_retry_initial: supervision::SUPERVISION_RETRY_INITIAL,
             create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
+            shutdown_timeout: DEFAULT_REGISTRY_SHUTDOWN_TIMEOUT,
         }
     }
 }
@@ -767,6 +783,9 @@ struct SessionRegistryInner {
     lifecycle_locks: SessionLocks,
     /// Detached create transactions, drained at daemon shutdown.
     creates: CreateTasks,
+    /// Every other background task of the registry, and the blocking store
+    /// writes, awaited by [`SessionRegistry::shutdown`].
+    background: background::BackgroundTasks,
     /// Sessions whose native supervisor could not be inspected, re-reconciled
     /// in the background until it answers.
     supervision_retries: supervision::SupervisionRetries,
@@ -1790,11 +1809,13 @@ impl SessionRegistry {
 
     /// Writes `record` to the store as it is. Callers hold `persist_lock`.
     async fn store_session_record(&self, record: SessionRecord) -> Result<(), ProtocolError> {
-        let Some(store) = self.inner.store.clone() else {
+        let Some(store) = self.store_for_write()? else {
             return Ok(());
         };
         let session_id = record.session_id.clone();
-        tokio::task::spawn_blocking(move || store.record_session(&record))
+        self.inner
+            .background
+            .spawn_blocking(move || store.record_session(&record))
             .await
             .map_err(|_join_error| {
                 runtime_error(
@@ -1933,26 +1954,27 @@ impl SessionRegistry {
         expected: SessionRecord,
         record: SessionRecord,
     ) -> Result<(), ProtocolError> {
-        let Some(store) = self.inner.store.clone() else {
+        let Some(store) = self.store_for_write()? else {
             return Ok(());
         };
         let session_id = record.session_id.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            store.record_session_if_current(&expected, &record)
-        })
-        .await
-        .map_err(|_join_error| {
-            runtime_error(
-                "session_store_failed",
-                format!("conditional session write task panicked for {session_id}"),
-            )
-        })?
-        .map_err(|error| {
-            runtime_error(
-                "session_store_failed",
-                format!("failed to conditionally write session record {session_id}: {error}"),
-            )
-        })?;
+        let outcome = self
+            .inner
+            .background
+            .spawn_blocking(move || store.record_session_if_current(&expected, &record))
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("conditional session write task panicked for {session_id}"),
+                )
+            })?
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to conditionally write session record {session_id}: {error}"),
+                )
+            })?;
         match outcome {
             SessionWriteOutcome::Applied => Ok(()),
             SessionWriteOutcome::AppliedDurabilityUncertain { error } => {
@@ -2005,11 +2027,13 @@ impl SessionRegistry {
     }
 
     async fn delete_session_record(&self, id: &SessionId) -> Result<(), ProtocolError> {
-        let Some(store) = self.inner.store.clone() else {
+        let Some(store) = self.store_for_write()? else {
             return Ok(());
         };
         let session_id = id.0.clone();
-        tokio::task::spawn_blocking(move || store.remove_session(&session_id))
+        self.inner
+            .background
+            .spawn_blocking(move || store.remove_session(&session_id))
             .await
             .map_err(|_join_error| {
                 runtime_error(
@@ -2425,6 +2449,7 @@ impl SessionRegistry {
                 package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
+                background: background::BackgroundTasks::default(),
                 supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
@@ -2686,6 +2711,110 @@ impl SessionRegistry {
             ));
         }
         Ok(self.inner.creates.tracker.spawn(transaction))
+    }
+
+    /// Spawns a background task of the registry that shutdown aborts.
+    ///
+    /// `name` identifies the task in the [`ShutdownReport`]. After shutdown
+    /// started the task is refused: the returned handle is already aborted and
+    /// the future never runs.
+    pub(super) fn spawn_background<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner
+            .background
+            .spawn(name, background::OnShutdown::Abort, task)
+    }
+
+    /// Spawns a background task that finishes on its own at shutdown, either
+    /// because it watches a token derived from the registry's root token or
+    /// because it is a finite transaction that must not be cut in half.
+    pub(super) fn spawn_finishing<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner
+            .background
+            .spawn(name, background::OnShutdown::Finish, task)
+    }
+
+    /// A cancellation token that [`Self::shutdown`] cancels, for a task
+    /// bound to one session or runtime.
+    pub(super) fn background_token(&self) -> CancellationToken {
+        self.inner.background.child_token()
+    }
+
+    /// Stops every background task of the registry and waits until none is
+    /// left, bounded by [`SessionRegistryConfig::shutdown_timeout`].
+    ///
+    /// Shutdown refuses new tasks, cancels the per-session tokens, aborts the
+    /// tasks that do not watch one, and awaits them together with the blocking
+    /// store writes still in flight. When it returns the registry writes
+    /// nothing more: a store write through it is refused with
+    /// `registry_shut_down` (and aborts the process in test builds, where it is
+    /// always a defect). A task that outlived the deadline is named in the
+    /// report and logged. Daemon shutdown calls it after [`Self::drain_creates`]
+    /// and after the tasks that drive the registry from outside have stopped; a
+    /// test calls it before it opens the next registry over the same store.
+    pub async fn shutdown(&self) -> ShutdownReport {
+        self.begin_daemon_shutdown();
+        let timeout = self.inner.config.shutdown_timeout;
+        let report = self.inner.background.shutdown(timeout).await;
+        if report.is_quiescent() {
+            debug!("session registry background tasks stopped");
+        } else {
+            warn!(
+                tasks = ?report.still_running,
+                outstanding = report.outstanding,
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "session registry background work did not stop within the shutdown timeout; its later store writes are refused"
+            );
+        }
+        report
+    }
+
+    /// Aborts the process in test builds; a late write there is always a defect.
+    fn abort_in_tests(location: &std::panic::Location<'_>) {
+        #[cfg(test)]
+        {
+            eprintln!("session registry store write after shutdown completed, at {location}");
+            std::process::abort();
+        }
+        #[cfg(not(test))]
+        let _ = location;
+    }
+
+    /// The store, for a write, or `None` when persistence is not configured.
+    ///
+    /// Every durable write of the registry takes its store here. Once
+    /// [`Self::shutdown`] has completed the registry is quiescent and a write
+    /// is a late writer: it is refused with `registry_shut_down`, logged at
+    /// ERROR with its location, and aborts the process in test builds, where
+    /// tokio would only print a panic of a spawned task and the test would
+    /// stay green.
+    ///
+    /// # Errors
+    ///
+    /// Returns `registry_shut_down` after [`Self::shutdown`] completed.
+    #[track_caller]
+    fn store_for_write(&self) -> Result<Option<Arc<Store>>, ProtocolError> {
+        if self.inner.background.is_quiescent() {
+            let location = std::panic::Location::caller();
+            tracing::error!(
+                location = %location,
+                backtrace = %std::backtrace::Backtrace::force_capture(),
+                "session registry store write after shutdown completed"
+            );
+            Self::abort_in_tests(location);
+            return Err(runtime_error(
+                "registry_shut_down",
+                format!("the session registry has shut down; refused a store write at {location}"),
+            ));
+        }
+        Ok(self.inner.store.clone())
     }
 
     /// The project manager, when the metadata store is configured. Exposed for
@@ -3128,9 +3257,11 @@ impl SessionRegistry {
     async fn commit_initial_input(&self, id: &SessionId) -> Result<(), ProtocolError> {
         #[cfg(test)]
         self.hold_initial_input_commit(id).await;
-        if let Some(store) = self.inner.store.clone() {
+        if let Some(store) = self.store_for_write()? {
             let session_id = id.0.clone();
-            tokio::task::spawn_blocking(move || store.clear_initial_input(&session_id))
+            self.inner
+                .background
+                .spawn_blocking(move || store.clear_initial_input(&session_id))
                 .await
                 .map_err(|_join_error| {
                     runtime_error(
@@ -5330,28 +5461,30 @@ impl SessionRegistry {
         metadata: &BTreeMap<String, String>,
         updated_at: &str,
     ) -> Result<(), ProtocolError> {
-        let Some(store) = self.inner.store.clone() else {
+        let Some(store) = self.store_for_write()? else {
             return Ok(());
         };
         let session_id = id.0.clone();
         let metadata = metadata.clone();
         let updated_at = updated_at.to_owned();
-        tokio::task::spawn_blocking(move || {
-            store.replace_session_metadata(&session_id, &metadata, &updated_at)
-        })
-        .await
-        .map_err(|_join_error| {
-            runtime_error(
-                "session_store_failed",
-                format!("metadata commit task panicked for {}", id.0),
-            )
-        })?
-        .map_err(|error| {
-            runtime_error(
-                "session_store_failed",
-                format!("failed to write the metadata of {}: {error}", id.0),
-            )
-        })?;
+        self.inner
+            .background
+            .spawn_blocking(move || {
+                store.replace_session_metadata(&session_id, &metadata, &updated_at)
+            })
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("metadata commit task panicked for {}", id.0),
+                )
+            })?
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to write the metadata of {}: {error}", id.0),
+                )
+            })?;
         Ok(())
     }
 
@@ -6232,7 +6365,7 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
-        tokio::spawn(async move {
+        self.spawn_background("worker_exit_watcher", async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
             let mut metadata = WorkerMetadataTracker::default();
@@ -7330,7 +7463,7 @@ impl SessionRegistry {
     fn spawn_external_exit_watch_task(&self, identity: ProcessIdentity, watch: ExitWatch) {
         let registry = self.clone();
         let shutdown = self.inner.external.shutdown_token();
-        tokio::spawn(async move {
+        self.spawn_background("external_exit_watch", async move {
             tokio::select! {
                 () = shutdown.cancelled() => {}
                 result = watch.wait() => {

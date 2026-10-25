@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
+
 use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
 use pohunek_worker_protocol::{BackgroundSnapshot, ClaimOrigin, ReportedSession};
 use serde::{Deserialize, Serialize};
@@ -667,11 +670,14 @@ struct SchemaProbe {
 
 /// Sole-writer handle for one worker journal.
 ///
-/// Clones share one seal: the terminal record this worker process committed.
+/// Clones share one seal, the terminal record this worker process committed,
+/// and one tracker of the blocking writes started through
+/// [`Self::write_tracked`].
 #[derive(Debug, Clone)]
 pub struct Journal {
     path: PathBuf,
     sealed: Arc<Mutex<Option<JournalRecord>>>,
+    writes: TaskTracker,
 }
 
 /// Why [`Journal::check_seal`] refused a record.
@@ -691,7 +697,23 @@ impl Journal {
         Self {
             path: path.as_ref().to_path_buf(),
             sealed: Arc::new(Mutex::new(None)),
+            writes: TaskTracker::new(),
         }
+    }
+
+    /// Starts [`Self::write`] on the blocking pool, tracked so that
+    /// [`Self::wait_for_writes`] covers it even when the awaiting task is gone.
+    #[must_use]
+    pub fn write_tracked(&self, record: JournalRecord) -> JoinHandle<Result<(), JournalError>> {
+        let journal = self.clone();
+        self.writes.spawn_blocking(move || journal.write(&record))
+    }
+
+    /// Waits until every write started through [`Self::write_tracked`] has
+    /// returned. Writes started afterwards are not covered.
+    pub async fn wait_for_writes(&self) {
+        self.writes.close();
+        self.writes.wait().await;
     }
 
     /// Seals `record`, the terminal record this worker just committed.

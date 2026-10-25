@@ -655,7 +655,7 @@ mod test_support {
     use std::time::Duration;
 
     use pohunek_platform::filesystem::FsError;
-    use pohunek_session_worker::{Server, ServerArgs, WorkerConfig, WorkerError};
+    use pohunek_session_worker::{Server, ServerArgs, ServerHandle, WorkerConfig, WorkerError};
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
@@ -695,7 +695,29 @@ mod test_support {
         runtime_root: PathBuf,
         state_root: PathBuf,
         daemon_socket: PathBuf,
-        tasks: Arc<Mutex<HashMap<ServiceId, JoinHandle<()>>>>,
+        tasks: Arc<Mutex<HashMap<ServiceId, InProcessWorker>>>,
+    }
+
+    /// One running in-process worker: its serve loop and the handle that ends
+    /// the tasks the server spawned.
+    #[derive(Debug)]
+    struct InProcessWorker {
+        serve: JoinHandle<()>,
+        server: ServerHandle,
+    }
+
+    impl InProcessWorker {
+        /// Ends the worker and waits until none of its tasks is left.
+        ///
+        /// Dropping the serve loop releases the socket lease; terminating the
+        /// server then ends its connection handlers and runtime monitors and
+        /// waits for their journal writes, so a retired generation writes nothing
+        /// more.
+        async fn retire(self) {
+            self.serve.abort();
+            let _ = self.serve.await;
+            self.server.terminate().await;
+        }
     }
 
     impl InProcessWorkerLauncher {
@@ -709,20 +731,34 @@ mod test_support {
                 tasks: Arc::new(Mutex::new(HashMap::new())),
             }
         }
+
+        /// Retires every running generation and waits for each to end.
+        pub async fn shutdown(&self) {
+            let workers: Vec<InProcessWorker> = self
+                .tasks
+                .lock()
+                .await
+                .drain()
+                .map(|(_, worker)| worker)
+                .collect();
+            for worker in workers {
+                worker.retire().await;
+            }
+        }
     }
 
     /// Whether any generation of `session_id` still has a running task.
-    fn session_running(tasks: &HashMap<ServiceId, JoinHandle<()>>, session_id: &str) -> bool {
-        tasks.iter().any(|(id, task)| {
-            !task.is_finished()
+    fn session_running(tasks: &HashMap<ServiceId, InProcessWorker>, session_id: &str) -> bool {
+        tasks.iter().any(|(id, worker)| {
+            !worker.serve.is_finished()
                 && WorkerKey::from_service_id(id).is_ok_and(|key| key.session_id() == session_id)
         })
     }
 
-    fn observe(id: &ServiceId, task: &JoinHandle<()>) -> ServiceObservation {
+    fn observe(id: &ServiceId, worker: &InProcessWorker) -> ServiceObservation {
         ServiceObservation {
             id: id.clone(),
-            state: if task.is_finished() {
+            state: if worker.serve.is_finished() {
                 ServiceState::Stopped
             } else {
                 ServiceState::Running
@@ -777,11 +813,15 @@ mod test_support {
                         Err(error) => return Err(operation("start_test_worker", error)),
                     }
                 };
+                let handle = server.handle();
                 tasks.insert(
                     id.clone(),
-                    tokio::spawn(async move {
-                        let _ = server.serve().await;
-                    }),
+                    InProcessWorker {
+                        serve: tokio::spawn(async move {
+                            let _ = server.serve().await;
+                        }),
+                        server: handle,
+                    },
                 );
                 Ok(())
             })
@@ -794,7 +834,7 @@ mod test_support {
                     .lock()
                     .await
                     .iter()
-                    .map(|(id, task)| observe(id, task))
+                    .map(|(id, worker)| observe(id, worker))
                     .collect::<Vec<_>>();
                 observations.sort_by(|left, right| left.id.cmp(&right.id));
                 Ok(observations)
@@ -804,25 +844,24 @@ mod test_support {
         fn inspect<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ServiceObservation> {
             Box::pin(async move {
                 let tasks = self.tasks.lock().await;
-                let task = tasks
+                let worker = tasks
                     .get(id)
                     .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
-                Ok(observe(id, task))
+                Ok(observe(id, worker))
             })
         }
 
         fn retire<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
             Box::pin(async move {
-                let task = self
+                let worker = self
                     .tasks
                     .lock()
                     .await
                     .remove(id)
                     .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
-                task.abort();
-                // Awaiting the aborted task drops the server and its socket
+                // Awaiting the retired worker drops the server and its socket
                 // lease, so the session's next generation can bind the path.
-                let _ = task.await;
+                worker.retire().await;
                 Ok(())
             })
         }

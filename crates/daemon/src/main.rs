@@ -672,6 +672,10 @@ async fn run() -> Result<(), DaemonError> {
     notification_projector.shutdown().await;
     attention_task.shutdown().await;
     sessions.shutdown_agent_state_hooks().await;
+    // The tasks that drive the registry from outside have stopped, so nothing
+    // legitimate is left to write through it; it stops its own background work
+    // last and refuses a store write after that.
+    sessions.shutdown().await;
     shutdown_event_logs(event_logs).await;
 
     remote_result?;

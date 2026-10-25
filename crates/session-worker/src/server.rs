@@ -46,6 +46,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{event, Level};
 
 mod forwarded_identity;
@@ -469,6 +470,8 @@ impl Server {
             data_streams: watch::channel(0).0,
             state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+            terminate: CancellationToken::new(),
             #[cfg(test)]
             starting_gate: Mutex::new(None),
         });
@@ -483,6 +486,15 @@ impl Server {
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.shared.socket_path
+    }
+
+    /// A handle that ends the server's tasks, for a supervisor that runs the
+    /// server inside the daemon's own process.
+    #[must_use]
+    pub fn handle(&self) -> ServerHandle {
+        ServerHandle {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Serves connections until terminal acknowledgement or retention expiry.
@@ -528,7 +540,7 @@ impl Server {
                         source,
                     })?;
                     let shared = Arc::clone(&self.shared);
-                    tokio::spawn(async move {
+                    self.shared.spawn_task(async move {
                         if let Err(error) = serve_connection(shared, stream).await {
                             event!(
                                 name: "worker.connection.failed",
@@ -542,6 +554,27 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+/// Ends a running [`Server`] the way the death of its process would.
+#[derive(Debug, Clone)]
+pub struct ServerHandle {
+    shared: Arc<Shared>,
+}
+
+impl ServerHandle {
+    /// Ends every connection handler and runtime monitor of the server, then
+    /// waits until they and the journal writes they started are gone.
+    ///
+    /// Call it after the future of [`Server::serve`] has been dropped or has
+    /// returned. When it returns, the server writes no journal and answers no
+    /// request.
+    pub async fn terminate(&self) {
+        self.shared.terminate.cancel();
+        self.shared.tasks.close();
+        self.shared.tasks.wait().await;
+        self.shared.journal.wait_for_writes().await;
     }
 }
 
@@ -578,6 +611,11 @@ struct Shared {
     data_streams: watch::Sender<usize>,
     state_changed: Notify,
     shutdown: CancellationToken,
+    /// The connection handlers and runtime monitors of this server.
+    tasks: TaskTracker,
+    /// Ends every task of `tasks` at once, as the death of the worker process
+    /// does in production. Only [`ServerHandle::terminate`] cancels it.
+    terminate: CancellationToken,
     /// Pauses `initialize` between the `Starting` commit and the child spawn.
     #[cfg(test)]
     starting_gate: Mutex<Option<StartingGate>>,
@@ -595,6 +633,21 @@ struct StartingGate {
 }
 
 impl Shared {
+    /// Spawns `task` as a task of this server.
+    ///
+    /// The task ends when [`ServerHandle::terminate`] cancels `terminate`;
+    /// a worker process dies as a whole, so no task outlives it.
+    fn spawn_task(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let terminate = self.terminate.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                () = terminate.cancelled() => {}
+                () = task => {}
+            }
+        });
+    }
+
     async fn record_never_initialized(&self) -> Result<(), WorkerError> {
         let mut state = self.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;
@@ -2119,12 +2172,13 @@ fn spawn_runtime_monitors(
     let output_shared = Arc::clone(&shared);
     let output_pty = pty.clone();
     let output_runtime = worker_instance_id.clone();
-    tokio::spawn(async move {
+    shared.spawn_task(async move {
         let result = monitor_runtime_output(&output_shared, &output_pty, &output_runtime).await;
         let _ = output_eof_tx.send(result);
     });
 
-    tokio::spawn(coordinate_runtime_completion(
+    let coordinator_shared = Arc::clone(&shared);
+    coordinator_shared.spawn_task(coordinate_runtime_completion(
         shared,
         pty,
         worker_instance_id,
@@ -7375,7 +7429,8 @@ async fn persist(journal: Journal, record: JournalRecord) -> Result<(), WorkerEr
     let sealing = record.phase == JournalPhase::Terminal;
     let sealed_record = sealing.then(|| record.clone());
     let sealed_journal = journal.clone();
-    let result = tokio::task::spawn_blocking(move || journal.write(&record))
+    let result = journal
+        .write_tracked(record)
         .await
         .map_err(|_join_error| WorkerError::Protocol("journal writer task failed".to_owned()))?;
     if let Some(record) = sealed_record {

@@ -238,7 +238,8 @@ pub(super) fn spawn_agent_state_hook_dispatcher(
     mut events: broadcast::Receiver<Event>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    let spawner = registry.clone();
+    spawner.spawn_finishing("agent_state_hook_dispatcher", async move {
         let mut last_fired: HashMap<SessionId, AgentActivity> = HashMap::new();
         let mut pending: HashMap<SessionId, (AgentActivity, tokio::time::Instant)> = HashMap::new();
         let mut in_flight: HashSet<SessionId> = HashSet::new();
@@ -463,7 +464,7 @@ fn fire_agent_state_hook(
         activity: Some(agent_activity_env(snapshot.activity)),
     });
     let done_tx = done_tx.clone();
-    tokio::spawn(async move {
+    registry.spawn_background("agent_state_hook_done", async move {
         let _ = handle.await;
         let _ = done_tx.send(session_id);
     });

@@ -67,7 +67,7 @@ impl SessionRegistry {
         } = inputs;
         let registry = self.clone();
         let progress = self.inner.turns.progress(&scope.id);
-        tokio::spawn(async move {
+        self.spawn_background("session_detector", async move {
             let DetectorScope { id, runtime } = scope;
             let initial_config = detector_config_rx.borrow().clone();
             let mut applied_config_generation = initial_config.generation;

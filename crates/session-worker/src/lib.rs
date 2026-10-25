@@ -63,6 +63,6 @@ pub use pohunek_terminal::TerminalSnapshot;
 #[doc(inline)]
 pub use pty::{Command, Exit, ProcessIdentity, PtyError, PtyOwner};
 #[doc(inline)]
-pub use server::{run, Server, ServerArgs};
+pub use server::{run, Server, ServerArgs, ServerHandle};
 #[doc(inline)]
 pub use service::{load_service_config, log_unknown_service_keys, ServiceConfigError};
