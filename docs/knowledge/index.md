@@ -82,3 +82,5 @@ Start here:
 Generated reference documentation is intentionally not committed here. It will
 be produced by the documentation build pipeline and merged into the materialized
 bundle later.
+
+Disposable contributor walkthrough: [architecture reference](concepts/walkthrough-802-missing.md).
