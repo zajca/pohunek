@@ -1,0 +1,779 @@
+#!/usr/bin/env python3
+"""Stress the Rust tests a diff adds or changes under CPU contention (#364).
+
+    scripts/stress-changed-tests --base REV --count N --deadline DURATION \\
+        --profile PROFILE [--unpinned] [--print]
+
+A new timing-sensitive test that passes once and merges later fails on other
+people's branches. This gate runs exactly the tests the change touches, N
+iterations each, under the pinned load of `scripts/stress-run`, before push.
+There is no retry: a failing iteration is the result (the stress invocation
+passes `--retries 0`, so a `retries = 2` profile such as `heavy` cannot turn a
+failure into a FLAKY pass).
+
+Suggested counts (a lane, not a default; `--count` is required): 50 for
+`heavy`, 20 for `relay-db`. The profile must be one whose filter contains the
+test: a heavy test selected under `fast` is excluded by the profile's
+default-filter and the gate then fails instead of running nothing.
+
+What is selected. The changed lines are those of `git diff <merge-base of
+BASE and HEAD>` against the working tree (committed, staged and unstaged
+changes) plus every line of an untracked `.rs` file. A Rust test is a `fn`
+carrying `#[test]` or `#[<path>::test(..)]` (for example `#[tokio::test]`). Its
+range runs from the first line of its doc comments and attributes to the
+closing brace of its body. A test is selected when any changed line lies in
+that range, whatever the change is: new code, an edited body, an edited
+comment or attribute inside the range, a deleted line inside the body, or the
+whole test moved (a moved test is an added test at its new place). A deleted
+test no longer exists and is not selected. A change to a helper, fixture or
+`mod tests` import outside every test range selects nothing: stress such a
+change with the profile's whole partition instead.
+
+How a test is identified. `cargo metadata` gives the crate targets; each
+target's module tree is walked from its root file through `mod x;`
+declarations (with `#[path]`). The nextest test name is the module path inside
+that binary plus the function name, so a `crates/cli/tests/<file>.rs` module
+of the single `all` binary becomes `binary(=all)` and `test(=<file>::<name>)`.
+One filterset selects every test exactly (`test(=name)`); a file compiled into
+several binaries yields one identity per binary.
+
+Nothing is dropped silently. A changed test that cannot be mapped (a file no
+target reaches, a test inside a function body, a `macro_rules!` that generates
+tests (its definition or an invocation changed), `rstest`/`test_case`
+variants, `#[path]` inside an inline module) fails the run and names the test.
+Every selected test is then checked against `cargo nextest list` for the
+profile, which also builds the test binaries before the pinned run starts: a
+test missing from the list (compiled out on this host, for example a macOS
+`cfg`; `--allow-missing-on-host` names it as NOT STRESSED and stresses the rest)
+or excluded by the profile's filter fails by name, and an `#[ignore]`d
+test is reported as skipped because nextest does not run it. Both cargo
+invocations use `--all-features`, as CI's test archive does, and are limited
+to the packages of the selected tests (`-p`). The
+stress run is `scripts/stress-run --cpus 4 -- cargo nextest run --stress-count
+N ...`.
+
+`--print` prints the static selection (target, test, source line) and the
+filterset, then exits without running cargo nextest.
+
+Exit codes: the stress run's status; 0 with a message when the diff changes no
+test; 1 a changed test cannot be mapped or listed; 2 usage error.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+# Workspace subtree whose Rust files are scanned; mirrors where the
+# workspace's tests live.
+SOURCE_ROOT = "crates"
+# Contention width. CI's Linux test jobs run on 4 vCPUs, so the gate stresses
+# on 4 pinned CPUs whatever the host has (see scripts/stress-run).
+STRESS_CPUS = 4
+# `#[...]` last path segments that mark a plain libtest/tokio test. The
+# attributes below generate several named variants per function, which the
+# exact-name filter cannot select, so they fail the run by name.
+TEST_ATTRIBUTE = "test"
+VARIANT_ATTRIBUTES = ("rstest", "test_case", "bench")
+# CI builds every test lane from one `--all-features` archive, so feature-gated
+# tests (for example relay `postgres-tests`) exist only with it.
+BUILD_FLAGS = ("--all-features",)
+STRESS_RUN = Path(__file__).resolve().parent / "stress-run"
+EXIT_UNMAPPED = 1
+EXIT_USAGE = 2
+
+TEST_ATTRIBUTE_PATTERN = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\b")
+ATTRIBUTE_START = re.compile(r"#\s*!?\s*\[")
+FN_PATTERN = re.compile(r"\bfn\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)")
+MOD_BLOCK_TAIL = re.compile(r"(?:^|[\s;{}\]])mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*$")
+MOD_DECLARATION = re.compile(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;")
+QUALIFIERS = {"pub", "async", "unsafe", "const", "extern", "default"}
+HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+# Files whose text mentions a `cfg`; a test missing from the nextest list is
+# accepted as "not built on this host" only for these files.
+CFG_GATED = set()
+
+
+class SelectionError(Exception):
+    """A changed test cannot be selected exactly."""
+
+
+def blank_literals(text):
+    """`text` with comments, strings and char literals replaced by spaces.
+
+    Offsets and newlines are preserved, so an offset in the result is the
+    same offset (and line) in `text`.
+    """
+    out = list(text)
+    length = len(text)
+    i = 0
+
+    def blank(start, end):
+        for k in range(start, end):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < length:
+        char = text[i]
+        pair = text[i:i + 2]
+        if pair == "//":
+            end = text.find("\n", i)
+            end = length if end == -1 else end
+            blank(i, end)
+            i = end
+        elif pair == "/*":
+            depth = 1
+            j = i + 2
+            while j < length and depth:
+                if text[j:j + 2] == "/*":
+                    depth += 1
+                    j += 2
+                elif text[j:j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif char == "r" and re.match(r'r#*"', text[i:i + 40]) and not (
+            i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+        ):
+            hashes = len(re.match(r"r(#*)", text[i:]).group(1))
+            closing = '"' + "#" * hashes
+            end = text.find(closing, i + 2 + hashes)
+            end = length if end == -1 else end + len(closing)
+            blank(i, end)
+            i = end
+        elif char == '"':
+            j = i + 1
+            while j < length and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            blank(i, min(j + 1, length))
+            i = j + 1
+        elif char == "'":
+            match = re.match(r"'(?:\\.[^']*|[^\\'])'", text[i:i + 12])
+            if match:
+                blank(i, i + match.end())
+                i += match.end()
+            else:
+                i += 1  # a lifetime
+        else:
+            i += 1
+    return "".join(out)
+
+
+def matching(skeleton, start, opener, closer):
+    """Offset of the bracket closing the one at `start`, or -1."""
+    depth = 0
+    for k in range(start, len(skeleton)):
+        if skeleton[k] == opener:
+            depth += 1
+        elif skeleton[k] == closer:
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def matching_back(text, end, opener, closer):
+    """Offset of the bracket opening the one closing at `end`, or -1."""
+    depth = 0
+    for k in range(end, -1, -1):
+        if text[k] == closer:
+            depth += 1
+        elif text[k] == opener:
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+class Item:
+    """A function with its attributes, range (1-based lines) and module chain."""
+
+    def __init__(self, name, attrs, first_line, last_line, mods, nested):
+        self.name = name
+        self.attrs = attrs
+        self.first_line = first_line
+        self.last_line = last_line
+        self.mods = mods
+        self.nested = nested
+
+    @property
+    def is_test(self):
+        return any(a["last"] == TEST_ATTRIBUTE for a in self.attrs)
+
+    @property
+    def variant(self):
+        return next((a["last"] for a in self.attrs if a["last"] in VARIANT_ATTRIBUTES), None)
+
+    @property
+    def ignored(self):
+        return any(a["last"] == "ignore" or (
+            a["last"] == "cfg_attr" and re.search(r"\bignore\b", a["body"]))
+            for a in self.attrs)
+
+
+class Module:
+    """Parsed facts about one source file."""
+
+    def __init__(self, text, scan=True):
+        self.text = text
+        self.skeleton = blank_literals(text)
+        self.line_starts = [0]
+        for match in re.finditer("\n", text):
+            self.line_starts.append(match.end())
+        self.items = []
+        self.declarations = []  # (name, inline mod chain, path attr or None)
+        if scan:
+            self.scan()
+
+    def line_of(self, offset):
+        low, high = 0, len(self.line_starts)
+        while high - low > 1:
+            mid = (low + high) // 2
+            if self.line_starts[mid] <= offset:
+                low = mid
+            else:
+                high = mid
+        return low + 1
+
+    def skip_qualifiers(self, offset):
+        """Offset where the qualifiers (`pub(crate) async unsafe ...`) before `offset` begin."""
+        cursor = offset
+        while True:
+            head = self.skeleton[:cursor].rstrip()
+            word = re.search(r"([A-Za-z_]+)$", head)
+            if word and word.group(1) in QUALIFIERS:
+                cursor = word.start()
+            elif head.endswith(")"):
+                opening = matching_back(head, len(head) - 1, "(", ")")
+                before = head[:opening].rstrip() if opening > 0 else ""
+                if not before.endswith("pub"):
+                    return cursor
+                cursor = len(before) - len("pub")
+            else:
+                return cursor
+
+    def test_macro_definitions(self):
+        """`[(name, first line, last line)]` of `macro_rules!` bodies that hold a test attribute."""
+        found = []
+        for match in re.finditer(r"\bmacro_rules\s*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*([({\[])",
+                                 self.skeleton):
+            closer = {"(": ")", "{": "}", "[": "]"}[match.group(2)]
+            end = matching(self.skeleton, match.end() - 1, match.group(2), closer)
+            end = len(self.skeleton) - 1 if end == -1 else end
+            if TEST_ATTRIBUTE_PATTERN.search(self.skeleton[match.end():end]):
+                found.append((match.group(1), self.line_of(match.start()), self.line_of(end)))
+        return found
+
+    def macro_invocations(self, names):
+        """`[(name, first line, last line)]` of `name!(..)` calls for the given macro names."""
+        found = []
+        if not names:
+            return found
+        pattern = re.compile(r"\b(" + "|".join(map(re.escape, names)) + r")\s*!\s*([({\[])")
+        for match in pattern.finditer(self.skeleton):
+            if self.skeleton[:match.start()].rstrip().endswith("macro_rules!"):
+                continue
+            closer = {"(": ")", "{": "}", "[": "]"}[match.group(2)]
+            end = matching(self.skeleton, match.end() - 1, match.group(2), closer)
+            end = len(self.skeleton) - 1 if end == -1 else end
+            found.append((match.group(1), self.line_of(match.start()), self.line_of(end)))
+        return found
+
+    def attributes_before(self, offset):
+        """Attributes directly above `offset`: (list of attr dicts, first offset)."""
+        attrs = []
+        cursor = offset
+        skeleton = self.skeleton
+        while True:
+            head = skeleton[:cursor].rstrip()
+            if not head.endswith("]"):
+                break
+            k = matching_back(head, len(head) - 1, "[", "]")
+            if k <= 0:
+                break
+            start = k
+            before = head[:start].rstrip()
+            if before.endswith("!"):
+                break
+            if not before.endswith("#"):
+                break
+            start = len(before) - 1
+            body = self.text[k + 1:len(head) - 1]
+            path = re.match(r"\s*([A-Za-z_][A-Za-z0-9_:]*)", body)
+            path_text = path.group(1) if path else ""
+            attrs.append({
+                "path": path_text,
+                "last": path_text.split("::")[-1],
+                "body": body,
+            })
+            cursor = start
+        return attrs, cursor
+
+    def scan(self):
+        skeleton = self.skeleton
+        fn_positions = [m for m in FN_PATTERN.finditer(skeleton)]
+        decl_positions = {m.start(): m for m in MOD_DECLARATION.finditer(skeleton)}
+        stack = []  # entries: ("mod", name) or ("block", None)
+        fn_index = 0
+        i = 0
+        length = len(skeleton)
+        while i < length:
+            if fn_index < len(fn_positions) and fn_positions[fn_index].start() == i:
+                self.add_item(fn_positions[fn_index], list(stack))
+                fn_index += 1
+            if i in decl_positions:
+                match = decl_positions[i]
+                attrs, _ = self.attributes_before(self.skip_qualifiers(i))
+                path_attr = None
+                for attr in attrs:
+                    if attr["last"] == "path":
+                        literal = re.search(r'"([^"]*)"', attr["body"])
+                        path_attr = literal.group(1) if literal else ""
+                chain = tuple(name for kind, name in stack if kind == "mod")
+                nested_in_block = any(kind == "block" for kind, _ in stack)
+                self.declarations.append((match.group(1), chain, path_attr, nested_in_block))
+            char = skeleton[i]
+            if char == "{":
+                tail = MOD_BLOCK_TAIL.search(skeleton[max(0, i - 200):i])
+                stack.append(("mod", tail.group(1)) if tail else ("block", None))
+            elif char == "}" and stack:
+                stack.pop()
+            i += 1
+
+    def add_item(self, match, stack):
+        name = match.group(2)
+        start = match.start()
+        qualifier_start = self.skip_qualifiers(start)
+        attrs, first = self.attributes_before(qualifier_start)
+        first = min(first, qualifier_start)
+        # Body: the first `{` outside parentheses/brackets after the name.
+        k = match.end()
+        depth = 0
+        end = -1
+        while k < len(self.skeleton):
+            char = self.skeleton[k]
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth -= 1
+            elif char == ";" and depth == 0:
+                end = k
+                break
+            elif char == "{" and depth == 0:
+                end = matching(self.skeleton, k, "{", "}")
+                break
+            k += 1
+        if end == -1:
+            end = len(self.skeleton) - 1
+        first_line = self.line_of(first)
+        # Comment lines directly above the attributes belong to the item.
+        lines = self.text.split("\n")
+        while first_line > 1 and lines[first_line - 2].lstrip().startswith("//"):
+            first_line -= 1
+        mods = tuple(name for kind, name in stack if kind == "mod")
+        nested = any(kind == "block" for kind, _ in stack)
+        self.items.append(Item(name, attrs, first_line, self.line_of(end), mods, nested))
+
+
+def run(argv, cwd, check=True):
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise SelectionError(
+            f"`{shlex.join(argv)}` failed ({result.returncode}): {result.stderr.strip()}"
+        )
+    return result
+
+
+def only_attributes_and_comments(lines):
+    """True when the removed `lines` are whole attributes and comment lines."""
+    code = "\n".join(l for l in lines if not l.lstrip().startswith("//")).strip()
+    if not code:
+        return bool(lines)
+    # Every top-level item must be an attribute with balanced brackets.
+    return bool(re.fullmatch(r"(?:#\s*!?\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*)+", code))
+
+
+def changed_lines(root, base):
+    """`{path: [(start, end, attrs_only)]}` of changed 1-based line spans.
+
+    `end` is inclusive. A pure deletion is a zero-width span `(c + 0.5, c +
+    0.5)` between lines c and c + 1; `attrs_only` says that every removed line
+    was an attribute or comment line, which is the only deletion that selects
+    the test right below it.
+    """
+    merge_base = run(["git", "merge-base", base, "HEAD"], root).stdout.strip()
+    diff = run(
+        ["git", "-c", "core.quotepath=off", "diff", "--unified=0", "--no-color",
+         "--no-ext-diff", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", merge_base,
+         "--", f"{SOURCE_ROOT}/"],
+        root,
+    ).stdout
+    spans = {}
+    current = None
+    pending = None  # [start, removed lines] of the hunk being read
+    def close_hunk():
+        if pending and current and pending[2] == 0:
+            attrs_only = only_attributes_and_comments(pending[1])
+            spans.setdefault(current, []).append((pending[0] + 0.5, pending[0] + 0.5, attrs_only))
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            close_hunk()
+            pending = None
+            current = line[6:] if line.startswith("+++ b/") else None
+            continue
+        match = HUNK_HEADER.match(line)
+        if match:
+            close_hunk()
+            pending = None
+            if current:
+                start = int(match.group(1))
+                count = 1 if match.group(2) is None else int(match.group(2))
+                if count == 0:
+                    pending = [start, [], count]
+                else:
+                    spans.setdefault(current, []).append((start, start + count - 1, False))
+            continue
+        if pending is not None and line.startswith("-") and not line.startswith("---"):
+            pending[1].append(line[1:])
+    close_hunk()
+    untracked = run(
+        ["git", "ls-files", "--others", "--exclude-standard", "--", f"{SOURCE_ROOT}/"],
+        root,
+    ).stdout.split("\n")
+    for path in filter(None, untracked):
+        text = (root / path).read_text(errors="replace")
+        spans[path] = [(1, max(1, text.count("\n") + 1), False)]
+    return {path: s for path, s in spans.items() if path.endswith(".rs")}
+
+
+def intersects(span, item):
+    start, end, attrs_only = span
+    if start != int(start):  # a deletion between two lines
+        # A removed first attribute (for example `#[ignore]`) leaves the item
+        # starting right below the deletion; any other removal there belongs
+        # to a neighbour.
+        slack = 1 if attrs_only else 0
+        return item.first_line - slack <= start - 0.5 and start + 0.5 <= item.last_line
+    return start <= item.last_line and end >= item.first_line
+
+
+class Target:
+    def __init__(self, package, name, kind, root_file):
+        self.package = package
+        self.name = name
+        self.kind = kind
+        self.root_file = root_file
+
+    @property
+    def binary_id(self):
+        if self.kind == "lib":
+            return self.package
+        if self.kind == "bin":
+            return f"{self.package}::bin/{self.name}"
+        return f"{self.package}::{self.name}"
+
+    def filter_head(self):
+        if self.kind == "lib":
+            return f"package(={self.package}) and kind(lib)"
+        return f"package(={self.package}) and kind({self.kind}) and binary(={self.name})"
+
+
+def load_targets(root):
+    metadata = json.loads(
+        run(["cargo", "metadata", "--no-deps", "--format-version", "1"], root).stdout)
+    targets = []
+    for package in metadata["packages"]:
+        for target in package["targets"]:
+            kinds = target["kind"]
+            if not target.get("test", True):
+                continue
+            if "lib" in kinds or "proc-macro" in kinds:
+                kind = "lib"
+            elif "bin" in kinds:
+                kind = "bin"
+            elif "test" in kinds:
+                kind = "test"
+            else:
+                continue
+            targets.append(Target(package["name"], target["name"], kind,
+                                  Path(target["src_path"]).resolve()))
+    return targets
+
+
+class ModuleTree:
+    """File to `(target, module path)` placements for every target."""
+
+    def __init__(self, targets, modules):
+        self.modules = modules
+        self.placements = {}
+        for target in targets:
+            self.walk(target, target.root_file, (), True, set())
+
+    def parse(self, path):
+        if path not in self.modules:
+            self.modules[path] = Module(path.read_text(errors="replace"))
+        return self.modules[path]
+
+    def walk(self, target, path, modpath, mod_rs, seen):
+        key = (target.binary_id, path, modpath)
+        if key in seen:
+            return
+        seen.add(key)
+        self.placements.setdefault(path, []).append((target, modpath))
+        if not path.exists():
+            return
+        module = self.parse(path)
+        for name, chain, path_attr, in_block in module.declarations:
+            if in_block:
+                continue
+            directory = path.parent if mod_rs else path.parent / path.stem
+            if path_attr is not None:
+                if chain:
+                    continue  # unsupported shape; its tests fail as unmapped
+                child = (path.parent / path_attr).resolve()
+                child_mod_rs = True
+            else:
+                base = directory.joinpath(*chain)
+                candidates = [base / f"{name}.rs", base / name / "mod.rs"]
+                child = next((c for c in candidates if c.exists()), None)
+                if child is None:
+                    continue
+                child_mod_rs = child.name == "mod.rs"
+            self.walk(target, child, modpath + chain + (name,), child_mod_rs, seen)
+
+
+def workspace_test_macros(root):
+    """Names of every `macro_rules!` under the source root whose body holds a test attribute."""
+    names = set()
+    for directory, dirs, files in os.walk(root / SOURCE_ROOT):
+        dirs[:] = [d for d in dirs if d != "target"]
+        for filename in files:
+            if not filename.endswith(".rs"):
+                continue
+            text = (Path(directory) / filename).read_text(errors="replace")
+            if "macro_rules" in text:
+                names.update(name for name, _, _ in Module(text, scan=False).test_macro_definitions())
+    return names
+
+
+def select(root, base):
+    """Return `(identities, skipped)` for the diff, or raise SelectionError.
+
+    An identity is `(target, test name, rel path, line)`; `skipped` lists
+    `(rel path, test name, reason)` for tests that exist but are not run.
+    """
+    spans = changed_lines(root, base)
+    targets = load_targets(root)
+    modules = {}
+    tree = ModuleTree(targets, modules)
+    test_macros = workspace_test_macros(root)
+    selected = []
+    skipped = []
+    problems = []
+    for rel, file_spans in sorted(spans.items()):
+        path = (root / rel).resolve()
+        if not path.exists():
+            continue  # deleted file
+        module = tree.parse(path)
+        if re.search(r"\bcfg(?:_attr)?\s*\(", module.skeleton):
+            CFG_GATED.add(rel)
+        for name, first, last in module.test_macro_definitions() + module.macro_invocations(
+                test_macros):
+            probe = Item(name, [], first, last, (), False)
+            if any(intersects(span, probe) for span in file_spans):
+                problems.append(
+                    f"{rel}:{first}: `{name}!` generates tests, so the changed lines here "
+                    "cannot be mapped to test names; stress the whole partition instead")
+        for item in module.items:
+            if not any(intersects(span, item) for span in file_spans):
+                continue
+            if item.variant:
+                problems.append(
+                    f"{rel}:{item.first_line}: `{item.name}` uses #[{item.variant}], whose "
+                    "generated cases cannot be selected exactly")
+                continue
+            if not item.is_test:
+                continue
+            if item.nested:
+                problems.append(
+                    f"{rel}:{item.first_line}: test `{item.name}` sits inside a macro or "
+                    "function body, so its test name cannot be derived")
+                continue
+            placements = tree.placements.get(path)
+            if not placements:
+                problems.append(
+                    f"{rel}:{item.first_line}: test `{item.name}` is in a file no cargo "
+                    "target reaches through `mod` declarations")
+                continue
+            if item.ignored:
+                skipped.append((rel, item.name, "#[ignore]: nextest does not run it"))
+                continue
+            for target, modpath in placements:
+                name = "::".join(modpath + item.mods + (item.name,))
+                selected.append((target, name, rel, item.first_line))
+    if problems:
+        raise SelectionError("\n".join(problems))
+    return selected, skipped
+
+
+def build_filter(selected):
+    groups = {}
+    for target, name, _, _ in selected:
+        groups.setdefault(target.filter_head(), set()).add(name)
+    clauses = []
+    for head, names in sorted(groups.items()):
+        tests = " or ".join(f"test(={name})" for name in sorted(names))
+        clauses.append(f"({head} and ({tests}))")
+    return " or ".join(clauses)
+
+
+def package_args(selected):
+    """`-p <package>` for each package a selected test lives in.
+
+    Restricting the build to them keeps the list and the run from compiling
+    every test binary of the workspace.
+    """
+    args = []
+    for package in sorted({target.package for target, _, _, _ in selected}):
+        args += ["-p", package]
+    return args
+
+
+def verify_listed(root, profile, expression, selected, allow_missing):
+    """Check every selected test against `cargo nextest list`; builds the binaries.
+
+    Returns the tests the run will stress. A test missing from the list
+    fails the check, unless `allow_missing` names it as not stressed here.
+    """
+    result = run(
+        ["cargo", "nextest", "list", "--profile", profile, *BUILD_FLAGS,
+         *package_args(selected), "-E", expression, "--message-format", "json"],
+        root, check=False)
+    if result.returncode != 0:
+        raise SelectionError(
+            f"`cargo nextest list` failed ({result.returncode}):\n{result.stderr.strip()}")
+    suites = json.loads(result.stdout)["rust-suites"]
+    missing = []
+    runnable = []
+    for target, name, rel, line in selected:
+        suite = suites.get(target.binary_id)
+        case = suite["testcases"].get(name) if suite else None
+        if case is None:
+            if allow_missing and rel in CFG_GATED:
+                print(f"stress-changed-tests: NOT STRESSED on this host: {rel}:{line} `{name}` "
+                      f"({target.binary_id}) is not built here; it must be stressed on a host "
+                      "that builds it, and the report must say so", file=sys.stderr)
+                continue
+            missing.append(
+                f"{rel}:{line}: `{name}` ({target.binary_id}) is not in the nextest list: "
+                "not built on this host (for example a cfg for another OS; run the gate "
+                "there, or pass --allow-missing-on-host to stress only this host's share; "
+                "that flag applies only to files with a cfg) or the identity is wrong")
+        elif case.get("ignored"):
+            print(f"stress-changed-tests: skipped {rel} `{name}`: ignored in the nextest "
+                  "list, so nextest does not run it", file=sys.stderr)
+        elif case["filter-match"]["status"] != "matches":
+            missing.append(
+                f"{rel}:{line}: `{name}` ({target.binary_id}) is excluded by profile "
+                f"{profile!r} ({case['filter-match'].get('reason', 'filtered')}); pick the "
+                "profile that owns the test")
+        else:
+            runnable.append((target, name, rel, line))
+    if missing:
+        raise SelectionError("\n".join(missing))
+    return runnable
+
+
+def positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="stress-changed-tests",
+        description=(
+            "Stress the Rust tests that BASE...HEAD plus the working tree add or "
+            "change, under the pinned CPU load of scripts/stress-run. No retries. "
+            "Suggested --count: 50 for the heavy lane, 20 for relay-db."),
+        epilog=(
+            "A test is selected when any changed line lies between its first doc "
+            "comment/attribute and its closing brace (edits, comment edits; a moved "
+            "test counts as added at its new place); "
+            "a deleted test is not selected. An unmappable test fails by name. "
+            "Exit: the stress status; 0 when no test changed; 1 selection failure; "
+            "2 usage."),
+    )
+    parser.add_argument("--base", required=True, metavar="REV",
+                        help="revision the change is measured against (e.g. origin/main)")
+    parser.add_argument("--count", required=True, type=positive_int, metavar="N",
+                        help="nextest --stress-count (heavy: 50, relay-db: 20)")
+    parser.add_argument("--deadline", required=True, metavar="DURATION",
+                        help="scripts/stress-run deadline for the whole run, e.g. 30m")
+    parser.add_argument("--profile", required=True, metavar="PROFILE",
+                        help="nextest profile that owns the tests (heavy, relay-db, macos, ...)")
+    parser.add_argument("--unpinned", action="store_true",
+                        help="pass --unpinned to stress-run (required on macOS)")
+    parser.add_argument("--allow-missing-on-host", action="store_true",
+                        help="stress only the tests this host builds; name each one it does "
+                        "not build (for example another OS's cfg) as NOT STRESSED, which the "
+                        "report must carry to a host that builds it")
+    parser.add_argument("--print", dest="print_only", action="store_true",
+                        help="print the selection and filterset, then exit")
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    root = Path(run(["git", "rev-parse", "--show-toplevel"], Path.cwd()).stdout.strip())
+    try:
+        selected, skipped = select(root, args.base)
+    except SelectionError as error:
+        print(f"stress-changed-tests: cannot map every changed test:\n{error}", file=sys.stderr)
+        return EXIT_UNMAPPED
+    for rel, name, reason in skipped:
+        print(f"stress-changed-tests: skipped {rel} `{name}`: {reason}", file=sys.stderr)
+    if not selected:
+        print("stress-changed-tests: the diff changes no runnable Rust test; nothing to stress")
+        return 0
+    expression = build_filter(selected)
+    if args.print_only:
+        for target, name, rel, line in sorted(selected, key=lambda s: (s[0].binary_id, s[1])):
+            print(f"{target.binary_id} {name} ({rel}:{line})")
+        print(f"filter: {expression}")
+        return 0
+    try:
+        selected = verify_listed(root, args.profile, expression, selected,
+                                 args.allow_missing_on_host)
+    except SelectionError as error:
+        print(f"stress-changed-tests: {error}", file=sys.stderr)
+        return EXIT_UNMAPPED
+    if not selected:
+        print("stress-changed-tests: no selected test runs on this host; nothing stressed here")
+        return 0
+    expression = build_filter(selected)
+    command = [
+        str(STRESS_RUN), "--deadline", args.deadline, "--cpus", str(STRESS_CPUS),
+        *(["--unpinned"] if args.unpinned else []),
+        "--", "cargo", "nextest", "run", "--profile", args.profile, *BUILD_FLAGS,
+        *package_args(selected), "--stress-count", str(args.count), "--retries", "0", "--no-tests=fail",
+        "-E", expression,
+    ]
+    print(f"stress-changed-tests: {len(selected)} test(s); {shlex.join(command)}", file=sys.stderr)
+    os.chdir(root)
+    os.execv(command[0], command)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

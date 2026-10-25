@@ -56,6 +56,39 @@ lists and the documentation index). Run it for every
 change; it is mandatory when the change touches anything under `docs/knowledge/`,
 a CLI command/flag, a protocol method/event, or `docs/public-api.md`.
 
+## Stress the changed tests
+
+Mandatory when the diff (committed, staged or unstaged) adds or changes a Rust
+test in a heavy, relay-db or macOS-lane package or file: any test outside the
+`profile.fast` default-filter in `.config/nextest.toml` (the complement of its
+`not ( ... )` expression is the heavy partition). Run it after the core gate
+set passes and before push, with the profile that owns the tests:
+
+```bash
+scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy
+scripts/stress-changed-tests --base origin/main --count 20 --deadline 45m --profile relay-db   # needs the relay database fixture
+scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile macos --unpinned   # macOS hosts
+```
+
+It builds the test binaries first (`cargo nextest list`), then runs exactly the
+changed tests N times under `scripts/stress-run` (4 pinned CPUs, no retries).
+Counts are lane suggestions, not defaults: 50 for heavy, 20 for relay-db; pick
+the deadline from the measured cost of one iteration. On macOS there is no CPU
+affinity, so the run needs `--unpinned` and the contention is host-wide; say so
+in the report. Both cargo calls build with `--all-features`, like CI's test
+archive, so feature-gated tests (relay `postgres-tests`) run. `--print` shows the selection without running anything. A test
+the script cannot map or list fails the step by name; a `macro_rules!` that
+generates tests fails by the macro's name (stress the whole partition then). A
+diff that changes tests for two operating systems cannot pass on one host: run
+the step on each host with `--allow-missing-on-host`, which names every test the
+host does not build as NOT STRESSED, and carry those names to the host that
+builds them in the report.
+
+A failure is a FLAKY result under the flaky-test policy: open or reuse an issue
+with the root cause, fix the test or the product race, and run the step again.
+Never retry the step to green and never lower `--count` to pass. A diff that
+adds no test in those lanes skips the step, and the report says so.
+
 ## When the change touches the SDK workspace
 
 Run from the repository root (see `.agents/instructions/verification.md` for
