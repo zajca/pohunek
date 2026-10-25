@@ -97,6 +97,7 @@ PUBLISH_NEEDS = [
     "package-macos",
     "verify-macos",
     "evidence",
+    "release-notes",
 ]
 
 JOB_HEADER = re.compile(r"^  ([a-z][a-z0-9-]*):\n", re.M)
@@ -211,7 +212,7 @@ TIER_EVIDENCE_LINES = [
 EVIDENCE_CALL = "./.github/workflows/release-evidence.yml"
 TIER_EVIDENCE_JOB = "tier-evidence"
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+UPLOAD_ARTIFACT = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
 PUBLISH_ACTIONS = {DOWNLOAD}
 OIDC_ACTIONS = {DOWNLOAD, ATTEST_ACTION}
 
@@ -269,7 +270,8 @@ PUBLISH_SCRIPTS = {
     ),
     (
         'set -euo pipefail',
-        'gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes ""',
+        'test -s "$RUNNER_TEMP/release-notes/release-notes.md"',
+        'gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes/release-notes.md"',
     ),
     (
         'set -euo pipefail',
@@ -299,9 +301,22 @@ PUBLISH_SCRIPTS = {
     ),
     (
         'set -euo pipefail',
+        'test "$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .body)" = "$(cat "$RUNNER_TEMP/release-notes/release-notes.md")"',
+    ),
+    (
+        'set -euo pipefail',
         'for id in $(gh api --paginate "repos/$GH_REPO/releases" --jq \'.[] | select(.tag_name == env.TAG and .draft) | .id\'); do',
         'gh api --method DELETE "repos/$GH_REPO/releases/$id"',
         'done',
+    ),
+}
+NOTES_SCRIPTS = {
+    (
+        'set -euo pipefail',
+        '[[ "$TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
+        'version="${TAG#v}"',
+        'mkdir -p "$RUNNER_TEMP/release-notes"',
+        'python3 scripts/changelog notes "$version" > "$RUNNER_TEMP/release-notes/release-notes.md"',
     ),
 }
 
@@ -519,7 +534,8 @@ class WriterTests(ReleaseWorkflowFiles):
         self.assertNotIn("--dispatch-ref", gate)
         for name in (
             "gate", "upgrade-test", "docs-gate", "sdk-gate", "build",
-            "stage-macos", "package-macos", "verify-macos", "evidence", WRITER,
+            "stage-macos", "package-macos", "verify-macos", "evidence",
+            "release-notes", WRITER,
         ):
             with self.subTest(job=name):
                 self.assertIn(TIER_EVIDENCE_JOB, needs_of(self.release_jobs[name]))
@@ -599,6 +615,56 @@ class WriterTests(ReleaseWorkflowFiles):
                 with self.subTest(job=f"{file}:{name}"):
                     self.assertNotIn("contents: write", block)
                     self.assertNotIn("GH_TOKEN: ${{ secrets", block)
+
+
+class ReleaseNotesTests(ReleaseWorkflowFiles):
+    """The release body is data rendered by a read-only job from the tagged commit."""
+
+    def test_the_notes_job_reads_only_the_tagged_commit(self):
+        block = self.release_jobs["release-notes"]
+        self.assertEqual(needs_of(block), [TIER_EVIDENCE_JOB])
+        self.assertEqual(
+            re.findall(r"(?m)^    permissions:\n      contents: read$", block), ["    permissions:\n      contents: read"]
+        )
+        self.assertEqual(set(USES.findall(block)), {CHECKOUT, UPLOAD_ARTIFACT})
+        self.assertRegex(block, r"(?m)^          persist-credentials: false$")
+        self.assertNotRegex(block, r"\bgh (release|api)\b")
+        self.assertEqual(
+            workflow_violations(self.release, writer=WRITER, oidc=set(), callers={RELEASE_CALLER}),
+            [],
+        )
+        self.assertEqual(run_scripts(block), list(NOTES_SCRIPTS))
+
+    def test_the_notes_are_uploaded_as_their_own_artifact(self):
+        block = self.release_jobs["release-notes"]
+        self.assertRegex(block, r"(?m)^          name: release-notes$")
+        self.assertRegex(block, r"(?m)^          if-no-files-found: error$")
+
+    def test_the_draft_takes_its_body_from_the_notes_artifact(self):
+        block = self.release_jobs[WRITER]
+        self.assertRegex(
+            block,
+            r"(?m)^          name: release-notes\n          path: \$\{\{ runner\.temp \}\}/release-notes$",
+        )
+        self.assertEqual(block.count("--notes-file"), 1)
+        self.assertNotIn('--notes ""', block)
+        self.assertLess(block.index("Download the release notes"), block.index("Create the draft release"))
+
+    def test_the_published_body_is_compared_with_the_notes_after_publication(self):
+        block = self.release_jobs[WRITER]
+        self.assertLess(block.index("Publish the draft"), block.index("Verify the published release body"))
+        self.assertLess(block.index("Verify the published release body"), block.index("Remove an unpublished draft"))
+
+    def test_the_notes_never_enter_the_bundle_or_its_inventory(self):
+        self.assertNotIn("release-notes", self.build + self.evidence + self.scenarios)
+        for name, block in jobs(self.release).items():
+            if name in (WRITER, "release-notes"):
+                continue
+            with self.subTest(job=name):
+                self.assertNotIn("release-notes", block)
+        for script in run_scripts(self.release_jobs[WRITER]):
+            if any("bundle" in line for line in script):
+                self.assertFalse(any("release-notes" in line for line in script))
 
 
 class OidcTests(ReleaseWorkflowFiles):
@@ -1237,8 +1303,9 @@ class AssetNameTests(ReleaseWorkflowFiles):
 
     def test_the_bundle_is_the_only_published_set(self):
         publish = self.release_jobs[WRITER]
-        self.assertEqual(publish.count("download-artifact"), 1)
+        self.assertEqual(publish.count("download-artifact"), 2)
         self.assertIn("name: release-bundle", publish)
+        self.assertIn("name: release-notes", publish)
         for name in ("sdk-release-assets", "macos-signed", "package-archives"):
             self.assertNotIn(name, publish)
 

@@ -79,9 +79,13 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    explicit `X.Y.Z`; the workspace is already bumped, so do not request another
    relative bump such as `patch`.
 
-5. **Publish the notes.** When a notes file was needed, attach it to the GitHub
-   Release once the workflow has created it (`gh release edit "vX.Y.Z"
-   --notes-file FILE`) and confirm with `gh release view "vX.Y.Z"`.
+5. **Check the release body.** The Release workflow sets the body when it
+   creates the draft: the changelog section of the tagged commit between the
+   `<!-- pohunek-changelog:start -->` and `<!-- pohunek-changelog:end -->`
+   markers. Confirm it with `gh release view "vX.Y.Z" --json body`. Do not edit
+   the body by hand; a wrong entry is fixed in `CHANGELOG.md` of a later
+   release. The `--notes FILE` option is the compatibility check input, not the
+   release body.
 
 6. **Record the release.** Via the `github-workflow` skill, comment the
    version/tag and release URL on any issue whose delivery this release

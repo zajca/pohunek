@@ -4,6 +4,7 @@ name: Release
 # has one producer half, one evidence half and ONE writer:
 #
 #   tier-evidence     exact-commit main and nightly CI evidence
+#   release-notes     read-only: the changelog block of the tagged commit
 #   gate, docs-gate, sdk-gate, upgrade-test   the quality gate on the tagged
 #       commit (a tag push does not run the CI workflow, so the gate is
 #       duplicated here);
@@ -21,7 +22,8 @@ name: Release
 # checks out nothing and runs no repository or downloaded code: it takes the
 # `release-bundle` artifact, whose `release-inventory.sha256` is the only list
 # of files, verifies it, refuses an existing release for the tag, creates a
-# DRAFT, uploads exactly the inventory, verifies the draft's assets by name,
+# DRAFT whose body is the `release-notes` artifact (data, never part of the
+# inventory), uploads exactly the inventory, verifies the draft's assets by name,
 # size and digest, and only then publishes it. A visible release is therefore
 # either complete or absent. `.github/workflows/notify-tap.yml` runs after this
 # workflow and requires the release to be published.
@@ -77,6 +79,41 @@ jobs:
 
       - name: Require exact-commit nightly-tier evidence
         run: python3 scripts/ci-evidence --repo "$GH_REPO" --sha "$COMMIT" --tier nightly
+
+  # The release body is the version section of the tagged commit's
+  # CHANGELOG.md, printed by the same script that the release commit folds
+  # with. It runs on the tagged commit with a read-only token and hands the
+  # block to `publish` as an artifact; a missing section or fragments that were
+  # not folded fail this job, so nothing is published.
+  release-notes:
+    name: Render the changelog section of the tag
+    needs: [tier-evidence]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Render the changelog block
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${TAG#v}"
+          mkdir -p "$RUNNER_TEMP/release-notes"
+          python3 scripts/changelog notes "$version" > "$RUNNER_TEMP/release-notes/release-notes.md"
+
+      - name: Upload the release notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes/release-notes.md
+          if-no-files-found: error
+          retention-days: 1
 
   gate:
     name: fmt + clippy + test
@@ -635,7 +672,7 @@ jobs:
   # draft it created, so no partial release stays behind.
   publish:
     name: Publish the release
-    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test, build, stage-macos, package-macos, verify-macos, evidence]
+    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test, build, stage-macos, package-macos, verify-macos, evidence, release-notes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -651,6 +688,12 @@ jobs:
         with:
           name: release-bundle
           path: ${{ runner.temp }}/bundle
+
+      - name: Download the release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes
 
       # The inventory is the only list of files: the directory must hold
       # exactly the listed regular files plus the inventory itself, with the
@@ -706,7 +749,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes ""
+          test -s "$RUNNER_TEMP/release-notes/release-notes.md"
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes/release-notes.md"
 
       - name: Upload exactly the inventory
         shell: bash
@@ -743,6 +787,14 @@ jobs:
           have="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG and (.draft | not)) | .assets[] | select(.state == "uploaded") | "\(.name) \(.digest) \(.size)"' | LC_ALL=C sort)"
           test -n "$have"
           test "$want" = "$have"
+
+      # The body is the notes file byte for byte, so the markers reach pohunek.dev
+      # exactly as the tagged CHANGELOG.md rendered them.
+      - name: Verify the published release body
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .body)" = "$(cat "$RUNNER_TEMP/release-notes/release-notes.md")"
 
       # Only a draft this run created and left unpublished is removed; a
       # published release is never touched.
