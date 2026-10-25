@@ -645,7 +645,7 @@ impl SessionRegistry {
         guard: LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
         let registry = self.clone();
-        self.spawn_finishing("pty_registration", async move {
+        self.spawn_transaction("pty_registration", async move {
             Box::pin(registry.run_pty_registration(spec, guard)).await
         })
         .await

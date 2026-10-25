@@ -1252,7 +1252,7 @@ impl SessionRegistry {
             let inner = Arc::downgrade(&self.inner);
             let shutdown = self.inner.daemon_shutdown.clone();
             let initial = self.inner.config.supervision_retry_initial;
-            self.spawn_background("supervision_retries", async move {
+            self.spawn_cooperative("supervision_retries", async move {
                 run_supervision_retries(inner, shutdown, initial).await;
             });
         }
@@ -1288,7 +1288,7 @@ impl SessionRegistry {
         let registry = self.clone();
         let task_id = id.clone();
         match self
-            .spawn_background("supervision_retry_pass", async move {
+            .spawn_transaction("supervision_retry_pass", async move {
                 registry.retry_supervised_session(&task_id).await
             })
             .await
@@ -1406,8 +1406,8 @@ impl SessionRegistry {
     /// so the session is never stranded without a re-check.
     pub(super) fn settle_abandoned_create(&self, id: SessionId, generation: Generation) {
         let registry = self.clone();
-        self.spawn_background("abandoned_create_settlement", async move {
-            let settle = registry.spawn_background(
+        self.spawn_cooperative("abandoned_create_settlement", async move {
+            let settle = registry.spawn_cooperative(
                 "abandoned_create_watch",
                 registry
                     .clone()
@@ -1491,9 +1491,9 @@ impl SessionRegistry {
     /// Daemon shutdown leaves it to the next start as well.
     pub(super) fn settle_unproven_stale_job(&self, key: WorkerKey) {
         let registry = self.clone();
-        self.spawn_background("unproven_stale_job_settlement", async move {
+        self.spawn_cooperative("unproven_stale_job_settlement", async move {
             let service_id = key.service_id();
-            let settle = registry.spawn_background(
+            let settle = registry.spawn_cooperative(
                 "unproven_stale_job_watch",
                 registry.clone().watch_unproven_stale_job(key),
             );

@@ -359,7 +359,7 @@ impl SessionRegistry {
         rescan: std::sync::Arc<Notify>,
     ) {
         let registry = self.clone();
-        self.spawn_background("procwatch_scan", async move {
+        self.spawn_cooperative("procwatch_scan", async move {
             let base = registry.inner.config.procwatch_poll;
             let ceiling = registry.inner.config.procwatch_idle_poll_max.max(base);
             // The first scan runs at once; later ones wait `delay`, which grows
@@ -1009,7 +1009,7 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
-        self.spawn_background("bound_reporter_exit_watch", async move {
+        self.spawn_cooperative("bound_reporter_exit_watch", async move {
             tokio::select! {
                 () = cancel.cancelled() => {}
                 result = watch.wait() => match result {
@@ -1195,7 +1195,7 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
-        self.spawn_background("observed_exit_watch", async move {
+        self.spawn_cooperative("observed_exit_watch", async move {
             tokio::select! {
                 () = cancel.cancelled() => {}
                 result = watch.wait() => {

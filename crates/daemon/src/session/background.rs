@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -21,11 +22,17 @@ use tokio_util::task::TaskTracker;
 /// How a tracked task ends when the registry shuts down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OnShutdown {
-    /// The task is aborted at its next await point.
+    /// The task is aborted at its next await point. For work blocked on I/O
+    /// that has no cancellation of its own, and for waiters on other tasks.
     Abort,
-    /// The task finishes on its own: it watches a token that is a child of the
-    /// registry's root token, or it is a finite transaction.
-    Finish,
+    /// The task watches a token that shutdown cancels (the root token's
+    /// children, or a daemon-wide shutdown token) and ends by itself; shutdown
+    /// waits for it instead of cutting it off mid-commit.
+    Cooperative,
+    /// The task is a finite transaction with the worker or the store that must
+    /// not be cut in half: shutdown waits for it, and a test can wait for the
+    /// transactions in flight with [`BackgroundTasks::settle`].
+    Transaction,
 }
 
 /// What [`BackgroundTasks::shutdown`] found.
@@ -68,6 +75,27 @@ impl Drop for LiveGuard {
     }
 }
 
+/// Counts one transaction or blocking store write in flight until dropped.
+struct InFlight {
+    count: Arc<watch::Sender<usize>>,
+}
+
+impl InFlight {
+    fn enter(count: &Arc<watch::Sender<usize>>) -> Self {
+        count.send_modify(|in_flight| *in_flight += 1);
+        Self {
+            count: Arc::clone(count),
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.count
+            .send_modify(|in_flight| *in_flight = in_flight.saturating_sub(1));
+    }
+}
+
 /// Tracker, root cancellation token and quiescence state of one registry.
 #[derive(Debug)]
 pub(super) struct BackgroundTasks {
@@ -80,6 +108,8 @@ pub(super) struct BackgroundTasks {
     quiesced: AtomicBool,
     next_id: AtomicU64,
     live: LiveTasks,
+    /// Transactions and blocking store writes in flight.
+    in_flight: Arc<watch::Sender<usize>>,
 }
 
 impl Default for BackgroundTasks {
@@ -91,6 +121,7 @@ impl Default for BackgroundTasks {
             quiesced: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
             live: Arc::new(Mutex::new(BTreeMap::new())),
+            in_flight: Arc::new(watch::channel(0).0),
         }
     }
 }
@@ -144,8 +175,11 @@ impl BackgroundTasks {
             live: Arc::clone(&self.live),
             id,
         };
+        let in_flight =
+            (on_shutdown == OnShutdown::Transaction).then(|| InFlight::enter(&self.in_flight));
         let handle = self.tracker.spawn(async move {
             let _guard = guard;
+            let _in_flight = in_flight;
             task.await
         });
         if on_shutdown == OnShutdown::Abort {
@@ -167,7 +201,22 @@ impl BackgroundTasks {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.tracker.spawn_blocking(work)
+        let in_flight = InFlight::enter(&self.in_flight);
+        self.tracker.spawn_blocking(move || {
+            let _in_flight = in_flight;
+            work()
+        })
+    }
+
+    /// Waits until no transaction and no blocking store write is in flight.
+    ///
+    /// Unlike [`Self::shutdown`] it leaves the registry running: a transaction
+    /// a transaction spawns is counted before its parent ends, so the count
+    /// does not reach zero in between.
+    #[cfg(test)]
+    pub(super) async fn settle(&self) {
+        let mut in_flight = self.in_flight.subscribe();
+        let _ = in_flight.wait_for(|count| *count == 0).await;
     }
 
     /// Refuses every later [`Self::spawn`].

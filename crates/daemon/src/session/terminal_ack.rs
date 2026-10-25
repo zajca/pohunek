@@ -43,7 +43,7 @@ impl SessionRegistry {
             return;
         }
         let registry = self.clone();
-        self.spawn_background("terminal_acknowledgement", async move {
+        self.spawn_transaction("terminal_acknowledgement", async move {
             registry.acknowledge_terminal_runtime(&id, ack).await;
         });
     }

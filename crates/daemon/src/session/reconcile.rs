@@ -21697,8 +21697,13 @@ generation "$1"
                 .await
             };
             drop(stopped);
+            // The forwarding task logs the failure; read the capture only
+            // once every forward and acknowledgement in flight is done.
+            fixture.registry.settle_transactions().await;
+            let events = (released, logs.messages(), logs.trace());
+            // The worker was killed in transit, so the stop cannot succeed.
             let _ = fixture.registry.stop(&created.id).await;
-            (released, logs.messages(), logs.trace())
+            events
         }
 
         /// A release whose forward failed over a memory claim ends it, and the

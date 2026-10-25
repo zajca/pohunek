@@ -2728,17 +2728,39 @@ impl SessionRegistry {
             .spawn(name, background::OnShutdown::Abort, task)
     }
 
-    /// Spawns a background task that finishes on its own at shutdown, either
-    /// because it watches a token derived from the registry's root token or
-    /// because it is a finite transaction that must not be cut in half.
-    pub(super) fn spawn_finishing<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
+    /// Spawns a task that watches a token [`Self::shutdown`] cancels and ends
+    /// by itself; shutdown waits for it instead of aborting it.
+    pub(super) fn spawn_cooperative<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
         self.inner
             .background
-            .spawn(name, background::OnShutdown::Finish, task)
+            .spawn(name, background::OnShutdown::Cooperative, task)
+    }
+
+    /// Spawns a finite transaction with the worker or the store that shutdown
+    /// waits for instead of aborting.
+    pub(super) fn spawn_transaction<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner
+            .background
+            .spawn(name, background::OnShutdown::Transaction, task)
+    }
+
+    /// Waits until no transaction (a terminal acknowledgement, a package
+    /// transaction, a launch registration) and no blocking store write is in
+    /// flight, and leaves the registry running.
+    ///
+    /// A test calls it after a lifecycle call whose background consequences it
+    /// is about to observe, such as the acknowledgement a stop schedules.
+    #[cfg(test)]
+    pub(crate) async fn settle_transactions(&self) {
+        self.inner.background.settle().await;
     }
 
     /// A cancellation token that [`Self::shutdown`] cancels, for a task
@@ -6365,7 +6387,7 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
-        self.spawn_background("worker_exit_watcher", async move {
+        self.spawn_cooperative("worker_exit_watcher", async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
             let mut metadata = WorkerMetadataTracker::default();
@@ -7463,7 +7485,7 @@ impl SessionRegistry {
     fn spawn_external_exit_watch_task(&self, identity: ProcessIdentity, watch: ExitWatch) {
         let registry = self.clone();
         let shutdown = self.inner.external.shutdown_token();
-        self.spawn_background("external_exit_watch", async move {
+        self.spawn_cooperative("external_exit_watch", async move {
             tokio::select! {
                 () = shutdown.cancelled() => {}
                 result = watch.wait() => {
