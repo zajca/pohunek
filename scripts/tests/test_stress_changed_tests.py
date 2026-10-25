@@ -487,8 +487,19 @@ class HostShare(Fixture):
     def setUp(self):
         super().setUp()
         self.edit("crates/demo/src/lib.rs", "// original comment", "// edit")
-        self.edit("crates/demo/tests/flow.rs", "assert!(true);", "assert!(!false);")
+        self.write("crates/demo/tests/flow.rs", "#[cfg(all())]\n" + FLOW_BASE.replace(
+            "assert!(true);", "assert!(!false);"))
         self.commit()
+
+    def test_a_missing_test_in_a_file_without_a_cfg_still_fails_under_the_flag(self):
+        # No cfg could have compiled the test out, so a missing name is a wrong identity.
+        self.edit("crates/demo/tests/flow.rs", "#[cfg(all())]\n", "")
+        self.commit("drop cfg")
+        result = self.run_script(
+            "--allow-missing-on-host",
+            list_json=listing({"demo": {"tests::comment_edit": "matches"}}))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("flow_case", result.stderr)
 
     def test_a_test_the_host_does_not_build_fails_by_default(self):
         result = self.run_script(list_json=listing({"demo": {"tests::comment_edit": "matches"}}))
@@ -515,6 +526,20 @@ class HostShare(Fixture):
         self.assertIn("nothing stressed here", result.stdout)
         run_calls = [line for line in self.log.read_text().splitlines() if '"run"' in line]
         self.assertEqual(run_calls, [])
+
+
+class MultiLineAttribute(Fixture):
+    def test_removing_a_multi_line_first_attribute_selects_the_test(self):
+        self.edit("crates/demo/src/lib.rs", "    #[test]\n    fn middle_case() {",
+                  "    #[cfg_attr(\n        target_os = \"macos\",\n        ignore = \"flaky\"\n"
+                  "    )]\n    #[test]\n    fn middle_case() {")
+        self.commit("gate")
+        self.edit("crates/demo/src/lib.rs",
+                  "    #[cfg_attr(\n        target_os = \"macos\",\n        ignore = \"flaky\"\n    )]\n", "")
+        self.commit("enable")
+        result = self.run_script("--print", base="HEAD~1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tests::middle_case", result.stdout)
 
 
 class Arguments(Fixture):

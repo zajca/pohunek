@@ -95,6 +95,11 @@ QUALIFIERS = {"pub", "async", "unsafe", "const", "extern", "default"}
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
+# Files whose text mentions a `cfg`; a test missing from the nextest list is
+# accepted as "not built on this host" only for these files.
+CFG_GATED = set()
+
+
 class SelectionError(Exception):
     """A changed test cannot be selected exactly."""
 
@@ -388,6 +393,15 @@ def run(argv, cwd, check=True):
     return result
 
 
+def only_attributes_and_comments(lines):
+    """True when the removed `lines` are whole attributes and comment lines."""
+    code = "\n".join(l for l in lines if not l.lstrip().startswith("//")).strip()
+    if not code:
+        return bool(lines)
+    # Every top-level item must be an attribute with balanced brackets.
+    return bool(re.fullmatch(r"(?:#\s*!?\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*)+", code))
+
+
 def changed_lines(root, base):
     """`{path: [(start, end, attrs_only)]}` of changed 1-based line spans.
 
@@ -408,8 +422,7 @@ def changed_lines(root, base):
     pending = None  # [start, removed lines] of the hunk being read
     def close_hunk():
         if pending and current and pending[2] == 0:
-            attrs_only = bool(pending[1]) and all(
-                text.lstrip().startswith(("#[", "#!", "//")) for text in pending[1])
+            attrs_only = only_attributes_and_comments(pending[1])
             spans.setdefault(current, []).append((pending[0] + 0.5, pending[0] + 0.5, attrs_only))
     for line in diff.splitlines():
         if line.startswith("+++ "):
@@ -571,6 +584,8 @@ def select(root, base):
         if not path.exists():
             continue  # deleted file
         module = tree.parse(path)
+        if re.search(r"\bcfg(?:_attr)?\s*\(", module.skeleton):
+            CFG_GATED.add(rel)
         for name, first, last in module.test_macro_definitions() + module.macro_invocations(
                 test_macros):
             probe = Item(name, [], first, last, (), False)
@@ -653,7 +668,7 @@ def verify_listed(root, profile, expression, selected, allow_missing):
         suite = suites.get(target.binary_id)
         case = suite["testcases"].get(name) if suite else None
         if case is None:
-            if allow_missing:
+            if allow_missing and rel in CFG_GATED:
                 print(f"stress-changed-tests: NOT STRESSED on this host: {rel}:{line} `{name}` "
                       f"({target.binary_id}) is not built here; it must be stressed on a host "
                       "that builds it, and the report must say so", file=sys.stderr)
@@ -661,8 +676,8 @@ def verify_listed(root, profile, expression, selected, allow_missing):
             missing.append(
                 f"{rel}:{line}: `{name}` ({target.binary_id}) is not in the nextest list: "
                 "not built on this host (for example a cfg for another OS; run the gate "
-                "there, or pass --allow-missing-on-host to stress only this host's share) "
-                "or the identity is wrong")
+                "there, or pass --allow-missing-on-host to stress only this host's share; "
+                "that flag applies only to files with a cfg) or the identity is wrong")
         elif case.get("ignored"):
             print(f"stress-changed-tests: skipped {rel} `{name}`: ignored in the nextest "
                   "list, so nextest does not run it", file=sys.stderr)
