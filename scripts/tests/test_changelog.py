@@ -7,6 +7,7 @@ contract are written here as fragment bytes and must each be refused by
 `check`, and by `fold`, which must then leave the tree untouched.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -207,6 +208,62 @@ class CheckWorkflow(unittest.TestCase):
         self.assertIn("python3 scripts/changelog check", scripts)
         self.assertIn('"$BASE_SHA...$HEAD_SHA"', scripts)
         self.assertIn('"$NO_CHANGELOG" = true', scripts)
+
+
+class FragmentRequirement(unittest.TestCase):
+    """The pull-request check's fragment rule, run as the workflow runs it in a real history."""
+
+    def script(self) -> str:
+        text = CHECK_WORKFLOW.read_text()
+        block = text.split("      - name: Require a fragment or the no-changelog label\n", 1)[1]
+        body = block.split("        run: |\n", 1)[1].split("\n\n", 1)[0]
+        return "\n".join(line[10:] for line in body.splitlines())
+
+    def repo_with(self, *paths: str) -> tuple[Path, str, str]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+               "PATH": os.environ["PATH"]}
+        self.env = env
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", str(root), *args], check=True, env=env,
+                                  capture_output=True, text=True).stdout.strip()
+
+        git("init", "-q", "-b", "main")
+        (root / "README.md").write_text("base\n")
+        git("add", "-A")
+        git("-c", "commit.gpgsign=false", "commit", "-q", "-m", "base")
+        base = git("rev-parse", "HEAD")
+        for path in paths:
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text("---\nkind: added\n---\nText.\n")
+        git("add", "-A")
+        git("-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "head")
+        return root, base, git("rev-parse", "HEAD")
+
+    def run_rule(self, paths: tuple[str, ...], no_changelog: str = "false") -> int:
+        root, base, head = self.repo_with(*paths)
+        env = dict(self.env, BASE_SHA=base, HEAD_SHA=head, NO_CHANGELOG=no_changelog)
+        result = subprocess.run(["bash", "-c", self.script()], cwd=root, env=env,
+                                capture_output=True, text=True, check=False)
+        return result.returncode
+
+    def test_a_valid_fragment_satisfies_the_rule(self):
+        self.assertEqual(self.run_rule(("changelog.d/12-tailscale-overlay.md",)), 0)
+
+    def test_a_dotfile_does_not_satisfy_the_rule(self):
+        self.assertEqual(self.run_rule(("changelog.d/.hidden.md",)), 1)
+
+    def test_a_name_the_tool_rejects_does_not_satisfy_the_rule(self):
+        self.assertEqual(self.run_rule(("changelog.d/x-foo.md",)), 1)
+        self.assertEqual(self.run_rule(("changelog.d/12-Foo.md",)), 1)
+
+    def test_the_label_waives_the_rule(self):
+        self.assertEqual(self.run_rule((), no_changelog="true"), 0)
 
 
 class ReleaseRules(ChangelogScenarios):

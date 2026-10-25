@@ -44,7 +44,10 @@ jobs:
             echo "no-changelog label: no fragment required"
             exit 0
           fi
-          if git diff --name-only --diff-filter=AMR "$BASE_SHA...$HEAD_SHA" -- 'changelog.d/*.md' | grep -q .; then
+          # Only names scripts/changelog accepts count: a pathspec such as
+          # changelog.d/*.md also matches dotfiles, which the tool ignores.
+          if git diff --name-only --diff-filter=AMR "$BASE_SHA...$HEAD_SHA" -- 'changelog.d/*.md' |
+            grep -Eq '^changelog\.d/[1-9][0-9]*-[a-z0-9]+(-[a-z0-9]+)*\.md$'; then
             echo "changelog fragment added or changed"
             exit 0
           fi
