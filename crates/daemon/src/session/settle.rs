@@ -22,10 +22,10 @@
 //! | detector (`DetectorOutput`) | detector output pump | detector | at the send, one per chunk, `skipped` on a lag; a detector tick is counted until its transitions are applied |
 //! | worker snapshot | worker poll | worker exit watcher | when a snapshot is read, until applied |
 //! | exit watch | OS exit watch | bound-reporter and observed-agent exit watch tasks | when the exit is delivered, until applied |
-//! | supervision retry | retry loop | retry loop | when a pending session is taken after its delay, until its pass is accounted for |
+//! | supervision retry | retry loop | retry loop | when its delay expires, until its pass is accounted for |
 //! | unattributed | OS exit watch | external exit watch task | like the exit watches; belongs to no session |
 
-// Rust guideline compliant 2026-10-01
+// Rust guideline compliant 2026-10-26
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

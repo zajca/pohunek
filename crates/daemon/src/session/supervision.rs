@@ -1602,6 +1602,29 @@ impl SessionRegistry {
     }
 }
 
+impl SessionRegistry {
+    /// The retries that are due, each counted as pending input of its session
+    /// from now until its guard drops, not only from its turn in the pass.
+    fn due_supervision_retries(&self) -> Vec<(String, super::settle::Applying)> {
+        self.inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .pending
+            .iter()
+            .map(|session_id| {
+                let applying = self
+                    .inner
+                    .settle
+                    .gate(&SessionId(session_id.clone()))
+                    .begin();
+                (session_id.clone(), applying)
+            })
+            .collect()
+    }
+}
+
 /// Serves the pending supervision retries of one registry.
 async fn run_supervision_retries(
     inner: Weak<SessionRegistryInner>,
@@ -1641,15 +1664,8 @@ async fn run_supervision_retries(
             return;
         };
         let registry = SessionRegistry { inner };
-        let pending = registry
-            .inner
-            .supervision_retries
-            .state
-            .lock()
-            .expect("supervision retry state is never poisoned")
-            .pending
-            .clone();
-        for session_id in pending {
+        let pending = registry.due_supervision_retries();
+        for (session_id, _applying) in pending {
             if shutdown.is_cancelled() {
                 return;
             }
@@ -1668,9 +1684,6 @@ async fn run_supervision_retries(
                 continue;
             }
             let id = SessionId(session_id);
-            // The pass is pending input of its session from the moment its
-            // retry is due until the pass is accounted for below.
-            let _applying = registry.inner.settle.gate(&id).begin();
             registry
                 .inner
                 .supervision_retries
