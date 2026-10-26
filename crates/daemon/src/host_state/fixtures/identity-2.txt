@@ -1,0 +1,6 @@
+identity
+identity.format_version
+identity.host_id
+identity.phase
+identity.phase=complete
+identity.phase=in_progress

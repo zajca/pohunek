@@ -70,7 +70,7 @@ mod dry_run;
 mod legacy_binding;
 mod schema;
 #[cfg(test)]
-mod shape_guard;
+pub(crate) mod shape_guard;
 
 #[cfg(test)]
 mod legacy_binding_tests;

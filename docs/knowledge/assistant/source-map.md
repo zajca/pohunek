@@ -519,8 +519,10 @@ Daemon, sessions, integrations, and project state:
   table, the `.pre-schema-<old>` backup, and `StoreSchemaError`.
 - `crates/daemon/src/store/dry_run.rs` — read-only in-memory run of the startup
   migration used by the upgrade preflight.
-- `crates/daemon/src/store/shape_guard.rs` — persisted-shape guard test and its
-  `fixtures/shape/schema-<N>.txt` snapshots.
+- `crates/daemon/src/store/shape_guard.rs` — persisted-shape guard test (keys and
+  enum values) and its `fixtures/shape/schema-<N>.txt` snapshots.
+- `crates/daemon/src/host_state/records/shape_guard.rs` — governance and identity
+  record guard and its `host_state/fixtures/*-<N>.txt` snapshots.
 - `crates/protocol/src/version.rs`
 - `crates/worker-protocol/src/version.rs`
 - `scripts/release` — compatibility-constant check against the previous tag.

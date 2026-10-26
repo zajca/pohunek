@@ -586,6 +586,9 @@ fn required<E: serde::de::Error, T>(value: Option<T>, field: &'static str) -> Re
 }
 
 #[cfg(test)]
+mod shape_guard;
+
+#[cfg(test)]
 mod tests {
     use serde_json::Value;
 
