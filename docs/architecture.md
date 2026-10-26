@@ -503,6 +503,16 @@ turning true). Any other write is refused and logged as
 `worker.journal.sealed_write_refused`, because it would change an outcome the
 daemon may already have read.
 
+Each session also counts the input its watchers have been handed and not yet
+applied: a rescan request, an output chunk of the detector, a worker snapshot, a
+delivered process exit, a due supervision retry and a scan or detector tick that
+fired. The count rises where the input is handed over and falls after the watcher
+applied it, store write and event emission included, so a producer cannot hand
+input over without it being counted. Input that is only scheduled (a scan timer,
+a retry delay) is not counted until it fires, and input still on its way from a
+worker or the OS is not counted until the daemon receives it. Test builds expose
+the count as `SessionRegistry::settled`.
+
 The private worker protocol is local-only and owner-private. It uses bounded
 newline-delimited JSON for control requests and binary-safe framed data
 connections for output and attach traffic. A worker accepts one leased daemon
