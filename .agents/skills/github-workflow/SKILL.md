@@ -106,8 +106,11 @@ review, and the marker arrives as a comment on the pull request. If no marker
 has arrived some hours after green CI, the contributor mentions the maintainer
 on the pull request. The marker is the technical gate only: merging an outside
 contribution also needs the maintainer's explicit approval. An outside
-contributor never receives the credential that posts the marker, and an agent
-working for the maintainer never posts or imitates one.
+contributor never receives the credential that posts the marker. Only the designated independent review
+session posts the marker: a fresh Opus high effort session that did not author
+the change, started by the maintainer's manager (the coordinator or operator)
+or, when no manager is named, by the delivering agent per `deliver-issue`
+Phase 5. The authoring agent never posts or imitates a marker.
 Review grants no merge authority; release remains separately authorized.
 
 Unsolicited competing pull requests remain welcome and use the same criteria.

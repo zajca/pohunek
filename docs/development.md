@@ -135,7 +135,11 @@ passed, and a failing, cancelled or still pending check does not.
   `TS binding drift (xs check)`, `upgrade from the previous release`,
   `release build`, `cargo-hack (feature powerset)`, the `release rehearsal`
   jobs, `SDK workspace (macOS arm64)` and
-  `macOS package install and upgrade (macos-15)`.
+  `macOS package install and upgrade (macos-15)`. The `release rehearsal`
+  jobs also skip every pull request from a fork, so an outside
+  contribution that touches the release paths never shows that evidence; the
+  maintainer runs it with a `tier=nightly` dispatch of a branch in this
+  repository that holds the fork head. Dependabot pull requests skip it too.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

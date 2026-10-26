@@ -95,8 +95,8 @@ do not re-report them as review findings:
   authorization only and does not authorize merging.
 - Invoking the `deliver-issue` skill on an issue is the owner's explicit
   request to commit, push, open that issue's PRs, and merge them once the
-  skill's merge criteria hold (green checks and a review of the final head
-  with no unanswered actionable finding). It covers that one issue only and
+  skill's merge criteria hold (green checks and an `opus-pr-review:v1`
+  marker for the final head with `high=0` and `medium=0`). It covers that one issue only and
   never releases, tags, or force-pushes `main`.
 - Harness executors run their model CLI unsandboxed on the operator's host;
   `--workspace` scopes the working directory, not file access.

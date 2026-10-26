@@ -123,8 +123,10 @@ unpublished slices as pending.
    checks <n>`). Report the PR number, URL, and CI state.
 
    **Review gate.** No label or other trigger starts the review. The
-   maintainer's manager starts an Opus (high effort) review session for each
-   pushed head, which posts a PR conversation comment authored by `zajca`
+   maintainer's manager (the coordinator or operator) starts the independent
+   review session for each pushed head (a fresh Opus high effort session that
+   did not author the change; with no manager named, `deliver-issue` Phase 5
+   step 1 says who starts it), which posts a PR conversation comment authored by `zajca`
    that carries `<!-- opus-pr-review:v1:<repo>#<N>@<40-char head sha>:high=<h>:medium=<m>:low=<l> -->`.
    Report the PR number and head sha to the manager. The gate holds only for a
    marker whose author is `zajca` and whose sha is the PR's current head, with

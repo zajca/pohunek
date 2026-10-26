@@ -135,8 +135,10 @@ marker for that exact head, next to green CI. **Both** must be checked for
 every head; checking only CI loses review rounds.
 
 The marker is a comment on the PR conversation, authored by `zajca`, posted by
-an Opus (high effort) review session that the maintainer's manager starts for
-the pushed head. It carries
+the independent review session for the pushed head: a fresh Opus (high
+effort) session that did not author the change, started by the maintainer's
+manager (the coordinator or operator) or, when no manager is named, by the
+delivering agent per step 1. It carries
 
 ```text
 <!-- opus-pr-review:v1:<repo>#<N>@<40-char head sha>:high=<h>:medium=<m>:low=<l> -->
@@ -151,13 +153,17 @@ followed by the findings. The rules:
   counts.
 - GO is `high=0` and `medium=0`. A review with only LOW findings passes; each
   LOW finding is verified and filed as a follow-up issue per `github-workflow`.
-- The delivering agent never posts, edits, or imitates a marker.
+- Only the independent review session posts a marker. The authoring agent
+  never posts, edits, or imitates one.
 
-1. **Request the review.** The review session is started by the manager, not
-   by the delivering agent. Report every pushed head (PR number, sha, CI
-   state) to the manager through the channel the invocation names. When no
-   review has arrived, say so again and record the wait on the issue; never
-   push or amend a head only to provoke a review.
+1. **Request the review.** The authoring session never reviews its own
+   change. Report every pushed head (PR number, sha, CI state) to the manager
+   through the channel the invocation names. When the invocation names no
+   manager or channel, start the independent review session yourself: a fresh
+   session with a review-only briefing (the PR, the head sha, the issue's DoD,
+   the marker format) that did not take part in the implementation. When a
+   review is late, say so again and record the wait on the issue; never push
+   or amend a head only to provoke a review.
 2. **Watch.** Start one background watcher per push (a monitor tool where the
    runtime has one; otherwise a polling loop or repeated scheduled checks)
    that polls until (a) every check of the PR is non-pending and (b) a marker
@@ -173,6 +179,13 @@ followed by the findings. The rules:
    human reviews, inline review comments, and PR conversation comments since
    the last round. Re-arm on expiry. Never merge without the marker of the
    final head.
+
+   **Disputed MEDIUM.** The gate stays `high=0` and `medium=0` at the exact
+   head. When a MEDIUM finding is a false positive, answer it with evidence
+   (`path:line`, spec reference, reproduction) as a comment on the PR. The
+   coordinator rules on the dispute, or the maintainer when there is no
+   coordinator. A fresh independent review at the same head then reflects the
+   ruling in the `medium` count of its marker, and the latest marker for the head decides.
 3. **CI failure triage** — before changing anything:
    - Fetch logs only after the whole run completed (`gh run view <run> --job
      <job> --log-failed`; earlier it returns nothing).
@@ -193,7 +206,8 @@ followed by the findings. The rules:
 4. **Review findings** — for each finding of the round:
    - Verify it against the code. A false positive is answered, not coded
      around: record the evidence (`path:line`, spec/manual reference, a
-     reproduction) in the round's issue comment.
+     reproduction) in the round's issue comment. A disputed MEDIUM also
+     follows the dispute path of Phase 5 step 2.
    - Group real findings by file ownership and dispatch them to workers
      (Phase 3 rules; resume the worker that owns the area).
    - Prefer the principled fix the finding points at over a narrow patch,

@@ -76,13 +76,14 @@ PR. Move anything else to the next milestone with a one-line reason.
    before any code: decide its open questions explicitly.
 2. **Push discipline:** local gates and a local Opus subagent review before every
    push; one push per review round; no pushes while CI runs unless you ask.
-3. **Review every PR head** with an Opus (high effort) review session, the
-   gate of `deliver-issue` Phase 5: run two to four read-only reviewer
-   subagents in parallel, one per commit or per concern, with a shared
+3. **Review every PR head** with an independent Opus (high effort) review
+   session, the gate of `deliver-issue` Phase 5. That session runs two to
+   four read-only reviewer subagents in parallel, one per commit or per concern, with a shared
    `/tmp/agent-context-review-<pr>.md` and a confidence threshold of 80.
-   Post one comment from the maintainer account that carries the
-   `opus-pr-review:v1` marker for the exact head and names the verdict. After fixes,
-   review only the delta (`git range-diff` after a rebase). A LOW finding is
+   It is a fresh session that did not author the change, with a review-only
+   briefing, and it posts one comment from the maintainer account that
+   carries the `opus-pr-review:v1` marker for the exact head and names the
+   verdict. After fixes, review only the delta (`git range-diff` after a rebase). A LOW finding is
    filed as an issue instead of fixed; say so in the comment.
 4. **Batch** findings from all reviewers into one fix push. Prefer one PR with
    ordered commits over a stacked train when the release clock matters, and
