@@ -6475,6 +6475,10 @@ impl SessionRegistry {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the watcher is one loop over the worker's snapshots and its reconnects"
+    )]
     fn spawn_worker_exit_watcher(
         &self,
         id: SessionId,

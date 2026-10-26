@@ -4229,7 +4229,10 @@ impl SessionRegistry {
             input_ready: input_ready_tx,
             initial_input_done: cancelled_initial_input(),
         });
-        if !root_missing_during_drain {
+        if root_missing_during_drain {
+            // No scan loop serves this entry, so its requests are not counted.
+            procwatch_rescan.gate().close();
+        } else {
             self.spawn_procwatch(
                 id.clone(),
                 expected.clone(),
@@ -4240,9 +4243,6 @@ impl SessionRegistry {
                 procwatch_cancel,
                 procwatch_rescan,
             );
-        } else {
-            // No scan loop serves this entry, so its requests are not counted.
-            procwatch_rescan.gate().close();
         }
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_worker_instance_id) = native_recovery {

@@ -257,14 +257,13 @@ impl SettleRegistry {
     /// with no live gate has nothing pending.
     pub(super) fn gate(&self, id: &SessionId) -> Arc<InputGate> {
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        let session = match sessions.get(id).and_then(Weak::upgrade) {
-            Some(session) => session,
-            None => {
-                sessions.retain(|_, session| session.strong_count() > 0);
-                let session = Arc::new(SessionSettle::default());
-                sessions.insert(id.clone(), Arc::downgrade(&session));
-                session
-            }
+        let session = if let Some(session) = sessions.get(id).and_then(Weak::upgrade) {
+            session
+        } else {
+            sessions.retain(|_, session| session.strong_count() > 0);
+            let session = Arc::new(SessionSettle::default());
+            sessions.insert(id.clone(), Arc::downgrade(&session));
+            session
         };
         Self::gate_on(session)
     }
