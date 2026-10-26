@@ -29,7 +29,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
 use nix::unistd::{mkfifo, Pid};
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::wait::poll_until;
+use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 use pohunek_test_support::workers::WorkerGuard;
 use pohunek_test_support::{bin_exe, worker_binary};
 use serde_json::Value;
@@ -242,7 +242,15 @@ async fn session_created_reaches_the_reaction_with_no_origin_pair() {
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn a_full_queue_drops_events_and_keeps_delivering_later_ones() {
     let mut managed = Managed::new(&format!("{KNOBS}\n{ONE_QUEUED_EVENT}"));
-    let plugin = Plugin::new(PLUGIN).reaction("on_created", &["session_created"], "react");
+    // The held run outlives the burst, the stop and the barrier, so its
+    // deadline is the hang guard, not the runner's default.
+    let hang_guard_ms = u64::try_from(HANG_GUARD.as_millis()).expect("hang guard fits u64");
+    let plugin = Plugin::new(PLUGIN).reaction_within(
+        "on_created",
+        &["session_created"],
+        "react",
+        hang_guard_ms,
+    );
     // The barrier plugin shares the dispatcher's event stream and its own
     // queue stays empty, so its reaction proves how far the stream was routed.
     let barrier = Plugin::new(BARRIER_PLUGIN).reaction("on_stopped", &["session_stopped"], "react");

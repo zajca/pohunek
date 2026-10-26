@@ -165,6 +165,24 @@ impl Plugin {
         self
     }
 
+    /// Declares reaction `name` like [`Plugin::reaction`], with a run deadline
+    /// of `timeout_ms`.
+    pub(crate) fn reaction_within(
+        mut self,
+        name: &str,
+        events: &[&str],
+        program: &str,
+        timeout_ms: u64,
+    ) -> Self {
+        let events: Vec<String> = events.iter().map(|event| format!("\"{event}\"")).collect();
+        let _ = write!(
+            self.tables,
+            "\n[reactions.{name}]\nevents = [{}]\nargv = [\"bin/{program}\"]\ntimeout_ms = {timeout_ms}\n",
+            events.join(", ")
+        );
+        self
+    }
+
     /// Declares every name in `names` as a service running `bin/hang`, one
     /// line each in a single `[services]` table, so a manifest with many
     /// services stays small enough for its size bound.
