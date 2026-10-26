@@ -943,9 +943,11 @@ version. A refused rollback keeps the transaction; restore the
 installed. There is no automatic reverse schema migration.
 
 The guard test `crates/daemon/src/store/shape_guard.rs` fails when the
-serialized field set of a record kind differs from
-`crates/daemon/src/store/fixtures/shape/schema-<N>.txt` without a schema bump,
-and when an older schema has no migration step.
+serialized field set of a record kind or the serialized value set of a persisted
+enum differs from `crates/daemon/src/store/fixtures/shape/schema-<N>.txt` without
+a schema bump, and when an older schema has no migration step. The sibling guard
+`crates/daemon/src/host_state/records/shape_guard.rs` does the same for
+`governance.json` and `identity.json` against their format versions.
 
 ## Attach Streaming
 

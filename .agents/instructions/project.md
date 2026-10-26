@@ -102,19 +102,35 @@ registry exists, and copies the store to `<store>.pre-schema-<old>` before the
 first migrating write.
 
 The guard test in `crates/daemon/src/store/shape_guard.rs` compares the
-serialized field set of every persisted record kind, including the nested
-`SessionInfo` protocol type, with the snapshot
-`crates/daemon/src/store/fixtures/shape/schema-<STORE_SCHEMA_VERSION>.txt`. It
-fails when a field is added, removed or renamed without a schema bump, and when
-an older schema has no migration step. A protocol field change in `SessionInfo`
-trips it on purpose: the field lands in `metadata.jsonl`. To resolve a failure:
+serialized field set and the serialized value set of every persisted enum of
+every persisted record kind, including the nested `SessionInfo` protocol type,
+with the snapshot
+`crates/daemon/src/store/fixtures/shape/schema-<STORE_SCHEMA_VERSION>.txt`
+(`kind.path` key lines and `kind.path=value` enum lines). It fails when a field
+is added, removed or renamed, when an enum value is added, removed or renamed,
+and when a string-valued field is neither a registered enum path nor listed free
+text, all without a schema bump, and when an older schema has no migration step.
+A new enum value needs the bump because an older daemon rejects the line. An
+`Unknown` variant contributes no value. A protocol field change in `SessionInfo`
+trips the guard on purpose: the field lands in `metadata.jsonl`. To resolve a
+failure:
 
 1. bump `STORE_SCHEMA_VERSION`;
 2. add a step for the previous schema to `MIGRATIONS` in `schema.rs`;
-3. add `fixtures/shape/schema-<new>.txt` (the failure prints the key set) and
-   register it in `SHAPE_SNAPSHOTS`;
+3. add `fixtures/shape/schema-<new>.txt` (the failure prints the key and value
+   set) and register it in `SHAPE_SNAPSHOTS`;
 4. freeze a store written by the previous release as a fixture under
    `crates/daemon/src/store/fixtures/` and test that it migrates.
+
+`governance.json` and `identity.json` carry their own format versions
+(`GOVERNANCE_FORMAT_VERSION`, `IDENTITY_FORMAT_VERSION` in
+`crates/daemon/src/host_state/records.rs`), and each reader accepts exactly one.
+The sibling guard `crates/daemon/src/host_state/records/shape_guard.rs` pins the
+key and enum value sets of both records to
+`crates/daemon/src/host_state/fixtures/{governance,identity}-<N>.txt`. A failure
+means: bump the format constant, make the reader accept the previous format, and
+add the new snapshot. `notifications.jsonl`, `policy.json` and the other
+daemon-owned documents are not covered by these guards.
 
 Authoritative design lives in `docs/architecture.md` (it wins over `idea.md`).
 Hard constraints, decided on purpose — respect them in every change:
