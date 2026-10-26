@@ -99,10 +99,7 @@ fn is_detached_spawn(skeleton: &str, offset: usize) -> bool {
     }
     let (segments, _) = path_segments_before(bytes, offset);
     // `segments` runs from the nearest segment outwards.
-    matches!(
-        segments.as_slice(),
-        ["tokio" | "task"] | ["task", "tokio"]
-    )
+    matches!(segments.as_slice(), ["tokio" | "task"] | ["task", "tokio"])
 }
 
 /// Scans `files` (workspace-relative path to text).
