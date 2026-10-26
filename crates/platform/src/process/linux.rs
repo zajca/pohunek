@@ -14,8 +14,8 @@ use async_io::Async;
 use rustix::process::{pidfd_open, Pid as NativePid, PidfdFlags};
 
 use super::{
-    BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
-    ProcessInspector, StartIdentity,
+    BootIdentity, ControlGroupPath, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact,
+    ProcessIdentity, ProcessInspector, StartIdentity,
 };
 
 /// Linux proc filesystem root.
@@ -113,6 +113,12 @@ impl ProcessInspector for LinuxInspector {
         let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
         process_is_running_at(Path::new(PROC_ROOT), identity, euid)
             .map_err(|source| process_error("inspect_process_liveness", source))
+    }
+
+    fn control_group(&self, pid: Pid) -> Result<Option<ControlGroupPath>, Error> {
+        require_initial_cgroup_namespace()?;
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        read_unified_control_group_at(Path::new(PROC_ROOT), pid, euid)
     }
 
     fn process_age(&self, identity: ProcessIdentity) -> Result<Option<Duration>, Error> {
@@ -439,6 +445,66 @@ fn read_control_group_membership_at(
             || controllers.is_some_and(|value| value.split(',').any(|name| name == "name=systemd"));
         is_systemd_hierarchy && path.is_some_and(|path| cgroup_path_matches(path, expected))
     }))
+}
+
+/// Stable operation label of the unified control-group read.
+const CONTROL_GROUP_OPERATION: &str = "inspect_process_control_group";
+/// Link naming the reader's cgroup namespace.
+const CGROUP_NAMESPACE_LINK: &str = "/proc/self/ns/cgroup";
+/// Target of [`CGROUP_NAMESPACE_LINK`] in the initial cgroup namespace.
+///
+/// The kernel gives the initial namespace the fixed inode number
+/// `PROC_CGROUP_INIT_INO` (`0xEFFFFFFB`); every other cgroup namespace has a
+/// dynamically allocated one. Only the initial namespace shows paths from the
+/// real cgroup root, which is the root a journaled path is relative to.
+const INITIAL_CGROUP_NAMESPACE: &str = "cgroup:[4026531835]";
+
+/// Fails with [`Error::Unavailable`] unless the calling process is in the
+/// initial cgroup namespace; a kernel without cgroup namespaces has no link and
+/// fails the same way.
+fn require_initial_cgroup_namespace() -> Result<(), Error> {
+    // Fails closed: a reader outside the initial namespace gets no control group,
+    // so no proof is drawn from paths relative to another root. An unprivileged
+    // test cannot enter another cgroup namespace on every host, so no hermetic
+    // scenario covers this return.
+    match fs::read_link(CGROUP_NAMESPACE_LINK) {
+        Ok(target) if target.as_os_str() == INITIAL_CGROUP_NAMESPACE => Ok(()),
+        Ok(_) => Err(Error::Unavailable {
+            operation: CONTROL_GROUP_OPERATION,
+        }),
+        Err(source) => Err(facility_error(CONTROL_GROUP_OPERATION, source)),
+    }
+}
+
+/// Reads the unified (`0::`) control group of a same-user process.
+///
+/// Returns `None` when the process is gone or not owned by `euid`. A host with
+/// no unified line (cgroup v1 only) reports [`Error::Unavailable`], and a path
+/// that is not a valid [`ControlGroupPath`] reports
+/// [`Error::InvalidControlGroup`].
+fn read_unified_control_group_at(
+    root: &Path,
+    process_id: Pid,
+    euid: u32,
+) -> Result<Option<ControlGroupPath>, Error> {
+    let same_user = checked_same_user_at(root, process_id, euid)
+        .map_err(|source| process_error(CONTROL_GROUP_OPERATION, source))?;
+    if same_user != Some(true) {
+        return Ok(None);
+    }
+    let cgroups = fs::read_to_string(proc_path_at(root, process_id).join("cgroup"))
+        .map_err(|source| process_error(CONTROL_GROUP_OPERATION, source))?;
+    // Fails closed: no unified line (cgroup v1) is `Unavailable` and a path that
+    // is not a valid `ControlGroupPath` is `InvalidControlGroup`; the sweep reads
+    // both as "no proof". A real candidate cannot be made to report either on a
+    // unified-hierarchy host without privileges, so no hermetic scenario covers them.
+    let path = cgroups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or(Error::Unavailable {
+            operation: CONTROL_GROUP_OPERATION,
+        })?;
+    ControlGroupPath::parse(path).map(Some)
 }
 
 fn cgroup_path_matches(actual: &str, expected: &str) -> bool {

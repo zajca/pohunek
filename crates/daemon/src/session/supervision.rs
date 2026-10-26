@@ -15,9 +15,9 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use pohunek_platform::process::{
-    survey_runtime_shared, sweep_runtime_shared, HostInspector, ProcessCoalitions, ProcessIdentity,
-    ProcessInspector, SkipReason, Skipped, SpawnId, StartIdentity, SweepReport, SweepRequest,
-    SweepSurvey,
+    survey_runtime_shared, sweep_runtime_shared, ControlGroupPath, HostInspector,
+    ProcessCoalitions, ProcessIdentity, ProcessInspector, SkipReason, Skipped, SpawnId,
+    StartIdentity, SweepReport, SweepRequest, SweepSurvey,
 };
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
@@ -228,6 +228,9 @@ pub(super) struct JournalWorker<'a> {
     /// recorded; absent when the worker's host has none or the journal predates
     /// the field.
     pub(super) coalitions: Option<&'a str>,
+    /// Unified control-group path of the worker process, as recorded; absent
+    /// when the worker's host reported none or the journal predates the field.
+    pub(super) control_group: Option<&'a str>,
     /// Runtime (PTY) identifier after initialization; its processes carry it
     /// as their ownership marker.
     pub(super) worker_instance_id: Option<&'a str>,
@@ -254,6 +257,8 @@ impl JournalWorker<'_> {
     /// recorded them in the boot the host reports now: the numbers restart at
     /// every reboot, so one from another boot could coincide with the number of
     /// an unrelated process. A boot the host cannot name counts as another boot.
+    /// The control group follows the same rule: a path from another boot could
+    /// name the cgroup of an unrelated service.
     pub(super) fn bounds(&self) -> WorkerBounds {
         let start_identity = self.identity().ok().map(|identity| identity.start_identity);
         let same_boot = || {
@@ -289,13 +294,30 @@ impl JournalWorker<'_> {
                 }
             }
         });
-        // Creation and coalition numbers restart at every reboot, so only the
-        // ones recorded in the current boot are kept.
-        let same_boot = (spawn_id.is_some() || coalitions.is_some()) && same_boot();
+        let control_group = self.control_group.and_then(|recorded| {
+            match recorded.parse::<ControlGroupPath>() {
+                Ok(control_group) => Some(control_group),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = self.session_id,
+                        worker_id = self.worker_id,
+                        error = %error,
+                        "worker journal control group is malformed; the runtime sweep ignores it"
+                    );
+                    None
+                }
+            }
+        });
+        // Creation numbers, coalition numbers and control-group paths are valid
+        // only within one boot, so only the ones recorded in the current boot
+        // are kept.
+        let same_boot =
+            (spawn_id.is_some() || coalitions.is_some() || control_group.is_some()) && same_boot();
         WorkerBounds {
             start_identity,
             spawn_id: spawn_id.filter(|_| same_boot),
             coalitions: coalitions.filter(|_| same_boot),
+            control_group: control_group.filter(|_| same_boot),
         }
     }
 }
@@ -303,10 +325,11 @@ impl JournalWorker<'_> {
 /// What a lost worker's journal proves about the processes of its runtime.
 ///
 /// Each field is absent when the journal lacks it, cannot be interpreted, or
-/// (for the spawn id and the coalitions) was recorded in another boot. An
+/// (for the spawn id, the coalitions and the control group) was recorded in
+/// another boot. An
 /// absent field proves nothing, and the sweep then treats every process whose
 /// ownership markers it cannot read as possibly the runtime's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct WorkerBounds {
     /// Start identity of the worker process instance. A same-user process
     /// whose markers cannot be read is provably foreign when it started
@@ -320,6 +343,11 @@ pub(super) struct WorkerBounds {
     /// prove that an unreadable-marker process whose lineage is open is not a
     /// descendant, on hosts that report coalitions.
     pub(super) coalitions: Option<ProcessCoalitions>,
+    /// Unified control group of the worker in the current boot. It lets the
+    /// sweep prove that an unreadable-marker process outside the user manager
+    /// holding the worker is not a descendant, on hosts that report control
+    /// groups.
+    pub(super) control_group: Option<ControlGroupPath>,
 }
 
 impl WorkerBounds {
@@ -328,13 +356,14 @@ impl WorkerBounds {
         start_identity: None,
         spawn_id: None,
         coalitions: None,
+        control_group: None,
     };
 
     /// Keeps each bound only when `other` carries the same one.
     ///
     /// Several workers journaling one runtime cannot tell which one started
     /// it, so a fact bounds the runtime only when every worker agrees on it.
-    pub(super) fn agreeing(self, other: Self) -> Self {
+    pub(super) fn agreeing(self, other: &Self) -> Self {
         Self {
             start_identity: self
                 .start_identity
@@ -343,6 +372,9 @@ impl WorkerBounds {
             coalitions: self
                 .coalitions
                 .filter(|coalitions| other.coalitions == Some(*coalitions)),
+            control_group: self
+                .control_group
+                .filter(|control_group| other.control_group.as_ref() == Some(control_group)),
         }
     }
 }
@@ -558,7 +590,8 @@ fn sweep_request(
             .with_runtime_session(session_id)
             .with_worker_start_identity(bounds.start_identity)
             .with_worker_spawn_id(bounds.spawn_id)
-            .with_worker_coalitions(bounds.coalitions),
+            .with_worker_coalitions(bounds.coalitions)
+            .with_worker_control_group(bounds.control_group),
         Err(error) => {
             tracing::warn!(session_id, worker_instance_id, error = %error, "lost runtime cannot be swept");
             return None;

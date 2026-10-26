@@ -1496,7 +1496,8 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         if IS_LINUX:
             self.assertEqual(
                 [check["command"] for check in focused],
-                [build, "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1",
+                [build, "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1 "
+                 "--skip privileged_",
                  "POHUNEK_SYSTEMD_E2E=1 cargo test -p pohunek-cli --test all -- "
                  "--test-threads 1 service_config_migration::"],
             )

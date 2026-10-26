@@ -11,8 +11,8 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(not(target_os = "linux"))]
 use nix::unistd::Pid as NativePid;
 use pohunek_platform::process::{
-    Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessCoalitions, ProcessFact,
-    ProcessIdentity, ProcessInspector, ProcessLineage,
+    ControlGroupPath, Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessCoalitions,
+    ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage,
 };
 
 /// The real host in which a scenario sees only the processes working in its own
@@ -119,6 +119,10 @@ impl ProcessInspector for ScopedHost {
 
     fn coalitions(&self, pid: Pid) -> Result<Option<ProcessCoalitions>, Error> {
         self.host.coalitions(pid)
+    }
+
+    fn control_group(&self, pid: Pid) -> Result<Option<ControlGroupPath>, Error> {
+        self.host.control_group(pid)
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {

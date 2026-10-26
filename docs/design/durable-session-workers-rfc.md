@@ -1177,8 +1177,9 @@ The daemon reconciles before advertising readiness:
    `worker_pid`, `worker_start_identity`, the optional `worker_spawn_id`, the
    worker's kernel creation number as a decimal string, and the optional
    `worker_coalitions`, its kernel resource and jetsam coalitions as
-   `<resource>:<jetsam>` decimals, both absent from journals of workers started
-   by the previous release) and runtime sockets, and join the
+   `<resource>:<jetsam>` decimals, and the optional `worker_control_group`, the
+   worker's unified cgroup path on Linux, all absent from journals of workers
+   started by the previous release) and runtime sockets, and join the
    three sources on each record's current generation (`runtime.generation`,
    `runtime.service_id`). A socket counts only when the connected worker's
    journal names that generation; terminal journals of other generations are
@@ -1215,7 +1216,7 @@ Reconciliation applies these rows in order
 | 12a | unfinished create; a successful scan found no journal of its generation; job present and running with a matching definition | the create that registered it died with its daemon: `conflict`, `runtime_supervision_ambiguous` while a background task holding the session's lifecycle lock watches the job from first sight until first sight plus `worker_initialize` (startup does not wait); the generation is never adopted, even if its worker binds in that window. Then the exact generation is retired and the create deleted (`session_removed`); a job that ends earlier is retired at once; an inspection or retirement failure is `reconnecting`, `runtime_supervision_unavailable` and retried |
 | 12 | no reachable worker; job present and running, or loaded without a process and without a journal of the generation, or ended while the journaled worker PID still runs with its start identity, or that PID cannot be inspected | `conflict`, `runtime_supervision_ambiguous`; nothing killed or retired. Re-checked in the background with the row 16 backoff until the evidence resolves: a worker that answers again is adopted, a job that ends while the journaled PID is gone becomes row 14 |
 | 13 | no reachable worker; job with a mismatched definition or process, or a malformed journaled start identity | `conflict`, `runtime_identity_mismatch` |
-| 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; a removal intent runs the removal finalizer (§16.3) instead, whose own sweep must be confirmed before the record is deleted. `lost` counts as ended, so it is published only after the job is retired: a failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which reaches this row again. The same holds when a running session's worker connection drops; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that started at or after the journaled worker, or still finds processes after 3 passes. Never a retried kill loop |
+| 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; a removal intent runs the removal finalizer (§16.3) instead, whose own sweep must be confirmed before the record is deleted. `lost` counts as ended, so it is published only after the job is retired: a failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which reaches this row again. The same holds when a running session's worker connection drops; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that no containment bound excludes (it started at or after the journaled worker, and neither the Darwin lineage and coalitions nor the Linux cgroup rule below proves it foreign), or still finds processes after 3 passes. Never a retried kill loop |
 | 15 | no reachable worker; job absent or ended; a successful scan found no journal for this generation | retire the job, then `lost`, `worker_unavailable`. No marker sweep: without a journal nothing proves which runtime ran. An unfinished create is deleted only after the retire succeeds, a removal intent runs the removal finalizer (§16.3), and any other failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried; all three keep the record until the retry succeeds |
 | 16 | job inspection fails (unavailable, timeout, or still racing after the retries) | `reconnecting`, `runtime_supervision_unavailable`; nothing touched; background re-reconciliation after 1 s, doubling to at most 60 s, until the session is resolved or changed or the daemon shuts down (a supervisor outage during create schedules the same retry). The same retry re-checks `runtime_supervision_ambiguous` sessions and never kills while the evidence stays ambiguous; a removal waiting for a confirmed marker sweep (§16.3) re-runs that sweep, which signals only processes carrying exactly a removed runtime's marker |
 | 17 | job of a generation that is not a record's current one, or of a session without a record | re-inspected: proven ended is retired by exact service ID (removing its definition). An absent or ended job is no proof by itself, because its worker can outlive it: the one journal of its generation must name a worker PID that is not running with its recorded start identity, or a successful scan must find no journal of the generation. A job loaded without a process counts as ended by the same journal proof; with no journal it stays `orphaned` until `worker_initialize` has passed since first sight, and is then retired if a fresh check still finds no process and no journal, because a worker journals before it opens its PTY. A journaled worker that still runs keeps the job `orphaned`; journals of the session that cannot be read keep it `orphaned` as well and are re-read once `worker_initialize` has passed, never retiring on that evidence. Still live is left alone. A job left alone is inventory `orphaned` with `runtime_slot` = its service ID and reason `stale_worker_generation`. A job whose inspection fails is also `orphaned`, never retired on that evidence, and re-inspected once `worker_initialize` has passed, repeating while the inspection keeps failing. When discovery fails this cleanup is skipped and logged; each record's own generation is still inspected |
@@ -1235,6 +1236,34 @@ signals; uncertain evidence kills nothing. The sweep never touches another
 runtime ID. On macOS it is the primary cleanup of descendants that left the
 worker's process group; on Linux it is a backstop behind
 `KillMode=control-group`.
+
+An unreadable-marker process the start-time bound cannot exclude is decided by
+containment evidence, which only ever excludes and never selects or signals.
+On Darwin the worker's fork lineage proves descent, and the worker's journaled
+coalitions exclude a process whose ancestry is unproven when both of its
+coalitions differ from the worker's. On Linux the worker journals the unified
+cgroup path it runs in (`worker_control_group`, read from `/proc/self/cgroup`
+before the PTY child starts, valid only in the boot it was recorded in). A
+candidate whose own `0::` path lies outside the `user@<uid>.service` subtree of
+that path is foreign: cgroup v2 lets a process migrate only when the writer can
+write the `cgroup.procs` of the common ancestor of source and destination, and
+everything above `user@<uid>.service` is root-owned, so an unprivileged
+descendant of the worker cannot leave the user manager's subtree. Docker scopes
+and logind session scopes are outside it. A candidate inside the subtree
+(`app-*.scope`, `systemd-run --user --scope`, other user units) stays unproven
+and keeps the cleanup unconfirmed, as does a candidate inside the worker unit
+itself, which systemd's `KillMode=control-group` ends. A journal without the
+field, a path that is not absolute or has an empty, `.` or `..` segment, a worker
+path without a `user@<uid>.service` segment, a journal from another boot, a
+host without a unified hierarchy, an unreadable record and an identity change
+between the reads each give no proof, and so does a reader outside the initial
+cgroup namespace, whose paths are relative to another root than the journaled
+one (the worker then journals no path either). Residual: a same-user process
+holding `CAP_DAC_OVERRIDE` or `CAP_SYS_ADMIN` through a file capability can
+migrate anywhere, and a root-owned service that starts same-user jobs with a
+recorded copy of the submitter's environment (for example `at(1)`) runs them
+outside the subtree, so they count as foreign. The marker scheme already does
+not defend against a descendant that drops its markers on purpose.
 
 The same rows classify a worker that becomes unreachable while the daemon
 runs. When the control connection drops, the session turns `reconnecting` and

@@ -19,9 +19,9 @@ use pohunek_platform::filesystem::{
     AdvisoryLock, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 use pohunek_platform::process::{
-    survey_runtime, sweep_runtime, Error as PlatformProcessError, HostInspector, ProcessCoalitions,
-    ProcessIdentity as OsProcessIdentity, ProcessInspector, SkipReason, Skipped, SpawnId,
-    StartIdentity, SweepReport, SweepRequest, MAX_SWEEP_GRACE,
+    survey_runtime, sweep_runtime, ControlGroupPath, Error as PlatformProcessError, HostInspector,
+    ProcessCoalitions, ProcessIdentity as OsProcessIdentity, ProcessInspector, SkipReason, Skipped,
+    SpawnId, StartIdentity, SweepReport, SweepRequest, MAX_SWEEP_GRACE,
 };
 use pohunek_terminal::strip_probe_replies;
 use pohunek_worker_protocol as protocol;
@@ -442,6 +442,7 @@ impl Server {
         );
         record.worker_spawn_id = own_spawn_id();
         record.worker_coalitions = own_coalitions();
+        record.worker_control_group = own_control_group();
         journal.write(&record)?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (initialized_tx, _) = watch::channel(false);
@@ -2350,12 +2351,13 @@ async fn confirm_forced_close_cleanup(
     shared: &Shared,
     worker_instance_id: &WorkerInstanceId,
 ) -> Result<(), WorkerError> {
-    let (grace, worker_spawn, worker_coalitions) = {
+    let (grace, worker_spawn, worker_coalitions, worker_control_group) = {
         let state = shared.state.lock().await;
         (
             state.stop_grace,
             state.journal.worker_spawn_id.clone(),
             state.journal.worker_coalitions.clone(),
+            state.journal.worker_control_group.clone(),
         )
     };
     let scope = CleanupScope {
@@ -2367,6 +2369,8 @@ async fn confirm_forced_close_cleanup(
         worker_spawn: worker_spawn.and_then(|value| value.parse::<SpawnId>().ok()),
         worker_coalitions: worker_coalitions
             .and_then(|value| value.parse::<ProcessCoalitions>().ok()),
+        worker_control_group: worker_control_group
+            .and_then(|value| value.parse::<ControlGroupPath>().ok()),
     };
     confirm_runtime_cleanup(&HostInspector::new(), &scope, grace).await
 }
@@ -2386,6 +2390,8 @@ struct CleanupScope<'a> {
     worker_spawn: Option<SpawnId>,
     /// This worker's kernel coalitions, on a host that reports them.
     worker_coalitions: Option<ProcessCoalitions>,
+    /// This worker's unified control group, on a host that reports one.
+    worker_control_group: Option<ControlGroupPath>,
 }
 
 /// Sweeps every process marked with the runtime and confirms none is left.
@@ -2431,7 +2437,8 @@ async fn confirm_runtime_cleanup(
     .with_runtime_session(scope.session_id)
     .with_worker_start_identity(Some(scope.worker_start))
     .with_worker_spawn_id(scope.worker_spawn)
-    .with_worker_coalitions(scope.worker_coalitions);
+    .with_worker_coalitions(scope.worker_coalitions)
+    .with_worker_control_group(scope.worker_control_group.clone());
     // Passes that signalled or decided; the pauses of an unreadable-marker
     // settle window are not counted.
     let mut passes = 0;
@@ -7662,6 +7669,38 @@ fn own_coalitions() -> Option<String> {
                 error.type = "process_inspection",
                 error.message = %error,
                 "worker coalitions could not be read; journaling none: {{error.message}}",
+            );
+            None
+        }
+    }
+}
+
+/// Reads the worker's own unified control group for the journal.
+///
+/// It lets a later runtime sweep leave out the processes that live outside the
+/// user manager holding the worker. Like the spawn id it only speeds up cleanup,
+/// so a host without a unified control group yields `None` silently and any
+/// other read failure yields `None` with a warning; neither stops the worker
+/// from starting.
+fn own_control_group() -> Option<String> {
+    match HostInspector::new().control_group(std::process::id()) {
+        Ok(Some(control_group)) => Some(control_group.to_string()),
+        Ok(None) => {
+            event!(
+                name: "worker.control_group.unreadable",
+                Level::WARN,
+                "worker process vanished while reading its control group; journaling none",
+            );
+            None
+        }
+        Err(PlatformProcessError::Unavailable { .. }) => None,
+        Err(error) => {
+            event!(
+                name: "worker.control_group.unreadable",
+                Level::WARN,
+                error.type = "process_inspection",
+                error.message = %error,
+                "worker control group could not be read; journaling none: {{error.message}}",
             );
             None
         }

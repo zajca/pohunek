@@ -262,6 +262,110 @@ impl FromStr for ProcessCoalitions {
     }
 }
 
+/// Longest control-group path a journal or a process record may carry.
+///
+/// The kernel limits a path it reports through procfs to `PATH_MAX`, so a longer
+/// value cannot be a real cgroup path and is rejected instead of stored.
+pub const MAX_CONTROL_GROUP_BYTES: usize = 4096;
+
+/// Absolute path of a process's cgroup in the unified (v2) hierarchy.
+///
+/// The path is the `0::` line of `/proc/<pid>/cgroup`, read from the initial
+/// cgroup namespace so that it names the cgroup from the real root. It is valid
+/// only within the boot it was read in, so a persisted path is used only
+/// together with the [`BootIdentity`] it was recorded under.
+///
+/// Systemd runs each user's units below `user@<uid>.service`, a subtree it
+/// delegates to that user. Above it every cgroup is root-owned, so an
+/// unprivileged process can move a process only within the subtree, never out
+/// of it. A process outside the subtree of a worker therefore cannot have been
+/// moved there by one of the worker's descendants, while a process inside it
+/// proves nothing; see [`Self::outside_user_manager_of`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ControlGroupPath(String);
+
+impl ControlGroupPath {
+    /// Parses an absolute control-group path of at most
+    /// [`MAX_CONTROL_GROUP_BYTES`] bytes.
+    ///
+    /// The root path `/` is valid. Every other path has nonempty segments, none
+    /// of them `.` or `..`, and holds no control character.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidControlGroup`] for any other value.
+    pub fn parse(value: impl Into<String>) -> Result<Self, Error> {
+        let value = value.into();
+        let valid = value.len() <= MAX_CONTROL_GROUP_BYTES
+            && value.starts_with('/')
+            && !value.chars().any(char::is_control)
+            && (value == "/"
+                || value
+                    .split('/')
+                    .skip(1)
+                    .all(|segment| !matches!(segment, "" | "." | "..")));
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(Error::InvalidControlGroup)
+        }
+    }
+
+    /// Returns the path as recorded.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this path is provably outside the user manager that holds `worker`.
+    ///
+    /// The user manager of `worker` is the first `user@<owner_uid>.service`
+    /// segment of `worker` and everything below it. `owner_uid` is the user who
+    /// owns the swept processes, so the segment names the manager that can move
+    /// them. This is the only comparison a caller may act on: it attests that
+    /// the process at `self` did not descend from the worker. A path inside the
+    /// subtree and a `worker` without that segment attest nothing.
+    #[must_use]
+    pub fn outside_user_manager_of(&self, worker: &Self, owner_uid: u32) -> bool {
+        let Some(manager) = worker.user_manager(owner_uid) else {
+            return false;
+        };
+        let inside = self.0 == manager
+            || self
+                .0
+                .strip_prefix(manager)
+                .is_some_and(|rest| rest.starts_with('/'));
+        !inside
+    }
+
+    /// Returns the path of the `user@<owner_uid>.service` subtree this path is in.
+    fn user_manager(&self, owner_uid: u32) -> Option<&str> {
+        let unit = format!("user@{owner_uid}.service");
+        let mut end = 0;
+        for segment in self.0.split('/').skip(1) {
+            end += 1 + segment.len();
+            if segment == unit {
+                return Some(&self.0[..end]);
+            }
+        }
+        None
+    }
+}
+
+impl std::fmt::Display for ControlGroupPath {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ControlGroupPath {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 /// Opaque operating-system boot identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BootIdentity(String);
@@ -442,6 +546,9 @@ pub enum Error {
         #[source]
         source: Option<std::num::ParseIntError>,
     },
+    /// A control-group path was not absolute, oversized, or malformed.
+    #[error("control-group path is not an absolute path of plain segments")]
+    InvalidControlGroup,
     /// A decimal start identity was invalid.
     #[error("process start identity is not an unsigned decimal integer")]
     InvalidStartIdentity {
@@ -580,6 +687,33 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     fn coalitions(&self, _pid: Pid) -> Result<Option<ProcessCoalitions>, Error> {
         Err(Error::Unavailable {
             operation: "inspect_process_coalitions",
+        })
+    }
+
+    /// Returns the unified-hierarchy control group of one same-user process, or
+    /// `None` if it exited.
+    ///
+    /// The path is readable for every same-user process, including one whose
+    /// environment the kernel withholds. A host reports it only to a reader in
+    /// the initial cgroup namespace, because a path relative to another root
+    /// cannot be compared with a path another process recorded. The result
+    /// describes the process that
+    /// holds `pid` when the call returns; callers that bind it to a
+    /// [`ProcessIdentity`] recheck the identity afterwards.
+    ///
+    /// The default reports [`Error::Unavailable`], so a host without control
+    /// groups needs no implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unavailable`] when the host reports no unified control
+    /// group or the reader is outside the initial cgroup namespace,
+    /// [`Error::InvalidControlGroup`] when the reported path is not a
+    /// valid [`ControlGroupPath`], or another typed failure when the process
+    /// record cannot be inspected.
+    fn control_group(&self, _pid: Pid) -> Result<Option<ControlGroupPath>, Error> {
+        Err(Error::Unavailable {
+            operation: "inspect_process_control_group",
         })
     }
 

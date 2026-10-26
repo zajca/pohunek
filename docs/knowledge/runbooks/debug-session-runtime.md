@@ -522,7 +522,11 @@ and the daemon log has the panic.
   unreadable candidates, so `session rm` may still need
   `--accept-unconfirmed-cleanup` after you judge the listed processes. A runtime
   whose worker journaled no creation number (a worker started by the previous
-  release) has no lineage or coalition proof, so every hidden process is a candidate. When
+  release) has no lineage or coalition proof, so every hidden process is a candidate.
+  On Linux a hidden process outside the `user@<uid>.service` cgroup subtree of the
+  worker's journaled `worker_control_group` (a Docker scope, a logind session scope)
+  is ignored; one inside it (another user unit, `systemd-run --user --scope`) is still
+  listed, and so is every hidden process when the journal lacks the field. When
   unreadable same-user
   processes are the only obstacle, the error message names each as
   `pid N (start S, command `name`)` (at most eight, then `and N more`) and

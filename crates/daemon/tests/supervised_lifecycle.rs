@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 use pohunek_client::ClientError;
 use pohunek_platform::process::ProcessIdentity;
+#[cfg(target_os = "linux")]
+use pohunek_platform::process::{Error as ProcessError, HostInspector, ProcessInspector as _};
 use pohunek_platform::supervisor::{
     JobDefinition, JobLogs, JobSpec, Namespace, RestartPolicy, Supervisor, WorkerKey,
 };
@@ -965,7 +967,6 @@ impl Bystanders {
 
 /// Reason of a proven worker crash whose marker sweep left a process it could not
 /// attribute.
-#[cfg(target_os = "macos")]
 const RUNTIME_LOST_CLEANUP_UNCONFIRMED: &str = "runtime_lost_cleanup_unconfirmed";
 
 /// Agent command whose only descendant is a platform binary that outlives its
@@ -1821,4 +1822,497 @@ async fn a_hook_descendant_writing_stderr_survives_an_unsupervised_daemon_restar
     assert_writer_survives(&fixture, writer, &write_log).await;
     signal(writer.pid, Signal::SIGKILL);
     fixture.wait_gone(drain, "drain after its writer").await;
+}
+
+/// Error code of a removal refused because unreadable-marker processes may
+/// belong to the runtime.
+#[cfg(target_os = "linux")]
+const SUPERVISION_AMBIGUOUS: &str = "runtime_supervision_ambiguous";
+
+/// Opt-in of the scenarios that start a bystander in a scope of the system
+/// manager through `sudo`; set by the CI lane, never by a local run.
+#[cfg(target_os = "linux")]
+const PRIVILEGED_VARIABLE: &str = "POHUNEK_PRIVILEGED_E2E";
+
+/// Name of the copy of `sleep` that only its owner may execute.
+#[cfg(target_os = "linux")]
+const UNREADABLE_SLEEP: &str = "unreadable-sleep";
+
+/// Where a bystander runs relative to the user manager holding the workers.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+enum Placement {
+    /// A scope of the system manager (`sudo systemd-run --scope`), outside
+    /// every user manager. The CI lane has passwordless `sudo`.
+    SystemScope,
+    /// A scope of the user manager (`systemd-run --user --scope`), inside the
+    /// subtree of `user@<uid>.service`.
+    UserScope,
+}
+
+/// A same-user process that started after a crashed worker and whose
+/// environment the kernel withholds, so neither its markers nor its start time
+/// attribute it.
+///
+/// It is the copy of `sleep` that only its owner may execute: the kernel marks
+/// the image of an unreadable executable non-dumpable, which hides its
+/// environment from procfs, as for the field cases of #186 (`op`, `frankenphp`).
+#[cfg(target_os = "linux")]
+struct Bystander {
+    process: ProcessIdentity,
+    launcher: std::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl Bystander {
+    /// Starts a bystander at `placement` and checks that it is the process the
+    /// scenario claims: unreadable markers, in the cgroup class `placement` names.
+    async fn start(fixture: &Installation, placement: Placement) -> Self {
+        let binary = fixture.probe.join(UNREADABLE_SLEEP);
+        if !binary.exists() {
+            std::fs::copy("/bin/sleep", &binary).expect("copy sleep");
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111))
+                .expect("make the copy execute-only");
+        }
+        // `systemd-run` collapses `$$` in its arguments, so the shell cannot
+        // record its own PID; the process is found by the image it executes.
+        let script = "exec \"$1\" infinity";
+        let mut command = match placement {
+            Placement::SystemScope => {
+                assert_eq!(
+                    std::env::var(PRIVILEGED_VARIABLE).as_deref(),
+                    Ok("1"),
+                    "set {PRIVILEGED_VARIABLE}=1 explicitly: the scenario needs passwordless sudo and runs in CI only"
+                );
+                let mut command = std::process::Command::new("sudo");
+                command.args(["-n", "systemd-run", "--scope", "--quiet"]);
+                command.arg(format!("--uid={}", supervised::uid()));
+                command
+            }
+            Placement::UserScope => {
+                let mut command = std::process::Command::new("systemd-run");
+                command.args(["--user", "--scope", "--quiet"]);
+                command
+            }
+        };
+        let launcher = command
+            .args(["--", "sh", "-c", script, "sh"])
+            .arg(&binary)
+            .current_dir(&fixture.probe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the bystander scope");
+        let pid = eventually("the bystander's image", || async {
+            process_running_image(&binary)
+        })
+        .await;
+        let bystander = Self {
+            process: fixture.identity(pid).expect("the bystander runs"),
+            launcher,
+        };
+        // The execute-only image is what hides the environment from procfs.
+        eventually("the bystander's image is non-dumpable", || async {
+            matches!(
+                HostInspector::new().ownership_markers(pid),
+                Err(ProcessError::PermissionDenied { .. } | ProcessError::Unobservable { .. })
+            )
+            .then_some(())
+        })
+        .await;
+        Self::assert_placement(placement, pid);
+        bystander
+    }
+
+    fn assert_placement(placement: Placement, pid: u32) {
+        let cgroups = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .expect("read the bystander's cgroup");
+        let unified = cgroups
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("the host uses the unified cgroup hierarchy");
+        let manager = format!("/user@{}.service", supervised::uid());
+        match placement {
+            Placement::SystemScope => assert!(
+                unified.starts_with("/system.slice/") && !unified.contains(&manager),
+                "the bystander is in a system scope: {unified}"
+            ),
+            Placement::UserScope => assert!(
+                unified.contains(&format!("{manager}/")),
+                "the bystander is in the user manager: {unified}"
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Bystander {
+    fn drop(&mut self) {
+        // The bystander is this test's own process; the identity check keeps a
+        // reused PID safe.
+        if HostInspector::new()
+            .identity(self.process.pid)
+            .ok()
+            .flatten()
+            == Some(self.process)
+        {
+            signal(self.process.pid, Signal::SIGKILL);
+        }
+        let _reaped = self.launcher.wait();
+    }
+}
+
+/// PID of the process whose `argv[0]` is exactly `image`, if one runs.
+///
+/// `/proc/<pid>/cmdline` is readable for every process, including one whose
+/// environment the kernel withholds.
+#[cfg(target_os = "linux")]
+fn process_running_image(image: &std::path::Path) -> Option<u32> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                cmdline.split(|byte| *byte == 0).next() == Some(image.as_os_str().as_bytes())
+            })
+        })
+}
+
+/// The session whose worker crashed beside a bystander, with what the scenario
+/// asserts on.
+#[cfg(target_os = "linux")]
+struct Crashed {
+    session: String,
+    bystander: Bystander,
+}
+
+/// Crashes a session's worker while the daemon is away, starts a bystander
+/// after it, lets `patch` rewrite the dead worker's journal, and starts the
+/// daemon, which then reconciles the lost runtime.
+#[cfg(target_os = "linux")]
+async fn crash_beside_bystander(
+    fixture: &Installation,
+    placement: Placement,
+    patch: impl FnOnce(&mut serde_json::Value),
+) -> Crashed {
+    fixture.start_daemon().await;
+    let session = fixture.new_session("contained").await.id.0;
+    let before = fixture.snapshot(&session).await;
+    fixture.stop_daemon().await;
+    let bystander = Bystander::start(fixture, placement).await;
+    signal(before.worker.pid, Signal::SIGKILL);
+    fixture.wait_gone(before.worker, "crashed worker").await;
+    fixture.patch_journal(&session, &before.worker_id, patch);
+    fixture.start_daemon().await;
+    Crashed { session, bystander }
+}
+
+#[cfg(target_os = "linux")]
+impl Crashed {
+    /// The runtime is lost with a complete sweep, and the removal needs no
+    /// consent; the bystander is never signalled.
+    async fn assert_removable(&self, fixture: &Installation) {
+        fixture
+            .wait_reason(&self.session, RuntimeState::Lost, RUNTIME_LOST)
+            .await;
+        let removed = fixture
+            .client()
+            .await
+            .call::<method::SessionRemove>(SessionId(self.session.clone()))
+            .await
+            .expect("the removal of a runtime whose sweep is complete");
+        assert!(removed.removed && removed.accepted_unconfirmed_processes.is_empty());
+        assert!(
+            fixture.is_running(self.bystander.process),
+            "the removal signalled the bystander"
+        );
+    }
+
+    /// The runtime is lost with an unconfirmed sweep, and the removal is refused
+    /// naming the bystander, which is never signalled.
+    async fn assert_unconfirmed(&self, fixture: &Installation) {
+        fixture
+            .wait_reason(
+                &self.session,
+                RuntimeState::Lost,
+                RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+            )
+            .await;
+        let refused = fixture
+            .client()
+            .await
+            .call::<method::SessionRemove>(SessionId(self.session.clone()))
+            .await
+            .expect_err("the removal beside an unattributed process is refused");
+        let ClientError::Protocol(error) = refused else {
+            panic!("the refusal is a daemon error: {refused:?}");
+        };
+        assert_eq!(error.code, SUPERVISION_AMBIGUOUS, "{error:?}");
+        assert!(
+            error
+                .msg
+                .contains(&format!("pid {}", self.bystander.process.pid)),
+            "the refusal names the bystander: {}",
+            error.msg
+        );
+        assert!(
+            fixture.is_running(self.bystander.process),
+            "the refused removal signalled the bystander"
+        );
+    }
+}
+
+/// Journal path of the worker control group the hostile-journal scenarios
+/// fabricate: a user manager that is not the one holding the worker, so a real
+/// bystander of the user manager is outside it.
+#[cfg(target_os = "linux")]
+fn fabricated_control_group() -> String {
+    format!(
+        "/system.slice/user@{}.service/fabricated.service",
+        supervised::uid()
+    )
+}
+
+/// A bystander in a root-owned system scope cannot have descended from the
+/// worker, so it no longer keeps the removal of a lost runtime unconfirmed.
+///
+/// CI only: the scope is started through `sudo`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, POHUNEK_PRIVILEGED_E2E=1 and passwordless sudo (CI only)"]
+async fn privileged_a_bystander_in_a_system_scope_does_not_block_a_lost_runtime_removal() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "privileged_a_bystander_in_a_system_scope_does_not_block_a_lost_runtime_removal",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(&fixture, Placement::SystemScope, |_| {}).await;
+    crashed.assert_removable(&fixture).await;
+}
+
+/// A journal without the control group, as a previous release writes it, proves
+/// nothing, so the same bystander keeps the removal unconfirmed.
+///
+/// CI only: the scope is started through `sudo`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, POHUNEK_PRIVILEGED_E2E=1 and passwordless sudo (CI only)"]
+async fn privileged_a_journal_without_the_control_group_keeps_the_removal_unconfirmed() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "privileged_a_journal_without_the_control_group_keeps_the_removal_unconfirmed",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(&fixture, Placement::SystemScope, |journal| {
+        journal
+            .as_object_mut()
+            .expect("the journal is an object")
+            .remove("worker_control_group")
+            .expect("the worker journaled its control group");
+    })
+    .await;
+    crashed.assert_unconfirmed(&fixture).await;
+}
+
+/// A bystander inside the user manager may have been started by the worker's
+/// descendants (`systemd-run --user --scope` keeps their environment), so it
+/// stays unproven.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_bystander_in_a_user_scope_keeps_the_removal_unconfirmed() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_bystander_in_a_user_scope_keeps_the_removal_unconfirmed",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(&fixture, Placement::UserScope, |_| {}).await;
+    crashed.assert_unconfirmed(&fixture).await;
+}
+
+/// The worker journals the control group it runs in: the unit of the user
+/// manager that holds it, below `user@<uid>.service`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn the_worker_journals_its_unit_control_group() {
+    let fixture = Installation::new(Settings::default()).await;
+    fixture.start_daemon().await;
+    let session = fixture.new_session("journaled").await.id.0;
+    let before = fixture.snapshot(&session).await;
+    let journal: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.journal_path(&session, &before.worker_id)).expect("read journal"),
+    )
+    .expect("the journal is JSON");
+    let journaled = journal["worker_control_group"]
+        .as_str()
+        .expect("the worker journaled its control group");
+    let cgroups = std::fs::read_to_string(format!("/proc/{}/cgroup", before.worker.pid))
+        .expect("read the worker's cgroup");
+    let unified = cgroups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("the host uses the unified cgroup hierarchy");
+    assert_eq!(journaled, unified);
+    assert!(
+        journaled.contains(&format!("/user@{}.service/", supervised::uid())),
+        "{journaled}"
+    );
+}
+
+/// A non-dumpable descendant inside the worker's own unit does not survive the
+/// retirement of the unit, and the cgroup never selects it: systemd's
+/// control-group kill ends it and the cleanup confirms.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_non_dumpable_descendant_in_the_worker_unit_does_not_survive_retirement() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_non_dumpable_descendant_in_the_worker_unit_does_not_survive_retirement",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let binary = fixture.probe.join(UNREADABLE_SLEEP);
+    std::fs::copy("/bin/sleep", &binary).expect("copy sleep");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111))
+        .expect("make the copy execute-only");
+    let script = format!(
+        "p='{}'; s=\"$POHUNEK_SESSION_ID\"; \
+         \"$p/{UNREADABLE_SLEEP}\" infinity & echo $! > \"$p/$s.unreadable\"; \
+         while IFS= read -r line; do :; done",
+        supervised::path_string(&fixture.probe)
+    );
+    let profile = format!(
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {}]\n",
+        toml::Value::String(script)
+    );
+    let profile_path = fixture
+        .paths
+        .config_dir
+        .join("agents")
+        .join(format!("{}.toml", supervised::AGENT));
+    std::fs::write(&profile_path, profile).expect("write the agent profile");
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o600))
+        .expect("keep the agent profile private");
+
+    fixture.start_daemon().await;
+    let session = fixture.new_session("unit-descendant").await.id.0;
+    let before = fixture.snapshot(&session).await;
+    let pid_file = fixture.probe.join(format!("{session}.unreadable"));
+    let pid = eventually("the unreadable descendant's PID file", || async {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    })
+    .await;
+    let descendant = fixture.identity(pid).expect("the descendant runs");
+
+    signal(before.worker.pid, Signal::SIGKILL);
+    fixture
+        .wait_reason(&session, RuntimeState::Lost, RUNTIME_LOST)
+        .await;
+    fixture
+        .wait_gone(descendant, "the unit's unreadable descendant")
+        .await;
+    let removed = fixture
+        .client()
+        .await
+        .call::<method::SessionRemove>(SessionId(session))
+        .await
+        .expect("the removal needs no consent");
+    assert!(removed.removed && removed.accepted_unconfirmed_processes.is_empty());
+}
+
+/// Positive control of the hostile-journal scenarios: the journal names a user
+/// manager other than the one the user-scope bystander lives in, so it is
+/// outside the worker's user manager and does not block the removal. The same
+/// decision as the privileged scenario, driven by the journal and the live
+/// `/proc/<pid>/cgroup` read of the bystander.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_bystander_outside_the_journaled_user_manager_does_not_block_the_removal() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_bystander_outside_the_journaled_user_manager_does_not_block_the_removal",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(&fixture, Placement::UserScope, |journal| {
+        journal["worker_control_group"] = fabricated_control_group().into();
+    })
+    .await;
+    crashed.assert_removable(&fixture).await;
+}
+
+/// A journaled control group that proves nothing leaves the removal
+/// unconfirmed, whatever the live cgroup of the bystander says.
+#[cfg(target_os = "linux")]
+async fn a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(
+    patch: impl FnOnce(&mut serde_json::Value),
+) {
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(&fixture, Placement::UserScope, patch).await;
+    crashed.assert_unconfirmed(&fixture).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_control_group_recorded_in_another_boot_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_control_group_recorded_in_another_boot_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] = fabricated_control_group().into();
+        journal["boot_identity"] = "another-boot".into();
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_relative_control_group_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_relative_control_group_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] = fabricated_control_group().trim_start_matches('/').into();
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_control_group_with_a_parent_segment_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_control_group_with_a_parent_segment_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] =
+            format!("{}/../other.service", fabricated_control_group()).into();
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_control_group_outside_any_user_manager_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_control_group_outside_any_user_manager_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] = "/system.slice/fabricated.service".into();
+    })
+    .await;
 }

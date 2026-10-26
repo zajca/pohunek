@@ -1005,7 +1005,7 @@ decimal, no schema bump, used only in the boot it was recorded in). A hidden
 process whose lineage is open and whose both coalitions differ from the
 worker's is ignored and not reported; equal or unreadable coalitions prove
 nothing and keep it a candidate, and a lineage descendant whose coalitions
-differ is skipped, never selected. Those processes are not reported at once: while only such
+differ is skipped, never selected. On Linux the worker journals the unified cgroup path it runs in as the optional `worker_control_group` (no schema bump, same boot rule). A hidden process whose own `0::` path lies outside the `user@<uid>.service` subtree of that path (a Docker scope, a logind session scope) is ignored and not reported, because an unprivileged process cannot migrate out of the user manager's subtree; a hidden process inside the subtree, such as a `systemd-run --user --scope` unit, stays a candidate. Those processes are not reported at once: while only such
 unreadable processes remain, the sweep re-reads the process table for up to the
 sweep grace (`sweep.grace_ms`), so one that is caught between images or about to
 exit does not leave the cleanup unconfirmed; a candidate that outlives the grace
@@ -1021,7 +1021,7 @@ journal-backed sweep passes it; the sweep of a runtime absent from its journal
 passes none. A journal without it (a worker started by the previous release)
 gives no lineage proof. Under the session-ID requirement a lineage-proven
 process is not signalled either, since its session marker cannot be read. Linux
-has no lineage proof and keeps its start-time ordering. A descendant that left the worker's process group
+has no lineage proof and keeps its start-time ordering and the cgroup exclusion. A descendant that left the worker's process group
 (macOS kills only the group) can outlive the stop and job retirement. A sweep
 that cannot confirm every marked process exited fails
 the removal with `runtime_supervision_ambiguous` and keeps the session listed
@@ -1038,8 +1038,9 @@ those unreadable processes are the only obstacle. After a lost runtime on macOS
 27 the runtime's own platform-binary processes are reaped without it, but it may
 still be needed for a re-executed orphan or a process whose creator exited after
 the worker started, which the refusal lists by pid and command name for you to
-judge, and for every hidden process when the worker journaled neither a creation
-number nor coalitions (`worker_coalitions`). The flag is per call: nothing
+judge, for every hidden process when the worker journaled neither a creation
+number nor coalitions (`worker_coalitions`), and on Linux for every hidden process inside the
+user manager's cgroup subtree or when the worker journaled no `worker_control_group`. The flag is per call: nothing
 stores it, a retried removal needs it again, and neither the reconciliation that
 finishes an interrupted removal nor the retention sweep ever has it. With it the
 removal proceeds past the unreadable candidates without signalling them,
