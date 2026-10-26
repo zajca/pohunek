@@ -492,7 +492,9 @@ pohunek session wait s-01J00000000000000000000000 s-01J00000000000000000000001 \
 
 `session wait <target>...` takes up to 32 targets; every target must be on one
 host, or the command fails as a usage error before any request (run one wait
-per host). Targets may be ids, `host/id`, or display names. `--until` takes a
+per host). Targets may be ids, `host/id`, or display names; an exact id is
+confirmed with an id-filtered `session.list`, and only a display name reads the
+full list. `--until` takes a
 comma list or a repeated flag and defaults to all four kinds. `--timeout` needs a
 unit (`ms`, `s`, `m`, or `h`, for example `90s` or `5m`); without it the daemon
 default applies (5 minutes unless `service.toml` `[waits]` sets another), and a
