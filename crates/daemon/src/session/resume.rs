@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
-use crate::agent::host::{ProfileRevision, RuntimeDefinition};
+use crate::agent::host::{LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
     InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, Pin, ProfilePin, ProfileRegistry,
     ReferenceCheckFailure, ReferenceExistence, StoreRoot,
@@ -22,8 +22,8 @@ use crate::agent::{
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
 use pohunek_worker_protocol::BaseEnv;
-use protocol::BindingProvenance;
 use protocol::ErrorClass;
+use protocol::{BindingProvenance, RuntimeRef};
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -263,12 +263,14 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         let mut lookup_inputs = Vec::with_capacity(sessions.len());
+        let mut resolutions = PinResolutions::default();
         for (info, candidate) in sessions.iter_mut().zip(candidates) {
             let Some(binding) = candidate else {
                 lookup_inputs.push(None);
                 continue;
             };
-            let definition = recovery_definition(&self.inner.profiles, &binding);
+            let definition =
+                recovery_definition_memo(&self.inner.profiles, &binding, &mut resolutions);
             clear_refused_capabilities(info, &binding, definition.as_ref());
             let definition = definition.ok();
             lookup_inputs.push(
@@ -1692,13 +1694,81 @@ pub(super) fn recovery_definition(
     profiles: &ProfileRegistry,
     binding: &ResumeBinding,
 ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+    recovery_definition_memo(profiles, binding, &mut PinResolutions::default())
+}
+
+/// The pin resolutions of one batch of bindings.
+///
+/// Resolving a pin reads the registry record and verifies the package root, so
+/// a listing resolves each distinct runtime source and frozen launch once
+/// instead of once per session.
+#[derive(Default)]
+pub(super) struct PinResolutions {
+    adopters: Vec<(RuntimeRef, LaunchPin, Option<Arc<RuntimeDefinition>>)>,
+    pinned: Vec<(
+        RuntimeRef,
+        LaunchPin,
+        Result<Arc<RuntimeDefinition>, ProtocolError>,
+    )>,
+}
+
+impl PinResolutions {
+    fn adopter(
+        &mut self,
+        runtimes: &RuntimeHost,
+        binding: &ResumeBinding,
+    ) -> Option<Arc<RuntimeDefinition>> {
+        let known = self
+            .adopters
+            .iter()
+            .find(|(base, pin, _)| *base == binding.agent_base && *pin == binding.launch_binding);
+        if let Some((_, _, adopter)) = known {
+            return adopter.clone();
+        }
+        let adopter = runtimes.newer_adopter(&binding.agent_base, &binding.launch_binding);
+        self.adopters.push((
+            binding.agent_base.clone(),
+            binding.launch_binding.clone(),
+            adopter.clone(),
+        ));
+        adopter
+    }
+
+    fn pinned(
+        &mut self,
+        runtimes: &RuntimeHost,
+        binding: &ResumeBinding,
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        let known = self
+            .pinned
+            .iter()
+            .find(|(base, pin, _)| *base == binding.agent_base && *pin == binding.launch_binding);
+        if let Some((_, _, definition)) = known {
+            return definition.clone();
+        }
+        let definition = runtimes.resolve_pinned(&binding.agent_base, &binding.launch_binding);
+        self.pinned.push((
+            binding.agent_base.clone(),
+            binding.launch_binding.clone(),
+            definition.clone(),
+        ));
+        definition
+    }
+}
+
+/// [`recovery_definition`] resolving the pin through `resolutions`.
+pub(super) fn recovery_definition_memo(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    resolutions: &mut PinResolutions,
+) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
     let runtimes = profiles.runtimes();
-    if let Some(adopter) = runtimes.newer_adopter(&binding.agent_base, &binding.launch_binding) {
+    if let Some(adopter) = resolutions.adopter(runtimes, binding) {
         if newer_adoption_holds(profiles, binding, &adopter) {
             return Ok(adopter);
         }
     }
-    let definition = runtimes.resolve_pinned(&binding.agent_base, &binding.launch_binding)?;
+    let definition = resolutions.pinned(runtimes, binding)?;
     recovery_contract(binding, &definition, false)?;
     Ok(definition)
 }

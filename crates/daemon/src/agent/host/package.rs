@@ -12,13 +12,21 @@
 //! loads exactly the digest a session was launched with, whatever is selected
 //! or enabled now, because a pin must keep resolving to the content it froze.
 //! Neither ever substitutes another package or a built-in.
+//!
+//! The definition of a digest is compiled once and shared as an `Arc`, so every
+//! session of one package observes through the same compiled detection
+//! manifest. The cache is filled only from a root that just passed
+//! verification, and every load verifies the root again before it returns the
+//! cached definition, so sharing never skips the verification.
 
 // Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use package::registry::{IncompatibleReason, RegistryError, RetainedDigests, RetainedState};
 use package::verify::{VerifiedRoot, VerifyError};
@@ -133,10 +141,61 @@ pub struct PackageLoad {
     pub rejected: Vec<RejectedPackage>,
 }
 
+/// Definitions built from verified roots, one per installed digest.
+///
+/// A digest names the package content, so an entry never goes stale; it only
+/// stops being wanted. The map holds at most one entry per installed
+/// package, so it needs no size limit: [`PackageStore::prune_definitions`]
+/// drops the entries of packages the registry no longer records. A rejection
+/// is never stored.
+#[derive(Debug, Default)]
+struct DefinitionCache {
+    entries: Mutex<BTreeMap<PackageDigest, Arc<RuntimeDefinition>>>,
+}
+
+impl DefinitionCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<PackageDigest, Arc<RuntimeDefinition>>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cached definition of `digest`, built by `build` on a miss.
+    ///
+    /// `build` runs under the lock, so concurrent misses on one digest compile
+    /// once and every caller receives the same `Arc`. The lock is never held
+    /// across an await point.
+    fn get_or_build(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+        build: impl FnOnce() -> Result<RuntimeDefinition, PackageRejection>,
+    ) -> Result<Arc<RuntimeDefinition>, PackageRejection> {
+        let mut entries = self.lock();
+        if let Some(definition) = entries.get(digest).filter(|d| built_for(d, identity)) {
+            return Ok(Arc::clone(definition));
+        }
+        let definition = Arc::new(build()?);
+        entries.insert(digest.clone(), Arc::clone(&definition));
+        Ok(definition)
+    }
+}
+
+/// Whether `definition` was built from a package recorded under `identity`.
+fn built_for(definition: &RuntimeDefinition, identity: &PackageIdentity) -> bool {
+    matches!(
+        &definition.binding().provenance,
+        BindingProvenance::Package { package, .. } if package == identity
+    )
+}
+
 /// The daemon's handle over the runtime package registry.
 #[derive(Debug, Clone)]
 pub struct PackageStore {
     registry: Arc<package::registry::Registry>,
+    definitions: Arc<DefinitionCache>,
+    /// Package roots verified so far, which tests read to bound the work of a
+    /// listing.
+    #[cfg(test)]
+    verifications: Arc<AtomicU64>,
 }
 
 impl PackageStore {
@@ -168,6 +227,9 @@ impl PackageStore {
     pub fn new(registry: package::registry::Registry) -> Self {
         Self {
             registry: Arc::new(registry),
+            definitions: Arc::default(),
+            #[cfg(test)]
+            verifications: Arc::default(),
         }
     }
 
@@ -179,6 +241,8 @@ impl PackageStore {
 
     /// Verifies the root of `digest` and returns it only when it is ready.
     fn ready_root(&self, digest: &PackageDigest) -> Result<VerifiedRoot, PackageRejection> {
+        #[cfg(test)]
+        self.verifications.fetch_add(1, Ordering::Relaxed);
         let referenced = RetainedDigests::from_iter([digest.clone()]);
         let roots = self
             .registry
@@ -260,12 +324,15 @@ impl PackageStore {
     /// Returns the [`PackageRejection`] when the package is not installed,
     /// its root fails verification, or the descriptor does not describe
     /// `runtime_id` under `identity`.
+    ///
+    /// The record is read and the root verified on every call; the compiled
+    /// definition is shared by every caller of the same digest.
     pub fn load_pinned(
         &self,
         runtime_id: &RuntimeId,
         digest: &PackageDigest,
         identity: &PackageIdentity,
-    ) -> Result<RuntimeDefinition, PackageRejection> {
+    ) -> Result<Arc<RuntimeDefinition>, PackageRejection> {
         let record = self.record(digest, identity)?;
         let definition = self.load_definition(&record)?;
         if definition.runtime_id() == runtime_id {
@@ -273,6 +340,34 @@ impl PackageStore {
         } else {
             Err(PackageRejection::IdentityMismatch)
         }
+    }
+
+    /// How many package roots this store has verified.
+    #[cfg(test)]
+    pub(crate) fn root_verifications(&self) -> u64 {
+        self.verifications.load(Ordering::Relaxed)
+    }
+
+    /// How many definitions the cache holds.
+    #[cfg(test)]
+    pub(crate) fn cached_definitions(&self) -> usize {
+        self.definitions.lock().len()
+    }
+
+    /// Drops the cached definitions of packages the registry no longer
+    /// records under the identity they were built for.
+    ///
+    /// Called when the runtime registry reloads. A registry record that
+    /// cannot be read leaves the cache alone.
+    pub fn prune_definitions(&self) {
+        let Ok(state) = self.registry.state() else {
+            return;
+        };
+        self.definitions.lock().retain(|digest, definition| {
+            state
+                .package(digest)
+                .is_some_and(|record| built_for(definition, record.identity()))
+        });
     }
 
     /// Loads the definition of exactly the package `digest` for a host
@@ -294,7 +389,7 @@ impl PackageStore {
         runtime_id: &RuntimeId,
         digest: &PackageDigest,
         package: &PackageId,
-    ) -> Result<RuntimeDefinition, PackageRejection> {
+    ) -> Result<Arc<RuntimeDefinition>, PackageRejection> {
         let state = self.registry.state().map_err(PackageRejection::Registry)?;
         let record = state
             .package(digest)
@@ -320,11 +415,7 @@ impl PackageStore {
         identity: &PackageIdentity,
     ) -> Result<RuntimeDefinition, PackageRejection> {
         let root = self.ready_root(digest)?;
-        let definition = definition_from_files(&RootFiles(&root), digest)?;
-        match &definition.binding().provenance {
-            BindingProvenance::Package { package, .. } if package == identity => Ok(definition),
-            _ => Err(PackageRejection::IdentityMismatch),
-        }
+        definition_of_root(&root, digest, identity)
     }
 
     /// The integration handler a recorded package's descriptor names, read
@@ -373,16 +464,24 @@ impl PackageStore {
             .map_err(PackageRejection::Descriptor)
     }
 
-    /// [`Self::read_definition`] for a package a fresh launch may use.
+    /// [`Self::read_definition`] for a package a fresh launch may use, shared
+    /// by every caller of the same digest.
     ///
-    /// A reserved runtime id is served only by a package the signed official
-    /// catalog authorized when it was installed; every other package that
-    /// claims one is refused outright.
+    /// The root is verified on every call and the definition is compiled from
+    /// it only when the cache holds none. A reserved runtime id is served only
+    /// by a package the signed official catalog authorized when it was
+    /// installed; the current `record` decides that on every call, cached or
+    /// not, and every other package that claims one is refused outright.
     fn load_definition(
         &self,
         record: &package::registry::PackageRecord,
-    ) -> Result<RuntimeDefinition, PackageRejection> {
-        let definition = self.read_definition(record.digest(), record.identity())?;
+    ) -> Result<Arc<RuntimeDefinition>, PackageRejection> {
+        let root = self.ready_root(record.digest())?;
+        let definition =
+            self.definitions
+                .get_or_build(record.digest(), record.identity(), || {
+                    definition_of_root(&root, record.digest(), record.identity())
+                })?;
         if is_reserved(definition.runtime_id()) && !may_serve_reserved(record, &definition) {
             return Err(PackageRejection::ReservedRuntimeId);
         }
@@ -399,6 +498,21 @@ pub(crate) fn may_serve_reserved(
 ) -> bool {
     matches!(record.source(), package::registry::PackageSource::Official)
         && definition.runtime_id().as_str() != protocol::RuntimeId::SHELL
+}
+
+/// Builds the definition of a verified `root`, checking that it declares
+/// `identity`.
+fn definition_of_root(
+    root: &VerifiedRoot,
+    digest: &PackageDigest,
+    identity: &PackageIdentity,
+) -> Result<RuntimeDefinition, PackageRejection> {
+    let definition = definition_from_files(&RootFiles(root), digest)?;
+    if built_for(&definition, identity) {
+        Ok(definition)
+    } else {
+        Err(PackageRejection::IdentityMismatch)
+    }
 }
 
 /// Builds the definition a package archive declares, from the archive entries
@@ -592,7 +706,8 @@ impl PackageSource {
                         digest: record.digest().clone(),
                         identity: record.identity().clone(),
                         official,
-                        definition,
+                        // A clone shares the compiled manifest with the pin cache.
+                        definition: RuntimeDefinition::clone(&definition),
                     });
                 }
                 Err(reason) => rejected.push(RejectedPackage {

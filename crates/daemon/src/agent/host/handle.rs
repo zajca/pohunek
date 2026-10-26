@@ -347,6 +347,9 @@ impl RuntimeHost {
         }
         let report = Arc::clone(&state.report);
         *self.state.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(state);
+        if let Some(store) = self.package_store() {
+            store.prune_definitions();
+        }
         Ok(report)
     }
 
@@ -433,7 +436,6 @@ impl RuntimeHost {
         }
         store
             .load_pinned(runtime_id, package_digest, package)
-            .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
     }
 
@@ -532,7 +534,7 @@ impl RuntimeHost {
             return Some(candidate);
         }
         match store.load_pinned(runtime_id, package_digest, package) {
-            Ok(verified) => Some(Arc::new(verified)),
+            Ok(verified) => Some(verified),
             Err(reason) => {
                 debug!(
                     runtime = %runtime_id,
@@ -663,7 +665,6 @@ impl RuntimeHost {
         let runtime_id = definition.runtime_id();
         store
             .load_pinned(runtime_id, package_digest, package)
-            .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
     }
 
@@ -692,7 +693,6 @@ impl RuntimeHost {
         if let Some(store) = self.package_store() {
             return store
                 .load_bound(runtime_id, digest, package)
-                .map(Arc::new)
                 .map_err(|reason| refuse(runtime_id, &reason));
         }
         let definition = self.resolve_id(runtime_id)?;
