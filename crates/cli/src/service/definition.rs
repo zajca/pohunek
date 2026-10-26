@@ -235,6 +235,11 @@ mod tests {
     use crate::service::context::tests::temp_root;
     use crate::service::context::tests::{context, make_dirs};
     use crate::service::context::PathDiscovery;
+    use pohunek_test_support::wait::HANG_GUARD;
+
+    /// Probe timeout of the login shell that never answers: it ends only by
+    /// being killed at the timeout.
+    const SILENT_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
     #[test]
     fn daemon_definition_runs_the_versioned_daemon_with_the_config() {
@@ -278,7 +283,19 @@ mod tests {
     }
 
     /// A context whose discovery runs `shell` and falls back to `fallback`.
+    /// The probe is bounded by the hang guard, so a shell that answers is
+    /// never cut off by a loaded host.
     fn managed_context(root: &Path, shell: std::path::PathBuf, fallback: &[String]) -> Context {
+        managed_context_within(root, shell, fallback, HANG_GUARD)
+    }
+
+    /// Like [`managed_context`], with the probe killed after `timeout`.
+    fn managed_context_within(
+        root: &Path,
+        shell: std::path::PathBuf,
+        fallback: &[String],
+        timeout: std::time::Duration,
+    ) -> Context {
         let discovery = managed_path_discovery(Some(shell), Vec::new()).expect("discovery");
         let PathDiscovery::Managed {
             login_shell: Some(mut login_shell),
@@ -287,7 +304,7 @@ mod tests {
         else {
             panic!("managed discovery");
         };
-        login_shell.timeout = std::time::Duration::from_millis(500);
+        login_shell.timeout = timeout;
         context(root).with_path_discovery(PathDiscovery::Managed {
             login_shell: Some(login_shell),
             shell_defaulted: false,
@@ -395,14 +412,14 @@ mod tests {
             brew.display().to_string(),
             root.join("usr/local/bin").display().to_string(),
         ];
-        for body in [
-            "exit 1",
-            "echo junk before the sentinel",
-            "exit 0",
-            "exec sleep 300",
+        for (body, timeout) in [
+            ("exit 1", HANG_GUARD),
+            ("echo junk before the sentinel", HANG_GUARD),
+            ("exit 0", HANG_GUARD),
+            ("exec sleep 300", SILENT_SHELL_TIMEOUT),
         ] {
             let shell = fake_shell(root, body);
-            let context = managed_context(root, shell, &fallback);
+            let context = managed_context_within(root, shell, &fallback, timeout);
             let config = initial_config(&context, &root.join("prefix"), "1.2.3").expect(body);
             assert_eq!(
                 config.search_path().entries(),
