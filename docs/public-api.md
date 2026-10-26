@@ -2388,7 +2388,11 @@ written in milliseconds, `1000..=600000`, 30000 and 10000 by default) and
 `keepalive_count` (`1..=10`, 3 by default) set the TCP keepalive of every
 overlay connection the daemon accepts (#862); they are additive optional keys,
 so they leave `schema_version` at 7 and the writer omits each while it equals
-its default. The `[hooks]` table also takes the optional `required` key, a list
+its default. The optional `[deadlines]` key `registry_shutdown_ms` (`1..=600000`,
+5000 by default) bounds how long the daemon's session registry waits for its
+background tasks and in-flight store writes at shutdown; it is additive, so it
+leaves `schema_version` at 7 and the writer omits it while it equals its
+default. The `[hooks]` table also takes the optional `required` key, a list
 of the hook events whose failure ends `session.new` (only `"post-create"`, #670);
 it is additive, so it leaves `schema_version` at 7, the writer omits it while it
 is empty, and a previous release ignores the key and does not enforce it.

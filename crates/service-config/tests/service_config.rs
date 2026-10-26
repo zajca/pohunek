@@ -2743,3 +2743,67 @@ fn non_default_keepalive_keys_round_trip_and_are_not_unknown() {
     assert!(rendered.contains("keepalive_count = 5"), "{rendered}");
     assert!(!rendered.contains("keepalive_idle_ms"), "{rendered}");
 }
+
+/// Replaces the `[deadlines]` table of the golden file with `extra` keyed
+/// lines appended after the restart throttle.
+fn with_registry_shutdown(extra: &str) -> String {
+    replace(
+        GOLDEN,
+        "daemon_restart_throttle_ms = 5000",
+        &format!("daemon_restart_throttle_ms = 5000\n{extra}"),
+    )
+}
+
+/// `deadlines.registry_shutdown_ms` is bounded like the other deadlines.
+#[test]
+fn registry_shutdown_outside_its_bounds_is_refused_by_key() {
+    let fixture = Fixture::new();
+    for (line, value) in [
+        ("registry_shutdown_ms = 0", 0),
+        ("registry_shutdown_ms = 600001", 600_001),
+    ] {
+        match fixture.load(&with_registry_shutdown(line)) {
+            Err(ConfigError::OutOfRange {
+                key,
+                value: rejected,
+                min,
+                max,
+            }) => assert_eq!(
+                (key, rejected, min, max),
+                ("deadlines.registry_shutdown_ms", value, 1, 600_000),
+                "{line}"
+            ),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+}
+
+/// A non-default `registry_shutdown_ms` is loaded, written back, and a known key.
+#[test]
+fn non_default_registry_shutdown_round_trips_and_is_not_unknown() {
+    let fixture = Fixture::new();
+    let loaded = fixture
+        .load(&with_registry_shutdown("registry_shutdown_ms = 7000"))
+        .expect("load a custom registry shutdown bound");
+    assert_eq!(loaded.deadlines().registry_shutdown, Duration::from_secs(7));
+    assert_ne!(DEFAULT_REGISTRY_SHUTDOWN, Duration::from_secs(7));
+    assert!(
+        loaded.unknown_keys().is_empty(),
+        "{:?}",
+        loaded.unknown_keys()
+    );
+    let rendered = loaded.to_toml();
+    assert!(
+        rendered.contains("registry_shutdown_ms = 7000"),
+        "{rendered}"
+    );
+    let reloaded = fixture.load(&rendered).expect("reload the rendered file");
+    assert_eq!(reloaded, loaded);
+
+    let default = fixture.load(GOLDEN).expect("load the golden file");
+    assert_eq!(
+        default.deadlines().registry_shutdown,
+        DEFAULT_REGISTRY_SHUTDOWN
+    );
+    assert!(!default.to_toml().contains("registry_shutdown"));
+}
