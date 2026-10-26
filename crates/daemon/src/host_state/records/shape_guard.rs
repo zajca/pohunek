@@ -9,6 +9,10 @@
 //! `unit_values!` (or a hand-written exhaustive `match`) and every string leaf must
 //! be a registered enum path or free text, as in `store::shape_guard`.
 //!
+//! The top-level wire structs are destructured field by field and each enum-valued
+//! field is pinned to its type. The protocol types nested below them keep private
+//! fields, so their keys and values are covered by the populated samples only.
+//!
 //! When a snapshot no longer matches, the test fails. To resolve it:
 //!
 //! 1. bump the format constant,
@@ -23,8 +27,8 @@ use protocol::{EnrollmentStatus, HostOwner, QuarantineReason, ShareSuspensionInt
 use serde_json::Value;
 
 use super::{
-    GovernanceState, IdentityRecord, RetiredEnrollment, GOVERNANCE_FORMAT_VERSION,
-    IDENTITY_FORMAT_VERSION,
+    GovernanceState, GovernanceWireOwned, IdentityBootstrapPhase, IdentityRecord,
+    IdentityWireOwned, RetiredEnrollment, GOVERNANCE_FORMAT_VERSION, IDENTITY_FORMAT_VERSION,
 };
 use crate::host_state::approval_key::{generate_host_id, ApprovalKeyRecord};
 use crate::store::shape_guard::{
@@ -141,6 +145,40 @@ fn governance_samples() -> Vec<GovernanceState> {
     vec![current, quarantined, following]
 }
 
+/// Fails to compile when a wire field is added or an enum field is retyped.
+#[expect(
+    clippy::unneeded_field_pattern,
+    reason = "naming every field with `_` is what makes a field change a compile error"
+)]
+fn assert_wire_fields_are_reviewed(governance: &GovernanceState, identity: &IdentityRecord) {
+    let wire: GovernanceWireOwned =
+        serde_json::from_slice(&governance.encode().expect("encode")).expect("governance wire");
+    let GovernanceWireOwned {
+        format_version: _,
+        host_id: _,
+        approval_key_reference: _,
+        enrollment: _,
+        owner,
+        owner_revision: _,
+        quarantine,
+        quarantine_origin,
+        latest_transfer_outcome: _,
+        retired_enrollment: _,
+    } = wire;
+    let _: &Option<HostOwner> = &owner;
+    let _: &Option<QuarantineReason> = &quarantine;
+    let _: &Option<EnrollmentStatus> = &quarantine_origin;
+
+    let wire: IdentityWireOwned =
+        serde_json::from_slice(&identity.encode().expect("encode")).expect("identity wire");
+    let IdentityWireOwned {
+        format_version: _,
+        host_id: _,
+        phase,
+    } = wire;
+    let _: &IdentityBootstrapPhase = &phase;
+}
+
 fn host_owner_values() -> Vec<String> {
     let principal = HostOwner::Principal(
         protocol::PrincipalId::parse(&identifier("principal_", 2)).expect("principal"),
@@ -199,7 +237,6 @@ fn governance_enums() -> Vec<EnumEntry> {
 }
 
 fn identity_enums() -> Vec<EnumEntry> {
-    use super::IdentityBootstrapPhase;
     vec![EnumEntry {
         paths: vec!["identity.phase".to_owned()],
         values: unit_values!(IdentityBootstrapPhase: InProgress, Complete),
@@ -277,7 +314,12 @@ fn shape_of(
 }
 
 fn governance_shape() -> BTreeSet<String> {
-    let documents: Vec<Value> = governance_samples()
+    let samples = governance_samples();
+    assert_wire_fields_are_reviewed(
+        &samples[0],
+        &IdentityRecord::complete(generate_host_id().expect("host identity")),
+    );
+    let documents: Vec<Value> = samples
         .iter()
         .map(|state| serde_json::from_slice(&state.encode().expect("encode")).expect("json"))
         .collect();

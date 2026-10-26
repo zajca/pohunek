@@ -110,7 +110,8 @@ with the snapshot
 is added, removed or renamed, when an enum value is added, removed or renamed,
 and when a string-valued field is neither a registered enum path nor listed free
 text, all without a schema bump, and when an older schema has no migration step.
-A new enum value needs the bump because an older daemon rejects the line. An
+A new enum value needs the bump because an older daemon rejects the line or
+degrades it to a fallback variant. An
 `Unknown` variant contributes no value. A protocol field change in `SessionInfo`
 trips the guard on purpose: the field lands in `metadata.jsonl`. To resolve a
 failure:

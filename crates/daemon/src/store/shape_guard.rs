@@ -22,11 +22,14 @@
 //! Every string-valued leaf of the samples must be a registered enum path or a
 //! free-text path ([`free_text`]); an unclassified leaf fails the guard, which is
 //! how a new enum-valued field is caught. A new enum value is a bump of
-//! [`STORE_SCHEMA_VERSION`], because an older daemon rejects the line.
+//! [`STORE_SCHEMA_VERSION`], because an older daemon rejects the line or degrades
+//! it to a fallback variant.
 //!
 //! Every sample is destructured field by field (no `..`), so adding a field to a
 //! persisted struct fails to compile here until the sample and snapshot are
-//! revisited. Types with private fields ([`NativeSessionLaunch`] and its
+//! revisited. Each enum-valued field is also pinned to its enum type in that
+//! function, so retyping a field, or turning a string field into an enum, fails to
+//! compile. Types with private fields ([`NativeSessionLaunch`] and its
 //! components) cannot be destructured; their samples are populated through the
 //! full JSON form instead.
 //!
@@ -185,7 +188,17 @@ fn background_json() -> Value {
     })
 }
 
+/// Session whose recovery binding is the package-pinned resume sample.
 fn session_json() -> Value {
+    session_json_with(&resume_package_json())
+}
+
+/// Session whose recovery binding is the built-in resume sample.
+fn session_builtin_json() -> Value {
+    session_json_with(&resume_builtin_json())
+}
+
+fn session_json_with(recovery: &Value) -> Value {
     let mut record = json!({
         "schema_version": STORE_SCHEMA_VERSION,
         "session_id": "s-1",
@@ -255,7 +268,7 @@ fn session_json() -> Value {
             "updated_at": "2026-01-01T00:00:01Z",
             "exit_code": 0
         },
-        "recovery": resume_builtin_json(),
+        "recovery": recovery,
         "native_identity_ordering": {
             "runtime_id": "r-1",
             "pid": 4242,
@@ -311,9 +324,10 @@ fn assert_every_field_is_reviewed(
             native_launch: _,
             native_launch_unresolved: _,
             launch_binding: _,
-            native_reference_provenance: _,
+            native_reference_provenance,
             profile_revision: _,
         } = binding;
+        let _: &NativeReferenceProvenance = native_reference_provenance;
         let StoredInputRules {
             bracketed_paste: _,
             submit_delay_ms: _,
@@ -328,11 +342,12 @@ fn assert_every_field_is_reviewed(
         branch_slug: _,
         path: _,
         agent: _,
-        status: _,
+        status,
         project_id: _,
         created_at: _,
         updated_at: _,
     } = worktree;
+    let _: &WorktreeStatus = status;
     let ProjectRecord {
         git_common_dir: _,
         repo_root: _,
@@ -340,30 +355,35 @@ fn assert_every_field_is_reviewed(
         origin_url: _,
         default_base_branch: _,
         is_bare: _,
-        source: _,
+        source,
         added_at: _,
         last_used_at: _,
     } = project;
+    let _: &ProjectSource = source;
     let SessionRecord {
         schema_version: _,
         session_id: _,
-        desired_state: _,
+        desired_state,
         transaction,
         info,
         recovery: _,
         native_identity_ordering,
         runtime,
-        active_agent_origin: _,
+        active_agent_origin,
     } = session;
+    let _: &DesiredState = desired_state;
+    let _: &Option<ActiveAgentOrigin> = active_agent_origin;
     if let Some(SessionTransaction {
         id: _,
-        kind: _,
+        kind,
         phase: _,
         previous_worker_id: _,
         previous_worker_instance_id: _,
         daemon_instance_id: _,
     }) = transaction
-    {}
+    {
+        let _: &TransactionKind = kind;
+    }
     if let Some(NativeIdentityOrdering {
         worker_instance_id: _,
         pid: _,
@@ -373,7 +393,7 @@ fn assert_every_field_is_reviewed(
     }) = native_identity_ordering
     {}
     let RuntimeRecord {
-        state: _,
+        state: record_state,
         worker_id: _,
         worker_instance_id: _,
         service_id: _,
@@ -381,6 +401,7 @@ fn assert_every_field_is_reviewed(
         executable: _,
         reason: _,
     } = runtime;
+    let _: &RuntimeState = record_state;
     let SessionInfo {
         id: _,
         external: _,
@@ -389,14 +410,14 @@ fn assert_every_field_is_reviewed(
         agent: _,
         agent_base: _,
         cwd: _,
-        cwd_source: _,
+        cwd_source,
         pid: _,
         runtime: session_runtime,
         cols: _,
         rows: _,
-        state: _,
-        state_source: _,
-        activity: _,
+        state,
+        state_source,
+        activity,
         subagents,
         background,
         active_agent: _,
@@ -421,9 +442,13 @@ fn assert_every_field_is_reviewed(
         updated_at: _,
         exit_code: _,
     } = info;
+    let _: &Option<CwdSource> = cwd_source;
+    let _: &SessionState = state;
+    let _: &StateSource = state_source;
+    let _: &Option<AgentActivity> = activity;
     let protocol::SessionCapabilities { resume: _, fork: _ } = capabilities;
     if let Some(protocol::SessionRuntime {
-        state: _,
+        state: runtime_state,
         runtime_generation: _,
         worker_id: _,
         worker_instance_id: _,
@@ -432,20 +457,25 @@ fn assert_every_field_is_reviewed(
         loss_reason: _,
         exit: _,
     }) = session_runtime
-    {}
+    {
+        let _: &RuntimeState = runtime_state;
+    }
     for protocol::SubagentInfo {
         id: _,
         parent_id: _,
         provider: _,
         agent_type: _,
-        lifecycle: _,
-        activity: _,
+        lifecycle,
+        activity,
         revision: _,
         started_at_ms: _,
         updated_at_ms: _,
         finished_at_ms: _,
     } in subagents
-    {}
+    {
+        let _: &SubagentLifecycle = lifecycle;
+        let _: &Option<AgentActivity> = activity;
+    }
     if let Some(protocol::SessionBackground {
         revision: _,
         observed_at_ms: _,
@@ -454,23 +484,28 @@ fn assert_every_field_is_reviewed(
     {
         for protocol::BackgroundItem {
             id: _,
-            kind: _,
+            kind,
             provider_kind: _,
-            status: _,
+            status,
             agent_type: _,
             label: _,
             program: _,
             first_seen_ms: _,
             last_seen_ms: _,
         } in items
-        {}
+        {
+            let _: &BackgroundKind = kind;
+            let _: &BackgroundStatus = status;
+        }
     }
     for protocol::SessionWarning {
-        kind: _,
+        kind,
         message: _,
         detail: _,
     } in warnings
-    {}
+    {
+        let _: &SessionWarningKind = kind;
+    }
 }
 
 /// Serializes `record` the way the store writes it and returns the line as JSON.
@@ -923,7 +958,7 @@ pub(crate) fn normalized_leaf(path: &str) -> String {
 }
 
 /// Checks that every string leaf is a registered enum value or free text, that
-/// every registry entry matches a leaf, and returns the `path=value` snapshot lines.
+/// every path of every registry entry matches a leaf, and returns the `path=value` snapshot lines.
 pub(crate) fn classify_leaves(
     leaves: &Leaves,
     enums: &[EnumEntry],
@@ -948,7 +983,7 @@ pub(crate) fn classify_leaves(
     }
     for entry in enums
         .iter()
-        .filter(|entry| !entry.paths.iter().any(|path| seen.contains(path)))
+        .filter(|entry| !entry.paths.iter().all(|path| seen.contains(path)))
     {
         problems.push(format!(
             "registered enum paths {:?} match no sample leaf",
@@ -957,7 +992,7 @@ pub(crate) fn classify_leaves(
     }
     for paths in free
         .iter()
-        .filter(|paths| !paths.iter().any(|path| seen.contains(path)))
+        .filter(|paths| !paths.iter().all(|path| seen.contains(path)))
     {
         problems.push(format!("free-text entry {paths:?} matches no sample leaf"));
     }
@@ -1022,9 +1057,18 @@ fn sampled_shape() -> (BTreeSet<String>, Leaves) {
     label("worktree", paths, found);
     let (project, paths, found) = typed::<ProjectRecord>(&project_json(), Record::Project);
     label("project", paths, found);
-    let (session, paths, found) =
-        typed::<SessionRecord>(&session_json(), |record| Record::Session(Box::new(record)));
-    label("session", paths, found);
+    let wrap = |record| Record::Session(Box::new(record));
+    let (session, session_paths, mut session_leaves) =
+        typed::<SessionRecord>(&session_json(), wrap);
+    let (_, builtin_paths, builtin_leaves) = typed::<SessionRecord>(&session_builtin_json(), wrap);
+    for (path, values) in builtin_leaves {
+        session_leaves.entry(path).or_default().extend(values);
+    }
+    label(
+        "session",
+        session_paths.union(&builtin_paths).cloned().collect(),
+        session_leaves,
+    );
 
     assert_every_field_is_reviewed(&[resume_a, resume_b], &worktree, &project, &session);
     (shape, leaves)
