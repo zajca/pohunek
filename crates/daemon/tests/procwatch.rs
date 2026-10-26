@@ -440,7 +440,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
         .expect("inspect session");
     assert_eq!(after_scan.active_agent_pid, None);
     assert_eq!(after_scan.active_agent, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A foreground `agent` in a shell session is attributed only through the
@@ -513,7 +513,7 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
     assert_eq!(scanned.active_agent_pid, None, "{scanned:?}");
     assert_eq!(scanned.active_agent, None, "{scanned:?}");
     assert_eq!(scanned.active_agent_base, None, "{scanned:?}");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -846,7 +846,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
     let updated = wait_for_cwd(&registry, &created.id, &target_dir).await;
     assert_eq!(updated.cwd_source, Some(CwdSource::Procwatch));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]

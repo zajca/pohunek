@@ -976,7 +976,7 @@ mod tests {
             result.session.metadata
         );
 
-        let _ = sessions.stop(&created.id).await;
+        sessions.stop(&created.id).await.expect("stop the session");
     }
 
     #[tokio::test]
@@ -1030,7 +1030,7 @@ mod tests {
         let remaining = sessions.list().await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, created.id);
-        let _ = sessions.stop(&created.id).await;
+        sessions.stop(&created.id).await.expect("stop the session");
     }
 
     #[tokio::test]
@@ -1095,7 +1095,7 @@ mod tests {
                 DetectionRegionKind::WholeRecent,
             ]
         );
-        let _ = sessions.stop(&created.id).await;
+        sessions.stop(&created.id).await.expect("stop the session");
     }
 
     #[tokio::test]

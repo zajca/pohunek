@@ -383,7 +383,11 @@ async fn a_probe_waiting_agent_reports_activity_through_program_status() {
         assert_eq!(idle.activity_source, Some(StateSource::OscProgress));
     };
     flow.await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -409,7 +413,11 @@ async fn a_record_without_input_changes_the_activity() {
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
         .await;
 
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -435,7 +443,11 @@ async fn a_blocked_record_is_blocked_activity_and_refuses_a_waited_input() {
         .await
         .expect_err("a blocked agent refuses a waited input");
     assert_eq!(refused.code, "session_agent_blocked");
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -473,7 +485,11 @@ async fn an_agent_that_gets_no_probe_answer_is_classified_from_the_screen() {
         fixture.activity(&created.id).await,
         Some((AgentActivity::Idle, StateSource::Screen))
     );
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -516,5 +532,9 @@ async fn a_restated_record_emits_no_agent_state() {
         1,
         "the restated working emits nothing; only the edge to idle does: {states:?}"
     );
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }

@@ -339,7 +339,11 @@ async fn codex_reports_turns_through_program_status() {
     let idle = idle.expect("input until idle");
     assert_eq!(idle.activity, Some(AgentActivity::Idle));
     assert_eq!(idle.activity_source, Some(StateSource::OscProgress));
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// L1p: a turn whose working and done records arrive in one chunk is still a
@@ -359,7 +363,11 @@ async fn a_working_record_followed_by_done_in_one_chunk_satisfies_a_working_wait
         .expect("input until working");
     assert_eq!(working.activity, Some(AgentActivity::Working));
     fixture.wait_activity(&created.id, IDLE).await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// A record with no input changes the activity.
@@ -378,7 +386,11 @@ async fn a_codex_record_without_input_changes_the_activity() {
     command(&fixture, b'g');
     command(&fixture, b'd');
     fixture.wait_activity(&created.id, IDLE).await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// E3: a blocked record is blocked activity and refuses a waited input.
@@ -403,7 +415,11 @@ async fn a_codex_blocked_record_refuses_a_waited_input() {
         .await
         .expect_err("a blocked agent refuses a waited input");
     assert_eq!(refused.code, "session_agent_blocked");
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// W2, W8, S5: a Codex session never gets a probe reply, whatever the program
@@ -437,7 +453,11 @@ async fn a_codex_session_never_gets_a_probe_reply() {
         "two input bytes: {typed}"
     );
     assert_ne!(typed, REPLY_PREFIX_HEX, "the worker writes no reply");
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// N1: an agent of the previous supported release (banner 0.160.0) launches
@@ -452,7 +472,11 @@ async fn the_previous_supported_codex_release_launches_and_reads_from_the_title(
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscTitle))
         .await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// ES4 (M2, S3): a Codex started below a shell session reports through its
@@ -525,6 +549,10 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscTitle))
         .await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     drop(env_probe);
 }
