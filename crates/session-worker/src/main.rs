@@ -367,6 +367,7 @@ mod tests {
                 worker_exit_timeout: other,
                 daemon_exit_timeout: other,
                 daemon_restart_throttle: other,
+                registry_shutdown: other,
             },
             environment_allowlist: vec!["PATH".to_owned()],
             search_path: pohunek_platform::shell_env::SearchPath::default(),

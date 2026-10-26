@@ -664,6 +664,7 @@ impl Fixture {
                 worker_exit_timeout: EXIT_TIMEOUT,
                 daemon_exit_timeout: EXIT_TIMEOUT,
                 daemon_restart_throttle: RESTART_THROTTLE,
+                registry_shutdown: EXIT_TIMEOUT,
             },
             environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
                 .iter()

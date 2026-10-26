@@ -93,6 +93,7 @@ pub(crate) fn config_with_search_path(
             worker_exit_timeout: settings::WORKER_EXIT_TIMEOUT,
             daemon_exit_timeout: settings::DAEMON_EXIT_TIMEOUT,
             daemon_restart_throttle: settings::DAEMON_RESTART_THROTTLE,
+            registry_shutdown: pohunek_service_config::DEFAULT_REGISTRY_SHUTDOWN,
         },
         environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
             .iter()

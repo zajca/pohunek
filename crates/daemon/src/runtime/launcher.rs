@@ -731,20 +731,6 @@ mod test_support {
                 tasks: Arc::new(Mutex::new(HashMap::new())),
             }
         }
-
-        /// Retires every running generation and waits for each to end.
-        pub async fn shutdown(&self) {
-            let workers: Vec<InProcessWorker> = self
-                .tasks
-                .lock()
-                .await
-                .drain()
-                .map(|(_, worker)| worker)
-                .collect();
-            for worker in workers {
-                worker.retire().await;
-            }
-        }
     }
 
     /// Whether any generation of `session_id` still has a running task.

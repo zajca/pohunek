@@ -44,6 +44,7 @@ pub(crate) fn write_service_file(
             worker_exit_timeout: Duration::from_secs(3),
             daemon_exit_timeout: Duration::from_secs(10),
             daemon_restart_throttle: Duration::from_secs(1),
+            registry_shutdown: Duration::from_secs(5),
         },
         environment_allowlist: allowlist.to_vec(),
         search_path: SearchPath::default(),

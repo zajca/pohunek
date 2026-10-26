@@ -204,6 +204,7 @@ mod tests {
                 worker_exit_timeout: deadline,
                 daemon_exit_timeout: deadline,
                 daemon_restart_throttle: deadline,
+                registry_shutdown: deadline,
             },
             environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
             search_path: pohunek_platform::shell_env::SearchPath::default(),

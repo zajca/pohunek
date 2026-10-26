@@ -493,7 +493,7 @@ owns, and runs its blocking store writes through the same tracker. At shutdown
 the daemon first drains the creates still running, stops the tasks that drive the
 registry from outside, and then calls `SessionRegistry::shutdown`. That refuses
 new background tasks, cancels the per-session tokens, aborts the work that has no
-cancellation of its own, and waits, bounded by `shutdown_timeout`, until nothing
+cancellation of its own, and waits, bounded by `shutdown_timeout` (`deadlines.registry_shutdown_ms` in `service.toml`, optional, 5 s by default), until nothing
 tracked is left; tasks still running at the deadline are named in the log. After
 that the registry writes nothing: a store write through it is refused with
 `registry_shut_down` and logged at ERROR with its location. The worker seals its

@@ -191,15 +191,6 @@ const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// deadline is recovered by startup reconciliation from its durable record.
 const DEFAULT_CREATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default bound on how long [`SessionRegistry::shutdown`] waits for the
-/// registry's background tasks and in-flight store writes
-/// ([`SessionRegistryConfig::shutdown_timeout`]).
-///
-/// The tasks are cancelled or aborted first, so the wait covers a blocking
-/// store write that cannot be interrupted. It matches the bound the other
-/// daemon background tasks use at shutdown.
-const DEFAULT_REGISTRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Default per-session raw-output history cap (10 MB), replayed on attach.
 ///
 /// Matches herdr's `DEFAULT_SCROLLBACK_LIMIT_BYTES`; overridable via
@@ -585,7 +576,9 @@ pub struct SessionRegistryConfig {
     pub create_drain_timeout: Duration,
     /// Bound on how long [`SessionRegistry::shutdown`] waits for background
     /// tasks and in-flight store writes after cancelling them.
-    /// Defaults to [`DEFAULT_REGISTRY_SHUTDOWN_TIMEOUT`].
+    /// The daemon reads it from `deadlines.registry_shutdown_ms` of
+    /// `service.toml`; it defaults to
+    /// [`pohunek_service_config::DEFAULT_REGISTRY_SHUTDOWN`].
     pub shutdown_timeout: Duration,
 }
 
@@ -677,7 +670,7 @@ impl Default for SessionRegistryConfig {
             supervision: None,
             supervision_retry_initial: supervision::SUPERVISION_RETRY_INITIAL,
             create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
-            shutdown_timeout: DEFAULT_REGISTRY_SHUTDOWN_TIMEOUT,
+            shutdown_timeout: pohunek_service_config::DEFAULT_REGISTRY_SHUTDOWN,
         }
     }
 }
@@ -2805,7 +2798,10 @@ impl SessionRegistry {
     fn abort_in_tests(location: &std::panic::Location<'_>) {
         #[cfg(test)]
         {
-            eprintln!("session registry store write after shutdown completed, at {location}");
+            eprintln!(
+                "session registry store write after shutdown completed, at {location}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
             std::process::abort();
         }
         #[cfg(not(test))]
