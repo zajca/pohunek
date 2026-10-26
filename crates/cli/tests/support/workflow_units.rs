@@ -79,12 +79,16 @@ wait
 const CRASH: &str = "#!/bin/sh\nexit 3\n";
 
 /// Reaction program: records its context and the origin marker it received,
-/// one file per run, then sleeps three seconds when the plugin state holds a
-/// `slow` marker.
+/// one file per run. While the plugin state holds a `hold` marker it then
+/// writes `held.<pid>` and blocks until the test opens the `gate` FIFO for
+/// writing, so a scenario decides when the run ends.
 const REACT: &str = r#"#!/bin/sh
 printf '%s' "$POHUNEK_PLUGIN_CONTEXT" > "$POHUNEK_PLUGIN_STATE_DIR/context.$$.json"
 printf '%s' "${POHUNEK_SESSION_ID:-absent}" > "$POHUNEK_PLUGIN_STATE_DIR/origin.$$.txt"
-if [ -e "$POHUNEK_PLUGIN_STATE_DIR/slow" ]; then /bin/sleep 3; fi
+if [ -e "$POHUNEK_PLUGIN_STATE_DIR/hold" ]; then
+    : > "$POHUNEK_PLUGIN_STATE_DIR/held.$$"
+    read -r _ < "$POHUNEK_PLUGIN_STATE_DIR/gate"
+fi
 if [ -e "$POHUNEK_PLUGIN_STATE_DIR/wedge" ]; then
     : > "$POHUNEK_PLUGIN_STATE_DIR/wedged.$$"
     trap '' TERM
