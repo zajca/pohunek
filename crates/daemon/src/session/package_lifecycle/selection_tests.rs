@@ -232,6 +232,39 @@ async fn an_incompatible_update_stays_installed_and_unselected_while_a_live_sess
 }
 
 #[tokio::test]
+async fn an_unreadable_store_record_holds_an_incompatible_update_back_until_it_is_removed() {
+    let v = versions("selection-uncertain", Some(SUBAGENT)).await;
+    let created = v
+        .fixture
+        .registry
+        .create(new_params(&v.dir))
+        .await
+        .expect("create");
+    end(&v.fixture, &created.id).await;
+    let new = update("2.0.0", Some(IDENTITY));
+    install(&v.fixture, &new, false).await;
+    assert_eq!(
+        info(&v.fixture, &new.digest).await.selection_blocked,
+        None,
+        "no pin holds the update back while the store is readable"
+    );
+
+    let intact = fs::read(&v.store).expect("read the store");
+    let mut store = fs::OpenOptions::new()
+        .append(true)
+        .open(&v.store)
+        .expect("open the store");
+    store
+        .write_all(b"{\"type\":\"resume\",\"damaged\":\n")
+        .expect("append a damaged line");
+    drop(store);
+    assert_held_back(&v.fixture, &new, &v.old).await;
+
+    fs::write(&v.store, intact).expect("move the damaged line aside");
+    assert_selectable_then_select(&v.fixture, &new, &v.old).await;
+}
+
+#[tokio::test]
 async fn a_dry_run_install_reports_the_withheld_selection() {
     let v = versions("selection-preview", Some(SUBAGENT)).await;
     let created = v
