@@ -676,7 +676,9 @@ selects it explicitly. Selection changes commit under the exclusive lifecycle
 authority, and a launch that resolved the previously selected version before a
 selection committed is refused with `runtime/runtime_package_changed` (retry the
 request) instead of pinning the version that was just replaced; a digest a host
-profile pins launches whatever is selected.
+profile pins launches whatever is selected. While an unreadable `metadata.jsonl`
+line may pin a package, every installed version counts as retained, including
+the pin a `package.bind_profile` rebind replaces.
 
 Install and link validate the package in memory before anything is extracted:
 `runtime.toml` is parsed from the verified archive, and the package identity

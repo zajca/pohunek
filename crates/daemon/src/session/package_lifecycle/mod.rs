@@ -287,7 +287,13 @@ impl SessionRegistry {
                     warn!(%error, "the sessions that pin packages cannot be listed");
                     PackageErrorKind::RegistryFailed
                 })?;
+            let uncertain = retained.is_uncertain();
             let outcome = blocking(move || work(&context, &retained)).await;
+            if uncertain && outcome.is_err() {
+                warn!(
+                    "a package change was refused while an unreadable metadata-store line may pin a package; see the metadata-store warning for the line and the remedy"
+                );
+            }
             // Every transaction may have rebuilt the registry, so live adopted
             // sessions follow whichever package serves their runtime now.
             registry.refresh_adopted_pins().await;

@@ -31,7 +31,11 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    `pohunek plugin doctor <package> --json` restricts the report to one package
    id and prints every digest in full. The `PINNED` column says whether a
    session or host profile pins the digest; a pinned digest cannot be
-   uninstalled (`package_referenced`).
+   uninstalled (`package_referenced`). `package_retention_uncertain` means a line
+   of `metadata.jsonl` that may pin a package cannot be read, so no digest can
+   be proven unpinned: stop the daemon, move the line the daemon log names into
+   a backup file, start the daemon and retry; listing and inspection keep
+   working meanwhile.
 2. Match each finding (implemented in
    `crates/daemon/src/session/package_lifecycle/` and
    `crates/package/src/registry.rs`):

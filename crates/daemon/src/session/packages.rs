@@ -294,9 +294,9 @@ impl SessionRegistry {
         let mut gate = retained.clone();
         let uncertain = unreadable_lines > 0;
         if uncertain {
-            warn!(
+            tracing::debug!(
                 unreadable_lines,
-                "package retention is judged against every installed package: the metadata store holds a line that may pin a package and cannot be read; see the metadata-store warning for the line and the remedy"
+                "package gates judge every installed package: the metadata store holds a line that may pin a package and cannot be read"
             );
             let runtimes = self.inner.profiles.runtimes().clone();
             let installed = tokio::task::spawn_blocking(move || {

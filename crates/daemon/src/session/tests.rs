@@ -25111,6 +25111,43 @@ async fn an_unreadable_store_record_blocks_uninstall_and_leaves_listing_availabl
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_pinned_digest_is_still_referenced_while_an_unreadable_store_record_exists() {
+    let dir = temp_dir("packaged-known-pin-uncertain");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-known-pin-uncertain-plugins", &script);
+    let store_path = temp_store_path("packaged-known-pin-uncertain");
+    let registry = packaged.registry(&store_path);
+    let _created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session that pins the digest");
+    let mut store = fs::OpenOptions::new()
+        .append(true)
+        .open(&store_path)
+        .expect("open the store");
+    std::io::Write::write_all(&mut store, b"{\"type\":\"resume\",\"damaged\":\n")
+        .expect("append a damaged line");
+    drop(store);
+
+    let refused = registry
+        .package_uninstall(protocol::PackageUninstallParams {
+            digest: packaged.digest.clone(),
+            remove_modified: false,
+        })
+        .await
+        .expect_err("a live session pins the package");
+    assert_eq!(
+        refused,
+        protocol::PackageErrorKind::Referenced,
+        "a provable pin keeps its own refusal"
+    );
+    let listed = registry.package_list().await.expect("list packages");
+    assert!(listed.packages[0].referenced);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn recovery_keeps_an_unchanged_profile_after_its_package_is_disabled() {
     let dir = temp_dir("packaged-profile-recovery");
     let marker = dir.join("argv.txt");
