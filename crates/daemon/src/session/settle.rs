@@ -20,7 +20,7 @@
 //! |---|---|---|---|
 //! | procwatch (`RescanSignal`) | every `RescanSignal::request` | scan loop | at the request, taken when the loop wakes for it; a scan the loop starts on its timer is counted from its first read until applied |
 //! | detector (`DetectorOutput`) | detector output pump | detector | at the send, one per chunk, `skipped` on a lag; a detector tick is counted until its transitions are applied |
-//! | worker snapshot | worker poll | worker exit watcher | when a snapshot is read, until applied |
+//! | worker snapshot | worker poll | worker exit watcher | when a snapshot is read, until applied; a lost worker from the failed read until the loss is marked and first classified |
 //! | exit watch | OS exit watch | bound-reporter and observed-agent exit watch tasks | when the exit is delivered, until applied |
 //! | supervision retry | retry loop | retry loop | when its delay expires, until its pass is accounted for |
 //! | unattributed | OS exit watch | external exit watch task | like the exit watches; belongs to no session |

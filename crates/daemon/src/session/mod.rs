@@ -6637,6 +6637,9 @@ impl SessionRegistry {
         if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
             return None;
         }
+        // The loss is pending input from here until it is marked and first
+        // classified; the wait for the socket that follows is not.
+        let applying = self.inner.settle.gate(id).begin();
         if !self.mark_worker_reconnecting(id, expected, error).await {
             return None;
         }
@@ -6649,6 +6652,7 @@ impl SessionRegistry {
         if classified == LossClassification::Settled {
             return None;
         }
+        drop(applying);
         let mut deadline = tokio::time::Instant::now() + connect_deadline;
         loop {
             if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {

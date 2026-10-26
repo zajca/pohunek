@@ -725,6 +725,12 @@ impl SessionRegistry {
             }
             None => HashMap::new(),
         };
+        // A concurrent scan that commits before this one opens a second watch
+        // for the same process; the surplus watch is dropped unused.
+        #[cfg(test)]
+        if !exit_watches.is_empty() {
+            self.hold_input(id, "observed_watch_open").await;
+        }
 
         let (to_spawn, updated, focus, foreground_group, foreground_changed, quiet) = {
             let mut sessions = self.inner.sessions.lock().await;

@@ -530,7 +530,7 @@ A helper asserts `shutdown().is_quiescent()` on the report it gets.
 A test that reads a live snapshot, counts events or scans, or asserts that nothing
 else happened while watchers run first awaits `registry.settled(&id)`: it returns
 once the session's watchers applied every input they were handed (a rescan
-request, a detector chunk, a worker snapshot, a delivered exit, a due retry) and
+request, a detector chunk, a worker snapshot or loss, a delivered exit, a due retry) and
 no transaction is in flight, and it parks on counters, so a paused clock does not
 move. It does not see input still on its way from a worker or the OS, so the test
 awaits a positive signal for such an event first (the mock inspector's

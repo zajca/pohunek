@@ -2019,6 +2019,26 @@ impl MockInspector {
         guard("the exit watcher received the signal", sender.closed()).await;
     }
 
+    /// Indices, in the order they were opened, of the watches for `pid` whose
+    /// receiver is still held; a watch a scan opened and dropped unused is not
+    /// among them.
+    fn live_exit_watches(&self, pid: Pid) -> Vec<usize> {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .map(|senders| {
+                senders
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sender)| !sender.is_closed())
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn exit_watch_count(&self, pid: Pid) -> usize {
         self.inner
             .lock()
@@ -13421,13 +13441,18 @@ fn descendant_reporter_fact(parent: Pid, pgid: Pid) -> ProcessFact {
 
 /// Admits the Codex hook claim of the descendant reporter.
 async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionInfo) {
+    report_descendant_claim_at(registry, created, DIRECT_AGENT_REPORT_SEQ).await;
+}
+
+/// [`report_descendant_claim`] at report sequence `seq`.
+async fn report_descendant_claim_at(registry: &SessionRegistry, created: &SessionInfo, seq: u64) {
     let report = registry
         .report_agent(SessionReportAgentParams {
             session_id: created.id.clone(),
             source: CODEX_HOOK_SOURCE.to_owned(),
             agent: CODEX_HOOK_AGENT.to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            seq: Some(ReportSequence::new(seq)),
             pid: Some(DESCENDANT_REPORTER_PID),
             agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
             agent_session_path: Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned()),
@@ -14692,18 +14717,33 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             ],
         );
         report_descendant_claim(&registry, &created).await;
+        // A scan of the session's own loop that began with this claim parks
+        // after it opened its watches. The claim then changes, so that scan
+        // binds nothing and drops the reporter watch it armed; the explicit
+        // scan arms another and binds it.
+        let scan_held = registry.hold_next_input(&created.id, "observed_watch_open");
+        registry.inner.sessions.lock().await[&created.id]
+            .procwatch_rescan
+            .request();
+        guard(
+            "the session's scan opened its watches",
+            scan_held.entered.notified(),
+        )
+        .await;
+        report_descendant_claim_at(&registry, &created, DIRECT_AGENT_REPORT_SEQ + 1).await;
+        scan_held.release.notify_one();
         registry
             .rescan_procwatch_at(&created.id, created.pid, Instant::now())
             .await;
-        // The session's own loop may still be applying a scan that arms watches.
         guard(
             "the watchers of the session settled",
             registry.settled(&created.id),
         )
         .await;
         assert!(reporter_is_bound(&registry, &created.id).await);
+        let live = inspector.live_exit_watches(DESCENDANT_REPORTER_PID);
         assert_eq!(
-            inspector.exit_watch_count(DESCENDANT_REPORTER_PID),
+            live.len(),
             2,
             "one watch for the observation, one for the binding"
         );
@@ -14716,7 +14756,7 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
         // only follow once the first was applied.
         let held = registry.hold_next_input(&created.id, "exit_watch");
         inspector
-            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, order[0])
+            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, live[order[0]])
             .await;
         guard(
             "the first exit signal reached its watcher",
@@ -14737,7 +14777,7 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
         )
         .await;
         inspector
-            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, order[1])
+            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, live[order[1]])
             .await;
         guard(
             "the watchers of the session settled",
@@ -21144,6 +21184,9 @@ async fn a_removal_that_fails_after_the_sweep_still_logs_that_it_proceeded() {
     let session = record_only_session_in(&registry, Some(&repo)).await;
     let worktree = session.worktree_path.clone().expect("session worktree");
     assert!(worktree.exists(), "the session owns a checkout");
+    // The candidate is a live unreadable survivor, so the sweep keeps it
+    // whether or not a journal of the worker bounds the runtime.
+    inspector.set_live_candidates(true);
     inspector.set_candidate(true);
     let proceeds_log = "removal proceeds past an unreadable-marker process";
 
