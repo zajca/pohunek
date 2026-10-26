@@ -353,7 +353,7 @@ class Wrapper:
         try:
             self.process = subprocess.Popen(
                 self.command,
-                process_group=0,
+                start_new_session=True,
                 preexec_fn=self.command_preexec,
             )
         except OSError as error:
