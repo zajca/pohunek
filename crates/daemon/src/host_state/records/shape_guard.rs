@@ -6,7 +6,7 @@
 //! current [`GOVERNANCE_FORMAT_VERSION`] and [`IDENTITY_FORMAT_VERSION`]. Each
 //! reader accepts exactly one format, so a daemon that meets a record with a new
 //! key or enum value refuses to start. Every enum is listed through
-//! `unit_values!` (or a hand-written exhaustive `match`) and every string leaf must
+//! `unit_values!` or `data_values!` and every string leaf must
 //! be a registered enum path or free text, as in `store::shape_guard`.
 //!
 //! The top-level wire structs are destructured field by field and each enum-valued
@@ -32,8 +32,8 @@ use super::{
 };
 use crate::host_state::approval_key::{generate_host_id, ApprovalKeyRecord};
 use crate::store::shape_guard::{
-    classify_leaves, collect_paths, collect_string_leaves, string_values, unit_values, EnumEntry,
-    Leaves,
+    classify_leaves, collect_paths, collect_string_leaves, data_values, string_values, unit_values,
+    EnumEntry, Leaves,
 };
 
 /// Governance key and value snapshots by format version.
@@ -180,17 +180,17 @@ fn assert_wire_fields_are_reviewed(governance: &GovernanceState, identity: &Iden
 }
 
 fn host_owner_values() -> Vec<String> {
-    let principal = HostOwner::Principal(
-        protocol::PrincipalId::parse(&identifier("principal_", 2)).expect("principal"),
-    );
-    let team = HostOwner::Team(protocol::TeamId::parse(&identifier("team_", 3)).expect("team"));
-    let listed = [principal, team];
-    for value in &listed {
-        match value {
-            HostOwner::Principal(_) | HostOwner::Team(_) => {}
-        }
-    }
-    string_values(&listed, Some("kind"))
+    let principal = || {
+        HostOwner::Principal(
+            protocol::PrincipalId::parse(&identifier("principal_", 2)).expect("principal"),
+        )
+    };
+    let team = || HostOwner::Team(protocol::TeamId::parse(&identifier("team_", 3)).expect("team"));
+    data_values!(
+        HostOwner, Some("kind");
+        HostOwner::Principal(_) => principal(),
+        HostOwner::Team(_) => team(),
+    )
 }
 
 const OWNER_KIND_PATHS: &[&str] = &[
@@ -460,5 +460,18 @@ fn a_bumped_format_without_a_snapshot_is_reported() {
         GOVERNANCE_SNAPSHOTS,
     )
     .expect_err("a new format needs its own snapshot");
+    assert!(message.contains("has no snapshot"), "{message}");
+}
+
+#[test]
+fn a_bumped_identity_format_without_a_snapshot_is_reported() {
+    let message = check_format(
+        "identity",
+        "IDENTITY_FORMAT_VERSION",
+        IDENTITY_FORMAT_VERSION + 1,
+        &identity_shape(),
+        IDENTITY_SNAPSHOTS,
+    )
+    .expect_err("a new identity format needs its own snapshot");
     assert!(message.contains("has no snapshot"), "{message}");
 }

@@ -15,9 +15,10 @@
 //!
 //! The snapshot also carries the serialized value set of every persisted enum, as
 //! `<kind>.<path>=<value>` lines. Each enum is listed once through [`unit_values!`]
-//! (or a hand-written exhaustive `match`), which generates the sample list and a
-//! `match` without a wildcard arm from the same variant list, so a new variant
-//! fails to compile until it is listed. Every listed value must round-trip through
+//! or `data_values!` (variants with data; each entry pairs a pattern with its
+//! sample), which generate the sample list and a `match` without a wildcard arm
+//! from the same variant list, so a new variant fails to compile until it is
+//! listed. Every listed value must round-trip through
 //! strict serde; a skipped `Unknown` variant contributes no value and must not.
 //! Every string-valued leaf of the samples must be a registered enum path or a
 //! free-text path ([`free_text`]); an unclassified leaf fails the guard, which is
@@ -376,13 +377,14 @@ fn assert_every_field_is_reviewed(
     if let Some(SessionTransaction {
         id: _,
         kind,
-        phase: _,
+        phase,
         previous_worker_id: _,
         previous_worker_instance_id: _,
         daemon_instance_id: _,
     }) = transaction
     {
         let _: &TransactionKind = kind;
+        let _: &String = phase;
     }
     if let Some(NativeIdentityOrdering {
         worker_instance_id: _,
@@ -399,8 +401,9 @@ fn assert_every_field_is_reviewed(
         service_id: _,
         generation: _,
         executable: _,
-        reason: _,
+        reason,
     } = runtime;
+    let _: &Option<String> = reason;
     let _: &RuntimeState = record_state;
     let SessionInfo {
         id: _,
@@ -454,11 +457,20 @@ fn assert_every_field_is_reviewed(
         worker_instance_id: _,
         started_at: _,
         last_connected_at: _,
-        loss_reason: _,
-        exit: _,
+        loss_reason,
+        exit,
     }) = session_runtime
     {
         let _: &RuntimeState = runtime_state;
+        let _: &Option<String> = loss_reason;
+        if let Some(protocol::RuntimeExit {
+            cause,
+            signal: _,
+            code: _,
+        }) = exit
+        {
+            let _: &String = cause;
+        }
     }
     for protocol::SubagentInfo {
         id: _,
@@ -598,9 +610,9 @@ where
 }
 
 /// Serialized values of `samples`, each checked to deserialize strictly back to
-/// itself. A plain string is the value; a data-carrying variant contributes the
-/// string under `tag` when the enum is internally tagged, otherwise nothing (its
-/// keys are covered by the key set).
+/// itself. A plain string is the value. A data-carrying variant contributes the
+/// string under `tag` when the enum is internally tagged, or its only key when it
+/// is externally tagged (`{"literal": ..}`), so every variant name is a value.
 pub(crate) fn string_values<T>(samples: &[T], tag: Option<&str>) -> Vec<String>
 where
     T: Serialize + DeserializeOwned + PartialEq + Debug,
@@ -611,13 +623,20 @@ where
         let back: T = serde_json::from_value(json.clone()).expect("sample deserializes strictly");
         assert_eq!(&back, sample, "a listed value must round-trip");
         let value = match (&json, tag) {
-            (Value::String(text), None) => Some(text.clone()),
-            (Value::Object(map), Some(tag)) => {
-                map.get(tag).and_then(Value::as_str).map(str::to_owned)
-            }
-            _ => None,
+            (Value::String(text), None) => text.clone(),
+            (Value::Object(map), Some(tag)) => map
+                .get(tag)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{json} carries no string under `{tag}`"))
+                .to_owned(),
+            (Value::Object(map), None) if map.len() == 1 => map
+                .keys()
+                .next()
+                .expect("an object with one key has a key")
+                .clone(),
+            _ => panic!("{json} is not a string, a tagged object or a one-key object"),
         };
-        values.extend(value);
+        values.insert(value);
     }
     values.into_iter().collect()
 }
@@ -657,17 +676,35 @@ macro_rules! unit_values {
 
 pub(crate) use unit_values;
 
-fn native_arg_values() -> Vec<String> {
-    let listed = [
-        NativeArg::Literal("--flag".to_owned()),
-        NativeArg::Reference,
-    ];
-    for value in &listed {
-        match value {
-            NativeArg::Literal(_) | NativeArg::Reference => {}
+/// Serialized values of an enum with data-carrying variants. Each entry pairs a
+/// pattern with the sample that must match it, and the generated `match` lists the
+/// same patterns without a wildcard arm: a new variant fails to compile until an
+/// entry names it, and an entry cannot name a variant without supplying its sample.
+/// `$tag` is the internal tag key, or `None` for an externally tagged enum.
+macro_rules! data_values {
+    ($ty:ty, $tag:expr; $($pattern:pat => $sample:expr),+ $(,)?) => {{
+        let listed: Vec<$ty> = vec![$($sample),+];
+        let matchers: Vec<fn(&$ty) -> bool> = vec![$(|value| matches!(value, $pattern)),+];
+        for (value, matcher) in listed.iter().zip(&matchers) {
+            assert!(matcher(value), "{value:?} does not match the pattern it is listed under");
         }
-    }
-    string_values(&listed, None)
+        for value in &listed {
+            match value {
+                $($pattern => {})+
+            }
+        }
+        string_values(&listed, $tag)
+    }};
+}
+
+pub(crate) use data_values;
+
+fn native_arg_values() -> Vec<String> {
+    data_values!(
+        NativeArg, None;
+        NativeArg::Literal(_) => NativeArg::Literal("--flag".to_owned()),
+        NativeArg::Reference => NativeArg::Reference,
+    )
 }
 
 fn binding_provenance_values() -> Vec<String> {
@@ -675,16 +712,11 @@ fn binding_provenance_values() -> Vec<String> {
         serde_json::from_value::<BindingProvenance>(sample["launch_binding"]["provenance"].clone())
             .expect("provenance sample deserializes")
     };
-    let listed = [
-        provenance(resume_builtin_json()),
-        provenance(resume_package_json()),
-    ];
-    for value in &listed {
-        match value {
-            BindingProvenance::Builtin { .. } | BindingProvenance::Package { .. } => {}
-        }
-    }
-    string_values(&listed, Some("kind"))
+    data_values!(
+        BindingProvenance, Some("kind");
+        BindingProvenance::Builtin { .. } => provenance(resume_builtin_json()),
+        BindingProvenance::Package { .. } => provenance(resume_package_json()),
+    )
 }
 
 /// Records that embed a [`ResumeBinding`]: the resume record and a session's
@@ -1241,4 +1273,57 @@ fn a_registry_entry_without_a_leaf_fails_the_guard() {
     let message = classify_leaves(&leaves, &persisted_enums(), &free)
         .expect_err("a free-text entry without a leaf must fail");
     assert!(message.contains("session.info.removed_field"), "{message}");
+}
+
+/// Externally tagged enum standing in for a persisted one that gained a variant.
+#[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ArgWithNewVariant {
+    Literal(String),
+    Reference,
+    Env(String),
+}
+
+#[test]
+fn a_data_variant_contributes_its_variant_name_as_a_value() {
+    let current = string_values(
+        &[NativeArg::Literal("x".to_owned()), NativeArg::Reference],
+        None,
+    );
+    assert_eq!(current, ["literal", "reference"]);
+    let shape = current_shape();
+    assert!(shape.contains("session.recovery.native_launch.resume_args[]=literal"));
+    assert!(shape.contains("resume.native_launch.resume_args[]=reference"));
+
+    let extended = string_values(
+        &[
+            ArgWithNewVariant::Literal("x".to_owned()),
+            ArgWithNewVariant::Reference,
+            ArgWithNewVariant::Env("HOME".to_owned()),
+        ],
+        None,
+    );
+    assert_eq!(extended, ["env", "literal", "reference"]);
+
+    let mut shape = current_shape();
+    shape.insert("resume.native_launch.resume_args[]=env".to_owned());
+    let message = check_shape(STORE_SCHEMA_VERSION, &shape, SHAPE_SNAPSHOTS)
+        .expect_err("a new data variant must fail the guard");
+    assert!(message.contains("resume_args[]=env"), "{message}");
+}
+
+#[test]
+#[should_panic(expected = "does not match the pattern it is listed under")]
+fn a_sample_must_match_the_pattern_it_is_listed_under() {
+    data_values!(
+        NativeArg, None;
+        NativeArg::Literal(_) => NativeArg::Reference,
+        NativeArg::Reference => NativeArg::Reference,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must not round-trip through strict serde")]
+fn a_value_that_round_trips_is_not_accepted_as_unknown() {
+    assert_never_round_trips(&AgentActivity::Idle);
 }
