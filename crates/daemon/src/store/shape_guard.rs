@@ -615,13 +615,17 @@ where
 /// is externally tagged (`{"literal": ..}`), so every variant name is a value.
 pub(crate) fn string_values<T>(samples: &[T], tag: Option<&str>) -> Vec<String>
 where
-    T: Serialize + DeserializeOwned + PartialEq + Debug,
+    T: Serialize + DeserializeOwned + Debug,
 {
     let mut values = BTreeSet::new();
     for sample in samples {
         let json = serde_json::to_value(sample).expect("sample serializes");
         let back: T = serde_json::from_value(json.clone()).expect("sample deserializes strictly");
-        assert_eq!(&back, sample, "a listed value must round-trip");
+        assert_eq!(
+            serde_json::to_value(&back).expect("round-tripped sample serializes"),
+            json,
+            "a listed value must round-trip"
+        );
         let value = match (&json, tag) {
             (Value::String(text), None) => text.clone(),
             (Value::Object(map), Some(tag)) => map
@@ -704,6 +708,22 @@ fn native_arg_values() -> Vec<String> {
         NativeArg, None;
         NativeArg::Literal(_) => NativeArg::Literal("--flag".to_owned()),
         NativeArg::Reference => NativeArg::Reference,
+    )
+}
+
+/// The `kind` tags of the store's line enum, one per record kind.
+fn record_kind_values() -> Vec<String> {
+    let resume = || serde_json::from_value::<ResumeBinding>(resume_builtin_json()).expect("resume");
+    let worktree = || serde_json::from_value::<WorktreeBinding>(worktree_json()).expect("worktree");
+    let project = || serde_json::from_value::<ProjectRecord>(project_json()).expect("project");
+    let session =
+        || Box::new(serde_json::from_value::<SessionRecord>(session_json()).expect("session"));
+    data_values!(
+        Record, Some("kind");
+        Record::Session(_) => Record::Session(session()),
+        Record::Resume(_) => Record::Resume(resume()),
+        Record::Worktree(_) => Record::Worktree(worktree()),
+        Record::Project(_) => Record::Project(project()),
     )
 }
 
@@ -1054,6 +1074,19 @@ fn current_shape() -> BTreeSet<String> {
     let values = classify_leaves(&leaves, &persisted_enums(), &free_text())
         .unwrap_or_else(|message| panic!("{message}"));
     shape.extend(values);
+
+    let labels: BTreeSet<String> = shape
+        .iter()
+        .filter(|line| !line.contains('.'))
+        .cloned()
+        .collect();
+    let tags = record_kind_values();
+    assert_eq!(
+        tags.iter().cloned().collect::<BTreeSet<_>>(),
+        labels,
+        "the sampled record kinds must be exactly the serialized `kind` tags of `Record`"
+    );
+    shape.extend(tags.into_iter().map(|tag| format!("record.kind={tag}")));
     shape
 }
 

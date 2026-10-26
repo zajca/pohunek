@@ -11,6 +11,10 @@ project.schema_version
 project.source
 project.source=auto
 project.source=manual
+record.kind=project
+record.kind=resume
+record.kind=session
+record.kind=worktree
 resume
 resume.agent
 resume.agent_base
