@@ -35,8 +35,8 @@ Record exact commands and actual outcomes. Use `passed`, `failed`, `skipped` (wi
 ## Review and handoff
 
 - Area reviewer (if available):
-- Independent review required by policy: pending / complete (link exact-head review evidence)
+- Independent review required by policy: pending / complete (link the `zajca` `opus-pr-review:v1` marker at the exact head)
 - Remaining work, blockers, or unresolved effects:
 - Next permitted action / handoff owner:
 
-Review does not grant merge or release authority. The submitter, author, executor, or manager cannot satisfy a required independent review. Follow the issue's public route; private Project access is not required.
+Review does not grant merge or release authority. The submitter, author, executor, or manager cannot satisfy a required independent review, including through another session used to author or direct the change. Follow the issue's public route; private Project access is not required.

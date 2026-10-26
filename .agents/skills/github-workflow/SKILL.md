@@ -94,15 +94,31 @@ No permanently staffed area reviewer or response time commitment is promised.
 If an independent reviewer is unavailable, the candidate remains unaccepted;
 the maintainer records that state and retries routing when capacity exists.
 The submitter, author, executor, or manager cannot supply independent
-approval, including through another session. Automated review counts only
-after #700 resolves the reviewer-service defect and a completed review is
-verified against the exact pull request head under the corrected #700/#802
-contract. An interrupted or stale-head run is not approval. The restricted
-broker of #817 may request `ai:review` only for a validated exact-head
-submission under its exact-candidate contract and the corrected #700/#802
-contract; contributors, executors, and models never receive its credential,
-and its preliminary assessment is not independent review. Review grants no
-merge authority; release remains separately authorized.
+approval, including through another session used to author or direct the
+change; a fresh review-only session that did not author the change supplies
+the technical review (the marker). Starting that session with a
+review-only briefing is not directing the change. The technical review gate is
+an `opus-pr-review:v1` marker comment authored by `zajca` that names the exact
+pull request head (`<!-- opus-pr-review:v1:<repo>#<N>@<40-char sha>:high=<h>:medium=<m>:low=<l> -->`).
+GO is `high=0` and `medium=0`; a review with only LOW findings passes and each
+LOW finding becomes a follow-up issue. A marker from any other author, for
+another head, or from an interrupted run is not approval, and no label is
+needed. For an outside contribution the route per head is: the maintainer
+approves the workflow runs, the maintainer's manager requests the Opus
+review, and the marker arrives as a comment on the pull request. If no marker
+has arrived some hours after green CI, the contributor mentions the maintainer
+on the pull request. The marker is the technical gate only: merging an outside
+contribution also needs the maintainer's explicit approval. An outside
+contributor never receives the credential that posts the marker. Only the designated independent review
+session posts the marker: a fresh Opus high effort session that did not author
+the change, started by the maintainer's manager (the coordinator or operator)
+or, when no manager is named, by the delivering agent per `deliver-issue`
+Phase 5. The authoring agent never posts or imitates a marker.
+Review grants no merge authority; release remains separately authorized.
+A fork head is never dispatched, run through a ref such as
+`refs/pull/<N>/head`, or rerun by an agent in this repository; the
+`forkHeads` rule of `contributionPolicy.reviewAndIntegration` has the
+maintainer's route.
 
 Unsolicited competing pull requests remain welcome and use the same criteria.
 A reservation neither guarantees a merge nor prevents fork work; choosing a
@@ -124,8 +140,8 @@ the `contributionPolicy` in `.github/agent-workflow.json`:
 | Maintainer checks active work and public evidence before recording a manual reservation while the service is absent. | Only explicit maintainer reconciliation grants the manual reservation; a request, label, assignee, or unanswered comment does not. |
 | A reservation expires, a successor is assigned, or a holder submits for review. | Expiry triggers reconciliation; stale generations cannot renew, release, submit, or otherwise mutate successor custody; submission retains custody but is not acceptance. |
 | Two principals claim the same work once the coordination service exists, or one principal claims again under a new agent or run ID. | The service commits exactly one holder; a new agent or run ID does not reset the principal's allowance. |
-| The broker of #817 requests review for a submission. | The request is made only for a validated exact candidate; no contributor, executor, or model receives the broker credential, and its assessment is not independent review. |
-| The executor opens another session or no independent reviewer is available. | Another session does not satisfy independence; unavailable review leaves the candidate unaccepted and is recorded for retry. Automated review counts only for a completed exact-head review after #700 is resolved. |
+| The maintainer's manager requests the Opus review of a submitted head. | The marker comment authored by `zajca` names the exact head; no outside contributor receives the credential that posts it, and a marker from any other author does not count. |
+| The executor opens another session or no independent reviewer is available. | A session used to author or direct the change does not satisfy independence, while a fresh review-only session that did not author it supplies the marker; unavailable review leaves the candidate unaccepted and is recorded for retry. The Opus marker counts only when `zajca` authored it at the exact head. |
 | An unsolicited pull request competes with reserved work. | It remains eligible under the same criteria, and the reservation does not guarantee a merge. |
 | A candidate passes review and gates and is ready to integrate. | `zajca` integrates under existing authorization; release still needs separate authorization. |
 | A change is verified locally but not merged. | Its issue stays open; closure needs the verified remote landing. |

@@ -219,7 +219,8 @@ Release packaging and contributor verification:
   package pin survives the upgrade and `resume`. `.github/workflows/upgrade.yml` runs it from
   CI (pull requests touching the daemon, worker, protocol, or CLI crates),
   from `release.yml` before any publishable binary is built, and from
-  `gh workflow run upgrade.yml -f previous_tag=<tag> -f head_ref=<ref>`.
+  `gh workflow run upgrade.yml -f previous_tag=<tag> -f head_ref=<ref>` with a
+  branch, tag or commit of this repository, never `refs/pull/*` or a fork commit.
 - `bacon.toml` — optional watcher jobs for the documented fast loops
   (`check`, `nextest-fast` on the `fast` profile, `affected`, `clippy-fast`)
   with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.
@@ -240,7 +241,8 @@ Release packaging and contributor verification:
   read from `.config/nextest.toml`), `python3` >= 3.11 and the Hermes test
   interpreter (`POHUNEK_PYTHON_BIN` or the `test_python.rs` candidates: Python
   >= 3.10 with `yaml` passing the runtime file policy; the printed uv fix
-  mirrors the CI step), optional `bacon`,
+  mirrors the `hermes-test-python` composite action and reads its pins, and
+  unreadable pins fail only that row with `config-error`), optional `bacon`,
   `hyperfine`, and on Linux `mold` (fail only with `--strict`); a `rustc-pin`
   row warns when the active `rustc` differs from `rust-toolchain.toml` (fails
   only with `--strict`); a rustup proxy whose pinned toolchain is not
@@ -251,7 +253,7 @@ Release packaging and contributor verification:
   each missing or too-old tool (a shadowed or off-PATH copy gets the
   shell-quoted `export PATH` fix) and never installs anything itself. Those
   rows are the default `rust` contribution path; `--path` (repeatable) adds
-  `sdk` (bun at the `.bun-version`/`packageManager` pin), `scripts`
+  `docs` (`rustc` and its pin row for `cargo xtask docs check`), `sdk` (bun at the `.bun-version`/`packageManager` pin), `scripts`
   (`python3`, `shellcheck`, Linux `dash`), `macos-lint` (the
   `aarch64-apple-darwin` target and `zig`), `relay-db`
   (`POHUNEK_RELAY_TEST_DATABASE_URL` as set/unset only, never passed to child
@@ -273,7 +275,7 @@ Release packaging and contributor verification:
   required vs. optional and `--strict` exit status, MSRV and missing-`cargo`
   handling, the `rust-toolchain.toml` pin row and malformed pins, shadowed
   copies, the Hermes test interpreter check (explicit, policy, version,
-  `yaml`, CI-derived fix), the byte-exact default report, every contribution path, each
+  `yaml`, action-derived fix, a pin problem failing only its row, the real CI files), the byte-exact default report, every contribution path, each
   path's focused checks and final-gate pointer (listed only with an explicit
   `--path`), the `--json` contract and its error codes, and that the relay
   database URL never reaches any output. The `platform contracts (arm64)` CI

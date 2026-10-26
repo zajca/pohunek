@@ -2,9 +2,9 @@
 name: milestone
 description: >-
   Implement the pohunek milestone specified by a GitHub issue in a fresh
-  worktree, delegating the build to a subagent or Codex, then run the full
-  gate set. Use when the user points at a GitHub issue and asks to implement
-  that milestone.
+  worktree, delegating the build to subagents, then run the full gate set.
+  Use when the user points at a GitHub issue and asks to implement that
+  milestone.
 ---
 
 # milestone — implement a milestone from its GitHub issue
@@ -68,8 +68,8 @@ The issue is the spec — there is no `NEXT.md`.
    Every slice must pass the gates on its own and be complete production code
    for its concern — no stubs, dead code, or placeholders a later slice fills
    in. A milestone that is already one small concern is a stack of one.
-5. **Implement via parallel subagents/Codex by default.** Decompose the
-   slice and delegate implementation to parallel subagents or Codex — this
+5. **Implement via parallel subagents by default.** Decompose the
+   slice and delegate implementation to parallel subagents — this
    is the default, not something to wait for permission on. Brief each worker
    with concrete `path:line` context (per the global briefing protocol); they
    start with a clean context window. If the wire protocol

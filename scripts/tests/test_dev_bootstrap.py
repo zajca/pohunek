@@ -40,12 +40,16 @@ def toolchain_file(channel):
     )
 
 
-# The two lines of the CI step that provisions the Hermes test interpreter,
-# from which the printed fix takes its pins.
-CI_WORKFLOW = (
+# The CI workflow calls the composite action that provisions the Hermes test
+# interpreter; the action's two install lines carry the pins the printed fix
+# takes.
+CI_WORKFLOW = "      - uses: ./.github/actions/hermes-test-python\n"
+HERMES_ACTION = (
     "          uv python install 3.12 --no-config\n"
     "          uv pip install --no-config --python \"$python_bin\" pyyaml==6.0.2\n"
 )
+HERMES_ACTION_PATH = Path(".github") / "actions" / "hermes-test-python" / "action.yml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 HERMES_FAILURE = "hermes-test-python is missing (needs >= 3.10.0)"
 # A Python that runs but lacks PyYAML, shaped like a bare interpreter.
 NO_YAML_BODY = (
@@ -129,6 +133,8 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         (self.root / ".config" / "nextest.toml").write_text(NEXTEST_CONFIG)
         (self.root / ".github" / "workflows").mkdir(parents=True)
         (self.root / ".github" / "workflows" / "ci.yml").write_text(CI_WORKFLOW)
+        (self.root / HERMES_ACTION_PATH).parent.mkdir(parents=True)
+        (self.root / HERMES_ACTION_PATH).write_text(HERMES_ACTION)
         self.fakes = self.home / "fakes"
         self.make_private_dir(self.fakes)
         self.cargo_bin = self.home / CARGO_BIN
@@ -413,9 +419,9 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertIn("uv python install 3.12 --no-config", row["fix"])
         self.assertIn("hermes-test-python", doc["failing"])
 
-    def test_fix_follows_the_pins_in_the_ci_workflow(self):
+    def test_fix_follows_the_pins_in_the_composite_action(self):
         self.write_tool("cargo-nextest", NEXTEST_VERSION)
-        (self.root / ".github" / "workflows" / "ci.yml").write_text(
+        (self.root / HERMES_ACTION_PATH).write_text(
             "uv python install 3.13 --no-config\nuv pip install pyyaml==6.1.0\n"
         )
         _, output = self.run_script(
@@ -424,18 +430,74 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertIn("uv python install 3.13 --no-config", output)
         self.assertIn("pyyaml==6.1.0", output)
 
-    def test_ci_workflow_without_the_pins_is_a_configuration_error(self):
-        (self.root / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+    def assert_hermes_row_fails_alone(self, expected_detail):
+        """Unreadable Hermes pins fail the Hermes row; every other row still prints."""
+        self.write_all_tools()
         status, output = self.run_script()
-        self.assertEqual(status, 2, output)
-        self.assertIn("no longer pins", output)
+        self.assertEqual(status, 1, output)
+        self.assertIn("FAIL     hermes-test-python cannot be checked", output)
+        self.assertIn(expected_detail, output)
+        self.assertIn("failing: hermes-test-python", output)
+        for row in ("ok       rustc ", "ok       cargo-nextest ", "ok       python3 "):
+            self.assertIn(row, output)
+        status, doc, _ = self.run_json()
+        self.assertEqual(status, 1, doc)
+        self.assertEqual(doc["result"], "not-ready")
+        rows = {row["name"]: row for row in doc["rows"]}
+        self.assertEqual(rows["hermes-test-python"]["status"], "config-error")
+        self.assertIn(expected_detail, rows["hermes-test-python"]["detail"])
+        self.assertIn(".github/actions/hermes-test-python", rows["hermes-test-python"]["fix"])
+        self.assertEqual(doc["failing"], ["hermes-test-python"])
+        self.assertEqual(rows["rustc"]["status"], "ok")
 
-    def test_missing_ci_workflow_is_a_configuration_error(self):
+    def test_action_without_the_pins_fails_the_hermes_row_only(self):
+        (self.root / HERMES_ACTION_PATH).write_text("name: x\n")
+        self.assert_hermes_row_fails_alone("does not pin")
+
+    def test_missing_action_fails_the_hermes_row_only(self):
+        (self.root / HERMES_ACTION_PATH).unlink()
+        self.assert_hermes_row_fails_alone("cannot read")
+
+    def test_workflow_that_no_longer_calls_the_action_fails_the_hermes_row_only(self):
+        (self.root / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+        self.assert_hermes_row_fails_alone("does not call")
+
+    def test_commented_out_action_call_fails_the_hermes_row_only(self):
+        (self.root / ".github" / "workflows" / "ci.yml").write_text(
+            "      # - uses: ./.github/actions/hermes-test-python\n"
+        )
+        self.assert_hermes_row_fails_alone("does not call")
+
+    def test_missing_ci_workflow_fails_the_hermes_row_only(self):
         (self.root / ".github" / "workflows" / "ci.yml").unlink()
-        status, output = self.run_script()
-        self.assertEqual(status, 2, output)
-        self.assertIn("cannot read", output)
-        self.assertIn("ci.yml", output)
+        self.assert_hermes_row_fails_alone("ci.yml")
+
+    def test_pin_problem_does_not_abort_unrelated_paths(self):
+        (self.root / HERMES_ACTION_PATH).write_text("name: x\n")
+        status, output = self.run_script("--path", "docs", "--path", "scripts")
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("hermes-test-python", output)
+
+    def test_repository_ci_files_provide_the_hermes_pins(self):
+        # The real workflow and composite action, not a fake: the default run
+        # must print every row and pass the pin lookup.
+        self.write_all_tools()
+        (self.root / ".github" / "workflows" / "ci.yml").write_text(
+            (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        )
+        (self.root / HERMES_ACTION_PATH).write_text(
+            (REPO_ROOT / HERMES_ACTION_PATH).read_text()
+        )
+        status, doc, _ = self.run_json(
+            extra_env=self.explicit_interpreter(body=NO_YAML_BODY)
+        )
+        self.assertEqual(status, 1, doc)
+        rows = {row["name"]: row for row in doc["rows"]}
+        self.assertEqual(rows["hermes-test-python"]["status"], "missing")
+        self.assertRegex(rows["hermes-test-python"]["fix"], r"uv python install \d+\.\d+ --no-config")
+        self.assertRegex(rows["hermes-test-python"]["fix"], r"pyyaml==\d+\.\d+\.\d+")
+        self.assertNotIn("config-error", {row["status"] for row in doc["rows"]})
+        self.assertEqual(doc["failing"], ["hermes-test-python"])
 
     # -- optional tools ------------------------------------------------
 
@@ -909,12 +971,14 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         # Nothing but rustc and python3 on PATH, every path selected, strict.
         self.write_bun_config()
         status, doc, _ = self.run_json(
-            "--strict", "--path", "rust", "--path", "sdk", "--path", "scripts",
-            "--path", "macos-lint", "--path", "relay-db", "--path", "native",
+            "--strict", "--path", "docs", "--path", "rust", "--path", "sdk",
+            "--path", "scripts", "--path", "macos-lint", "--path", "relay-db",
+            "--path", "native",
         )
         self.assertEqual(status, 1, doc)
         self.assertEqual(
-            doc["paths"], ["rust", "sdk", "scripts", "macos-lint", "relay-db", "native"]
+            doc["paths"],
+            ["docs", "rust", "sdk", "scripts", "macos-lint", "relay-db", "native"],
         )
         names = [row["name"] for row in doc["rows"]]
         self.assertEqual(len(names), len(set(names)), names)
@@ -1358,6 +1422,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         # Commands copied from the verification guide and the gates skill;
         # each path's list is complete on its own.
         expected_focused = {
+            "docs": ["cargo xtask docs check"],
             "rust": ["cargo xtask affected", "cargo t -p <crate>"],
             "sdk": ["bun install --frozen-lockfile", "bun run typecheck",
                     "bun run lint", "bun test", "bun test sdk/ts/scripts"],
@@ -1368,7 +1433,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             "macos-lint": ["scripts/darwin-check"],
             "relay-db": ["python3 scripts/test-partitions run relay-db"],
         }
-        for path in ("rust", "sdk", "scripts", "macos-lint", "relay-db", "native"):
+        for path in ("docs", "rust", "sdk", "scripts", "macos-lint", "relay-db", "native"):
             with self.subTest(path):
                 checks, doc = self.checks_of(path)
                 self.assertEqual(doc["version"], 1)
@@ -1403,6 +1468,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         # The other OS's native suites are a `ci-only` row, never repeated
         # as a check.
         expected = {
+            "docs": [],
             "rust": [],
             "scripts": [],
             "macos-lint": ["platform contracts (arm64)"],

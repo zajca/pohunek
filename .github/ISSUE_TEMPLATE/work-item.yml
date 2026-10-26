@@ -102,7 +102,7 @@ body:
     id: review-route
     attributes:
       label: Review route
-      description: Name the area. zajca is the maintainer triage, routing, and integration contact; an available independent reviewer examines the code, contract, and evidence for the area. If none is available, the candidate remains unaccepted and no response-time promise applies. The submitter, author, executor, or manager cannot provide independent approval. Automated review counts only under the contributionPolicy in .github/agent-workflow.json (exact head verified, #700 resolved, corrected #700/#802 contract).
+      description: Name the area. zajca is the maintainer triage, routing, and integration contact; an available independent reviewer examines the code, contract, and evidence for the area. If none is available, the candidate remains unaccepted and no response-time promise applies. The submitter, author, executor, or manager cannot provide independent approval, including through another session used to author or direct the change; a fresh review-only session that did not author it supplies the technical review. The technical review gate is an opus-pr-review:v1 marker comment authored by zajca at the exact head, as defined in the contributionPolicy in .github/agent-workflow.json; merging an outside contribution also needs the maintainer's explicit approval.
     validations:
       required: true
   - type: markdown

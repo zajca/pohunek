@@ -3,9 +3,9 @@ name: deliver-issue
 description: >-
   Deliver one larger GitHub issue end to end without asking the operator
   anything: plan the stack, implement through parallel subagents, pass the
-  gates, publish stacked PRs, then loop on CI and the automated PR review of
+  gates, publish stacked PRs, then loop on CI and the Opus review marker of
   every pushed head — fixing or rebutting each finding — until the head is
-  green with a clean review, merge bottom-up, verify the landing, close the
+  green with a passing marker, merge bottom-up, verify the landing, close the
   issue, and file every verified follow-up. Use when the operator hands over
   an issue to be finished autonomously ("dotáhni issue #N", "deliver #N",
   "work on #N until it's merged").
@@ -118,73 +118,80 @@ slice:
    evidence, never silently skipped.
 2. Commit per `pr-handoff`: explicit staging, `--no-gpg-sign`, concise
    imperative English message with the *why*, no trailers or footers.
-3. Push and open the PR stack sequentially per `pr-handoff` (evidence-built
-   descriptions, `Refs #N` / final `Closes #N`) and label every PR
-   `ai:review`, the only trigger of the automated review. Keep higher slices
-   rebased and gate-checked locally, and push only the lowest slice currently
+3. Run a local Opus subagent review of `git diff origin/main...HEAD` for the
+   slice and fix every finding at MEDIUM and above before the push; repeat it
+   after every fix round. It is a pre-push quality check, not the review gate
+   of Phase 5.
+4. Push and open the PR stack sequentially per `pr-handoff` (evidence-built
+   descriptions, `Refs #N` / final `Closes #N`). Keep higher slices rebased
+   and gate-checked locally, and push only the lowest slice currently
    awaiting CI or review. Publish the next one after the prior head finishes;
    record unpublished slices as pending on the issue.
 
 ## Phase 5 — the CI + review loop
 
-Every push creates a new head, and the automated review (a PR review whose
-body starts with `<!-- hermes-codex-review:<repo>#<pr>:<sha> -->`) should land
-per head commit, typically minutes after CI. **Both** must be checked for
-every head; checking only CI loses review rounds. A marker and matching GitHub
-`commit_id` identify the request and reported head, but do not prove that a
-review ran. A review that says the trusted-head/checkout comparison failed,
-that no review was performed, or that assessment stopped is an aborted review:
-it is not a clean result, does not satisfy the gate, and must never be used as
-the previous reviewed head for an incremental review. Generic text such as
-"No actionable findings" does not override an explicit abort.
+Every push creates a new head. The review gate is an `opus-pr-review:v1`
+marker for that exact head, next to green CI. **Both** must be checked for
+every head; checking only CI loses review rounds.
 
-Until the reviewer service publishes a structured outcome, read the review
-from the PR reviews API and verify its marker identifies this repository, PR,
-and exact pushed SHA; its GitHub `commit_id` equals that SHA; and its body
-affirmatively establishes that the trusted head matched the checkout and the
-requested diff was actually assessed. Also verify that the API review's GitHub
-`state` is neither `PENDING` nor `DISMISSED`. Reject explicit mismatch, abort,
-or "no review performed" language even when the other fields match. For an
-incremental review, also establish that its prior reviewed head is a
-previously accepted completed review and is an ancestor of this head. Do not
-treat a label event, review submission, marker, SHA, generic clean summary, or
-human fallback as proof that the automated review service recovered. The
-service-side structured outcome and recovery remain separate work; this
-readback is a safety check, not a permanent substitute for them.
+The marker is a comment on the PR conversation, authored by `zajca`, posted by
+the independent review session for the pushed head: a fresh Opus (high
+effort) session that did not author the change, started by the maintainer's
+manager (the coordinator or operator) or, when no manager is named, by the
+delivering agent per step 1. It carries
 
-1. **Label first.** The automated review runs only for a PR labeled
-   `ai:review`. Before arming the watch verify the label with `gh pr view
-   <n> --json labels` and add it when missing or removed (`gh pr edit <n>
-   --add-label ai:review`; `gh label create ai:review` first if the label
-   does not exist). Do this for every PR of the stack and after every push.
-2. **Watch.** Start one background watcher per push (a monitor tool where
-   the runtime has one; otherwise a polling loop or repeated scheduled
-   checks) that polls until (a) every check of
-   the PR is non-pending and (b) a completed review for the pushed head passes
-   the evidence checks above (`gh api repos/<repo>/pulls/<n>/reviews`). Apply
-   those checks to every candidate; emit failed checks, rejected/aborted
-   review IDs, and the accepted completed review ID as events. Rejected or
-   aborted reviews do not satisfy (b); a matching marker and `commit_id` alone
-   do not satisfy it either. Also read human reviews, inline review
-   comments, and PR conversation comments since the last round. Re-arm on
-   expiry. The reviewer normally answers within about 10 minutes of the push.
-   If no acceptable completed review of the head exists 15 minutes after the
-   push (or after CI finished, whichever is later), the reviewer is stuck:
-   first check the `ai:review` label (a missing label is the usual cause),
-   then re-fire the `labeled` event by removing and re-adding `ai:review` (no
-   new head, so no CI churn), and only if that also gets no review within 15 minutes
-   re-trigger it by pushing a new head — rebase onto the current `main` when it moved,
-   otherwise `git commit --amend --no-edit --date=now` and
-   `--force-with-lease` with the old head SHA — and record the retrigger on
-   the issue. In a stack, keep the ancestry: rebase onto `main` only the
-   bottom slice, rebase any other slice onto its rewritten parent, amend in
-   place, and restack every slice above the rewritten one locally with the
-   pr-handoff procedure (`git rebase --update-refs`, gates on each rebased
-   slice). Push the affected slice first, then publish higher slices one at a
-   time only after the lower current head finishes CI and review. Repeat at
-   most three times; after that record the blocker on
-   the issue and keep waiting with long wakeups. Never merge without the
-   review of the final head.
+```text
+<!-- opus-pr-review:v1:<repo>#<N>@<40-char head sha>:high=<h>:medium=<m>:low=<l> -->
+```
+
+followed by the findings. The rules:
+
+- The comment author is `zajca`. A marker from any other login is not a
+  review. No label starts or enables the review.
+- The sha is the PR's current head. A marker for an earlier head does not
+  carry over to a new head; when several markers name the head, the latest
+  counts.
+- GO is `high=0` and `medium=0`. A review with only LOW findings passes; each
+  LOW finding is verified and filed as a follow-up issue per `github-workflow`.
+- Only the independent review session posts a marker. The authoring agent
+  never posts, edits, or imitates one.
+
+1. **Request the review.** The authoring session never reviews its own
+   change. Report every pushed head (PR number, sha, CI state) to the manager
+   through the channel the invocation names. When the invocation names no
+   manager or channel, start the independent review session yourself: a fresh
+   session with a review-only briefing (the PR, the head sha, the issue's DoD,
+   the marker format) that did not take part in the implementation. When a
+   review is late, say so again and record the wait on the issue; never push
+   or amend a head only to provoke a review.
+2. **Watch.** Start one background watcher per push (a monitor tool where the
+   runtime has one; otherwise a polling loop or repeated scheduled checks)
+   that polls until (a) every check of the PR is non-pending and (b) a marker
+   for the pushed head exists:
+
+   ```bash
+   gh api "repos/<repo>/issues/<n>/comments" --paginate \
+     --jq '.[] | select(.user.login == "zajca") | select(.body | contains("opus-pr-review:v1:<repo>#<n>@<sha>:")) | .html_url'
+   ```
+
+   Read `high`, `medium`, and `low` from the marker and the findings from the
+   same comment; emit failed checks and the marker link as events. Also read
+   human reviews, inline review comments, and PR conversation comments since
+   the last round. Re-arm on expiry. Never merge without the marker of the
+   final head.
+
+   **Disputed MEDIUM.** The gate stays `high=0` and `medium=0` at the exact
+   head. When a MEDIUM finding is a false positive, answer it with evidence
+   (`path:line`, spec reference, reproduction) as a comment on the PR. The
+   coordinator rules on the dispute, or the maintainer when there is no
+   coordinator, as a comment on the PR. The manager (coordinator or operator)
+   then starts the re-review after the ruling; with no manager the delivering
+   agent waits for the maintainer's ruling and starts it per step 1. Exactly
+   one party starts it, and its briefing links the ruling comment so the fresh
+   session reads the ruling from the PR. The fresh review only records the
+   ruling; it does not replace the finding's evidence. A fresh independent review at
+   the same head reflects the ruling in the `medium` count of its marker, and
+   the latest marker for the head decides.
 3. **CI failure triage** — before changing anything:
    - Fetch logs only after the whole run completed (`gh run view <run> --job
      <job> --log-failed`; earlier it returns nothing).
@@ -201,11 +208,13 @@ readback is a safety check, not a permanent substitute for them.
    - Fix the root cause. A test is aligned only to the product's real
      contract (e.g. the product hook's timeout), never weakened below it.
      A pre-existing flake outside the diff gets its own issue (with root
-     cause); rerun the failed job only after that.
+     cause); rerun the failed job only after that. An agent never reruns the jobs
+     of a fork head (see Fork heads in `.agents/instructions/verification.md`).
 4. **Review findings** — for each finding of the round:
    - Verify it against the code. A false positive is answered, not coded
      around: record the evidence (`path:line`, spec/manual reference, a
-     reproduction) in the round's issue comment.
+     reproduction) in the round's issue comment. A disputed MEDIUM is
+     answered on the PR per the dispute path of Phase 5 step 2.
    - Group real findings by file ownership and dispatch them to workers
      (Phase 3 rules; resume the worker that owns the area).
    - Prefer the principled fix the finding points at over a narrow patch,
@@ -223,19 +232,26 @@ readback is a safety check, not a permanent substitute for them.
    verify its final status. Commit and push to the owning slice branch;
    restack upper slices locally with `git rebase --update-refs`, and publish
    them bottom-up after the lower head's CI and review. Post one issue comment
-   per round: review id, each finding → fixed (`path:line`, test) / rejected
+   per round: marker link, each finding → fixed (`path:line`, test) / rejected
    (evidence) / follow-up (#issue), CI triage results, gate results, new
-   head SHA. Go back to step 1 (re-check the `ai:review` label).
+   head SHA. Go back to step 1 (report the new head).
 
 **Merge criteria** for a PR (all must hold on its current head):
-every required check green; a completed automated review of that exact head
-affirmatively establishes the trusted checkout and actual assessment; it has
-no actionable finding, or each remaining finding is answered with evidence as
-a false positive; no unresolved human review request; every
-DoD item the slice owns is met with evidence.
+every required check green; the `opus-pr-review:v1` marker authored by `zajca`
+names this exact head with `high=0` and `medium=0`, and every LOW finding is
+filed as a follow-up issue; no unresolved human
+review request; every DoD item the slice owns is met with evidence. A diff
+that touches release workflows or xtask release code, runtime packages or
+packaging, the TypeScript SDK, Cargo dependencies, or the protocol version
+window also needs one green `tier=main` dispatch at the final head, started
+after PR CI and the marker are green (`gh workflow run ci.yml --ref <branch>
+-f tier=main`). A fork head is never dispatched in this repository: the
+maintainer re-creates the change on its own branch and dispatches that, or
+relies on the post-merge `main` run (Fork heads in
+`.agents/instructions/verification.md`).
 
 If the operator asked for **merge on green CI** in the invocation, merge as
-soon as the checks are green, keep watching for the head's review, and
+soon as the checks are green, keep watching for the head's marker, and
 address its findings in a new fix PR off the updated `main` (same loop).
 
 ## Phase 6 — merge, verify, close

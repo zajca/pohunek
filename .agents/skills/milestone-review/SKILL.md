@@ -3,8 +3,7 @@ name: milestone-review
 description: >-
   Read-only review of a branch/worktree against its GitHub issue's
   definition-of-done, reporting each item with path:line evidence, then
-  delegating any discrepancy fixes to a subagent/Codex and re-running the
-  gates. Use when the user asks for a detailed review of a branch or to verify
+  delegating any discrepancy fixes to a subagent and re-running the gates. Use when the user asks for a detailed review of a branch or to verify
   a milestone matches its spec.
 ---
 
@@ -53,7 +52,7 @@ issue via the `github-workflow` skill.
    the `github-workflow` skill). Keep the project status at `In Progress`
    while gaps are open; blockers and review state live in comments.
 4. **Delegate the fixes.** For each confirmed discrepancy, hand the fix to a
-   subagent or Codex (this is the standing default). Brief each with concrete
+   subagent (this is the standing default). Brief each with concrete
    `path:line` context and the exact DoD item it must satisfy. Do not silently
    fix and re-review in one blur — keep the review findings and the fix work
    traceable on the issue. Verified out-of-scope findings discovered during

@@ -115,7 +115,8 @@ older one before downloading or building anything. It uploads the previous relea
 and protocol outputs as the `upgrade-goldens-<tag>` artifact. Run it on any pair
 with `gh workflow run upgrade.yml -f previous_tag=v0.34.2 -f head_ref=<ref>`
 (the harness comes from the dispatched ref; `head_ref` is only the source built
-as the target). Run it locally on a Linux x86_64 host with systemd, passwordless
+as the target, and it is a branch, tag or commit of this repository, never
+`refs/pull/*` or a fork commit; see Fork heads below). Run it locally on a Linux x86_64 host with systemd, passwordless
 sudo, `gh`, and `jq`:
 
 ```bash
@@ -258,8 +259,9 @@ A red G3 means a test reads a path that its package's selector does not cover.
 Fix it by adding the path to the package's `RULES` entry, never by relaxing
 the test.
 
-Before the final head of a pull request merges, dispatch `ci.yml` once with
-`tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
+Before the final head of a pull request from this repository merges, dispatch
+`ci.yml` once with `tier=main` on the branch (`gh workflow run ci.yml --ref
+<branch> -f tier=main`; fork heads: see Fork heads below)
 only when the diff touches a release workflow or release xtask code, the runtime
 packages or packaging, the TypeScript SDK, Cargo dependencies, the protocol
 version window, or what the main and nightly tiers run (their jobs in `ci.yml`,
@@ -269,6 +271,15 @@ already ran it, and a rehearsal-only failure in the product crates, docs or SDK
 sources, which the filter leaves out, surfaces in the nightly tier. Ordinary
 worker, PTY, hook, daemon, and CLI changes need no dispatch: pull-request CI
 already runs the macOS lanes.
+
+**Fork heads.** This applies to every dispatch, rerun and `head_ref` rule in
+this repository's agent instructions. A fork head is never dispatched, never run
+through a ref such as `refs/pull/<N>/head`, and its jobs are never rerun by an
+agent. For an outside pull request the maintainer reviews the full diff,
+workflow files included, then re-creates the change on a maintainer branch and
+dispatches that branch, or relies on the post-merge `main` run before any
+release. Fork-provided workflow YAML runs only in the approved, read-only
+`pull_request` run.
 
 The automatic red-main issue reporter remains pending under #477 S3. The S4
 release evidence gate is implemented: `scripts/release` requires successful
@@ -739,8 +750,9 @@ and never installs anything. In the same PR, install the new toolchain, fix
 every new clippy lint and `cargo fmt` change it brings, run the gate set, and
 make sure `scripts/check-rust-toolchain-pin` passes. Pull-request CI does not
 run the `cargo-udeps` job, so a nightly bump is verified before merge by a
-manual nightly-tier run of the bump branch
-(`gh workflow run ci.yml --ref <branch> -f tier=nightly`).
+manual nightly-tier run of the maintainer's bump branch
+(`gh workflow run ci.yml --ref <branch> -f tier=nightly`; never a fork head,
+see Fork heads above).
 
 Local toolchain: `scripts/dev-bootstrap` checks the tools these loops need
 against their minimum versions and prints the exact install command for each
@@ -748,7 +760,9 @@ missing or too-old one. `rustc` (the workspace `rust-version`), `cargo-nextest` 
 `python3` >= 3.11, and the Hermes test interpreter (`POHUNEK_PYTHON_BIN` or the
 `test_python.rs` candidates: Python >= 3.10 with `yaml` that passes the runtime
 file policy; the `pohunek-cli` Hermes tests fail without it, and the printed
-fix mirrors the CI uv step) are required; `bacon`, `hyperfine`
+fix mirrors the uv step of the `hermes-test-python` composite action CI calls,
+whose pins it reads; unreadable pins fail that row with `config-error` and
+nothing else) are required; `bacon`, `hyperfine`
 (`scripts/measure-dev-loop`), and `mold` (CI linker only; checked on Linux only) fail only with
 `--strict`. The `rustc-pin` row compares the active `rustc` (first on PATH)
 with the `rust-toolchain.toml` pin and prints the PATH and `rustup toolchain
@@ -771,7 +785,9 @@ installs anything and never changes host configuration; run the printed fixes
 yourself.
 
 Those rows are the `rust` contribution path, the default. `--path NAME`
-(repeatable) selects others: `sdk` (`bun` at or above the `.bun-version` pin,
+(repeatable) selects others: `docs` (a documentation, skill or knowledge-source
+change: `rustc` and its pin row, the toolchain `cargo xtask docs check` builds
+with; no nextest, no Hermes interpreter), `sdk` (`bun` at or above the `.bun-version` pin,
 which must agree with `packageManager` in `package.json`, plus a `bun-pin` row
 that, like `rustc-pin`, fails only with `--strict`; the fix is the official
 installer for the pin), `scripts` (`python3`; optional `shellcheck` and, on
@@ -787,7 +803,7 @@ the host cannot run is `unavailable`, or `ci-only` with the CI job that runs
 it, and never `ok`). A tool shared by two paths is
 reported once, under the first selected path. Each path also names its
 checks, which the script lists and never runs: `focused` commands for the
-inner loop (rust `cargo xtask affected` and `cargo t -p <crate>`; sdk the Bun
+inner loop (docs `cargo xtask docs check`; rust `cargo xtask affected` and `cargo t -p <crate>`; sdk the Bun
 gates; scripts the `scripts/tests` unittests; macos-lint
 `scripts/darwin-check`; relay-db `python3 scripts/test-partitions run
 relay-db`; native the binary build, then the six real-systemd suites on
@@ -816,6 +832,7 @@ go to stdout).
 ```bash
 scripts/dev-bootstrap                          # rust path; non-zero if a required tool fails
 scripts/dev-bootstrap --strict                 # optional tools and a pin mismatch fail the run too
+scripts/dev-bootstrap --path docs              # documentation-only change
 scripts/dev-bootstrap --path rust --path sdk   # several contribution paths
 scripts/dev-bootstrap --json --path native     # machine-readable report on stdout
 ```
