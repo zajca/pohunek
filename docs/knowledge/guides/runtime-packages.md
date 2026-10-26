@@ -85,8 +85,8 @@ rest of the descriptor:
 
 - An id this core does not implement is refused with
   `runtime_feature_unsupported`. The daemon log names the feature and the
-  core's version; the wire message is the same fixed text as every other
-  `package_*` error. The refusal wins over `descriptor_invalid` for a key only
+  core's version; the wire message is fixed text, like every other
+  package error. The refusal wins over `descriptor_invalid` for a key only
   that feature's core understands. An installed package that fails this check at
   load is left out and faulted as `descriptor_invalid`; other packages and
   built-ins still load.
