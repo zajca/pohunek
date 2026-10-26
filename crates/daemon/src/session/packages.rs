@@ -55,7 +55,7 @@ pub enum PackageUninstallError {
 /// [`Self::gate`] widens to every installed digest while one exists, and only
 /// gates see it.
 #[derive(Debug, Clone, Default)]
-pub struct RetainedPins {
+pub(super) struct RetainedPins {
     /// Digests a profile, a readable durable record or a live session pins.
     known: RetainedDigests,
     /// [`Self::known`], plus every installed digest while a store line that may
@@ -68,7 +68,7 @@ pub struct RetainedPins {
 impl RetainedPins {
     /// A set whose pins are all known, as the offline planner reads them.
     #[must_use]
-    pub(crate) fn from_known(known: RetainedDigests) -> Self {
+    pub(super) fn from_known(known: RetainedDigests) -> Self {
         Self {
             gate: known.clone(),
             known,
@@ -78,19 +78,19 @@ impl RetainedPins {
 
     /// The digests that are provably pinned.
     #[must_use]
-    pub fn known(&self) -> &RetainedDigests {
+    pub(super) fn known(&self) -> &RetainedDigests {
         &self.known
     }
 
     /// The set every gate judges.
     #[must_use]
-    pub fn gate(&self) -> &RetainedDigests {
+    pub(super) fn gate(&self) -> &RetainedDigests {
         &self.gate
     }
 
     /// Whether an unreadable store line widened [`Self::gate`].
     #[must_use]
-    pub fn is_uncertain(&self) -> bool {
+    pub(super) fn is_uncertain(&self) -> bool {
         self.uncertain
     }
 }

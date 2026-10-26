@@ -320,11 +320,10 @@ fn only_a_line_that_may_pin_a_package_makes_the_pinned_set_incomplete() {
             "{{\"kind\":\"{kind}\",\"schema_version\":{STORE_SCHEMA_VERSION},\"unexpected\":1}}"
         )
     };
-    content.push_str(&format!(
-        "{}\n{}\n",
-        carries_no_pin("worktree"),
-        carries_no_pin("project")
-    ));
+    for kind in ["worktree", "project"] {
+        content.push_str(&carries_no_pin(kind));
+        content.push('\n');
+    }
     std::fs::write(&path, &content).expect("append unreadable worktree and project lines");
     assert_eq!(
         store
