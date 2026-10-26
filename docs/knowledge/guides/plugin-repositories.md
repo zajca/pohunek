@@ -18,10 +18,12 @@ its details. The mechanics of installing a package are in the
 
 ## What is available when
 
-The plugin kit, the repository template and the plugin index arrive in a later
-release than the one that introduced this rule. Until they exist, the steps below
-that name them describe the target workflow, and the existing digest install of
-an archive (`--sha256`) is the only way to install a plugin. The four official
+The plugin kit, the repository template, the plugin index, the runtime features
+and the official plugin snapshot arrive in a later release than the one that
+introduced this rule. Until they exist, the steps below that name them describe
+the target workflow, and a plugin installs as today: an official package from
+the signed release catalog, any other archive by the owner's digest
+(`--sha256`) or from a developer directory. The four official
 runtimes (Pi, Codex, Claude Code and Hermes) stay under `runtime-packages/` and
 `compat/` and are changed in place until they move to their own repositories;
 no other directory is added there. `cargo xtask docs check` fails a change that
@@ -95,7 +97,7 @@ vector.
 ## Compatibility declaration
 
 A plugin declares what it needs from core, and core refuses an install that
-does not fit:
+does not fit once these checks ship:
 
 - `runtime_api`, the major number of the runtime contract;
 - the runtime features it requires, each an append-only core id;
@@ -125,7 +127,7 @@ install by id.
 
 ## Release snapshot
 
-A core release bundles the official set of its day from
+From the release that ships the snapshot, a core release bundles the official set of its day from
 `packaging/official-plugins.lock.json`, a snapshot of the official tier of the
 index. The release proves every locked plugin against its exact artifacts before
 it ships, so an offline install of a release carries the official plugins that

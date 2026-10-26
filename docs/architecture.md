@@ -157,7 +157,8 @@ versioned SDKs. The Rust crates are pinned by git tag; the TypeScript SDK is
 pinned by release-tarball URL and integrity. The core crates a Rust client links
 (`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`, `assistant`,
 and the `netbird`, `overlay` and `overlay-tailscale` crates that `client` links
-for the overlay transports) are a pinned, not a stable, API: they stay pre-1.0 with no back-compat shims.
+for the overlay transports) are a pinned, not a stable, API: they stay pre-1.0
+with no back-compat shims.
 External UIs pin the `PROTOCOL_VERSION` they were built against; a daemon one
 release newer still serves them through the protocol window, and the SDK talks
 to a daemon one release older through its own adapter (see "Protocol
@@ -170,10 +171,11 @@ core.
 Herd orchestration stays outside the daemon. A herd (a manager session that
 launches and supervises a set of worker sessions) is defined, limited and
 orchestrated by manager tooling or by a plugin, through the public contracts.
-Core keeps two primitives for it and no herd definition, limit or admission
-policy: the `spawned_by` attribution of a session
+Core keeps only two primitives for it, and no herd definition, limit or
+admission policy: the `spawned_by` attribution of a session
 ([#1300](https://github.com/zajca/pohunek/issues/1300)) and durable session
-metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)). Metadata stays
+metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); neither has
+shipped yet. Metadata stays
 opaque to the daemon, and attribution is never an authorization input.
 
 ### Shipped host identity and local governance
@@ -1531,7 +1533,9 @@ Plugins live outside core. A new runtime package or workflow plugin is never
 added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,
 a third-party plugin in its author's account, and a plugin becomes installable
 by id through a reviewed pull request to `pohunekd/pohunek-plugin-index`, which
-needs no core release. Core owns what plugins build on: the descriptor and
+needs no core release. The plugin kit, the runtime features, the reusable plugin
+workflows, the index and its verifier, and the official plugin snapshot are
+available from a later release; the rule applies from now on. Core owns what plugins build on: the descriptor and
 manifest schemas, `runtime_api` and the runtime features, the integration
 handlers, the plugin kit, the reusable plugin workflows, the index format and
 verifier, and the release catalog. A plugin that needs a new core capability
@@ -2143,7 +2147,7 @@ from the previous release is strict for an enum whose tolerance ships in the
 current one, and the TypeScript SDK checks `StateSource` against a closed set,
 so a new value of either needs a protocol bump and an N-1 adapter. The
 bump-only enums (`SessionState`, `SessionTurnEventKind`, `NotificationKind`)
-get no new value without one.
+get no new value.
 
 ## Testing Strategy
 

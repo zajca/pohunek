@@ -155,8 +155,8 @@ Hard constraints, decided on purpose — respect them in every change:
   versioned SDKs: the Rust crates pinned by git tag and the TypeScript SDK
   release tarballs pinned by URL and integrity. The core crates a Rust client
   links (`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`,
-  `assistant`, `netbird`, `overlay`, `overlay-tailscale`) are a pinned API, not a stable one: they stay pre-1.0 with no
-  back-compat shims, and a client absorbs breaking changes when it bumps its
+  `assistant`, `netbird`, `overlay`, `overlay-tailscale`) are a pinned API, not
+  a stable one: they stay pre-1.0 with no back-compat shims, and a client absorbs breaking changes when it bumps its
   pinned tag.
 - **UIs pin the core release they were built against.** A Rust or
   TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS` and reaches

@@ -18,7 +18,8 @@ network-isolated archive smoke run). Implemented in
 `upstream` object selects how a release is installed: an npm release (no
 `upstream.kind`, an `upstream.npm` package) from a committed npm project, or a
 provisioned runtime (`upstream.kind` `provisioner`) by a repository script. A
-new `runtime-packages/<runtime>` is staged by adding its lock fields and its
+official `runtime-packages/<runtime>` (a new plugin lives in its own repository)
+is staged by adding its lock fields and its
 npm project or provisioner.
 
 ## What the lock pins
