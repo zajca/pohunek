@@ -689,73 +689,78 @@ fn handle_connection<S>(
 {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    // A client whose first request depends on the daemon's protocol version
-    // sends `daemon.health` first. The fixture answers it like a daemon and keeps
-    // it out of the captured wire, which holds the method requests only.
-    let request: Request = loop {
-        line.clear();
-        if reader.read_line(&mut line).expect("read request") == 0 {
+    // A client may send several requests on one connection, as a name target
+    // does when its id-filtered lookup finds nothing.
+    loop {
+        // A client whose first request depends on the daemon's protocol version
+        // sends `daemon.health` first. The fixture answers it like a daemon and keeps
+        // it out of the captured wire, which holds the method requests only.
+        let request: Request = loop {
+            line.clear();
+            if reader.read_line(&mut line).expect("read request") == 0 {
+                return;
+            }
+            let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
+            if request.method() != protocol::method::DAEMON_HEALTH {
+                break request;
+            }
+            let health = Response::ok(
+                PROTOCOL_VERSION,
+                request.id(),
+                json!({
+                    "status": "ok",
+                    "daemon_version": "fixture",
+                    "protocol_version": PROTOCOL_VERSION.get()
+                }),
+            )
+            .expect("valid health response");
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::to_string(&health).expect("serialize health response")
+            )
+            .expect("write health response");
+        };
+        requests
+            .lock()
+            .expect("request capture lock")
+            .push(request.clone());
+        if let Some(request_log) = request_log {
+            request_log
+                .lock()
+                .expect("redacted request log lock")
+                .record(&request);
+        }
+        if matches!(scenario, Scenario::SlowWait)
+            && request.method() == protocol::method::SESSION_WAIT
+        {
+            thread::sleep(SLOW_RESPONSE_DELAY);
+        }
+        if matches!(scenario, Scenario::SlowInput)
+            && request.method() == protocol::method::SESSION_INPUT
+        {
+            thread::sleep(SLOW_RESPONSE_DELAY);
+        }
+        if matches!(scenario, Scenario::NoReplyToNew)
+            && request.method() == protocol::method::SESSION_NEW
+        {
+            // The creation is never answered: the connection is held until the
+            // client hangs up, so only the client's own deadline ends the call.
+            let mut rest = String::new();
+            while reader.read_line(&mut rest).is_ok_and(|read| read > 0) {
+                rest.clear();
+            }
             return;
         }
-        let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
-        if request.method() != protocol::method::DAEMON_HEALTH {
-            break request;
-        }
-        let health = Response::ok(
-            PROTOCOL_VERSION,
-            request.id(),
-            json!({
-                "status": "ok",
-                "daemon_version": "fixture",
-                "protocol_version": PROTOCOL_VERSION.get()
-            }),
-        )
-        .expect("valid health response");
-        writeln!(
+        let response = fixture_response(&request, scenario);
+        let write_result = writeln!(
             reader.get_mut(),
             "{}",
-            serde_json::to_string(&health).expect("serialize health response")
-        )
-        .expect("write health response");
-    };
-    requests
-        .lock()
-        .expect("request capture lock")
-        .push(request.clone());
-    if let Some(request_log) = request_log {
-        request_log
-            .lock()
-            .expect("redacted request log lock")
-            .record(&request);
-    }
-    if matches!(scenario, Scenario::SlowWait) && request.method() == protocol::method::SESSION_WAIT
-    {
-        thread::sleep(SLOW_RESPONSE_DELAY);
-    }
-    if matches!(scenario, Scenario::SlowInput)
-        && request.method() == protocol::method::SESSION_INPUT
-    {
-        thread::sleep(SLOW_RESPONSE_DELAY);
-    }
-    if matches!(scenario, Scenario::NoReplyToNew)
-        && request.method() == protocol::method::SESSION_NEW
-    {
-        // The creation is never answered: the connection is held until the
-        // client hangs up, so only the client's own deadline ends the call.
-        let mut rest = String::new();
-        while reader.read_line(&mut rest).is_ok_and(|read| read > 0) {
-            rest.clear();
+            serde_json::to_string(&response).expect("serialize response")
+        );
+        if matches!(scenario, Scenario::SlowWait | Scenario::SlowInput) {
+            return;
         }
-        return;
-    }
-    let response = fixture_response(&request, scenario);
-    let mut stream = reader.into_inner();
-    let write_result = writeln!(
-        stream,
-        "{}",
-        serde_json::to_string(&response).expect("serialize response")
-    );
-    if !matches!(scenario, Scenario::SlowWait | Scenario::SlowInput) {
         write_result.expect("write fixture response");
     }
 }
@@ -1713,8 +1718,11 @@ fn exact_name_ambiguity_is_typed_sorted_and_sends_no_mutation() {
     let document = assert_json_error(&output, "ambiguous_session_name");
     let message = document["err"]["msg"].as_str().expect("error message");
     assert!(message.contains("s-ambiguous-1, s-ambiguous-2"));
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].method(), protocol::method::SESSION_LIST);
+    // The id-filtered lookup finds nothing, so the name resolves from the full list.
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.method() == protocol::method::SESSION_LIST));
 }
 
 #[test]
