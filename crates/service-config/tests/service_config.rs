@@ -14,8 +14,9 @@ use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, InputTiming, KeepaliveTiming, RequiredHook, ServiceConfig,
     WaitTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
-    DEFAULT_KEEPALIVE_TIMING, DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
-    MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    DEFAULT_KEEPALIVE_TIMING, DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING,
+    MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES,
+    MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
@@ -169,6 +170,7 @@ fn spec() -> ConfigSpec {
             worker_exit_timeout: Duration::from_secs(30),
             daemon_exit_timeout: Duration::from_secs(30),
             daemon_restart_throttle: Duration::from_secs(5),
+            registry_shutdown: DEFAULT_REGISTRY_SHUTDOWN,
         },
         environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
         search_path: SearchPath::empty(),

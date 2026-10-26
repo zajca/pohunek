@@ -176,7 +176,7 @@ impl SessionRegistry {
         let sent_flag = Arc::new(SentAt::new());
         let task_sent = Arc::clone(&sent_flag);
         let held = guard.take();
-        let task = tokio::spawn(async move {
+        let task = self.spawn_transaction("forward_active_identity_report", async move {
             let outcome = tokio::time::timeout(
                 deadline,
                 worker.record_active_identity_tracked(report, &task_sent),
@@ -326,7 +326,7 @@ impl SessionRegistry {
         let sent_flag = Arc::new(SentAt::new());
         let task_sent = Arc::clone(&sent_flag);
         let held = guard.take();
-        let task = tokio::spawn(async move {
+        let task = self.spawn_transaction("forward_active_identity_release", async move {
             let outcome = tokio::time::timeout(
                 deadline,
                 worker.release_active_identity_tracked(release, &task_sent),

@@ -550,7 +550,12 @@ impl SessionRegistry {
                 "the daemon is not configured for worktree binding",
             ));
         };
-        tokio::task::spawn_blocking(move || manager.bind(&request))
+        // The manager writes the registry's store itself, so the write gate is
+        // taken here and the write is tracked like the registry's own.
+        self.store_for_write()?;
+        self.inner
+            .background
+            .spawn_blocking(move || manager.bind(&request))
             .await
             .map_err(|_join_error| {
                 runtime_error("worktree_bind_failed", "worktree bind task panicked")
@@ -645,11 +650,23 @@ impl SessionRegistry {
         guard: LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
         let registry = self.clone();
-        tokio::spawn(async move { Box::pin(registry.run_pty_registration(spec, guard)).await })
-            .await
-            .map_err(|_join_error| {
+        self.spawn_transaction("pty_registration", async move {
+            Box::pin(registry.run_pty_registration(spec, guard)).await
+        })
+        .await
+        .map_err(|join_error| {
+            if join_error.is_cancelled() {
+                // Only a refused spawn is cancelled: the registry has shut down.
+                ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "daemon_shutting_down",
+                    "the daemon is shutting down and accepts no new sessions",
+                    Some("retry once the daemon is running again".to_owned()),
+                )
+            } else {
                 runtime_error("session_launch_failed", "session launch task panicked")
-            })?
+            }
+        })?
     }
 
     /// Registers `spec` while holding `guard`, then compensates a failed
@@ -960,9 +977,9 @@ impl SessionRegistry {
                 return Err(LaunchFailure::Unavailable(error));
             }
         };
-        let detector_cancel = CancellationToken::new();
-        let procwatch_cancel = CancellationToken::new();
-        let runtime_watch_cancel = CancellationToken::new();
+        let detector_cancel = self.background_token();
+        let procwatch_cancel = self.background_token();
+        let runtime_watch_cancel = self.background_token();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
@@ -1316,7 +1333,7 @@ impl SessionRegistry {
                 format!("worker {} did not report a child process", id.0),
             )
         })?;
-        let detector_output = open_detector_output(&worker, id).await?;
+        let detector_output = self.open_detector_output(&worker, id).await?;
         let connected_at = timestamp_now();
         Ok(StartedRuntime {
             handle: RuntimeHandle::Worker(worker),
@@ -1346,52 +1363,55 @@ struct StartedRuntime {
     runtime_info: Option<SessionRuntime>,
 }
 
-pub(super) async fn open_detector_output(
-    worker: &Worker,
-    id: &SessionId,
-) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, ProtocolError> {
-    let stream_id = StreamId::new(format!("detector-{}", id.0))
-        .map_err(|error| runtime_error("worker_detector_failed", error.to_string()))?;
-    let data = worker
-        .open_data(stream_id, StreamMode::Detector, None)
-        .await
-        .map_err(super::worker_error_to_protocol)?;
-    let (output, receiver) = tokio::sync::broadcast::channel(256);
-    tokio::spawn(async move {
-        let mut stream = data.stream;
-        loop {
-            match read_frame(&mut stream).await {
-                Ok(Some(frame)) => {
-                    let (header, payload) = frame.into_parts();
-                    match header.kind {
-                        FrameKind::Replay { .. }
-                        | FrameKind::Output { .. }
-                        | FrameKind::TerminalSnapshot { .. } => {
-                            let _ = output.send(payload);
-                        }
-                        FrameKind::Gap { .. }
-                        | FrameKind::InputAck { .. }
-                        | FrameKind::Exit { .. }
-                        | FrameKind::Error { .. }
-                        | FrameKind::Close { .. } => {}
-                        FrameKind::Open { .. }
-                        | FrameKind::AttachReady { .. }
-                        | FrameKind::ObservationStart { .. }
-                        | FrameKind::Input { .. } => {
-                            warn!("worker detector received an invalid server frame");
-                            break;
+impl SessionRegistry {
+    pub(super) async fn open_detector_output(
+        &self,
+        worker: &Worker,
+        id: &SessionId,
+    ) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, ProtocolError> {
+        let stream_id = StreamId::new(format!("detector-{}", id.0))
+            .map_err(|error| runtime_error("worker_detector_failed", error.to_string()))?;
+        let data = worker
+            .open_data(stream_id, StreamMode::Detector, None)
+            .await
+            .map_err(super::worker_error_to_protocol)?;
+        let (output, receiver) = tokio::sync::broadcast::channel(256);
+        self.spawn_background("detector_output_pump", async move {
+            let mut stream = data.stream;
+            loop {
+                match read_frame(&mut stream).await {
+                    Ok(Some(frame)) => {
+                        let (header, payload) = frame.into_parts();
+                        match header.kind {
+                            FrameKind::Replay { .. }
+                            | FrameKind::Output { .. }
+                            | FrameKind::TerminalSnapshot { .. } => {
+                                let _ = output.send(payload);
+                            }
+                            FrameKind::Gap { .. }
+                            | FrameKind::InputAck { .. }
+                            | FrameKind::Exit { .. }
+                            | FrameKind::Error { .. }
+                            | FrameKind::Close { .. } => {}
+                            FrameKind::Open { .. }
+                            | FrameKind::AttachReady { .. }
+                            | FrameKind::ObservationStart { .. }
+                            | FrameKind::Input { .. } => {
+                                warn!("worker detector received an invalid server frame");
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    warn!(error = %error, "worker detector data stream failed");
-                    break;
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!(error = %error, "worker detector data stream failed");
+                        break;
+                    }
                 }
             }
-        }
-    });
-    Ok(receiver)
+        });
+        Ok(receiver)
+    }
 }
 
 /// Builds the launch command of a new session.

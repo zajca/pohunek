@@ -555,30 +555,33 @@ impl SessionRegistry {
             .reserve_worker_before_deadline(&worker, vec![first_plan], deadline)
             .await?;
         let (body_started_tx, body_started_rx) = tokio::sync::oneshot::channel();
-        let mut write = tokio::spawn(run_delayed_submit(
-            self.clone(),
-            DelayedSubmitRun {
-                session_id: session_id.clone(),
-                runtime: runtime.clone(),
-                delay,
-                ack_delay,
-                deadline,
-                body_empty,
-                progress: std::sync::Arc::clone(&progress),
-                body_started_tx,
-                #[cfg(test)]
-                send_boundary,
-                #[cfg(test)]
-                delay_boundary: self
-                    .inner
-                    .input_delay_hold
-                    .lock()
-                    .expect("input delay hold test lock")
-                    .take(),
-            },
-            reservation,
-            input_guard,
-        ));
+        let mut write = self.spawn_background(
+            "delayed_submit",
+            run_delayed_submit(
+                self.clone(),
+                DelayedSubmitRun {
+                    session_id: session_id.clone(),
+                    runtime: runtime.clone(),
+                    delay,
+                    ack_delay,
+                    deadline,
+                    body_empty,
+                    progress: std::sync::Arc::clone(&progress),
+                    body_started_tx,
+                    #[cfg(test)]
+                    send_boundary,
+                    #[cfg(test)]
+                    delay_boundary: self
+                        .inner
+                        .input_delay_hold
+                        .lock()
+                        .expect("input delay hold test lock")
+                        .take(),
+                },
+                reservation,
+                input_guard,
+            ),
+        );
         tokio::pin!(body_started_rx);
 
         tokio::select! {
@@ -611,7 +614,7 @@ impl SessionRegistry {
             biased;
             result = &mut write => worker_write_task_result(result),
             () = self.inner.daemon_shutdown.cancelled() => {
-                return Err(Self::give_up_delayed_submit(
+                return Err(self.give_up_delayed_submit(
                     write,
                     &progress,
                     InputNotSubmittedReason::DaemonShuttingDown,
@@ -621,7 +624,7 @@ impl SessionRegistry {
                 ));
             }
             () = tokio::time::sleep_until(deadline) => {
-                return Err(Self::give_up_delayed_submit(
+                return Err(self.give_up_delayed_submit(
                     write,
                     &progress,
                     InputNotSubmittedReason::DeadlineElapsed,
@@ -661,13 +664,14 @@ impl SessionRegistry {
     /// was claimed its acknowledgement is consumed in the background and the
     /// caller gets `after_enter`.
     fn give_up_delayed_submit(
+        &self,
         write: tokio::task::JoinHandle<Result<InputActivitySnapshot, ProtocolError>>,
         progress: &SubmitProgress,
         reason: InputNotSubmittedReason,
         after_enter: ProtocolError,
     ) -> ProtocolError {
         if progress.abandon(reason) {
-            tokio::spawn(async move {
+            self.spawn_background("abandoned_submit_waiter", async move {
                 match write.await {
                     Ok(Err(error)) if error.code == "session_input_not_submitted" => {}
                     Ok(Err(error)) => warn!(
@@ -683,7 +687,7 @@ impl SessionRegistry {
             });
             ProtocolError::session_input_not_submitted(reason)
         } else {
-            shield_worker_ack(write);
+            self.shield_worker_ack(write);
             after_enter
         }
     }
@@ -758,7 +762,7 @@ impl SessionRegistry {
         let (send_started_tx, send_started_rx) = tokio::sync::oneshot::channel();
         let registry = self.clone();
         let turns = self.inner.turns.clone();
-        let mut write = tokio::spawn(async move {
+        let mut write = self.spawn_background("worker_input", async move {
             let _input_guard = input_guard;
             let sessions = registry.inner.sessions.lock().await;
             let entry = sessions
@@ -814,13 +818,13 @@ impl SessionRegistry {
             biased;
             result = &mut write => worker_write_task_result(result),
             () = self.inner.daemon_shutdown.cancelled() => {
-                shield_worker_ack(write);
+                self.shield_worker_ack(write);
                 Err(input_wait_shutdown_error(
                     "daemon shutdown cancelled input after worker delivery began",
                 ))
             }
             () = tokio::time::sleep_until(deadline) => {
-                shield_worker_ack(write);
+                self.shield_worker_ack(write);
                 Err(ProtocolError::session_input_timeout())
             }
         }
@@ -1223,8 +1227,13 @@ fn worker_write_task_result(
     result.map_err(|error| worker_input_task_error(&error))?
 }
 
-fn shield_worker_ack(write: tokio::task::JoinHandle<Result<InputActivitySnapshot, ProtocolError>>) {
-    tokio::spawn(async move {
+impl SessionRegistry {
+    /// Consumes the acknowledgement of a worker input whose caller stopped waiting.
+    fn shield_worker_ack(
+        &self,
+        write: tokio::task::JoinHandle<Result<InputActivitySnapshot, ProtocolError>>,
+    ) {
+        self.spawn_background("input_acknowledgement_waiter", async move {
         match write.await {
             Ok(Ok(_boundary)) => {}
             Ok(Err(error)) => warn!(
@@ -1236,7 +1245,8 @@ fn shield_worker_ack(write: tokio::task::JoinHandle<Result<InputActivitySnapshot
                 "worker input task failed after the public deadline"
             ),
         }
-    });
+        });
+    }
 }
 
 pub(super) fn plan_initial_input_delivery(

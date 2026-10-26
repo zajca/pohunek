@@ -28,6 +28,7 @@
 //! worker_exit_timeout_ms = 30000
 //! daemon_exit_timeout_ms = 30000
 //! daemon_restart_throttle_ms = 5000
+//! registry_shutdown_ms = 5000                      # optional; 1..=600000
 //!
 //! [environment]
 //! search_path = ["/opt/homebrew/bin", "/usr/bin"]  # absolute normalized directories; may be empty
@@ -437,6 +438,16 @@ pub const DEFAULT_TERMINAL_COMMIT_WAIT: Duration = Duration::from_secs(10);
 /// margin is frozen, not slow.
 pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
 
+/// Default `deadlines.registry_shutdown_ms`: how long the daemon's session
+/// registry waits for its background tasks and in-flight store writes after
+/// cancelling them.
+///
+/// The tasks are cancelled or aborted first, so the wait covers a blocking
+/// store write that cannot be interrupted. Five seconds leaves the rest of the
+/// daemon's shutdown inside [`Deadlines::daemon_exit_timeout`]. The key is
+/// optional and the writer omits it while it equals this value.
+pub const DEFAULT_REGISTRY_SHUTDOWN: Duration = Duration::from_secs(5);
+
 /// Longest a stop waits behind an input write that holds the worker's control
 /// connection.
 ///
@@ -572,6 +583,9 @@ pub struct Deadlines {
     pub daemon_exit_timeout: Duration,
     /// Minimum interval between native restarts of a failed daemon.
     pub daemon_restart_throttle: Duration,
+    /// How long the daemon's session registry waits for its background tasks
+    /// and in-flight store writes once it shuts down.
+    pub registry_shutdown: Duration,
 }
 
 /// Host input timings recorded in `[input]`, in whole milliseconds.
@@ -902,6 +916,10 @@ impl ServiceConfig {
             "deadlines.daemon_restart_throttle_ms",
             deadlines.daemon_restart_throttle,
         )?;
+        validate_duration(
+            "deadlines.registry_shutdown_ms",
+            deadlines.registry_shutdown,
+        )?;
         validate_allowlist(&spec.environment_allowlist)?;
         validate_duration("sweep.grace_ms", spec.sweep_grace)?;
         validate_duration(
@@ -1102,6 +1120,7 @@ impl ServiceConfig {
                 worker_exit_timeout_ms: millis(self.deadlines.worker_exit_timeout),
                 daemon_exit_timeout_ms: millis(self.deadlines.daemon_exit_timeout),
                 daemon_restart_throttle_ms: millis(self.deadlines.daemon_restart_throttle),
+                registry_shutdown_ms: millis(self.deadlines.registry_shutdown),
             },
             environment: RawEnvironment {
                 search_path: self
@@ -1479,6 +1498,11 @@ struct RawNamespace {
 }
 
 /// On-disk `[deadlines]` table in milliseconds.
+///
+/// `registry_shutdown_ms` is optional: a file that lacks it means its default,
+/// and the writer omits it while it equals the default, so a file written
+/// without a deliberate setting stays readable by a release that predates the
+/// key.
 #[derive(Debug, Serialize, Deserialize)]
 #[expect(
     clippy::struct_field_names,
@@ -1491,6 +1515,23 @@ struct RawDeadlines {
     worker_exit_timeout_ms: u64,
     daemon_exit_timeout_ms: u64,
     daemon_restart_throttle_ms: u64,
+    #[serde(
+        default = "default_registry_shutdown_ms",
+        skip_serializing_if = "is_default_registry_shutdown_ms"
+    )]
+    registry_shutdown_ms: u64,
+}
+
+fn default_registry_shutdown_ms() -> u64 {
+    millis(DEFAULT_REGISTRY_SHUTDOWN)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_registry_shutdown_ms(value: &u64) -> bool {
+    *value == default_registry_shutdown_ms()
 }
 
 /// On-disk `[environment]` table.
@@ -1858,6 +1899,7 @@ impl RawConfig {
                 worker_exit_timeout_ms: 0,
                 daemon_exit_timeout_ms: 0,
                 daemon_restart_throttle_ms: 0,
+                registry_shutdown_ms: default_registry_shutdown_ms() + 1,
             },
             environment: RawEnvironment {
                 search_path: Vec::new(),
@@ -2168,6 +2210,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             daemon_restart_throttle: Duration::from_millis(
                 raw.deadlines.daemon_restart_throttle_ms,
             ),
+            registry_shutdown: Duration::from_millis(raw.deadlines.registry_shutdown_ms),
         },
         environment_allowlist: raw.environment.allowlist,
         search_path,

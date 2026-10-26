@@ -362,10 +362,15 @@ impl SessionRegistry {
     /// via a warning. Durable logical session records use the fail-closed store
     /// path separately.
     pub(super) async fn persist_resume_binding(&self, id: &SessionId) {
-        let Some(store) = &self.inner.store else {
-            return;
-        };
         let _persist = self.inner.persist_lock.lock().await;
+        let store = match self.store_for_write() {
+            Ok(Some(store)) => store,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(session_id = %id.0, %error, "resume binding not persisted");
+                return;
+            }
+        };
         #[cfg(test)]
         if self.inner.resume_writes_blocked.load(Ordering::Relaxed) {
             return;
@@ -387,14 +392,16 @@ impl SessionRegistry {
                 Some(Self::resume_binding_from_entry(id, entry))
             })
         };
-        let store = Arc::clone(store);
         let session_id = id.0.clone();
-        let result = tokio::task::spawn_blocking(move || match desired {
-            Some(binding) => store.record_resume(&binding),
-            None => store.remove_resume(&session_id),
-        })
-        .await
-        .unwrap_or_else(join_error_to_io);
+        let result = self
+            .inner
+            .background
+            .spawn_blocking(move || match desired {
+                Some(binding) => store.record_resume(&binding),
+                None => store.remove_resume(&session_id),
+            })
+            .await
+            .unwrap_or_else(join_error_to_io);
         if let Err(err) = result {
             warn!(
                 session_id = %id.0,

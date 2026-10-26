@@ -43,7 +43,9 @@ impl SessionRegistry {
             return;
         }
         let registry = self.clone();
-        tokio::spawn(async move { registry.acknowledge_terminal_runtime(&id, ack).await });
+        self.spawn_transaction("terminal_acknowledgement", async move {
+            registry.acknowledge_terminal_runtime(&id, ack).await;
+        });
     }
 
     /// Makes the registry skip every later terminal acknowledgement, as a

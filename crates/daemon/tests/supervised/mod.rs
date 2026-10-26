@@ -1175,6 +1175,7 @@ fn service_config(
             worker_exit_timeout: settings.worker_exit,
             daemon_exit_timeout: settings.daemon_exit,
             daemon_restart_throttle: settings.restart_throttle,
+            registry_shutdown: settings.daemon_exit,
         },
         environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
             .iter()

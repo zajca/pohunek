@@ -500,6 +500,33 @@ real I/O), a gate or barrier the fixture holds (the mock daemon's `gate` step
 holds a reply until the test releases it), or, for an incidental bound,
 `HANG_GUARD`.
 
+Quiescence in tests: an assertion reads a state that a product-provided
+happens-before edge has made final, which is the checked result of the call that
+caused it, an awaited event, or a quiescence barrier. Polling is for a positive
+state the product will reach; a test that asserts something has *not* happened,
+or that a value is final, needs a barrier. A test never discards the result of a
+lifecycle call (`stop`, `remove`, `resume`, `restart`, `kill`, `shutdown`,
+`retire`): it checks it, and a stop leaves its terminal acknowledgement to a
+background transaction that `SessionRegistry::settle_transactions` waits for. A
+test that opens a second registry over the same store or workers calls
+`SessionRegistry::shutdown` on the first one before it does, instead of holding
+`persist_lock` or waiting for the registry to drop; after `shutdown` a store
+write through the old registry aborts the test process in the daemon's unit
+tests (SIGABRT in nextest; integration tests under `crates/daemon/tests` get the
+`registry_shut_down` error instead), and a write over a sealed terminal worker
+journal aborts a debug worker, so a late writer fails every run instead of some.
+A helper asserts `shutdown().is_quiescent()` on the report it gets. `crates/xtask/tests/lifecycle_result_ratchet.rs`
+counts `let _ = <x>.stop|remove|resume|restart|kill|shutdown|retire(..).await;`
+in test code per file against `lifecycle_result_ratchet_baseline.txt`, and
+`crates/xtask/tests/detached_spawn_ratchet.rs` counts bare `tokio::spawn` in the
+production code of `crates/daemon` and `crates/session-worker` against
+`detached_spawn_ratchet_baseline.txt`. Both baselines may only go down (lower
+them with the ignored `regenerate_lifecycle_result_baseline` and
+`regenerate_detached_spawn_baseline` tests). A discard that cannot be avoided
+carries `// lifecycle-result-allowed: #<issue> <reason>` on or directly above its
+line; new background work of the registry goes through its tracker
+(`spawn_background`, `spawn_cooperative` or `spawn_transaction`).
+
 Test binary layout: the integration tests of `pohunek-cli` are modules of one
 test binary, `all` (`crates/cli/tests/all.rs`, `autotests = false`), so the
 dependency graph links once for the crate (#1228). A new test file there gets a

@@ -5,6 +5,10 @@
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
 use pohunek_worker_protocol::{BackgroundSnapshot, ClaimOrigin, ReportedSession};
@@ -665,9 +669,25 @@ struct SchemaProbe {
 }
 
 /// Sole-writer handle for one worker journal.
+///
+/// Clones share one seal, the terminal record this worker process committed,
+/// and one tracker of the blocking writes started through
+/// [`Self::write_tracked`].
 #[derive(Debug, Clone)]
 pub struct Journal {
     path: PathBuf,
+    sealed: Arc<Mutex<Option<JournalRecord>>>,
+    writes: TaskTracker,
+}
+
+/// Why [`Journal::check_seal`] refused a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealRefusal {
+    /// Phase of the refused record.
+    pub attempted_phase: RuntimePhase,
+    /// Top-level journal fields in which the refused record differs from the
+    /// sealed terminal record.
+    pub changed_fields: Vec<String>,
 }
 
 impl Journal {
@@ -676,7 +696,69 @@ impl Journal {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            sealed: Arc::new(Mutex::new(None)),
+            writes: TaskTracker::new(),
         }
+    }
+
+    /// Starts [`Self::write`] on the blocking pool, tracked so that
+    /// [`Self::wait_for_writes`] covers it even when the awaiting task is gone.
+    #[must_use]
+    pub fn write_tracked(&self, record: JournalRecord) -> JoinHandle<Result<(), JournalError>> {
+        let journal = self.clone();
+        self.writes.spawn_blocking(move || journal.write(&record))
+    }
+
+    /// Waits until every write started through [`Self::write_tracked`] has
+    /// returned. Writes started afterwards are not covered.
+    pub async fn wait_for_writes(&self) {
+        self.writes.close();
+        self.writes.wait().await;
+    }
+
+    /// Seals `record`, the terminal record this worker just committed.
+    ///
+    /// From now on [`Self::check_seal`] refuses every replacement except the
+    /// terminal acknowledgement.
+    pub fn seal(&self, record: &JournalRecord) {
+        *self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record.clone());
+    }
+
+    /// Checks `record` against the sealed terminal record, when there is one.
+    ///
+    /// A committed terminal record is final: the runtime has exited and its
+    /// outcome, output offset and subagent fates are recorded. The only
+    /// replacement allowed is the terminal acknowledgement, which sets
+    /// `terminal_acknowledged` (and refreshes `updated_at`) on an otherwise
+    /// identical record. The seal lives in this process, not on disk, so a
+    /// later worker generation that opens the same path starts unsealed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SealRefusal`] naming the fields that differ.
+    pub fn check_seal(&self, record: &JournalRecord) -> Result<(), SealRefusal> {
+        let guard = self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sealed) = guard.as_ref() else {
+            return Ok(());
+        };
+        let mut normalized = record.clone();
+        normalized.terminal_acknowledged = sealed.terminal_acknowledged;
+        normalized.updated_at.clone_from(&sealed.updated_at);
+        let acknowledgement_only = normalized == *sealed
+            && (record.terminal_acknowledged || !sealed.terminal_acknowledged);
+        if acknowledgement_only {
+            return Ok(());
+        }
+        Err(SealRefusal {
+            attempted_phase: record.phase.clone(),
+            changed_fields: changed_fields(sealed, record),
+        })
     }
 
     /// Returns the exact journal path.
@@ -791,6 +873,23 @@ fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), sequence))
 }
 
+/// Top-level fields in which two records serialize differently.
+fn changed_fields(sealed: &JournalRecord, attempted: &JournalRecord) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(sealed)), Ok(serde_json::Value::Object(attempted))) = (
+        serde_json::to_value(sealed),
+        serde_json::to_value(attempted),
+    ) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<&String> = sealed.keys().chain(attempted.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|key| sealed.get(*key) != attempted.get(*key))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use pohunek_platform::filesystem::AtomicReplaceError;
@@ -872,6 +971,53 @@ mod tests {
             finished_at_ms: None,
         });
         record
+    }
+
+    #[test]
+    fn a_sealed_terminal_journal_accepts_only_the_acknowledgement() {
+        let journal = Journal::new("/nonexistent/s-1/worker-1.json");
+        let mut terminal = record("native-reference");
+        terminal.phase = RuntimePhase::Terminal;
+        assert_eq!(journal.check_seal(&terminal), Ok(()), "unsealed accepts");
+        journal.seal(&terminal);
+
+        let mut acknowledged = terminal.clone();
+        acknowledged.terminal_acknowledged = true;
+        acknowledged.updated_at = "2026-07-23T00:00:09Z".to_owned();
+        assert_eq!(
+            journal.check_seal(&terminal),
+            Ok(()),
+            "an identical rewrite"
+        );
+        assert_eq!(journal.check_seal(&acknowledged), Ok(()), "acknowledgement");
+        journal.seal(&acknowledged);
+        assert_eq!(
+            journal.check_seal(&acknowledged),
+            Ok(()),
+            "repeated acknowledgement"
+        );
+
+        let mut revoked = acknowledged.clone();
+        revoked.terminal_acknowledged = false;
+        assert!(
+            journal.check_seal(&revoked).is_err(),
+            "acknowledgement is final"
+        );
+
+        let mut changed = acknowledged.clone();
+        changed.subagents.clear();
+        changed.phase = RuntimePhase::Faulted;
+        let refusal = journal.check_seal(&changed).expect_err("sealed");
+        assert_eq!(refusal.attempted_phase, RuntimePhase::Faulted);
+        assert_eq!(refusal.changed_fields, ["phase", "subagents"]);
+
+        let clone = journal.clone();
+        assert!(clone.check_seal(&changed).is_err(), "clones share the seal");
+        assert_eq!(
+            Journal::new("/nonexistent/s-1/worker-2.json").check_seal(&changed),
+            Ok(()),
+            "another handle starts unsealed"
+        );
     }
 
     #[test]

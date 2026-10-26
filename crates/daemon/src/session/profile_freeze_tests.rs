@@ -19,8 +19,8 @@ use protocol::{
 };
 
 use super::tests::{
-    append_launch_record, complete_lines, drop_settled, durable_recovery, hermetic_shell,
-    hook_gate, params, temp_dir, temp_store_path, wait_for_file_contains, write_executable,
+    append_launch_record, complete_lines, durable_recovery, hermetic_shell, hook_gate, params,
+    temp_dir, temp_store_path, wait_for_file_contains, write_executable,
 };
 use super::{ProfileChange, SessionRegistry, SessionRegistryConfig};
 use crate::agent::host::fixture::{pi_shaped_host, pi_shaped_profile_pin, PI_SHAPED_NO_CHECK};
@@ -130,13 +130,13 @@ impl Frozen {
         registry
     }
 
-    /// Creates the profile session, lets its first run exit, and drops
-    /// `registry` once that exit made its last write, so a registry or store
-    /// opened next never races the dropped one.
+    /// Creates the profile session, lets its first run exit, and shuts
+    /// `registry` down once that exit made its last write, so a registry or
+    /// store opened next never races the old one.
     async fn created_and_settled(&self, registry: SessionRegistry) -> SessionId {
-        let mut events = registry.subscribe();
         let id = self.created_and_exited(&registry).await;
-        drop_settled(registry, &mut events, &id).await;
+        let report = registry.shutdown().await;
+        assert!(report.is_quiescent(), "{report:?}");
         id
     }
 
@@ -283,7 +283,7 @@ async fn a_session_without_a_profile_freezes_no_revision_and_resumes_uncondition
         .resume(&created.id)
         .await
         .expect("a session without a profile has nothing to compare");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -301,7 +301,7 @@ async fn resume_of_an_unchanged_profile_relaunches_under_it_after_a_restart() {
         [SECRET_MARK, SECRET_MARK]
     );
     assert_eq!(frozen.frozen_revision(&id), revision, "nothing re-froze");
-    let _ = restarted.stop(&id).await;
+    restarted.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -356,9 +356,9 @@ async fn resume_of_an_edited_profile_is_refused_until_the_owner_accepts_it() {
     assert_eq!(after, current_revision(&restarted));
 
     // The re-frozen revision is durable: a restart resumes without the override.
-    let mut events = restarted.subscribe();
     restarted.stop(&id).await.expect("stop");
-    drop_settled(restarted, &mut events, &id).await;
+    let report = restarted.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     let again = frozen.restarted().await;
     again
         .resume(&id)
@@ -368,7 +368,7 @@ async fn resume_of_an_edited_profile_is_refused_until_the_owner_accepts_it() {
         frozen.wait_for_launches(3).await,
         [SECRET_MARK, "second-account", "second-account"]
     );
-    let _ = again.stop(&id).await;
+    again.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -397,7 +397,7 @@ async fn resume_of_a_deleted_profile_is_refused_even_with_the_override() {
         .resume(&id)
         .await
         .expect("the restored profile has the frozen revision");
-    let _ = restarted.stop(&id).await;
+    restarted.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -436,7 +436,7 @@ async fn a_legacy_binding_without_a_revision_needs_the_override_and_then_freezes
         Some(current_revision(&restarted)),
         "the accepted relaunch freezes the current revision"
     );
-    let _ = restarted.stop(&id).await;
+    restarted.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -498,10 +498,10 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
             .expect("a session without a profile needs no key");
         // The next configuration reconciles the same store, so this registry
         // goes only after the bare session's exit made its last write.
-        let mut events = broken.subscribe();
         let stopped = broken.stop(&bare.id).await.expect("stop the bare session");
         assert!(stopped.stopped, "the bare session was live until stopped");
-        drop_settled(broken, &mut events, &bare.id).await;
+        let report = broken.shutdown().await;
+        assert!(report.is_quiescent(), "{report:?}");
     }
     assert_eq!(
         frozen.marks(),
@@ -525,7 +525,7 @@ async fn fork_of_an_unchanged_profile_freezes_the_same_revision() {
         [SECRET_MARK, SECRET_MARK]
     );
     assert_eq!(frozen.frozen_revision(&forked.id), revision);
-    let _ = restarted.stop(&forked.id).await;
+    restarted.stop(&forked.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -567,7 +567,7 @@ async fn fork_of_an_edited_or_deleted_profile_is_refused_and_the_override_forks_
         frozen.frozen_revision(&id),
         "the source keeps its own revision"
     );
-    let _ = restarted.stop(&forked.id).await;
+    restarted.stop(&forked.id).await.expect("stop the session");
 
     frozen.delete_profile();
     for accept in [false, true] {
@@ -650,7 +650,7 @@ async fn fork_resolves_the_profile_once_so_an_edit_during_the_operation_cannot_l
         frozen.frozen_revision(&forked.id),
         frozen.frozen_revision(&id)
     );
-    let _ = restarted.stop(&forked.id).await;
+    restarted.stop(&forked.id).await.expect("stop the session");
 }
 
 fn daemon_state(registry: &SessionRegistry, transport: ControlTransport) -> DaemonState {
@@ -751,7 +751,7 @@ async fn a_local_connection_accepts_a_changed_profile_and_the_bare_id_shape_stil
         .await
         .expect("a local fork with the override");
     assert!(forked["id"].is_string(), "{forked}");
-    let _ = restarted.stop(&id).await;
+    restarted.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -810,7 +810,7 @@ async fn a_profile_added_over_the_name_of_a_bare_session_needs_the_override() {
         .await
         .expect("the owner accepts the new profile");
     assert_eq!(frozen.wait_for_launches(2).await, ["unset", "late-profile"]);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The exit of a run is observable only together with the removal of its

@@ -47,7 +47,6 @@ use crate::runtime::lifecycle::{
     journal_schema_supported, observation_live, require_supported_journal_schema, Lifecycle,
     UnsupportedJournalSchema, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
 };
-use crate::session::target::open_detector_output;
 use crate::store::{ActiveAgentOrigin, ResumeBinding, SessionWriteOutcome};
 
 // Rust guideline compliant 2026-10-12
@@ -4037,7 +4036,7 @@ impl SessionRegistry {
         let active_agent = identity_projection
             .active
             .or_else(|| active_report_from_record(&record));
-        let detector_output = match open_detector_output(&worker, &id).await {
+        let detector_output = match self.open_detector_output(&worker, &id).await {
             Ok(output) => output,
             Err(error) => {
                 return !self
@@ -4143,9 +4142,9 @@ impl SessionRegistry {
         let restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())
             .unwrap_or_else(|| default_detector_config.clone());
-        let detector_cancel = CancellationToken::new();
-        let procwatch_cancel = CancellationToken::new();
-        let runtime_watch_cancel = CancellationToken::new();
+        let detector_cancel = self.background_token();
+        let procwatch_cancel = self.background_token();
+        let runtime_watch_cancel = self.background_token();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) =
             watch::channel((record.info.rows, record.info.cols));
@@ -21698,8 +21697,13 @@ generation "$1"
                 .await
             };
             drop(stopped);
+            // The forwarding task logs the failure; read the capture only
+            // once every forward and acknowledgement in flight is done.
+            fixture.registry.settle_transactions().await;
+            let events = (released, logs.messages(), logs.trace());
+            // The worker was killed in transit, so the stop cannot succeed.
             let _ = fixture.registry.stop(&created.id).await;
-            (released, logs.messages(), logs.trace())
+            events
         }
 
         /// A release whose forward failed over a memory claim ends it, and the

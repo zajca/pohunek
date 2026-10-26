@@ -119,7 +119,7 @@ async fn info(fixture: &Fixture, digest: &PackageDigest) -> PackageInfo {
 
 /// Stops and removes `id`, which releases its pin.
 async fn end(fixture: &Fixture, id: &protocol::SessionId) {
-    let _ = fixture.registry.stop(id).await;
+    fixture.registry.stop(id).await.expect("stop the session");
     fixture
         .registry
         .remove(id)
@@ -703,6 +703,8 @@ async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_v
                 .expect("worker watch identity before restart"),
         )
     };
+    let report = v.fixture.registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     let restarted = v.fixture.reopen_with_workers().await;
     let old_reconnect = v
         .fixture
@@ -736,7 +738,11 @@ async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_v
     assert_eq!(
         adopted.runtime.as_ref().map(|runtime| runtime.state),
         Some(protocol::RuntimeState::Live),
-        "the worker of the old version is adopted, not lost; inventory: {:#?}",
+        "the worker of the old version is adopted, not lost; reason: {:?}; inventory: {:#?}",
+        adopted
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.loss_reason.as_deref()),
         inventory.entries
     );
     assert_eq!(
@@ -792,6 +798,8 @@ async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_
     install(&v.fixture, &new, true).await;
     assert_held_back(&v.fixture, &new, &v.old).await;
 
+    let report = v.fixture.registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     let restarted = v.fixture.reopen_with_workers().await;
     if let Err(error) = restarted.registry.reconcile_workers().await {
         let inventory = restarted.registry.runtime_inventory().await;
@@ -809,7 +817,11 @@ async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_
     assert_eq!(
         adopted.runtime.as_ref().map(|runtime| runtime.state),
         Some(protocol::RuntimeState::Live),
-        "the activated package session remains live after restart; worker inventory: {:#?}",
+        "the activated package session remains live after restart; reason: {:?}; worker inventory: {:#?}",
+        adopted
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.loss_reason.as_deref()),
         inventory.entries
     );
 

@@ -275,7 +275,7 @@ impl SessionRegistry {
         // authority is held by the task that computes the retained set,
         // removes the package and reloads, so a caller that stops waiting
         // cannot release it while the removal is still in flight.
-        tokio::spawn(async move {
+        self.spawn_transaction("package_uninstall", async move {
             let _exclusive = registry.inner.package_lifecycle.write().await;
             let retained = registry
                 .retained_package_digests()

@@ -273,7 +273,7 @@ impl SessionRegistry {
     {
         let context = self.package_context()?;
         let registry = self.clone();
-        tokio::spawn(async move {
+        self.spawn_transaction("package_transaction", async move {
             let _exclusive = registry.inner.package_lifecycle.write().await;
             let retained = registry
                 .retained_digests_excluding_profile(profile)
@@ -500,7 +500,7 @@ impl SessionRegistry {
         F: FnOnce(&RetainedSchemas) -> Result<T, ProtocolError> + Send + 'static,
     {
         let registry = self.clone();
-        tokio::spawn(async move {
+        self.spawn_transaction("integration_install", async move {
             let _shared = registry.inner.package_lifecycle.read().await;
             let schemas = if registry.inner.profiles.runtimes().package_store().is_none() {
                 RetainedSchemas::default()

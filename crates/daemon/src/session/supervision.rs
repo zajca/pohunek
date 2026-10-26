@@ -1252,7 +1252,7 @@ impl SessionRegistry {
             let inner = Arc::downgrade(&self.inner);
             let shutdown = self.inner.daemon_shutdown.clone();
             let initial = self.inner.config.supervision_retry_initial;
-            tokio::spawn(async move {
+            self.spawn_cooperative("supervision_retries", async move {
                 run_supervision_retries(inner, shutdown, initial).await;
             });
         }
@@ -1287,7 +1287,12 @@ impl SessionRegistry {
     async fn retry_supervised_session_isolated(&self, id: &SessionId) -> bool {
         let registry = self.clone();
         let task_id = id.clone();
-        match tokio::spawn(async move { registry.retry_supervised_session(&task_id).await }).await {
+        match self
+            .spawn_transaction("supervision_retry_pass", async move {
+                registry.retry_supervised_session(&task_id).await
+            })
+            .await
+        {
             Ok(settled) => settled,
             Err(error) => {
                 tracing::warn!(
@@ -1401,8 +1406,9 @@ impl SessionRegistry {
     /// so the session is never stranded without a re-check.
     pub(super) fn settle_abandoned_create(&self, id: SessionId, generation: Generation) {
         let registry = self.clone();
-        tokio::spawn(async move {
-            let settle = tokio::spawn(
+        self.spawn_cooperative("abandoned_create_settlement", async move {
+            let settle = registry.spawn_cooperative(
+                "abandoned_create_watch",
                 registry
                     .clone()
                     .watch_abandoned_create(id.clone(), generation.clone()),
@@ -1485,9 +1491,12 @@ impl SessionRegistry {
     /// Daemon shutdown leaves it to the next start as well.
     pub(super) fn settle_unproven_stale_job(&self, key: WorkerKey) {
         let registry = self.clone();
-        tokio::spawn(async move {
+        self.spawn_cooperative("unproven_stale_job_settlement", async move {
             let service_id = key.service_id();
-            let settle = tokio::spawn(registry.watch_unproven_stale_job(key));
+            let settle = registry.spawn_cooperative(
+                "unproven_stale_job_watch",
+                registry.clone().watch_unproven_stale_job(key),
+            );
             if let Err(error) = settle.await {
                 tracing::warn!(
                     service_id = %service_id,
