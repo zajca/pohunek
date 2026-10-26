@@ -138,13 +138,14 @@ passed, and a failing, cancelled or still pending check does not.
   `macOS package install and upgrade (macos-15)`. The `release rehearsal`
   jobs also skip every pull request from a fork and from Dependabot, so an
   outside contribution that touches the release paths never shows that
-  evidence. Workflow YAML supplied by a fork runs only as a `pull_request` run with a
-  read-only token and no repository secrets, and a fork head is never
-  dispatched, or run through `pull_request_target` or `workflow_run`, in this
-  repository. The
-  maintainer reviews the full diff, workflow files included, then re-creates
-  the change on a maintainer branch and runs the release evidence there, or
-  relies on the post-merge `main` and nightly runs before any release.
+  evidence. Workflow YAML supplied by a fork runs only as the approved
+  `pull_request` run with a read-only token and no repository secrets. A fork
+  head is never dispatched, run through a ref such as `refs/pull/<N>/head`
+  or through `pull_request_target` or `workflow_run`, or rerun by an agent in
+  this repository. The maintainer reviews the full diff, workflow files
+  included, then re-creates the change on a maintainer branch and runs the
+  release evidence there, or relies on the post-merge `main` run before any
+  release.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

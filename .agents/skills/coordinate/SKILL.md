@@ -84,11 +84,12 @@ PR. Move anything else to the next milestone with a one-line reason.
    briefing, and it posts one comment from the maintainer account that
    carries the `opus-pr-review:v1` marker for the exact head and names the
    verdict. When the author disputes a MEDIUM finding with evidence on the
-   PR, the coordinator rules on it, and the coordinator then starts the fresh
-   review at the same head that records the ruling in its `medium` count (the
-   maintainer does both when there is no coordinator; a delivering agent with
-   no manager starts that review itself, after the maintainer's ruling, per
-   `deliver-issue` Phase 5 step 1).
+   PR, the coordinator rules on it as a PR comment (the maintainer when there is no
+   coordinator). The manager (coordinator or operator) then starts the fresh
+   review at the same head that records the ruling in its `medium` count, or
+   the delivering agent does when no manager is named (`deliver-issue` Phase
+   5 step 1). Exactly one party starts it, and its briefing links the ruling
+   comment.
    After fixes, review only the delta (`git range-diff` after a rebase). A LOW finding is
    filed as an issue instead of fixed; say so in the comment.
 4. **Batch** findings from all reviewers into one fix push. Prefer one PR with
@@ -99,7 +100,10 @@ PR. Move anything else to the next milestone with a one-line reason.
 
 - Merge when the PR CI is green at the exact head, the `opus-pr-review:v1` marker by
   `zajca` names that head with `high=0` and `medium=0`, and the tier=main dispatch is green where the dispatch rules require
-  one (release workflows, packaging, SDK, dependencies, protocol window).
+  one (release workflows, packaging, SDK, dependencies, protocol window). A
+  fork head is never dispatched; the maintainer re-creates the change on its
+  own branch and dispatches that, or relies on the post-merge `main` run
+  (Fork heads in `.agents/instructions/verification.md`).
 - **Semantic check:** if `main` moved since the PR's CI base, `cargo check
   --workspace --all-targets --all-features` plus fmt on the PR merged with
   `main` before merging.
@@ -107,8 +111,8 @@ PR. Move anything else to the next milestone with a one-line reason.
   `gh pr merge --match-head-commit <head>` in one command that refuses when
   `main` moved.
 - Close the issue on merge with the PR CI run id (and dispatch id).
-- On the release clock, fire the dispatch in parallel with PR CI and cancel
-  the other on a real failure. A docs-only delta after a green dispatch keeps
+- On the release clock, fire the dispatch for a branch of this repository in
+  parallel with PR CI and cancel the other on a real failure. A docs-only delta after a green dispatch keeps
   that dispatch as evidence (verify the delta with `git diff --name-only`).
 - Merge without pausing for a `main` run: pushes to `main` drain, so every
   started main run completes and reports a verdict (#1209). A red `main` run
@@ -122,6 +126,8 @@ PR. Move anything else to the next milestone with a one-line reason.
 - A transient registry stall (an optional npm platform package skipped, a
   pinned sha mismatch right after a stalled `npm ci`) may be rerun with
   `gh run rerun --failed` at most twice; anything else stops for a diagnosis.
+  Never rerun the jobs of a fork head; only the maintainer's approved,
+  read-only `pull_request` run applies.
 - **Rate limits:** repeated 403s mean someone is polling hard. Find the
   process (`ps` for `gh run|pr|api` loops), verify its command line and age,
   and stop a clearly runaway loop by its exact PID; ask workers to poll at

@@ -115,6 +115,10 @@ the change, started by the maintainer's manager (the coordinator or operator)
 or, when no manager is named, by the delivering agent per `deliver-issue`
 Phase 5. The authoring agent never posts or imitates a marker.
 Review grants no merge authority; release remains separately authorized.
+A fork head is never dispatched, run through a ref such as
+`refs/pull/<N>/head`, or rerun by an agent in this repository; the
+`forkHeads` rule of `contributionPolicy.reviewAndIntegration` has the
+maintainer's route.
 
 Unsolicited competing pull requests remain welcome and use the same criteria.
 A reservation neither guarantees a merge nor prevents fork work; choosing a

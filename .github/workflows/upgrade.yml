@@ -23,6 +23,8 @@ name: Upgrade test
 #   runs it on any pair. The harness (script and test) always comes from the
 #   ref the workflow is dispatched on; `head_ref` selects only the source built
 #   as the upgrade target, so an older tree without the harness can be tested.
+#   `head_ref` is a branch, tag or commit of this repository, never a fork
+#   head (`refs/pull/<N>/head` or a fork commit).
 
 on:
   workflow_dispatch:
@@ -32,7 +34,7 @@ on:
         type: string
         default: latest
       head_ref:
-        description: Branch, tag or commit built as the upgrade target; empty means the ref this run was started on
+        description: Branch, tag or commit of this repository (never a fork head) built as the upgrade target; empty means the ref this run was started on
         type: string
         default: ''
   workflow_call:
@@ -42,7 +44,7 @@ on:
         type: string
         default: latest
       head_ref:
-        description: Branch, tag or commit built as the upgrade target; empty means the caller's ref
+        description: Branch, tag or commit of this repository (never a fork head) built as the upgrade target; empty means the caller's ref
         type: string
         default: ''
 

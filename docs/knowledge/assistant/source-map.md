@@ -219,7 +219,8 @@ Release packaging and contributor verification:
   package pin survives the upgrade and `resume`. `.github/workflows/upgrade.yml` runs it from
   CI (pull requests touching the daemon, worker, protocol, or CLI crates),
   from `release.yml` before any publishable binary is built, and from
-  `gh workflow run upgrade.yml -f previous_tag=<tag> -f head_ref=<ref>`.
+  `gh workflow run upgrade.yml -f previous_tag=<tag> -f head_ref=<ref>` with a
+  branch, tag or commit of this repository, never `refs/pull/*` or a fork commit.
 - `bacon.toml` — optional watcher jobs for the documented fast loops
   (`check`, `nextest-fast` on the `fast` profile, `affected`, `clippy-fast`)
   with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.

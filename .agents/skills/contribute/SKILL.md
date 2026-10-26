@@ -130,7 +130,13 @@ needs the maintainer's explicit approval. Every new head needs its own marker,
 and an interrupted run is not approval. The CI checks that must be green on
 the head are listed under
 [Required checks](../../../docs/development.md#required-checks). Review grants
-no merge authority; release is separately authorized.
+no merge authority; release is separately authorized. Apart from the
+maintainer-approved, read-only `pull_request` run, your fork head is never
+dispatched, run through a ref such as `refs/pull/<N>/head`, or rerun by an
+agent in this repository. For a pull request that needs `tier=main` or release
+evidence, the maintainer reviews the full diff, workflow files included, and
+re-creates the change on a maintainer branch or relies on the post-merge
+`main` run.
 
 For a handoff, record the issue/spec revision, current reservation and
 identity generation when applicable, exact branch/commit/PR, actual checks,

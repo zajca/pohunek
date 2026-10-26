@@ -184,10 +184,12 @@ followed by the findings. The rules:
    head. When a MEDIUM finding is a false positive, answer it with evidence
    (`path:line`, spec reference, reproduction) as a comment on the PR. The
    coordinator rules on the dispute, or the maintainer when there is no
-   coordinator, and the same party then starts the re-review after the ruling; a
-   delivering agent with no manager waits for the maintainer's ruling and then
-   starts it per step 1. The fresh review only records the ruling; it does not
-   replace the finding's evidence. A fresh independent review at
+   coordinator, as a comment on the PR. The manager (coordinator or operator)
+   then starts the re-review after the ruling; with no manager the delivering
+   agent waits for the maintainer's ruling and starts it per step 1. Exactly
+   one party starts it, and its briefing links the ruling comment so the fresh
+   session reads the ruling from the PR. The fresh review only records the
+   ruling; it does not replace the finding's evidence. A fresh independent review at
    the same head reflects the ruling in the `medium` count of its marker, and
    the latest marker for the head decides.
 3. **CI failure triage** — before changing anything:
@@ -206,12 +208,13 @@ followed by the findings. The rules:
    - Fix the root cause. A test is aligned only to the product's real
      contract (e.g. the product hook's timeout), never weakened below it.
      A pre-existing flake outside the diff gets its own issue (with root
-     cause); rerun the failed job only after that.
+     cause); rerun the failed job only after that. An agent never reruns the jobs
+     of a fork head (see Fork heads in `.agents/instructions/verification.md`).
 4. **Review findings** — for each finding of the round:
    - Verify it against the code. A false positive is answered, not coded
      around: record the evidence (`path:line`, spec/manual reference, a
-     reproduction) in the round's issue comment. A disputed MEDIUM also
-     follows the dispute path of Phase 5 step 2.
+     reproduction) in the round's issue comment. A disputed MEDIUM is
+     answered on the PR per the dispute path of Phase 5 step 2.
    - Group real findings by file ownership and dispatch them to workers
      (Phase 3 rules; resume the worker that owns the area).
    - Prefer the principled fix the finding points at over a narrow patch,
@@ -242,7 +245,10 @@ that touches release workflows or xtask release code, runtime packages or
 packaging, the TypeScript SDK, Cargo dependencies, or the protocol version
 window also needs one green `tier=main` dispatch at the final head, started
 after PR CI and the marker are green (`gh workflow run ci.yml --ref <branch>
--f tier=main`).
+-f tier=main`). A fork head is never dispatched in this repository: the
+maintainer re-creates the change on its own branch and dispatches that, or
+relies on the post-merge `main` run (Fork heads in
+`.agents/instructions/verification.md`).
 
 If the operator asked for **merge on green CI** in the invocation, merge as
 soon as the checks are green, keep watching for the head's marker, and
