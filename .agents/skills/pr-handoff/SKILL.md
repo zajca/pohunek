@@ -122,24 +122,16 @@ unpublished slices as pending.
    file afterwards). Confirm the URL, then check the initial CI status (`gh pr
    checks <n>`). Report the PR number, URL, and CI state.
 
-   **Review trigger.** The automated review runs only for a PR that carries
-   the `ai:review` label, so add it right after opening (`gh pr edit <n>
-   --add-label ai:review`; create the label first with `gh label create
-   ai:review` if the repository does not have it yet) and verify it from
-   `gh pr view <n> --json labels`. Re-apply it after every push to the PR
-   when the reviewer removed it, and never assume a review is coming for an
-   unlabeled PR. A label, review marker, or matching GitHub `commit_id` does
-   not prove that assessment completed. When checking a review, verify its
-   marker identifies this repository, PR, and exact head, its `commit_id`
-   matches that head, the API review's GitHub `state` is neither `PENDING` nor
-   `DISMISSED`, and its body affirmatively establishes that the trusted head
-   matched the checkout and the requested diff was assessed. Treat an
-   explicit head/checkout mismatch, abort, or statement that no review was
-   performed as a failed review even if the body also says there are no
-   actionable findings. Do not use such a review as an incremental baseline.
-   Use the same completed-review evidence rules as `deliver-issue` before
-   treating the review gate as satisfied; a human fallback does not establish
-   recovery of the automated service.
+   **Review gate.** No label or other trigger starts the review. The
+   maintainer's manager starts an Opus (high effort) review session for each
+   pushed head, which posts a PR conversation comment authored by `zajca`
+   that carries `<!-- opus-pr-review:v1:<repo>#<N>@<40-char head sha>:high=<h>:medium=<m>:low=<l> -->`.
+   Report the PR number and head sha to the manager. The gate holds only for a
+   marker whose author is `zajca` and whose sha is the PR's current head, with
+   `high=0` and `medium=0`; LOW-only passes and each LOW finding becomes a
+   follow-up issue. A marker for an earlier head, or from any other author,
+   does not count. `deliver-issue` Phase 5 has the watch command and the merge
+   criteria.
 6. **Update the milestone tracking.** Via the `github-workflow` skill, comment
    the ordered list of stack PR links on the milestone issue with the standard
    handoff content (branch/worktree, HEAD revision, scope covered, exact

@@ -111,12 +111,25 @@ and independent review, and an available independent reviewer examines the
 code, contract, and evidence of the exact candidate. If no independent reviewer
 is available, the candidate stays unaccepted until routing succeeds. You cannot
 supply independent approval for your own work, including through another
-session or agent. An automated review counts only under the conditions in
-`contributionPolicy.reviewAndIntegration.automatedReview` (a completed review of
-the exact head after #700, under the corrected #700/#802 contract); an
-interrupted or stale-head run is not approval, and the #817 broker's assessment
-is not independent review. Review grants no merge authority; release is
-separately authorized.
+session or agent. The technical review gate is defined in
+`contributionPolicy.reviewAndIntegration.automatedReview`; for each head of
+your pull request:
+
+1. The maintainer approves the workflow runs for that head.
+2. The maintainer's manager requests an Opus review of that head.
+3. The result arrives as a pull request comment authored by `zajca` that
+   carries the `opus-pr-review:v1` marker at the exact head. A marker from any
+   other author does not count, and no label is needed. GO is `high=0` and
+   `medium=0`; LOW-only findings pass and become follow-up issues.
+4. If no review has arrived some hours after green CI, mention the maintainer
+   on the pull request.
+
+The marker is the technical gate only: merging an outside contribution also
+needs the maintainer's explicit approval. Every new head needs its own marker,
+and an interrupted run is not approval. The CI checks that must be green on
+the head are listed under
+[Required checks](../../../docs/development.md#required-checks). Review grants
+no merge authority; release is separately authorized.
 
 For a handoff, record the issue/spec revision, current reservation and
 identity generation when applicable, exact branch/commit/PR, actual checks,

@@ -10,6 +10,10 @@ is printed for them to run.
 
 Contribution paths (`--path NAME`, repeatable; `rust` when none is given):
 
+* docs -- a documentation, skill or knowledge-source change: `rustc` at the
+  workspace MSRV and the `rustc-pin` row (`cargo xtask docs check` builds
+  and runs with the Rust toolchain; it needs no nextest and no Hermes
+  interpreter).
 * rust -- the Rust fast loops: `rustc` at the workspace MSRV
   (`[workspace.package] rust-version`), `rustc-pin`, `cargo-nextest` (every
   `cargo t`/`cargo ta` alias and the test gates run through it), `python3`
@@ -93,6 +97,9 @@ Status codes (stable; the `status` of every row in `--json`):
 * not-compared -- a pin row whose dependency row fails; it never fails.
 * toolchain-not-installed -- a rustup proxy's active toolchain is absent.
 * unset -- a required environment variable is unset or empty.
+* config-error -- the row cannot be checked because a repository input it
+  reads is unusable (the Hermes row when the CI workflow or its composite
+  action does not provide the pins). It fails only that row.
 * unavailable -- a native facility this host should provide is not usable
   (no systemd user manager, no launchd `gui/<uid>` domain).
 * ci-only -- see the category above; it never fails.
@@ -120,8 +127,11 @@ includes `pohunek-cli`, cannot pass without it. It is searched the way
 canonical, passes the runtime file policy (owned by root or the current user,
 no group/other write bit on the file or any ancestor, executable), is Python
 >= 3.10 and imports `yaml` wins. The printed fix mirrors the `Require the
-Hermes test interpreter` step of `.github/workflows/ci.yml` and takes the
-Python and PyYAML versions from it.
+Hermes test interpreter` step of `.github/actions/hermes-test-python/action.yml`
+(the composite action `.github/workflows/ci.yml` calls) and takes the Python
+and PyYAML versions from it. When the workflow does not call the action or
+the action does not pin them, the row reports `config-error` and fails; no
+other row or path is affected.
 
 `--json` prints exactly one JSON document on stdout and nothing else there:
 `schema` (`pohunek.dev-bootstrap`), `version` (1), `paths`, `strict`, `os`
@@ -151,9 +161,7 @@ its value.
 Exit status: 0 when every row that counts passes, 1 otherwise, 2 on an
 unsupported `--path`, an internal error under `--json`, or a configuration
 error (Python without `tomllib`, a malformed `Cargo.toml` MSRV, an unreadable
-`.config/nextest.toml`, an unreadable `.github/workflows/ci.yml` or one that
-no longer pins `uv python install` and `pyyaml==` for the Hermes test
-interpreter, a missing or malformed `rust-toolchain.toml` channel, or for the
+`.config/nextest.toml`, a missing or malformed `rust-toolchain.toml` channel, or for the
 sdk path a missing, malformed or disagreeing `.bun-version` /
 `package.json` pin). A path's repository inputs are read only when it is
 selected.
@@ -183,6 +191,11 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[1]
 NEXTEST_CONFIG = Path(".config") / "nextest.toml"
 CI_WORKFLOW = Path(".github") / "workflows" / "ci.yml"
+# The composite action CI jobs use to provision the Hermes test interpreter;
+# it holds the Python and PyYAML pins, and the workflow must call it.
+HERMES_ACTION_DIR = Path(".github") / "actions" / "hermes-test-python"
+HERMES_ACTION = HERMES_ACTION_DIR / "action.yml"
+HERMES_ACTION_USE = "uses: ./" + HERMES_ACTION_DIR.as_posix()
 TOOLCHAIN_FILE = Path("rust-toolchain.toml")
 BUN_VERSION_FILE = Path(".bun-version")
 PACKAGE_JSON = Path("package.json")
@@ -237,6 +250,11 @@ HERMES_TOOL_NAME = "hermes-test-python"
 # developer and not group/other writable, because the runtime policy rejects
 # shared interpreter trees (Homebrew, framework installs).
 HERMES_PRIVATE_ROOT = '"${XDG_DATA_HOME:-$HOME/.local/share}/pohunek/hermes-test-python"'
+# Fix of the Hermes row when the CI pins cannot be read.
+HERMES_PINS_FIX = (
+    f"restore the `uv python install` and `pyyaml==` pins in {HERMES_ACTION.as_posix()} "
+    f"and the `{HERMES_ACTION_USE}` step in {CI_WORKFLOW.as_posix()}"
+)
 # Line prefix of a fix in the report; continuation lines of a multi-line fix
 # align under its first line.
 FIX_PREFIX = "           fix: "
@@ -345,7 +363,7 @@ GATES_SKILL = ".agents/skills/gates/SKILL.md"
 # or changing what a value means, bumps the version.
 SCHEMA = "pohunek.dev-bootstrap"
 SCHEMA_VERSION = 1
-PATHS = ("rust", "sdk", "scripts", "macos-lint", "relay-db", "native")
+PATHS = ("docs", "rust", "sdk", "scripts", "macos-lint", "relay-db", "native")
 DEFAULT_PATHS = ("rust",)
 ERROR_UNSUPPORTED_PATH = "unsupported-path"
 ERROR_CONFIG = "config-error"
@@ -395,6 +413,7 @@ PIN_MISMATCH = "pin-mismatch"
 NOT_COMPARED = "not-compared"
 TOOLCHAIN_NOT_INSTALLED = "toolchain-not-installed"
 UNSET = "unset"
+CONFIG_ERROR_STATUS = "config-error"
 UNAVAILABLE = "unavailable"
 CI_ONLY = "ci-only"
 NOT_APPLICABLE = "not-applicable"
@@ -690,9 +709,9 @@ def python_tool():
     )
 
 
-def rust_tools(root, system):
-    """The rust path: the Rust fast loops, required first."""
-    checked = [
+def rustc_tools(root):
+    """The `rustc` row at the workspace MSRV and its `rustc-pin` row."""
+    return [
         Tool(
             name="rustc",
             version_args=("--version",),
@@ -709,6 +728,18 @@ def rust_tools(root, system):
             pin_of="rustc",
             pin_source=str(TOOLCHAIN_FILE),
         ),
+    ]
+
+
+def docs_tools(root, system):
+    """The docs path: the toolchain `cargo xtask docs check` builds and runs with."""
+    return rustc_tools(root)
+
+
+def rust_tools(root, system):
+    """The rust path: the Rust fast loops, required first."""
+    checked = [
+        *rustc_tools(root),
         Tool(
             name="cargo-nextest",
             version_args=("--version",),
@@ -721,14 +752,7 @@ def rust_tools(root, system):
         # Required although it is not on the path of every crate: the
         # `pohunek-cli` Hermes tests fail without it, so the documented
         # workspace gate (`cargo nextest run --workspace`) cannot pass.
-        Tool(
-            name=HERMES_TOOL_NAME,
-            version_args=(),
-            min_version=HERMES_PYTHON_MIN_VERSION,
-            required=True,
-            manual=hermes_python_fix(root),
-            probe=check_hermes_interpreter,
-        ),
+        hermes_tool(root),
         Tool(
             name="bacon",
             version_args=("--version",),
@@ -929,6 +953,7 @@ def native_tools(root, system):
 
 
 PATH_TOOLS = {
+    "docs": docs_tools,
     "rust": rust_tools,
     "sdk": sdk_tools,
     "scripts": scripts_tools,
@@ -944,6 +969,13 @@ FINAL_GATES = Check(
     f'the "Core gate set" in {GATES_SKILL}, run once on the final revision; '
     f"{VERIFICATION_DOC} is the full inventory and wins over that summary",
 )
+FINAL_DOCS_GATES = Check(
+    FINAL, None,
+    f'the "Core gate set" in {GATES_SKILL}, run once on the final revision; a '
+    "change that only touches documentation needs just its `cargo xtask docs "
+    "check`, and any other gate of the set needs the rust path; "
+    f"{VERIFICATION_DOC} is the full inventory and wins over that summary",
+)
 FINAL_SDK_GATES = Check(
     FINAL, None,
     f'the "When the change touches the SDK workspace" section of {GATES_SKILL}, '
@@ -957,6 +989,16 @@ FINAL_SDK_GATES = Check(
 # produce. A native suite is a focused check on the OS that runs it; on other
 # OSes the `ci-only` row of the native path already names its CI job.
 PATH_CHECKS = {
+    "docs": (
+        Check(
+            FOCUSED, "cargo xtask docs check",
+            "the knowledge bundle (schema, drift, source map, runbooks, "
+            "secrets), the doc commands against the clap tree, the crate "
+            "table, the package lists and the doc index; it needs only the "
+            "Rust toolchain, not nextest or the Hermes interpreter",
+        ),
+        FINAL_DOCS_GATES,
+    ),
     "rust": (
         Check(
             FOCUSED, "cargo xtask affected",
@@ -1243,30 +1285,45 @@ def version_result(tool, argv, path, runner):
     return Result(tool, OK, version=version, path=path, prerelease=prerelease)
 
 
-def read_ci_workflow(root):
-    """The text of the CI workflow that provisions the Hermes test interpreter."""
-    path = Path(root) / CI_WORKFLOW
+def read_repository_file(root, relative):
+    """The text of one repository file that provisions the Hermes interpreter."""
+    path = Path(root) / relative
     try:
         return path.read_text()
     except OSError as error:
         raise ConfigError(f"cannot read {path}: {error}") from error
 
 
-def hermes_python_fix(root):
-    """The uv commands of the CI `Require the Hermes test interpreter` step.
+def hermes_pins(root):
+    """`(python, pyyaml)` as the CI workflow and its composite action install them.
 
-    The Python minor release and the PyYAML pin are read from the workflow, so
-    the printed fix cannot drift from what CI installs.
+    The workflow must call the composite action; the action holds the pins.
     """
-    workflow = read_ci_workflow(root)
-    python = re.search(r"uv python install (\d+(?:\.\d+)*)", workflow)
-    pyyaml = re.search(r"pyyaml==(\d[0-9A-Za-z.]*)", workflow)
+    workflow = read_repository_file(root, CI_WORKFLOW)
+    if not re.search(
+        rf"^\s*(?:-\s+)?{re.escape(HERMES_ACTION_USE)}\s*$", workflow, re.MULTILINE
+    ):
+        raise ConfigError(
+            f"{Path(root) / CI_WORKFLOW} does not call {HERMES_ACTION_DIR.as_posix()}"
+        )
+    action = read_repository_file(root, HERMES_ACTION)
+    python = re.search(r"uv python install (\d+(?:\.\d+)*)", action)
+    pyyaml = re.search(r"pyyaml==(\d[0-9A-Za-z.]*)", action)
     if python is None or pyyaml is None:
         raise ConfigError(
-            f"{Path(root) / CI_WORKFLOW} no longer pins `uv python install` and "
+            f"{Path(root) / HERMES_ACTION} does not pin `uv python install` and "
             "`pyyaml==` for the Hermes test interpreter"
         )
-    version, pin = python.group(1), pyyaml.group(1)
+    return python.group(1), pyyaml.group(1)
+
+
+def hermes_python_fix(root):
+    """The uv commands of the `hermes-test-python` composite action.
+
+    The Python minor release and the PyYAML pin are read from the action, so
+    the printed fix cannot drift from what CI installs.
+    """
+    version, pin = hermes_pins(root)
     return "\n".join([
         "install uv (https://docs.astral.sh/uv/), then run:",
         f"private_root={HERMES_PRIVATE_ROOT}",
@@ -1281,6 +1338,30 @@ def hermes_python_fix(root):
         'find "$private_root" -not -type l -exec chmod go-w {} +',
         'export POHUNEK_PYTHON_BIN="$python_bin"   # add to your shell profile',
     ])
+
+
+def hermes_tool(root):
+    """The Hermes interpreter row; unreadable CI pins fail this row only."""
+    try:
+        manual = hermes_python_fix(root)
+    except ConfigError as error:
+        problem = str(error)
+        return Tool(
+            name=HERMES_TOOL_NAME,
+            version_args=(),
+            min_version=HERMES_PYTHON_MIN_VERSION,
+            required=True,
+            manual=HERMES_PINS_FIX,
+            probe=lambda tool, host: Result(tool, CONFIG_ERROR_STATUS, detail=problem),
+        )
+    return Tool(
+        name=HERMES_TOOL_NAME,
+        version_args=(),
+        min_version=HERMES_PYTHON_MIN_VERSION,
+        required=True,
+        manual=manual,
+        probe=check_hermes_interpreter,
+    )
 
 
 def hermes_candidates(environ):
@@ -1688,6 +1769,8 @@ def describe(result, strict, cargo_bin):
         what = f"{tool.name} is unset" + (f" ({result.detail})" if result.detail else "")
     elif result.status == UNAVAILABLE:
         what = f"{tool.name} is unavailable: {result.detail}"
+    elif result.status == CONFIG_ERROR_STATUS:
+        what = f"{tool.name} cannot be checked: {result.detail}"
     else:
         what = f"{tool.name} version unknown: {result.detail}"
     fix = fix_hint(result, cargo_bin).replace("\n", "\n" + " " * len(FIX_PREFIX))

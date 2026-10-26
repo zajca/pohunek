@@ -48,7 +48,7 @@ of your contribution path and run the fixes it prints:
 
 ```bash
 git clone https://github.com/zajca/pohunek.git && cd pohunek
-scripts/dev-bootstrap --path rust          # rust, sdk, scripts, macos-lint, relay-db, native; repeatable
+scripts/dev-bootstrap --path rust          # docs, rust, sdk, scripts, macos-lint, relay-db, native; repeatable
 scripts/dev-bootstrap --json --path sdk    # one versioned JSON document, for agents
 ```
 
@@ -57,6 +57,11 @@ step that fixes it. It needs `python3` >= 3.11 itself (`tomllib`). With an
 explicit `--path`, the report also lists that path's focused checks, a
 pointer to the final gates, and the CI jobs that hold the evidence this host
 cannot produce (`checks` in `--json`).
+
+A documentation, skill or knowledge-source change has its own path:
+`scripts/dev-bootstrap --path docs` checks only the Rust toolchain that
+`cargo xtask docs check` builds and runs with, so it needs no nextest and no
+Hermes interpreter.
 
 Worktrees: `scripts/worktree-new <slug>` creates `pohunek-worktrees/<slug>`
 beside the primary checkout on the branch `zajca/<slug>` (`--branch NAME`
@@ -71,6 +76,7 @@ this table and prints a note per check):
 
 | Path | Focused checks | CI-only evidence |
 |------|----------------|------------------|
+| `docs` | `cargo xtask docs check` | — |
 | `rust` | `cargo xtask affected` (`cargo ta`), `cargo t -p <crate>` | — |
 | `sdk` | `bun install --frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, `bun test sdk/ts/scripts` | `SDK workspace (macOS arm64)`, off macOS |
 | `scripts` | `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` (one file: `-p test_<name>.py`) | — |
@@ -101,6 +107,41 @@ runs the `dev-bootstrap` scenarios and this native check on the macOS runner.
 The `macOS tier packages (arm64)` job runs the macOS tests of the packages the
 lane does not, on main and nightly only; `scripts/test-partitions` documents
 the selections.
+
+## Required checks
+
+The repository has no branch ruleset, so the required set is what CI itself
+decides, listed here by the check names of `.github/workflows/ci.yml`. A pull
+request head is ready when every check on it is green: a check the workflow
+skips by its own paths filter, narrowed selection or docs-only path counts as
+passed, and a failing, cancelled or still pending check does not.
+
+- `test selection verdict` is the aggregate. It fails when a test job, a gate
+  job, the macOS lane or the Hermes macOS job that the selection requires did
+  not pass. Its `needs` are `required jobs (paths filter)`, `test selection`,
+  `test selection check`, `build tests (nextest archive)`, the fast shards (`tests (<shard>, fast)`),
+  `tests (heavy, PTY + Hermes)`, `tests (relay DB, PostgreSQL)`,
+  `fmt + clippy`, `macOS lint from Linux (aarch64-apple-darwin clippy)`,
+  `doctests`, `build bins (pohunekd + pohunek-sessiond + pohunek)`,
+  `SDK workspace`, `cargo-audit (RustSec advisories)`,
+  `cargo-shear (unused dependencies)`, `platform contracts (arm64)`,
+  `macOS release daemon build (macos-15)` and
+  `pinned Hermes compatibility (macOS arm64, model-free)`.
+- These jobs decide the pull request by their own result, outside the
+  verdict: `docs check (schema + drift + source-map + runbooks + secrets +
+  release)`, `package version bump`, `runtime package selection` with
+  `pinned Hermes compatibility (model-free)` and the Pi, Codex and Claude Code
+  runtime package jobs, `real systemd supervision`, and the paths-filtered
+  `TS binding drift (xs check)`, `upgrade from the previous release`,
+  `release build`, `cargo-hack (feature powerset)`, the `release rehearsal`
+  jobs, `SDK workspace (macOS arm64)` and
+  `macOS package install and upgrade (macos-15)`.
+
+Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
+comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the
+route is in the [contribution workflow](../.agents/skills/contribute/SKILL.md)),
+and an outside contribution is merged only with the maintainer's explicit
+approval on top of both.
 
 ## Gates
 
