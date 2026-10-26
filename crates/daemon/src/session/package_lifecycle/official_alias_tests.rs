@@ -5950,6 +5950,7 @@ async fn listing_sessions_of_one_package_verifies_its_root_once_per_runtime_sour
 
     assert_eq!(all.len(), ids.len());
     assert!(all.iter().all(|info| info.capabilities.resume));
+    assert!(one_session > 0, "the listing verifies the package root");
     assert_eq!(
         all_sessions, one_session,
         "the listing cost does not grow with the number of sessions"
