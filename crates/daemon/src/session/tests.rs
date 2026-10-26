@@ -1644,9 +1644,9 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
 /// registry writes nothing more for the exit. After a `stop`, the watcher
 /// that lost the commit to the stop writes nothing, but it can still be
 /// inside its own `record_exit`, holding the registry and reading the store.
-/// After a stop a test uses [`drop_settled`] to open another registry or
-/// `Store` over the same file, or [`stop_settled`] to keep writing through
-/// this registry.
+/// After a stop a test calls `SessionRegistry::shutdown` on the registry before
+/// it opens another registry or `Store` over the same file, or uses
+/// [`stop_settled`] to keep writing through this registry.
 ///
 /// `events` must be subscribed before the exit commits, or its terminal event
 /// is never received.
@@ -1703,39 +1703,6 @@ pub(super) async fn stop_settled(
         || {
             let quiet = Arc::strong_count(&registry.inner) == 1;
             async move { quiet.then_some(()) }
-        },
-    )
-    .await;
-}
-
-/// Drops `registry` once nothing of it can write the store any more.
-///
-/// Waits for the terminal event of session `id` as [`exit_settled`] does, then
-/// drops `registry` and waits until every task holding a handle to it has
-/// ended, which includes an exit watcher that lost the commit to a stop. A
-/// registry or `Store` opened next over the same file then races no write of
-/// this one.
-///
-/// Every session of `registry` must have ended and the caller must hold no
-/// other handle to it, or its tasks never let it go.
-///
-/// # Panics
-///
-/// Panics as [`exit_settled`] does, and when the registry is still held after
-/// [`HANG_GUARD`].
-pub(super) async fn drop_settled(
-    registry: SessionRegistry,
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
-    id: &SessionId,
-) {
-    exit_settled(events, id).await;
-    let state = Arc::downgrade(&registry.inner);
-    drop(registry);
-    wait_until(
-        &format!("the tasks of the registry of session {} to end", id.0),
-        || {
-            let released = state.upgrade().is_none();
-            async move { released.then_some(()) }
         },
     )
     .await;
@@ -12821,7 +12788,7 @@ async fn quiet_sessions_with_a_stable_tree_are_scanned_at_the_backoff_rate_off_t
 
     tokio::time::resume();
     for session in &created {
-        let _ = registry.stop(&session.id).await;
+        registry.stop(&session.id).await.expect("stop the session");
     }
 }
 
@@ -12874,7 +12841,7 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
         "the working transition triggers a scan without waiting for the backoff"
     );
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12926,7 +12893,7 @@ async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
         "a child started under a quiet session is observed within {BACKOFF_CEILING:?}"
     );
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Two scans of one session never overlap: the second collects after the
@@ -12983,7 +12950,7 @@ async fn overlapping_scans_of_one_session_arm_one_exit_watch_per_observation() {
     second.await.expect("second scan joins");
 
     assert_eq!(inspector.exit_watch_count(DESCENDANT_WRAPPER_PID), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -14766,7 +14733,7 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             .await;
         registry.settled(&created.id).await;
         assert_wrapper_replaces_bound_claim(&registry, &created.id, &format!("{order:?}")).await;
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -19326,7 +19293,9 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         .stop(&created.id)
         .await
         .expect("stop original session after snapshot capture");
-    drop_settled(registry, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     fs::write(&marker_v1, "").expect("clear v1 marker");
     fs::write(
         agents_dir.join("editable.toml"),
@@ -22524,7 +22493,9 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
     registry.stop(&created.id).await.expect("stop session");
     let worktree = created.worktree_path.clone().expect("bound worktree");
     registry.begin_daemon_shutdown();
-    drop_settled(registry, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     // The daemon died after the worker ran, before it committed the create:
     // the worker still serves the final output of the ended runtime.
     let mut record = stored_record(&daemon.store_path, &created.id);
@@ -24834,7 +24805,9 @@ async fn durable_bindings_without_a_live_session_still_retain_the_package() {
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
-    drop_settled(first, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = first.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
 
     // A registry that holds no session in memory reads the same durable store.
     let second = packaged.registry(&store_path);
@@ -24866,7 +24839,9 @@ async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_sessio
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
-    drop_settled(first, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = first.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
 
     let second = packaged.registry(&store_path);
     let daemon = second.retained_package_digests().await.expect("retained");

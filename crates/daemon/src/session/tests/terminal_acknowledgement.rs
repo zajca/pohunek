@@ -9,8 +9,8 @@ use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState};
 use protocol::{SessionId, SessionInfo, SessionState};
 
 use super::{
-    drop_settled, exit_settled, native_report_params, params, resumable_params, scripted_registry,
-    stored_record, temp_agents_dir_with, temp_dir, wait_until, RestartableDaemon,
+    exit_settled, native_report_params, params, resumable_params, scripted_registry, stored_record,
+    temp_agents_dir_with, temp_dir, wait_until, RestartableDaemon,
 };
 use crate::runtime::lifecycle::tests::{InspectStep, JobScript, LogCapture, ScriptedSupervisor};
 use crate::session::{RuntimeHandle, SessionRegistry, SessionRegistryConfig, ShellCommand};
@@ -255,7 +255,9 @@ async fn terminal_race_acknowledges_once() {
     let supervisor = Arc::clone(&rig.supervisor);
     let service_id = rig.service_id.clone();
     let store_path = rig.daemon.store_path.clone();
-    drop_settled(rig.registry, &mut events, &id).await;
+    exit_settled(&mut events, &id).await;
+    let report = rig.registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
 
     assert_eq!(
         supervisor.retired(),
