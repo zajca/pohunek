@@ -239,6 +239,12 @@ fn a_command_targeting_an_exact_id_never_asks_for_the_unfiltered_list() {
 fn a_command_targeting_a_display_name_falls_back_to_the_unfiltered_list() {
     let run = run_session_command(&["screen", SESSION_NAME, "--json"]);
 
+    assert_eq!(run.lists.len(), 2, "{:?}", run.lists);
+    assert_eq!(
+        run.lists[0]["filters"],
+        json!([{"key": "id", "value": SESSION_NAME}]),
+        "the id-filtered lookup comes first"
+    );
     let full = run
         .lists
         .last()

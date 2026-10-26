@@ -1355,9 +1355,8 @@ pub(crate) struct TurnWaitArgs {
 /// Wait for the next turn event of `targets`, which share one host.
 ///
 /// Exact ids are confirmed by an id-filtered `session.list`, and display names
-/// resolve through one unfiltered `session.list`; the
-/// wait itself runs on a dedicated connection and ends early on a process
-/// signal. Every completion reason, a timeout included, is a success.
+/// resolve through one unfiltered `session.list`. The wait ends early on a
+/// process signal. Every completion reason, a timeout included, is a success.
 pub(crate) async fn run_wait_turn(
     host: &str,
     paths: &Paths,
