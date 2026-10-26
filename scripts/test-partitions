@@ -106,13 +106,14 @@ MACOS_BUCKETS = {
             "(package(=xtask) and test(/(^|::)changed_files_scenario_under_ambient_git_variables$/))",
         )),
     ),
-    # Maintenance tools that print or rewrite a checked-in file. A developer runs
+    # Maintenance tools that print or rewrite a checked-in file. Every xtask
+    # `survey_*` / `regenerate_*` test belongs here. A developer runs
     # them by hand with `--run-ignored only` (the Claude screen captures also
     # need POHUNEK_CLAUDE_CAPTURE_DIR and egress); no CI job does.
     "manual": Bucket(
         ("xtask", "pohunek-cli"),
         " or ".join((
-            "(package(=xtask) and test(/(^|::)(survey_hermetic_violations|regenerate_allow_list|regenerate_timing_baseline)$/))",
+            "(package(=xtask) and test(/(^|::)(survey|regenerate)_[a-z0-9_]+$/))",
             "(package(=pohunek-cli) and binary(=all) and test(/^claude_package::capture_the_real_claude_/))",
         )),
     ),
