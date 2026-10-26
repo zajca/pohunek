@@ -44,6 +44,9 @@ const SESSION_ID: &str = "s-pin-session-1";
 /// Requests the fixture daemon served, by method, in arrival order.
 type Served = Arc<Mutex<Vec<String>>>;
 
+/// Params of the `session.list` requests the fixture daemon served.
+type ListParams = Arc<Mutex<Vec<Value>>>;
+
 fn session() -> Value {
     json!({
         "id": SESSION_ID,
@@ -71,17 +74,18 @@ fn result_for(request: &Request) -> Value {
     }
 }
 
-fn serve(listener: TcpListener, served: Served) {
+fn serve(listener: TcpListener, served: Served, lists: ListParams) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let served = Arc::clone(&served);
-            thread::spawn(move || serve_connection(stream, &served));
+            let lists = Arc::clone(&lists);
+            thread::spawn(move || serve_connection(stream, &served, &lists));
         }
     });
 }
 
-fn serve_connection(stream: TcpStream, served: &Served) {
+fn serve_connection(stream: TcpStream, served: &Served, lists: &ListParams) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -94,6 +98,12 @@ fn serve_connection(stream: TcpStream, served: &Served) {
             .lock()
             .expect("served requests")
             .push(request.method().to_owned());
+        if request.method() == protocol::method::SESSION_LIST {
+            lists
+                .lock()
+                .expect("served list params")
+                .push(request.params().clone());
+        }
         let response = Response::ok(PROTOCOL_VERSION, request.id(), result_for(&request))
             .expect("valid fixture response");
         writeln!(
@@ -109,6 +119,7 @@ fn serve_connection(stream: TcpStream, served: &Served) {
 /// overlay addresses the CLI dialed.
 struct Run {
     served: Vec<String>,
+    lists: Vec<Value>,
     dialed: Vec<String>,
     diagnostics: String,
 }
@@ -147,7 +158,8 @@ fn run_session_command(args: &[&str]) -> Run {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
     let port = listener.local_addr().expect("fixture address").port();
     let served = Served::default();
-    serve(listener, Arc::clone(&served));
+    let lists = ListParams::default();
+    serve(listener, Arc::clone(&served), Arc::clone(&lists));
 
     let output = env
         .command(pohunek_test_support::bin_exe("pohunek"))
@@ -165,9 +177,11 @@ fn run_session_command(args: &[&str]) -> Run {
         String::from_utf8_lossy(&output.stderr)
     );
     let served = served.lock().expect("served requests").clone();
+    let lists = lists.lock().expect("served list params").clone();
     let dialed = pin_overlay::dialed_ips(&capture);
     Run {
         served,
+        lists,
         dialed,
         diagnostics,
     }
@@ -192,6 +206,54 @@ fn assert_pinned(label: &str, args: &[&str], method: &str) {
         run.dialed.iter().all(|ip| ip == FIRST_IP),
         "{label}: no connection follows the name to the second peer: {:?}",
         run.dialed
+    );
+}
+
+#[test]
+fn a_command_targeting_an_exact_id_never_asks_for_the_unfiltered_list() {
+    let run = run_session_command(&["screen", SESSION_ID, "--json"]);
+
+    assert!(
+        run.served
+            .iter()
+            .any(|served| served == protocol::method::SESSION_SCREEN),
+        "the screen request reached the daemon: {:?} ({})",
+        run.served,
+        run.diagnostics
+    );
+    assert!(
+        !run.lists.is_empty(),
+        "the target was confirmed with session.list ({})",
+        run.diagnostics
+    );
+    for params in &run.lists {
+        assert_eq!(
+            params["filters"],
+            json!([{"key": "id", "value": SESSION_ID}]),
+            "an exact id resolves through an id-filtered request: {params}"
+        );
+    }
+}
+
+#[test]
+fn a_command_targeting_a_display_name_falls_back_to_the_unfiltered_list() {
+    let run = run_session_command(&["screen", SESSION_NAME, "--json"]);
+
+    let full = run
+        .lists
+        .last()
+        .is_some_and(|params| params["filters"].as_array().is_none_or(Vec::is_empty));
+    assert!(
+        full,
+        "a name is resolved from the full list: {:?} ({})",
+        run.lists, run.diagnostics
+    );
+    assert!(
+        run.served
+            .iter()
+            .any(|served| served == protocol::method::SESSION_SCREEN),
+        "{:?}",
+        run.served
     );
 }
 

@@ -260,12 +260,50 @@ pub(crate) async fn resolve_target_pinned(
 
 async fn resolve_target_on(client: Client, target: &Target) -> Result<Target, CliError> {
     let mut sdk = client.into_sdk();
+    let mut resolved = resolve_targets_via(&mut sdk, std::slice::from_ref(target)).await?;
+    Ok(resolved.remove(0))
+}
+
+/// Resolves `targets` to stable session ids on the host `sdk` is connected to.
+///
+/// A target that is an exact session id is confirmed by a request filtered to
+/// that id, which makes the daemon read one session instead of enriching every
+/// stored one. Only targets no id matches (display names, unknown values) share
+/// one unfiltered list.
+async fn resolve_targets_via(
+    sdk: &mut pohunek_client::Client,
+    targets: &[Target],
+) -> Result<Vec<Target>, CliError> {
+    let mut resolved: Vec<Option<Target>> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let matches = sdk
+            .call::<protocol::method::SessionList>(SessionListParams {
+                filters: vec![SessionListFilter::Id(target.session_id.clone())],
+            })
+            .await?;
+        resolved.push(
+            matches
+                .iter()
+                .any(|session| session.id.0 == target.session_id)
+                .then(|| target.clone()),
+        );
+    }
+    if resolved.iter().all(Option::is_some) {
+        return Ok(resolved.into_iter().flatten().collect());
+    }
     let sessions = sdk
         .call::<protocol::method::SessionList>(SessionListParams {
             filters: Vec::new(),
         })
         .await?;
-    resolve_target_from_sessions(target, &sessions)
+    targets
+        .iter()
+        .zip(resolved)
+        .map(|(target, known)| match known {
+            Some(target) => Ok(target),
+            None => resolve_target_from_sessions(target, &sessions),
+        })
+        .collect()
 }
 
 fn resolve_target_from_sessions(
@@ -1316,7 +1354,8 @@ pub(crate) struct TurnWaitArgs {
 
 /// Wait for the next turn event of `targets`, which share one host.
 ///
-/// Display names resolve to session ids with one `session.list` request; the
+/// Exact ids are confirmed by an id-filtered `session.list`, and display names
+/// resolve through one unfiltered `session.list`; the
 /// wait itself runs on a dedicated connection and ends early on a process
 /// signal. Every completion reason, a timeout included, is a success.
 pub(crate) async fn run_wait_turn(
@@ -1349,18 +1388,11 @@ pub(crate) async fn run_wait_turn(
             .collect(),
     )?;
     let mut sdk = Client::connect(host, paths).await?.into_sdk();
-    let sessions = sdk
-        .call::<protocol::method::SessionList>(SessionListParams {
-            filters: Vec::new(),
-        })
-        .await?;
-    let session_ids = targets
-        .iter()
-        .map(|target| {
-            resolve_target_from_sessions(target, &sessions)
-                .map(|target| SessionId(target.session_id))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let session_ids = resolve_targets_via(&mut sdk, targets)
+        .await?
+        .into_iter()
+        .map(|target| SessionId(target.session_id))
+        .collect::<Vec<_>>();
     // Two targets can name one session, for example its id and its display name.
     let params = params(session_ids)?;
     let result = cancellable(sdk.session_wait_turn(params)).await?;
