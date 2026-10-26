@@ -832,6 +832,9 @@ impl<T> StoreMutation<T> {
 pub struct Store {
     path: PathBuf,
     write_lock: Mutex<()>,
+    /// Rejected lines already warned about, so a line that stays in the store
+    /// warns once per process rather than on every read.
+    warned_rejected: Mutex<std::collections::HashSet<String>>,
     #[cfg(test)]
     fail_parent_sync_after_rename: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -849,6 +852,7 @@ impl Store {
         Self {
             path,
             write_lock: Mutex::new(()),
+            warned_rejected: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -975,7 +979,7 @@ impl Store {
             return Ok(Vec::new());
         };
         let lines = self.checked_lines(&content)?;
-        Ok(partition_lines_logged(lines).1)
+        Ok(self.partition_logged(lines).1)
     }
 
     /// Upserts one logical session and preserves every other record kind.
@@ -1523,7 +1527,26 @@ impl Store {
             return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         };
         let lines = self.checked_lines(&content)?;
-        Ok(partition_lines_logged(lines).0)
+        Ok(self.partition_logged(lines).0)
+    }
+
+    /// [`partition_lines_logged`] that warns about each distinct rejected line
+    /// once per store instance.
+    fn partition_logged(
+        &self,
+        lines: Vec<schema::ParsedLine<'_>>,
+    ) -> (StoreRecords, Vec<RejectedLine>) {
+        let partitioned = partition_lines(lines);
+        let mut warned = self
+            .warned_rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for line in &partitioned.1 {
+            if warned.insert(line.text.clone()) {
+                warn_rejected(line);
+            }
+        }
+        partitioned
     }
 
     /// The raw text of every line no loader accepts, in file order. A missing
@@ -1541,7 +1564,8 @@ impl Store {
     }
 
     /// Serialize all records (resume, then worktree, then project, then session)
-    /// and every line no loader accepts, unchanged and in file order, to a temp
+    /// and every line no loader accepts, unchanged and in file order (each ends
+    /// in `\n`, whatever terminator it had), to a temp
     /// file and rename it over the store path. One `rename(2)` commits all kinds.
     ///
     /// The rejected lines are read again here, under the write lock every caller
@@ -1961,22 +1985,27 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
     ((resume, worktrees, projects, sessions), rejected)
 }
 
-/// [`partition_lines`] that warns once per skipped line.
+/// [`partition_lines`] that warns for every skipped line.
+fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<RejectedLine>) {
+    let partitioned = partition_lines(lines);
+    for line in &partitioned.1 {
+        warn_rejected(line);
+    }
+    partitioned
+}
+
+/// Warns about one skipped line.
 ///
 /// The store holds no secrets, so logging the offending line is safe and aids
 /// debugging. The line stays in the store and every rewrite re-emits it
 /// unchanged; remove it from the store file, or move the file aside, to stop
 /// the warning.
-fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<RejectedLine>) {
-    let partitioned = partition_lines(lines);
-    for line in &partitioned.1 {
-        warn!(
-            reason = %line.reason,
-            line = %line.text,
-            "skipping a metadata-store line this build cannot load; the line stays in the store unchanged, remove it from the file to stop this warning"
-        );
-    }
-    partitioned
+fn warn_rejected(line: &RejectedLine) {
+    warn!(
+        reason = %line.reason,
+        line = %line.text,
+        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged, remove it from the file to stop this warning"
+    );
 }
 
 /// Record kinds that never hold a session.
