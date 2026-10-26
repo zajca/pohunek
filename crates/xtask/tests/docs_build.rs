@@ -7,8 +7,8 @@ use xtask::{build_docs, build_site, validate_docs, BuildOptions, SiteOptions};
 // guides, runbooks, safety rules, the source map, and the system prompt) plus
 // the reserved `index.md` and `log.md` files. The counts are exact so adding or
 // removing a checked Markdown file needs an intentional update here.
-const COMMITTED_KNOWLEDGE_FILES: usize = 38;
-const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 36;
+const COMMITTED_KNOWLEDGE_FILES: usize = 39;
+const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 37;
 
 #[test]
 fn validate_docs_reports_committed_bundle() {

@@ -7,6 +7,9 @@
 //! - The fact checks hold the crate table of `docs/development.md` to the
 //!   workspace members, the official package lists and counts of the user docs
 //!   to `runtime-packages/`, and the documentation indexes to every page.
+//! - The plugin boundary check rejects a top-level directory under
+//!   `runtime-packages/` or `compat/` that is not one of the four official
+//!   runtimes: a new plugin lives in its own repository.
 
 // Rust guideline compliant 2026-10-20
 
@@ -86,6 +89,14 @@ const PACKAGE_PAGES: [&str; 3] = ["README.md", "docs/install.md", "docs/features
 
 /// The page that lists the packages of a daemon archive by path.
 const PACKAGE_LISTING_PAGE: &str = "docs/install.md";
+
+/// Trees in which only the official runtimes of [`TRANSITIONAL_PLUGIN_DIRECTORIES`]
+/// may have a top-level directory.
+const PLUGIN_TREES: [&str; 2] = ["runtime-packages", "compat"];
+
+/// The official runtimes that still live in this repository. #1622 removes
+/// them when they move to their own repositories; no entry is ever added.
+const TRANSITIONAL_PLUGIN_DIRECTORIES: [&str; 4] = ["claude", "codex", "hermes", "pi"];
 
 /// Indexes every documentation page must be reachable from.
 const INDEX_ROOTS: [&str; 2] = ["docs/README.md", "docs/knowledge/index.md"];
@@ -1068,6 +1079,55 @@ fn check_index_reachability(repo: &Path) -> Result<bool, XtaskError> {
     Ok(false)
 }
 
+/// Top-level directory names of `tree`, dot-named and symbolic-link entries
+/// included; a missing tree holds none.
+fn plugin_tree_directories(repo: &Path, tree: &str) -> Result<BTreeSet<String>, XtaskError> {
+    let directory = repo.join(tree);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(source) => return Err(read_error(&directory, source)),
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| read_error(&directory, source))?;
+        let kind = entry
+            .file_type()
+            .map_err(|source| read_error(&entry.path(), source))?;
+        if kind.is_dir() || kind.is_symlink() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Only the four official runtimes have a directory under `runtime-packages/`
+/// or `compat/`; a new plugin goes to its own repository.
+fn check_plugin_directories(repo: &Path) -> Result<bool, XtaskError> {
+    let mut problems = Vec::new();
+    for tree in PLUGIN_TREES {
+        for name in plugin_tree_directories(repo, tree)? {
+            if !TRANSITIONAL_PLUGIN_DIRECTORIES.contains(&name.as_str()) {
+                problems.push(format!("{tree}/{name}"));
+            }
+        }
+    }
+    if problems.is_empty() {
+        println!("[PASS] plugin-directories: no plugin directory beyond the official runtimes");
+        return Ok(true);
+    }
+    println!(
+        "[FAIL] plugin-directories: a new plugin lives in its own repository \
+         (docs/knowledge/guides/plugin-repositories.md), not in:"
+    );
+    for problem in &problems {
+        println!("        {problem}");
+    }
+    Ok(false)
+}
+
 /// Runs every drift check of this module against the checkout at `repo` and
 /// returns the names of the checks that failed.
 pub(crate) fn check(repo: &Path) -> Result<Vec<&'static str>, XtaskError> {
@@ -1082,6 +1142,7 @@ pub(crate) fn check(repo: &Path) -> Result<Vec<&'static str>, XtaskError> {
         ("crate-table", check_crate_table(repo)?),
         ("package-lists", check_package_lists(repo)?),
         ("doc-index", check_index_reachability(repo)?),
+        ("plugin-directories", check_plugin_directories(repo)?),
     ];
     Ok(outcomes
         .into_iter()

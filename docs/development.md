@@ -413,8 +413,9 @@ use this build's binaries through an explicit `target_bin_dir` helper, so a run
 that executes a prebuilt test executable on a machine without that build
 selects the suite by name (`the_release_binaries_serve_the_runtime_out_of_process`).
 
-Adding a driver: a new `runtime-packages/<runtime>/` directory without an entry
-in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
+Adding a driver (for one of the four official runtimes; a new plugin lives
+outside this repository): a `runtime-packages/<runtime>/` directory without an
+entry in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
 fail with a message saying so. An entry names the runtime id, how its screen
 shows readiness, the marker that makes the model stub hold a reply (none when
 the stub holds every reply until the gate opens), which integration reports
@@ -709,6 +710,13 @@ workflow or script reads the per-pull-request selection or a release baseline
 (`scripts/tests/test_release_workflow.py` pins this).
 
 ### Adding a runtime package or row
+
+This section covers the four official runtimes that still live in this
+repository. A new plugin is never added here: it lives in its own repository and
+is admitted through the plugin index
+([plugin repositories](knowledge/guides/plugin-repositories.md)), and
+`cargo xtask docs check` fails a new directory under `runtime-packages/` or
+`compat/`.
 
 Add `runtime-packages/<runtime>/`, `compat/<runtime>/` (lock and npm project) and
 the rows to `compat/matrix.json` (`cargo xtask compat matrix-check`), and a driver

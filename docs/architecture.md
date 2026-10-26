@@ -155,8 +155,10 @@ desktop launchers live in `zajca/pohunek-work` and reach core through public
 contracts only: the CLI with `--json`, and the public protocol through the
 versioned SDKs. The Rust crates are pinned by git tag; the TypeScript SDK is
 pinned by release-tarball URL and integrity. The core crates a Rust client links
-(`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`, `assistant`)
-are a pinned, not a stable, API: they stay pre-1.0 with no back-compat shims.
+(`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`, `assistant`,
+and the `netbird`, `overlay` and `overlay-tailscale` crates that `client` links
+for the overlay transports) are a pinned, not a stable, API: they stay pre-1.0
+with no back-compat shims.
 External UIs pin the `PROTOCOL_VERSION` they were built against; a daemon one
 release newer still serves them through the protocol window, and the SDK talks
 to a daemon one release older through its own adapter (see "Protocol
@@ -165,6 +167,16 @@ call (`host.discover`, `worktree.remove`) are still public obligations with
 server-side contract tests in core (`docs/public-api.md`, "External clients").
 Issue and PR providers (Linear, GitHub) are client concerns and never enter
 core.
+
+Herd orchestration stays outside the daemon. A herd (a manager session that
+launches and supervises a set of worker sessions) is defined, limited and
+orchestrated by manager tooling or by a plugin, through the public contracts.
+Core keeps only two primitives for it, and no herd definition, limit or
+admission policy: the `spawned_by` attribution of a session
+([#1300](https://github.com/zajca/pohunek/issues/1300)) and durable session
+metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); neither has
+shipped yet. Metadata stays opaque to the daemon, and attribution is never an
+authorization input.
 
 ### Shipped host identity and local governance
 
@@ -1517,6 +1529,25 @@ and uninstall in `crates/daemon/src/session/package_lifecycle/`.
 | Workflow plugin | The archive digest the owner supplies (`pohunek workflow install --sha256`). Not a runtime package: the archive carries `workflow.toml` and never `runtime.toml`. | Shipped ([#148](https://github.com/zajca/pohunek/issues/148)): the CLI-owned store `<state>/pohunek/workflow-plugins/` (a package registry of its own, never read by the daemon), the strict manifest, the consent install, and `pohunek workflow run`, which runs one action without a shell under the owner limits of `<config>/pohunek/workflow.toml` with a minimal environment that keeps the complete session origin pair, and logs a content-free record per run (`crates/cli/src/workflow/`, `crates/cli/src/commands/workflow.rs`). `workflow run --json` places the action's single JSON document byte for byte in the CLI envelope. Declared jobs and services run as user service manager units of the `pohunek service` installation that `workflow enable` installs and `disable`/`uninstall` remove; each unit runs the CLI's hidden `pohunek workflow __exec` trampoline, which owns the overlap lock, the wall-clock job schedule, the service backoff and the stop handling (`crates/cli/src/workflow/units.rs`, `crates/cli/src/workflow/supervised.rs`). Shipped: event reactions. A plugin's `[reactions.<name>]` tables run its argv once per matching public event (the protocol's event table minus `attach_opened` and `attach_closed`). One dispatcher unit per namespace, running the CLI's hidden `pohunek workflow __dispatch`, reads the daemon's `subscribe` stream as a separate process: it never starts the daemon, reconnects with bounded backoff, drops events for a full per-plugin queue with one `dropped` record per overflow episode, and never delays the daemon or another plugin (`crates/cli/src/workflow/dispatch.rs`). A plugin is an external command that runs as the owner and calls the public CLI or SDK. The v1 boundary ([#480](https://github.com/zajca/pohunek/issues/480)) gives core no channel or record for plugin data and no launch-time policy hook; a launch still names one concrete, locally approved profile. |
 | Daemon, overlay, session worker or GUI extension | None. | Unsupported. Protocol methods, overlay providers, worker behavior and GUI code stay compiled and audited in core or in the client that owns them. |
 
+Plugins live outside core. A new runtime package or workflow plugin is never
+added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,
+a third-party plugin in its author's account, and a plugin becomes installable
+by id through a reviewed pull request to `pohunekd/pohunek-plugin-index`, which
+needs no core release. The plugin kit, the runtime features, the reusable plugin
+workflows, the index and its verifier, and the official plugin snapshot are
+available from a later release; the rule applies from now on. Core owns what
+plugins build on: the descriptor and manifest schemas, `runtime_api` and the
+runtime features, the integration handlers, the plugin kit, the reusable plugin
+workflows, the index format and verifier, and the release catalog. A plugin
+that needs a new core capability gets it in a core pull request first, behind a
+runtime feature. The four
+official runtimes (Pi, Codex, Claude Code and Hermes) are the only directories
+under `runtime-packages/` and `compat/`, and `cargo xtask docs check` refuses
+any other (`plugin-directories`); they are changed in place until they move to
+their own repositories ([#1609](https://github.com/zajca/pohunek/issues/1609)).
+Naming, required CI, compatibility and admission are in the
+[plugin repositories guide](knowledge/guides/plugin-repositories.md).
+
 Trust boundary:
 
 - **Same-UID owner trust, not a sandbox.** A descriptor may name any program,
@@ -2108,6 +2139,16 @@ never `unreachable!()`.
 | `EnrollmentStatus`, `HostOwner` | bump-only | cross-validated with quarantine; an identity coordinate covered by a signed outcome | |
 | `ConceptDeprecation` | bump-only | untagged; any new version string already decodes | |
 | `HostOwnerKind`, `ShareSuspensionIntent`, `TransferOutcomeError`, `PackageTrust`, `BindingProvenance`, `HostClass` | n/a | not decoded from the daemon wire by the Rust client; must stay strict | |
+
+0.38 rule: a 0.38 change adds a value only to an enum that 0.37 already
+decodes tolerantly in both the Rust client and the TypeScript SDK
+(`AgentActivity`, `CwdSource`, `SubagentLifecycle`, `BackgroundKind` and
+`BackgroundStatus`), and optional fields only to non-strict types. A 0.37 client
+is still strict for an enum whose tolerance ships in 0.38, and the 0.37
+TypeScript SDK checks `StateSource` against a closed set, so a new value of
+either needs a protocol bump and an N-1 adapter. A new value of a bump-only
+enum (`SessionState`, `SessionTurnEventKind`, `NotificationKind`) needs a
+protocol bump too, which 0.38 does not make, so those get no new value in 0.38.
 
 ## Testing Strategy
 
