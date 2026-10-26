@@ -127,9 +127,9 @@ install by id.
 
 ## Release snapshot
 
-From the release that ships the snapshot, a core release bundles the official set of its day from
-`packaging/official-plugins.lock.json`, a snapshot of the official tier of the
-index. The release proves every locked plugin against its exact artifacts before
+From the release that ships the snapshot, a core release bundles the official
+set of its day from `packaging/official-plugins.lock.json`, a snapshot of the
+official tier of the index. The release proves every locked plugin against its exact artifacts before
 it ships, so an offline install of a release carries the official plugins that
 were proven with it. Plugins admitted after the snapshot install from the index.
 

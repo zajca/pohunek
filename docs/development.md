@@ -414,8 +414,8 @@ that executes a prebuilt test executable on a machine without that build
 selects the suite by name (`the_release_binaries_serve_the_runtime_out_of_process`).
 
 Adding a driver (for one of the four official runtimes; a new plugin lives
-outside this repository): a `runtime-packages/<runtime>/` directory without an entry
-in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
+outside this repository): a `runtime-packages/<runtime>/` directory without an
+entry in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
 fail with a message saying so. An entry names the runtime id, how its screen
 shows readiness, the marker that makes the model stub hold a reply (none when
 the stub holds every reply until the gate opens), which integration reports

@@ -156,8 +156,8 @@ Hard constraints, decided on purpose — respect them in every change:
   release tarballs pinned by URL and integrity. The core crates a Rust client
   links (`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`,
   `assistant`, `netbird`, `overlay`, `overlay-tailscale`) are a pinned API, not
-  a stable one: they stay pre-1.0 with no back-compat shims, and a client absorbs breaking changes when it bumps its
-  pinned tag.
+  a stable one: they stay pre-1.0 with no back-compat shims, and a client
+  absorbs breaking changes when it bumps its pinned tag.
 - **UIs pin the core release they were built against.** A Rust or
   TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS` and reaches
   an N-1 daemon through its adapter; a client two releases newer than its daemon
@@ -186,7 +186,11 @@ Hard constraints, decided on purpose — respect them in every change:
   core release is needed for that. A core release bundles the official set of
   its day from `packaging/official-plugins.lock.json`, a snapshot of the index,
   and proves every locked plugin against its exact artifacts. Naming and the
-  full rules are in `docs/knowledge/guides/plugin-repositories.md`.
+  full rules are in `docs/knowledge/guides/plugin-repositories.md`. The
+  template, the plugin kit, the index and the release snapshot are available
+  from a later release (#1613-#1616, #1618; "What is available when" in that
+  guide); until then no new plugin is added here, and a plugin installs by
+  digest.
 - **Issue/PR providers (Linear, GitHub) live only in `zajca/pohunek-work`,
   never in core** (neither the daemon, the CLI, nor this repository's scripts).
 - **Protocol today:** public protocol v4 (the daemon also accepts v3 through the

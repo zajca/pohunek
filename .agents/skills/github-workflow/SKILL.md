@@ -175,7 +175,8 @@ filed. Core issues are only for core capabilities:
   `<owner>/pohunek-plugin-<name>`). Until an official runtime leaves
   `runtime-packages/`, its work stays in this repository.
 - Admitting, updating or revoking a plugin is a pull request, with its tracking
-  issue, in `pohunekd/pohunek-plugin-index`.
+  issue, in `pohunekd/pohunek-plugin-index`. That repository exists from a later
+  release; until then admission work is a core issue under #1609.
 - A capability a plugin needs from core is a core issue that names the plugin.
 - Only the owner creates `pohunekd/*` repositories: propose one in an issue and
   wait for the grant. Never open an issue in a repository the task does not

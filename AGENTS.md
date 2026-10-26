@@ -49,7 +49,9 @@ unrelated runbooks.
   `pohunekd/pohunek-plugin-index`, never through a change here. Change this
   repository only for a core capability the plugin needs. Naming, required CI,
   compatibility and admission are in
-  [Plugin repositories](docs/knowledge/guides/plugin-repositories.md).
+  [Plugin repositories](docs/knowledge/guides/plugin-repositories.md). The
+  template, kit, index and snapshot are available from a later release (see
+  "What is available when" there); until then no new plugin is added here.
 - **Rust edits:** before touching `.rs`, read the relevant files named by
   [.agents/rust-guidelines/SKILL.md](.agents/rust-guidelines/SKILL.md), starting
   with `11_universal_guidelines.md`.

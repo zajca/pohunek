@@ -66,6 +66,11 @@ a workflow plugin:
    change lands behind a runtime feature, and your plugin adopts it against
    the nightly kit. Do not patch core for one plugin.
 
+The template, the plugin kit, the index and its CI are available from a later
+release ([What is available when](../../../docs/knowledge/guides/plugin-repositories.md#what-is-available-when)).
+Until then steps 1, 3 and 4 cannot be completed: do not add the plugin here;
+propose it in a core issue under #1609 and wait.
+
 ## Understand reservation and custody
 
 The binding rules are in
