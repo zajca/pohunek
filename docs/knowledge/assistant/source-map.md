@@ -662,6 +662,7 @@ Runtime package archive format:
 - `crates/cli/tests/workflow_run_json.rs` — `workflow run --json` and verbatim-argument scenarios through the real binary: byte-exact `ok`, invalid, failed, cut and capped output as single error envelopes, refusals as envelopes, and every argument after the action reaching it unchanged.
 - `crates/cli/tests/support/workflow_scenarios.rs` — job and service scenarios against the real service manager (`workflow_systemd.rs`, `workflow_launchd.rs`): enable and disable, overlap, timeout, service backoff, failure isolation, stale units, the supervised environment and clean stops.
 - `docs/knowledge/guides/workflow-plugins.md`
+- `docs/knowledge/guides/plugin-repositories.md` — the rule that new plugins live in their own repositories, naming, required CI, index admission and the release snapshot; the guard is `check_plugin_directories` in `crates/xtask/src/doc_drift.rs`.
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.
 - `docs/architecture.md` — "Runtime Packages and Trust": the package classes and the same-UID owner trust boundary.
 - `docs/knowledge/guides/pi-package.md`

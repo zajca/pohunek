@@ -710,6 +710,13 @@ workflow or script reads the per-pull-request selection or a release baseline
 
 ### Adding a runtime package or row
 
+This section covers the four official runtimes that still live in this
+repository. A new plugin is never added here: it lives in its own repository and
+is admitted through the plugin index
+([plugin repositories](knowledge/guides/plugin-repositories.md)), and
+`cargo xtask docs check` fails a new directory under `runtime-packages/` or
+`compat/`.
+
 Add `runtime-packages/<runtime>/`, `compat/<runtime>/` (lock and npm project) and
 the rows to `compat/matrix.json` (`cargo xtask compat matrix-check`), and a driver
 entry for the consumer suite. The builder evidence that `build-packages` and the

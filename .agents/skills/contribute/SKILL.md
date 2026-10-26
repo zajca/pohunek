@@ -42,6 +42,30 @@ implementation. If the work is not listed, propose it using the
 [work-item issue form](../../../.github/ISSUE_TEMPLATE/work-item.yml); follow
 the [github-workflow skill](../github-workflow/SKILL.md) for issue handling.
 
+## Contribute a plugin
+
+A plugin is not contributed to this repository. To write a runtime package or
+a workflow plugin:
+
+1. Create a repository in your own account from the template
+   `pohunekd/pohunek-plugin-template` and name it `pohunek-plugin-<name>`.
+   The `pohunekd/plugin-*` names and the `pohunek.` package-id namespace are
+   reserved for official plugins.
+2. Follow [Plugin repositories](../../../docs/knowledge/guides/plugin-repositories.md):
+   declare `runtime_api`, the runtime features you require and a core range,
+   and keep the template's CI, which calls the reusable workflows pinned to a
+   core release tag.
+3. Publish releases from your repository's CI with the template's release
+   workflow; it attests the archive. Owners can install it by digest at once
+   (community tier).
+4. To make it installable by id (verified tier), open a pull request to
+   `pohunekd/pohunek-plugin-index` that adds your entry. Its CI checks the
+   attestation and runs the kit proof; a named reviewer approves it.
+5. If your plugin needs something core does not provide (a new integration
+   handler, descriptor key or hook schema), open a core issue first. The core
+   change lands behind a runtime feature, and your plugin adopts it against
+   the nightly kit. Do not patch core for one plugin.
+
 ## Understand reservation and custody
 
 The binding rules are in

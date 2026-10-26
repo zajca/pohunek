@@ -41,6 +41,15 @@ unrelated runbooks.
   [.agents/instructions/workflow.md](.agents/instructions/workflow.md) and the
   [github-workflow skill](.agents/skills/github-workflow/SKILL.md). That skill
   owns issue/project operations; `.github/agent-workflow.json` is its config.
+- **A new plugin (runtime package or workflow plugin):** never add it to this
+  repository. An official plugin lives in its own repository
+  `pohunekd/plugin-<name>`, created from `pohunekd/pohunek-plugin-template` by
+  the owner; a third-party plugin lives in its author's account. A plugin
+  becomes installable by id through a pull request to
+  `pohunekd/pohunek-plugin-index`, never through a change here. Change this
+  repository only for a core capability the plugin needs. Naming, required CI,
+  compatibility and admission are in
+  [Plugin repositories](docs/knowledge/guides/plugin-repositories.md).
 - **Rust edits:** before touching `.rs`, read the relevant files named by
   [.agents/rust-guidelines/SKILL.md](.agents/rust-guidelines/SKILL.md), starting
   with `11_universal_guidelines.md`.

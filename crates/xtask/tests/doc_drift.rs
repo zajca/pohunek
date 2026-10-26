@@ -108,14 +108,16 @@ impl Checkout {
             root: pohunek_test_support::tempdir_with_prefix("pxdd-").expect("fixture root"),
         };
         checkout.write("Cargo.toml", "[workspace]\nmembers = [\"crates/alpha\"]\n");
-        checkout.write("runtime-packages/alpha/package.toml", "name = \"alpha\"\n");
+        checkout.write("runtime-packages/pi/package.toml", "name = \"pi\"\n");
+        checkout.write("compat/pi/lock.json", "{}\n");
+        checkout.write("compat/matrix.json", "{}\n");
         checkout.write(
             "docs/development.md",
             "| Crate | Role |\n|---|---|\n| `crates/alpha` | The only crate. |\n",
         );
         checkout.write(
             "docs/install.md",
-            "The archive holds `runtime/packages/alpha.tar.zst`.\n",
+            "The archive holds `runtime/packages/pi.tar.zst`.\n",
         );
         checkout.write("docs/features.md", "Features.\n");
         checkout.write("README.md", "Readme.\n");
@@ -333,13 +335,13 @@ fn the_crate_table_must_list_exactly_the_workspace_crates() {
 #[test]
 fn the_package_lists_must_match_runtime_packages() {
     let added = Checkout::consistent();
-    added.write("runtime-packages/beta/package.toml", "name = \"beta\"\n");
+    added.write("runtime-packages/codex/package.toml", "name = \"codex\"\n");
     assert_eq!(added.failed_checks(), vec!["package-lists"]);
 
     let stale = Checkout::consistent();
     stale.write(
         "docs/install.md",
-        "`runtime/packages/alpha.tar.zst` `runtime/packages/gone.tar.zst`\n",
+        "`runtime/packages/pi.tar.zst` `runtime/packages/gone.tar.zst`\n",
     );
     assert_eq!(stale.failed_checks(), vec!["package-lists"]);
 
@@ -348,11 +350,44 @@ fn the_package_lists_must_match_runtime_packages() {
     assert_eq!(counted.failed_checks(), vec!["package-lists"]);
 
     let numeral = Checkout::consistent();
-    numeral.write(
-        "README.md",
-        "The 3 packages ship; the one package is alpha.\n",
-    );
+    numeral.write("README.md", "The 3 packages ship; the one package is pi.\n");
     assert_eq!(numeral.failed_checks(), Vec::<&str>::new());
+}
+
+#[test]
+fn only_the_four_official_runtimes_may_have_a_plugin_directory() {
+    let official = Checkout::consistent();
+    for name in ["claude", "codex", "hermes"] {
+        official.write(&format!("runtime-packages/{name}/package.toml"), "x = 1\n");
+        official.write(&format!("compat/{name}/lock.json"), "{}\n");
+    }
+    official.write(
+        "docs/install.md",
+        "`runtime/packages/pi.tar.zst` `runtime/packages/claude.tar.zst` \
+         `runtime/packages/codex.tar.zst` `runtime/packages/hermes.tar.zst`\n",
+    );
+    assert_eq!(official.failed_checks(), Vec::<&str>::new());
+
+    let package = Checkout::consistent();
+    package.write("runtime-packages/newthing/package.toml", "x = 1\n");
+    package.write(
+        "docs/install.md",
+        "`runtime/packages/pi.tar.zst` `runtime/packages/newthing.tar.zst`\n",
+    );
+    assert_eq!(package.failed_checks(), vec!["plugin-directories"]);
+
+    let compat = Checkout::consistent();
+    compat.write("compat/newthing/lock.json", "{}\n");
+    assert_eq!(compat.failed_checks(), vec!["plugin-directories"]);
+
+    let hidden = Checkout::consistent();
+    hidden.write("compat/.newthing/lock.json", "{}\n");
+    assert_eq!(hidden.failed_checks(), vec!["plugin-directories"]);
+
+    let linked = Checkout::consistent();
+    std::os::unix::fs::symlink("pi", linked.root.path().join("compat/newthing"))
+        .expect("link a plugin directory");
+    assert_eq!(linked.failed_checks(), vec!["plugin-directories"]);
 }
 
 #[test]

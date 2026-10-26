@@ -165,6 +165,22 @@ asking, then report the links in your summary.
   Done/closure bar, and the ban on destructive project edits still apply, and
   commits/pushes still need the owner's explicit request.
 
+## Route plugin work to the plugin repository
+
+`pluginRouting` in `.github/agent-workflow.json` decides where an issue is
+filed. Core issues are only for core capabilities:
+
+- Work on one plugin (a fix, a feature, an upstream bump) is an issue in that
+  plugin's repository (`pohunekd/plugin-<name>`, or the author's
+  `<owner>/pohunek-plugin-<name>`). Until an official runtime leaves
+  `runtime-packages/`, its work stays in this repository.
+- Admitting, updating or revoking a plugin is a pull request, with its tracking
+  issue, in `pohunekd/pohunek-plugin-index`.
+- A capability a plugin needs from core is a core issue that names the plugin.
+- Only the owner creates `pohunekd/*` repositories: propose one in an issue and
+  wait for the grant. Never open an issue in a repository the task does not
+  authorize.
+
 ## Gate meaningful work on an issue first
 
 No meaningful work starts without something on the triage record. Before

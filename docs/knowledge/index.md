@@ -53,6 +53,10 @@ Start here:
   action with `pohunek workflow run` (verbatim arguments, `--json` results,
   environment, context, limits, run log, owner knobs), and the same-UID trust
   boundary.
+  The [plugin repositories guide](guides/plugin-repositories.md) is the rule
+  that a new plugin lives in its own repository and is admitted through the
+  plugin index, with the naming, required CI, compatibility declaration, release
+  snapshot and documentation split.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

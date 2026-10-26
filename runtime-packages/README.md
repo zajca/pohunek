@@ -1,7 +1,10 @@
 # Runtime packages
 
-Source of the official runtime packages. Each subdirectory is one package and
-holds exactly what its archive holds, nothing else:
+Source of the four official runtime packages that still live in this repository
+(Pi, Codex, Claude Code and Hermes). A new plugin is never added here; see
+[plugin repositories](../docs/knowledge/guides/plugin-repositories.md). Each
+subdirectory is one package and holds exactly what its archive holds, nothing
+else:
 
 ```text
 runtime-packages/<runtime>/
