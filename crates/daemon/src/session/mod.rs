@@ -27,9 +27,9 @@ use protocol::{
     SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 #[cfg(test)]
 use tokio::sync::Notify;
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;

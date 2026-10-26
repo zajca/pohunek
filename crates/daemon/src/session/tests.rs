@@ -1971,6 +1971,25 @@ impl MockInspector {
         }
     }
 
+    /// Fires every exit watch of `pid` and waits until their watchers received
+    /// the signal (see [`Self::fire_exit_watch_delivered`]).
+    async fn fire_exit_delivered(&self, pid: Pid) {
+        let senders = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default();
+        for sender in &senders {
+            sender.send_replace(true);
+        }
+        for sender in &senders {
+            guard("the exit watcher received the signal", sender.closed()).await;
+        }
+    }
+
     /// Makes arming an exit watch for `pid` fail; with `gone` the process has
     /// exited by then.
     fn fail_exit_watch(&self, pid: Pid, gone: bool) {
@@ -2012,6 +2031,25 @@ impl MockInspector {
             .cloned()
             .expect("exit watch generation");
         sender.send_replace(true);
+    }
+
+    /// Fires the exit watch and waits until its watcher received the signal.
+    ///
+    /// The watcher drops its watch in the poll that receives the signal and
+    /// counts the exit as pending input in the same poll, so once this returns
+    /// `SessionRegistry::settled` covers what the watcher applies.
+    async fn fire_exit_watch_delivered(&self, pid: Pid, generation: usize) {
+        let sender = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .and_then(|watches| watches.get(generation))
+            .cloned()
+            .expect("exit watch generation");
+        sender.send_replace(true);
+        guard("the exit watcher received the signal", sender.closed()).await;
     }
 
     fn exit_watch_count(&self, pid: Pid) -> usize {
@@ -12801,9 +12839,30 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
     let before = inspector.descendant_scans().0;
     let paused_at = tokio::time::Instant::now();
 
+    // The requested scan is parked inside the loop before its first read: the
+    // request is pending input, so nothing may report the session settled.
+    let held = registry.hold_next_input(&created.id, "procwatch_scan");
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
+    guard(
+        "the requested scan reached the loop",
+        held.entered.notified(),
+    )
+    .await;
+    tokio::select! {
+        biased;
+        () = registry.settled(&created.id) => {
+            panic!("settled returned while a requested scan is still pending")
+        }
+        () = std::future::ready(()) => {}
+    }
+    assert_eq!(
+        inspector.descendant_scans().0,
+        before,
+        "the parked scan has not read anything"
+    );
+    held.release.notify_one();
     wait_for_scans_started(&inspector, before + 1).await;
     settle_procwatch_scans(&registry).await;
 
@@ -14188,8 +14247,6 @@ async fn bound_reporter_exit_clears_the_claim_while_collection_fails() {
 
 /// Pid of a process group no fixture process carries.
 const UNLISTED_PID: Pid = 900;
-/// Scheduler yields that let spawned exit-watch tasks run.
-const EXIT_WATCH_YIELDS: usize = 64;
 
 /// The reporter fact every descendant-claim fixture lists.
 fn fixture_reporter_fact() -> ProcessFact {
@@ -14671,6 +14728,8 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
         registry
             .rescan_procwatch_at(&created.id, created.pid, Instant::now())
             .await;
+        // The session's own loop may still be applying a scan that arms watches.
+        registry.settled(&created.id).await;
         assert!(reporter_is_bound(&registry, &created.id).await);
         assert_eq!(
             inspector.exit_watch_count(DESCENDANT_REPORTER_PID),
@@ -14682,11 +14741,30 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             created.pid,
             vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid)],
         );
-        inspector.fire_exit_watch(DESCENDANT_REPORTER_PID, order[0]);
-        for _ in 0..EXIT_WATCH_YIELDS {
-            tokio::task::yield_now().await;
+        // The first signal is parked inside its watcher, so the second one can
+        // only follow once the first was applied.
+        let held = registry.hold_next_input(&created.id, "exit_watch");
+        inspector
+            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, order[0])
+            .await;
+        guard(
+            "the first exit signal reached its watcher",
+            held.entered.notified(),
+        )
+        .await;
+        tokio::select! {
+            biased;
+            () = registry.settled(&created.id) => {
+                panic!("settled returned while an exit signal is still being applied")
+            }
+            () = std::future::ready(()) => {}
         }
-        inspector.fire_exit_watch(DESCENDANT_REPORTER_PID, order[1]);
+        held.release.notify_one();
+        registry.settled(&created.id).await;
+        inspector
+            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, order[1])
+            .await;
+        registry.settled(&created.id).await;
         assert_wrapper_replaces_bound_claim(&registry, &created.id, &format!("{order:?}")).await;
         let _ = registry.stop(&created.id).await;
     }

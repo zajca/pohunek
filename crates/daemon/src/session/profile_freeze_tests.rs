@@ -9,6 +9,7 @@
 // Rust guideline compliant 2026-10-12
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,10 +61,11 @@ impl Frozen {
         let script = dir.join("marked-agent");
         let gate_path = dir.join("exit.gate");
         let gate = hook_gate(&gate_path);
+        let dir_start_gate = dir.join("start.gate");
         write_executable(
             &script,
             &format!(
-                "#!/bin/sh\n{record}case \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
+                "#!/bin/sh\n[ ! -p '{start_gate}' ] || read _ < '{start_gate}'\n{record}case \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
                 record = append_launch_record(
                     &marker,
                     &format!(
@@ -71,6 +73,7 @@ impl Frozen {
                     ),
                 ),
                 gate = gate_path.display(),
+                start_gate = dir_start_gate.display(),
             ),
         );
         let frozen = Self {
@@ -84,6 +87,12 @@ impl Frozen {
         };
         frozen.write_profile(SECRET_MARK);
         frozen
+    }
+
+    /// Parks every later launch before it records itself, until a line is
+    /// written to the returned gate.
+    fn hold_launches(&self) -> fs::File {
+        hook_gate(&self.dir.join("start.gate"))
     }
 
     /// Writes the profile `work` with `mark` as its environment variable.
@@ -446,8 +455,11 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
     let id = frozen.created_and_settled(registry).await;
     let not_a_directory = frozen.dir.join("not-a-state-dir");
     fs::write(&not_a_directory, "").expect("write a plain file");
+    // The bare run parks before it records itself, so the stop below can only
+    // see its mark once the test released it and awaited it.
+    let mut launch_gate = frozen.hold_launches();
 
-    for host_state_dir in [None, Some(not_a_directory)] {
+    for (round, host_state_dir) in [None, Some(not_a_directory)].into_iter().enumerate() {
         let config = SessionRegistryConfig {
             host_state_dir: host_state_dir.clone(),
             ..frozen.config()
@@ -496,6 +508,10 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
             })
             .await
             .expect("a session without a profile needs no key");
+        launch_gate
+            .write_all(b"go\n")
+            .expect("release the bare launch");
+        frozen.wait_for_launches(round + 2).await;
         // The next configuration reconciles the same store, so this registry
         // goes only after the bare session's exit made its last write.
         let stopped = broken.stop(&bare.id).await.expect("stop the bare session");
