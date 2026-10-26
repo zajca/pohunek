@@ -2021,6 +2021,20 @@ struct StoppedClaude {
 }
 
 async fn stopped_built_in_claude(tag: &str) -> StoppedClaude {
+    let (fixture, store_path, mut ids) = stopped_built_in_claudes(tag, 1).await;
+    StoppedClaude {
+        fixture,
+        store_path,
+        id: ids.remove(0),
+    }
+}
+
+/// `count` stopped sessions of the built-in Claude runtime, each with its own
+/// native conversation.
+async fn stopped_built_in_claudes(
+    tag: &str,
+    count: usize,
+) -> (Fixture, PathBuf, Vec<protocol::SessionId>) {
     let key = signing_key("root");
     let dir = temp_dir(tag);
     let store_path = temp_store_path(tag);
@@ -2034,33 +2048,38 @@ async fn stopped_built_in_claude(tag: &str) -> StoppedClaude {
     let config_home = fixture.dir.join("claude-home");
     let conversations = config_home.join("projects").join("work");
     fs::create_dir_all(&conversations).expect("the conversation directory");
-    fs::write(conversations.join(format!("{CONVERSATION}.jsonl")), b"{}\n")
-        .expect("the conversation");
     fixture.write_profile(PROFILE, &claude_profile_text(&config_home));
     let previous = compiled_in_daemon(&fixture, &store_path);
-    let created = previous
-        .create(protocol::SessionNewParams {
-            agent: PROFILE.to_owned(),
-            cwd: Some(dir),
-            ..params()
-        })
-        .await
-        .expect("a session of the built-in Claude runtime");
-    let report = native_report_params(
-        &previous,
-        created.id.clone(),
-        RuntimeId::CLAUDE.to_owned(),
-        CONVERSATION.to_owned(),
-        None,
-    )
-    .await;
-    assert!(previous.report_as_root(report).await.recorded);
-    previous.stop(&created.id).await.expect("stop the session");
-    StoppedClaude {
-        fixture,
-        store_path,
-        id: created.id,
+    let mut ids = Vec::with_capacity(count);
+    for index in 0..count {
+        let conversation = if index == 0 {
+            CONVERSATION.to_owned()
+        } else {
+            format!("{CONVERSATION}-{index}")
+        };
+        fs::write(conversations.join(format!("{conversation}.jsonl")), b"{}\n")
+            .expect("the conversation");
+        let created = previous
+            .create(protocol::SessionNewParams {
+                agent: PROFILE.to_owned(),
+                cwd: Some(dir.clone()),
+                ..params()
+            })
+            .await
+            .expect("a session of the built-in Claude runtime");
+        let report = native_report_params(
+            &previous,
+            created.id.clone(),
+            RuntimeId::CLAUDE.to_owned(),
+            conversation,
+            None,
+        )
+        .await;
+        assert!(previous.report_as_root(report).await.recorded);
+        previous.stop(&created.id).await.expect("stop the session");
+        ids.push(created.id);
     }
+    (fixture, store_path, ids)
 }
 
 /// Restarts the daemon over `fixture`'s state and reconciles its workers.
@@ -5901,4 +5920,39 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
 
     let _ = stop.send(());
     serving.await.expect("the server stops");
+}
+
+#[tokio::test]
+async fn listing_sessions_of_one_package_verifies_its_root_once_per_runtime_source() {
+    let (fixture, _store_path, ids) = stopped_built_in_claudes("claude-list-cost", 4).await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&fixture, &fixture.registry, RuntimeId::CLAUDE, &package, 5).await;
+    let restarted = restart(&fixture).await;
+    let store = restarted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .package_store()
+        .expect("package store")
+        .clone();
+
+    let before_one = store.root_verifications();
+    let mut one = restarted.registry.list().await;
+    one.retain(|info| info.id.0 == ids[0].0);
+    restarted.registry.enrich_native_activity(&mut one).await;
+    let one_session = store.root_verifications() - before_one;
+
+    let before_all = store.root_verifications();
+    let mut all = restarted.registry.list().await;
+    restarted.registry.enrich_native_activity(&mut all).await;
+    let all_sessions = store.root_verifications() - before_all;
+
+    assert_eq!(all.len(), ids.len());
+    assert!(all.iter().all(|info| info.capabilities.resume));
+    assert!(one_session > 0, "the listing verifies the package root");
+    assert_eq!(
+        all_sessions, one_session,
+        "the listing cost does not grow with the number of sessions"
+    );
 }
