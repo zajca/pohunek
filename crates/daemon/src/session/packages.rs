@@ -237,9 +237,10 @@ impl SessionRegistry {
     /// The set is the union of the digests host profiles pin, the durable
     /// records (logical sessions and resume bindings) and the sessions held in
     /// memory, so a registry without persistence still protects its live
-    /// sessions. A record that cannot be interpreted may pin a package, so it
-    /// is never an omission: it widens the gate set of
-    /// [`Self::retained_package_pins`] to every installed digest.
+    /// sessions. Only the pins that are known are returned: a record that cannot
+    /// be interpreted contributes nothing here, so a gate must use
+    /// [`Self::retained_package_pins`], whose gate set covers every installed
+    /// digest in that case.
     ///
     /// # Errors
     ///

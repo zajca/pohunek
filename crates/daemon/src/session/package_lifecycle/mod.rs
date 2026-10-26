@@ -290,9 +290,7 @@ impl SessionRegistry {
             let uncertain = retained.is_uncertain();
             let outcome = blocking(move || work(&context, &retained)).await;
             if uncertain && outcome.is_err() {
-                warn!(
-                    "a package change was refused while an unreadable metadata-store line may pin a package; see the metadata-store warning for the line and the remedy"
-                );
+                warn_refused_under_uncertainty("a package change");
             }
             // Every transaction may have rebuilt the registry, so live adopted
             // sessions follow whichever package serves their runtime now.
@@ -517,11 +515,13 @@ impl SessionRegistry {
         let registry = self.clone();
         self.spawn_transaction("integration_install", async move {
             let _shared = registry.inner.package_lifecycle.read().await;
+            let mut uncertain = false;
             let schemas = if registry.inner.profiles.runtimes().package_store().is_none() {
                 RetainedSchemas::default()
             } else {
                 let context = registry.package_context()?;
                 let retained = registry.package_retained().await?;
+                uncertain = retained.is_uncertain();
                 blocking(move || {
                     let state = read_state(&context)?;
                     Ok(selection::retained_schemas(
@@ -532,7 +532,7 @@ impl SessionRegistry {
                 })
                 .await?
             };
-            tokio::task::spawn_blocking(move || work(&schemas))
+            let outcome = tokio::task::spawn_blocking(move || work(&schemas))
                 .await
                 .map_err(|error| {
                     warn!(%error, "an integration install task failed");
@@ -542,7 +542,11 @@ impl SessionRegistry {
                         "integration installation task panicked",
                         Some("retry the request; if it repeats, inspect daemon logs".to_owned()),
                     )
-                })?
+                })?;
+            if uncertain && outcome.is_err() {
+                warn_refused_under_uncertainty("an integration install");
+            }
+            outcome
         })
         .await
         .map_err(|_join_error| ProtocolError::from(PackageErrorKind::RegistryFailed))?
@@ -554,6 +558,14 @@ impl SessionRegistry {
             PackageErrorKind::RegistryFailed
         })
     }
+}
+
+/// Logs that `change` was refused while an unreadable metadata-store line may
+/// pin a package.
+fn warn_refused_under_uncertainty(change: &str) {
+    warn!(
+        "{change} was refused while an unreadable metadata-store line may pin a package; see the metadata-store warning for the line and the remedy"
+    );
 }
 
 /// Runs registry and filesystem work off the async runtime.

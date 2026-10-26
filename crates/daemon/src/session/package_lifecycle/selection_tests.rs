@@ -265,6 +265,53 @@ async fn an_unreadable_store_record_holds_an_incompatible_update_back_until_it_i
 }
 
 #[tokio::test]
+async fn an_integration_install_refused_under_an_unreadable_store_record_names_the_cause() {
+    let v = versions("selection-uncertain-integration", Some(SUBAGENT)).await;
+    let created = v
+        .fixture
+        .registry
+        .create(new_params(&v.dir))
+        .await
+        .expect("create");
+    end(&v.fixture, &created.id).await;
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let refuse = |_: &crate::integration::RetainedSchemas| -> Result<(), protocol::ProtocolError> {
+        Err(protocol::PackageErrorKind::IntegrationIncompatible.into())
+    };
+
+    v.fixture
+        .registry
+        .integration_install(refuse)
+        .await
+        .expect_err("the work refuses");
+    assert!(
+        !logs.text().contains("unreadable metadata-store line"),
+        "a refusal over a readable store points at no line"
+    );
+
+    let mut store = fs::OpenOptions::new()
+        .append(true)
+        .open(&v.store)
+        .expect("open the store");
+    store
+        .write_all(b"{\"type\":\"resume\",\"damaged\":\n")
+        .expect("append a damaged line");
+    drop(store);
+    v.fixture
+        .registry
+        .integration_install(refuse)
+        .await
+        .expect_err("the work refuses");
+    assert!(
+        logs.text()
+            .contains("an integration install was refused while an unreadable metadata-store line"),
+        "the refusal says that an unreadable line may have decided it: {}",
+        logs.text()
+    );
+}
+
+#[tokio::test]
 async fn a_dry_run_install_reports_the_withheld_selection() {
     let v = versions("selection-preview", Some(SUBAGENT)).await;
     let created = v

@@ -805,7 +805,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_identity_installed` | `runtime` | The package id and version are installed from another archive. |
 | `package_identity_conflict` | `runtime` | The digest is installed under another package identity. |
 | `package_referenced` | `runtime` | A session or host profile still pins the digest. |
-| `package_retention_uncertain` | `runtime` | A `metadata.jsonl` line that may pin a package cannot be read, so `package.uninstall` cannot prove the digest unreferenced. The line stays in the store; stop the daemon, move it into a backup file and start the daemon. Listing, inspecting and the other package methods still work. |
+| `package_retention_uncertain` | `runtime` | A `metadata.jsonl` line that may pin a package cannot be read, so `package.uninstall` cannot prove the digest unreferenced. The line stays in the store; stop the daemon, move it into a backup file and start the daemon. Listing, inspecting and doctor still work; selecting, binding and integration updates judge every installed version while the line stays unreadable. |
 | `package_root_invalid` | `runtime` | The recorded package root fails verification. |
 | `package_root_intact` | `runtime` | The recorded package root verifies, so it is not removed as modified. |
 | `package_registry_busy` | `daemon` | Another writer holds the package registry. |
@@ -3525,7 +3525,7 @@ registration (the commands that run the managed scripts, restricted to the
 arguments each embedded script accepts) and not from a declaration, and every hook schema of the
 package versions that live, lost or resumable sessions and host profile pins
 still reference for that handler to admit them too (an undeterminable retained
-version, whose handler is unknown, refuses an update of every handler's asset set); otherwise the update is refused
+version, whose handler is unknown, refuses an update of every handler's asset set; while a `metadata.jsonl` line that may pin a package cannot be read, every installed version counts as retained, and the refusal is logged with a pointer to the unreadable line); otherwise the update is refused
 with `runtime/integration_update_incompatible` before anything is written. An
 active set of any version is replaceable, so a rolled-back release reinstalls
 its older set.

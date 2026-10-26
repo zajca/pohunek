@@ -138,7 +138,8 @@ fn resolve_target(
 /// handler or hook schema launchable together against one active asset set,
 /// whether or not a version is selected. `retained` leaves out the pin this
 /// bind replaces, so rebinding a profile never compares the new pin with the
-/// old one.
+/// old one; while an unreadable store line may pin a package, the caller's
+/// gate set adds that pin back.
 pub(super) fn ensure_coexists(
     context: &Context,
     state: &RegistryState,
