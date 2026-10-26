@@ -10,6 +10,8 @@
 
 use std::fs;
 use std::io::{Read as _, Write as _};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,6 +98,103 @@ fn stopped(pid: i32) -> bool {
         })
 }
 
+/// Whether `ps` reports `pid` blocked in a wait (`S` or `D`) rather than
+/// running or stopped.
+#[cfg(target_os = "linux")]
+fn blocked(pid: i32) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with(['S', 'D'])
+        })
+}
+
+/// A write lease on a private copy of `sleep` that precedes the real one on
+/// the session's `PATH`.
+///
+/// The kernel holds any `execve` of the copy until the lease is released or
+/// `lease-break-time` (45 s) passes, so while the lease is held the command
+/// cannot finish starting a `sleep`. A
+/// `sh` that starts programs with `vfork` (dash 0.5.11 and later) keeps its
+/// whole job in the kernel's vfork wait from the `vfork` until the child's
+/// `execve`. A `Ctrl-Z` that lands in that window stops only the child, so the
+/// job never reports a stop to `service lock` (#554). Holding every `sleep`
+/// start makes that window observable, and a `Ctrl-Z` typed while the command
+/// waits in a builtin never meets it.
+#[cfg(target_os = "linux")]
+struct SleepLease {
+    bin: PathBuf,
+    file: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl SleepLease {
+    /// Copies the `sleep` that `path_var` resolves into `dir/bin` and takes
+    /// the lease on the copy.
+    fn take(dir: &Path, path_var: &std::ffi::OsStr) -> Self {
+        let host = std::env::split_paths(path_var)
+            .map(|entry| entry.join("sleep"))
+            .find(|candidate| candidate.is_file())
+            .expect("resolve the host sleep from PATH");
+        let bin = dir.join("bin");
+        fs::create_dir(&bin).expect("create the sleep directory");
+        let copy = bin.join("sleep");
+        fs::copy(&host, &copy).expect("copy the host sleep");
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o755))
+            .expect("make the sleep copy executable");
+
+        let file = fs::File::open(&copy).expect("open the sleep copy");
+        // Another open of the copy may exist briefly; any other failure is final.
+        wait_until("the write lease on the sleep copy", || {
+            match fcntl_int(&file, libc::F_SETLEASE, libc::F_WRLCK) {
+                Ok(_) => true,
+                Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => false,
+                Err(error) => panic!("take a write lease on {}: {error}", copy.display()),
+            }
+        });
+        // `F_SETLEASE` makes this process the file's owner, so a lease break
+        // would signal it with `SIGIO`, whose default action ends it.
+        fcntl_int(&file, libc::F_SETOWN, 0).expect("detach the lease signal from the test");
+        Self { bin, file }
+    }
+
+    /// Whether the write lease is still unbroken, i.e. no open of the copy
+    /// has been attempted.
+    fn unbroken(&self) -> bool {
+        fcntl_int(&self.file, libc::F_GETLEASE, 0).expect("read the lease") == libc::F_WRLCK
+    }
+
+    /// Releases the lease, letting held opens through.
+    fn release(self) {
+        fcntl_int(&self.file, libc::F_SETLEASE, libc::F_UNLCK).expect("release the lease");
+    }
+}
+
+/// `fcntl(fd, command, argument)` for the lease and owner commands, which
+/// take an integer and return one.
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "libc::fcntl has no safe wrapper for the lease commands"
+)]
+fn fcntl_int(
+    file: &fs::File,
+    command: libc::c_int,
+    argument: libc::c_int,
+) -> std::io::Result<libc::c_int> {
+    // SAFETY: the descriptor is open for the whole call, and these commands
+    // take an integer argument and read or write no memory.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), command, argument) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
 /// A FIFO that holds the lock process before its own handoff of the terminal
 /// ([`pohunek_cli::service::HANDOFF_HOLD_ENV`]) until it is released.
 struct Hold {
@@ -139,11 +238,20 @@ struct Session {
     writer: Box<dyn std::io::Write + Send>,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
     hold: Option<Hold>,
+    /// Holds every `sleep` the command could start; see [`SleepLease`].
+    #[cfg(target_os = "linux")]
+    sleep_lease: Option<SleepLease>,
 }
 
 impl Session {
     fn start() -> Self {
         Self::launch(false, SHELL)
+    }
+
+    /// Starts a session for a test that stops the command with `Ctrl-Z`. On
+    /// Linux every `sleep` the command could start is held in its `execve`.
+    fn start_stoppable() -> Self {
+        Self::launch_options(false, SHELL, None, true)
     }
 
     /// Starts a session whose lock process waits before its own handoff of
@@ -157,6 +265,15 @@ impl Session {
     }
 
     fn launch_with_failure(with_hold: bool, locked: &str, failure: Option<&str>) -> Self {
+        Self::launch_options(with_hold, locked, failure, false)
+    }
+
+    fn launch_options(
+        with_hold: bool,
+        locked: &str,
+        failure: Option<&str>,
+        hold_sleep: bool,
+    ) -> Self {
         // `TestEnv` roots are canonical, so no symlinked ancestor (macOS `/var`)
         // is refused.
         let env = TestEnv::new().expect("create the hermetic test environment");
@@ -168,6 +285,17 @@ impl Session {
         fs::write(dir.join("inner.sh"), INNER).expect("write inner script");
         fs::write(dir.join("outer.sh"), OUTER).expect("write outer script");
         let hold = with_hold.then(|| Hold::new(&dir));
+        #[cfg(target_os = "linux")]
+        let sleep_lease = hold_sleep.then(|| {
+            let path_var = env
+                .environment()
+                .get(std::ffi::OsStr::new("PATH"))
+                .expect("the test environment inherits PATH");
+            SleepLease::take(&dir, path_var)
+        });
+        // macOS has no leases, and its `sh` forks rather than `vfork`s.
+        #[cfg(not(target_os = "linux"))]
+        let _ = hold_sleep;
 
         let pair = native_pty_system().openpty(SIZE).expect("open a pty");
         let mut command = CommandBuilder::new("sh");
@@ -175,6 +303,16 @@ impl Session {
         command.env_clear();
         for (name, value) in env.environment() {
             command.env(name, value);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(lease) = &sleep_lease {
+            let inherited = env.environment().get(std::ffi::OsStr::new("PATH"));
+            let path = std::env::join_paths(
+                std::iter::once(lease.bin.clone())
+                    .chain(inherited.into_iter().flat_map(std::env::split_paths)),
+            )
+            .expect("join PATH");
+            command.env("PATH", path);
         }
         command.env("POHUNEK", pohunek_bin());
         command.env("LOCKED", locked);
@@ -201,7 +339,22 @@ impl Session {
             writer,
             shell,
             hold,
+            #[cfg(target_os = "linux")]
+            sleep_lease,
         }
+    }
+
+    /// Asserts that no `sleep` start was attempted while the lease was held,
+    /// then releases it so the command can start `sleep` again.
+    #[cfg(target_os = "linux")]
+    fn release_sleep(&mut self) {
+        let lease = self.sleep_lease.take().expect("the session holds sleep");
+        assert!(
+            lease.unbroken(),
+            "#554: the command started a program while Ctrl-Z could land; a vfork \
+             shell would have held the job in the vfork wait"
+        );
+        lease.release();
     }
 
     fn release(&mut self) {
@@ -250,7 +403,7 @@ impl Session {
             .chain(self.shell.process_id().map(|pid| pid.to_string()))
             .collect();
         let listing = Command::new("ps")
-            .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,command="])
+            .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,wchan=,command="])
             .output()
             .map_or_else(
                 |error| format!("ps failed: {error}"),
@@ -330,15 +483,32 @@ fn the_command_owns_the_terminal_and_gets_each_interrupt_once() {
     assert_eq!(session.foreground(), Some(shell));
 }
 
+/// Types the line the command's first `read` waits for and checks it arrived.
+fn answer_first(session: &mut Session) {
+    session.type_bytes(b"hello\n");
+    assert_eq!(line(&session.path("first")), "hello");
+}
+
+/// On Linux, `Ctrl-Z` is typed while the command waits in `read first`, where
+/// it runs only builtins. A `sh` that starts every program with `vfork` would hold
+/// the whole job in the kernel's vfork wait if the stop landed between the
+/// `vfork` and the `execve` of a `sleep`, and `service lock` would never see
+/// the job stop (#554). On Linux every `sleep` is held in its `execve` for the
+/// stop, so such a start fails the test instead of racing it.
 #[test]
 fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
-    let mut session = Session::start();
+    let mut session = Session::start_stoppable();
     let child = session.pid("child.pid");
     let lock = session.pid("lock.pid");
     let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
     wait_until("the handoff", || session.foreground() == Some(child));
-    session.type_bytes(b"hello\n");
-    assert_eq!(line(&session.path("first")), "hello");
+    // macOS's `sh` is bash, whose `read` returns an empty line when a stop
+    // interrupts it, so the line is typed before the stop there. That `sh`
+    // forks instead of `vfork`ing, so no program start can strand the stop.
+    #[cfg(not(target_os = "linux"))]
+    answer_first(&mut session);
+    #[cfg(target_os = "linux")]
+    wait_until("the command to wait for its first line", || blocked(child));
 
     // `Ctrl-Z` stops the command; the lock process takes the terminal back
     // for its own group and stops as well, as a stopped job does.
@@ -346,6 +516,8 @@ fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
     wait_until("the command to stop", || stopped(child));
     wait_until("the lock process to stop", || stopped(lock));
     assert_eq!(session.foreground(), Some(shell));
+    #[cfg(target_os = "linux")]
+    session.release_sleep();
 
     // Continuing the lock process continues the command in the foreground.
     let sent = Command::new("kill")
@@ -359,6 +531,8 @@ fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
     wait_until("the command to run", || !stopped(child));
     assert!(!stopped(lock));
 
+    #[cfg(target_os = "linux")]
+    answer_first(&mut session);
     session.touch("phase2");
     session.type_bytes(b"after\n");
     assert_eq!(line(&session.path("second")), "after");
