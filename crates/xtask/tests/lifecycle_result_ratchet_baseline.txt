@@ -3,4 +3,3 @@
 # in test code, per file.
 # Format: `<workspace-relative path> <count>`. Counts may only go down;
 # regenerate with the ignored `regenerate_lifecycle_result_baseline` test.
-crates/daemon/src/session/reconcile.rs 33
