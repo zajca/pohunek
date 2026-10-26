@@ -809,6 +809,7 @@ fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceC
     config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
     config.hook_required = service.hook_required().to_vec();
     config.event_retention = service.event_retention();
+    config.inventory_probe = service.inventory_probe();
 }
 
 /// Applies the validated `session.wait_turn` default and ceiling and the

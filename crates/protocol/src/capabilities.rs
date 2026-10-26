@@ -63,10 +63,30 @@ pub struct AgentRuntime {
     pub config_home_id: Option<String>,
 }
 
+/// Optional parameters for `host.inspect`.
+///
+/// A daemon that predates the parameters ignores them and answers the full
+/// inventory, so a client that sets one must still accept a complete answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostInspectParams.ts"))]
+pub struct HostInspectParams {
+    /// Answer only the feature flags, `daemon_version` and `git_available`:
+    /// `supported_agents` and `runtimes` are empty and no agent runtime is
+    /// resolved or probed. For a client that only gates a request on a
+    /// capability flag. Absent or `false` keeps the full inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub skip_runtime_probes: Option<bool>,
+}
+
 /// Live capability snapshot returned by `host.inspect`.
 ///
-/// Built fresh on each request from the host's running daemon and a probe of its
-/// `PATH`; it is never cached, so it always reflects the host as it is now.
+/// Built from the host's running daemon on each request: the presence of every
+/// agent program on its `PATH` is resolved afresh, and the version probes
+/// behind `runtimes` are shared with earlier requests for as long as the probed
+/// file is unchanged and the daemon's probe cache lifetime has not passed, so
+/// a result may be up to that lifetime old.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the wire snapshot exposes independent host feature flags"

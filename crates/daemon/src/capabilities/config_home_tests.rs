@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use pohunek_worker_protocol::{BaseEnv, DEFAULT_ENVIRONMENT_ALLOWLIST};
 use protocol::{AgentRuntime, HostCapabilities};
 
-use super::host_capabilities;
+use super::host_capabilities_uncached;
 use crate::agent::host::fixture::{official_host, official_profile_pin};
 use crate::agent::ProfileRegistry;
 use crate::runtime::environment::{base_environment, EnvironmentSource};
@@ -103,7 +103,7 @@ impl Rig {
     }
 
     fn inspect(&self, registry: &ProfileRegistry) -> HostCapabilities {
-        host_capabilities("0.0.0", registry, &self.base(&[]))
+        host_capabilities_uncached("0.0.0", registry, &self.base(&[]))
     }
 }
 
@@ -282,7 +282,7 @@ fn runtimes_without_a_declared_home_and_unresolvable_homes_carry_no_id() {
     )
     .expect("an empty base environment");
     let registry = rig.registry(Some(rig.state()));
-    let caps = host_capabilities("0.0.0", &registry, &bare_env);
+    let caps = host_capabilities_uncached("0.0.0", &registry, &bare_env);
     assert_eq!(entry(&caps, "claude").config_home_id, None);
     assert_eq!(entry(&caps, "codex").config_home_id, None);
     assert!(!caps.runtimes.is_empty(), "the inventory is still reported");
@@ -317,11 +317,11 @@ fn only_the_launch_base_environment_steers_the_identifier() {
     // CLAUDE_CONFIG_DIR is not in the default allowlist: a launch does not
     // forward it, so the bare runtime resolves the default home whatever the
     // daemon's own environment holds.
-    let launch = host_capabilities("0.0.0", &registry, &rig.base(&[]));
+    let launch = host_capabilities_uncached("0.0.0", &registry, &rig.base(&[]));
     assert_eq!(id_of(&launch, "claude"), id_of(&launch, "pinned"));
 
     // A base environment that does forward it gives the agent that home.
-    let forwarded = host_capabilities(
+    let forwarded = host_capabilities_uncached(
         "0.0.0",
         &registry,
         &rig.base(&[("CLAUDE_CONFIG_DIR", &steered)]),

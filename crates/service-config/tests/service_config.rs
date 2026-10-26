@@ -12,11 +12,11 @@ use pohunek_platform::filesystem::FsError;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
-    ConfigError, ConfigSpec, Deadlines, InputTiming, KeepaliveTiming, RequiredHook, ServiceConfig,
-    WaitTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
-    DEFAULT_KEEPALIVE_TIMING, DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING,
-    MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES,
-    MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    ConfigError, ConfigSpec, Deadlines, InputTiming, InventoryProbe, KeepaliveTiming, RequiredHook,
+    ServiceConfig, WaitTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES,
+    DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE, DEFAULT_KEEPALIVE_TIMING,
+    DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
+    MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
@@ -180,6 +180,7 @@ fn spec() -> ConfigSpec {
         hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
         hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
+        inventory_probe: DEFAULT_INVENTORY_PROBE,
         open_files: 8192,
     }
 }
@@ -2742,6 +2743,131 @@ fn non_default_keepalive_keys_round_trip_and_are_not_unknown() {
     let rendered = only_count.to_toml();
     assert!(rendered.contains("keepalive_count = 5"), "{rendered}");
     assert!(!rendered.contains("keepalive_idle_ms"), "{rendered}");
+}
+
+/// Appends an `[inventory]` table with `lines` to the golden file, before `[limits]`.
+fn with_inventory(lines: &str) -> String {
+    replace(
+        GOLDEN,
+        "[limits]",
+        &format!("[inventory]\n{lines}\n\n[limits]"),
+    )
+}
+
+/// A file without `[inventory]` means the documented defaults, and a rewrite
+/// does not add the table, so a release that predates it still reads the file.
+#[test]
+fn a_file_without_inventory_keys_loads_the_defaults_and_rewrites_unchanged() {
+    let fixture = Fixture::new();
+    let loaded = fixture.load(GOLDEN).expect("load the golden file");
+    assert_eq!(loaded.inventory_probe(), DEFAULT_INVENTORY_PROBE);
+    let rendered = loaded.to_toml();
+    assert!(!rendered.contains("inventory"), "{rendered}");
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+}
+
+/// Non-default inventory keys are loaded, written back, and known keys; a
+/// single key leaves the others at their defaults and out of the rewrite.
+#[test]
+fn non_default_inventory_keys_round_trip_and_are_not_unknown() {
+    let fixture = Fixture::new();
+    let text = with_inventory(
+        "probe_cache_ttl_ms = 60000\nprobe_failure_ttl_ms = 2000\nprobe_cache_max_entries = 8\nprobe_parallelism = 4",
+    );
+    let loaded = fixture.load(&text).expect("load custom inventory keys");
+    assert_eq!(
+        loaded.inventory_probe(),
+        InventoryProbe {
+            cache_ttl: Duration::from_secs(60),
+            failure_ttl: Duration::from_secs(2),
+            cache_max_entries: 8,
+            parallelism: 4,
+        }
+    );
+    assert!(
+        loaded.unknown_keys().is_empty(),
+        "{:?}",
+        loaded.unknown_keys()
+    );
+    let rendered = loaded.to_toml();
+    assert!(rendered.contains("[inventory]"), "{rendered}");
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+
+    let only_parallelism = fixture
+        .load(&with_inventory("probe_parallelism = 4"))
+        .expect("a single key is enough");
+    let rendered = only_parallelism.to_toml();
+    assert!(rendered.contains("probe_parallelism = 4"), "{rendered}");
+    assert!(!rendered.contains("probe_cache_ttl_ms"), "{rendered}");
+}
+
+/// Each inventory key is bounded, and the bounds are inclusive.
+#[test]
+fn inventory_values_outside_their_bounds_are_refused_by_key() {
+    let fixture = Fixture::new();
+    for (line, key, value, min, max) in [
+        (
+            "probe_cache_ttl_ms = 0",
+            "inventory.probe_cache_ttl_ms",
+            0,
+            1,
+            600_000,
+        ),
+        (
+            "probe_failure_ttl_ms = 600001",
+            "inventory.probe_failure_ttl_ms",
+            600_001,
+            1,
+            600_000,
+        ),
+        (
+            "probe_cache_max_entries = 0",
+            "inventory.probe_cache_max_entries",
+            0,
+            1,
+            4096,
+        ),
+        (
+            "probe_cache_max_entries = 4097",
+            "inventory.probe_cache_max_entries",
+            4097,
+            1,
+            4096,
+        ),
+        (
+            "probe_parallelism = 0",
+            "inventory.probe_parallelism",
+            0,
+            1,
+            256,
+        ),
+        (
+            "probe_parallelism = 257",
+            "inventory.probe_parallelism",
+            257,
+            1,
+            256,
+        ),
+    ] {
+        match fixture.load(&with_inventory(line)) {
+            Err(ConfigError::OutOfRange {
+                key: rejected,
+                value: rejected_value,
+                min: rejected_min,
+                max: rejected_max,
+            }) => assert_eq!(
+                (rejected, rejected_value, rejected_min, rejected_max),
+                (key, value, min, max),
+                "{line}"
+            ),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+    fixture
+        .load(&with_inventory(
+            "probe_cache_ttl_ms = 1\nprobe_failure_ttl_ms = 600000\nprobe_cache_max_entries = 4096\nprobe_parallelism = 1",
+        ))
+        .expect("bounds are inclusive");
 }
 
 /// Replaces the `[deadlines]` table of the golden file with `extra` keyed

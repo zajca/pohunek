@@ -1,33 +1,60 @@
 //! Host-scoped methods: `host.inspect`, `host.discover` and `host.resolve`.
 
-use protocol::{HostDiscoverParams, HostResolveParams, ProtocolError, Request, Response};
+use protocol::{
+    HostDiscoverParams, HostInspectParams, HostResolveParams, ProtocolError, Request, Response,
+};
 
 use super::util::error_value;
 
-use super::util::{ok_value, parse_optional_params, parse_params, selected_version};
+use super::util::{ok_value, parse_optional_params, parse_params, run_blocking, selected_version};
 use super::{ControlTransport, HealthInfo};
 use crate::discovery::DiscoveryCache;
 use crate::session::SessionRegistry;
 
 /// `host.inspect`: report this host's live capability snapshot.
 ///
-/// The snapshot is built fresh on each request (agent runtimes are probed
-/// against `PATH`), so it always reflects the host as it is now. Transport
-/// agnostic: the same handler answers over the local Unix socket and over an
-/// overlay TCP connection. The reported protocol version is the one this
-/// connection negotiated.
-pub(super) fn handle_host_inspect(
+/// Presence and path of each agent program are resolved against `PATH` on every
+/// request; the version probes behind them come from the daemon's probe cache
+/// (see [`crate::capabilities::ProbeCache`]). The inventory is built on a
+/// blocking thread, so a slow probe never stalls other requests. With
+/// `skip_runtime_probes` only the feature flags are answered and nothing is
+/// resolved or probed. Transport agnostic: the same handler answers over the
+/// local Unix socket and over an overlay TCP connection. The reported protocol
+/// version is the one this connection negotiated.
+pub(super) async fn handle_host_inspect(
     request: &Request,
     health: &HealthInfo,
     sessions: &SessionRegistry,
 ) -> Response {
-    let mut capabilities = crate::capabilities::host_capabilities(
-        &health.daemon_version,
-        sessions.profiles(),
-        &sessions.inspect_base_environment(),
-    );
-    capabilities.protocol_version = selected_version(request);
-    ok_value(request, &capabilities)
+    let params = match parse_optional_params::<Option<HostInspectParams>>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    let daemon_version = health.daemon_version.clone();
+    let protocol_version = selected_version(request);
+    if params.and_then(|params| params.skip_runtime_probes) == Some(true) {
+        let mut capabilities = crate::capabilities::host_capability_flags(&daemon_version);
+        capabilities.protocol_version = protocol_version;
+        return ok_value(request, &capabilities);
+    }
+    let sessions = sessions.clone();
+    run_blocking(
+        request,
+        move || {
+            let mut capabilities = crate::capabilities::host_capabilities(
+                &daemon_version,
+                sessions.profiles(),
+                &sessions.inspect_base_environment(),
+                sessions.probe_cache(),
+            );
+            capabilities.protocol_version = protocol_version;
+            Ok(capabilities)
+        },
+        "host_inspect_task_panicked",
+        "host inventory task panicked",
+        Some("retry the request; if it repeats, inspect daemon logs"),
+    )
+    .await
 }
 
 /// `host.discover`: enumerate overlay peers and classify each daemon.

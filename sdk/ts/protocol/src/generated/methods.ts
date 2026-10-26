@@ -8,6 +8,7 @@ import type {
   HostCapabilities,
   HostDiscoverParams,
   HostGovernanceStatus,
+  HostInspectParams,
   HostRecord,
   HostResolution,
   HostResolveParams,
@@ -121,7 +122,7 @@ export interface Methods {
   "daemon.health": { params: null; output: DaemonHealthResult };
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
   "host.governance.inspect": { params: null; output: HostGovernanceStatus };
-  "host.inspect": { params: null; output: HostCapabilities };
+  "host.inspect": { params: HostInspectParams | null; output: HostCapabilities };
   "host.resolve": { params: HostResolveParams; output: HostResolution };
   "integration.doctor": { params: IntegrationDoctorParams; output: IntegrationDoctorResult };
   "integration.install": { params: IntegrationInstallParams; output: IntegrationInstallResult };

@@ -814,6 +814,29 @@ impl Client {
         Ok(protocol::tolerant::from_value(value)?)
     }
 
+    /// `host.inspect` with explicit parameters.
+    ///
+    /// [`Self::call`] with [`protocol::method::HostInspect`] sends canonical
+    /// `null` parameters and gets the full inventory; this sends `params`, for
+    /// example to skip the runtime inventory. A daemon that predates the
+    /// parameters ignores them and answers the full inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when transport, protocol, or decoding fails.
+    pub async fn host_inspect_with(
+        &mut self,
+        params: protocol::HostInspectParams,
+    ) -> Result<protocol::HostCapabilities, ClientError> {
+        let request = Request::new(
+            next_request_id(protocol::method::HOST_INSPECT),
+            protocol::method::HOST_INSPECT,
+            serde_json::to_value(params)?,
+        )?;
+        let value = self.request(&request).await?;
+        Ok(protocol::tolerant::from_value(value)?)
+    }
+
     /// Probe the daemon and return the negotiated protocol version it reports.
     pub async fn handshake(&mut self) -> Result<ProtocolVersion, ClientError> {
         let _result = self.call::<protocol::method::DaemonHealth>(()).await?;

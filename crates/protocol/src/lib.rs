@@ -48,7 +48,7 @@ pub use assistant::{
     ConceptMeta, ConceptType,
 };
 #[doc(inline)]
-pub use capabilities::{AgentRuntime, HostCapabilities};
+pub use capabilities::{AgentRuntime, HostCapabilities, HostInspectParams};
 #[doc(inline)]
 pub use decimal::{
     ActivityRevision, BackgroundRevision, DecimalWireError, OutputOffset, ProcessStartIdentity,

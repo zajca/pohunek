@@ -1188,6 +1188,7 @@ fn service_config(
         hook_stderr_tail_bytes: pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES,
         hook_required: Vec::new(),
         event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
+        inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration")

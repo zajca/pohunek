@@ -474,7 +474,7 @@ method_table!(
     "host.inspect",
     (),
     HostCapabilities,
-    "null",
+    "HostInspectParams | null",
     "HostCapabilities";
 
     /// Materialize the embedded assistant knowledge bundle on the agent host.
