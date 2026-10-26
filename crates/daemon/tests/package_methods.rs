@@ -592,6 +592,60 @@ async fn a_descriptor_with_an_invalid_transcript_declaration_is_refused() {
 }
 
 #[tokio::test]
+async fn a_descriptor_requiring_an_unknown_runtime_feature_is_refused() {
+    let servers = spawn_servers("pkg-requires").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let plain = descriptor("/bin/sh");
+    let requiring = |requires: &str| {
+        plain.replace(
+            "runtime_api = 1\n",
+            &format!("runtime_api = 1\nrequires = {requires}\n"),
+        )
+    };
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "unknown-feature",
+        &requiring("[\"later-v1\"]"),
+        false,
+    )
+    .await;
+    let error = result.expect_err("an unknown feature is refused");
+    assert_eq!(error.code, "runtime_feature_unsupported");
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "not-an-id",
+        &requiring("[\"Later\"]"),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a malformed id is refused").code,
+        "package_descriptor_invalid"
+    );
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "empty-requires",
+        &requiring("[]"),
+        false,
+    )
+    .await;
+    result.expect("an empty requires installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
 async fn a_fork_assignment_installs_only_next_to_an_assigned_fork_and_is_shown_for_review() {
     let servers = spawn_servers("pkg-assign-fork").await;
     let mut local = connect_unix(&servers.socket).await;

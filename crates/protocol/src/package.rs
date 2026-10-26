@@ -584,6 +584,9 @@ pub enum PackageErrorKind {
     /// a version of the same package that is retained by a session or profile
     /// pin, or that is selected; nothing was changed.
     IntegrationIncompatible,
+    /// The descriptor requires a runtime feature this core does not implement,
+    /// or uses a key or compiled id of a feature it does not require.
+    RuntimeFeatureUnsupported,
 }
 
 impl PackageErrorKind {
@@ -618,6 +621,7 @@ impl PackageErrorKind {
             Self::ProfileTargetInvalid => "package_profile_target_invalid",
             Self::ProfileChanged => "package_profile_changed",
             Self::IntegrationIncompatible => "package_integration_incompatible",
+            Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
         }
     }
 
@@ -674,6 +678,9 @@ impl PackageErrorKind {
             Self::IntegrationIncompatible => {
                 "the package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected"
             }
+            Self::RuntimeFeatureUnsupported => {
+                "the package descriptor requires a runtime feature this core does not support, or uses one without requiring it"
+            }
         }
     }
 
@@ -717,6 +724,9 @@ impl PackageErrorKind {
             Self::ProfileChanged => "run the command again to review the profile as it is now",
             Self::IntegrationIncompatible => {
                 "stop or remove the sessions and unpin the profiles that use the other version, or uninstall it, then retry"
+            }
+            Self::RuntimeFeatureUnsupported => {
+                "upgrade pohunek to a release that implements the feature, or list every feature the descriptor uses in `requires`"
             }
         }
     }
@@ -844,6 +854,7 @@ mod tests {
             PackageErrorKind::ProfileTargetInvalid,
             PackageErrorKind::ProfileChanged,
             PackageErrorKind::IntegrationIncompatible,
+            PackageErrorKind::RuntimeFeatureUnsupported,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

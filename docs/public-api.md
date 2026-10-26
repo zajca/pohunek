@@ -818,6 +818,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_profile_target_invalid` | `runtime` | The package is not installed, is faulted, does not serve the base runtime, or is not the unique selected package. |
 | `package_profile_changed` | `runtime` | The profile changed while it was being rewritten and was left as found. |
 | `package_integration_incompatible` | `runtime` | The package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected, or that an unreadable `metadata.jsonl` line may reference; nothing changed. |
+| `runtime_feature_unsupported` | `runtime` | The descriptor's `requires` names a runtime feature this core does not implement, or the descriptor uses a key or compiled parser or handler id of a feature it does not list in `requires`; nothing was recorded. |
 
 ### Daemon Runtime Configuration
 

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config_home::ConfigHome;
+use super::features::{check_gates, check_requires, FeatureTables};
 use super::transcripts::Transcripts;
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
@@ -134,6 +135,23 @@ pub enum DefinitionError {
     /// `detect_manifest` names a manifest the source cannot provide.
     #[error("detect_manifest does not name an available detection manifest")]
     UnknownManifest,
+    /// `requires` names a runtime feature this core does not implement.
+    #[error("runtime feature {feature} is not supported by core {core}")]
+    FeatureUnsupported {
+        /// The required feature id.
+        feature: String,
+        /// Version of this core.
+        core: &'static str,
+    },
+    /// A descriptor key or compiled id belongs to a runtime feature that
+    /// `requires` does not list.
+    #[error("{key} needs runtime feature {feature} in requires")]
+    FeatureNotRequired {
+        /// Dotted path of the descriptor key.
+        key: &'static str,
+        /// The feature that owns the key.
+        feature: &'static str,
+    },
 }
 
 impl From<VersionProbeError> for DefinitionError {
@@ -601,19 +619,21 @@ impl RuntimeDefinition {
         origin: impl FnOnce(PackageIdentity) -> DefinitionOrigin,
         manifest: impl FnOnce(&str) -> Result<Arc<Manifest>, DefinitionError>,
     ) -> Result<Self, DefinitionError> {
+        Self::from_toml_with(source, &FeatureTables::PRODUCTION, origin, manifest)
+    }
+
+    /// [`Self::from_toml`] checking `requires` and the feature-gated keys
+    /// against `features`.
+    pub(super) fn from_toml_with(
+        source: &str,
+        features: &FeatureTables<'_>,
+        origin: impl FnOnce(PackageIdentity) -> DefinitionOrigin,
+        manifest: impl FnOnce(&str) -> Result<Arc<Manifest>, DefinitionError>,
+    ) -> Result<Self, DefinitionError> {
         if source.len() > MAX_DEFINITION_BYTES {
             return Err(DefinitionError::TooLarge);
         }
-        let raw: RawDefinition = toml::from_str(source).map_err(|error| {
-            let line = error.span().map(|span| {
-                source[..span.start.min(source.len())]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1
-            });
-            DefinitionError::Malformed { line }
-        })?;
+        let (document, raw) = parse_document(source, features)?;
         if raw.schema != SUPPORTED_SCHEMA {
             return Err(DefinitionError::UnsupportedSchema { found: raw.schema });
         }
@@ -622,6 +642,7 @@ impl RuntimeDefinition {
                 found: raw.runtime_api,
             });
         }
+        check_gates(&document, features)?;
         let package = PackageIdentity {
             id: PackageId::parse(&raw.id).map_err(|source| DefinitionError::Identifier {
                 field: "id",
@@ -1121,6 +1142,10 @@ struct RawDefinition {
     id: String,
     version: String,
     runtime_api: u32,
+    /// Runtime features the descriptor needs; checked on the untyped document
+    /// before this struct is parsed.
+    #[serde(default, rename = "requires")]
+    _requires: Vec<String>,
     runtime: RawRuntime,
     input: RawInput,
     resume: RawResume,
@@ -1164,6 +1189,29 @@ struct RawInput {
     /// Absent means the host's startup grace alone bounds the readiness wait.
     #[serde(default)]
     startup_grace_ms: Option<u64>,
+}
+
+/// Parses `source` as an untyped table and as a [`RawDefinition`], checking
+/// `requires` between the two so an unknown feature wins over the parse error
+/// of a key only that feature's core understands.
+fn parse_document(
+    source: &str,
+    features: &FeatureTables<'_>,
+) -> Result<(toml::Table, RawDefinition), DefinitionError> {
+    let malformed = |error: &toml::de::Error| {
+        let line = error.span().map(|span| {
+            source[..span.start.min(source.len())]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        });
+        DefinitionError::Malformed { line }
+    };
+    let document: toml::Table = toml::from_str(source).map_err(|error| malformed(&error))?;
+    check_requires(&document, features)?;
+    let raw = toml::from_str(source).map_err(|error| malformed(&error))?;
+    Ok((document, raw))
 }
 
 /// Readiness names accepted in `[input]`.

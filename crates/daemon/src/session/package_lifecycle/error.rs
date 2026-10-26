@@ -8,7 +8,7 @@ use package::registry::RegistryError;
 use package::verify::VerifyError;
 use protocol::PackageErrorKind;
 
-use crate::agent::host::PackageRejection;
+use crate::agent::host::{DefinitionError, PackageRejection};
 
 /// The error kind of a registry failure.
 ///
@@ -48,6 +48,9 @@ pub(super) fn rejection_kind(rejection: &PackageRejection) -> PackageErrorKind {
         return PackageErrorKind::RuntimeNotClaimable;
     }
     match rejection {
+        PackageRejection::Descriptor(
+            DefinitionError::FeatureUnsupported { .. } | DefinitionError::FeatureNotRequired { .. },
+        ) => PackageErrorKind::RuntimeFeatureUnsupported,
         PackageRejection::NotRegistered => PackageErrorKind::NotInstalled,
         PackageRejection::Root(VerifyError::Unreadable { .. }) => PackageErrorKind::RegistryFailed,
         PackageRejection::Root(_) => PackageErrorKind::RootInvalid,
@@ -70,7 +73,7 @@ mod tests {
     use package::ArchiveError;
 
     use super::*;
-    use crate::agent::host::{DefinitionError, DefinitionInvariant};
+    use crate::agent::host::DefinitionInvariant;
 
     #[test]
     fn registry_errors_map_to_their_stable_kinds() {
@@ -183,6 +186,20 @@ mod tests {
             (
                 PackageRejection::Descriptor(DefinitionError::TooLarge),
                 PackageErrorKind::DescriptorInvalid,
+            ),
+            (
+                PackageRejection::Descriptor(DefinitionError::FeatureUnsupported {
+                    feature: "later-v1".to_owned(),
+                    core: "0.38.0",
+                }),
+                PackageErrorKind::RuntimeFeatureUnsupported,
+            ),
+            (
+                PackageRejection::Descriptor(DefinitionError::FeatureNotRequired {
+                    key: "input.ready",
+                    feature: "later-v1",
+                }),
+                PackageErrorKind::RuntimeFeatureUnsupported,
             ),
             (
                 PackageRejection::ReservedRuntimeId,

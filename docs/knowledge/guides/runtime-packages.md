@@ -68,6 +68,41 @@ A `pohunek service upgrade` runs this install for the release's packages it need
 and pins the host profiles to them, so the manual install is the fallback for a
 host that upgrades without that step.
 
+## Runtime features
+
+`runtime_api` stays the major number of the descriptor contract. A capability
+added to the core within a major number is a named runtime feature, with an id
+shaped `<name>-v<N>` such as `input-readiness-v2`. A descriptor that uses a
+feature lists it in a top-level `requires` array, before the first table:
+
+```toml
+runtime_api = 1
+requires = ["input-readiness-v2"]
+```
+
+`requires` holds at most 16 unique feature ids. The core checks it before the
+rest of the descriptor:
+
+- An id this core does not implement is refused with
+  `runtime_feature_unsupported`. The daemon log names the feature and the
+  core's version; the wire message is the same fixed text as every other
+  `package_*` error. The refusal wins over `descriptor_invalid` for a key only
+  that feature's core understands. An installed package that fails this check at
+  load is left out and faulted as `descriptor_invalid`; other packages and
+  built-ins still load.
+- A descriptor key, or a compiled parser or handler id, that belongs to a
+  feature is accepted only when `requires` lists that feature. Using it
+  without the entry is refused with `runtime_feature_unsupported`, and the
+  log names the key path.
+- A `requires` entry the descriptor does not use is accepted.
+- An entry that is not a feature id, a repeated entry or more than 16 entries
+  is `descriptor_invalid`.
+
+The core owns an append-only table of its features. A row is never removed or
+renamed, because a published descriptor may require it; the table equals a
+snapshot file that a test compares. Which core version first has a feature is
+not part of the refusal, because an older core cannot know it.
+
 ## Config home
 
 A runtime that keeps its settings, hook registration or conversations in a
