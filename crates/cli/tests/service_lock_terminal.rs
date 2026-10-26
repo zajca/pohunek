@@ -98,8 +98,9 @@ fn stopped(pid: i32) -> bool {
         })
 }
 
-/// Whether `ps` reports `pid` blocked in a wait rather than running or
-/// stopped: `S` or `D`, and on macOS also `I` (idle) or `U` (uninterruptible).
+/// Whether `ps` reports `pid` blocked in a wait (`S` or `D`) rather than
+/// running or stopped.
+#[cfg(target_os = "linux")]
 fn blocked(pid: i32) -> bool {
     Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -107,7 +108,7 @@ fn blocked(pid: i32) -> bool {
         .is_ok_and(|output| {
             String::from_utf8_lossy(&output.stdout)
                 .trim_start()
-                .starts_with(['S', 'D', 'I', 'U'])
+                .starts_with(['S', 'D'])
         })
 }
 
@@ -482,8 +483,14 @@ fn the_command_owns_the_terminal_and_gets_each_interrupt_once() {
     assert_eq!(session.foreground(), Some(shell));
 }
 
-/// `Ctrl-Z` is typed while the command waits in `read first`, where it runs
-/// only builtins. A `sh` that starts every program with `vfork` would hold
+/// Types the line the command's first `read` waits for and checks it arrived.
+fn answer_first(session: &mut Session) {
+    session.type_bytes(b"hello\n");
+    assert_eq!(line(&session.path("first")), "hello");
+}
+
+/// On Linux, `Ctrl-Z` is typed while the command waits in `read first`, where
+/// it runs only builtins. A `sh` that starts every program with `vfork` would hold
 /// the whole job in the kernel's vfork wait if the stop landed between the
 /// `vfork` and the `execve` of a `sleep`, and `service lock` would never see
 /// the job stop (#554). On Linux every `sleep` is held in its `execve` for the
@@ -495,6 +502,12 @@ fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
     let lock = session.pid("lock.pid");
     let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
     wait_until("the handoff", || session.foreground() == Some(child));
+    // macOS's `sh` is bash, whose `read` returns an empty line when a stop
+    // interrupts it, so the line is typed before the stop there. That `sh`
+    // forks instead of `vfork`ing, so no program start can strand the stop.
+    #[cfg(not(target_os = "linux"))]
+    answer_first(&mut session);
+    #[cfg(target_os = "linux")]
     wait_until("the command to wait for its first line", || blocked(child));
 
     // `Ctrl-Z` stops the command; the lock process takes the terminal back
@@ -518,8 +531,8 @@ fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
     wait_until("the command to run", || !stopped(child));
     assert!(!stopped(lock));
 
-    session.type_bytes(b"hello\n");
-    assert_eq!(line(&session.path("first")), "hello");
+    #[cfg(target_os = "linux")]
+    answer_first(&mut session);
     session.touch("phase2");
     session.type_bytes(b"after\n");
     assert_eq!(line(&session.path("second")), "after");
