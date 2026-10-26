@@ -491,7 +491,7 @@ impl RuntimeHost {
         else {
             return None;
         };
-        let state = store.registry().state().ok()?;
+        let state = store.registry_state().ok()?;
         let official =
             |record: &package::registry::PackageRecord| record.source() == RecordSource::Official;
         if !state.package(frozen_digest).is_some_and(official) {
@@ -570,7 +570,7 @@ impl RuntimeHost {
         else {
             return false;
         };
-        let Ok(state) = store.registry().state() else {
+        let Ok(state) = store.registry_state() else {
             return false;
         };
         let official =

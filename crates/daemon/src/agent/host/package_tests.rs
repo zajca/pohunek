@@ -1352,3 +1352,30 @@ fn concurrent_cold_loads_of_one_digest_converge_on_one_definition() {
         assert!(std::sync::Arc::ptr_eq(&loaded[0], definition));
     }
 }
+
+#[test]
+fn a_rejected_load_is_not_remembered_once_the_package_is_repaired() {
+    let plugins = Plugins::new();
+    let built = acme("1.0.0");
+    install(&plugins.registry(), &built, true, true);
+    let store = plugins.store();
+    let descriptor = plugins
+        .root(&built.digest)
+        .join("files")
+        .join("runtime.toml");
+    let mode = fs::metadata(&descriptor).expect("descriptor").permissions();
+
+    tamper(&plugins, &built.digest, &Tamper::Chmod);
+    let refused = store
+        .load_pinned(&runtime("acme"), &built.digest, &built.identity)
+        .expect_err("a changed mode fails verification");
+    assert!(matches!(refused, PackageRejection::Root(_)));
+    assert_eq!(store.cached_definitions(), 0);
+
+    fs::set_permissions(&descriptor, mode).expect("repair the mode");
+    let repaired = store
+        .load_pinned(&runtime("acme"), &built.digest, &built.identity)
+        .expect("the repaired package loads");
+    assert_eq!(repaired.runtime_id(), &runtime("acme"));
+    assert_eq!(store.cached_definitions(), 1);
+}

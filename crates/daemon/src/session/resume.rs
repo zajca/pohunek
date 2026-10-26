@@ -21,9 +21,10 @@ use crate::agent::{
 };
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
+use package::PackageDigest;
 use pohunek_worker_protocol::BaseEnv;
 use protocol::ErrorClass;
-use protocol::{BindingProvenance, RuntimeRef};
+use protocol::{BindingProvenance, LaunchBinding, PackageId, RuntimeRef};
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -215,12 +216,17 @@ impl SessionRegistry {
     fn native_activity_lookup(
         &self,
         (target, binding, definition): (String, ResumeBinding, Arc<RuntimeDefinition>),
+        resolutions: &mut PinResolutions,
     ) -> Option<(ReferenceExistence, SessionRef, LaunchEnv)> {
         let launch = binding_native_launch(&binding, &definition);
         let existence = reference_existence(&binding, launch.as_ref(), &definition)?;
-        let Ok(profile) =
-            self.resolve_recovery_profile(&binding, &definition, ProfileChange::Refuse, false)
-        else {
+        let Ok(profile) = self.resolve_recovery_profile_memo(
+            &binding,
+            &definition,
+            ProfileChange::Refuse,
+            false,
+            resolutions,
+        ) else {
             return None;
         };
         let Ok(reference) = SessionRef::id(&target) else {
@@ -282,7 +288,7 @@ impl SessionRegistry {
         }
         let lookups = lookup_inputs
             .into_iter()
-            .map(|input| self.native_activity_lookup(input?))
+            .map(|input| self.native_activity_lookup(input?, &mut resolutions))
             .collect::<Vec<_>>();
         if lookups.iter().all(Option::is_none) {
             return;
@@ -965,12 +971,32 @@ impl SessionRegistry {
         change: ProfileChange,
         fork: bool,
     ) -> Result<RecoveryProfile, ProtocolError> {
-        recovery_profile_in(
+        self.resolve_recovery_profile_memo(
+            binding,
+            definition,
+            change,
+            fork,
+            &mut PinResolutions::default(),
+        )
+    }
+
+    /// [`Self::resolve_recovery_profile`] resolving the pin judgements through
+    /// `resolutions`.
+    pub(super) fn resolve_recovery_profile_memo(
+        &self,
+        binding: &ResumeBinding,
+        definition: &Arc<RuntimeDefinition>,
+        change: ProfileChange,
+        fork: bool,
+        resolutions: &mut PinResolutions,
+    ) -> Result<RecoveryProfile, ProtocolError> {
+        recovery_profile_memo(
             &self.inner.profiles,
             binding,
             Some(definition),
             change,
             fork,
+            resolutions,
         )
     }
 
@@ -1466,11 +1492,19 @@ fn adopted_profile_matches_in(
     definition: &RuntimeDefinition,
     frozen: &ProfileRevision,
     fork: bool,
+    resolutions: &mut PinResolutions,
 ) -> Result<bool, ProtocolError> {
     let built_in = host::adopts(&binding.launch_binding, definition);
     let newer = host::adopts_newer(&binding.launch_binding, definition);
     if !(built_in || newer) {
-        return repinned_profile_matches_in(profiles, binding, name, definition, frozen);
+        return repinned_profile_matches_in(
+            profiles,
+            binding,
+            name,
+            definition,
+            frozen,
+            resolutions,
+        );
     }
     if recovery_contract(binding, definition, fork).is_err() {
         return Ok(false);
@@ -1541,6 +1575,7 @@ fn repinned_profile_matches_in(
     name: &str,
     definition: &RuntimeDefinition,
     frozen: &ProfileRevision,
+    resolutions: &mut PinResolutions,
 ) -> Result<bool, ProtocolError> {
     let Some(stored) = binding.launch_binding.binding() else {
         return Ok(false);
@@ -1558,10 +1593,12 @@ fn repinned_profile_matches_in(
     let ProfilePin::Pinned(current) = profiles.profile_pin(name)? else {
         return Ok(false);
     };
-    if !profiles
-        .runtimes()
-        .pins_newer_official(stored, &current.package, &current.digest)
-    {
+    if !resolutions.pins_newer_official(
+        profiles.runtimes(),
+        stored,
+        &current.package,
+        &current.digest,
+    ) {
         return Ok(false);
     }
     let launched = Pin {
@@ -1602,6 +1639,25 @@ pub(super) fn recovery_profile_in(
     change: ProfileChange,
     fork: bool,
 ) -> Result<RecoveryProfile, ProtocolError> {
+    recovery_profile_memo(
+        profiles,
+        binding,
+        definition,
+        change,
+        fork,
+        &mut PinResolutions::default(),
+    )
+}
+
+/// [`recovery_profile_in`] resolving the pin judgements through `resolutions`.
+pub(super) fn recovery_profile_memo(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    definition: Option<&Arc<RuntimeDefinition>>,
+    change: ProfileChange,
+    fork: bool,
+    resolutions: &mut PinResolutions,
+) -> Result<RecoveryProfile, ProtocolError> {
     let frozen = binding.profile_revision.as_ref();
     let resolved = match definition.map_or_else(
         || profiles.resolve_agent(&binding.agent),
@@ -1636,6 +1692,7 @@ pub(super) fn recovery_profile_in(
                     &resolved.definition,
                     frozen,
                     fork,
+                    resolutions,
                 )?
         }
         None => false,
@@ -1710,6 +1767,7 @@ pub(super) struct PinResolutions {
         LaunchPin,
         Result<Arc<RuntimeDefinition>, ProtocolError>,
     )>,
+    newer_official: Vec<(LaunchBinding, PackageId, PackageDigest, bool)>,
 }
 
 impl PinResolutions {
@@ -1732,6 +1790,26 @@ impl PinResolutions {
             adopter.clone(),
         ));
         adopter
+    }
+
+    /// [`RuntimeHost::pins_newer_official`], which reads the registry record.
+    fn pins_newer_official(
+        &mut self,
+        runtimes: &RuntimeHost,
+        frozen: &LaunchBinding,
+        package: &PackageId,
+        digest: &PackageDigest,
+    ) -> bool {
+        let known = self.newer_official.iter().find(|(binding, id, pinned, _)| {
+            binding == frozen && id == package && pinned == digest
+        });
+        if let Some((_, _, _, pins)) = known {
+            return *pins;
+        }
+        let pins = runtimes.pins_newer_official(frozen, package, digest);
+        self.newer_official
+            .push((frozen.clone(), package.clone(), digest.clone(), pins));
+        pins
     }
 
     fn pinned(

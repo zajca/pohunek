@@ -1499,3 +1499,108 @@ async fn a_newer_package_version_does_not_adopt_a_session_whose_frozen_profile_i
         "the preflight judges what resume refuses"
     );
 }
+
+/// Adds a stopped Claude session of the [`PROFILE`] profile to `session`'s
+/// host, with its own native conversation.
+async fn add_stopped_claude(session: &Stopped, index: usize) -> SessionId {
+    let conversation = format!("{CONVERSATION}-extra-{index}");
+    let created = session
+        .fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(temp_dir(&format!("newer-list-cost-extra-{index}"))),
+            ..params()
+        })
+        .await
+        .expect("a session of the older package");
+    let conversations = session
+        .fixture
+        .dir
+        .join("agent-home")
+        .join("projects")
+        .join("work");
+    fs::write(conversations.join(format!("{conversation}.jsonl")), b"{}\n")
+        .expect("the conversation");
+    let report = native_report_params(
+        &session.fixture.registry,
+        created.id.clone(),
+        CLAUDE.runtime.to_owned(),
+        conversation,
+        None,
+    )
+    .await;
+    assert!(
+        session
+            .fixture
+            .registry
+            .report_as_root(report)
+            .await
+            .recorded
+    );
+    session
+        .fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    created.id
+}
+
+/// Listing sessions pinned to one package digest, whose profile moved to a
+/// newer version that does not adopt them, reads the registry record and
+/// verifies the package root the same number of times for four sessions as for
+/// one, and compiles no further definition.
+#[tokio::test]
+async fn listing_package_pinned_sessions_costs_the_same_as_listing_one() {
+    let old = CLAUDE.older();
+    let session = stopped_on("newer-list-cost", &CLAUDE, &old, CLAUDE.old_version).await;
+    let mut ids = vec![session.id.clone()];
+    for index in 0..3 {
+        ids.push(add_stopped_claude(&session, index).await);
+    }
+    let case = FailClosed {
+        name: "an unselected newer version",
+        kind: &CLAUDE,
+        newer: Newer::Unselected,
+        expected: Expected::Frozen,
+    };
+    let newer = install_newer(&session.fixture, &case).await;
+    pin_profile(&session.fixture.registry, &newer).await;
+    let restarted = restart(&session.fixture).await;
+    let store = restarted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .package_store()
+        .expect("package store")
+        .clone();
+
+    let cost = |before: (u64, u64)| {
+        (
+            store.root_verifications() - before.0,
+            store.registry_state_reads() - before.1,
+        )
+    };
+    let mut one = restarted.registry.list().await;
+    one.retain(|info| info.id.0 == ids[0].0);
+    let before = (store.root_verifications(), store.registry_state_reads());
+    restarted.registry.enrich_native_activity(&mut one).await;
+    let one_session = cost(before);
+    let cached = store.cached_definitions();
+
+    let mut all = restarted.registry.list().await;
+    let before = (store.root_verifications(), store.registry_state_reads());
+    restarted.registry.enrich_native_activity(&mut all).await;
+    let all_sessions = cost(before);
+
+    assert_eq!(all.len(), ids.len());
+    assert!(all.iter().all(|info| info.capabilities.resume));
+    assert!(one_session.0 > 0 && one_session.1 > 0, "{one_session:?}");
+    assert_eq!(
+        all_sessions, one_session,
+        "the listing cost does not grow with the number of sessions"
+    );
+    assert_eq!(store.cached_definitions(), cached);
+}

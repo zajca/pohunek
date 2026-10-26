@@ -196,6 +196,9 @@ pub struct PackageStore {
     /// listing.
     #[cfg(test)]
     verifications: Arc<AtomicU64>,
+    /// Registry records read so far, for the same bound.
+    #[cfg(test)]
+    state_reads: Arc<AtomicU64>,
 }
 
 impl PackageStore {
@@ -230,6 +233,8 @@ impl PackageStore {
             definitions: Arc::default(),
             #[cfg(test)]
             verifications: Arc::default(),
+            #[cfg(test)]
+            state_reads: Arc::default(),
         }
     }
 
@@ -237,6 +242,17 @@ impl PackageStore {
     #[must_use]
     pub fn registry(&self) -> &package::registry::Registry {
         &self.registry
+    }
+
+    /// Reads the registry record.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`package::registry::Registry::state`].
+    pub fn registry_state(&self) -> Result<package::registry::RegistryState, RegistryError> {
+        #[cfg(test)]
+        self.state_reads.fetch_add(1, Ordering::Relaxed);
+        self.registry.state()
     }
 
     /// Verifies the root of `digest` and returns it only when it is ready.
@@ -301,7 +317,7 @@ impl PackageStore {
         digest: &PackageDigest,
         identity: &PackageIdentity,
     ) -> Result<package::registry::PackageRecord, PackageRejection> {
-        let state = self.registry.state().map_err(PackageRejection::Registry)?;
+        let state = self.registry_state().map_err(PackageRejection::Registry)?;
         let record = state
             .package(digest)
             .ok_or(PackageRejection::NotRegistered)?;
@@ -348,6 +364,12 @@ impl PackageStore {
         self.verifications.load(Ordering::Relaxed)
     }
 
+    /// How many registry records this store has read.
+    #[cfg(test)]
+    pub(crate) fn registry_state_reads(&self) -> u64 {
+        self.state_reads.load(Ordering::Relaxed)
+    }
+
     /// How many definitions the cache holds.
     #[cfg(test)]
     pub(crate) fn cached_definitions(&self) -> usize {
@@ -360,7 +382,7 @@ impl PackageStore {
     /// Called when the runtime registry reloads. A registry record that
     /// cannot be read leaves the cache alone.
     pub fn prune_definitions(&self) {
-        let Ok(state) = self.registry.state() else {
+        let Ok(state) = self.registry_state() else {
             return;
         };
         self.definitions.lock().retain(|digest, definition| {
@@ -390,7 +412,7 @@ impl PackageStore {
         digest: &PackageDigest,
         package: &PackageId,
     ) -> Result<Arc<RuntimeDefinition>, PackageRejection> {
-        let state = self.registry.state().map_err(PackageRejection::Registry)?;
+        let state = self.registry_state().map_err(PackageRejection::Registry)?;
         let record = state
             .package(digest)
             .ok_or(PackageRejection::NotRegistered)?;
@@ -691,7 +713,7 @@ impl PackageSource {
     /// Returns the registry error when the registry record itself cannot be
     /// read; no package is loaded then.
     pub fn load_report(&self) -> Result<PackageLoad, RegistryError> {
-        let state = self.store.registry.state()?;
+        let state = self.store.registry_state()?;
         let mut loaded: Vec<Loaded> = Vec::new();
         let mut rejected = Vec::new();
         for record in state.packages() {
