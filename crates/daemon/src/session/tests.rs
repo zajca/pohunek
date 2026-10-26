@@ -14696,7 +14696,11 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             .rescan_procwatch_at(&created.id, created.pid, Instant::now())
             .await;
         // The session's own loop may still be applying a scan that arms watches.
-        registry.settled(&created.id).await;
+        guard(
+            "the watchers of the session settled",
+            registry.settled(&created.id),
+        )
+        .await;
         assert!(reporter_is_bound(&registry, &created.id).await);
         assert_eq!(
             inspector.exit_watch_count(DESCENDANT_REPORTER_PID),
@@ -14727,11 +14731,19 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             () = std::future::ready(()) => {}
         }
         held.release.notify_one();
-        registry.settled(&created.id).await;
+        guard(
+            "the watchers of the session settled",
+            registry.settled(&created.id),
+        )
+        .await;
         inspector
             .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, order[1])
             .await;
-        registry.settled(&created.id).await;
+        guard(
+            "the watchers of the session settled",
+            registry.settled(&created.id),
+        )
+        .await;
         assert_wrapper_replaces_bound_claim(&registry, &created.id, &format!("{order:?}")).await;
         registry.stop(&created.id).await.expect("stop the session");
     }

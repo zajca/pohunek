@@ -15,7 +15,7 @@ use super::{
 use crate::procwatch::{ProcessInspector, StartIdentity};
 use crate::session::{RuntimeHandle, SessionRegistry, SessionRegistryConfig, ShellCommand};
 use crate::store::DesiredState;
-use pohunek_test_support::wait::HANG_GUARD;
+use pohunek_test_support::wait::{guard, HANG_GUARD};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,7 +202,11 @@ async fn failed_stop_keeps_procwatch_and_detector() {
     registry.inner.sessions.lock().await[&created.id]
         .procwatch_rescan
         .request();
-    registry.settled(&created.id).await;
+    guard(
+        "the watchers of the session settled",
+        registry.settled(&created.id),
+    )
+    .await;
     assert_eq!(
         inspector.descendant_scans().0,
         started_during_stop,
@@ -243,7 +247,11 @@ async fn observed_exit_during_failed_stop_is_applied_by_rescan() {
 
     inspector.set_descendants(created.pid, Vec::new());
     inspector.fire_exit_delivered(AGENT_PID).await;
-    registry.settled(&created.id).await;
+    guard(
+        "the watchers of the session settled",
+        registry.settled(&created.id),
+    )
+    .await;
     assert_eq!(
         observed_pids(&registry, &created.id).await,
         [AGENT_PID],
@@ -276,7 +284,11 @@ async fn bound_reporter_exit_during_failed_stop_ends_claim() {
         super::descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID).identity(),
     );
     inspector.fire_exit_delivered(DESCENDANT_REPORTER_PID).await;
-    registry.settled(&created.id).await;
+    guard(
+        "the watchers of the session settled",
+        registry.settled(&created.id),
+    )
+    .await;
     assert!(
         super::reporter_is_bound(&registry, &created.id).await,
         "the claim waits for the scan after the stop"
@@ -307,7 +319,11 @@ async fn observed_exit_during_successful_stop_emits_once() {
     commit.entered.notified().await;
     inspector.set_descendants(created.pid, Vec::new());
     inspector.fire_exit_delivered(AGENT_PID).await;
-    registry.settled(&created.id).await;
+    guard(
+        "the watchers of the session settled",
+        registry.settled(&created.id),
+    )
+    .await;
     commit.release.notify_one();
     stopping
         .await

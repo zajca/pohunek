@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::settle::{Applying, CloseOnDrop, InputGate};
+use super::settle::{Applying, InputGate};
 use super::{
     activity_already_recorded, broadcast, debug, event, event_payload, is_terminal, log_lag_warn,
     record_activity_evidence, timestamp_now, ActivityTransition, AgentActivity,
@@ -40,6 +40,14 @@ impl DetectorFeed {
 pub(super) struct DetectorOutput {
     chunks: broadcast::Receiver<Vec<u8>>,
     gate: Arc<InputGate>,
+}
+
+/// Closes the gate with the output, wherever the output is dropped: when the
+/// detector ends, when its task is never started, or before it was handed over.
+impl Drop for DetectorOutput {
+    fn drop(&mut self) {
+        self.gate.close();
+    }
 }
 
 impl DetectorOutput {
@@ -136,11 +144,7 @@ impl SessionRegistry {
         let registry = self.clone();
         let progress = self.inner.turns.progress(&scope.id);
         let gate = Arc::clone(&output_rx.gate);
-        // Closes the gate when the detector ends or is never started, so a
-        // chunk aimed at it cannot stay pending.
-        let closed = CloseOnDrop(Arc::clone(&gate));
         self.spawn_cooperative("session_detector", async move {
-            let _closed = closed;
             let DetectorScope { id, runtime } = scope;
             let initial_config = detector_config_rx.borrow().clone();
             let mut applied_config_generation = initial_config.generation;
