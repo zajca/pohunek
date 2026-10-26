@@ -439,7 +439,7 @@ fn rebind_observed_agents(entry: &mut SessionEntry, previous: Option<&Arc<Runtim
     if super::same_pin(entry.pinned.as_ref(), previous) {
         return;
     }
-    entry.procwatch_rescan.notify_one();
+    entry.procwatch_rescan.request();
     let Some(previous) = previous else {
         return;
     };

@@ -1668,6 +1668,9 @@ async fn run_supervision_retries(
                 continue;
             }
             let id = SessionId(session_id);
+            // The pass is pending input of its session from the moment its
+            // retry is due until the pass is accounted for below.
+            let _applying = registry.inner.settle.gate(&id).begin();
             registry
                 .inner
                 .supervision_retries

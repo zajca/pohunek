@@ -220,6 +220,12 @@ impl BackgroundTasks {
         let _ = in_flight.wait_for(|count| *count == 0).await;
     }
 
+    /// Whether no transaction and no blocking store write is in flight now.
+    #[cfg(test)]
+    pub(super) fn is_settled(&self) -> bool {
+        *self.in_flight.borrow() == 0
+    }
+
     /// Refuses every later [`Self::spawn`].
     fn close_admission(&self) {
         let _admission = self

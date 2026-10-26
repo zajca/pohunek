@@ -12672,21 +12672,22 @@ fn backoff_registry() -> (SessionRegistry, Arc<MockInspector>) {
 
 /// Lets every scan the loops started finish, apply and re-arm its timer, on the
 /// paused clock. A scan holds its session's scan gate from its first read to
-/// its applied result, so locking the gate waits out exactly that span.
+/// its applied result, so locking the gate waits out exactly that span; the
+/// session's pending-input count then covers what the scan handed on.
 async fn settle_procwatch_scans(registry: &SessionRegistry) {
-    let gates: Vec<_> = registry
+    let (ids, gates): (Vec<_>, Vec<_>) = registry
         .inner
         .sessions
         .lock()
         .await
-        .values()
-        .map(|entry| Arc::clone(&entry.procwatch_scan))
-        .collect();
+        .iter()
+        .map(|(id, entry)| (id.clone(), Arc::clone(&entry.procwatch_scan)))
+        .unzip();
     for gate in gates {
         drop(guard("the in-flight procwatch scan finished", gate.lock()).await);
     }
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
+    for id in &ids {
+        guard("the watchers of the session settled", registry.settled(id)).await;
     }
 }
 
@@ -12965,7 +12966,7 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
             start_identity: StartIdentity::new(u64::MAX),
         }),
     );
-    rescan.notify_one();
+    rescan.request();
     guard(
         "procwatch to retire a reused root generation",
         cancel.cancelled(),
@@ -15055,10 +15056,10 @@ async fn journal_projected_claim_requests_a_rescan_that_binds_it() {
     // and drain what it left pending.
     stop_procwatch_loop(&registry, &inspector, &created.id).await;
     let rescan = Arc::clone(&registry.inner.sessions.lock().await[&created.id].procwatch_rescan);
-    let _ = tokio::time::timeout(Duration::ZERO, rescan.notified()).await;
+    let _ = tokio::time::timeout(Duration::ZERO, rescan.requested()).await;
 
     project_journal_descendant_claim(&registry, &created.id).await;
-    guard("the projection requested a rescan", rescan.notified()).await;
+    let _ = guard("the projection requested a rescan", rescan.requested()).await;
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;

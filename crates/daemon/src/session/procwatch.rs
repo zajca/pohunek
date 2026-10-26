@@ -14,11 +14,12 @@ use crate::agent::host::RuntimeDefinition;
 use crate::detect::{identify_definition, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdentity};
 
+use super::settle::{Applying, CloseOnDrop, RescanSignal};
 use super::{
     agent_kind_label, clear_active_agent, is_terminal, report_is_current, same_pin,
     send_detector_config, timestamp_now, ActiveAgentReport, CancellationToken, ClaimOrigin,
-    MatchedDefinition, Notify, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionRegistry, TurnEvents,
+    MatchedDefinition, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry, SessionId,
+    SessionRegistry, TurnEvents,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -356,10 +357,14 @@ impl SessionRegistry {
         expected: RuntimeWatchIdentity,
         root: ProcessIdentity,
         cancel: CancellationToken,
-        rescan: std::sync::Arc<Notify>,
+        rescan: Arc<RescanSignal>,
     ) {
         let registry = self.clone();
+        // Closes the rescan gate when the loop ends or is never started, so a
+        // request aimed at it cannot stay pending.
+        let closed = CloseOnDrop(Arc::clone(rescan.gate()));
         self.spawn_cooperative("procwatch_scan", async move {
+            let _closed = closed;
             let base = registry.inner.config.procwatch_poll;
             let ceiling = registry.inner.config.procwatch_idle_poll_max.max(base);
             // The first scan runs at once; later ones wait `delay`, which grows
@@ -372,8 +377,10 @@ impl SessionRegistry {
             let mut paused = false;
             loop {
                 // Cancellation wins over a ready timer or rescan so a stopped
-                // loop never starts another scan.
-                let outcome = tokio::select! {
+                // loop never starts another scan. The guard counts the scan as
+                // pending input from its first read until its result is applied
+                // to the loop's own state below.
+                let (outcome, _applying): (ScanOutcome, Applying) = tokio::select! {
                     biased;
                     () = cancel.cancelled() => break,
                     () = async {
@@ -383,6 +390,9 @@ impl SessionRegistry {
                             tokio::time::sleep(delay).await;
                         }
                     } => {
+                        let applying = rescan.begin();
+                        #[cfg(test)]
+                        registry.hold_input(&id, "procwatch_scan").await;
                         let outcome = registry
                             .rescan_live_root(&id, &expected, root, crate::time::now())
                             .await;
@@ -391,13 +401,16 @@ impl SessionRegistry {
                             && outcome.tree.is_some()
                             && outcome.tree == last_tree;
                         delay = if steady { (delay * 2).clamp(base, ceiling) } else { base };
-                        outcome
+                        (outcome, applying)
                     }
-                    () = rescan.notified() => {
+                    applying = rescan.requested() => {
                         delay = base;
-                        registry
+                        #[cfg(test)]
+                        registry.hold_input(&id, "procwatch_scan").await;
+                        let outcome = registry
                             .rescan_live_root(&id, &expected, root, crate::time::now())
-                            .await
+                            .await;
+                        (outcome, applying)
                     }
                 };
                 if !outcome.alive {
@@ -737,7 +750,7 @@ impl SessionRegistry {
                     if !same_pin(entry.pinned.as_ref(), scan_pin.as_ref())
                         || !Arc::ptr_eq(&scan_registry, &current_registry) =>
                 {
-                    entry.procwatch_rescan.notify_one();
+                    entry.procwatch_rescan.request();
                     None
                 }
                 observed_refresh => observed_refresh,
@@ -1009,10 +1022,16 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
+        let gate = self.inner.settle.gate(&id);
         self.spawn_cooperative("bound_reporter_exit_watch", async move {
             tokio::select! {
                 () = cancel.cancelled() => {}
-                result = watch.wait() => match result {
+                result = watch.wait() => {
+                    // The delivered exit is pending input until it is applied.
+                    let _applying = gate.begin();
+                    #[cfg(test)]
+                    registry.hold_input(&id, "exit_watch").await;
+                    match result {
                     Ok(()) => registry.on_bound_reporter_exit(&id, identity).await,
                     Err(err) => {
                         debug!(
@@ -1022,6 +1041,7 @@ impl SessionRegistry {
                             "bound reporter exit watch failed; scans read its liveness"
                         );
                         registry.on_bound_reporter_watch_failed(&id, identity).await;
+                    }
                     }
                 }
             }
@@ -1195,10 +1215,14 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
+        let gate = self.inner.settle.gate(&id);
         self.spawn_cooperative("observed_exit_watch", async move {
             tokio::select! {
                 () = cancel.cancelled() => {}
                 result = watch.wait() => {
+                    let _applying = gate.begin();
+                    #[cfg(test)]
+                    registry.hold_input(&id, "exit_watch").await;
                     if let Err(err) = result {
                         debug!(
                             session_id = %id.0,

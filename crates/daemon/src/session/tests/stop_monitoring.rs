@@ -201,7 +201,7 @@ async fn failed_stop_keeps_procwatch_and_detector() {
     let (started_during_stop, _, _) = inspector.descendant_scans();
     registry.inner.sessions.lock().await[&created.id]
         .procwatch_rescan
-        .notify_one();
+        .request();
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }

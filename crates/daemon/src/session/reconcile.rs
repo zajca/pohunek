@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::claim::{same_claim, ClaimKey, ClaimOrigin, PendingRelease};
 use super::conflict_stop::is_conflict_proven_removal;
+use super::settle::RescanSignal;
 use super::supervision::{
     classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
     record_accepted_process, with_settle_window, Cleanup, JobEvidence, JournalWorker, Unreachable,
@@ -34,10 +35,10 @@ use super::{
     present_lost_runtime, preserve_durable_worker_metadata, preserve_newer_updated_at,
     runtime_error, sort_subagents, terminalize_running_subagents, timestamp_now, watch,
     ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate,
-    DetectorInputs, DetectorScope, LossProof, Mutex, Notify, ObservedAgent, ProtocolError,
-    ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId,
-    SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
-    StateSource, TurnEvents, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
+    DetectorInputs, DetectorScope, LossProof, Mutex, ObservedAgent, ProtocolError, ResumeSnapshot,
+    RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord,
+    SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource,
+    TurnEvents, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
     WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::agent::host::RuntimeDefinition;
@@ -905,7 +906,7 @@ impl SessionRegistry {
             if projected.active {
                 // A projected claim is bound or released by a scan that reads
                 // its process, so ask for one.
-                entry.procwatch_rescan.notify_one();
+                entry.procwatch_rescan.request();
                 let config = reported_detector_config
                     .clone()
                     .unwrap_or_else(|| entry.default_detector_config.clone());
@@ -4145,7 +4146,7 @@ impl SessionRegistry {
         let detector_cancel = self.background_token();
         let procwatch_cancel = self.background_token();
         let runtime_watch_cancel = self.background_token();
-        let procwatch_rescan = Arc::new(Notify::new());
+        let procwatch_rescan = RescanSignal::new(self.inner.settle.gate(&id));
         let (detector_resize, detector_resize_rx) =
             watch::channel((record.info.rows, record.info.cols));
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
@@ -4239,6 +4240,9 @@ impl SessionRegistry {
                 procwatch_cancel,
                 procwatch_rescan,
             );
+        } else {
+            // No scan loop serves this entry, so its requests are not counted.
+            procwatch_rescan.gate().close();
         }
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_worker_instance_id) = native_recovery {
@@ -4488,7 +4492,7 @@ impl SessionRegistry {
                 .pinned_definition(&record.info.agent_base, &pin),
             procwatch_cancel: CancellationToken::new(),
             runtime_watch_cancel: CancellationToken::new(),
-            procwatch_rescan: Arc::new(Notify::new()),
+            procwatch_rescan: RescanSignal::detached(self.inner.settle.gate(&record.info.id)),
             procwatch_scan: Arc::new(Mutex::new(())),
             stopping: false,
             stop_transaction_id: None,
