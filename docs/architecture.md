@@ -1556,6 +1556,17 @@ their own repositories ([#1609](https://github.com/zajca/pohunek/issues/1609)).
 Naming, required CI, compatibility and admission are in the
 [plugin repositories guide](knowledge/guides/plugin-repositories.md).
 
+A runtime feature is a named core capability within one `runtime_api` major
+number, with an id such as `input-readiness-v2`. The core keeps an append-only
+table of them in `crates/daemon/src/agent/host/features.rs`; a row is never
+removed or renamed, and a test compares the table with a snapshot. A descriptor
+lists the features it uses in `requires`. An unknown feature, or a gated
+descriptor key or compiled parser or handler id whose feature is not listed, is
+refused with `runtime_feature_unsupported` before anything is recorded, and an
+installed package that fails the check is left out of the load while the other
+packages and the daemon start. A feature adds no protocol shape and no
+persisted field.
+
 Trust boundary:
 
 - **Same-UID owner trust, not a sandbox.** A descriptor may name any program,

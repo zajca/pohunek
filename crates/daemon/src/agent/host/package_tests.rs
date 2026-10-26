@@ -596,6 +596,36 @@ fn a_broken_package_does_not_take_down_the_others_or_the_builtins() {
 }
 
 #[test]
+fn a_package_requiring_an_unknown_feature_is_rejected_alone() {
+    let plugins = Plugins::new();
+    let registry = plugins.registry();
+    install(&registry, &acme("1.0.0"), true, true);
+    let ahead = build(
+        &descriptor("ahead.agent", "1.0.0", "ahead").replace(
+            "runtime_api = 1",
+            "runtime_api = 1\nrequires = [\"later-v1\"]",
+        ),
+        "ahead",
+        identity("ahead.agent", "1.0.0"),
+    );
+    install(&registry, &ahead, true, true);
+
+    let host = plugins.host();
+
+    host.resolve_id(&runtime("acme"))
+        .expect("the other package");
+    host.resolve_id(&runtime("ahead"))
+        .expect_err("the runtime is not served");
+    let report = host.package_report();
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].digest, ahead.digest);
+    assert!(matches!(
+        report.rejected[0].reason,
+        PackageRejection::Descriptor(super::DefinitionError::FeatureUnsupported { .. })
+    ));
+}
+
+#[test]
 fn packages_claiming_the_same_runtime_are_both_refused() {
     let plugins = Plugins::new();
     let registry = plugins.registry();

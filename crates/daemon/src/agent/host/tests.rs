@@ -8,6 +8,7 @@ use protocol::{
     RuntimeRef,
 };
 
+use super::features::{FeatureGate, FeatureTables, GateRule, RuntimeFeature};
 use super::{
     check_pin, validate_launch_runtime, BuiltinSource, DefinitionError, DefinitionInvariant,
     DefinitionOrigin, DefinitionParts, HandlerId, Integration, LaunchPin, LaunchProgram,
@@ -100,6 +101,21 @@ text_policy = "unrestricted"
 fn parse(source: &str) -> Result<RuntimeDefinition, DefinitionError> {
     RuntimeDefinition::from_toml(
         source,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(shell_manifest()),
+    )
+}
+
+fn parse_with(
+    source: &str,
+    features: &FeatureTables<'_>,
+) -> Result<RuntimeDefinition, DefinitionError> {
+    RuntimeDefinition::from_toml_with(
+        source,
+        features,
         |package| DefinitionOrigin::Package {
             package,
             digest: PackageDigest::parse(DIGEST).expect("valid digest"),
@@ -1608,4 +1624,137 @@ fn a_descriptor_startup_grace_is_bounded_like_the_host_grace() {
         super::fixture::PI_SHAPED_NO_CHECK,
     );
     assert_eq!(undeclared.startup_grace(), None);
+}
+
+const GATED_FEATURES: &[RuntimeFeature] = &[
+    RuntimeFeature {
+        id: "fixture-ready-v1",
+        since: "0.38.0",
+    },
+    RuntimeFeature {
+        id: "fixture-other-v1",
+        since: "0.38.0",
+    },
+];
+const GATES: &[FeatureGate] = &[
+    FeatureGate {
+        feature: "fixture-ready-v1",
+        rule: GateRule::Value("input.ready", "screen_idle"),
+    },
+    FeatureGate {
+        feature: "fixture-other-v1",
+        rule: GateRule::Key("input.startup_grace_ms"),
+    },
+];
+const GATED: FeatureTables<'static> = FeatureTables {
+    features: GATED_FEATURES,
+    gates: GATES,
+};
+
+/// The baseline document with `lines` added at the top level and the
+/// `[input]` table extended by `input`.
+fn gated_document(top: &str, input: &str) -> String {
+    let base = document("supported = false", "supported = false");
+    base.replace("runtime_api = 1", &format!("runtime_api = 1\n{top}"))
+        .replace("[input]", &format!("[input]\n{input}"))
+}
+
+#[test]
+fn gated_value_needs_its_required_feature() {
+    let screen_idle = "ready = \"screen_idle\"";
+    let refused = DefinitionError::FeatureNotRequired {
+        key: "input.ready",
+        feature: "fixture-ready-v1",
+    };
+    assert_eq!(
+        parse_with(&gated_document("", screen_idle), &GATED).expect_err("refused"),
+        refused
+    );
+    assert_eq!(
+        parse_with(
+            &gated_document("requires = [\"fixture-other-v1\"]", screen_idle),
+            &GATED
+        )
+        .expect_err("another feature does not cover it"),
+        refused
+    );
+    let covered = parse_with(
+        &gated_document("requires = [\"fixture-ready-v1\"]", screen_idle),
+        &GATED,
+    );
+    assert!(covered.is_ok(), "{covered:?}");
+    let other_value = parse_with(&gated_document("", "ready = \"bracketed_paste\""), &GATED);
+    assert!(other_value.is_ok(), "{other_value:?}");
+}
+
+#[test]
+fn gated_key_needs_its_required_feature() {
+    let key = "startup_grace_ms = 1";
+    let refused = DefinitionError::FeatureNotRequired {
+        key: "input.startup_grace_ms",
+        feature: "fixture-other-v1",
+    };
+    assert_eq!(
+        parse_with(&gated_document("", key), &GATED).expect_err("refused"),
+        refused
+    );
+    assert_eq!(
+        parse_with(
+            &gated_document("requires = [\"fixture-ready-v1\"]", key),
+            &GATED
+        )
+        .expect_err("another feature does not cover it"),
+        refused
+    );
+    let covered = parse_with(
+        &gated_document("requires = [\"fixture-other-v1\"]", key),
+        &GATED,
+    );
+    assert!(covered.is_ok(), "{covered:?}");
+    parse_with(&gated_document("", ""), &GATED).expect("no gated key");
+}
+
+#[test]
+fn requires_is_accepted_without_a_gated_key_and_refused_when_unknown() {
+    let listed = gated_document("requires = [\"fixture-ready-v1\"]", "");
+    parse_with(&listed, &GATED).expect("a feature the descriptor does not use");
+    assert_eq!(
+        parse(&gated_document("requires = [\"input-readiness-v2\"]", ""))
+            .expect_err("the production table is empty"),
+        DefinitionError::FeatureUnsupported {
+            feature: "input-readiness-v2".to_owned(),
+            core: crate::DAEMON_VERSION,
+        }
+    );
+    let message = parse(&gated_document("requires = [\"input-readiness-v2\"]", ""))
+        .expect_err("refused")
+        .to_string();
+    assert!(message.contains("input-readiness-v2"), "{message}");
+    assert!(message.contains(crate::DAEMON_VERSION), "{message}");
+}
+
+#[test]
+fn unknown_feature_wins_over_a_key_this_core_cannot_parse() {
+    let document = gated_document("requires = [\"later-v1\"]\nlater_key = 1", "");
+    assert!(matches!(
+        parse(&document),
+        Err(DefinitionError::FeatureUnsupported { .. })
+    ));
+    let without = gated_document("later_key = 1", "");
+    assert!(matches!(
+        parse(&without),
+        Err(DefinitionError::Malformed { .. })
+    ));
+}
+
+#[test]
+fn requires_of_the_wrong_type_is_malformed() {
+    assert!(matches!(
+        parse(&gated_document("requires = \"fixture-ready-v1\"", "")),
+        Err(DefinitionError::Malformed { .. })
+    ));
+    assert!(matches!(
+        parse(&gated_document("requires = [1]", "")),
+        Err(DefinitionError::Malformed { .. })
+    ));
 }

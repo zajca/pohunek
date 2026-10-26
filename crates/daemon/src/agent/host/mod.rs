@@ -11,6 +11,7 @@ mod builtin;
 mod claim;
 mod config_home;
 mod definition;
+mod features;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod handle;
