@@ -1858,7 +1858,8 @@ async fn a_live_session_keeps_its_own_observation_through_a_later_package_versio
         now,
     )
     .await;
-    let _ = fixture.registry.stop(&created.id).await;
+    let stopped = fixture.registry.stop(&created.id).await;
+    stopped.expect("stop the session");
 }
 
 /// The provenance of `package`, the official package at `version`.

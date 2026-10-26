@@ -2098,6 +2098,6 @@ mod tests {
         .await;
 
         tokio::time::resume();
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }

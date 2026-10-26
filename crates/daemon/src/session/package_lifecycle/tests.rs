@@ -768,7 +768,11 @@ async fn a_pinned_session_blocks_uninstall_even_of_a_modified_root() {
     );
     assert!(fixture.root(&package.digest).exists());
 
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture
         .registry
         .remove(&created.id)
@@ -815,7 +819,11 @@ async fn a_disabled_package_refuses_fresh_launches_and_still_resumes_its_session
         .resume(&created.id)
         .await
         .expect("the pinned session keeps resuming from its own digest");
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -921,7 +929,11 @@ async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
         resumed[..predicted.len() - 1],
         predicted[..predicted.len() - 1]
     );
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 /// The recorded argv of launch `index`, once it holds at least `lines`

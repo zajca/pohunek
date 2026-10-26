@@ -459,7 +459,7 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
         .expect_err("stale generation must fail");
     assert_eq!(stale.code, "session_runtime_changed");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 // Linux keeps the session's terminal usable for descendants after the
@@ -881,7 +881,7 @@ async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
             entry.runtime = runtime_handle;
             entry.info.runtime = runtime_info;
         };
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -1126,7 +1126,7 @@ async fn worker_identity_changes_project_live_into_the_logical_session() {
     )
     .await;
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1199,7 +1199,7 @@ async fn session_read_returns_visible_tail_and_truthful_source_fallbacks() {
         .expect_err("ANSI is unavailable");
     assert_eq!(ansi_error.code, "session_read_ansi_unavailable");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1234,7 +1234,7 @@ async fn session_read_preserves_alternate_screen_state_during_fallback() {
     assert!(result.alternate_screen);
     assert_eq!(result.text, "TUI-one\nTUI-two");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1286,7 +1286,7 @@ async fn session_read_identity_guard_rejects_runtime_replacement_race() {
     entry.info.state = SessionState::Running;
     entry.info.runtime.as_mut().expect("live runtime").state = RuntimeState::Live;
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1341,7 +1341,7 @@ async fn mutations_fail_closed_for_a_session_whose_agent_kind_is_not_launchable(
         .expect("registered session")
         .info
         .agent_base = RuntimeRef::shell();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1370,7 +1370,7 @@ async fn a_launched_session_freezes_the_launch_binding_of_its_runtime() {
         pin,
         crate::agent::host::LaunchPin::Pinned(Box::new(expected))
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -1513,7 +1513,7 @@ async fn the_shell_command_text_never_breaks_the_registry_or_the_snapshot_progra
         .resolve_agent("shell")
         .expect("shell resolves");
     assert_eq!(resolved.program(), crate::agent::host_login_shell());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Returns the metadata store path inside a fresh private directory that is
@@ -2372,7 +2372,7 @@ async fn start_up_output_seen_by_the_detector_is_not_a_turn() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Input given to the session through `session.input`.
@@ -2405,7 +2405,7 @@ async fn input_given_through_session_input_makes_the_output_it_causes_a_turn() {
         .expect("a turn started")
         .expect("edge channel open");
     assert!(matches!(edge, TurnEdge::Started(..)), "{edge:?}");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2438,7 +2438,7 @@ async fn the_input_a_turn_started_on_is_used_up_by_it() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert!(ended_turns(&mut edges).is_empty());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2465,7 +2465,7 @@ async fn output_without_input_continues_a_turn_inside_its_window() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(started_turns_and_ends(&mut edges), (1, 2));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2491,7 +2491,7 @@ async fn output_without_input_continues_a_turn_that_waited_for_approval() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(started_turns_and_ends(&mut edges), (1, 1));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 fn started_turns_and_ends(
@@ -2524,7 +2524,7 @@ async fn the_input_a_running_turn_held_does_not_outlive_its_runtime() {
     reinstall_entry(&registry, &created.id, None).await;
     work_then_idle(&registry, &created.id).await;
     assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The input evidence is armed when the send starts and nothing takes it back
@@ -2544,7 +2544,7 @@ async fn input_whose_write_failed_after_it_started_is_still_evidence() {
     registry.note_input(&created.id);
     work_then_idle(&registry, &created.id).await;
     assert_eq!(started_turns_and_ends(&mut edges), (1, 1));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2595,7 +2595,7 @@ async fn wait_turn_progress_follows_the_last_transition_into_working() {
         .await;
     assert_eq!(started_turns(&mut edges).len(), 1);
     assert_eq!(progress(), Some(20_000), "a restatement is no transition");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2638,7 +2638,7 @@ async fn turn_starts_never_decrease_when_the_wall_clock_steps_back_after_a_takeo
         other => panic!("the turn ended: {other:?}"),
     };
     assert!(start(later[0]) > start(takeover[0]));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2681,7 +2681,7 @@ async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2704,7 +2704,7 @@ async fn an_idle_session_adopted_after_a_restart_runs_the_turn_of_its_first_comm
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2740,7 +2740,7 @@ async fn a_replaced_agent_restating_working_opens_its_own_turn() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(ended_turns(&mut edges).len(), 1, "the replacement's turn");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2788,7 +2788,7 @@ async fn another_process_of_the_same_agent_does_not_inherit_the_turn_of_the_one_
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert!(ended_turns(&mut edges).is_empty(), "the replaced turn");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A shell session whose client submitted `codex exec ...`: the output after
@@ -2841,7 +2841,7 @@ async fn an_agent_observed_after_the_opening_working_still_has_its_turn_reported
         panic!("the turn ended");
     };
     assert_eq!(snapshot.started_nanos, Some(10_000));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Reports `activity` of the hook agent `codex` to the session.
@@ -2936,7 +2936,7 @@ async fn a_codex_that_exits_before_idle_still_has_its_turn_reported() {
     observe_codex(&registry, &inspector, &created, None).await;
     work_then_idle(&registry, &created.id).await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2954,7 +2954,7 @@ async fn a_hook_claim_replacing_an_observed_one_leaves_the_input_to_the_next_tur
     hook_report(&registry, &created.id, 1, None).await;
     work_then_idle(&registry, &created.id).await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -2973,7 +2973,7 @@ async fn a_released_claim_leaves_the_input_to_the_turn_of_the_next_owner() {
     hook_release(&registry, &created.id, 1).await;
     work_then_idle(&registry, &created.id).await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3003,7 +3003,7 @@ async fn a_replacement_process_after_a_resumed_turn_runs_a_new_turn_not_the_old_
     let ended = ended_turns(&mut edges);
     assert_eq!(ended.len(), 1, "{ended:?}");
     assert!(ended[0] > first[0], "the old turn was reported again");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3032,7 +3032,7 @@ async fn a_turn_that_ends_blocked_leaves_the_input_to_the_next_working() {
 
     work_then_idle(&registry, &created.id).await;
     assert_eq!(ended_turns(&mut edges).len(), 1, "the later turn");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3050,7 +3050,7 @@ async fn a_reported_activity_is_no_input_for_a_later_detector_turn() {
 
     work_then_idle(&registry, &created.id).await;
     assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3071,7 +3071,7 @@ async fn a_reported_turn_takes_the_input_it_answers() {
     // agent's exit is not another one.
     work_then_idle(&registry, &created.id).await;
     assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The `agent_state` events the registry broadcast since `events` was taken.
@@ -3122,7 +3122,7 @@ async fn a_restated_working_emits_no_agent_state() {
         .await;
     assert_eq!(started_turns(&mut edges).len(), 1);
     assert_eq!(agent_states(&mut events), 0);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The turns that opened since the last call.
@@ -3209,7 +3209,7 @@ async fn a_re_adopted_working_session_runs_its_own_unobserved_turn() {
         panic!("the adopted turn ended");
     };
     assert_eq!((snapshot.started_nanos, snapshot.length), (None, None));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3239,7 +3239,7 @@ async fn a_turn_that_finished_before_the_session_stopped_is_still_reported() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(4)).await;
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     assert!(
         matches!(
             registry.turn_events().settle(&created.id, ended[0], None),
@@ -3272,7 +3272,7 @@ async fn a_turn_still_inside_its_window_is_dropped_when_the_session_stops() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     let ended = ended_turns(&mut edges);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     assert_eq!(
         registry.turn_events().settle(&created.id, ended[0], None),
         TurnVerdict::Drop
@@ -3283,7 +3283,7 @@ async fn a_turn_still_inside_its_window_is_dropped_when_the_session_stops() {
 async fn input_to_a_removed_session_arms_nothing() {
     let registry = turn_registry();
     let created = registry.create(params()).await.expect("create session");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     registry.remove(&created.id).await.expect("remove session");
     registry.note_input(&created.id);
     assert!(
@@ -3336,7 +3336,7 @@ async fn working_seen_from_another_source_keeps_the_running_turn() {
         ),
         "one turn opened and ended once: {edges:?}"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3369,7 +3369,7 @@ async fn a_rebuilt_idle_entry_does_not_complete_the_turn_of_the_one_it_replaced(
         1,
         "only the rebuilt entry's own turn"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3459,7 +3459,7 @@ async fn a_turn_never_starts_before_the_one_that_ran_when_the_wall_clock_steps_b
         .await;
     assert_eq!(first, Some(10_000));
     assert_eq!(progress().turn_started_nanos(), Some(10_001));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3513,8 +3513,8 @@ async fn a_restarted_daemon_counts_turns_from_one_and_knows_no_earlier_turn() {
         TurnVerdict::Drop,
         "a pending report of the earlier instance names a turn this one never ran"
     );
-    let _ = registry.stop(&created.id).await;
-    let _ = restarted.stop(&other.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
+    restarted.stop(&other.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3554,7 +3554,7 @@ async fn foreground_leader_selects_agent_and_shell_return_clears_claim() {
         assert_eq!(cleared.active_agent_pid, None);
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3609,7 +3609,7 @@ async fn shell_foreground_preserves_recent_unbound_claim_until_ttl() {
         .expect("inspect expired");
     assert_eq!(expired.active_agent, None);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3637,7 +3637,7 @@ async fn root_foreground_group_selects_member_until_member_exits() {
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_pid, None);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3700,7 +3700,7 @@ async fn foreground_member_matches_pgid_without_crossing_groups() {
         assert_eq!(selected.active_agent_pid, Some(410));
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3730,7 +3730,7 @@ async fn foreground_recognized_leader_wins_over_older_same_kind_other_group() {
         assert_eq!(selected.active_agent_pid, Some(440));
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3781,7 +3781,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
         DetectorConfig::for_agent(&official_host(), &RuntimeRef::claude()).detection
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3852,7 +3852,7 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
         );
     };
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -3900,7 +3900,7 @@ async fn transient_foreground_error_preserves_last_known_claim() {
         .expect("recovered inspect");
     assert_eq!(recovered.active_agent_pid, Some(610));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity> {
@@ -4087,7 +4087,7 @@ async fn session_new_metadata_is_validated_and_exposed() {
         "metadata validation error must be clear: {err:?}"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -4134,7 +4134,7 @@ async fn set_metadata_merges_deletes_updates_timestamp_and_emits_event() {
     assert_eq!(event_info.id, created.id);
     assert_eq!(event_info.metadata, expected);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 fn armed_entry_record_hold(
@@ -4215,7 +4215,7 @@ async fn a_metadata_edit_cannot_land_between_a_record_snapshot_and_its_write() {
         .find(|record| record.session_id == created.id.0)
         .expect("the session has a durable record");
     assert_eq!(durable.info.metadata, expected);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A stopped session whose durable record was read before a metadata edit: the
@@ -4242,7 +4242,7 @@ async fn session_edited_after_its_record_was_read(
         })
         .await
         .expect("create session");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     let stale = registry
         .load_durable_session_record(&created.id)
         .await
@@ -4413,7 +4413,7 @@ async fn a_worker_snapshot_parked_before_a_metadata_edit_does_not_overwrite_it()
 
     let (live, durable) = metadata_in_memory_and_store(&registry, &created.id, store_path).await;
     assert_eq!((live, durable), (expected.clone(), expected));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A startup adoption of a record read before a metadata edit keeps the edit in
@@ -4458,7 +4458,7 @@ async fn an_adoption_of_a_record_read_before_a_metadata_edit_keeps_the_edit() {
     );
     let (live, durable) = metadata_in_memory_and_store(&registry, &created.id, store_path).await;
     assert_eq!((live, durable), (expected.clone(), expected));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -4531,7 +4531,7 @@ async fn create_trims_the_name_and_rename_sets_then_clears_it_with_an_event() {
         None
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -4561,7 +4561,7 @@ async fn rename_rejects_overlong_and_control_character_names() {
         None
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -4608,7 +4608,7 @@ async fn invalid_metadata_rejected_for_create_or_set_and_set_leaves_session_unch
         "failed metadata patch must not mutate the session"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 
     let key_64_bytes = "é".repeat(32);
     assert_eq!(key_64_bytes.len(), 64);
@@ -4619,7 +4619,7 @@ async fn invalid_metadata_rejected_for_create_or_set_and_set_leaves_session_unch
         })
         .await
         .expect("64-byte UTF-8 metadata key is accepted");
-    let _ = registry.stop(&accepted.id).await;
+    registry.stop(&accepted.id).await.expect("stop the session");
 
     let key_66_bytes = "é".repeat(33);
     assert_eq!(key_66_bytes.len(), 66);
@@ -5391,8 +5391,8 @@ async fn cwd_hint_remaps_between_registered_worktrees() {
     assert_eq!(restored.is_linked_worktree, Some(true));
     assert_eq!(restored.project_id, first.project_id);
 
-    let _ = registry.stop(&first.id).await;
-    let _ = registry.stop(&second.id).await;
+    registry.stop(&first.id).await.expect("stop the session");
+    registry.stop(&second.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -5456,7 +5456,7 @@ async fn older_cwd_evidence_never_replaces_newer_evidence() {
     assert_eq!(moved.cwd, launched);
     assert_eq!(moved.cwd_source, Some(CwdSource::Procwatch));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -5505,7 +5505,7 @@ async fn cwd_hint_into_an_unregistered_repo_registers_no_project() {
     );
     assert_eq!(projects[0].id(), session.project_id.expect("stamped"));
 
-    let _ = registry.stop(&session.id).await;
+    registry.stop(&session.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -5855,7 +5855,7 @@ async fn session_child_sees_the_fixture_home_and_not_the_developer_environment()
     );
     assert_eq!(child.get("DISPLAY").map(String::as_str), Some("unset"));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Creates a FIFO at `path` and opens it for reading and writing.
@@ -5937,7 +5937,7 @@ async fn session_start_hook_runs_detached_from_create() {
         .await
         .expect("create task joins after the release");
         if let Ok(late) = late {
-            let _ = registry.stop(&late.id).await;
+            registry.stop(&late.id).await.expect("stop the session");
         }
         panic!(
             "create waited for the session-start hook past the hang guard of {:?}",
@@ -5967,7 +5967,7 @@ async fn session_start_hook_runs_detached_from_create() {
     .await;
     drop(gate);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Bounds how long [`session_start_hook_is_terminated_after_hook_timeout`] waits
@@ -7047,7 +7047,7 @@ async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     assert!(entry.activity_evidence.is_empty());
     entry.info.runtime = original_runtime;
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7090,7 +7090,7 @@ async fn a_transition_computed_before_the_agent_left_is_dropped() {
         .await;
     let info = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(info.activity, Some(AgentActivity::Working), "{info:?}");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[test]
@@ -7227,7 +7227,7 @@ async fn session_input_wait_rejects_invalid_contract_before_delivery() {
         "invalid wait must not deliver input; output={output:?}"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7276,7 +7276,7 @@ async fn session_input_wait_preserves_external_read_only_error() {
         .expect_err("external waited input remains read-only");
 
     assert_eq!(error.code, "session_external_read_only");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7357,7 +7357,7 @@ async fn stale_external_exit_watch_does_not_remove_reused_pid() {
         Some(external)
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7386,7 +7386,7 @@ async fn session_input_wait_times_out_with_typed_error() {
         .expect_err("missing target activity must time out");
 
     assert_eq!(error.code, "session_input_timeout");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7426,7 +7426,7 @@ async fn session_input_wait_rejects_blocked_session_before_delivery() {
         !output.contains("blocked-input-marker"),
         "output={output:?}"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7484,7 +7484,7 @@ async fn rejected_input_is_no_evidence_for_a_turn() {
         (0, 0),
         "input that was never delivered armed a turn"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 const DELAYED_SUBMIT_TUI: &str = "while IFS= read -r line; do echo got:$line; done";
@@ -7587,7 +7587,7 @@ async fn delayed_wait_input_reports_submitted_once_the_agent_works() {
             "agent={agent}"
         );
         assert!(result.activity_revision.is_some(), "agent={agent}");
-        let _ = registry.stop(&id).await;
+        registry.stop(&id).await.expect("stop the session");
     }
 }
 
@@ -7612,7 +7612,7 @@ async fn delayed_wait_input_times_out_after_enter_when_the_agent_never_works() {
     assert!(error.msg.contains("Enter was written"), "msg={}", error.msg);
     let output = wait_for_session_output(&registry, &id, &["got:"]).await;
     assert!(output.contains("idle-marker"), "output={output:?}");
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7647,7 +7647,7 @@ async fn delayed_wait_input_never_writes_enter_when_the_agent_blocks_during_the_
         !output.contains("got:"),
         "Enter reached the agent: {output:?}"
     );
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7693,7 +7693,7 @@ async fn delayed_wait_idle_target_ignores_the_pre_submit_idle_screen() {
         .expect("idle after working acknowledges the input");
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.submitted, Some(true));
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7722,7 +7722,7 @@ async fn delayed_wait_input_deadline_during_the_delay_leaves_the_text_unsubmitte
         !output.contains("got:"),
         "Enter reached the agent: {output:?}"
     );
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7752,7 +7752,7 @@ async fn delayed_wait_input_deadline_after_the_recheck_never_writes_enter() {
         !output.contains("got:"),
         "Enter reached the agent: {output:?}"
     );
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7774,7 +7774,7 @@ async fn delayed_wait_input_with_a_deadline_inside_the_delay_writes_nothing() {
     assert_eq!(error.code, "session_input_timeout");
     let output = read_session_output_after_rejection(&registry, &id).await;
     assert!(!output.contains("short-marker"), "output={output:?}");
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 /// Creates a session and returns it with the acknowledgement of its initial
@@ -7866,7 +7866,7 @@ async fn session_new_input_ack_reports_prompt_delivered_once_the_agent_works() {
         .expect("the create succeeds");
     assert_eq!(info.id, id);
     assert_eq!(prompt_delivered, Some(true));
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7890,7 +7890,7 @@ async fn session_new_input_ack_keeps_the_session_when_the_agent_never_works() {
             .any(|listed| listed.id == info.id),
         "the session is still listed"
     );
-    let _ = registry.stop(&info.id).await;
+    registry.stop(&info.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7905,7 +7905,7 @@ async fn session_new_input_ack_is_unknown_when_the_daemon_shuts_down_in_the_wind
         .expect("create task joins")
         .expect("the input was written, so the create succeeds");
     assert_eq!(prompt_delivered, Some(false));
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7936,7 +7936,7 @@ async fn session_new_input_ack_keeps_the_session_when_the_agent_exits_after_ente
         .expect("create task joins")
         .expect("Enter was sent, so the create keeps its session");
     assert_eq!(prompt_delivered, Some(false));
-    let _ = registry.stop(&info.id).await;
+    registry.stop(&info.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -7993,7 +7993,7 @@ async fn session_new_input_ack_counts_working_evidence_recorded_before_a_shutdow
         .expect("create task joins")
         .expect("the input was written, so the create succeeds");
     assert_eq!(prompt_delivered, Some(true));
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8005,7 +8005,7 @@ async fn session_new_without_an_ack_window_reports_no_outcome() {
         .expect("the create succeeds");
     assert_eq!(prompt_delivered, None);
     wait_for_session_output(&registry, &info.id, &["got:"]).await;
-    let _ = registry.stop(&info.id).await;
+    registry.stop(&info.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8056,7 +8056,7 @@ async fn delayed_wait_input_shutdown_during_the_delay_leaves_the_text_unsubmitte
         !output.contains("got:"),
         "Enter reached the agent: {output:?}"
     );
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8103,7 +8103,7 @@ async fn delayed_wait_input_never_writes_enter_after_the_session_stopped_running
         .expect("session entry")
         .info
         .state = SessionState::Running;
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8138,7 +8138,7 @@ async fn delayed_wait_input_holds_the_session_gate_across_body_and_enter() {
         .await
         .expect("waited input task joins")
         .expect("working acknowledges the input");
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8158,7 +8158,7 @@ async fn delayed_wait_input_with_empty_text_presses_enter_only() {
         .expect("waited input task joins")
         .expect("Enter alone acknowledges as the input");
     assert_eq!(result.submitted, Some(true));
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8231,7 +8231,7 @@ async fn session_input_wait_rejects_blocked_transition_during_gate_for_all_adapt
             !output.contains(&marker),
             "agent={agent}; output={output:?}"
         );
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -8299,7 +8299,7 @@ async fn session_input_wait_boundary_excludes_activity_before_worker_write_reser
         .expect("waited input task joins")
         .expect_err("pre-reservation activity must not confirm delivered input");
     assert_eq!(error.code, "session_input_timeout");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8376,7 +8376,7 @@ async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
 
     assert!(result.activity_revision > Some(submission.after_revision));
     assert_eq!(result.submitted, Some(true));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8440,7 +8440,7 @@ async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input
         "output={output:?}"
     );
     assert!(output.contains("received:next-input"), "output={output:?}");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8504,7 +8504,7 @@ async fn session_input_wait_shutdown_while_worker_reserved_never_sends_late_inpu
         !output.contains("must-not-arrive-after-shutdown"),
         "output={output:?}"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Deadline of the waited write in
@@ -8611,7 +8611,7 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     )
     .await;
     assert!(!output.contains("got:atomic-plan-timeoutnext-input"));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8682,7 +8682,7 @@ async fn session_input_serializes_waited_transactions() {
     let first_position = output.find("got:first-waited").expect("first output");
     let second_position = output.find("got:second-waited").expect("second output");
     assert!(first_position < second_position, "output={output:?}");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8751,7 +8751,7 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
     let first_position = output.find("got:first-waited").expect("waited output");
     let second_position = output.find("got:second-fire").expect("fire output");
     assert!(first_position < second_position, "output={output:?}");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8831,7 +8831,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
 
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8889,7 +8889,7 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
         .expect_err("timeout recheck must reject post-deadline evidence");
     assert_eq!(error.code, "session_input_timeout");
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -8940,7 +8940,7 @@ async fn session_input_wait_retains_pre_deadline_evidence_after_late_same_activi
         .expect("pre-deadline evidence remains available");
     assert_eq!(result.activity_revision, Some(expected_revision));
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -9012,8 +9012,14 @@ async fn daemon_reconnect_scopes_reset_activity_revision_with_new_epoch() {
         .info
         .runtime = second_runtime;
     drop(sessions);
-    let _ = first.stop(&first_session.id).await;
-    let _ = second.stop(&second_session.id).await;
+    first
+        .stop(&first_session.id)
+        .await
+        .expect("stop the session");
+    second
+        .stop(&second_session.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -9121,7 +9127,7 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     assert!(!serialized.contains("transcript"));
     assert!(!serialized.contains("prompt"));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// How long a retried worker metadata snapshot may take to be registered: a
@@ -9239,7 +9245,7 @@ async fn worker_metadata_reported_before_the_record_is_current_is_applied_afterw
     .expect("the snapshot reported while not current is retried");
     assert_eq!(observed, "child-late");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A snapshot of a worker the record no longer names stays dropped, with a
@@ -9288,7 +9294,7 @@ async fn worker_metadata_of_a_superseded_worker_is_dropped_with_a_warning() {
         "a superseded snapshot is not retried"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A record that stays not current while the worker has exited does not hold
@@ -9418,7 +9424,7 @@ async fn a_worker_without_a_journaled_schema_is_reprojected_with_the_runtime_sch
         Some("child-reprojected")
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -9461,7 +9467,7 @@ async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live
         .expect("durable record");
     assert_eq!(durable.runtime.state, RuntimeState::Live);
 
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "worker_operation_failed").await;
 }
 
 /// Applies `snapshot` the way the exit watcher does: an outcome that says the
@@ -9556,7 +9562,7 @@ async fn worker_metadata_cannot_overwrite_a_terminal_durable_record() {
         RuntimeState::Terminal
     );
     assert!(durable.info.subagents.is_empty());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -9606,7 +9612,7 @@ async fn worker_metadata_cannot_recreate_a_removed_durable_record() {
             .is_empty(),
         "rejected metadata must not mutate memory"
     );
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_stop_intent_busy").await;
 }
 
 #[tokio::test]
@@ -9676,7 +9682,7 @@ async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
     })
     .await;
     assert_eq!(event.event(), protocol::event::SUBAGENT_STATE);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -9737,7 +9743,7 @@ async fn transient_identity_validation_failure_retries_the_same_snapshot() {
     let retried = registry.inspect(&created.id).await.expect("inspect retry");
     assert_eq!(retried.active_agent.as_deref(), Some("codex"));
     assert_eq!(retried.subagents.len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A worker's hook report of the agent procwatch already observed under the
@@ -9813,7 +9819,7 @@ async fn a_worker_report_of_an_observed_agent_makes_it_reported() {
         Some(crate::store::ActiveAgentOrigin::Reported),
         "the hook report makes the observed agent reported"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A forwarded claim names its profile by an opaque label. The daemon makes it
@@ -9885,7 +9891,7 @@ async fn a_forwarded_claim_label_becomes_the_active_agent_only_when_it_resolves_
             .expect("inspect session");
         assert_eq!(info.active_agent.as_deref(), Some(expected), "{label}");
     }
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A session with a forwarded `codex` claim and a turn the detector opened
@@ -9976,7 +9982,7 @@ async fn a_forwarded_claim_of_another_agent_does_not_complete_the_turn_it_replac
         ended_turns(&mut edges).is_empty(),
         "the replacement's idle completed the turn of the claim it replaced"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -9999,7 +10005,7 @@ async fn a_forwarded_claim_of_another_agent_runs_its_own_turn() {
     let second = started_turns(&mut edges);
     assert_eq!(second.len(), 1, "the replacement continued the old turn");
     assert!(second[0] > first[0]);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -10027,7 +10033,7 @@ async fn a_forwarded_release_does_not_leave_its_turn_to_the_next_idle() {
         ended_turns(&mut edges).is_empty(),
         "the idle after the release completed the turn of the released claim"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A release carries the provider of the claim it ends, so it clears a claim
@@ -10095,7 +10101,7 @@ async fn a_release_clears_a_forwarded_claim_that_was_relabelled_to_a_profile() {
         .await
         .expect("inspect session");
     assert_eq!(info.active_agent, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -10140,7 +10146,7 @@ async fn subagent_only_metadata_skips_identity_process_validation() {
         Some("safe-only-child")
     );
     inspector.clear_descendants_error();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -10225,7 +10231,7 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     assert_eq!(recovery.cwd, PathBuf::from("/work/concurrent-cwd"));
     assert_eq!(recovery.project_id.as_deref(), Some("p-concurrent"));
     assert_eq!(recovery.is_linked_worktree, Some(true));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -10296,7 +10302,7 @@ async fn durable_launch_identity_survives_worker_metadata_rebase() {
         rebased.info.cwd,
         PathBuf::from("/work/concurrent-launch-cwd")
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[test]
@@ -10835,7 +10841,7 @@ async fn failed_stop_intent_rollback_does_not_overwrite_replacement_runtime() {
         .expect("runtime metadata")
         .worker_instance_id = Some(original_runtime.worker_instance_id);
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -10959,7 +10965,7 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
 
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11027,7 +11033,7 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.runtime.as_ref(), Some(&submitted.runtime));
     assert!(result.activity_revision > Some(submitted.revision));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 fn drain_agent_state(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
@@ -11097,7 +11103,7 @@ async fn a_restated_detector_activity_neither_advances_the_revision_nor_publishe
         .expect("snapshot after a real change");
     assert!(changed.revision > first.revision);
     assert_eq!(drain_agent_state(&mut events), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11129,7 +11135,7 @@ async fn an_outstanding_output_or_session_wait_does_not_keep_an_idle_session_pub
         .expect("snapshot after the restatements");
     assert_eq!(after.revision, first.revision);
     assert_eq!(drain_agent_state(&mut events), 0);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11185,7 +11191,7 @@ async fn an_input_wait_into_an_idle_session_settles_on_the_restated_idle() {
         .expect("the restated idle settles the wait");
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert!(result.activity_revision > Some(boundary.revision));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11247,8 +11253,8 @@ async fn a_wait_on_one_session_settles_through_a_burst_of_another_sessions_event
         .expect("wait task joins")
         .expect("the waited session's own event settles the wait");
     assert_eq!(result.activity, Some(AgentActivity::Idle));
-    let _ = registry.stop(&waited.id).await;
-    let _ = registry.stop(&other.id).await;
+    registry.stop(&waited.id).await.expect("stop the session");
+    registry.stop(&other.id).await.expect("stop the session");
 }
 
 #[test]
@@ -11333,7 +11339,7 @@ async fn session_input_wait_rejects_replaced_runtime() {
         .expect_err("replacement runtime must not confirm prior input");
 
     assert_eq!(error.code, "session_runtime_changed");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11440,7 +11446,7 @@ async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
         .await
         .expect_err("duplicate sequence must not synthesize blocked evidence");
     assert_eq!(error.code, "session_input_timeout");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11480,7 +11486,7 @@ async fn session_input_wait_is_cancelled_by_daemon_shutdown() {
         .expect_err("shutdown must cancel input wait");
 
     assert_eq!(error.code, "daemon_shutting_down");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11532,7 +11538,7 @@ async fn session_input_wait_obeys_per_session_waiter_limit() {
     first.abort();
     let _ = first.await;
     wait_for_session_waiters(&registry, &created.id, 0).await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11589,7 +11595,7 @@ async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
         let _ = event;
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 async fn read_session_output_after_rejection(registry: &SessionRegistry, id: &SessionId) -> String {
@@ -11893,7 +11899,7 @@ async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch
     assert_eq!(inspected.activity, Some(AgentActivity::Working));
     assert_eq!(inspected.state_source, StateSource::Report);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -11986,7 +11992,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
     let restored_config = detector_config_rx.borrow().config.clone();
     assert_eq!(title_activity(&restored_config, "profile-only-title"), None);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12048,7 +12054,7 @@ async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
     assert_eq!(error.class, ErrorClass::Runtime);
     assert_eq!(error.code, "session_detection_response_too_large");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12086,7 +12092,7 @@ async fn osc_7_output_updates_cwd_before_next_procwatch_tick() {
     assert_eq!(updated.cwd, cwd);
     assert_eq!(updated.cwd_source, Some(CwdSource::Osc7));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12159,7 +12165,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
     assert_eq!(cleared.activity, None);
     assert_eq!(cleared.state_source, StateSource::Process);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12212,7 +12218,7 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
         Some("codex-newer")
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12269,7 +12275,7 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
     assert_eq!(inspected.activity, Some(AgentActivity::Working));
     assert_eq!(inspected.state_source, StateSource::Report);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12377,7 +12383,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
     assert_eq!(active_again.activity, Some(AgentActivity::Blocked));
     assert_eq!(active_again.state_source, StateSource::Report);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12437,7 +12443,7 @@ async fn report_agent_activity_blocks_detector_until_release() {
     assert_eq!(working.activity, Some(AgentActivity::Working));
     assert_eq!(working.state_source, StateSource::Process);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12500,7 +12506,7 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
     assert_eq!(released.activity, Some(AgentActivity::Working));
     assert_eq!(released.state_source, StateSource::Process);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12579,7 +12585,7 @@ async fn report_agent_returns_false_for_unknown_agent() {
     assert_eq!(inspected.active_agent, None);
     assert_eq!(inspected.activity, None);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
@@ -13028,7 +13034,7 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
         inspected.cwd, safe_cwd,
         "a reused root PID must not drive descendant or cwd reconciliation"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -13072,7 +13078,7 @@ async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
         .expect("inspect session")
         .active_agent
         .is_none());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -13102,7 +13108,7 @@ async fn procwatch_discards_scan_when_root_generation_changes_inside_bracket() {
         .expect("inspect session");
     assert!(inspected.active_agent.is_none());
     assert_eq!(inspected.cwd, safe_cwd);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -13151,7 +13157,7 @@ async fn procwatch_discards_cwd_when_focus_generation_changes_inside_bracket() {
         safe_cwd,
         "a reused focus PID cannot apply its cwd"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -13201,7 +13207,7 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
         let entry = sessions.get_mut(&created.id).expect("replacement entry");
         entry.info.runtime = created.runtime.clone();
     };
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 async fn mock_direct_codex_registry(
@@ -13394,7 +13400,7 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
         );
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -13414,7 +13420,7 @@ async fn direct_agent_without_hook_does_not_auto_report_root() {
         assert_eq!(inspected.active_agent_pid, None);
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Pid of the observed Codex wrapper a descendant reporter claims from.
@@ -13593,7 +13599,7 @@ async fn descendant_reporter_hook_claim_survives_fallback_rescans() {
             .await;
         assert_descendant_claim_kept(&registry, &created.id, "fallback rescan").await;
     }
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The same claim survives a rescan in which the foreground process group
@@ -13621,7 +13627,7 @@ async fn descendant_reporter_hook_claim_survives_foreground_wrapper_selection() 
             .await;
         assert_descendant_claim_kept(&registry, &created.id, "foreground wrapper selection").await;
     }
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A reporter below a session whose launch process is the agent keeps its
@@ -13735,7 +13741,7 @@ async fn procwatch_unknown_foreground_binds_the_reported_start_identity() {
         released.active_agent_session_id, None,
         "native metadata does not survive the pid reuse"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A reported pid no scan verifies is never bound: the claim releases instead
@@ -13796,7 +13802,7 @@ async fn procwatch_unknown_foreground_never_binds_an_unverified_reporter() {
             "the wrapper stays observed and nothing stands in for the claim"
         );
     };
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -13838,7 +13844,7 @@ async fn foreground_moves_from_observed_child_to_same_runtime_wrapper() {
         Some(DESCENDANT_WRAPPER_PID),
         "only reported claims retain a descendant across foreground selection"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Registry, inspector and session of a descendant claim whose process tree is
@@ -14079,7 +14085,7 @@ async fn observed_reporter_claim_follows_the_foreground_ancestry() {
             )
             .await;
         }
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -14109,7 +14115,7 @@ async fn observed_reporter_below_the_launch_root_follows_the_root_kind() {
             let cleared = registry.inspect(&created.id).await.expect("inspect");
             assert_eq!(cleared.active_agent_pid, None, "shell launch root");
         }
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -14130,7 +14136,7 @@ async fn launch_root_anchors_an_observed_reporter_only_within_its_runtime() {
         .await;
     let other_runtime_root = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(other_runtime_root.active_agent_pid, None, "claude root");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 
     // A codex launch root does not anchor a claim below a claude agent.
     let (registry, inspector, created) = mock_direct_registry("root-agent-between", "codex").await;
@@ -14148,7 +14154,7 @@ async fn launch_root_anchors_an_observed_reporter_only_within_its_runtime() {
         .await;
     let between = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(between.active_agent_pid, None, "other runtime in between");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// PR2 scenarios: a reporter a scan proved keeps its claim until its own
@@ -14165,7 +14171,7 @@ async fn bound_reporter_survives_a_failed_collection() {
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "failed collection").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A failed liveness read of the proven reporter leaves its claim in place.
@@ -14177,7 +14183,7 @@ async fn bound_reporter_survives_its_own_probe_error() {
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "own probe error").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The exit of an unrelated observed agent leaves a proven reporter's claim in
@@ -14211,7 +14217,7 @@ async fn bound_reporter_survives_an_unrelated_exit_callback() {
     })
     .await;
     assert_descendant_claim_kept(&registry, &created.id, "unrelated exit").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The reporter's own exit clears its claim while collection keeps failing: the
@@ -14234,7 +14240,7 @@ async fn bound_reporter_exit_clears_the_claim_while_collection_fails() {
         "own exit",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Pid of a process group no fixture process carries.
@@ -14327,7 +14333,7 @@ async fn bound_reporter_exit_clears_the_claim_after_refreshes_with_zombie_facts(
 
     inspector.fire_exit(DESCENDANT_REPORTER_PID);
     assert_wrapper_replaces_bound_claim(&registry, &created.id, "exit after refreshes").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A scan that reads the reporter alive after its exit was reported does not
@@ -14352,7 +14358,7 @@ async fn bound_reporter_exit_wins_over_a_newer_scan() {
         "a scan after the exit",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A refresh that names no process, or the bound process again, keeps the
@@ -14374,7 +14380,7 @@ async fn bound_reporter_keeps_its_process_across_refreshes() {
         assert_descendant_claim_kept(&registry, &created.id, "refreshed claim, failed scan").await;
         inspector.fire_exit(DESCENDANT_REPORTER_PID);
         assert_wrapper_replaces_bound_claim(&registry, &created.id, "refreshed claim, exit").await;
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -14394,7 +14400,7 @@ async fn bound_reporter_ignores_the_exit_of_another_generation() {
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "stale exit").await;
     assert!(reporter_is_bound(&registry, &created.id).await);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The exit of the anchor leaves the reporter's claim to the reporter's own
@@ -14417,7 +14423,7 @@ async fn bound_reporter_survives_the_exit_of_its_anchor() {
 
     inspector.fire_exit(DESCENDANT_REPORTER_PID);
     wait_for_active_agent_pid(&registry, &created.id, None).await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A reporter missing from a successful scan, or listed with a broken
@@ -14441,7 +14447,7 @@ async fn bound_reporter_survives_scans_that_cannot_place_it() {
             .rescan_procwatch_at(&created.id, created.pid, Instant::now())
             .await;
         assert_descendant_claim_kept(&registry, &created.id, case).await;
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -14456,7 +14462,7 @@ async fn bound_reporter_survives_a_foreground_group_without_an_agent() {
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "foreground group without an agent").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// While collection fails, the foreground still decides a bound claim by the
@@ -14500,7 +14506,7 @@ async fn bound_reporter_follows_the_foreground_while_collection_fails() {
             )
             .await;
         }
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 
     let (registry, inspector, created) = descendant_claim_fixture("bound-shell-root", true).await;
@@ -14511,7 +14517,7 @@ async fn bound_reporter_follows_the_foreground_while_collection_fails() {
         .await;
     let cleared = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(cleared.active_agent_pid, None, "shell root");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A reporter bound below an agent launch root keeps its claim with the
@@ -14533,7 +14539,7 @@ async fn bound_reporter_below_the_launch_root_survives_the_root_foreground() {
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "launch root foreground").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Without an exit watch every scan reads the bound generation's liveness: a
@@ -14580,7 +14586,7 @@ async fn bound_reporter_without_an_exit_watch_ends_when_a_scan_reads_it_gone() {
         "unwatched, reporter gone",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A reporter that exits between its liveness read and the arming of its exit
@@ -14609,7 +14615,7 @@ async fn reporter_that_exits_while_its_watch_is_armed_is_not_bound() {
         "exit while arming",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A reporter an unwatched binding reads gone ends its claim in the same scan
@@ -14645,7 +14651,7 @@ async fn unwatched_reporter_death_ends_the_claim_despite_a_foreground_probe_erro
         "unwatched death, foreground probe error",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The binding's exit signal alone ends the claim of a reporter that is also
@@ -14670,7 +14676,7 @@ async fn binding_exit_alone_ends_an_observed_reporters_claim() {
     // The binding's watch is armed before the observation's.
     inspector.fire_exit_watch(DESCENDANT_REPORTER_PID, 0);
     assert_wrapper_replaces_bound_claim(&registry, &created.id, "binding exit only").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A binding whose watch task was cancelled with the runtime watchers falls
@@ -14700,7 +14706,7 @@ async fn bound_reporter_with_a_cancelled_watch_ends_when_a_scan_reads_it_gone() 
         "cancelled watch, reporter gone",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A bound reporter that is itself an observed agent ends through either of
@@ -14848,7 +14854,7 @@ async fn unbound_claim_with_an_inconclusive_probe_stays_until_the_claim_ttl() {
             Some(DESCENDANT_REPORTER_PID),
             "{case}: the claim follows main after the TTL"
         );
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -14888,7 +14894,7 @@ async fn unbound_claim_with_a_conclusive_probe_is_replaced_at_once() {
         "reporter gone",
     )
     .await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A foreground switch to an agent the reporter does not descend from is the
@@ -14938,7 +14944,7 @@ async fn foreground_switch_to_another_agent_replaces_a_descendant_claim() {
             case,
         )
         .await;
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -14955,7 +14961,7 @@ async fn foreground_return_to_the_shell_root_clears_a_descendant_claim() {
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_pid, None);
     assert_eq!(cleared.active_agent_session_id, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A scan collected before a claim was admitted and applied after it neither
@@ -15008,7 +15014,7 @@ async fn pre_admission_scan_does_not_refute_a_descendant_claim() {
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "rescan after admission").await;
     assert!(reporter_is_bound(&registry, &created.id).await);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A report admitted during a scan for a reused reporter pid carries another
@@ -15051,7 +15057,7 @@ async fn reused_pid_report_admitted_during_a_scan_is_not_refuted_by_it() {
         !reporter_is_bound(&registry, &created.id).await,
         "the scan proves nothing for the new generation"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A descendant claim the worker journal projects survives a successful scan
@@ -15110,7 +15116,7 @@ async fn journal_projected_descendant_claim_survives_a_successful_scan() {
             Some(crate::store::ActiveAgentOrigin::Reported)
         );
     }
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Projects the descendant reporter's claim the way the worker journal does.
@@ -15161,7 +15167,7 @@ async fn journal_projected_claim_requests_a_rescan_that_binds_it() {
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
     assert!(reporter_is_bound(&registry, &created.id).await);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A new journal claim survives a failed collection within the claim TTL and
@@ -15213,7 +15219,7 @@ async fn new_journal_claim_survives_a_failed_collection_until_the_claim_ttl() {
         Some(DESCENDANT_REPORTER_PID),
         "after the claim TTL"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A claim adopted from the persisted record carries no start identity and no
@@ -15255,7 +15261,7 @@ async fn adopted_claim_binds_at_the_first_scan() {
         .await;
     assert!(reporter_is_bound(&registry, &created.id).await);
     assert_descendant_claim_kept(&registry, &created.id, "adopted claim").await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15295,7 +15301,7 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
         .expect("inspect must not wait for foreground probe")
         .expect("inspect session");
     scan_result.expect("foreground rescan thread");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15373,7 +15379,7 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     let after_new_exit = wait_for_active_agent_pid(&registry, &created.id, None).await;
     assert_eq!(after_new_exit.active_agent, None);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15419,7 +15425,7 @@ async fn procwatch_reconciles_unbound_claim_after_descendants_error() {
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_base, None);
     assert_eq!(cleared.active_agent_pid, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15451,7 +15457,7 @@ async fn procwatch_updates_cwd_from_active_agent_pid() {
     );
     assert_eq!(updated.cwd_source, Some(CwdSource::Procwatch));
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15538,7 +15544,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
     assert_eq!(adopted.active_agent_pid, Some(FOREIGN_AGENT_PID));
     assert_eq!(adopted.cwd, agent_cwd, "own agent drives the cwd focus");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15820,7 +15826,7 @@ async fn procwatch_releases_hook_claim_when_observed_pid_exits() {
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_base, None);
     assert_eq!(cleared.active_agent_session_id, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15859,7 +15865,7 @@ async fn procwatch_late_hook_report_for_dead_pid_is_cleared_on_reconcile() {
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_pid, None);
     assert_eq!(cleared.active_agent_session_id, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15880,7 +15886,7 @@ async fn procwatch_auto_report_releases_immediately_on_sigkill_style_exit() {
 
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_base, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15948,7 +15954,7 @@ async fn procwatch_expires_unbound_hook_claim_after_ttl() {
     let cleared = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(cleared.active_agent, None);
     assert_eq!(cleared.active_agent_pid, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -15989,7 +15995,7 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
     assert_eq!(rebound.active_agent_base, Some(RuntimeRef::codex()));
     assert_eq!(rebound.active_agent_pid, Some(200));
     assert_eq!(rebound.active_agent_session_id, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A resumable session whose agent exits with code 3 on its first input line,
@@ -16250,7 +16256,7 @@ async fn report_native_id_records_binding_and_updates_info() {
         "a lower sequence must remain stale after the ordering key is reloaded"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -16352,7 +16358,7 @@ async fn concurrent_session_writes_cannot_regress_native_ordering() {
     );
 
     assert_previous_runtime_cannot_overwrite(&store, &persisted, &delayed_resize);
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_stop_intent_busy").await;
 }
 
 fn assert_previous_runtime_cannot_overwrite(
@@ -16678,7 +16684,7 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
         .expect("restore live entry")
         .info
         .runtime = Some(original);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -16780,7 +16786,7 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_RECONNECTED
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Connect deadline of the unanswered-socket reconnect attempt; short so the
@@ -16866,7 +16872,7 @@ async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
         Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
     );
     silent.abort();
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "runtime_supervision_ambiguous").await;
 }
 
 #[tokio::test]
@@ -17297,10 +17303,23 @@ fn is_runtime_transition_event(name: &str) -> bool {
     )
 }
 
+/// Stops a session the test left unable to stop and asserts the
+/// stop is refused with `code`.
+async fn assert_stop_refused(registry: &SessionRegistry, id: &SessionId, code: &str) {
+    let error = registry
+        .stop(id)
+        .await
+        .expect_err("the stop of this session is refused");
+    assert_eq!(error.code, code, "{error:?}");
+}
+
 async fn stop_test_worker(worker: crate::runtime::Worker) {
     let transaction =
         pohunek_worker_protocol::TransactionId::new("test-cleanup").expect("cleanup transaction");
-    let _ = worker.stop(transaction).await;
+    worker
+        .stop(transaction)
+        .await
+        .expect("stop the test worker");
 }
 
 fn runtime_commit_candidate(entry: SessionEntry, worker_instance_id: &str) -> SessionEntry {
@@ -17479,7 +17498,7 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
         Some("claude-native")
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -17601,7 +17620,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
         inspected.native_session_id.as_deref(),
         Some("native-current")
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Create a temp `agents/` dir holding one profile file; return the dir path.
@@ -17965,8 +17984,8 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
         "fork argv must preserve frozen args and append the Claude fork flag: {argv:?}"
     );
 
-    let _ = registry.stop(&created.id).await;
-    let _ = registry.stop(&forked.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
+    registry.stop(&forked.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -18033,7 +18052,7 @@ async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects()
                 .all(|session| session.name.as_deref() != Some("must-not-exist")),
             "{agent}: no child registered"
         );
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -18096,7 +18115,7 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
         .load_resume()
         .expect("load resume bindings")
         .is_empty());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -18143,7 +18162,7 @@ async fn fork_disable_is_frozen_across_profile_removal() {
 
     assert_eq!(err.code, "agent_fork_unsupported");
     assert_eq!(registry.list().await.len(), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -18226,7 +18245,7 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
         "path-kind resume binding must refresh dimensions after resize"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -18305,7 +18324,7 @@ async fn resume_binding_never_persists_profile_env_secrets() {
         "profile env (key or value) must never reach the store: {raw}"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -18366,7 +18385,7 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
     let persisted = crate::store::Store::new(store_path)
         .load_resume()
         .expect("load after shutdown exit");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     crate::procwatch::scoped_host::kill_if_current(&crate::procwatch::HostInspector::new(), child);
 
     assert_eq!(
@@ -18607,7 +18626,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         resumed.pid
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 // Linux only: on macOS /usr/bin/python3 and framework Pythons re-exec another image, which the
@@ -18672,7 +18691,7 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
     );
     assert!(!argv.contains("--continue"));
     assert!(!argv.contains("--pass-session-id"));
-    let _ = registry.stop(&resumed.id).await;
+    registry.stop(&resumed.id).await.expect("stop the session");
 }
 
 // Linux only: on macOS /usr/bin/python3 and framework Pythons re-exec another image, which the
@@ -18942,7 +18961,7 @@ async fn a_hostile_native_id_refuses_recovery_without_launching() {
         "a hostile reference can never drive the recovery argv"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -19028,8 +19047,8 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
         ["--session", reference, "--fork", reference]
     );
 
-    let _ = registry.stop(&forked.id).await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&forked.id).await.expect("stop the session");
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -19122,7 +19141,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
         );
     }
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -19169,7 +19188,7 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
     assert_eq!(persisted[0].session_id, created.id.0);
     assert_eq!(persisted[0].metadata, expected);
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -19242,7 +19261,7 @@ async fn resume_binding_restores_metadata_from_store() {
         expected
     );
 
-    let _ = registry.stop(&resumed.id).await;
+    registry.stop(&resumed.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -19271,7 +19290,7 @@ async fn resize_without_captured_native_id_persists_no_binding() {
         "resize without a native id must not create a resume binding"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -19397,7 +19416,7 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         "edited profile program must not run during resume"
     );
 
-    let _ = restarted.stop(&resumed.id).await;
+    restarted.stop(&resumed.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -19525,7 +19544,7 @@ async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
         "persisted binding must match the live size after a concurrent resize + recapture"
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -19614,7 +19633,7 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
     .expect_err("an empty native id must fail validation");
 
     // Terminal session.
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     let terminal = registry
         .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
@@ -23958,8 +23977,8 @@ async fn a_prompt_in_the_launch_arguments_makes_the_first_answer_a_turn() {
         .record_activity(&prompted.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&bare.id).await;
-    let _ = registry.stop(&prompted.id).await;
+    registry.stop(&bare.id).await.expect("stop the session");
+    registry.stop(&prompted.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -24053,8 +24072,8 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         .iter()
         .all(|binding| binding.session_id != forked.id.0));
 
-    let _ = registry.stop(&forked.id).await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&forked.id).await.expect("stop the session");
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A Pi-shaped agent that records every start in `marker` and stays alive.
@@ -24182,7 +24201,7 @@ async fn a_fork_of_a_runtime_assigning_forks_resumes_its_own_conversation_after_
     wait_for_file_contains(&marker, &format!("--session\n{fork}\n")).await;
     assert_eq!(recorded_launch(&marker, 2), ["--session", fork.as_str()]);
     assert_eq!(resumed.native_session_id.as_deref(), Some(fork.as_str()));
-    let _ = restarted.stop(&resumed.id).await;
+    restarted.stop(&resumed.id).await.expect("stop the session");
 }
 
 /// A Pi-shaped agent that answers `--version` from `version_file` and records
@@ -24290,7 +24309,7 @@ async fn a_probed_package_runtime_is_revalidated_before_every_launch_kind() {
         .expect_err("resume re-runs the probe");
     assert_eq!(refused.code, "agent_runtime_unsupported");
     assert_eq!(launches(&marker), 2, "nothing was launched");
-    let _ = registry.stop(&forked.id).await;
+    registry.stop(&forked.id).await.expect("stop the session");
 }
 
 /// The durable recovery binding of `id`, as a restarted daemon reads it.
@@ -24419,7 +24438,7 @@ async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() 
         ["--session", reference.as_str()]
     );
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -24479,7 +24498,7 @@ async fn a_report_labels_the_reference_it_writes_reported() {
     );
     assert!(record.native_identity_ordering.is_some());
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A fixed base-environment source: the thread fixture's variables plus
@@ -24572,7 +24591,7 @@ async fn recover_assigned(
         .await
         .expect("session exits");
     let outcome = registry.resume(&created.id).await.map(|_| ());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     outcome.map_err(|error| error.code)
 }
 
@@ -24787,7 +24806,7 @@ async fn a_package_session_is_pinned_to_its_archive_digest() {
         protocol::BindingProvenance::Package { package_digest, .. }
             if *package_digest == packaged.digest
     ));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -24823,7 +24842,7 @@ async fn a_package_modified_after_install_blocks_a_fresh_launch_and_leaves_no_re
         "the refused launch persisted nothing"
     );
     assert_eq!(registry.list().await.len(), 1);
-    let _ = registry.stop(&first.id).await;
+    registry.stop(&first.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -24894,7 +24913,7 @@ async fn a_session_resumes_from_its_pin_after_the_package_is_disabled() {
         .resume(&created.id)
         .await
         .expect("the pin keeps resuming from its own digest");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -24928,7 +24947,7 @@ async fn uninstall_is_refused_while_a_live_session_references_the_package() {
         .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))
         .expect("the runtime still serves");
 
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     registry.remove(&created.id).await.expect("remove");
     registry
         .uninstall_package(&packaged.digest)
@@ -25114,8 +25133,8 @@ async fn a_fork_holds_the_package_authority_until_its_registration_ends() {
         .await
         .expect("fork task")
         .expect("a pinned disabled package still forks");
-    let _ = registry.stop(&forked.id).await;
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&forked.id).await.expect("stop the session");
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -25169,7 +25188,7 @@ async fn an_unreadable_store_record_blocks_uninstall_and_leaves_listing_availabl
         .create(packaged_params(&dir))
         .await
         .expect("create a package session");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
     registry.remove(&created.id).await.expect("remove");
     let mut store = fs::OpenOptions::new()
         .append(true)
@@ -25355,7 +25374,7 @@ async fn a_resumed_package_session_detects_with_its_pinned_manifest_after_disabl
     );
     drop(sessions);
     assert_eq!(actual, expected, "the pinned package's rules are in effect");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Debug text of the regions a session's current detector manifest reads.
@@ -25445,7 +25464,7 @@ async fn callbacks_of_a_pinned_session_use_its_own_version_after_another_is_sele
         v1_regions,
         "a v1 session keeps v1 detection rules"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -25486,7 +25505,7 @@ async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_r
         })
         .await;
     assert!(release.released, "and releases");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Writes `<root>/<name>/interp`, a shim that prints `version` whatever its
@@ -25587,7 +25606,7 @@ async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
             match create_in(&registry, agent, &root).await {
                 Ok(created) => {
                     assert!(launches, "{agent} must be refused");
-                    let _ = registry.stop(&created.id).await;
+                    registry.stop(&created.id).await.expect("stop the session");
                 }
                 Err(error) => {
                     assert!(!launches, "{agent} must launch: {}", error.code);
@@ -25611,7 +25630,7 @@ async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
         .resume(&created.id)
         .await
         .expect("resume probes under the profile PATH");
-    let _ = registry.stop(&resumed.id).await;
+    registry.stop(&resumed.id).await.expect("stop the session");
 }
 
 /// One built-in agent of the migrated-binding tests: the v0.33.0 flat fields
@@ -25801,7 +25820,7 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
                 expected_fork,
                 "{tag}: fork argv"
             );
-            let _ = registry.stop(&forked.id).await;
+            registry.stop(&forked.id).await.expect("stop the session");
         }
         None => assert_eq!(
             fork.expect_err("the built-in spec has no fork").code,
@@ -25809,7 +25828,7 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
             "{tag}"
         ),
     }
-    let _ = registry.stop(&resumed.id).await;
+    registry.stop(&resumed.id).await.expect("stop the session");
 }
 
 /// Writes the script a hooked session runs: every real Codex and Claude
@@ -25928,7 +25947,7 @@ impl HookRig {
 
     /// Stops the server and the session.
     async fn finish(mut self, id: &SessionId) {
-        let _ = self.registry.stop(id).await;
+        self.registry.stop(id).await.expect("stop the session");
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -26971,7 +26990,7 @@ async fn a_report_binds_the_start_identity_only_when_the_host_confirms_it() {
     assert_eq!(active.pid, Some(created.pid));
     assert_eq!(active.start_identity, Some(real));
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A release that names a start identity the host contradicts is ignored; one
@@ -27020,7 +27039,7 @@ async fn a_release_is_ignored_when_the_host_contradicts_its_start_identity() {
 
     inspector.set_identity(created.pid, None);
     assert!(registry.release_agent(release(Some(real))).await.released);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A bound report of the session's root process, ordered by `sequence`.
@@ -27133,7 +27152,7 @@ async fn a_bound_report_is_journaled_by_the_worker_and_never_becomes_a_native_re
             Some("native-one")
         );
     }
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A worker snapshot parked before it commits cannot overwrite a report made
@@ -27211,7 +27230,7 @@ async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarde
         Some(AgentActivity::Blocked),
         "the detector follows the newer report"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A snapshot read before a forwarded commit carries an older revision and
@@ -27245,7 +27264,7 @@ async fn a_snapshot_older_than_the_committed_revision_cannot_replace_the_identit
         annotation(&registry, &created.id).await.as_deref(),
         Some("native-two")
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A forwarded release survives a parked snapshot that still holds the claim.
@@ -27327,7 +27346,7 @@ async fn a_forwarded_release_survives_a_snapshot_parked_with_the_claim() {
         default_activity,
         "the detector is back to the default after the release"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A report without a process or a monotonic sequence is never offered to the
@@ -27358,7 +27377,7 @@ async fn an_unbound_report_stays_in_memory_and_is_not_sent_to_the_worker() {
         .not_durable_logged
         .contains(&crate::session::NotDurableCause::Unbound));
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A worker that negotiated protocol 7 cannot journal a forwarded claim: no
@@ -27417,7 +27436,7 @@ async fn a_report_for_a_protocol_7_worker_stays_in_memory() {
         Some(crate::session::claim::ClaimOrigin::Memory { .. })
     ));
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A runtime the daemon cannot reach leaves the report in memory with the
@@ -27450,7 +27469,7 @@ async fn a_report_whose_forward_cannot_start_is_kept_in_memory() {
         &sessions[&created.id]
     ));
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_lost").await;
 }
 
 /// A release the worker refuses is final, except for an identity the worker
@@ -27489,7 +27508,7 @@ async fn a_refused_release_still_clears_an_identity_that_was_never_journaled() {
             .active_agent,
         None
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The activity a bound report carries is applied although the worker's claim
@@ -27537,7 +27556,7 @@ async fn a_bound_report_applies_the_activity_it_carries() {
         "the release ends the reported activity"
     );
     assert_eq!(info.state_source, StateSource::Process);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A report that names a session id and its transcript keeps both public
@@ -27578,7 +27597,7 @@ async fn a_bound_report_keeps_both_the_session_id_and_the_transcript_path() {
         annotation.transcript_path.as_deref(),
         Some("/work/native-one.jsonl")
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A registry on the host's real process table whose session runs two
@@ -27691,7 +27710,7 @@ async fn a_release_of_a_really_exited_process_clears_a_forwarded_identity() {
             .active_agent,
         None
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The activity of a report whose identity commit was deferred is applied by
@@ -27745,7 +27764,7 @@ async fn the_activity_of_a_report_with_a_deferred_commit_lands_with_the_commit()
             .activity,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A journaled claim of a process that exited is not brought back by the next
@@ -27809,7 +27828,7 @@ async fn a_sync_does_not_resurrect_the_claim_of_an_exited_reporter() {
             .active_agent_pid,
         None
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 // Claim model scenarios: each case of the forwarded-identity claim table.
@@ -27908,7 +27927,7 @@ async fn a_release_that_cannot_be_forwarded_does_not_end_a_journaled_claim() {
     assert!(!registry.release_agent(unbound).await.released);
 
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R3-B: a release of an exited process names the start identity of the claim;
@@ -27941,7 +27960,7 @@ async fn a_release_naming_another_start_identity_ends_no_journaled_claim() {
     }
 
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(1));
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_lost").await;
 }
 
 /// N6: a daemon that restarts holds the persisted identity as a memory claim
@@ -27975,7 +27994,7 @@ async fn the_first_sync_after_a_restart_adopts_the_journaled_claim() {
     assert!(registry.inner.sessions.lock().await[&created.id]
         .identity_fence
         .is_some());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R1-X004: a memory-only report that the worker later journals with the same
@@ -28012,7 +28031,7 @@ async fn a_memory_report_journaled_unchanged_becomes_the_journaled_claim() {
         "the worker refuses a release older than the claim"
     );
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R2-X003: the activity of a report whose claim a newer report replaced is
@@ -28070,7 +28089,7 @@ async fn the_activity_of_a_superseded_claim_is_dropped() {
     assert!(registry.inner.sessions.lock().await[&created.id]
         .pending_activity
         .is_none());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R2-X004: reports with unchanged public fields order the claim by the newest
@@ -28096,7 +28115,7 @@ async fn repeated_bound_reports_order_the_claim_by_the_newest_sequence() {
             .released
     );
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(20));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R3-A: an older snapshot applying after a deferred commit keeps the activity
@@ -28144,7 +28163,7 @@ async fn an_older_snapshot_keeps_the_activity_waiting_for_a_deferred_commit() {
             .activity,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// N1: a report that cannot be forwarded and is older than the last public
@@ -28182,7 +28201,7 @@ async fn an_older_public_report_does_not_replace_a_journaled_claim() {
     assert!(claim_origin(&registry, &created.id)
         .await
         .is_some_and(|origin| matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })));
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_lost").await;
 }
 
 /// N2: a snapshot at or below the fence a memory claim was recorded over does
@@ -28220,7 +28239,7 @@ async fn a_snapshot_at_the_floor_does_not_replace_a_memory_claim() {
         Some("native-two"),
         "the newer memory report survives a snapshot at its floor"
     );
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_lost").await;
 }
 
 /// N4: a release the worker journaled whose acknowledgement never reached the
@@ -28256,7 +28275,7 @@ async fn a_release_journaled_without_an_acknowledgement_is_adopted_by_the_next_s
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// N5: a report the worker journaled although its acknowledgement was lost keeps
@@ -28317,7 +28336,7 @@ async fn a_memory_claim_the_worker_journaled_keeps_its_activity() {
             .activity,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_lost").await;
 }
 
 /// N7: activity waiting for a worker instance that was replaced is dropped.
@@ -28368,7 +28387,7 @@ async fn activity_waiting_for_a_replaced_worker_instance_is_dropped() {
             .activity,
         None
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// N9: a memory release of a memory claim is not undone by a snapshot at the
@@ -28403,7 +28422,7 @@ async fn a_memory_release_is_not_undone_by_a_snapshot_at_its_floor() {
         None,
         "the older journaled claim is not brought back"
     );
-    let _ = registry.stop(&created.id).await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_lost").await;
 }
 
 /// A report as the shipped Hermes reporter used to send it: a pid and a public
@@ -28450,7 +28469,7 @@ async fn a_reporter_without_bound_fields_is_bound_by_the_host_over_a_journaled_c
             .activity,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// L2: the same report from a pid the host cannot read, or from another
@@ -28489,7 +28508,7 @@ async fn a_reporter_the_host_cannot_bind_does_not_replace_a_journaled_claim() {
     );
 
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A session whose journaled claim belongs to its root process, which the
@@ -28547,7 +28566,7 @@ async fn a_reused_pid_does_not_replace_a_journaled_claim_through_a_stale_observa
     };
     assert!(!registry.report_agent(stale).await.recorded);
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// X002: the same for a pid the host cannot read.
@@ -28565,7 +28584,7 @@ async fn an_unreadable_pid_does_not_replace_a_journaled_claim_through_a_stale_ob
     };
     assert!(!registry.report_agent(stale).await.recorded);
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// V-C: a report that names no pid is not bound to the one agent procwatch
@@ -28583,7 +28602,7 @@ async fn a_report_without_a_pid_does_not_replace_a_journaled_claim_through_the_o
     };
     assert!(!registry.report_agent(pidless).await.recorded);
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// P1: the public order of a report whose identity commit was deferred is
@@ -28627,7 +28646,7 @@ async fn a_deferred_commit_keeps_the_public_order_of_its_report() {
             .await
             .recorded
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// E1: a snapshot that re-projects a claim with an equal origin updates the
@@ -28694,7 +28713,7 @@ async fn a_profile_change_updates_the_label_of_an_unchanged_claim() {
     assert_eq!(active.reported_at, reported_at);
     assert!(super::active_agent_origin(entry).is_some());
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R5-B: a release a snapshot carries for another provider or process ends
@@ -28733,7 +28752,7 @@ async fn a_projected_release_of_another_process_leaves_the_held_claim() {
         "the report that SessionInfo names must stay releasable"
     );
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R5-C: a journaled claim refreshed while a scan runs is another claim for
@@ -28807,7 +28826,7 @@ async fn a_refreshed_journaled_claim_is_not_proven_by_an_older_scan() {
         !reporter_is_bound(&registry, &created.id).await,
         "the scan proves nothing for the refreshed claim"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A snapshot of `worker` that carries only a release tombstone for a process
@@ -28883,7 +28902,7 @@ async fn a_worker_release_of_another_process_leaves_a_memory_claim_and_its_activ
                     .released,
             "{label}: the claim can still be released"
         );
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -28930,7 +28949,7 @@ async fn a_worker_release_of_another_process_keeps_the_memory_tombstone() {
             .await
             .recorded
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// D1-d: an observed claim survives repeated syncs under a release tombstone
@@ -28975,7 +28994,7 @@ async fn an_observed_claim_survives_syncs_under_a_foreign_release_tombstone() {
             "sync {sync}"
         );
     }
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// F1, F2: a forwardable report that is older than a memory claim, or than a
@@ -29029,7 +29048,7 @@ async fn a_forwardable_report_is_ordered_against_memory_state_before_it_is_forwa
             snapshot.active_identity.is_none(),
             "released={released}: nothing reached the worker's journal"
         );
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -29053,7 +29072,7 @@ async fn a_forwarded_report_leaves_one_origin_on_both_records() {
         entry.last_agent_report.as_ref().map(|last| &last.origin)
     );
     drop(sessions);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// V7-A: a worker without identity revisions cannot be forwarded to, so a
@@ -29119,7 +29138,7 @@ async fn a_sync_from_a_protocol_7_worker_keeps_a_newer_public_report() {
             .await
             .released
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// V7-B: a protocol 7 snapshot of another process generation behind the same
@@ -29179,7 +29198,7 @@ async fn a_protocol_7_snapshot_of_another_process_generation_replaces_the_memory
         origin.is_some_and(|origin| !matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })),
         "the memory report of the earlier process generation must not outlive the snapshot of the new one"
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// F3: a forwardable release that is older than a memory-only claim of the
@@ -29226,7 +29245,7 @@ async fn a_forwardable_release_is_ordered_against_a_memory_claim_before_it_is_fo
     assert!(registry.inner.sessions.lock().await[&created.id]
         .active_agent
         .is_some());
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// X001 (round 6): a forwarded release keeps the public order of its caller,
@@ -29266,7 +29285,7 @@ async fn a_delayed_report_does_not_resurrect_a_claim_a_forwarded_release_ended()
             .recorded
     );
     assert_eq!(claim_origin(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A forward parked at the worker: `op` runs until it is about to offer its
@@ -29390,7 +29409,7 @@ async fn a_newer_memory_report_made_during_a_forward_stays_the_active_claim() {
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Y1 (row 2 during): an older unbound report made during a forward is refused
@@ -29423,7 +29442,7 @@ async fn an_older_unbound_report_made_during_a_forward_is_refused() {
     assert!(first.recorded);
     assert!(!second.recorded);
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Y2 (row 3 during, deferred commit): a newer memory report made while the
@@ -29469,7 +29488,7 @@ async fn a_newer_memory_report_holds_against_a_deferred_commit() {
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R7-X002: the newer memory report that outranked a deferred forwarded report
@@ -29515,7 +29534,7 @@ async fn a_newer_memory_report_survives_every_projection_of_the_deferred_identit
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R7-X001: a newer memory report of the process whose forwarded release waits
@@ -29569,7 +29588,7 @@ async fn a_newer_memory_report_holds_against_a_deferred_release() {
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 fn block_imports(registry: &SessionRegistry, blocked: bool) {
@@ -29655,7 +29674,7 @@ async fn a_memory_report_of_another_source_holds_against_a_deferred_report() {
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// L2 / V1: the same for a forwarded release that waits for its commit.
@@ -29692,7 +29711,7 @@ async fn a_memory_report_of_another_source_holds_against_a_deferred_release() {
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R5 / V2: the caller of a memory report made over a deferred report can
@@ -29731,7 +29750,7 @@ async fn a_memory_claim_over_a_deferred_report_can_be_released() {
 
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
     assert_eq!(activity_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R6 / V3: a memory claim released after the deferred report was adopted stays
@@ -29771,7 +29790,7 @@ async fn a_released_memory_claim_stays_released_across_projections() {
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// R3 / R4: an older memory report and a memory release made while a report
@@ -29804,7 +29823,7 @@ async fn an_older_report_and_a_memory_release_leave_a_deferred_report_alone() {
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// L3 / V4: once a release is accepted, a report of another process starts a
@@ -29832,7 +29851,7 @@ async fn a_report_of_another_process_is_admitted_after_a_deferred_release() {
         ..legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 20)
     };
     assert!(registry.report_agent(other).await.recorded);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// L4 / V5: a report older than a release the worker accepted is refused while
@@ -29869,7 +29888,7 @@ async fn a_report_older_than_a_deferred_release_is_refused() {
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// L4 / V5: the public order of a release the worker accepted replaces the one
@@ -29910,7 +29929,7 @@ async fn a_report_of_another_source_than_a_deferred_release_is_ordered_against_t
         ..older
     };
     assert!(registry.report_agent(older).await.recorded);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// X002: a release made while the report it ends still waits for its
@@ -29945,7 +29964,7 @@ async fn a_release_of_a_report_that_was_never_projected_keeps_its_order() {
         "a report older than the release is refused"
     );
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// L5 / L6: a memory release while a release waits ends nothing more; a memory
@@ -29996,7 +30015,7 @@ async fn a_memory_claim_made_after_a_deferred_release_is_released_for_good() {
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Restart after a release: a daemon that holds the persisted claim without a
@@ -30038,7 +30057,7 @@ async fn the_first_sync_after_a_restart_adopts_the_journaled_release() {
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(active_agent_of(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A claim the worker accepted and the daemon has not adopted yet is the
@@ -30092,7 +30111,7 @@ async fn a_claim_waiting_for_its_commit_is_held_by_the_journal() {
     let worker = session_worker(&registry, &created.id).await;
     sync_from(&registry, &created.id, &worker).await;
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Y3 (row 5 during): an unforwardable release made during a forward ends no
@@ -30138,7 +30157,7 @@ async fn an_unforwardable_release_made_during_a_forward_ends_nothing() {
     assert!(first.recorded);
     assert!(!second.released);
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Y4 (row 8 during): a memory report of the same process made while a bound
@@ -30180,7 +30199,7 @@ async fn a_memory_report_made_during_a_forwarded_release_starts_a_new_claim() {
         activity_of(&registry, &created.id).await,
         Some(AgentActivity::Blocked)
     );
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Row 4 (forwarded report, then a bound release during it): the release is
@@ -30212,7 +30231,7 @@ async fn a_bound_release_made_during_a_forward_ends_the_forwarded_claim() {
 
     assert!(first.recorded && second.released);
     assert_eq!(claim_origin(&registry, &created.id).await, None);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// The public order of the hook report the claim scenarios make.
@@ -30344,7 +30363,7 @@ async fn a_native_reference_change_adopts_the_newest_claim() {
     assert_eq!(info.native_session_id.as_deref(), Some("native-b"));
     assert_eq!(journaled_sequence(&registry, &created.id).await, Some(20));
     assert_eq!(info.activity, Some(AgentActivity::Blocked));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// A Claude-shaped TUI that answers one trigger with a working frame and an
@@ -30441,7 +30460,7 @@ async fn a_fast_turn_inside_one_chunk_satisfies_an_input_wait_for_working_and_en
     })
     .await;
     assert_eq!(ended_turns(&mut edges).len(), 1);
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
 
 #[cfg(unix)]
@@ -30474,5 +30493,5 @@ async fn a_fast_turn_nobody_asked_for_edges_activity_but_opens_no_turn() {
         seen.is_empty(),
         "a turn nobody asked for opened one: {seen:?}"
     );
-    let _ = registry.stop(&id).await;
+    registry.stop(&id).await.expect("stop the session");
 }
