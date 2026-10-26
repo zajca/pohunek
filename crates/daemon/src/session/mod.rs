@@ -3468,7 +3468,8 @@ impl SessionRegistry {
     /// Arms a hold that parks the next input of session `id` that the watcher
     /// `source` received (`procwatch_scan`, `exit_watch`, `worker_snapshot`,
     /// `detector_output`), after the input was counted as pending and before
-    /// it is applied.
+    /// it is applied. `observed_watch_open` parks a procwatch scan after it
+    /// opened its observed-agent exit watches and before it commits them.
     #[cfg(test)]
     pub(crate) fn hold_next_input(
         &self,

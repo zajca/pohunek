@@ -504,7 +504,7 @@ turning true). Any other write is refused and logged as
 daemon may already have read.
 
 Each session also counts the input its watchers have been handed and not yet
-applied: a rescan request, an output chunk of the detector, a worker snapshot, a
+applied: a rescan request, an output chunk of the detector, a worker snapshot or loss, a
 delivered process exit, a due supervision retry and a scan or detector tick that
 fired. The count rises where the input is handed over and falls after the watcher
 applied it, store write and event emission included, so a producer cannot hand

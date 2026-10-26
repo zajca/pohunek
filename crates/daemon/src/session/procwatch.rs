@@ -725,8 +725,9 @@ impl SessionRegistry {
             }
             None => HashMap::new(),
         };
-        // A concurrent scan that commits before this one opens a second watch
-        // for the same process; the surplus watch is dropped unused.
+        // A scan whose claim changes before it commits binds nothing, and the
+        // reporter watch it armed is dropped unused. The hold parks a scan at
+        // this point, but only one that opened an observed-agent watch.
         #[cfg(test)]
         if !exit_watches.is_empty() {
             self.hold_input(id, "observed_watch_open").await;
