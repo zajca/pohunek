@@ -80,7 +80,9 @@ runtime_api = 1
 requires = ["input-readiness-v2"]
 ```
 
-`requires` holds at most 16 unique feature ids. The core checks it before the
+`requires` needs core 0.38 or later: an older core does not know the key and
+faults the package as `descriptor_invalid`. It holds at most 16 unique feature
+ids. The core checks it before the
 rest of the descriptor:
 
 - An id this core does not implement is refused with

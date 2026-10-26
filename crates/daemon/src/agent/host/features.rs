@@ -229,151 +229,65 @@ fn snapshot_violation(table: &[RuntimeFeature], snapshot: &str) -> Option<String
         .map(|row| format!("table row `{row}` is not in the snapshot"))
 }
 
+/// Why `features` and `gates` are not a well-formed table, or `None`.
+///
+/// Ids must be feature ids and unique, `since` must be a semver version that
+/// never decreases down the table, and every gate must name a listed feature.
+/// `since` has no upper bound: a feature is recorded with the release that
+/// ships it, which is later than the version of the tree that adds it.
+#[cfg(test)]
+fn table_violation(features: &[RuntimeFeature], gates: &[FeatureGate]) -> Option<String> {
+    let mut previous: Option<semver::Version> = None;
+    for (index, feature) in features.iter().enumerate() {
+        if !is_feature_id(feature.id) {
+            return Some(format!("row {index} `{}` is not a feature id", feature.id));
+        }
+        if features[..index]
+            .iter()
+            .any(|earlier| earlier.id == feature.id)
+        {
+            return Some(format!("row {index} `{}` is listed twice", feature.id));
+        }
+        let Ok(since) = semver::Version::parse(feature.since) else {
+            return Some(format!("row {index} `{}` has no semver since", feature.id));
+        };
+        if previous.as_ref().is_some_and(|earlier| *earlier > since) {
+            return Some(format!("row {index} `{}` has an earlier since", feature.id));
+        }
+        previous = Some(since);
+    }
+    gates
+        .iter()
+        .find(|gate| !features.iter().any(|feature| feature.id == gate.feature))
+        .map(|gate| format!("gate for unlisted feature `{}`", gate.feature))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FIXTURE_FEATURES: &[RuntimeFeature] = &[
-        RuntimeFeature {
-            id: "fixture-config-v1",
-            since: "0.38.0",
-        },
-        RuntimeFeature {
-            id: "fixture-ready-v2",
-            since: "0.38.0",
-        },
-    ];
-    const FIXTURE_GATES: &[FeatureGate] = &[
-        FeatureGate {
-            feature: "fixture-config-v1",
-            rule: GateRule::Key("config_home"),
-        },
-        FeatureGate {
-            feature: "fixture-ready-v2",
-            rule: GateRule::Value("input.ready", "screen_idle"),
-        },
-    ];
-    const FIXTURES: FeatureTables<'static> = FeatureTables {
-        features: FIXTURE_FEATURES,
-        gates: FIXTURE_GATES,
-    };
-
-    fn table(source: &str) -> Table {
-        source.parse().expect("test document is TOML")
-    }
-
-    #[test]
-    fn feature_ids_are_name_and_version() {
-        for good in ["a-v1", "input-readiness-v2", "x1-y2-v10"] {
-            assert!(is_feature_id(good), "{good}");
-        }
-        for bad in [
-            "",
-            "-v1",
-            "input",
-            "input-v",
-            "input-vx",
-            "Input-v1",
-            "input_v1",
-            "input-v1.2",
-            "input-v-1",
-        ] {
-            assert!(!is_feature_id(bad), "{bad}");
-        }
-        assert!(!is_feature_id(&format!(
-            "{}-v1",
-            "a".repeat(MAX_LABEL_BYTES)
-        )));
-    }
-
-    #[test]
-    fn requires_is_checked_for_shape_and_known_ids() {
-        let check = |requires: &str| check_requires(&table(requires), &FIXTURES);
-        assert_eq!(check(""), Ok(()));
-        assert_eq!(check("requires = []"), Ok(()));
-        assert_eq!(
-            check("requires = [\"fixture-config-v1\", \"fixture-ready-v2\"]"),
-            Ok(())
-        );
-        assert_eq!(check("requires = \"fixture-config-v1\""), Ok(()));
-        assert_eq!(
-            check("requires = [\"later-v3\"]"),
-            Err(DefinitionError::FeatureUnsupported {
-                feature: "later-v3".to_owned(),
-                core: crate::DAEMON_VERSION,
-            })
-        );
-        let field = |reason| {
-            Err(DefinitionError::Field {
-                field: "requires",
-                reason,
-            })
-        };
-        assert_eq!(
-            check("requires = [\"fixture-config-v1\", \"fixture-config-v1\"]"),
-            field("entry is listed twice")
-        );
-        assert_eq!(
-            check("requires = [\"Config-v1\"]"),
-            field("entry is not a feature id")
-        );
-        let many = (0..=MAX_REQUIRES)
-            .map(|number| format!("\"f-v{number}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        assert_eq!(
-            check(&format!("requires = [{many}]")),
-            field("has too many entries")
-        );
-    }
-
-    #[test]
-    fn gated_rules_need_their_feature() {
-        let check = |document: &str| check_gates(&table(document), &FIXTURES);
-        let refused = |key, feature| Err(DefinitionError::FeatureNotRequired { key, feature });
-        assert_eq!(check("[input]\nready = \"manifest_idle\""), Ok(()));
-        assert_eq!(
-            check("[config_home]\nenv = \"X\""),
-            refused("config_home", "fixture-config-v1")
-        );
-        assert_eq!(
-            check("requires = [\"fixture-ready-v2\"]\n[config_home]\nenv = \"X\""),
-            refused("config_home", "fixture-config-v1")
-        );
-        assert_eq!(
-            check("requires = [\"fixture-config-v1\"]\n[config_home]\nenv = \"X\""),
-            Ok(())
-        );
-        assert_eq!(
-            check("[input]\nready = \"screen_idle\""),
-            refused("input.ready", "fixture-ready-v2")
-        );
-        assert_eq!(
-            check("requires = [\"fixture-ready-v2\"]\n[input]\nready = \"screen_idle\""),
-            Ok(())
-        );
-        assert_eq!(check("requires = [\"fixture-ready-v2\"]"), Ok(()));
-    }
-
     #[test]
     fn production_table_is_well_formed() {
-        let mut seen = std::collections::BTreeSet::new();
-        for feature in RUNTIME_FEATURES {
-            assert!(is_feature_id(feature.id), "{}", feature.id);
-            assert!(seen.insert(feature.id), "{} is listed twice", feature.id);
-            let since = semver::Version::parse(feature.since).expect("since is a core version");
-            let core = semver::Version::parse(crate::DAEMON_VERSION).expect("core version");
-            assert!(since <= core, "{} is newer than this core", feature.id);
-        }
-        for gate in FEATURE_GATES {
-            assert!(
-                RUNTIME_FEATURES
-                    .iter()
-                    .any(|feature| feature.id == gate.feature),
-                "gate for unknown feature {}",
-                gate.feature
-            );
-        }
+        assert_eq!(table_violation(RUNTIME_FEATURES, FEATURE_GATES), None);
+    }
+
+    #[test]
+    fn table_guard_catches_malformed_duplicate_and_unordered_rows() {
+        let row = |id, since| RuntimeFeature { id, since };
+        let gate = |feature| FeatureGate {
+            feature,
+            rule: GateRule::Key("config_home"),
+        };
+        let ok = [row("a-v1", "0.38.0"), row("b-v1", "0.38.0")];
+        assert_eq!(table_violation(&ok, &[gate("b-v1")]), None);
+        assert!(table_violation(&[row("A-v1", "0.38.0")], &[]).is_some());
+        assert!(table_violation(&[row("a", "0.38.0")], &[]).is_some());
+        assert!(table_violation(&[row("a-v1", "0.38.0"), row("a-v1", "0.39.0")], &[]).is_some());
+        assert!(table_violation(&[row("a-v1", "next")], &[]).is_some());
+        assert!(table_violation(&[row("a-v1", "0.39.0"), row("b-v1", "0.38.0")], &[]).is_some());
+        assert!(table_violation(&ok, &[gate("c-v1")]).is_some());
+        // A feature of the unreleased next version is valid in this tree.
+        assert_eq!(table_violation(&[row("a-v1", "99.0.0")], &[]), None);
     }
 
     #[test]

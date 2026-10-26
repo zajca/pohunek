@@ -613,18 +613,32 @@ async fn a_descriptor_requiring_an_unknown_runtime_feature_is_refused() {
     .await;
     let error = result.expect_err("an unknown feature is refused");
     assert_eq!(error.code, "runtime_feature_unsupported");
-    let (_digest, result) = install_descriptor(
-        &mut local,
-        &servers.plugins,
-        "not-an-id",
-        &requiring("[\"Later\"]"),
-        false,
-    )
-    .await;
-    assert_eq!(
-        result.expect_err("a malformed id is refused").code,
-        "package_descriptor_invalid"
-    );
+    let many = (0..=16)
+        .map(|number| format!("\"f-v{number}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let malformed = [
+        ("not-an-id", "[\"Later\"]".to_owned()),
+        ("no-version", "[\"later\"]".to_owned()),
+        ("duplicate", "[\"a-v1\", \"a-v1\"]".to_owned()),
+        ("too-long", format!("[\"{}-v1\"]", "a".repeat(64))),
+        ("too-many", format!("[{many}]")),
+    ];
+    for (name, requires) in &malformed {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &requiring(requires),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
     let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
     assert!(
         listed.packages.is_empty(),
