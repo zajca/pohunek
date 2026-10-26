@@ -77,9 +77,11 @@ rule. The current state of each place is stated separately.
   migration step.
 
 Every persisted record that cannot be migrated or adopted is logged at WARN,
-surfaced to the operator, and carries a recovery hint. A store newer than the
-binary, or older than every kept migration, makes the daemon refuse to start
-and leaves the store untouched.
+surfaced to the operator, and carries a recovery hint. A `metadata.jsonl` line
+no loader accepts stays in the file: every rewrite re-emits it unchanged after
+the parsed records, and the recovery hint is to remove it from the file. A store
+newer than the binary, or older than every kept migration, makes the daemon
+refuse to start and leaves the store untouched.
 
 The operator-facing gate of the window is the upgrade preflight: `pohunek
 service check|upgrade` run `pohunekd upgrade-preflight` of the new archive

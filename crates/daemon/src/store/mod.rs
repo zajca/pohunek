@@ -975,7 +975,7 @@ impl Store {
             return Ok(Vec::new());
         };
         let lines = self.checked_lines(&content)?;
-        Ok(partition_lines(lines).1)
+        Ok(partition_lines_logged(lines).1)
     }
 
     /// Upserts one logical session and preserves every other record kind.
@@ -1523,11 +1523,31 @@ impl Store {
             return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         };
         let lines = self.checked_lines(&content)?;
-        Ok(partition_lines(lines).0)
+        Ok(partition_lines_logged(lines).0)
     }
 
-    /// Serialize all records (resume, then worktree, then project) to a temp file
-    /// and rename it over the store path. One `rename(2)` commits all kinds.
+    /// The raw text of every line no loader accepts, in file order. A missing
+    /// file yields an empty list. Nothing is logged: the loaders already warn.
+    fn rejected_line_texts(&self) -> io::Result<Vec<String>> {
+        let Some(content) = self.read_content()? else {
+            return Ok(Vec::new());
+        };
+        let lines = self.checked_lines(&content)?;
+        Ok(partition_lines(lines)
+            .1
+            .into_iter()
+            .map(|line| line.text)
+            .collect())
+    }
+
+    /// Serialize all records (resume, then worktree, then project, then session)
+    /// and every line no loader accepts, unchanged and in file order, to a temp
+    /// file and rename it over the store path. One `rename(2)` commits all kinds.
+    ///
+    /// The rejected lines are read again here, under the write lock every caller
+    /// holds, so a rewrite never drops a line this build cannot parse: it may be
+    /// a record a newer daemon wrote, or evidence of a runtime upgrade preflight
+    /// must still count.
     fn write_all(
         &self,
         resume: &[ResumeBinding],
@@ -1563,6 +1583,10 @@ impl Store {
         }
         for record in sessions {
             append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
+        }
+        for text in self.rejected_line_texts()? {
+            body.push_str(&text);
+            body.push('\n');
         }
         self.commit_body(&body)
     }
@@ -1870,16 +1894,17 @@ pub(crate) struct RejectedLine {
     pub(crate) removal_intent: bool,
     /// Why the line was rejected.
     pub(crate) reason: String,
+    /// The line as stored, without its terminator.
+    pub(crate) text: String,
 }
 
 /// Partitions the lines of a store at the current schema into its record
 /// lists, and returns every line that was skipped.
 ///
-/// A skipped line is logged and never blocks the rest: a dropped resume line
-/// means a session never comes back, a dropped worktree line loses its
-/// restored metadata, and a dropped project line forgets a known repo. The
-/// store holds no secrets, so logging the offending line is safe and aids
-/// debugging.
+/// A skipped line never blocks the rest: a skipped resume line means a session
+/// never comes back, a skipped worktree line loses its restored metadata, and a
+/// skipped project line forgets a known repo. The rewrite keeps every skipped
+/// line, so it is skipped by the loaders only.
 fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<RejectedLine>) {
     let mut resume = Vec::new();
     let mut worktrees = Vec::new();
@@ -1911,7 +1936,6 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 continue;
             }
             Ok(Record::Session(_) | Record::Resume(_)) => {
-                warn!("skipping metadata-store record whose agent kind is not a runtime id");
                 "the agent kind is not a runtime id".to_owned()
             }
             Ok(Record::Worktree(binding)) => {
@@ -1922,10 +1946,7 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 projects.push(record);
                 continue;
             }
-            Err(error) => {
-                warn!(error = %error, line = %text, "skipping unparseable metadata-store line");
-                error
-            }
+            Err(error) => error,
         };
         let (kind, session_id, may_own_runtime, removal_intent) = hint;
         rejected.push(RejectedLine {
@@ -1934,9 +1955,28 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
             may_own_runtime,
             removal_intent,
             reason,
+            text: text.to_owned(),
         });
     }
     ((resume, worktrees, projects, sessions), rejected)
+}
+
+/// [`partition_lines`] that warns once per skipped line.
+///
+/// The store holds no secrets, so logging the offending line is safe and aids
+/// debugging. The line stays in the store and every rewrite re-emits it
+/// unchanged; remove it from the store file, or move the file aside, to stop
+/// the warning.
+fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<RejectedLine>) {
+    let partitioned = partition_lines(lines);
+    for line in &partitioned.1 {
+        warn!(
+            reason = %line.reason,
+            line = %line.text,
+            "skipping a metadata-store line this build cannot load; the line stays in the store unchanged, remove it from the file to stop this warning"
+        );
+    }
+    partitioned
 }
 
 /// Record kinds that never hold a session.
