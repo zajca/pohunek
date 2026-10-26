@@ -98,8 +98,8 @@ fn stopped(pid: i32) -> bool {
         })
 }
 
-/// Whether `ps` reports `pid` blocked in a wait (`S` or `D`) rather than
-/// running or stopped.
+/// Whether `ps` reports `pid` blocked in a wait rather than running or
+/// stopped: `S` or `D`, and on macOS also `I` (idle) or `U` (uninterruptible).
 fn blocked(pid: i32) -> bool {
     Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -107,15 +107,16 @@ fn blocked(pid: i32) -> bool {
         .is_ok_and(|output| {
             String::from_utf8_lossy(&output.stdout)
                 .trim_start()
-                .starts_with(['S', 'D'])
+                .starts_with(['S', 'D', 'I', 'U'])
         })
 }
 
 /// A write lease on a private copy of `sleep` that precedes the real one on
 /// the session's `PATH`.
 ///
-/// The kernel holds any `execve` of the copy until the lease is released, so
-/// while the lease is held the command cannot finish starting a `sleep`. A
+/// The kernel holds any `execve` of the copy until the lease is released or
+/// `lease-break-time` (45 s) passes, so while the lease is held the command
+/// cannot finish starting a `sleep`. A
 /// `sh` that starts programs with `vfork` (dash 0.5.11 and later) keeps its
 /// whole job in the kernel's vfork wait from the `vfork` until the child's
 /// `execve`. A `Ctrl-Z` that lands in that window stops only the child, so the
@@ -153,8 +154,8 @@ impl SleepLease {
                 Err(error) => panic!("take a write lease on {}: {error}", copy.display()),
             }
         });
-        // Without an owner of its own, the lease break signals this process
-        // with `SIGIO`, whose default action ends it.
+        // `F_SETLEASE` makes this process the file's owner, so a lease break
+        // would signal it with `SIGIO`, whose default action ends it.
         fcntl_int(&file, libc::F_SETOWN, 0).expect("detach the lease signal from the test");
         Self { bin, file }
     }
