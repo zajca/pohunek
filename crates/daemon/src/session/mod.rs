@@ -27,7 +27,9 @@ use protocol::{
     SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -99,6 +101,7 @@ pub use reconcile::upgrade_preflight;
 mod idle_stop;
 mod resume;
 mod retention;
+mod settle;
 mod supervision;
 mod target;
 mod terminal_ack;
@@ -779,6 +782,9 @@ struct SessionRegistryInner {
     /// Every other background task of the registry, and the blocking store
     /// writes, awaited by [`SessionRegistry::shutdown`].
     background: background::BackgroundTasks,
+    /// Input handed to the watchers of each session and not yet applied, which
+    /// `SessionRegistry::settled` waits for.
+    settle: settle::SettleRegistry,
     /// Sessions whose native supervisor could not be inspected, re-reconciled
     /// in the background until it answers.
     supervision_retries: supervision::SupervisionRetries,
@@ -894,6 +900,11 @@ struct SessionRegistryInner {
     /// intent commit.
     #[cfg(test)]
     stop_intent_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next input a watcher received, after it was counted as pending
+    /// and before it is applied, together with the name of the watcher.
+    #[cfg(test)]
+    input_hold:
+        std::sync::Mutex<Option<(&'static str, crate::runtime::lifecycle::tests::StartGate)>>,
     /// Holds the next native-id report at the named point of its commit.
     #[cfg(test)]
     native_id_hold:
@@ -998,7 +1009,9 @@ struct SessionEntry {
     pinned: Option<Arc<RuntimeDefinition>>,
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
-    procwatch_rescan: Arc<Notify>,
+    /// Asks this session's procwatch loop to scan; every request is counted
+    /// for `SessionRegistry::settled`.
+    procwatch_rescan: Arc<settle::RescanSignal>,
     /// Serializes this session's procwatch scans: a scan collects, then applies
     /// against the state the previous scan left.
     procwatch_scan: Arc<Mutex<()>>,
@@ -1127,7 +1140,7 @@ struct DetectionPreviewRequest {
 
 struct DetectorInputs {
     scope: DetectorScope,
-    output: broadcast::Receiver<Vec<u8>>,
+    output: detector::DetectorOutput,
     initial_size: (u16, u16),
     cancel: CancellationToken,
     resize: watch::Receiver<(u16, u16)>,
@@ -2446,6 +2459,7 @@ impl SessionRegistry {
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
                 background: background::BackgroundTasks::default(),
+                settle: settle::SettleRegistry::default(),
                 supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
@@ -2506,6 +2520,8 @@ impl SessionRegistry {
                 terminal_acknowledgement_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 stop_intent_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 native_id_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2757,6 +2773,40 @@ impl SessionRegistry {
     #[cfg(test)]
     pub(crate) async fn settle_transactions(&self) {
         self.inner.background.settle().await;
+    }
+
+    /// Waits until the watchers of session `id` have applied everything they
+    /// were handed, and no transaction is in flight, and leaves the registry
+    /// running.
+    ///
+    /// A test calls it before it reads a live snapshot, counts events or
+    /// asserts that nothing else happened. The wait parks on the counters, never
+    /// on a timer, so a paused clock does not move on its account. It covers
+    /// input the daemon already received or was asked to process (see
+    /// `settle.rs`); input still on its way from a worker or the OS is not
+    /// visible to it, so the test awaits a positive signal for that first.
+    /// Applying an input can hand work to another watcher or start a
+    /// transaction, so the wait repeats until both counts were zero together
+    /// and no input was counted meanwhile.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self, id: &SessionId) {
+        loop {
+            let counts = self.inner.settle.counts_for(id);
+            let generations: Vec<u64> = counts.iter().map(|count| count.generation()).collect();
+            self.inner.background.settle().await;
+            for count in &counts {
+                count.idle().await;
+            }
+            let quiet = self.inner.background.is_settled()
+                && counts.iter().all(|count| count.is_idle())
+                && counts
+                    .iter()
+                    .map(|count| count.generation())
+                    .eq(generations.iter().copied());
+            if quiet {
+                return;
+            }
+        }
     }
 
     /// A cancellation token that [`Self::shutdown`] cancels, for a task
@@ -3413,6 +3463,48 @@ impl SessionRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
         gate
+    }
+
+    /// Arms a hold that parks the next input of session `id` that the watcher
+    /// `source` received (`procwatch_scan`, `exit_watch`, `worker_snapshot`,
+    /// `detector_output`), after the input was counted as pending and before
+    /// it is applied. `observed_watch_open` parks a procwatch scan after it
+    /// opened its observed-agent exit watches and before it commits them.
+    #[cfg(test)]
+    pub(crate) fn hold_next_input(
+        &self,
+        id: &SessionId,
+        source: &'static str,
+    ) -> crate::runtime::lifecycle::tests::StartGate {
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: Some(id.0.clone()),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .inner
+            .input_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((source, gate.clone()));
+        gate
+    }
+
+    /// Parks the input a watcher is about to apply when a test armed the hold
+    /// for it.
+    #[cfg(test)]
+    async fn hold_input(&self, id: &SessionId, source: &'static str) {
+        let gate = self
+            .inner
+            .input_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|(held_source, gate)| {
+                *held_source == source && gate.session_id.as_deref().is_none_or(|held| held == id.0)
+            });
+        if let Some((_, gate)) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
     }
 
     /// Parks a stop before its durable intent commit when a test armed the
@@ -4939,7 +5031,7 @@ impl SessionRegistry {
         };
 
         self.emit(event::SESSION_UPDATED, &info);
-        rescan.notify_one();
+        rescan.request();
         if let Some(evidence) = evidence {
             let event = crate::events::event(
                 event::AGENT_STATE,
@@ -6384,6 +6476,10 @@ impl SessionRegistry {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the watcher is one loop over the worker's snapshots and its reconnects"
+    )]
     fn spawn_worker_exit_watcher(
         &self,
         id: SessionId,
@@ -6392,6 +6488,7 @@ impl SessionRegistry {
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
+        let gate = self.inner.settle.gate(&id);
         self.spawn_cooperative("worker_exit_watcher", async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
@@ -6404,6 +6501,10 @@ impl SessionRegistry {
                 };
                 match inspected {
                     Ok((snapshot, order)) => {
+                        // The snapshot is pending input until it is applied.
+                        let _applying = gate.begin();
+                        #[cfg(test)]
+                        registry.hold_input(&id, "worker_snapshot").await;
                         registry
                             .observe_worker_snapshot(&id, &snapshot, order)
                             .await;
@@ -6537,6 +6638,9 @@ impl SessionRegistry {
         if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
             return None;
         }
+        // The loss is pending input from here until it is marked and first
+        // classified; the wait for the socket that follows is not.
+        let applying = self.inner.settle.gate(id).begin();
         if !self.mark_worker_reconnecting(id, expected, error).await {
             return None;
         }
@@ -6549,6 +6653,7 @@ impl SessionRegistry {
         if classified == LossClassification::Settled {
             return None;
         }
+        drop(applying);
         let mut deadline = tokio::time::Instant::now() + connect_deadline;
         loop {
             if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
@@ -7150,7 +7255,7 @@ impl SessionRegistry {
                 entry.stop_transaction_id = None;
                 // The process watch paused for the stop and waits for this
                 // wakeup; the permit is kept when it is mid-scan.
-                entry.procwatch_rescan.notify_one();
+                entry.procwatch_rescan.request();
                 self.wake_idle_stop();
             }
         }
@@ -7213,7 +7318,7 @@ impl SessionRegistry {
             entry.stopping = false;
             entry.stop_transaction_id = None;
             entry.desired_state = previous_desired_state;
-            entry.procwatch_rescan.notify_one();
+            entry.procwatch_rescan.request();
             self.wake_idle_stop();
         }
     }
@@ -7490,10 +7595,12 @@ impl SessionRegistry {
     fn spawn_external_exit_watch_task(&self, identity: ProcessIdentity, watch: ExitWatch) {
         let registry = self.clone();
         let shutdown = self.inner.external.shutdown_token();
+        let gate = self.inner.settle.unattributed_gate();
         self.spawn_cooperative("external_exit_watch", async move {
             tokio::select! {
                 () = shutdown.cancelled() => {}
                 result = watch.wait() => {
+                    let _applying = gate.begin();
                     if let Err(err) = result {
                         debug!(
                             pid = identity.pid,

@@ -1,11 +1,87 @@
 //! Per-session activity detector task and activity recording.
 
+use std::sync::Arc;
+
+use super::settle::{Applying, InputGate};
 use super::{
     activity_already_recorded, broadcast, debug, event, event_payload, is_terminal, log_lag_warn,
     record_activity_evidence, timestamp_now, ActivityTransition, AgentActivity,
     DetectionPreviewRequest, Detector, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
     DetectorScope, LagWarnThrottle, RuntimeWatchIdentity, SessionId, SessionRegistry,
 };
+
+/// The sending half of a session's detector output.
+///
+/// Each chunk is counted as pending input before the detector can see it, and
+/// released when the detector has applied it.
+#[derive(Debug)]
+pub(super) struct DetectorFeed {
+    chunks: broadcast::Sender<Vec<u8>>,
+    gate: Arc<InputGate>,
+}
+
+impl DetectorFeed {
+    /// Hands `chunk` to the detector. Fails when the detector is gone.
+    pub(super) fn send(
+        &self,
+        chunk: Vec<u8>,
+    ) -> Result<usize, broadcast::error::SendError<Vec<u8>>> {
+        self.gate.note();
+        let sent = self.chunks.send(chunk);
+        if sent.is_err() {
+            drop(self.gate.take(1));
+        }
+        sent
+    }
+}
+
+/// The receiving half of a session's detector output.
+#[derive(Debug)]
+pub(super) struct DetectorOutput {
+    chunks: broadcast::Receiver<Vec<u8>>,
+    gate: Arc<InputGate>,
+}
+
+/// Closes the gate with the output, wherever the output is dropped: when the
+/// detector ends, when its task is never started, or before it was handed over.
+impl Drop for DetectorOutput {
+    fn drop(&mut self) {
+        self.gate.close();
+    }
+}
+
+impl DetectorOutput {
+    /// A feed and the output it fills, counted on `gate`.
+    pub(super) fn channel(capacity: usize, gate: Arc<InputGate>) -> (DetectorFeed, Self) {
+        let (chunks, receiver) = broadcast::channel(capacity);
+        (
+            DetectorFeed {
+                chunks,
+                gate: Arc::clone(&gate),
+            },
+            Self {
+                chunks: receiver,
+                gate,
+            },
+        )
+    }
+
+    /// Receives the next chunk, which stays pending until the guard drops. The
+    /// chunks a lag skipped are released here, since the detector never sees them.
+    async fn recv(&mut self) -> Result<(Vec<u8>, Applying), broadcast::error::RecvError> {
+        match self.chunks.recv().await {
+            Ok(chunk) => Ok((chunk, self.gate.take(1))),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                drop(
+                    self.gate
+                        .take(usize::try_from(skipped).unwrap_or(usize::MAX)),
+                );
+                Err(broadcast::error::RecvError::Lagged(skipped))
+            }
+            Err(closed) => Err(closed),
+        }
+    }
+}
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
     let mut tick = tokio::time::interval(config.detection.recheck_after);
@@ -67,6 +143,7 @@ impl SessionRegistry {
         } = inputs;
         let registry = self.clone();
         let progress = self.inner.turns.progress(&scope.id);
+        let gate = Arc::clone(&output_rx.gate);
         self.spawn_cooperative("session_detector", async move {
             let DetectorScope { id, runtime } = scope;
             let initial_config = detector_config_rx.borrow().clone();
@@ -112,6 +189,7 @@ impl SessionRegistry {
                         );
                     }
                     _ = tick.tick() => {
+                        let _applying = gate.begin();
                         if !initial_input_done.is_cancelled() {
                             input_ready.send_replace(detector.input_ready());
                         }
@@ -140,7 +218,9 @@ impl SessionRegistry {
                     }
                     received = output_rx.recv() => {
                         match received {
-                            Ok(chunk) => {
+                            Ok((chunk, _applying)) => {
+                                #[cfg(test)]
+                                registry.hold_input(&id, "detector_output").await;
                                 progress.note_output();
                                 if initial_input_done.is_cancelled() {
                                     detector.finish_initial_input();
@@ -361,7 +441,7 @@ impl SessionRegistry {
             (rescan, evidence)
         };
         if let Some(rescan) = updated.0 {
-            rescan.notify_one();
+            rescan.request();
         }
 
         let Some(evidence) = updated.1 else {
@@ -500,7 +580,7 @@ mod tests {
         registry: SessionRegistry,
         session: protocol::SessionInfo,
         events: broadcast::Receiver<protocol::Event>,
-        output: broadcast::Sender<Vec<u8>>,
+        output: super::DetectorFeed,
         cancel: CancellationToken,
         // Held so the detector loop's resize, config and preview channels stay open.
         _channels: (
@@ -558,7 +638,8 @@ mod tests {
                     Manifest::parse_str(manifest).expect("manifest parses"),
                 )),
             };
-            let (output, output_rx) = broadcast::channel(8);
+            let (output, output_rx) =
+                super::DetectorOutput::channel(8, registry.inner.settle.gate(&session.id));
             let (resize_tx, resize_rx) = watch::channel((24, 80));
             let (config_tx, config_rx) = watch::channel(DetectorConfigUpdate {
                 generation: 0,

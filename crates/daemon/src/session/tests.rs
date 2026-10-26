@@ -1644,9 +1644,9 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
 /// registry writes nothing more for the exit. After a `stop`, the watcher
 /// that lost the commit to the stop writes nothing, but it can still be
 /// inside its own `record_exit`, holding the registry and reading the store.
-/// After a stop a test uses [`drop_settled`] to open another registry or
-/// `Store` over the same file, or [`stop_settled`] to keep writing through
-/// this registry.
+/// After a stop a test calls `SessionRegistry::shutdown` on the registry before
+/// it opens another registry or `Store` over the same file, or uses
+/// [`stop_settled`] to keep writing through this registry.
 ///
 /// `events` must be subscribed before the exit commits, or its terminal event
 /// is never received.
@@ -1703,39 +1703,6 @@ pub(super) async fn stop_settled(
         || {
             let quiet = Arc::strong_count(&registry.inner) == 1;
             async move { quiet.then_some(()) }
-        },
-    )
-    .await;
-}
-
-/// Drops `registry` once nothing of it can write the store any more.
-///
-/// Waits for the terminal event of session `id` as [`exit_settled`] does, then
-/// drops `registry` and waits until every task holding a handle to it has
-/// ended, which includes an exit watcher that lost the commit to a stop. A
-/// registry or `Store` opened next over the same file then races no write of
-/// this one.
-///
-/// Every session of `registry` must have ended and the caller must hold no
-/// other handle to it, or its tasks never let it go.
-///
-/// # Panics
-///
-/// Panics as [`exit_settled`] does, and when the registry is still held after
-/// [`HANG_GUARD`].
-pub(super) async fn drop_settled(
-    registry: SessionRegistry,
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
-    id: &SessionId,
-) {
-    exit_settled(events, id).await;
-    let state = Arc::downgrade(&registry.inner);
-    drop(registry);
-    wait_until(
-        &format!("the tasks of the registry of session {} to end", id.0),
-        || {
-            let released = state.upgrade().is_none();
-            async move { released.then_some(()) }
         },
     )
     .await;
@@ -1971,6 +1938,25 @@ impl MockInspector {
         }
     }
 
+    /// Fires every exit watch of `pid` and waits until their watchers received
+    /// the signal (see [`Self::fire_exit_watch_delivered`]).
+    async fn fire_exit_delivered(&self, pid: Pid) {
+        let senders = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default();
+        for sender in &senders {
+            sender.send_replace(true);
+        }
+        for sender in &senders {
+            guard("the exit watcher received the signal", sender.closed()).await;
+        }
+    }
+
     /// Makes arming an exit watch for `pid` fail; with `gone` the process has
     /// exited by then.
     fn fail_exit_watch(&self, pid: Pid, gone: bool) {
@@ -2012,6 +1998,45 @@ impl MockInspector {
             .cloned()
             .expect("exit watch generation");
         sender.send_replace(true);
+    }
+
+    /// Fires the exit watch and waits until its watcher received the signal.
+    ///
+    /// The watcher drops its watch in the poll that receives the signal and
+    /// counts the exit as pending input in the same poll, so once this returns
+    /// `SessionRegistry::settled` covers what the watcher applies.
+    async fn fire_exit_watch_delivered(&self, pid: Pid, generation: usize) {
+        let sender = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .and_then(|watches| watches.get(generation))
+            .cloned()
+            .expect("exit watch generation");
+        sender.send_replace(true);
+        guard("the exit watcher received the signal", sender.closed()).await;
+    }
+
+    /// Indices, in the order they were opened, of the watches for `pid` whose
+    /// receiver is still held; a watch a scan opened and dropped unused is not
+    /// among them.
+    fn live_exit_watches(&self, pid: Pid) -> Vec<usize> {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .map(|senders| {
+                senders
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sender)| !sender.is_closed())
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn exit_watch_count(&self, pid: Pid) -> usize {
@@ -12672,21 +12697,22 @@ fn backoff_registry() -> (SessionRegistry, Arc<MockInspector>) {
 
 /// Lets every scan the loops started finish, apply and re-arm its timer, on the
 /// paused clock. A scan holds its session's scan gate from its first read to
-/// its applied result, so locking the gate waits out exactly that span.
+/// its applied result, so locking the gate waits out exactly that span; the
+/// session's pending-input count then covers what the scan handed on.
 async fn settle_procwatch_scans(registry: &SessionRegistry) {
-    let gates: Vec<_> = registry
+    let (ids, gates): (Vec<_>, Vec<_>) = registry
         .inner
         .sessions
         .lock()
         .await
-        .values()
-        .map(|entry| Arc::clone(&entry.procwatch_scan))
-        .collect();
+        .iter()
+        .map(|(id, entry)| (id.clone(), Arc::clone(&entry.procwatch_scan)))
+        .unzip();
     for gate in gates {
         drop(guard("the in-flight procwatch scan finished", gate.lock()).await);
     }
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
+    for id in &ids {
+        guard("the watchers of the session settled", registry.settled(id)).await;
     }
 }
 
@@ -12782,7 +12808,7 @@ async fn quiet_sessions_with_a_stable_tree_are_scanned_at_the_backoff_rate_off_t
 
     tokio::time::resume();
     for session in &created {
-        let _ = registry.stop(&session.id).await;
+        registry.stop(&session.id).await.expect("stop the session");
     }
 }
 
@@ -12800,9 +12826,30 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
     let before = inspector.descendant_scans().0;
     let paused_at = tokio::time::Instant::now();
 
+    // The requested scan is parked inside the loop before its first read: the
+    // request is pending input, so nothing may report the session settled.
+    let held = registry.hold_next_input(&created.id, "procwatch_scan");
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
+    guard(
+        "the requested scan reached the loop",
+        held.entered.notified(),
+    )
+    .await;
+    tokio::select! {
+        biased;
+        () = registry.settled(&created.id) => {
+            panic!("settled returned while a requested scan is still pending")
+        }
+        () = std::future::ready(()) => {}
+    }
+    assert_eq!(
+        inspector.descendant_scans().0,
+        before,
+        "the parked scan has not read anything"
+    );
+    held.release.notify_one();
     wait_for_scans_started(&inspector, before + 1).await;
     settle_procwatch_scans(&registry).await;
 
@@ -12814,7 +12861,7 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
         "the working transition triggers a scan without waiting for the backoff"
     );
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12866,7 +12913,7 @@ async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
         "a child started under a quiet session is observed within {BACKOFF_CEILING:?}"
     );
     tokio::time::resume();
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 /// Two scans of one session never overlap: the second collects after the
@@ -12923,7 +12970,7 @@ async fn overlapping_scans_of_one_session_arm_one_exit_watch_per_observation() {
     second.await.expect("second scan joins");
 
     assert_eq!(inspector.exit_watch_count(DESCENDANT_WRAPPER_PID), 1);
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -12965,7 +13012,7 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
             start_identity: StartIdentity::new(u64::MAX),
         }),
     );
-    rescan.notify_one();
+    rescan.request();
     guard(
         "procwatch to retire a reused root generation",
         cancel.cancelled(),
@@ -13394,13 +13441,18 @@ fn descendant_reporter_fact(parent: Pid, pgid: Pid) -> ProcessFact {
 
 /// Admits the Codex hook claim of the descendant reporter.
 async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionInfo) {
+    report_descendant_claim_at(registry, created, DIRECT_AGENT_REPORT_SEQ).await;
+}
+
+/// [`report_descendant_claim`] at report sequence `seq`.
+async fn report_descendant_claim_at(registry: &SessionRegistry, created: &SessionInfo, seq: u64) {
     let report = registry
         .report_agent(SessionReportAgentParams {
             session_id: created.id.clone(),
             source: CODEX_HOOK_SOURCE.to_owned(),
             agent: CODEX_HOOK_AGENT.to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            seq: Some(ReportSequence::new(seq)),
             pid: Some(DESCENDANT_REPORTER_PID),
             agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
             agent_session_path: Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned()),
@@ -14187,8 +14239,6 @@ async fn bound_reporter_exit_clears_the_claim_while_collection_fails() {
 
 /// Pid of a process group no fixture process carries.
 const UNLISTED_PID: Pid = 900;
-/// Scheduler yields that let spawned exit-watch tasks run.
-const EXIT_WATCH_YIELDS: usize = 64;
 
 /// The reporter fact every descendant-claim fixture lists.
 fn fixture_reporter_fact() -> ProcessFact {
@@ -14667,12 +14717,33 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             ],
         );
         report_descendant_claim(&registry, &created).await;
+        // A scan of the session's own loop that began with this claim parks
+        // after it opened its watches. The claim then changes, so that scan
+        // binds nothing and drops the reporter watch it armed; the explicit
+        // scan arms another and binds it.
+        let scan_held = registry.hold_next_input(&created.id, "observed_watch_open");
+        registry.inner.sessions.lock().await[&created.id]
+            .procwatch_rescan
+            .request();
+        guard(
+            "the session's scan opened its watches",
+            scan_held.entered.notified(),
+        )
+        .await;
+        report_descendant_claim_at(&registry, &created, DIRECT_AGENT_REPORT_SEQ + 1).await;
+        scan_held.release.notify_one();
         registry
             .rescan_procwatch_at(&created.id, created.pid, Instant::now())
             .await;
+        guard(
+            "the watchers of the session settled",
+            registry.settled(&created.id),
+        )
+        .await;
         assert!(reporter_is_bound(&registry, &created.id).await);
+        let live = inspector.live_exit_watches(DESCENDANT_REPORTER_PID);
         assert_eq!(
-            inspector.exit_watch_count(DESCENDANT_REPORTER_PID),
+            live.len(),
             2,
             "one watch for the observation, one for the binding"
         );
@@ -14681,13 +14752,40 @@ async fn bound_observed_reporter_ends_in_either_exit_order() {
             created.pid,
             vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid)],
         );
-        inspector.fire_exit_watch(DESCENDANT_REPORTER_PID, order[0]);
-        for _ in 0..EXIT_WATCH_YIELDS {
-            tokio::task::yield_now().await;
+        // The first signal is parked inside its watcher, so the second one can
+        // only follow once the first was applied.
+        let held = registry.hold_next_input(&created.id, "exit_watch");
+        inspector
+            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, live[order[0]])
+            .await;
+        guard(
+            "the first exit signal reached its watcher",
+            held.entered.notified(),
+        )
+        .await;
+        tokio::select! {
+            biased;
+            () = registry.settled(&created.id) => {
+                panic!("settled returned while an exit signal is still being applied")
+            }
+            () = std::future::ready(()) => {}
         }
-        inspector.fire_exit_watch(DESCENDANT_REPORTER_PID, order[1]);
+        held.release.notify_one();
+        guard(
+            "the watchers of the session settled",
+            registry.settled(&created.id),
+        )
+        .await;
+        inspector
+            .fire_exit_watch_delivered(DESCENDANT_REPORTER_PID, live[order[1]])
+            .await;
+        guard(
+            "the watchers of the session settled",
+            registry.settled(&created.id),
+        )
+        .await;
         assert_wrapper_replaces_bound_claim(&registry, &created.id, &format!("{order:?}")).await;
-        let _ = registry.stop(&created.id).await;
+        registry.stop(&created.id).await.expect("stop the session");
     }
 }
 
@@ -15055,10 +15153,10 @@ async fn journal_projected_claim_requests_a_rescan_that_binds_it() {
     // and drain what it left pending.
     stop_procwatch_loop(&registry, &inspector, &created.id).await;
     let rescan = Arc::clone(&registry.inner.sessions.lock().await[&created.id].procwatch_rescan);
-    let _ = tokio::time::timeout(Duration::ZERO, rescan.notified()).await;
+    let _ = tokio::time::timeout(Duration::ZERO, rescan.requested()).await;
 
     project_journal_descendant_claim(&registry, &created.id).await;
-    guard("the projection requested a rescan", rescan.notified()).await;
+    let _ = guard("the projection requested a rescan", rescan.requested()).await;
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
@@ -19247,7 +19345,9 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         .stop(&created.id)
         .await
         .expect("stop original session after snapshot capture");
-    drop_settled(registry, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
     fs::write(&marker_v1, "").expect("clear v1 marker");
     fs::write(
         agents_dir.join("editable.toml"),
@@ -21084,6 +21184,9 @@ async fn a_removal_that_fails_after_the_sweep_still_logs_that_it_proceeded() {
     let session = record_only_session_in(&registry, Some(&repo)).await;
     let worktree = session.worktree_path.clone().expect("session worktree");
     assert!(worktree.exists(), "the session owns a checkout");
+    // The candidate is a live unreadable survivor, so the sweep keeps it
+    // whether or not a journal of the worker bounds the runtime.
+    inspector.set_live_candidates(true);
     inspector.set_candidate(true);
     let proceeds_log = "removal proceeds past an unreadable-marker process";
 
@@ -22445,7 +22548,11 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
     registry.stop(&created.id).await.expect("stop session");
     let worktree = created.worktree_path.clone().expect("bound worktree");
     registry.begin_daemon_shutdown();
-    drop_settled(registry, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = registry.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
+    // The restarted daemon takes over from a registry that is gone.
+    drop(registry);
     // The daemon died after the worker ran, before it committed the create:
     // the worker still serves the final output of the ended runtime.
     let mut record = stored_record(&daemon.store_path, &created.id);
@@ -24755,7 +24862,9 @@ async fn durable_bindings_without_a_live_session_still_retain_the_package() {
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
-    drop_settled(first, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = first.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
 
     // A registry that holds no session in memory reads the same durable store.
     let second = packaged.registry(&store_path);
@@ -24787,7 +24896,9 @@ async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_sessio
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
-    drop_settled(first, &mut events, &created.id).await;
+    exit_settled(&mut events, &created.id).await;
+    let report = first.shutdown().await;
+    assert!(report.is_quiescent(), "{report:?}");
 
     let second = packaged.registry(&store_path);
     let daemon = second.retained_package_digests().await.expect("retained");

@@ -9,5 +9,5 @@ crates/daemon/src/session/package_lifecycle/tests.rs 3
 crates/daemon/src/session/procwatch.rs 1
 crates/daemon/src/session/profile_pin_tests.rs 2
 crates/daemon/src/session/reconcile.rs 33
-crates/daemon/src/session/tests.rs 326
+crates/daemon/src/session/tests.rs 321
 crates/daemon/src/session/tests/prompt_accepted.rs 2

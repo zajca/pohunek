@@ -526,7 +526,20 @@ write through the old registry aborts the test process in the daemon's unit
 tests (SIGABRT in nextest; integration tests under `crates/daemon/tests` get the
 `registry_shut_down` error instead), and a write over a sealed terminal worker
 journal aborts a debug worker, so a late writer fails every run instead of some.
-A helper asserts `shutdown().is_quiescent()` on the report it gets. `crates/xtask/tests/lifecycle_result_ratchet.rs`
+A helper asserts `shutdown().is_quiescent()` on the report it gets.
+A test that reads a live snapshot, counts events or scans, or asserts that nothing
+else happened while watchers run first awaits `registry.settled(&id)`: it returns
+once the session's watchers applied every input they were handed (a rescan
+request, a detector chunk, a worker snapshot or loss, a delivered exit, a due retry) and
+no transaction is in flight, and it parks on counters, so a paused clock does not
+move. It does not see input still on its way from a worker or the OS, so the test
+awaits a positive signal for such an event first (the mock inspector's
+`fire_exit_watch_delivered` reports that an exit watcher received its signal).
+An assertion about events selects them by predicate (the first event of the
+session and kind), never by position, unless the product promises that order. A
+fixed number of yields, a quiet period or polling an absence is not a barrier;
+`SessionRegistry::hold_next_input` parks the next input of a watcher inside the
+counted region for a forced-interleaving scenario. `crates/xtask/tests/lifecycle_result_ratchet.rs`
 counts `let _ = <x>.stop|remove|resume|restart|kill|shutdown|retire(..).await;`
 in test code per file against `lifecycle_result_ratchet_baseline.txt`, and
 `crates/xtask/tests/detached_spawn_ratchet.rs` counts bare `tokio::spawn` in the

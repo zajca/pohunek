@@ -8,18 +8,19 @@ use pohunek_worker_protocol::{
     StreamId, StreamMode, TransactionId, Version,
 };
 
+use super::settle::RescanSignal;
 use super::{
     build_pty_command, debug, detect_at, event, host, mpsc, plan_initial_input_delivery,
     runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdAssociation, CwdSource,
     DesiredState, DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
     DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch,
-    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
-    ResumeSnapshot, RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState,
-    RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
-    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
-    SessionWarning, StateSource, TransactionKind, Worker, WorktreeRequest,
-    DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
-    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION,
+    Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
+    RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState, RuntimeWatchIdentity,
+    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind,
+    SessionRegistry, SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource,
+    TransactionKind, Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
+    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
+    SESSION_RECORD_SCHEMA_VERSION,
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::runtime::lifecycle::{
@@ -980,7 +981,7 @@ impl SessionRegistry {
         let detector_cancel = self.background_token();
         let procwatch_cancel = self.background_token();
         let runtime_watch_cancel = self.background_token();
-        let procwatch_rescan = Arc::new(Notify::new());
+        let procwatch_rescan = RescanSignal::new(self.inner.settle.gate(&id));
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
             generation: 0,
@@ -1358,7 +1359,7 @@ impl SessionRegistry {
 
 struct StartedRuntime {
     handle: RuntimeHandle,
-    detector_output: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    detector_output: super::detector::DetectorOutput,
     root_process: ProcessIdentity,
     runtime_info: Option<SessionRuntime>,
 }
@@ -1368,14 +1369,15 @@ impl SessionRegistry {
         &self,
         worker: &Worker,
         id: &SessionId,
-    ) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, ProtocolError> {
+    ) -> Result<super::detector::DetectorOutput, ProtocolError> {
         let stream_id = StreamId::new(format!("detector-{}", id.0))
             .map_err(|error| runtime_error("worker_detector_failed", error.to_string()))?;
         let data = worker
             .open_data(stream_id, StreamMode::Detector, None)
             .await
             .map_err(super::worker_error_to_protocol)?;
-        let (output, receiver) = tokio::sync::broadcast::channel(256);
+        let (output, receiver) =
+            super::detector::DetectorOutput::channel(256, self.inner.settle.gate(id));
         self.spawn_background("detector_output_pump", async move {
             let mut stream = data.stream;
             loop {
