@@ -25239,7 +25239,7 @@ async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
     // profile PATH wins over it in both directions.
     for (base, bare_launches) in [(&in_range, true), (&out_of_range, false)] {
         let registry = path_probed_registry(&script, agents_dir.clone(), base);
-        let capabilities = crate::capabilities::host_capabilities(
+        let capabilities = crate::capabilities::host_capabilities_uncached(
             "0.0.0",
             registry.profiles(),
             &registry.inspect_base_environment(),

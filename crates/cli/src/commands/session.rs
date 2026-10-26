@@ -616,6 +616,48 @@ pub(crate) fn require_confirmation_for_stdin_input(host: &str, yes: bool) -> Res
     }
 }
 
+/// Refuses a `session new` the host's daemon predates the behavior of, before
+/// the request is sent.
+///
+/// A daemon that predates a behavior would start the session in the checkout
+/// root or the project checkout, or drop the option silently. Only the
+/// capability flags are needed, so the daemon is asked to skip its runtime
+/// inventory.
+async fn check_new_capabilities(
+    client: &mut Client,
+    host: &str,
+    cwd_requested: bool,
+    args: &NewArgs,
+) -> Result<(), CliError> {
+    if !(cwd_requested || args.from_remote || args.input_ack_timeout_ms.is_some()) {
+        return Ok(());
+    }
+    let capabilities = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?;
+    if cwd_requested && !capabilities.session_new_cwd_supported {
+        return Err(CliError::SessionNewCwdUnsupported {
+            host: host.to_owned(),
+            daemon_version: capabilities.daemon_version,
+        });
+    }
+    if args.from_remote && !capabilities.session_new_branch_source_supported {
+        return Err(CliError::SessionNewBranchSourceUnsupported {
+            host: host.to_owned(),
+            daemon_version: capabilities.daemon_version,
+        });
+    }
+    if args.input_ack_timeout_ms.is_some() && !capabilities.session_new_input_ack_supported {
+        return Err(CliError::SessionNewInputAckUnsupported {
+            host: host.to_owned(),
+            daemon_version: capabilities.daemon_version,
+        });
+    }
+    Ok(())
+}
+
 /// Run `session new` on `host`.
 ///
 /// Remote starts pass through the confirmation gate ([`confirmation_decision`])
@@ -661,30 +703,7 @@ pub(crate) async fn run_new(
         }
         None => Client::connect(host, paths).await?,
     };
-    // A daemon that predates the behavior would start the session in the
-    // checkout root or the project checkout, so the request is refused before it
-    // is sent.
-    if cwd_requested || args.from_remote || args.input_ack_timeout_ms.is_some() {
-        let capabilities = client.call::<method::HostInspect>(()).await?;
-        if cwd_requested && !capabilities.session_new_cwd_supported {
-            return Err(CliError::SessionNewCwdUnsupported {
-                host: host.to_owned(),
-                daemon_version: capabilities.daemon_version,
-            });
-        }
-        if args.from_remote && !capabilities.session_new_branch_source_supported {
-            return Err(CliError::SessionNewBranchSourceUnsupported {
-                host: host.to_owned(),
-                daemon_version: capabilities.daemon_version,
-            });
-        }
-        if args.input_ack_timeout_ms.is_some() && !capabilities.session_new_input_ack_supported {
-            return Err(CliError::SessionNewInputAckUnsupported {
-                host: host.to_owned(),
-                daemon_version: capabilities.daemon_version,
-            });
-        }
-    }
+    check_new_capabilities(&mut client, host, cwd_requested, &args).await?;
     let result = client
         .call::<method::SessionNew>(new_params(&args)?)
         .await

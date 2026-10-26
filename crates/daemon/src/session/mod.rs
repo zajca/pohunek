@@ -492,6 +492,10 @@ pub struct SessionRegistryConfig {
     pub event_retention: pohunek_service_config::EventRetention,
     /// TCP keepalive applied to every accepted overlay control connection.
     pub remote_keepalive: pohunek_service_config::KeepaliveTiming,
+    /// Lifetime, size and parallelism of the version-probe cache behind
+    /// `host.inspect` (`[inventory]` of `service.toml`). Defaults to
+    /// [`pohunek_service_config::DEFAULT_INVENTORY_PROBE`].
+    pub inventory_probe: pohunek_service_config::InventoryProbe,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
@@ -635,6 +639,7 @@ impl Default for SessionRegistryConfig {
             event_log_dir: None,
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             remote_keepalive: pohunek_service_config::DEFAULT_KEEPALIVE_TIMING,
+            inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
             retention_policy_path: None,
             idle_stop_policy_path: None,
             idle_stop_min_secs: idle_stop::DEFAULT_IDLE_STOP_MIN_SECS,
@@ -732,6 +737,8 @@ struct SessionRegistryInner {
     /// Resolves the free-string `agent` name to a base kind + optional host-profile
     /// overrides (Part C). Built from `config.agents_dir` at construction.
     profiles: ProfileRegistry,
+    /// Version-probe results shared by every `host.inspect`.
+    probe_cache: crate::capabilities::ProbeCache,
     events: broadcast::Sender<Event>,
     /// The same events with the instant each was published, for the consumers
     /// that order an event against other producers' records.
@@ -2386,6 +2393,7 @@ impl SessionRegistry {
             );
         let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes)
             .with_revision_state_dir(config.host_state_dir.clone());
+        let probe_cache = crate::capabilities::ProbeCache::new(config.inventory_probe);
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
         let idle_stop = idle_stop::IdleStopState::new(config.idle_stop_policy_path.clone());
         let daemon_instance_id = generate_daemon_instance_id();
@@ -2414,6 +2422,7 @@ impl SessionRegistry {
                 config,
                 launcher,
                 profiles,
+                probe_cache,
                 events,
                 produced_events,
                 store,
@@ -2551,6 +2560,12 @@ impl SessionRegistry {
     #[must_use]
     pub(crate) fn profiles(&self) -> &ProfileRegistry {
         &self.inner.profiles
+    }
+
+    /// The version-probe cache `host.inspect` reads through.
+    #[must_use]
+    pub(crate) fn probe_cache(&self) -> &crate::capabilities::ProbeCache {
+        &self.inner.probe_cache
     }
 
     /// This daemon process instance's opaque controller id.

@@ -150,6 +150,17 @@ impl Client {
         self.inner.call::<M>(params).await.map_err(map_client_error)
     }
 
+    /// `host.inspect` with explicit parameters.
+    pub(crate) async fn host_inspect_with(
+        &mut self,
+        params: protocol::HostInspectParams,
+    ) -> Result<protocol::HostCapabilities, CliError> {
+        self.inner
+            .host_inspect_with(params)
+            .await
+            .map_err(map_client_error)
+    }
+
     /// Deliver input with dedicated transport when the request waits.
     pub(crate) async fn session_input(
         &mut self,

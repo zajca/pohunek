@@ -3,15 +3,16 @@
 //! Builds a [`HostCapabilities`] describing what this host can do right now:
 //! which protocol version the daemon speaks, which agent kinds it supports,
 //! which agent runtimes are actually installed (probed against `PATH`), and
-//! whether git-backed worktree sessions are available. The snapshot is built
-//! fresh on every request, so it always reflects the host as it is now and is
-//! never cached.
+//! whether git-backed worktree sessions are available. Presence and path are
+//! resolved fresh on every request; the version probes behind them are shared
+//! through a [`ProbeCache`] keyed by the probed file's identity, so a program
+//! replaced on disk is probed again at once and an unchanged one at most once
+//! per configured lifetime.
 
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,10 @@ use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 use crate::integration::Home;
 use crate::runtime::environment::effective_variable;
 use pohunek_worker_protocol::BaseEnv;
+
+mod probe_cache;
+
+pub(crate) use probe_cache::{ProbeCache, ProbeRequest};
 
 /// Maximum wall time for a local version probe, including interpreter startup.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -58,24 +63,11 @@ impl<'a> VersionProbe<'a> {
         }
     }
 
-    /// Runs the probe against `path` and returns the normalized version.
-    ///
-    /// `launch_path` is the `PATH` the agent launch sees. The probe hands it to
-    /// the child so an interpreter script resolves the interpreter the launch
-    /// will use.
-    fn detect_version(
-        self,
-        path: &Path,
-        launch_path: Option<&OsStr>,
-        timeout: Duration,
-    ) -> Option<String> {
-        let policy = self.0;
-        match spawn_and_collect_probe(path, policy, launch_path, timeout, &[], &Instant::now)? {
-            ProbeOutcome::Output(output) => policy
-                .read_output(&output)
-                .map(|version| version.to_string()),
-            ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
-        }
+    /// The version the declared grammar reads from raw probe `output`.
+    fn read_version(self, output: &str) -> Option<String> {
+        self.0
+            .read_output(output)
+            .map(|version| version.to_string())
     }
 
     /// Whether this daemon accepts `version` for launch.
@@ -108,20 +100,75 @@ fn inventory_rank(runtime_id: &RuntimeId) -> usize {
 /// ([`which_executable`]) so "available" agrees with what a launch would accept.
 /// A version probe runs under the `PATH` the launch would see: `base_env` (the
 /// environment the daemon forwards to agents) overridden by the profile's own
-/// environment.
+/// environment. The probes of all entries are collected first and run once per
+/// distinct program, in parallel, through `cache`; blocking work, so an async
+/// caller runs this on a blocking thread.
 /// `git_available` reflects a `git` probe and currently also gates worktree support.
 #[must_use]
 pub(crate) fn host_capabilities(
     daemon_version: &str,
     profiles: &ProfileRegistry,
     base_env: &BaseEnv,
+    cache: &ProbeCache,
 ) -> HostCapabilities {
     host_capabilities_for(
         daemon_version,
         profiles,
         &profiles.runtimes().registry(),
         base_env,
+        cache,
     )
+}
+
+/// The capability snapshot without any runtime inventory: the feature flags,
+/// the daemon version and `git`, with empty `supported_agents` and `runtimes`.
+///
+/// This is what `host.inspect` answers for a client that only needs the flags;
+/// it resolves and probes no program besides `git`.
+#[must_use]
+pub(crate) fn host_capability_flags(daemon_version: &str) -> HostCapabilities {
+    capability_snapshot(daemon_version, Vec::new(), Vec::new())
+}
+
+/// [`host_capabilities`] through a probe cache of its own, so a call never
+/// sees a result an earlier call stored.
+#[cfg(test)]
+pub(crate) fn host_capabilities_uncached(
+    daemon_version: &str,
+    profiles: &ProfileRegistry,
+    base_env: &BaseEnv,
+) -> HostCapabilities {
+    host_capabilities(
+        daemon_version,
+        profiles,
+        base_env,
+        &ProbeCache::new(pohunek_service_config::DEFAULT_INVENTORY_PROBE),
+    )
+}
+
+/// [`host_capabilities_for`] through a probe cache of its own.
+#[cfg(test)]
+fn host_capabilities_for_uncached(
+    daemon_version: &str,
+    profiles: &ProfileRegistry,
+    registry: &RuntimeRegistry,
+    base_env: &BaseEnv,
+) -> HostCapabilities {
+    host_capabilities_for(
+        daemon_version,
+        profiles,
+        registry,
+        base_env,
+        &ProbeCache::new(pohunek_service_config::DEFAULT_INVENTORY_PROBE),
+    )
+}
+
+/// A runtime entry whose version probe is still to be read from the probe
+/// results: the entry sits at `index` of the inventory.
+struct PendingProbe {
+    index: usize,
+    request: ProbeRequest,
+    policy: VersionProbePolicy,
 }
 
 /// [`host_capabilities`] against an explicit runtime registry.
@@ -130,6 +177,7 @@ fn host_capabilities_for(
     profiles: &ProfileRegistry,
     registry: &RuntimeRegistry,
     base_env: &BaseEnv,
+    cache: &ProbeCache,
 ) -> HostCapabilities {
     let mut definitions: Vec<&Arc<RuntimeDefinition>> = registry.definitions().collect();
     // The sort is stable, so runtimes outside the reserved set stay in id order.
@@ -137,27 +185,30 @@ fn host_capabilities_for(
 
     let mut supported_agents = Vec::with_capacity(definitions.len());
     let mut runtimes = Vec::with_capacity(definitions.len());
+    let mut pending = Vec::new();
     for definition in definitions {
         let agent = definition.runtime_id().as_str();
         let agent_base = RuntimeRef::from(definition.runtime_id().clone());
-        runtimes.push(match definition.program() {
+        let planned = match definition.program() {
             // A host-shell runtime needs no named binary on PATH.
-            LaunchProgram::HostShell(_) => AgentRuntime {
-                agent: agent.to_owned(),
-                agent_base: Some(agent_base),
-                available: true,
-                path: None,
-                version: None,
-                supported: None,
-                config_home_id: None,
-            },
+            LaunchProgram::HostShell(_) => (
+                AgentRuntime {
+                    agent: agent.to_owned(),
+                    agent_base: Some(agent_base),
+                    available: true,
+                    path: None,
+                    version: None,
+                    supported: None,
+                    config_home_id: None,
+                },
+                None,
+            ),
             LaunchProgram::Fixed(program) => {
                 probe_definition(agent, agent_base, definition, program, base_env, &[])
             }
-        });
-        if let Some(entry) = runtimes.last_mut() {
-            entry.config_home_id = config_home_id(profiles, definition, base_env, &[]);
-        }
+        };
+        let entry = place_runtime(&mut runtimes, &mut pending, planned);
+        entry.config_home_id = config_home_id(profiles, definition, base_env, &[]);
         supported_agents.push(agent.to_owned());
     }
 
@@ -168,8 +219,8 @@ fn host_capabilities_for(
         // and is unavailable once that package cannot launch a fresh session.
         let launchable = profiles.runtimes().verify_launchable(&agent.definition);
         let agent_base = RuntimeRef::from(agent.base.clone());
-        let runtime = match (&launchable, agent.profile.as_ref()) {
-            (Err(_), _) => unavailable_runtime(&agent.name, agent_base),
+        let planned = match (&launchable, agent.profile.as_ref()) {
+            (Err(_), _) => (unavailable_runtime(&agent.name, agent_base), None),
             (Ok(()), Some(profile)) => probe_definition(
                 &agent.name,
                 agent_base,
@@ -187,14 +238,13 @@ fn host_capabilities_for(
                 &[],
             ),
         };
-        let mut runtime = runtime;
+        let entry = place_runtime(&mut runtimes, &mut pending, planned);
         if launchable.is_ok() {
             if let Some(profile) = agent.profile.as_ref() {
-                runtime.config_home_id =
+                entry.config_home_id =
                     config_home_id(profiles, &agent.definition, base_env, &profile.env);
             }
         }
-        runtimes.push(runtime);
         supported_agents.push(agent.name);
     }
     for profile in profiles.unavailable_pinned() {
@@ -205,6 +255,58 @@ fn host_capabilities_for(
         supported_agents.push(profile.name);
     }
 
+    let requests: Vec<&ProbeRequest> = pending.iter().map(|probe| &probe.request).collect();
+    let outputs = cache.fetch(&requests, Instant::now());
+    apply_probe_outputs(&mut runtimes, &pending, outputs);
+
+    capability_snapshot(daemon_version, supported_agents, runtimes)
+}
+
+/// Reads each pending probe's raw `outputs` with its runtime's own grammar and
+/// range, and records the version and support on the inventory entry.
+fn apply_probe_outputs(
+    runtimes: &mut [AgentRuntime],
+    pending: &[PendingProbe],
+    outputs: Vec<Option<String>>,
+) {
+    for (probe, output) in pending.iter().zip(outputs) {
+        let version = output
+            .as_deref()
+            .and_then(|output| VersionProbe(&probe.policy).read_version(output));
+        let supported = version
+            .as_deref()
+            .is_some_and(|version| VersionProbe(&probe.policy).accepts(version));
+        let entry = &mut runtimes[probe.index];
+        entry.version = version;
+        entry.supported = Some(supported);
+    }
+}
+
+/// Appends `planned` to the inventory, queues its probe, and returns the entry.
+fn place_runtime<'a>(
+    runtimes: &'a mut Vec<AgentRuntime>,
+    pending: &mut Vec<PendingProbe>,
+    (runtime, probe): PlannedRuntime,
+) -> &'a mut AgentRuntime {
+    if let Some((request, policy)) = probe {
+        pending.push(PendingProbe {
+            index: runtimes.len(),
+            request,
+            policy,
+        });
+    }
+    runtimes.push(runtime);
+    runtimes
+        .last_mut()
+        .expect("the entry was pushed just above")
+}
+
+/// The feature flags every snapshot carries around the inventory.
+fn capability_snapshot(
+    daemon_version: &str,
+    supported_agents: Vec<String>,
+    runtimes: Vec<AgentRuntime>,
+) -> HostCapabilities {
     let git_available = which_on_path("git").is_some();
 
     HostCapabilities {
@@ -271,6 +373,9 @@ fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
     }
 }
 
+/// A runtime entry plus the version probe still to run for it, when it has one.
+type PlannedRuntime = (AgentRuntime, Option<(ProbeRequest, VersionProbePolicy)>);
+
 /// Probe `program` for `definition`, honouring its version-probe parser.
 fn probe_definition(
     agent: &str,
@@ -279,11 +384,11 @@ fn probe_definition(
     program: &str,
     base_env: &BaseEnv,
     profile_env: &[(String, String)],
-) -> AgentRuntime {
+) -> PlannedRuntime {
     match definition.version_probe_parser() {
         Some(_) => {
             let launch_path = effective_variable(base_env, profile_env, SEARCH_PATH_VAR);
-            probe_versioned_runtime(
+            plan_versioned_runtime(
                 agent,
                 agent_base,
                 program,
@@ -291,7 +396,7 @@ fn probe_definition(
                 launch_path.as_deref(),
             )
         }
-        None => probe_runtime(agent, agent_base, program),
+        None => (probe_runtime(agent, agent_base, program), None),
     }
 }
 
@@ -323,12 +428,58 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
     }
 }
 
-/// Probe an executable with the compiled parser `definition` names and
-/// classify its version without exposing output.
+/// Resolve an executable for the compiled parser `definition` names and plan
+/// its version probe, without running it.
 ///
-/// A present runtime always reports `supported`: `Some(true)` only for an
-/// accepted version, `Some(false)` for any other version, unparseable output or
-/// a parser id this daemon does not compile in.
+/// A present runtime always reports `supported` once the probe result is
+/// read: `Some(true)` only for an accepted version, `Some(false)` for any
+/// other version, unparseable output or a parser id this daemon does not
+/// compile in (which plans no probe, so the entry starts at `Some(false)`).
+fn plan_versioned_runtime(
+    agent: &str,
+    agent_base: RuntimeRef,
+    binary: &str,
+    definition: &RuntimeDefinition,
+    launch_path: Option<&OsStr>,
+) -> PlannedRuntime {
+    let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
+        return (
+            AgentRuntime {
+                agent: agent.to_owned(),
+                agent_base: Some(agent_base),
+                available: false,
+                path: None,
+                version: None,
+                supported: None,
+                config_home_id: None,
+            },
+            None,
+        );
+    };
+
+    let probe = VersionProbe::for_definition(definition).map(|probe| {
+        (
+            ProbeRequest::new(program.as_path(), probe.0.args(), launch_path),
+            probe.0.clone(),
+        )
+    });
+    (
+        AgentRuntime {
+            agent: agent.to_owned(),
+            agent_base: Some(agent_base),
+            available: true,
+            path: Some(program.as_path().display().to_string()),
+            version: None,
+            supported: Some(false),
+            config_home_id: None,
+        },
+        probe,
+    )
+}
+
+/// Plans and runs one runtime's version probe through a probe cache of its
+/// own, returning the finished inventory entry.
+#[cfg(test)]
 fn probe_versioned_runtime(
     agent: &str,
     agent_base: RuntimeRef,
@@ -336,34 +487,32 @@ fn probe_versioned_runtime(
     definition: &RuntimeDefinition,
     launch_path: Option<&OsStr>,
 ) -> AgentRuntime {
-    let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
-        return AgentRuntime {
-            agent: agent.to_owned(),
-            agent_base: Some(agent_base),
-            available: false,
-            path: None,
-            version: None,
-            supported: None,
-            config_home_id: None,
-        };
-    };
+    probed_entry(plan_versioned_runtime(
+        agent,
+        agent_base,
+        binary,
+        definition,
+        launch_path,
+    ))
+}
 
-    let probe = VersionProbe::for_definition(definition);
-    let version = probe.and_then(|probe| {
-        probe.detect_version(program.as_path(), launch_path, VERSION_PROBE_TIMEOUT)
-    });
-    let supported = probe
-        .zip(version.as_deref())
-        .is_some_and(|(probe, version)| probe.accepts(version));
-    AgentRuntime {
-        agent: agent.to_owned(),
-        agent_base: Some(agent_base),
-        available: true,
-        path: Some(program.as_path().display().to_string()),
-        version,
-        supported: Some(supported),
-        config_home_id: None,
-    }
+/// Runs the probe of `planned`, if any, through a probe cache of its own.
+#[cfg(test)]
+fn probed_entry((runtime, probe): PlannedRuntime) -> AgentRuntime {
+    let mut runtimes = vec![runtime];
+    let pending: Vec<PendingProbe> = probe
+        .into_iter()
+        .map(|(request, policy)| PendingProbe {
+            index: 0,
+            request,
+            policy,
+        })
+        .collect();
+    let requests: Vec<&ProbeRequest> = pending.iter().map(|probe| &probe.request).collect();
+    let cache = ProbeCache::new(pohunek_service_config::DEFAULT_INVENTORY_PROBE);
+    let outputs = cache.fetch(&requests, Instant::now());
+    apply_probe_outputs(&mut runtimes, &pending, outputs);
+    runtimes.remove(0)
 }
 
 /// [`crate::agent::host::validate_launch_runtime`] for an already resolved definition.
@@ -512,8 +661,8 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
 enum ProbeOutcome {
     /// The child exited successfully; carries the retained stdout.
     Output(String),
-    /// The child exited unsuccessfully, including termination by a signal such
-    /// as the `SIGXFSZ` raised when it exceeds the output-file size limit.
+    /// The child exited unsuccessfully, including termination by a signal, or
+    /// wrote more than the output limit.
     Failed,
     /// The deadline expired and the child's process group was terminated.
     TimedOut,
@@ -523,6 +672,22 @@ enum ProbeOutcome {
 
 /// The environment variable that holds the executable search path.
 const SEARCH_PATH_VAR: &str = "PATH";
+
+/// Runs the probe `request` describes and returns its stdout, or `None` for
+/// every outcome that is not a successful exit.
+fn run_request(request: &ProbeRequest) -> Option<String> {
+    match collect_probe(
+        request.program(),
+        request.args(),
+        request.launch_path(),
+        VERSION_PROBE_TIMEOUT,
+        &[],
+        &Instant::now,
+    )? {
+        ProbeOutcome::Output(output) => Some(output),
+        ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
+    }
+}
 
 /// Runs `path` with the arguments `policy` declares under a runtime-neutral
 /// environment plus `launch_path`, the `PATH` the launch sees, and collects
@@ -535,13 +700,25 @@ fn spawn_and_collect_probe(
     seeded_env: &[(&str, &str)],
     now: &impl Fn() -> Instant,
 ) -> Option<ProbeOutcome> {
+    collect_probe(path, policy.args(), launch_path, timeout, seeded_env, now)
+}
+
+/// Spawns `path` with `args` and collects at most [`VERSION_OUTPUT_LIMIT`]
+/// bytes of its stdout.
+///
+/// The child is spawned without `pre_exec` so std can use `posix_spawn`, whose
+/// cost does not grow with the daemon's address space. Its stdout is a pipe the
+/// daemon drains while it waits; output past the limit ends the probe's process
+/// group and counts as a failed probe.
+fn collect_probe(
+    path: &std::path::Path,
+    args: &[String],
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+    seeded_env: &[(&str, &str)],
+    now: &impl Fn() -> Instant,
+) -> Option<ProbeOutcome> {
     let sandbox = VersionProbeSandbox::create()?;
-    let output_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&sandbox.output_path)
-        .ok()?;
-    set_owner_only_file_permissions(&output_file).ok()?;
     let mut command = Command::new(path);
     command.envs(seeded_env.iter().copied());
     command
@@ -560,19 +737,27 @@ fn spawn_and_collect_probe(
     // node`); the effective launch `PATH` (daemon base plus profile
     // overrides) finds the interpreter the launch will use. Every other
     // variable stays isolated.
-    command.args(policy.args());
+    command.args(args);
     if let Some(search_path) = launch_path {
         command.env(SEARCH_PATH_VAR, search_path);
     }
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output_file))
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     configure_probe_process_group(&mut command);
 
     let mut child = command.spawn().ok()?;
+    let Some(mut stdout) = child.stdout.take().and_then(ProbeStdout::new) else {
+        terminate_probe_process(&mut child);
+        return Some(ProbeOutcome::Unavailable);
+    };
     let deadline = now() + timeout;
     let status = loop {
+        if stdout.drain_available() == Drain::Overflow {
+            terminate_probe_process(&mut child);
+            return Some(ProbeOutcome::Failed);
+        }
         match probe_exited(&mut child) {
             Ok(true) => {
                 // The exited child is not reaped yet, so its pid still holds
@@ -605,12 +790,9 @@ fn spawn_and_collect_probe(
             }
         }
     };
-    let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT);
-    File::open(&sandbox.output_path)
-        .ok()?
-        .take(u64::try_from(VERSION_OUTPUT_LIMIT).ok()?)
-        .read_to_end(&mut output)
-        .ok()?;
+    let Some(output) = stdout.finish() else {
+        return Some(ProbeOutcome::Failed);
+    };
     Some(if status.success() {
         ProbeOutcome::Output(String::from_utf8_lossy(&output).into_owned())
     } else {
@@ -618,7 +800,102 @@ fn spawn_and_collect_probe(
     })
 }
 
-/// Owner-private state and output paths for one version probe.
+/// Whether the probe's stdout pipe may hold more output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// The pipe is empty for now or at end of file, and the cap is not reached.
+    Within,
+    /// More than [`VERSION_OUTPUT_LIMIT`] bytes were written.
+    Overflow,
+}
+
+/// The read end of a probe's stdout, bounded to [`VERSION_OUTPUT_LIMIT`] bytes.
+///
+/// The pipe is read without blocking while the probe runs, so a probe that
+/// floods its output is noticed within one poll interval and a descendant that
+/// keeps the pipe open past the probe's exit cannot stall the daemon.
+struct ProbeStdout {
+    pipe: ChildStdout,
+    bytes: Vec<u8>,
+    nonblocking: bool,
+}
+
+impl ProbeStdout {
+    /// Wraps `pipe`, or `None` when it cannot be read without blocking.
+    fn new(pipe: ChildStdout) -> Option<Self> {
+        let nonblocking = set_nonblocking(&pipe).ok()?;
+        Some(Self {
+            pipe,
+            bytes: Vec::with_capacity(VERSION_OUTPUT_LIMIT),
+            nonblocking,
+        })
+    }
+
+    /// Moves what the pipe holds right now into the retained output.
+    ///
+    /// A platform without non-blocking pipe reads leaves the read to
+    /// [`Self::finish`], after the probe has exited.
+    fn drain_available(&mut self) -> Drain {
+        if !self.nonblocking {
+            return Drain::Within;
+        }
+        let mut chunk = [0_u8; VERSION_OUTPUT_LIMIT];
+        loop {
+            match self.pipe.read(&mut chunk) {
+                // End of file, or nothing more to read yet.
+                Ok(0) => return Drain::Within,
+                Ok(read) => {
+                    self.bytes.extend_from_slice(&chunk[..read]);
+                    if self.bytes.len() > VERSION_OUTPUT_LIMIT {
+                        return Drain::Overflow;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Drain::Within;
+                }
+                Err(error) => {
+                    debug!(%error, "version probe output read failed");
+                    return Drain::Within;
+                }
+            }
+        }
+    }
+
+    /// The retained output once the probe has exited, or `None` when it
+    /// exceeded the cap or could not be read.
+    fn finish(mut self) -> Option<Vec<u8>> {
+        if self.nonblocking {
+            return (self.drain_available() == Drain::Within).then_some(self.bytes);
+        }
+        // A blocking pipe is read only now: the probe's process group is gone,
+        // so end of file arrives once the pipe's writers have closed.
+        let limit = u64::try_from(VERSION_OUTPUT_LIMIT + 1).ok()?;
+        (&mut self.pipe)
+            .take(limit)
+            .read_to_end(&mut self.bytes)
+            .ok()?;
+        (self.bytes.len() <= VERSION_OUTPUT_LIMIT).then_some(self.bytes)
+    }
+}
+
+/// Switches `pipe` to non-blocking reads; `Ok(false)` where the platform
+/// has none.
+#[cfg(unix)]
+fn set_nonblocking(pipe: &ChildStdout) -> std::io::Result<bool> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+
+    let flags = fcntl_getfl(pipe)?;
+    fcntl_setfl(pipe, flags | OFlags::NONBLOCK)?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking(_pipe: &ChildStdout) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Owner-private state paths for one version probe.
 #[derive(Debug)]
 struct VersionProbeSandbox {
     dir: PathBuf,
@@ -630,7 +907,6 @@ struct VersionProbeSandbox {
     xdg_runtime_path: PathBuf,
     tmp_path: PathBuf,
     cwd_path: PathBuf,
-    output_path: PathBuf,
 }
 
 impl VersionProbeSandbox {
@@ -649,7 +925,6 @@ impl VersionProbeSandbox {
                         xdg_runtime_path: dir.join("xdg-runtime"),
                         tmp_path: dir.join("tmp"),
                         cwd_path: dir.join("cwd"),
-                        output_path: dir.join("stdout"),
                         dir,
                     };
                     if sandbox
@@ -703,41 +978,10 @@ fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_owner_only_file_permissions(file: &File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_file_permissions(_file: &File) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn configure_probe_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     command.process_group(0);
-    #[expect(
-        unsafe_code,
-        reason = "pre_exec is required to cap an untrusted version probe's output file"
-    )]
-    // SAFETY: setrlimit is async-signal-safe and the closure only constructs a
-    // fixed rlimit value before calling it. An error prevents the child exec.
-    unsafe {
-        command.pre_exec(|| {
-            let output_limit = libc::rlimit {
-                rlim_cur: VERSION_OUTPUT_LIMIT as libc::rlim_t,
-                rlim_max: VERSION_OUTPUT_LIMIT as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &raw const output_limit) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
 }
 
 #[cfg(not(unix))]
@@ -867,7 +1111,7 @@ mod tests {
 
     #[test]
     fn shell_runtime_is_always_available() {
-        let caps = host_capabilities("0.0.0", &no_profiles(), &process_base());
+        let caps = host_capabilities_uncached("0.0.0", &no_profiles(), &process_base());
         let shell = caps
             .runtimes
             .iter()
@@ -893,7 +1137,7 @@ mod tests {
             ),
         )
         .expect("write profile");
-        let caps = host_capabilities(
+        let caps = host_capabilities_uncached(
             "0.0.0",
             &ProfileRegistry::with_runtimes(Some(dir.clone()), official_host()),
             &process_base(),
@@ -1021,7 +1265,8 @@ strategy = "none"
                 &OfficialFixtureSource,
             ])
             .expect("an invalid login shell must not fail the registry");
-            let caps = host_capabilities_for("0.0.0", &no_profiles(), &registry, &process_base());
+            let caps =
+                host_capabilities_for_uncached("0.0.0", &no_profiles(), &registry, &process_base());
             let names: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
             assert_eq!(names, RESERVED_RUNTIME_IDS);
             let shell_def = registry
@@ -1042,8 +1287,12 @@ strategy = "none"
 
     #[test]
     fn inventory_lists_reserved_runtimes_in_reserved_order_with_their_wire_shape() {
-        let caps =
-            host_capabilities_for("0.0.0", &no_profiles(), &test_registry(), &process_base());
+        let caps = host_capabilities_for_uncached(
+            "0.0.0",
+            &no_profiles(),
+            &test_registry(),
+            &process_base(),
+        );
         let order: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
         assert_eq!(order, RESERVED_RUNTIME_IDS);
         assert_eq!(caps.supported_agents, RESERVED_RUNTIME_IDS);
@@ -1107,7 +1356,7 @@ strategy = "none"
             ),
         )
         .expect("write profile");
-        let caps = host_capabilities_for(
+        let caps = host_capabilities_for_uncached(
             "0.0.0",
             &ProfileRegistry::with_runtimes(Some(dir.clone()), official_host()),
             &test_registry(),
@@ -1502,29 +1751,31 @@ strategy = "none"
     fn version_probe_output_is_bounded() {
         let dir = temp_agents_dir();
         let tool = dir.join("tool");
-        let marker = dir.join("writer-status.txt");
-        write_test_executable(
-            &tool,
-            &format!(
-                "#!/bin/sh\n\
-                 head -c 1048576 /dev/zero\n\
-                 writer_status=$?\n\
-                 printf '%s' \"$writer_status\" > {marker}\n\
-                 exit \"$writer_status\"\n",
-                marker = marker.display(),
-            ),
-        );
+        write_test_executable(&tool, "#!/bin/sh\nhead -c 1048576 /dev/zero\nexit 0\n");
 
-        // The deadline is far beyond any plausible scheduling delay, so a
-        // `Failed` outcome can only come from the output limit terminating the
-        // writer, never from the probe's own timeout.
+        // The deadline is far beyond any plausible scheduling delay, and the
+        // script exits successfully, so a `Failed` outcome can only come from
+        // the output limit ending the probe, never from its own timeout or exit
+        // status.
         let outcome = run_semver_probe(&tool, HANG_GUARD, &[], &Instant::now);
 
         assert!(matches!(outcome, ProbeOutcome::Failed), "{outcome:?}");
-        assert_eq!(
-            std::fs::read_to_string(marker).expect("writer status marker"),
-            (128 + libc::SIGXFSZ).to_string(),
-            "the writer must be terminated by SIGXFSZ at the output limit"
+    }
+
+    #[test]
+    fn version_probe_output_at_the_limit_is_kept() {
+        let dir = temp_agents_dir();
+        let tool = dir.join("tool");
+        write_test_executable(
+            &tool,
+            &format!("#!/bin/sh\nhead -c {VERSION_OUTPUT_LIMIT} /dev/zero | tr '\\0' '1'\n"),
+        );
+
+        let outcome = run_semver_probe(&tool, HANG_GUARD, &[], &Instant::now);
+
+        assert!(
+            matches!(&outcome, ProbeOutcome::Output(output) if output.len() == VERSION_OUTPUT_LIMIT),
+            "{outcome:?}"
         );
     }
 
@@ -1543,7 +1794,7 @@ strategy = "none"
         )
         .expect("write profile");
 
-        let caps = host_capabilities(
+        let caps = host_capabilities_uncached(
             "0.0.0",
             &ProfileRegistry::with_runtimes(Some(dir.clone()), official_host()),
             &process_base(),
@@ -1741,14 +1992,14 @@ strategy = "none"
         };
         let profile_path = |dir: &Path| vec![("PATH".to_owned(), dir.display().to_string())];
         let supported = |base: &BaseEnv, profile_env: &[(String, String)]| {
-            probe_definition(
+            probed_entry(probe_definition(
                 "tool",
                 RuntimeRef::from_wire("tool"),
                 &definition,
                 &binary,
                 base,
                 profile_env,
-            )
+            ))
             .supported
         };
 

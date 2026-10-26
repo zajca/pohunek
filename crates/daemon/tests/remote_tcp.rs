@@ -2518,3 +2518,394 @@ async fn wait_turn_over_tcp_releases_its_slot_when_the_peer_resets() {
     let _ = shutdown.send(());
     let _ = handle.await;
 }
+
+/// Programs, profiles and call counters for the `host.inspect` probe scenarios.
+///
+/// Every program appends one byte to its own counter file each time it runs,
+/// so a scenario counts probes by file size.
+struct ProbeRig {
+    root: tempfile::TempDir,
+    agents: PathBuf,
+    counters: PathBuf,
+}
+
+/// Banner the Hermes parser accepts.
+fn accepted_banner() -> String {
+    official_runtimes::supported_banner("hermes")
+}
+
+/// Banner of a release below the Hermes range.
+const REJECTED_BANNER: &str = "Hermes Agent v0.1.0 (2020.1.1)";
+
+impl ProbeRig {
+    fn new() -> Self {
+        let root = pohunek_test_support::tempdir().expect("create the probe fixture root");
+        let agents = root.path().join("agents");
+        let counters = root.path().join("counters");
+        std::fs::create_dir(&agents).expect("create the agents directory");
+        std::fs::create_dir(&counters).expect("create the counters directory");
+        Self {
+            root,
+            agents,
+            counters,
+        }
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::write(path, body).expect("write the fixture program");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the fixture program executable");
+    }
+
+    /// A program that counts its runs and prints `banner`.
+    fn program(&self, name: &str, banner: &str) -> PathBuf {
+        let path = self.root.path().join(name);
+        Self::write_executable(&path, &self.script(name, banner, ""));
+        path
+    }
+
+    /// A program that counts its runs and exits unsuccessfully.
+    fn failing_program(&self, name: &str) -> PathBuf {
+        let path = self.root.path().join(name);
+        Self::write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\nprintf x >> '{}'\nexit 1\n",
+                self.counters.join(name).display()
+            ),
+        );
+        path
+    }
+
+    /// A program that counts its runs, signals its start and prints `banner`
+    /// once `gate` reaches end of file.
+    fn gated_program(&self, name: &str, banner: &str, gate: &Path) -> PathBuf {
+        let path = self.root.path().join(name);
+        let started = self.counters.join(format!("{name}.started"));
+        let hold = format!(
+            ": > '{}'\nread held < '{}'\n",
+            started.display(),
+            gate.display()
+        );
+        Self::write_executable(&path, &self.script(name, banner, &hold));
+        path
+    }
+
+    fn script(&self, name: &str, banner: &str, middle: &str) -> String {
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\n{middle}printf '%s\\n' '{banner}'\n",
+            self.counters.join(name).display()
+        )
+    }
+
+    /// A Hermes profile named `agent` that runs `program` under `path_env`.
+    fn profile(&self, agent: &str, program: &Path, path_env: &str) {
+        std::fs::write(
+            self.agents.join(format!("{agent}.toml")),
+            format!(
+                "base = \"hermes\"\n{}program = \"{}\"\n[env]\nPATH = \"{path_env}\"\n",
+                official_runtimes::profile_pin("hermes"),
+                program.display()
+            ),
+        )
+        .expect("write the profile");
+    }
+
+    /// How many times the program `name` ran.
+    fn calls(&self, name: &str) -> u64 {
+        std::fs::metadata(self.counters.join(name)).map_or(0, |metadata| metadata.len())
+    }
+
+    fn config(&self, probe: pohunek_service_config::InventoryProbe) -> SessionRegistryConfig {
+        SessionRegistryConfig {
+            agents_dir: Some(self.agents.clone()),
+            inventory_probe: probe,
+            ..shell_config()
+        }
+    }
+}
+
+/// The `host.inspect` entry of `agent` in `payload`.
+fn inventory_entry<'a>(payload: &'a Value, agent: &str) -> &'a Value {
+    payload["runtimes"]
+        .as_array()
+        .expect("the runtimes array")
+        .iter()
+        .find(|entry| entry["agent"] == agent)
+        .unwrap_or_else(|| panic!("the inventory lists {agent}: {payload}"))
+}
+
+async fn inspect(client: &mut Framed<UnixStream, LinesCodec>, params: Value) -> Value {
+    ok_payload(
+        exchange(
+            client,
+            &Request::make("inspect", method::HOST_INSPECT, params),
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn host_inspect_probes_each_program_once_in_parallel_without_blocking_the_daemon() {
+    const PROGRAMS: usize = 6;
+    const PROFILES_PER_PROGRAM: usize = 3;
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = ProbeRig::new();
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", rig.root.path());
+    let gate = rig.root.path().join("gate");
+    nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the gate FIFO");
+    let gate_writer = open_fifo_writer(&gate);
+    for program in 0..PROGRAMS {
+        let path = rig.gated_program(&format!("prog-{program}"), &accepted_banner(), &gate);
+        for copy in 0..PROFILES_PER_PROGRAM {
+            rig.profile(&format!("agent-{program}-{copy}"), &path, "/bin");
+        }
+    }
+    let (_addr, socket, shutdown, handle) = spawn_dual_servers_serving_official_runtimes(
+        "inspect-parallel",
+        "0.0.0",
+        rig.config(pohunek_service_config::DEFAULT_INVENTORY_PROBE),
+    )
+    .await;
+
+    // The flags-only request resolves and probes nothing.
+    let mut gate_client = connect_unix(&socket).await;
+    let flags = inspect(
+        &mut gate_client,
+        serde_json::json!({"skip_runtime_probes": true}),
+    )
+    .await;
+    assert_eq!(flags["runtimes"], serde_json::json!([]));
+    assert_eq!(flags["supported_agents"], serde_json::json!([]));
+    assert_eq!(flags["session_new_cwd_supported"], true);
+    assert_eq!(flags["session_new_input_ack_supported"], true);
+    assert_eq!(flags["session_new_branch_source_supported"], true);
+    assert_eq!(rig.calls("prog-0"), 0, "the flags-only request probed");
+
+    // The full request blocks on the gated probes; all distinct programs must
+    // start before any is released, which only parallel probes can do.
+    let mut inspecting = connect_unix(&socket).await;
+    let full = tokio::spawn(async move { inspect(&mut inspecting, Value::Null).await });
+    pohunek_test_support::wait::wait_until("every distinct probe to have started", || async {
+        (0..PROGRAMS)
+            .all(|program| {
+                rig.counters
+                    .join(format!("prog-{program}.started"))
+                    .exists()
+            })
+            .then_some(())
+    })
+    .await;
+    // A second inventory that starts while the first one's probes are held
+    // waits for them instead of probing the same programs again.
+    let mut concurrent = connect_unix(&socket).await;
+    let second = tokio::spawn(async move { inspect(&mut concurrent, Value::Null).await });
+    // The inventory runs off the async runtime: other requests are answered
+    // while every probe is still held.
+    let health = ok_payload(
+        exchange(
+            &mut gate_client,
+            &Request::make("health", method::DAEMON_HEALTH, Value::Null),
+        )
+        .await,
+    );
+    assert!(health.is_object(), "{health}");
+
+    drop(gate_writer);
+    let payload = full.await.expect("the inventory task completes");
+    let concurrent_payload = second.await.expect("the concurrent inventory completes");
+    assert_eq!(concurrent_payload["runtimes"], payload["runtimes"]);
+    for program in 0..PROGRAMS {
+        assert_eq!(rig.calls(&format!("prog-{program}")), 1);
+        for copy in 0..PROFILES_PER_PROGRAM {
+            let entry = inventory_entry(&payload, &format!("agent-{program}-{copy}"));
+            assert_eq!(entry["available"], true, "{entry}");
+        }
+    }
+
+    // A second request inside the cache lifetime runs no probe.
+    let again = inspect(&mut gate_client, Value::Null).await;
+    assert_eq!(again["runtimes"], payload["runtimes"]);
+    for program in 0..PROGRAMS {
+        assert_eq!(rig.calls(&format!("prog-{program}")), 1);
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn host_inspect_reprobes_when_the_program_or_its_launch_environment_changes() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = ProbeRig::new();
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", rig.root.path());
+    let program_a = rig.program("prog-a", &accepted_banner());
+    let program_b = rig.program("prog-b", &accepted_banner());
+    let program_c = rig.program("prog-c", REJECTED_BANNER);
+    let program_d = rig.program("prog-d", &accepted_banner());
+    let failing = rig.failing_program("prog-f");
+    let link = rig.root.path().join("link");
+    std::os::unix::fs::symlink(&program_b, &link).expect("create the symlink");
+    rig.profile("p-a", &program_a, "/bin");
+    rig.profile("p-b", &program_b, "/bin");
+    rig.profile("p-link", &link, "/bin");
+    rig.profile("p-d", &program_d, "/bin");
+    rig.profile("p-d-path", &program_d, "/usr/bin:/bin");
+    rig.profile("p-f", &failing, "/bin");
+    let (_addr, socket, shutdown, handle) = spawn_dual_servers_serving_official_runtimes(
+        "inspect-identity",
+        "0.0.0",
+        rig.config(pohunek_service_config::DEFAULT_INVENTORY_PROBE),
+    )
+    .await;
+    let mut client = connect_unix(&socket).await;
+
+    // Cold: a symlink shares its target's probe, a different launch PATH does
+    // not share one, a failed probe counts as one run.
+    let first = inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-a"), 1);
+    assert_eq!(rig.calls("prog-b"), 1);
+    assert_eq!(rig.calls("prog-d"), 2);
+    assert_eq!(rig.calls("prog-f"), 1);
+    assert_eq!(inventory_entry(&first, "p-link")["supported"], true);
+    assert_eq!(inventory_entry(&first, "p-f")["supported"], false);
+
+    // Warm: nothing runs again, a failure is remembered too.
+    inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-a"), 1);
+    assert_eq!(rig.calls("prog-d"), 2);
+    assert_eq!(rig.calls("prog-f"), 1);
+
+    // A program replaced in place is probed again and reports its new release.
+    ProbeRig::write_executable(&program_a, &rig.script("prog-a", REJECTED_BANNER, ""));
+    let replaced = inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-a"), 2);
+    assert_eq!(inventory_entry(&replaced, "p-a")["supported"], false);
+
+    // A retargeted symlink resolves to another program and its probe.
+    std::fs::remove_file(&link).expect("remove the symlink");
+    std::os::unix::fs::symlink(&program_c, &link).expect("retarget the symlink");
+    let retargeted = inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-c"), 1);
+    assert_eq!(rig.calls("prog-b"), 1);
+    assert_eq!(inventory_entry(&retargeted, "p-link")["supported"], false);
+
+    // A touched file is probed again and reports the same release.
+    std::fs::File::options()
+        .write(true)
+        .open(&program_b)
+        .expect("open the program")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .expect("touch the program");
+    let touched = inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-b"), 2);
+    assert_eq!(
+        inventory_entry(&touched, "p-b")["version"],
+        inventory_entry(&first, "p-b")["version"]
+    );
+
+    // A new profile over a known program and launch PATH reuses its probe; a
+    // removed one leaves the others untouched.
+    rig.profile("p-b-twin", &program_b, "/bin");
+    std::fs::remove_file(rig.agents.join("p-d.toml")).expect("remove a profile");
+    let changed = inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-b"), 2);
+    assert_eq!(rig.calls("prog-d"), 2);
+    assert_eq!(inventory_entry(&changed, "p-b-twin")["supported"], true);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Runs two inventories over one succeeding and one failing program with
+/// `probe` and returns how often each program ran.
+async fn two_inventories_with(
+    tag: &str,
+    probe: pohunek_service_config::InventoryProbe,
+) -> (u64, u64) {
+    let rig = ProbeRig::new();
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", rig.root.path());
+    let program = rig.program("prog-a", &accepted_banner());
+    let failing = rig.failing_program("prog-f");
+    rig.profile("p-a", &program, "/bin");
+    rig.profile("p-f", &failing, "/bin");
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers_serving_official_runtimes(tag, "0.0.0", rig.config(probe)).await;
+    let mut client = connect_unix(&socket).await;
+
+    inspect(&mut client, Value::Null).await;
+    inspect(&mut client, Value::Null).await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    (rig.calls("prog-a"), rig.calls("prog-f"))
+}
+
+// One millisecond is shorter than any probe, so a result with that lifetime
+// never outlives the inventory that stored it.
+#[tokio::test]
+async fn host_inspect_successful_probes_expire_after_the_cache_lifetime() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let probe = pohunek_service_config::InventoryProbe {
+        cache_ttl: Duration::from_millis(1),
+        ..pohunek_service_config::DEFAULT_INVENTORY_PROBE
+    };
+    let (successful, failed) = two_inventories_with("inspect-ttl", probe).await;
+    assert_eq!((successful, failed), (2, 1));
+}
+
+#[tokio::test]
+async fn host_inspect_failed_probes_expire_after_the_failure_lifetime() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let probe = pohunek_service_config::InventoryProbe {
+        failure_ttl: Duration::from_millis(1),
+        ..pohunek_service_config::DEFAULT_INVENTORY_PROBE
+    };
+    let (successful, failed) = two_inventories_with("inspect-failure-ttl", probe).await;
+    assert_eq!((successful, failed), (1, 2));
+}
+
+#[tokio::test]
+async fn host_inspect_probe_cache_keeps_at_most_the_configured_entries() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = ProbeRig::new();
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", rig.root.path());
+    let program_a = rig.program("prog-a", &accepted_banner());
+    let program_b = rig.program("prog-b", &accepted_banner());
+    rig.profile("p-a", &program_a, "/bin");
+    rig.profile("p-b", &program_b, "/bin");
+    let probe = pohunek_service_config::InventoryProbe {
+        cache_max_entries: 1,
+        ..pohunek_service_config::DEFAULT_INVENTORY_PROBE
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers_serving_official_runtimes("inspect-cap", "0.0.0", rig.config(probe))
+            .await;
+    let mut client = connect_unix(&socket).await;
+
+    inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-a") + rig.calls("prog-b"), 2);
+    // One result survived the cap, so exactly one program is probed again.
+    inspect(&mut client, Value::Null).await;
+    assert_eq!(rig.calls("prog-a") + rig.calls("prog-b"), 3);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
