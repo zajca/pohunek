@@ -1231,3 +1231,151 @@ fn the_legacy_schema_lookup_ignores_unpinned_and_builtin_pins_and_foreign_identi
     };
     assert!(host.legacy_hook_schema(&pin_of(&other, "acme")).is_none());
 }
+
+/// The compiled detection manifest a definition observes through.
+fn manifest_of(definition: &super::RuntimeDefinition) -> std::sync::Arc<crate::detect::Manifest> {
+    std::sync::Arc::clone(definition.manifest())
+}
+
+#[test]
+fn every_resolution_of_one_digest_shares_one_compiled_manifest() {
+    let plugins = Plugins::new();
+    let built = acme("1.0.0");
+    install(&plugins.registry(), &built, true, true);
+    let host = plugins.host();
+    let reference = RuntimeRef::from_wire("acme");
+    let pin = pin_of(&built, "acme");
+
+    let served = host
+        .resolve_id(&runtime("acme"))
+        .expect("registry definition");
+    let first = host.resolve_pinned(&reference, &pin).expect("first pin");
+    let second = host.resolve_pinned(&reference, &pin).expect("second pin");
+    let observed = host.definition_for_pin(&reference, &pin).expect("observed");
+    let bound = host
+        .package_store()
+        .expect("package store")
+        .load_bound(&runtime("acme"), &built.digest, &built.identity.id)
+        .expect("profile binding");
+
+    // A fresh launch, every pinned session and a profile binding of one
+    // digest observe through the same compiled definition.
+    for definition in [&first, &second, &observed] {
+        assert!(std::sync::Arc::ptr_eq(&first, definition));
+    }
+    assert!(std::sync::Arc::ptr_eq(
+        &manifest_of(&served),
+        &manifest_of(&first)
+    ));
+    assert!(std::sync::Arc::ptr_eq(&bound, &first));
+}
+
+#[test]
+fn reload_drops_the_cached_definition_of_an_uninstalled_digest() {
+    let plugins = Plugins::new();
+    let first = acme("1.0.0");
+    let second = acme("2.0.0");
+    let registry = plugins.registry();
+    install(&registry, &first, true, true);
+    install(&registry, &second, true, true);
+    let host = plugins.host();
+    let reference = RuntimeRef::from_wire("acme");
+    let pin = pin_of(&first, "acme");
+    host.resolve_pinned(&reference, &pin).expect("cached");
+    let store = host.package_store().expect("package store");
+    assert_eq!(store.cached_definitions(), 2);
+
+    registry
+        .uninstall(&first.digest, &package::registry::RetainedDigests::new())
+        .expect("uninstall");
+    host.reload().expect("reload");
+
+    // Only the installed digest keeps a definition, so the cache is bounded
+    // by the installed packages.
+    assert_eq!(store.cached_definitions(), 1);
+    let error = host
+        .resolve_pinned(&reference, &pin)
+        .expect_err("the digest is gone");
+    assert_eq!(code(&error), "runtime_not_installed");
+}
+
+#[test]
+fn a_cached_reserved_runtime_is_refused_once_its_record_is_no_longer_official() {
+    let plugins = Plugins::new();
+    let built = build(
+        &descriptor("pohunek.runtime.official", "1.0.0", "claude"),
+        "official",
+        identity("pohunek.runtime.official", "1.0.0"),
+    );
+    let registry = plugins.registry();
+    install_from(&registry, &built, true, true, InstallSource::Official);
+    let host = plugins.host();
+    let reference = RuntimeRef::from_wire("claude");
+    let pin = pin_of(&built, "claude");
+    host.resolve_pinned(&reference, &pin).expect("official pin");
+
+    registry
+        .uninstall(&built.digest, &package::registry::RetainedDigests::new())
+        .expect("uninstall");
+    install_from(&registry, &built, true, true, InstallSource::ExplicitDigest);
+
+    let error = host
+        .resolve_pinned(&reference, &pin)
+        .expect_err("the record no longer authorizes the reserved id");
+    assert_eq!(code(&error), "runtime_incompatible");
+}
+
+#[test]
+fn concurrent_cold_loads_of_one_digest_converge_on_one_definition() {
+    let plugins = Plugins::new();
+    let built = acme("1.0.0");
+    install(&plugins.registry(), &built, true, true);
+    let store = plugins.store();
+
+    let loaded: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    store
+                        .load_pinned(&runtime("acme"), &built.digest, &built.identity)
+                        .expect("load")
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .collect()
+    });
+
+    for definition in &loaded {
+        assert!(std::sync::Arc::ptr_eq(&loaded[0], definition));
+    }
+}
+
+#[test]
+fn a_rejected_load_is_not_remembered_once_the_package_is_repaired() {
+    let plugins = Plugins::new();
+    let built = acme("1.0.0");
+    install(&plugins.registry(), &built, true, true);
+    let store = plugins.store();
+    let descriptor = plugins
+        .root(&built.digest)
+        .join("files")
+        .join("runtime.toml");
+    let mode = fs::metadata(&descriptor).expect("descriptor").permissions();
+
+    tamper(&plugins, &built.digest, &Tamper::Chmod);
+    let refused = store
+        .load_pinned(&runtime("acme"), &built.digest, &built.identity)
+        .expect_err("a changed mode fails verification");
+    assert!(matches!(refused, PackageRejection::Root(_)));
+    assert_eq!(store.cached_definitions(), 0);
+
+    fs::set_permissions(&descriptor, mode).expect("repair the mode");
+    let repaired = store
+        .load_pinned(&runtime("acme"), &built.digest, &built.identity)
+        .expect("the repaired package loads");
+    assert_eq!(repaired.runtime_id(), &runtime("acme"));
+    assert_eq!(store.cached_definitions(), 1);
+}

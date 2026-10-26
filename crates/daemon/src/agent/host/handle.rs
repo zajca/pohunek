@@ -347,6 +347,9 @@ impl RuntimeHost {
         }
         let report = Arc::clone(&state.report);
         *self.state.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(state);
+        if let Some(store) = self.package_store() {
+            store.prune_definitions();
+        }
         Ok(report)
     }
 
@@ -433,7 +436,6 @@ impl RuntimeHost {
         }
         store
             .load_pinned(runtime_id, package_digest, package)
-            .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
     }
 
@@ -489,7 +491,7 @@ impl RuntimeHost {
         else {
             return None;
         };
-        let state = store.registry().state().ok()?;
+        let state = store.registry_state().ok()?;
         let official =
             |record: &package::registry::PackageRecord| record.source() == RecordSource::Official;
         if !state.package(frozen_digest).is_some_and(official) {
@@ -532,7 +534,7 @@ impl RuntimeHost {
             return Some(candidate);
         }
         match store.load_pinned(runtime_id, package_digest, package) {
-            Ok(verified) => Some(Arc::new(verified)),
+            Ok(verified) => Some(verified),
             Err(reason) => {
                 debug!(
                     runtime = %runtime_id,
@@ -568,7 +570,7 @@ impl RuntimeHost {
         else {
             return false;
         };
-        let Ok(state) = store.registry().state() else {
+        let Ok(state) = store.registry_state() else {
             return false;
         };
         let official =
@@ -663,7 +665,6 @@ impl RuntimeHost {
         let runtime_id = definition.runtime_id();
         store
             .load_pinned(runtime_id, package_digest, package)
-            .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
     }
 
@@ -692,7 +693,6 @@ impl RuntimeHost {
         if let Some(store) = self.package_store() {
             return store
                 .load_bound(runtime_id, digest, package)
-                .map(Arc::new)
                 .map_err(|reason| refuse(runtime_id, &reason));
         }
         let definition = self.resolve_id(runtime_id)?;
