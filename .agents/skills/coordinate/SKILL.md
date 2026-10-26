@@ -83,7 +83,13 @@ PR. Move anything else to the next milestone with a one-line reason.
    It is a fresh session that did not author the change, with a review-only
    briefing, and it posts one comment from the maintainer account that
    carries the `opus-pr-review:v1` marker for the exact head and names the
-   verdict. After fixes, review only the delta (`git range-diff` after a rebase). A LOW finding is
+   verdict. When the author disputes a MEDIUM finding with evidence on the
+   PR, the coordinator rules on it, and the coordinator then starts the fresh
+   review at the same head that records the ruling in its `medium` count (the
+   maintainer does both when there is no coordinator; a delivering agent with
+   no manager starts that review itself, after the maintainer's ruling, per
+   `deliver-issue` Phase 5 step 1).
+   After fixes, review only the delta (`git range-diff` after a rebase). A LOW finding is
    filed as an issue instead of fixed; say so in the comment.
 4. **Batch** findings from all reviewers into one fix push. Prefer one PR with
    ordered commits over a stacked train when the release clock matters, and

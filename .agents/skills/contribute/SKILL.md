@@ -111,7 +111,8 @@ and independent review, and an available independent reviewer examines the
 code, contract, and evidence of the exact candidate. If no independent reviewer
 is available, the candidate stays unaccepted until routing succeeds. You cannot
 supply independent approval for your own work, including through another
-session or agent. The technical review gate is defined in
+session or agent used to author it; only a fresh review-only session that did
+not author the change supplies the marker below. The technical review gate is defined in
 `contributionPolicy.reviewAndIntegration.automatedReview`; for each head of
 your pull request:
 

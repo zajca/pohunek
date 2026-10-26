@@ -184,8 +184,12 @@ followed by the findings. The rules:
    head. When a MEDIUM finding is a false positive, answer it with evidence
    (`path:line`, spec reference, reproduction) as a comment on the PR. The
    coordinator rules on the dispute, or the maintainer when there is no
-   coordinator. A fresh independent review at the same head then reflects the
-   ruling in the `medium` count of its marker, and the latest marker for the head decides.
+   coordinator, and the same party then starts the re-review after the ruling; a
+   delivering agent with no manager waits for the maintainer's ruling and then
+   starts it per step 1. The fresh review only records the ruling; it does not
+   replace the finding's evidence. A fresh independent review at
+   the same head reflects the ruling in the `medium` count of its marker, and
+   the latest marker for the head decides.
 3. **CI failure triage** — before changing anything:
    - Fetch logs only after the whole run completed (`gh run view <run> --job
      <job> --log-failed`; earlier it returns nothing).

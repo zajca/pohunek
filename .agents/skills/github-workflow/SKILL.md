@@ -94,7 +94,10 @@ No permanently staffed area reviewer or response time commitment is promised.
 If an independent reviewer is unavailable, the candidate remains unaccepted;
 the maintainer records that state and retries routing when capacity exists.
 The submitter, author, executor, or manager cannot supply independent
-approval, including through another session. The technical review gate is
+approval, including through another session used to author or direct the
+change; a fresh review-only session that did not author the change supplies
+the technical review (the marker). Starting that session with a
+review-only briefing is not directing the change. The technical review gate is
 an `opus-pr-review:v1` marker comment authored by `zajca` that names the exact
 pull request head (`<!-- opus-pr-review:v1:<repo>#<N>@<40-char sha>:high=<h>:medium=<m>:low=<l> -->`).
 GO is `high=0` and `medium=0`; a review with only LOW findings passes and each
@@ -134,7 +137,7 @@ the `contributionPolicy` in `.github/agent-workflow.json`:
 | A reservation expires, a successor is assigned, or a holder submits for review. | Expiry triggers reconciliation; stale generations cannot renew, release, submit, or otherwise mutate successor custody; submission retains custody but is not acceptance. |
 | Two principals claim the same work once the coordination service exists, or one principal claims again under a new agent or run ID. | The service commits exactly one holder; a new agent or run ID does not reset the principal's allowance. |
 | The maintainer's manager requests the Opus review of a submitted head. | The marker comment authored by `zajca` names the exact head; no outside contributor receives the credential that posts it, and a marker from any other author does not count. |
-| The executor opens another session or no independent reviewer is available. | Another session does not satisfy independence; unavailable review leaves the candidate unaccepted and is recorded for retry. The Opus marker counts only when `zajca` authored it at the exact head. |
+| The executor opens another session or no independent reviewer is available. | A session used to author or direct the change does not satisfy independence, while a fresh review-only session that did not author it supplies the marker; unavailable review leaves the candidate unaccepted and is recorded for retry. The Opus marker counts only when `zajca` authored it at the exact head. |
 | An unsolicited pull request competes with reserved work. | It remains eligible under the same criteria, and the reservation does not guarantee a merge. |
 | A candidate passes review and gates and is ready to integrate. | `zajca` integrates under existing authorization; release still needs separate authorization. |
 | A change is verified locally but not merged. | Its issue stays open; closure needs the verified remote landing. |
