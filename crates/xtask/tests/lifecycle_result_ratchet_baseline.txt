@@ -3,8 +3,6 @@
 # in test code, per file.
 # Format: `<workspace-relative path> <count>`. Counts may only go down;
 # regenerate with the ignored `regenerate_lifecycle_result_baseline` test.
-crates/cli/tests/hermes_package.rs 1
-crates/daemon/src/api/handler/mod.rs 3
 crates/daemon/src/session/detector.rs 1
 crates/daemon/src/session/package_lifecycle/official_alias_tests.rs 1
 crates/daemon/src/session/package_lifecycle/tests.rs 3
@@ -13,8 +11,3 @@ crates/daemon/src/session/profile_pin_tests.rs 2
 crates/daemon/src/session/reconcile.rs 33
 crates/daemon/src/session/tests.rs 326
 crates/daemon/src/session/tests/prompt_accepted.rs 2
-crates/daemon/tests/codex_program_status_session.rs 7
-crates/daemon/tests/health_socket/native_recovery.rs 1
-crates/daemon/tests/pi_program_status.rs 11
-crates/daemon/tests/procwatch.rs 3
-crates/daemon/tests/program_status_session.rs 5
