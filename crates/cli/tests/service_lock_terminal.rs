@@ -239,8 +239,44 @@ impl Session {
     }
 }
 
+impl Session {
+    /// The shell, lock process and command rows of the process table with the
+    /// terminal's foreground group, for a failure report.
+    fn process_table(&self) -> String {
+        let pids: Vec<String> = ["lock.pid", "child.pid"]
+            .iter()
+            .filter_map(|name| fs::read_to_string(self.path(name)).ok())
+            .map(|text| text.trim().to_owned())
+            .chain(self.shell.process_id().map(|pid| pid.to_string()))
+            .collect();
+        let listing = Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,command="])
+            .output()
+            .map_or_else(
+                |error| format!("ps failed: {error}"),
+                |output| String::from_utf8_lossy(&output.stdout).into_owned(),
+            );
+        let rows: Vec<&str> = listing
+            .lines()
+            .filter(|row| {
+                let mut columns = row.split_whitespace();
+                let process = columns.next();
+                let group = columns.nth(1);
+                [process, group]
+                    .into_iter()
+                    .flatten()
+                    .any(|id| pids.iter().any(|known| known == id))
+            })
+            .collect();
+        format!("foreground={:?}\n{}", self.foreground(), rows.join("\n"))
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("process table at the failure:\n{}", self.process_table());
+        }
         // Every loop ends on these files, so no process outlives a failure.
         for name in ["phase2", "stop", "end"] {
             let _ = fs::write(self.path(name), "");
