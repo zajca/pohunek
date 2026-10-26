@@ -647,7 +647,7 @@ Shared payloads:
 | `package.link` | `{directory, dry_run}` | `{status, package, runtime, reloaded}` | Copies the directory into content-addressed storage and installs it disabled and unselected; the daemon never loads the directory itself. |
 | `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
 | `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. Refused with `package_integration_incompatible` while a retained reference uses a version of the same package whose integration differs; nothing changes. |
-| `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest. `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
+| `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest, and with `package_retention_uncertain` while a `metadata.jsonl` line that may pin a package cannot be read (the line is kept; stop the daemon, move it into a backup file and start the daemon). `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
 | `package.bind_profile` | `{profile, digest?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. A pin of a version whose integration differs from the selected version of its package, or from another referenced version (a session or another profile's pin; the pin being replaced does not count), is refused with `package_integration_incompatible`, because the pin would be a retained reference that coexists with an incompatible selected version. |
 
 Compatibility-gated selection. An integration handler owns one active asset set
@@ -662,7 +662,8 @@ integration, is incompatible. A version whose integration cannot be determined
 that predates `hook_schema` resolves through the schema its handler drives. A
 package is *held back* while a retained digest of the same package (a live, lost
 or resumable session, or a host profile pin; the same set that blocks
-`package.uninstall`) has a different integration: `package.select` is refused
+`package.uninstall`, widened to every installed version while an unreadable
+`metadata.jsonl` line may pin a package) has a different integration: `package.select` is refused
 with `package_integration_incompatible`, `package.install` with `select: true`
 installs it unselected, and the selected version keeps serving, with no fallback
 to another package. A retained pin still resolves from exactly its pinned digest.
@@ -675,7 +676,9 @@ selects it explicitly. Selection changes commit under the exclusive lifecycle
 authority, and a launch that resolved the previously selected version before a
 selection committed is refused with `runtime/runtime_package_changed` (retry the
 request) instead of pinning the version that was just replaced; a digest a host
-profile pins launches whatever is selected.
+profile pins launches whatever is selected. While an unreadable `metadata.jsonl`
+line may pin a package, every installed version counts as retained, including
+the pin a `package.bind_profile` rebind replaces.
 
 Install and link validate the package in memory before anything is extracted:
 `runtime.toml` is parsed from the verified archive, and the package identity
@@ -802,6 +805,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_identity_installed` | `runtime` | The package id and version are installed from another archive. |
 | `package_identity_conflict` | `runtime` | The digest is installed under another package identity. |
 | `package_referenced` | `runtime` | A session or host profile still pins the digest. |
+| `package_retention_uncertain` | `runtime` | A `metadata.jsonl` line that may pin a package cannot be read, so `package.uninstall` cannot prove the digest unreferenced. The line stays in the store; stop the daemon, move it into a backup file and start the daemon. Listing, inspecting and doctor still work; selecting, binding and integration updates judge every installed version while the line stays unreadable. |
 | `package_root_invalid` | `runtime` | The recorded package root fails verification. |
 | `package_root_intact` | `runtime` | The recorded package root verifies, so it is not removed as modified. |
 | `package_registry_busy` | `daemon` | Another writer holds the package registry. |
@@ -813,7 +817,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_profile_base_builtin` | `runtime` | The profile's base runtime is the built-in `shell`, so there is no package to pin. |
 | `package_profile_target_invalid` | `runtime` | The package is not installed, is faulted, does not serve the base runtime, or is not the unique selected package. |
 | `package_profile_changed` | `runtime` | The profile changed while it was being rewritten and was left as found. |
-| `package_integration_incompatible` | `runtime` | The package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected; nothing changed. |
+| `package_integration_incompatible` | `runtime` | The package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected, or that an unreadable `metadata.jsonl` line may reference; nothing changed. |
 
 ### Daemon Runtime Configuration
 
@@ -3542,7 +3546,7 @@ registration (the commands that run the managed scripts, restricted to the
 arguments each embedded script accepts) and not from a declaration, and every hook schema of the
 package versions that live, lost or resumable sessions and host profile pins
 still reference for that handler to admit them too (an undeterminable retained
-version, whose handler is unknown, refuses an update of every handler's asset set); otherwise the update is refused
+version, whose handler is unknown, refuses an update of every handler's asset set; while a `metadata.jsonl` line that may pin a package cannot be read, every installed version counts as retained, and the refusal is logged with a pointer to the unreadable line); otherwise the update is refused
 with `runtime/integration_update_incompatible` before anything is written. An
 active set of any version is replaceable, so a rolled-back release reinstalls
 its older set.

@@ -17,7 +17,9 @@ use super::legacy_binding::{self, RecoveryOutcome};
 use super::schema::{
     classify, migrated_body, parse_lines, ParsedLine, SchemaState, LEGACY_BINDING_STEP_FROM,
 };
-use super::{check_body_size, partition_lines, RejectedLine, ResumeBinding, SessionRecord, Store};
+use super::{
+    check_body_size, partition_lines_logged, RejectedLine, ResumeBinding, SessionRecord, Store,
+};
 
 /// What the startup migration would do to the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +103,8 @@ impl Store {
         // nothing: startup keeps a session's embedded recovery when its
         // separate projection is skipped.
         for (index, line) in lines.into_iter().enumerate() {
-            let ((resume, _worktrees, _projects, sessions), rejected) = partition_lines(vec![line]);
+            let ((resume, _worktrees, _projects, sessions), rejected) =
+                partition_lines_logged(vec![line]);
             if rejected.is_empty() {
                 if let Some(Some((session_id, outcome))) = assessed.get(index) {
                     raise(&mut recovery, session_id, *outcome);

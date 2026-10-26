@@ -428,7 +428,10 @@ and is reported by the host (package-pinned sessions are then incompatible).
   authority until its registration persisted. The uninstall transaction runs in
   a task of its own, so a caller that stops waiting cannot release the exclusive
   authority mid-removal. The retained-set scan of the durable store is strict: a
-  record that cannot be interpreted refuses the uninstall.
+  record that cannot be interpreted may pin a package: the uninstall is
+  refused with `package_retention_uncertain`, and selection, binding and
+  integration updates judge every installed version, while listing, inspecting
+  and doctor keep using the pins that are known.
   The session's recovery binding also records whether its input safety contract
   (safe-text validation, no automated input while blocked) applies, so an
   adopted session whose package no longer verifies keeps those protections.

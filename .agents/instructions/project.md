@@ -77,9 +77,18 @@ rule. The current state of each place is stated separately.
   migration step.
 
 Every persisted record that cannot be migrated or adopted is logged at WARN,
-surfaced to the operator, and carries a recovery hint. A store newer than the
-binary, or older than every kept migration, makes the daemon refuse to start
-and leaves the store untouched.
+surfaced to the operator, and carries a recovery hint. A `metadata.jsonl` line
+no loader accepts stays in the file: every rewrite re-emits it unchanged after
+the parsed records. The only safe recovery is to stop the daemon, move the line
+out of `metadata.jsonl` into a backup file, and start the daemon; editing the
+file while the daemon runs can be read half-written, and the next rewrite then
+drops every line after the cut. An unreadable line never shrinks a retention
+gate's set: package gates judge every installed digest while a line that may pin
+a package cannot be read (`package.uninstall` is refused with
+`package_retention_uncertain`; listing, inspecting and doctor still work), and no
+reader treats an unreadable line as proof of absence. A store
+newer than the binary, or older than every kept migration, makes the daemon
+refuse to start and leaves the store untouched.
 
 The operator-facing gate of the window is the upgrade preflight: `pohunek
 service check|upgrade` run `pohunekd upgrade-preflight` of the new archive

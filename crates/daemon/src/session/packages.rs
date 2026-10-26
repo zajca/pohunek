@@ -35,6 +35,10 @@ pub enum PackageUninstallError {
     /// The durable sessions that may reference the package could not be read.
     #[error("the sessions that may reference the package cannot be listed: {0}")]
     Retention(#[source] io::Error),
+    /// A store line that may pin the package cannot be read, so the removal
+    /// cannot be proven safe.
+    #[error("an unreadable metadata-store line may reference the package")]
+    RetentionUncertain,
     /// The package registry refused: still referenced, not installed, a
     /// modified root, or a registry fault.
     #[error(transparent)]
@@ -43,6 +47,52 @@ pub enum PackageUninstallError {
     /// rebuilt; the previous registry stays in place until the next reload.
     #[error("the package was uninstalled but the runtime registry was not rebuilt: {0}")]
     Reload(#[source] ReloadError),
+}
+
+/// The package digests the daemon retains, for display and for gates.
+///
+/// An unreadable store line that may pin a package never shrinks a gate's set:
+/// [`Self::gate`] widens to every installed digest while one exists, and only
+/// gates see it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct RetainedPins {
+    /// Digests a profile, a readable durable record or a live session pins.
+    known: RetainedDigests,
+    /// [`Self::known`], plus every installed digest while a store line that may
+    /// pin a package cannot be read.
+    gate: RetainedDigests,
+    /// Whether such a line exists.
+    uncertain: bool,
+}
+
+impl RetainedPins {
+    /// A set whose pins are all known, as the offline planner reads them.
+    #[must_use]
+    pub(super) fn from_known(known: RetainedDigests) -> Self {
+        Self {
+            gate: known.clone(),
+            known,
+            uncertain: false,
+        }
+    }
+
+    /// The digests that are provably pinned.
+    #[must_use]
+    pub(super) fn known(&self) -> &RetainedDigests {
+        &self.known
+    }
+
+    /// The set every gate judges.
+    #[must_use]
+    pub(super) fn gate(&self) -> &RetainedDigests {
+        &self.gate
+    }
+
+    /// Whether an unreadable store line widened [`Self::gate`].
+    #[must_use]
+    pub(super) fn is_uncertain(&self) -> bool {
+        self.uncertain
+    }
 }
 
 impl SessionRegistry {
@@ -187,15 +237,24 @@ impl SessionRegistry {
     /// The set is the union of the digests host profiles pin, the durable
     /// records (logical sessions and resume bindings) and the sessions held in
     /// memory, so a registry without persistence still protects its live
-    /// sessions. The durable scan is strict: a record that cannot be
-    /// interpreted may pin a package, so it is an error rather than an
-    /// omission.
+    /// sessions. Only the pins that are known are returned: a record that cannot
+    /// be interpreted contributes nothing here, so a gate must use
+    /// [`Self::retained_package_pins`], whose gate set covers every installed
+    /// digest in that case.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the durable store cannot be read or holds a
-    /// record that cannot be interpreted.
+    /// Returns the I/O error when the durable store cannot be read.
     pub async fn retained_package_digests(&self) -> io::Result<RetainedDigests> {
+        Ok(self.retained_package_pins().await?.known)
+    }
+
+    /// The retained digests for display and for gates.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::retained_package_digests`].
+    pub(super) async fn retained_package_pins(&self) -> io::Result<RetainedPins> {
         self.retained_digests_excluding_profile(None).await
     }
 
@@ -208,8 +267,9 @@ impl SessionRegistry {
     pub(super) async fn retained_digests_excluding_profile(
         &self,
         profile: Option<String>,
-    ) -> io::Result<RetainedDigests> {
+    ) -> io::Result<RetainedPins> {
         let mut retained = RetainedDigests::new();
+        let mut unreadable_lines = 0;
         let profiles = self.inner.profiles.clone();
         retained.extend(
             tokio::task::spawn_blocking(move || {
@@ -224,13 +284,46 @@ impl SessionRegistry {
             let pinned = tokio::task::spawn_blocking(move || store.pinned_package_digests())
                 .await
                 .map_err(|join_error| io::Error::other(join_error.to_string()))??;
-            retained.extend(pinned);
+            unreadable_lines = pinned.unreadable_lines;
+            retained.extend(pinned.digests);
         }
         let sessions = self.inner.sessions.lock().await;
         for entry in sessions.values() {
             retained.extend(pinned_digest(&entry.snapshot.launch_binding));
         }
-        Ok(retained)
+        drop(sessions);
+        let mut gate = retained.clone();
+        let uncertain = unreadable_lines > 0;
+        if uncertain {
+            tracing::debug!(
+                unreadable_lines,
+                "package gates judge every installed package: the metadata store holds a line that may pin a package and cannot be read"
+            );
+            let runtimes = self.inner.profiles.runtimes().clone();
+            let installed = tokio::task::spawn_blocking(move || {
+                runtimes
+                    .package_store()
+                    .map(|store| {
+                        store.registry().state().map(|state| {
+                            state
+                                .packages()
+                                .iter()
+                                .map(|record| record.digest().clone())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .transpose()
+            })
+            .await
+            .map_err(|join_error| io::Error::other(join_error.to_string()))?
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            gate.extend(installed.into_iter().flatten());
+        }
+        Ok(RetainedPins {
+            known: retained,
+            gate,
+            uncertain,
+        })
     }
 
     /// Uninstalls the package `digest` unless a session still references it,
@@ -240,7 +333,8 @@ impl SessionRegistry {
     ///
     /// Returns [`PackageUninstallError::Registry`] with
     /// [`RegistryError::StillReferenced`] while a session references the
-    /// digest, and the other variants for a missing store, an unreadable
+    /// digest, [`PackageUninstallError::RetentionUncertain`] while an
+    /// unreadable store line may reference it, and the other variants for a missing store, an unreadable
     /// session store, a registry refusal or a failed rebuild.
     pub async fn uninstall_package(
         &self,
@@ -277,18 +371,26 @@ impl SessionRegistry {
         // cannot release it while the removal is still in flight.
         self.spawn_transaction("package_uninstall", async move {
             let _exclusive = registry.inner.package_lifecycle.write().await;
-            let retained = registry
-                .retained_package_digests()
+            let pins = registry
+                .retained_package_pins()
                 .await
                 .map_err(PackageUninstallError::Retention)?;
             let removal = tokio::task::spawn_blocking(move || {
                 let registry = store.registry();
-                if remove_modified {
-                    registry.remove_modified(&digest, &retained)
+                let result = if remove_modified {
+                    registry.remove_modified(&digest, pins.gate())
                 } else {
-                    registry.uninstall(&digest, &retained)
+                    registry.uninstall(&digest, pins.gate())
+                };
+                match result {
+                    Err(RegistryError::StillReferenced)
+                        if pins.is_uncertain() && !pins.known().contains(&digest) =>
+                    {
+                        Err(PackageUninstallError::RetentionUncertain)
+                    }
+                    Err(error) => Err(PackageUninstallError::Registry(error)),
+                    Ok(_generation) => Ok(()),
                 }
-                .map(|_generation| ())
             })
             .await
             .map_err(|join_error| {
@@ -299,7 +401,10 @@ impl SessionRegistry {
             // registry must follow it before the error is returned.
             let committed = matches!(
                 removal,
-                Ok(()) | Err(RegistryError::RemovalIncomplete | RegistryError::CommitUncertain)
+                Ok(())
+                    | Err(PackageUninstallError::Registry(
+                        RegistryError::RemovalIncomplete | RegistryError::CommitUncertain
+                    ))
             );
             let reload = committed.then(|| runtimes.reload());
             registry.refresh_adopted_pins().await;

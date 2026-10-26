@@ -25050,7 +25050,7 @@ async fn an_uninstall_survives_the_cancellation_of_its_caller() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_retention() {
+async fn an_unreadable_store_record_blocks_uninstall_and_leaves_listing_available() {
     let dir = temp_dir("packaged-strict-retention");
     let marker = dir.join("argv.txt");
     let (script, _gate) = assigned_agent_script(&dir, &marker);
@@ -25075,11 +25075,28 @@ async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_r
         .uninstall_package(&packaged.digest)
         .await
         .expect_err("a record that cannot be read may pin the package");
-
     assert!(matches!(
         refused,
-        super::packages::PackageUninstallError::Retention(_)
+        super::packages::PackageUninstallError::RetentionUncertain
     ));
+
+    let listed = registry
+        .package_list()
+        .await
+        .expect("listing does not depend on the unreadable line");
+    assert_eq!(listed.packages.len(), 1);
+    assert!(
+        !listed.packages[0].referenced,
+        "the unreadable line proves no pin, so the package is not reported as referenced"
+    );
+    let refused = registry
+        .package_uninstall(protocol::PackageUninstallParams {
+            digest: packaged.digest.clone(),
+            remove_modified: false,
+        })
+        .await
+        .expect_err("the RPC refuses with the retention code");
+    assert_eq!(refused, protocol::PackageErrorKind::RetentionUncertain);
     assert_eq!(
         packaged
             .registry_handle()
@@ -25087,8 +25104,46 @@ async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_r
             .expect("state")
             .packages()
             .len(),
-        1
+        1,
+        "the package stays installed"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pinned_digest_is_still_referenced_while_an_unreadable_store_record_exists() {
+    let dir = temp_dir("packaged-known-pin-uncertain");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-known-pin-uncertain-plugins", &script);
+    let store_path = temp_store_path("packaged-known-pin-uncertain");
+    let registry = packaged.registry(&store_path);
+    let _created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session that pins the digest");
+    let mut store = fs::OpenOptions::new()
+        .append(true)
+        .open(&store_path)
+        .expect("open the store");
+    std::io::Write::write_all(&mut store, b"{\"type\":\"resume\",\"damaged\":\n")
+        .expect("append a damaged line");
+    drop(store);
+
+    let refused = registry
+        .package_uninstall(protocol::PackageUninstallParams {
+            digest: packaged.digest.clone(),
+            remove_modified: false,
+        })
+        .await
+        .expect_err("a live session pins the package");
+    assert_eq!(
+        refused,
+        protocol::PackageErrorKind::Referenced,
+        "a provable pin keeps its own refusal"
+    );
+    let listed = registry.package_list().await.expect("list packages");
+    assert!(listed.packages[0].referenced);
 }
 
 #[cfg(unix)]

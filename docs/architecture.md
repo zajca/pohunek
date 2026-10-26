@@ -850,7 +850,10 @@ states the contract and then the current state.
   so it resumes without the flag.
 
 Everything else stays unshimmed. A record that cannot be migrated or adopted is
-logged at WARN, surfaced to the operator, and carries a recovery hint.
+logged at WARN, surfaced to the operator, and carries a recovery hint. A
+`metadata.jsonl` line that no loader accepts stays in the file: every rewrite
+re-emits it unchanged after the parsed records, so the line is never lost to a
+later write; package gates treat it as possibly pinning any installed package.
 The operator-facing gate of the window is the upgrade preflight. `pohunek
 service check` and `pohunek service upgrade` of an existing service run
 `pohunekd upgrade-preflight` of the new archive before any effect; it prints a

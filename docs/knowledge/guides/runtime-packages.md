@@ -488,6 +488,11 @@ read counts as incompatible.
   to the old version is gone (stop and remove the sessions, unpin or rebind the
   profiles, or uninstall the old version); the package is then selectable, but
   nothing selects it for you: run `plugin select` (or `plugin update` again).
+  While a `metadata.jsonl` line that may pin a package cannot be read, every
+  installed version counts as referenced, so a version stays held back with no
+  session or profile naming it and `uninstall` fails with
+  `package_retention_uncertain`. Stop the daemon, move the line named in the
+  daemon log out of `metadata.jsonl` into a backup file and start the daemon.
 - `package.bind_profile` (the wire method behind `plugin profile migrate`)
   refuses to pin a version whose integration differs from the selected version
   of its package or from another referenced version (the pin being replaced does not count), with the same error, because the pin would be a retained
