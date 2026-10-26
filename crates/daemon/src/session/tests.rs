@@ -25050,7 +25050,7 @@ async fn an_uninstall_survives_the_cancellation_of_its_caller() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_retention() {
+async fn an_unreadable_store_record_blocks_uninstall_and_leaves_listing_available() {
     let dir = temp_dir("packaged-strict-retention");
     let marker = dir.join("argv.txt");
     let (script, _gate) = assigned_agent_script(&dir, &marker);
@@ -25075,11 +25075,28 @@ async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_r
         .uninstall_package(&packaged.digest)
         .await
         .expect_err("a record that cannot be read may pin the package");
-
     assert!(matches!(
         refused,
-        super::packages::PackageUninstallError::Retention(_)
+        super::packages::PackageUninstallError::RetentionUncertain
     ));
+
+    let listed = registry
+        .package_list()
+        .await
+        .expect("listing does not depend on the unreadable line");
+    assert_eq!(listed.packages.len(), 1);
+    assert!(
+        !listed.packages[0].referenced,
+        "the unreadable line proves no pin, so the package is not reported as referenced"
+    );
+    let refused = registry
+        .package_uninstall(protocol::PackageUninstallParams {
+            digest: packaged.digest.clone(),
+            remove_modified: false,
+        })
+        .await
+        .expect_err("the RPC refuses with the retention code");
+    assert_eq!(refused, protocol::PackageErrorKind::RetentionUncertain);
     assert_eq!(
         packaged
             .registry_handle()
@@ -25087,7 +25104,8 @@ async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_r
             .expect("state")
             .packages()
             .len(),
-        1
+        1,
+        "the package stays installed"
     );
 }
 

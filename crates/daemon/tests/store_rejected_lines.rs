@@ -1,15 +1,25 @@
-//! A store rewrite keeps every line no loader accepts, through the public
-//! daemon store boundary.
+//! A store rewrite keeps every line no loader accepts.
 //!
-//! The fixture is a schema-10 store migrated to the current schema. Two lines a
-//! build cannot load are appended: a current-schema session record carrying a
-//! desired state this build does not know, and a line that is not JSON.
+//! One scenario runs the real daemon over a store that already holds such lines
+//! and drives write RPCs; the others use the public daemon store boundary over a
+//! schema-10 fixture migrated to the current schema. The lines a build cannot
+//! load are a current-schema session record carrying a desired state this build
+//! does not know, and a line that is not JSON.
 
 // Rust guideline compliant 2026-10-26
 
-use pohunek_daemon::store::{ProjectRecord, SchemaMigration, Store};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use pohunek_daemon::store::{ProjectRecord, SchemaMigration, Store, STORE_SCHEMA_VERSION};
+use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::wait_until;
+use pohunek_test_support::{bin_exe, worker_binary};
+use protocol::SessionNewParams;
+use tokio::io::AsyncReadExt as _;
+use tokio::net::UnixStream;
 
 const SCHEMA_10: &str = include_str!("../src/store/fixtures/schema-10/metadata.jsonl");
 
@@ -117,4 +127,230 @@ fn a_store_without_rejected_lines_gains_none() {
 
     store.record_session(&session).expect("rewrite the session");
     assert_eq!(store_lines(&path).len(), 1);
+}
+
+/// Directory name the daemon uses below `XDG_DATA_HOME`.
+const DATA_APP_DIR: &str = "pohunek";
+
+/// The read limit of the durable store, as `StoreBodyTooLarge` reports it.
+const STORE_READ_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Room left below [`STORE_READ_LIMIT`] by the store of the size scenario.
+const SIZE_SCENARIO_HEADROOM: usize = 4 * 1024;
+
+/// Length of the session name that outgrows [`SIZE_SCENARIO_HEADROOM`].
+const SIZE_SCENARIO_NAME_LEN: usize = 8 * 1024;
+
+/// A current-schema session line that names a desired state this build rejects.
+fn rejected_session_line() -> String {
+    format!(
+        "{{\"kind\":\"session\",\"schema_version\":{STORE_SCHEMA_VERSION},\"session_id\":\"s-from-a-newer-daemon\",\"desired_state\":\"suspended\"}}"
+    )
+}
+
+struct Layout {
+    runtime: PathBuf,
+    state_home: PathBuf,
+    data_home: PathBuf,
+    store: PathBuf,
+}
+
+impl Layout {
+    fn new(env: &TestEnv, store_content: &str) -> Self {
+        let data_home = env.root().join("data");
+        let data_dir = data_home.join(DATA_APP_DIR);
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("make data dir private");
+        let store = data_dir.join("metadata.jsonl");
+        std::fs::write(&store, store_content).expect("write store");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600))
+            .expect("make store private");
+        Self {
+            runtime: env.root().join("r"),
+            state_home: env.root().join("s"),
+            data_home,
+            store,
+        }
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.runtime.join("pohunek/daemon.sock")
+    }
+}
+
+fn daemon_command(env: &TestEnv, layout: &Layout) -> tokio::process::Command {
+    let mut command = env.tokio_command(bin_exe("pohunekd"));
+    command
+        .env("XDG_RUNTIME_DIR", &layout.runtime)
+        .env("XDG_STATE_HOME", &layout.state_home)
+        .env("XDG_DATA_HOME", &layout.data_home)
+        .env("SHELL", "/bin/sh")
+        .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
+        .env("POHUNEK_WORKER_BIN", worker_binary())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+async fn wait_until_ready(child: &mut tokio::process::Child, socket: &Path) {
+    let connected = wait_until("the daemon control socket accepts connections", || async {
+        UnixStream::connect(socket).await.ok()
+    });
+    tokio::select! {
+        _stream = connected => {}
+        status = child.wait() => panic!("daemon exited before readiness: {status:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_started_over_rejected_lines_keeps_them_through_write_rpcs() {
+    let env = TestEnv::new().expect("create short test environment");
+    let rejected = [rejected_session_line(), CORRUPT_LINE.to_owned()];
+    let layout = Layout::new(&env, &format!("{}\n{}\n", rejected[0], rejected[1]));
+
+    let mut daemon = daemon_command(&env, &layout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    wait_until_ready(&mut daemon, &layout.socket()).await;
+    let mut client = pohunek_client::Client::connect_local(&layout.socket())
+        .await
+        .expect("connect to the daemon");
+
+    let created = client
+        .session_new(SessionNewParams {
+            name: None,
+            agent: "shell".to_owned(),
+            cwd: Some(env.root().to_path_buf()),
+            cols: 80,
+            rows: 24,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
+            input_ack_timeout_ms: None,
+            metadata: std::collections::BTreeMap::new(),
+        })
+        .await
+        .expect("create a session over a store holding rejected lines");
+    let lines = store_lines(&layout.store);
+    assert_eq!(lines.len(), 3, "the new session and both rejected lines");
+    assert!(lines[0].contains(&created.session.id.0));
+    assert_eq!(
+        lines[1..],
+        rejected,
+        "the rejected lines follow the records"
+    );
+
+    client
+        .session_remove(created.session.id.clone())
+        .await
+        .expect("remove the session");
+    assert_eq!(store_lines(&layout.store), rejected);
+
+    daemon.kill().await.expect("stop daemon");
+    let mut stderr = String::new();
+    daemon
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .await
+        .expect("read daemon stderr");
+    let _ = daemon.wait().await;
+    assert!(
+        stderr.contains("the line stays in the store unchanged"),
+        "the rejected lines are surfaced with the remedy: {stderr}"
+    );
+}
+
+#[test]
+fn a_rewrite_that_outgrows_the_read_limit_because_of_kept_lines_is_refused() {
+    let root = pohunek_test_support::tempdir().expect("private fixture root");
+    let (store, path) = fixture_store(root.path());
+    let session = store
+        .load_sessions()
+        .expect("load sessions")
+        .pop()
+        .expect("the fixture session");
+    let stored = std::fs::read_to_string(&path).expect("read current store");
+    let filler = STORE_READ_LIMIT - stored.len() - SIZE_SCENARIO_HEADROOM;
+    let mut content = stored;
+    content.push_str(&"x".repeat(filler));
+    content.push('\n');
+    std::fs::write(&path, &content).expect("append the large rejected line");
+    let before = std::fs::read(&path).expect("read store");
+
+    let mut grown = session.clone();
+    grown.info.name = Some("n".repeat(SIZE_SCENARIO_NAME_LEN));
+    let error = store
+        .record_session(&grown)
+        .expect_err("the kept line leaves no room for the larger record");
+    assert!(
+        error.to_string().contains("16777216-byte"),
+        "the refusal names the read limit: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read store"),
+        before,
+        "a refused write leaves the store unchanged"
+    );
+}
+
+#[test]
+fn only_a_line_that_may_pin_a_package_makes_the_pinned_set_incomplete() {
+    let root = pohunek_test_support::tempdir().expect("private fixture root");
+    let (store, path) = fixture_store(root.path());
+    assert_eq!(
+        store
+            .pinned_package_digests()
+            .expect("scan")
+            .unreadable_lines,
+        0
+    );
+    let mut content = std::fs::read_to_string(&path).expect("read current store");
+    let carries_no_pin = |kind: &str| {
+        format!(
+            "{{\"kind\":\"{kind}\",\"schema_version\":{STORE_SCHEMA_VERSION},\"unexpected\":1}}"
+        )
+    };
+    content.push_str(&format!(
+        "{}\n{}\n",
+        carries_no_pin("worktree"),
+        carries_no_pin("project")
+    ));
+    std::fs::write(&path, &content).expect("append unreadable worktree and project lines");
+    assert_eq!(
+        store
+            .pinned_package_digests()
+            .expect("scan")
+            .unreadable_lines,
+        0,
+        "worktree and project records carry no pin"
+    );
+
+    for may_pin in [
+        rejected_session_line(),
+        carries_no_pin("resume"),
+        carries_no_pin("kind_of_a_newer_daemon"),
+        CORRUPT_LINE.to_owned(),
+    ] {
+        content.push_str(&may_pin);
+        content.push('\n');
+    }
+    std::fs::write(&path, &content).expect("append the lines that may pin");
+    assert_eq!(
+        store
+            .pinned_package_digests()
+            .expect("scan")
+            .unreadable_lines,
+        4,
+        "a session, a resume, an unknown kind and a corrupt line may each pin"
+    );
 }

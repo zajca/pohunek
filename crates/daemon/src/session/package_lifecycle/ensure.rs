@@ -11,6 +11,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use super::super::packages::RetainedPins;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -900,7 +901,11 @@ fn apply(
         report.packages.push(entry);
     }
     for bind in binds {
-        let retained = retained_pins(&inputs.store_path, &profiles, Some(&bind.name))?;
+        let retained = RetainedPins::from_known(retained_pins(
+            &inputs.store_path,
+            &profiles,
+            Some(&bind.name),
+        )?);
         let params = PackageBindProfileParams {
             profile: bind.name.clone(),
             digest: Some(bind.digest.clone()),
@@ -2259,7 +2264,7 @@ fn install(
     store_path: &Path,
     profiles: &ProfileRegistry,
 ) -> Result<(), EnsureError> {
-    let retained = retained_pins(store_path, profiles, None)?;
+    let retained = RetainedPins::from_known(retained_pins(store_path, profiles, None)?);
     let state = read_state(context).map_err(kind_error)?;
     let digest = prepared.digest.clone();
     let definition = prepared.definition.clone();

@@ -28,13 +28,14 @@ mod selection;
 mod source;
 mod trust;
 
+use super::packages::RetainedPins;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use package::catalog_state::CatalogState;
 use package::registry::{
     InstallRequest, InstallStatus, PackageRecord, PackageSource as RecordSource, RegistryError,
-    RegistryState, RetainedDigests,
+    RegistryState,
 };
 use package::{
     archive_digest, read_archive, read_archive_with_digest, Limits, LocalTrust, LocalTrustError,
@@ -217,7 +218,7 @@ impl SessionRegistry {
                     .unregistered_roots()
                     .map_err(|error| registry_kind(&error))?;
                 for digest in unregistered {
-                    let referenced = retained.contains(&digest);
+                    let referenced = retained.known().contains(&digest);
                     findings.push(PackageFinding {
                         kind: PackageFindingKind::UnregisteredRoot,
                         digest,
@@ -227,7 +228,11 @@ impl SessionRegistry {
                         blocked_by: None,
                     });
                 }
-                for digest in retained.iter().filter(|d| state.package(d).is_none()) {
+                for digest in retained
+                    .known()
+                    .iter()
+                    .filter(|d| state.package(d).is_none())
+                {
                     findings.push(PackageFinding {
                         kind: PackageFindingKind::PinnedNotInstalled,
                         digest: digest.clone(),
@@ -255,7 +260,7 @@ impl SessionRegistry {
     async fn package_transaction<T, F>(&self, work: F) -> Result<T, PackageErrorKind>
     where
         T: Send + 'static,
-        F: FnOnce(&Context, &RetainedDigests) -> Result<T, PackageErrorKind> + Send + 'static,
+        F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageErrorKind> + Send + 'static,
     {
         self.package_transaction_excluding(None, work).await
     }
@@ -269,7 +274,7 @@ impl SessionRegistry {
     ) -> Result<T, PackageErrorKind>
     where
         T: Send + 'static,
-        F: FnOnce(&Context, &RetainedDigests) -> Result<T, PackageErrorKind> + Send + 'static,
+        F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageErrorKind> + Send + 'static,
     {
         let context = self.package_context()?;
         let registry = self.clone();
@@ -418,6 +423,10 @@ impl SessionRegistry {
                     warn!(%error, "the runtime registry was not rebuilt after an uninstall");
                     PackageErrorKind::ReloadFailed
                 }
+                PackageUninstallError::RetentionUncertain => {
+                    warn!("a package is not removed: an unreadable metadata-store line may reference it");
+                    PackageErrorKind::RetentionUncertain
+                }
                 PackageUninstallError::NoPackageStore | PackageUninstallError::Retention(_) => {
                     PackageErrorKind::RegistryFailed
                 }
@@ -509,7 +518,11 @@ impl SessionRegistry {
                 let retained = registry.package_retained().await?;
                 blocking(move || {
                     let state = read_state(&context)?;
-                    Ok(selection::retained_schemas(&context, &state, &retained))
+                    Ok(selection::retained_schemas(
+                        &context,
+                        &state,
+                        retained.gate(),
+                    ))
                 })
                 .await?
             };
@@ -529,8 +542,8 @@ impl SessionRegistry {
         .map_err(|_join_error| ProtocolError::from(PackageErrorKind::RegistryFailed))?
     }
 
-    async fn package_retained(&self) -> Result<RetainedDigests, PackageErrorKind> {
-        self.retained_package_digests().await.map_err(|error| {
+    async fn package_retained(&self) -> Result<RetainedPins, PackageErrorKind> {
+        self.retained_package_pins().await.map_err(|error| {
             warn!(%error, "the sessions that pin packages cannot be listed");
             PackageErrorKind::RegistryFailed
         })
@@ -656,7 +669,7 @@ fn inspect_record(
     context: &Context,
     state: &RegistryState,
     record: &PackageRecord,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
     report: &PackageReport,
 ) -> Inspected {
     let digest = record.digest();
@@ -675,7 +688,13 @@ fn inspect_record(
                 } else {
                     None
                 };
-                let blocked = block_of(context, state, retained, record, &declared_by(&definition));
+                let blocked = block_of(
+                    context,
+                    state,
+                    retained.gate(),
+                    record,
+                    &declared_by(&definition),
+                );
                 (Some(runtime_info(&definition)), fault, blocked)
             }
             Err(rejection) => (None, fault_of(&rejection), None),
@@ -690,7 +709,7 @@ fn inspect_record(
             installed_at_unix_seconds: record.installed_at_unix_seconds(),
             runtime_id: runtime.as_ref().map(|runtime| runtime.runtime_id.clone()),
             fault,
-            referenced: retained.contains(digest),
+            referenced: retained.known().contains(digest),
             selection_blocked,
         },
         runtime,
@@ -753,7 +772,7 @@ fn prove_loadable(
 /// `retained` computed under it.
 fn ensure_selectable(
     context: &Context,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
     digest: &PackageDigest,
     definition: &RuntimeDefinition,
 ) -> Result<(), PackageErrorKind> {
@@ -768,7 +787,7 @@ fn ensure_selectable(
     match conflict(
         context,
         &state,
-        retained,
+        retained.gate(),
         (digest, id),
         &declared_by(definition),
     ) {
@@ -788,7 +807,7 @@ fn ensure_selectable(
 fn reload_and_describe(
     context: &Context,
     digest: &PackageDigest,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
 ) -> Result<PackageChangeResult, PackageErrorKind> {
     let report = context.runtimes.reload().map_err(|error| {
         warn!(%error, "the runtime registry was not rebuilt after a package change");
@@ -956,7 +975,7 @@ fn commit_install(
     context: &Context,
     prepared: Prepared,
     plan: InstallPlan,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
 ) -> Result<PackageInstallResult, PackageErrorKind> {
     check_claim(
         &context.runtimes,
@@ -972,7 +991,7 @@ fn commit_install(
     let held_back = conflict(
         context,
         &read_state(context)?,
-        retained,
+        retained.gate(),
         (&prepared.digest, &prepared.identity.id),
         &declared_by(&prepared.definition),
     );
@@ -989,7 +1008,7 @@ fn commit_install(
                 installed_at_unix_seconds: now,
                 runtime_id: Some(runtime.runtime_id.clone()),
                 fault: None,
-                referenced: retained.contains(&prepared.digest),
+                referenced: retained.known().contains(&prepared.digest),
                 selection_blocked: held_back.map(|retained| PackageSelectionBlock {
                     reason: protocol::PackageSelectionBlockReason::IncompatibleWithRetained,
                     retained,

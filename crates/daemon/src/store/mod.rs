@@ -1450,23 +1450,24 @@ impl Store {
     }
 
     /// Package digests that any durable session record or resume binding
-    /// pinned.
+    /// pinned, and how many lines may pin a package but cannot be read.
     ///
     /// Unlike [`Self::load_sessions`] and [`Self::load_resume`], which skip a
-    /// damaged line so the rest still loads, this scan fails on a line it
+    /// damaged line so the rest still loads, this scan reports a line it
     /// cannot interpret: the line might pin a package, and a caller deciding
-    /// whether content may be deleted must not treat it as absent.
+    /// whether content may be deleted must not treat it as absent. A line may
+    /// pin unless its readable `kind` is `worktree` or `project`, which carry
+    /// no pin. The unreadable line is never searched for digests.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read or a non-empty line is
-    /// not a valid record.
-    pub fn pinned_package_digests(&self) -> io::Result<Vec<protocol::PackageDigest>> {
+    /// Returns an error when the store cannot be read or its schema is refused.
+    pub fn pinned_package_digests(&self) -> io::Result<PinnedDigests> {
         let Some(content) = self.read_content()? else {
-            return Ok(Vec::new());
+            return Ok(PinnedDigests::default());
         };
-        let mut digests = Vec::new();
-        let mut pin = |pin: &LaunchPin| {
+        let mut pinned = PinnedDigests::default();
+        let pin = |pin: &LaunchPin, digests: &mut Vec<protocol::PackageDigest>| {
             if let Some(protocol::BindingProvenance::Package { package_digest, .. }) =
                 pin.binding().map(|binding| &binding.provenance)
             {
@@ -1475,28 +1476,26 @@ impl Store {
         };
         for line in self.checked_lines(&content)? {
             let schema::ParsedLine::Record { value, .. } = line else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the metadata store holds a record that cannot be interpreted",
-                ));
+                pinned.unreadable_lines += 1;
+                continue;
             };
+            let carries_no_pin = value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "worktree" | "project"));
             match serde_json::from_value::<Record>(value) {
                 Ok(Record::Session(record)) => {
                     if let Some(recovery) = &record.recovery {
-                        pin(&recovery.launch_binding);
+                        pin(&recovery.launch_binding, &mut pinned.digests);
                     }
                 }
-                Ok(Record::Resume(binding)) => pin(&binding.launch_binding),
+                Ok(Record::Resume(binding)) => pin(&binding.launch_binding, &mut pinned.digests),
                 Ok(Record::Worktree(_) | Record::Project(_)) => {}
-                Err(_error) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "the metadata store holds a record that cannot be interpreted",
-                    ));
-                }
+                Err(_error) if carries_no_pin => {}
+                Err(_error) => pinned.unreadable_lines += 1,
             }
         }
-        Ok(digests)
+        Ok(pinned)
     }
 
     /// Splits the store text into lines and refuses a store whose schema is not
@@ -1902,6 +1901,17 @@ fn check_body_size(body: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The package digests the store pins and the lines that may pin one but cannot
+/// be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PinnedDigests {
+    /// Digests a readable session record or resume binding pins.
+    pub digests: Vec<protocol::PackageDigest>,
+    /// Lines that may pin a package and no loader accepts. Each stays in the
+    /// store, and the set of pinned digests is incomplete while one exists.
+    pub unreadable_lines: usize,
+}
+
 /// A store line that is not part of any loaded record list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RejectedLine {
@@ -1998,13 +2008,14 @@ fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, 
 ///
 /// The store holds no secrets, so logging the offending line is safe and aids
 /// debugging. The line stays in the store and every rewrite re-emits it
-/// unchanged; remove it from the store file, or move the file aside, to stop
-/// the warning.
+/// unchanged. Editing the file while the daemon runs is unsafe, because a
+/// half-written read drops the lines after the cut at the next rewrite: the
+/// remedy is to stop the daemon, move the line into a backup file and start it.
 fn warn_rejected(line: &RejectedLine) {
     warn!(
         reason = %line.reason,
         line = %line.text,
-        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged, remove it from the file to stop this warning"
+        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning stop the daemon, move the line out of the file into a backup file and start the daemon"
     );
 }
 

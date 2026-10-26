@@ -76,7 +76,8 @@ pub enum PackageFault {
 )]
 pub enum PackageSelectionBlockReason {
     /// A retained reference (a live, lost or resumable session or a host
-    /// profile pin) uses another version of the same package whose
+    /// profile pin, or an unreadable store line that may pin any installed
+    /// version) uses another version of the same package whose
     /// integration handler or hook schema differs, or cannot be determined.
     /// Selecting the package would make the runtime's integration serve two
     /// incompatible handler or schema declarations at once.
@@ -550,6 +551,9 @@ pub enum PackageErrorKind {
     IdentityConflict,
     /// A session or host profile still pins the digest.
     Referenced,
+    /// A metadata-store line that may pin the digest cannot be read, so the
+    /// removal cannot be proven safe.
+    RetentionUncertain,
     /// The recorded package root fails verification.
     RootInvalid,
     /// The recorded package root verifies, so it is not removed as modified.
@@ -601,6 +605,7 @@ impl PackageErrorKind {
             Self::IdentityInstalled => "package_identity_installed",
             Self::IdentityConflict => "package_identity_conflict",
             Self::Referenced => "package_referenced",
+            Self::RetentionUncertain => "package_retention_uncertain",
             Self::RootInvalid => "package_root_invalid",
             Self::RootIntact => "package_root_intact",
             Self::Busy => "package_registry_busy",
@@ -640,6 +645,9 @@ impl PackageErrorKind {
             }
             Self::IdentityConflict => "the digest is installed under another package identity",
             Self::Referenced => "a session or host profile still pins the package digest",
+            Self::RetentionUncertain => {
+                "an unreadable metadata-store line may pin the package digest, so it is not removed"
+            }
             Self::RootInvalid => "the installed package root fails verification",
             Self::RootIntact => {
                 "the installed package root verifies and is not removed as modified"
@@ -689,6 +697,9 @@ impl PackageErrorKind {
             Self::IdentityInstalled => "bump the package version or uninstall the old archive",
             Self::IdentityConflict => "use the digest of the installed package",
             Self::Referenced => "stop or remove the sessions and profiles that pin the digest",
+            Self::RetentionUncertain => {
+                "stop the daemon, move the unreadable line named in the daemon log out of metadata.jsonl into a backup file, and start the daemon"
+            }
             Self::RootInvalid => "reinstall the package, or remove it as modified",
             Self::RootIntact => "uninstall the package without the modified-root option",
             Self::Busy => "retry in a moment",
@@ -820,6 +831,7 @@ mod tests {
             PackageErrorKind::IdentityInstalled,
             PackageErrorKind::IdentityConflict,
             PackageErrorKind::Referenced,
+            PackageErrorKind::RetentionUncertain,
             PackageErrorKind::RootInvalid,
             PackageErrorKind::RootIntact,
             PackageErrorKind::Busy,

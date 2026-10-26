@@ -16,6 +16,7 @@ use protocol::{
 };
 use tracing::warn;
 
+use super::super::packages::RetainedPins;
 use super::selection::{conflict, differs, integration_of};
 use super::{inspect_record, prove_loadable, read_state, Context, Inspected};
 use crate::agent::host::ServedBy;
@@ -89,7 +90,7 @@ fn resolve_target(
     context: &Context,
     base: &RuntimeId,
     digest: Option<&PackageDigest>,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
 ) -> Result<Target, PackageErrorKind> {
     if matches!(context.runtimes.served_by(base), Some(ServedBy::Builtin)) {
         return Err(PackageErrorKind::ProfileBaseBuiltin);
@@ -174,7 +175,7 @@ pub(super) fn ensure_coexists(
 pub(super) fn bind_profile(
     context: &Context,
     profiles: &ProfileRegistry,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
     params: &PackageBindProfileParams,
 ) -> Result<PackageBindProfileResult, PackageErrorKind> {
     let name = params.profile.as_str();
@@ -207,7 +208,7 @@ pub(super) fn bind_profile(
     if head.pin().as_ref() == Some(&pin) {
         return Ok(result(PackageBindStatus::Unchanged, false, true));
     }
-    ensure_coexists(context, &read_state(context)?, retained, &pin.digest)?;
+    ensure_coexists(context, &read_state(context)?, retained.gate(), &pin.digest)?;
     let rewritten = apply_pin(file.text(), &pin).map_err(|detail| unusable(name, &detail))?;
     // The candidate must resolve against the target exactly as a launch of it
     // would (size bound, structure, resume and fork overrides against the
