@@ -22508,6 +22508,8 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
     exit_settled(&mut events, &created.id).await;
     let report = registry.shutdown().await;
     assert!(report.is_quiescent(), "{report:?}");
+    // The restarted daemon takes over from a registry that is gone.
+    drop(registry);
     // The daemon died after the worker ran, before it committed the create:
     // the worker still serves the final output of the ended runtime.
     let mut record = stored_record(&daemon.store_path, &created.id);
