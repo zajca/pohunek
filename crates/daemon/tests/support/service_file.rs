@@ -54,6 +54,7 @@ pub(crate) fn write_service_file(
         hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
         hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
+        inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration");

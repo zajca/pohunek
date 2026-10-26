@@ -1,0 +1,4 @@
+## Unreleased (2026-10-26, host.inspect probe cache, #1388)
+
+- `host.inspect` reads its runtime version probes through a daemon-wide cache keyed by the program's file identity, probe arguments and launch `PATH`; each distinct program is probed once per inventory, in parallel, off the async runtime. The optional `[inventory]` table of `service.toml` sets the lifetimes (`probe_cache_ttl_ms`, `probe_failure_ttl_ms`), the entry cap and the parallelism. A result can therefore be as old as the cache lifetime; a replaced, relinked or touched program is probed again at once.
+- `host.inspect` accepts the optional parameter `skip_runtime_probes: true`, which answers only the feature flags, `daemon_version` and `git_available` (empty `supported_agents` and `runtimes`). `pohunek session new --cwd`, `--from-remote` and `--input-ack-timeout-ms` send it for their capability check; an older daemon ignores it and answers the full inventory.

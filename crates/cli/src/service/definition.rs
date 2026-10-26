@@ -106,6 +106,7 @@ pub(crate) fn config_with_search_path(
         hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
         hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
+        inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
         open_files: settings::OPEN_FILES,
     })?)
 }

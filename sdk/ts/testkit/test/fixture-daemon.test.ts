@@ -1109,6 +1109,22 @@ describe("@pohunek/testkit fixture daemon", () => {
 });
 
 describe("session.wait_turn through the SDK client against the fixture daemon", () => {
+  test("host inspection answers only the flags when the runtime probes are skipped", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("skip-probes") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const flags = await client.call("host.inspect", { skip_runtime_probes: true });
+      expect(flags.runtimes).toEqual([]);
+      expect(flags.supported_agents).toEqual([]);
+      expect(flags.session_wait_turn_supported).toBe(true);
+      const full = await client.call("host.inspect", { skip_runtime_probes: false });
+      expect(full.runtimes.length).toBeGreaterThan(0);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("host inspection advertises turn waits", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-caps") } });
     try {

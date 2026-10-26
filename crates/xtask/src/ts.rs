@@ -922,6 +922,11 @@ fn add_ts_type_refs(type_expr: &str, imports: &mut BTreeSet<String>) {
         return;
     }
 
+    if let Some(non_null) = type_expr.strip_suffix(" | null") {
+        add_ts_type_refs(non_null, imports);
+        return;
+    }
+
     if let Some(item_type) = type_expr.strip_suffix("[]") {
         add_ts_type_refs(item_type, imports);
         return;

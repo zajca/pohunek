@@ -790,7 +790,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
           protocol_version: this.protocolVersion,
         } satisfies Methods["daemon.health"]["output"]);
       case "host.inspect":
-        return okResponse(request.id, cloneValue(this.hostCapabilities));
+        return this.handleHostInspect(request);
       case "host.discover":
         return this.handleHostDiscover(request);
       case "session.new":
@@ -857,6 +857,20 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       default:
         return errResponse(request.id, methodNotFound(request.method));
     }
+  }
+
+  private handleHostInspect(request: ControlRequest): ControlResponse {
+    const capabilities = cloneValue(this.hostCapabilities);
+    const params = request.params;
+    const skip =
+      typeof params === "object" &&
+      params !== null &&
+      (params as { skip_runtime_probes?: unknown }).skip_runtime_probes === true;
+    if (skip) {
+      capabilities.runtimes = [];
+      capabilities.supported_agents = [];
+    }
+    return okResponse(request.id, capabilities);
   }
 
   private handleHostDiscover(request: ControlRequest): ControlResponse {

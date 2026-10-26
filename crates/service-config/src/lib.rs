@@ -58,6 +58,12 @@
 //! max_files = 8                                    # 2..=64; including the active file
 //! max_age_days = 14                                # 1..=3650
 //!
+//! [inventory]                                      # optional table; every key optional
+//! probe_cache_ttl_ms = 120000                      # 1..=600000
+//! probe_failure_ttl_ms = 10000                     # 1..=600000
+//! probe_cache_max_entries = 256                    # 1..=4096
+//! probe_parallelism = 32                           # 1..=256
+//!
 //! [limits]
 //! open_files = 8192                                # 256..=1048576
 //! ```
@@ -82,6 +88,12 @@
 //! a previous release still reads the file unless the operator set it. A
 //! previous release that reads a file with the key reports it as an unknown key
 //! and does not enforce it.
+//!
+//! `[inventory]` bounds the version-probe cache behind `host.inspect`; see
+//! [`InventoryProbe`] and [`DEFAULT_INVENTORY_PROBE`]. The table and each of its
+//! keys are optional, a file that lacks them means the defaults, and the writer
+//! omits the table while every key equals its default, so a previous release
+//! still reads the file unless the operator set a key.
 //!
 //! # Compatibility
 //!
@@ -319,6 +331,38 @@ pub const MIN_EVENT_AGE_DAYS: u64 = 1;
 
 /// Largest accepted `events.max_age_days`: ten years.
 pub const MAX_EVENT_AGE_DAYS: u64 = 3650;
+
+/// Version-probe cache settings used when `[inventory]` names none.
+///
+/// A successful probe stays valid for two minutes: long enough that a client
+/// reading `host.inspect` repeatedly (a launcher dialog, a snapshot reseed)
+/// never pays for a probe, short enough that an interpreter or a dependency
+/// upgraded under an unchanged script is noticed within minutes. A failed
+/// probe is retried after ten seconds so a transient failure does not hide a
+/// runtime for long. 256 entries cover several hundred runtimes and profiles
+/// that share programs. 32 probes run at once, which keeps the cold inventory
+/// of a host with dozens of distinct programs within one probe timeout.
+pub const DEFAULT_INVENTORY_PROBE: InventoryProbe = InventoryProbe {
+    cache_ttl: Duration::from_secs(120),
+    failure_ttl: Duration::from_secs(10),
+    cache_max_entries: 256,
+    parallelism: 32,
+};
+
+/// Smallest accepted `inventory.probe_cache_max_entries`.
+pub const MIN_PROBE_CACHE_ENTRIES: u32 = 1;
+
+/// Largest accepted `inventory.probe_cache_max_entries`.
+pub const MAX_PROBE_CACHE_ENTRIES: u32 = 4096;
+
+/// Smallest accepted `inventory.probe_parallelism`.
+pub const MIN_PROBE_PARALLELISM: u32 = 1;
+
+/// Largest accepted `inventory.probe_parallelism`.
+///
+/// Each running probe holds one thread and a few descriptors; 256 stays far
+/// below the open-file limit every supervised job gets.
+pub const MAX_PROBE_PARALLELISM: u32 = 256;
 
 /// Shortest accepted `[waits]` value.
 ///
@@ -645,6 +689,24 @@ impl KeepaliveTiming {
     }
 }
 
+/// Version-probe cache settings recorded in `[inventory]`.
+///
+/// [`ServiceConfig::new`] keeps both TTLs within the usual deadline bounds
+/// (a whole number of milliseconds, `1..=600000`), `cache_max_entries` within
+/// [`MIN_PROBE_CACHE_ENTRIES`]`..=`[`MAX_PROBE_CACHE_ENTRIES`] and
+/// `parallelism` within [`MIN_PROBE_PARALLELISM`]`..=`[`MAX_PROBE_PARALLELISM`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InventoryProbe {
+    /// How long a successful probe result is reused.
+    pub cache_ttl: Duration,
+    /// How long a failed or timed-out probe result is reused.
+    pub failure_ttl: Duration,
+    /// Most probe results the cache keeps; the oldest are dropped first.
+    pub cache_max_entries: u32,
+    /// Most probes a single inventory runs at once.
+    pub parallelism: u32,
+}
+
 /// Event-journal retention recorded in `[events]`.
 ///
 /// [`ServiceConfig::new`] keeps `max_file_bytes` within
@@ -841,6 +903,8 @@ pub struct ConfigSpec {
     pub hook_required: Vec<RequiredHook>,
     /// Size, count and age bounds of the event journal.
     pub event_retention: EventRetention,
+    /// Version-probe cache of `host.inspect`.
+    pub inventory_probe: InventoryProbe,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -866,6 +930,7 @@ pub struct ServiceConfig {
     hook_stderr_tail_bytes: u32,
     hook_required: Vec<RequiredHook>,
     event_retention: EventRetention,
+    inventory_probe: InventoryProbe,
     open_files: u64,
     unknown: UnknownKeys,
 }
@@ -942,6 +1007,7 @@ impl ServiceConfig {
         }
         validate_required_hooks(&spec.hook_required)?;
         validate_event_retention(spec.event_retention)?;
+        validate_inventory_probe(spec.inventory_probe)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -967,6 +1033,7 @@ impl ServiceConfig {
             hook_stderr_tail_bytes: spec.hook_stderr_tail_bytes,
             hook_required: spec.hook_required,
             event_retention: spec.event_retention,
+            inventory_probe: spec.inventory_probe,
             open_files: spec.open_files,
             unknown: UnknownKeys::default(),
         })
@@ -1149,6 +1216,7 @@ impl ServiceConfig {
                     .collect(),
             },
             events: RawEvents::from(self.event_retention),
+            inventory: RawInventory::from(self.inventory_probe),
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -1183,6 +1251,7 @@ impl ServiceConfig {
             hook_stderr_tail_bytes: self.hook_stderr_tail_bytes,
             hook_required: self.hook_required.clone(),
             event_retention: self.event_retention,
+            inventory_probe: self.inventory_probe,
             open_files: self.open_files,
         }
     }
@@ -1340,6 +1409,12 @@ impl ServiceConfig {
         self.event_retention
     }
 
+    /// Version-probe cache settings of `host.inspect`.
+    #[must_use]
+    pub fn inventory_probe(&self) -> InventoryProbe {
+        self.inventory_probe
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -1407,6 +1482,8 @@ struct RawConfig {
     waits: RawWaits,
     hooks: RawHooks,
     events: RawEvents,
+    #[serde(default, skip_serializing_if = "RawInventory::is_default")]
+    inventory: RawInventory,
     limits: RawLimits,
 }
 
@@ -1643,6 +1720,122 @@ fn is_default_keepalive_count(value: &u32) -> bool {
     *value == default_keepalive_count()
 }
 
+/// On-disk `[inventory]` table in milliseconds.
+///
+/// Every key is optional: a file that lacks one means its default, and the
+/// writer omits a key that equals its default, so a file written without a
+/// deliberate setting stays readable by a release that predates the table.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the keys are the four probe settings"
+)]
+struct RawInventory {
+    #[serde(
+        default = "default_probe_cache_ttl_ms",
+        skip_serializing_if = "is_default_probe_cache_ttl_ms"
+    )]
+    probe_cache_ttl_ms: u64,
+    #[serde(
+        default = "default_probe_failure_ttl_ms",
+        skip_serializing_if = "is_default_probe_failure_ttl_ms"
+    )]
+    probe_failure_ttl_ms: u64,
+    #[serde(
+        default = "default_probe_cache_max_entries",
+        skip_serializing_if = "is_default_probe_cache_max_entries"
+    )]
+    probe_cache_max_entries: u32,
+    #[serde(
+        default = "default_probe_parallelism",
+        skip_serializing_if = "is_default_probe_parallelism"
+    )]
+    probe_parallelism: u32,
+}
+
+impl RawInventory {
+    /// Whether every key equals its default, so the whole table is omitted.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A value of every key, none at its default, used only to derive the set
+    /// of known keys.
+    fn known_keys_sample() -> Self {
+        Self {
+            probe_cache_ttl_ms: default_probe_cache_ttl_ms() + 1,
+            probe_failure_ttl_ms: default_probe_failure_ttl_ms() + 1,
+            probe_cache_max_entries: default_probe_cache_max_entries() + 1,
+            probe_parallelism: default_probe_parallelism() + 1,
+        }
+    }
+}
+
+impl Default for RawInventory {
+    fn default() -> Self {
+        Self::from(DEFAULT_INVENTORY_PROBE)
+    }
+}
+
+impl From<InventoryProbe> for RawInventory {
+    fn from(probe: InventoryProbe) -> Self {
+        Self {
+            probe_cache_ttl_ms: millis(probe.cache_ttl),
+            probe_failure_ttl_ms: millis(probe.failure_ttl),
+            probe_cache_max_entries: probe.cache_max_entries,
+            probe_parallelism: probe.parallelism,
+        }
+    }
+}
+
+fn default_probe_cache_ttl_ms() -> u64 {
+    millis(DEFAULT_INVENTORY_PROBE.cache_ttl)
+}
+
+fn default_probe_failure_ttl_ms() -> u64 {
+    millis(DEFAULT_INVENTORY_PROBE.failure_ttl)
+}
+
+fn default_probe_cache_max_entries() -> u32 {
+    DEFAULT_INVENTORY_PROBE.cache_max_entries
+}
+
+fn default_probe_parallelism() -> u32 {
+    DEFAULT_INVENTORY_PROBE.parallelism
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_probe_cache_ttl_ms(value: &u64) -> bool {
+    *value == default_probe_cache_ttl_ms()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_probe_failure_ttl_ms(value: &u64) -> bool {
+    *value == default_probe_failure_ttl_ms()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_probe_cache_max_entries(value: &u32) -> bool {
+    *value == default_probe_cache_max_entries()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_probe_parallelism(value: &u32) -> bool {
+    *value == default_probe_parallelism()
+}
+
 /// On-disk `[hooks]` table.
 #[derive(Debug, Serialize, Deserialize)]
 struct RawHooks {
@@ -1760,6 +1953,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                inventory: RawInventory::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
@@ -1784,6 +1978,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: previous.waits,
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                inventory: RawInventory::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
@@ -1804,6 +1999,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: previous.waits,
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                inventory: RawInventory::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 5);
@@ -1824,6 +2020,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: previous.waits,
                 hooks: previous.hooks,
                 events: RawEvents::DEFAULT,
+                inventory: RawInventory::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 6);
@@ -1848,6 +2045,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                inventory: RawInventory::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
@@ -1923,6 +2121,7 @@ impl RawConfig {
                 required: vec![String::new()],
             },
             events: RawEvents::DEFAULT,
+            inventory: RawInventory::known_keys_sample(),
             limits: RawLimits { open_files: 0 },
         }
     }
@@ -2236,6 +2435,12 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             max_files: raw.events.max_files,
             max_age: Duration::from_secs(max_age_days * SECONDS_PER_DAY),
         },
+        inventory_probe: InventoryProbe {
+            cache_ttl: Duration::from_millis(raw.inventory.probe_cache_ttl_ms),
+            failure_ttl: Duration::from_millis(raw.inventory.probe_failure_ttl_ms),
+            cache_max_entries: raw.inventory.probe_cache_max_entries,
+            parallelism: raw.inventory.probe_parallelism,
+        },
         open_files: raw.limits.open_files,
     })
 }
@@ -2435,6 +2640,29 @@ fn validate_duration(key: &'static str, value: Duration) -> Result<(), ConfigErr
             value: u64::try_from(value.as_millis()).unwrap_or(u64::MAX),
             min: 1,
             max: millis(MAX_DEADLINE),
+        });
+    }
+    Ok(())
+}
+
+/// Validates each `[inventory]` bound.
+fn validate_inventory_probe(probe: InventoryProbe) -> Result<(), ConfigError> {
+    validate_duration("inventory.probe_cache_ttl_ms", probe.cache_ttl)?;
+    validate_duration("inventory.probe_failure_ttl_ms", probe.failure_ttl)?;
+    if !(MIN_PROBE_CACHE_ENTRIES..=MAX_PROBE_CACHE_ENTRIES).contains(&probe.cache_max_entries) {
+        return Err(ConfigError::OutOfRange {
+            key: "inventory.probe_cache_max_entries",
+            value: u64::from(probe.cache_max_entries),
+            min: u64::from(MIN_PROBE_CACHE_ENTRIES),
+            max: u64::from(MAX_PROBE_CACHE_ENTRIES),
+        });
+    }
+    if !(MIN_PROBE_PARALLELISM..=MAX_PROBE_PARALLELISM).contains(&probe.parallelism) {
+        return Err(ConfigError::OutOfRange {
+            key: "inventory.probe_parallelism",
+            value: u64::from(probe.parallelism),
+            min: u64::from(MIN_PROBE_PARALLELISM),
+            max: u64::from(MAX_PROBE_PARALLELISM),
         });
     }
     Ok(())

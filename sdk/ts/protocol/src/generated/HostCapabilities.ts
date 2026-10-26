@@ -6,8 +6,11 @@ import type { ProtocolVersion } from "./ProtocolVersion";
 /**
  * Live capability snapshot returned by `host.inspect`.
  *
- * Built fresh on each request from the host's running daemon and a probe of its
- * `PATH`; it is never cached, so it always reflects the host as it is now.
+ * Built from the host's running daemon on each request: the presence of every
+ * agent program on its `PATH` is resolved afresh, and the version probes
+ * behind `runtimes` are shared with earlier requests for as long as the probed
+ * file is unchanged and the daemon's probe cache lifetime has not passed, so
+ * a result may be up to that lifetime old.
  */
 export type HostCapabilities = {
   /**

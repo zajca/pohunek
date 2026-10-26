@@ -40,6 +40,7 @@ export type { HostClass } from "./HostClass";
 export type { HostDiscoverParams } from "./HostDiscoverParams";
 export type { HostGovernanceStatus } from "./HostGovernanceStatus";
 export type { HostId } from "./HostId";
+export type { HostInspectParams } from "./HostInspectParams";
 export type { HostOwner } from "./HostOwner";
 export type { HostOwnerKind } from "./HostOwnerKind";
 export type { HostRecord } from "./HostRecord";

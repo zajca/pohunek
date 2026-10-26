@@ -384,6 +384,14 @@ fn from_remote_with_an_acknowledgement_reports_both_outcomes_in_json() {
     assert_eq!(params["input_ack_timeout_ms"], 250);
     assert_eq!(params["input"], "hello");
     assert_eq!(host_inspect_calls(&run), 1, "{:?}", run.served);
+    // The gate needs only the capability flags, so it asks the daemon to skip
+    // its runtime inventory.
+    let inspect = run
+        .served
+        .iter()
+        .find(|(method, _)| method == protocol::method::HOST_INSPECT)
+        .expect("host.inspect was sent");
+    assert_eq!(inspect.1, json!({"skip_runtime_probes": true}));
 }
 
 #[test]
