@@ -82,7 +82,10 @@ The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `real systemd supervision` runs all nine with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
-suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
+suites at the built binaries). The `privileged_` scenarios of
+`supervised_lifecycle.rs` start a bystander through
+`sudo systemd-run --scope` and need `POHUNEK_PRIVILEGED_E2E=1` plus passwordless
+`sudo`, which only the CI job provides; a local run adds `--skip privileged_`. The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
 called by `ci.yml` when the daemon, worker, protocol, or CLI crates change, and
 by `release.yml` before any publishable binary is built) installs the previous
 release's published Linux binaries (checksum verified, never rebuilt), runs

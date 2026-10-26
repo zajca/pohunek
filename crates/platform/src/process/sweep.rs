@@ -44,8 +44,8 @@ use rustix::process::{Pid as NativePid, Signal};
 use tokio::time::Instant;
 
 use super::{
-    Error, ProcessCoalitions, ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage,
-    SpawnId, StartIdentity,
+    ControlGroupPath, Error, ProcessCoalitions, ProcessFact, ProcessIdentity, ProcessInspector,
+    ProcessLineage, SpawnId, StartIdentity,
 };
 
 /// Largest accepted worker instance ID, in bytes.
@@ -89,6 +89,9 @@ pub struct SweepRequest {
     /// Coalitions of the worker that owned the runtime, when the caller knows
     /// them; see [`Self::with_worker_coalitions`].
     worker_coalitions: Option<ProcessCoalitions>,
+    /// Control group of the worker that owned the runtime, when the caller
+    /// knows it; see [`Self::with_worker_control_group`].
+    worker_control_group: Option<ControlGroupPath>,
 }
 
 impl SweepRequest {
@@ -131,6 +134,7 @@ impl SweepRequest {
             worker_start_identity: None,
             worker_spawn_id: None,
             worker_coalitions: None,
+            worker_control_group: None,
         })
     }
 
@@ -140,9 +144,10 @@ impl SweepRequest {
     /// a same-user process whose markers cannot be read is still provably not
     /// a descendant of the worker when its own start identity strictly
     /// precedes the worker's, on a host whose start identities order process
-    /// starts. Without the bound, and without [`Self::with_worker_spawn_id`] or
-    /// [`Self::with_worker_coalitions`], every unreadable-marker process stays
-    /// skipped and the sweep is reported unconfirmed.
+    /// starts. Without the bound, and without [`Self::with_worker_spawn_id`],
+    /// [`Self::with_worker_coalitions`] or [`Self::with_worker_control_group`],
+    /// every unreadable-marker process stays skipped and the sweep is reported
+    /// unconfirmed.
     #[must_use]
     pub fn with_worker_start_identity(
         mut self,
@@ -195,6 +200,31 @@ impl SweepRequest {
     #[must_use]
     pub fn with_worker_coalitions(mut self, worker_coalitions: Option<ProcessCoalitions>) -> Self {
         self.worker_coalitions = worker_coalitions;
+        self
+    }
+
+    /// Names the control group of the worker process instance that owned the
+    /// runtime.
+    ///
+    /// The daemon takes it from the dead worker's journal. With it, a same-user
+    /// process whose markers cannot be read and whose ancestry the fork lineage
+    /// leaves open is left out of the sweep when the host reports control groups
+    /// (see [`ProcessInspector::control_group`]) and the process lives outside
+    /// the user manager that holds the worker (see
+    /// [`ControlGroupPath::outside_user_manager_of`]): an unprivileged
+    /// descendant of the worker cannot leave that manager's cgroup subtree. A
+    /// process inside the subtree, an unreadable record, and a worker path
+    /// without a user manager are never dismissed this way, and the control
+    /// group never selects a process.
+    ///
+    /// Control-group paths are valid only within one boot, so the caller must
+    /// pass the path only when it was recorded in the current boot.
+    #[must_use]
+    pub fn with_worker_control_group(
+        mut self,
+        worker_control_group: Option<ControlGroupPath>,
+    ) -> Self {
+        self.worker_control_group = worker_control_group;
         self
     }
 
@@ -261,6 +291,12 @@ impl SweepRequest {
     #[must_use]
     pub const fn worker_coalitions(&self) -> Option<ProcessCoalitions> {
         self.worker_coalitions
+    }
+
+    /// Returns the worker control group, when the caller knows it.
+    #[must_use]
+    pub const fn worker_control_group(&self) -> Option<&ControlGroupPath> {
+        self.worker_control_group.as_ref()
     }
 }
 
@@ -759,7 +795,7 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// A process inherits its environment only when it is forked or execs, and
 /// only the worker and its descendants ever carry this runtime's marker, so
 /// a process carrying the marker must have started at or after the worker
-/// that owns the runtime, and must descend from it. Three bounds, each named by
+/// that owns the runtime, and must descend from it. Four bounds, each named by
 /// the request, decide such a process without its markers.
 ///
 /// The worker's start identity bounds the start time: a process whose start
@@ -784,6 +820,12 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// used to select, and a lineage descendant whose coalitions differ contradicts
 /// the kernel, so it is skipped unreadable instead.
 ///
+/// The worker's control group bounds the process the same way on a host whose
+/// processes live in cgroups: one outside the user manager that holds the worker
+/// is foreign (see [`outside_worker_delegation`]), because an unprivileged
+/// descendant cannot leave that manager's subtree. Only an exclusion; a process
+/// inside the subtree stays unproven.
+///
 /// Without a bound, when the process exited between the two reads, or when its
 /// start identity cannot be read, the process is not provably foreign: it stays
 /// skipped unreadable, which makes the caller's cleanup unconfirmed. The same
@@ -806,7 +848,11 @@ fn classify_unreadable_markers(
     }
     let worker_start = request.worker_start_identity();
     let worker_spawn = request.worker_spawn_id();
-    if worker_start.is_none() && worker_spawn.is_none() && request.worker_coalitions().is_none() {
+    if worker_start.is_none()
+        && worker_spawn.is_none()
+        && request.worker_coalitions().is_none()
+        && request.worker_control_group().is_none()
+    {
         return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
     }
     match inspector.identity(identity.pid) {
@@ -846,7 +892,10 @@ fn classify_unreadable_markers(
             Some(Delivery::Vanished | Delivery::Sent) => Selection::Skip(SkipReason::Vanished),
         },
         Ancestry::Unrelated => Selection::Foreign,
-        Ancestry::Unproven if outside_worker_coalitions(inspector, identity, request) => {
+        Ancestry::Unproven
+            if outside_worker_coalitions(inspector, identity, request)
+                || outside_worker_delegation(inspector, identity, request) =>
+        {
             Selection::Foreign
         }
         Ancestry::Unproven => Selection::Skip(SkipReason::MarkersUnreadable),
@@ -892,6 +941,64 @@ fn outside_worker_coalitions(
         }
     };
     matches!(verify(inspector, identity), Ok(None)) && worker.excludes(&candidate)
+}
+
+/// Whether the cgroup hierarchy attests that `identity` is outside the user
+/// manager that holds the worker.
+///
+/// True only when the request names the worker's control group, the host
+/// reports the process's, both reads are bracketed by the enumerated identity,
+/// and the process lives outside the worker's `user@<uid>.service` subtree (see
+/// [`ControlGroupPath::outside_user_manager_of`]). Every other outcome is
+/// `false`, which leaves the caller's decision as it was: no control group
+/// named, a host that reports none, a process that exited or changed meanwhile,
+/// a record the kernel denies or withholds, an identity recheck that fails, and
+/// any other read failure (a malformed path, an operating-system error). The
+/// control group only excludes, so no failure of it aborts the selection; an
+/// unexpected one is logged by process id and error class.
+fn outside_worker_delegation(
+    inspector: &dyn ProcessInspector,
+    identity: ProcessIdentity,
+    request: &SweepRequest,
+) -> bool {
+    let Some(worker) = request.worker_control_group() else {
+        return false;
+    };
+    // Every `false` below fails closed (no proof, the caller's decision stands);
+    // the identity-race and read-error returns cannot be provoked hermetically on
+    // a unified-hierarchy runner, so no scenario covers them.
+    if !matches!(verify(inspector, identity), Ok(None)) {
+        return false;
+    }
+    let candidate = match inspector.control_group(identity.pid) {
+        Ok(Some(candidate)) => candidate,
+        Ok(None)
+        | Err(
+            Error::Unavailable { .. } | Error::PermissionDenied { .. } | Error::Unobservable { .. },
+        ) => return false,
+        Err(error) if error.is_race() => return false,
+        Err(error) => {
+            tracing::event!(
+                name: "process.control_group.unreadable",
+                tracing::Level::WARN,
+                process.pid = identity.pid,
+                error.type = control_group_error_class(&error),
+                "process control group could not be read; the process stays unproven: {{error.type}}",
+            );
+            return false;
+        }
+    };
+    matches!(verify(inspector, identity), Ok(None))
+        && candidate.outside_user_manager_of(worker, request.owner_uid())
+}
+
+/// Stable label of a control-group read failure for the log.
+fn control_group_error_class(error: &Error) -> &'static str {
+    match error {
+        Error::InvalidControlGroup => "invalid_control_group",
+        Error::Io { .. } => "io",
+        _ => "other",
+    }
 }
 
 /// Stable label of a coalition read failure for the log.

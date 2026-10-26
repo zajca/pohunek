@@ -35,7 +35,9 @@ rule. The current state of each place is stated separately.
   is additive (no schema bump): the journal of an N-1 worker lacks it, and its
   lost runtime is swept without the fork-lineage proof. The same holds for the
   optional field `worker_coalitions`, which lets the sweep dismiss processes
-  the kernel places in other coalitions than the worker's. The optional outcome
+  the kernel places in other coalitions than the worker's. The optional field
+  `worker_control_group` (the worker's unified cgroup path on Linux) is additive
+  the same way: its absence leaves every unreadable-marker process unproven. The optional outcome
   field `output_forced_closed` (also on the private `ExitStatus`) is additive
   the same way: an N-1 worker's outcome lacks it and reads as `false`. The
   optional claim fields `agent`, `origin` and `reported_session` of a forwarded

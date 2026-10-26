@@ -823,7 +823,10 @@ states the contract and then the current state.
   fork-lineage proof for processes whose environment the kernel withholds. The
   optional field `worker_coalitions` (the worker's kernel resource and jetsam
   coalitions, `<resource>:<jetsam>` decimals) is additive in the same way; its
-  absence leaves those processes decided by lineage alone.
+  absence leaves those processes decided by lineage alone. The optional field
+  `worker_control_group` (the worker's unified cgroup path, valid only within the
+  boot named by `boot_identity`) is additive too: its absence leaves the Linux
+  sweep with start-time ordering alone.
 - **Public-protocol clients.** The contract: a protocol change keeps the
   previous version served through adapters, so the advertised range is
   `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.

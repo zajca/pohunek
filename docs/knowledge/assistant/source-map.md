@@ -498,7 +498,9 @@ Daemon, sessions, integrations, and project state:
   environment the kernel withholds (the worker's journaled `worker_spawn_id`;
   a launchd creator number proves nothing), the coalition exclusion (the
   worker's journaled `worker_coalitions`; only a difference between both
-  coalitions is evidence, and only of non-membership), and the never-signalled
+  coalitions is evidence, and only of non-membership), the Linux cgroup
+  exclusion (the worker's journaled `worker_control_group`; a process outside the
+  worker's `user@<uid>.service` subtree is foreign, one inside proves nothing), and the never-signalled
   skip of a worker child (`POHUNEK_WORKER_ID`) of the session without a
   worker-instance marker.
 - `crates/service-config/src/lib.rs` — `service.toml` schema, trust, and

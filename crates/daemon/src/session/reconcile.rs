@@ -194,6 +194,11 @@ pub(super) struct JournalEvidence {
     /// for a worker of the previous release.
     #[serde(default)]
     worker_coalitions: Option<String>,
+    /// Unified control-group path of the worker, valid within `boot_identity`;
+    /// absent for a worker on a host without a unified hierarchy and for a
+    /// worker of the previous release.
+    #[serde(default)]
+    worker_control_group: Option<String>,
     #[serde(rename = "runtime_id")]
     worker_instance_id: Option<String>,
     /// Package release of the worker that wrote the journal; every journal of
@@ -299,6 +304,7 @@ impl JournalEvidence {
             boot_identity: &self.boot_identity,
             spawn_id: self.worker_spawn_id.as_deref(),
             coalitions: self.worker_coalitions.as_deref(),
+            control_group: self.worker_control_group.as_deref(),
             worker_instance_id: self.worker_instance_id.as_deref(),
         }
     }
@@ -2947,7 +2953,7 @@ impl SessionRegistry {
                     // Several workers journaling one runtime cannot tell
                     // which one started it, so a fact bounds it only when
                     // every one of them agrees on it.
-                    Some((_, known, _)) => *known = known.agreeing(bounds),
+                    Some((_, known, _)) => *known = std::mem::take(known).agreeing(&bounds),
                     None => runtimes.push((journaled.to_owned(), bounds, false)),
                 }
             }
@@ -8340,6 +8346,7 @@ while os.getppid() == parent:
             boot_identity: "boot-test".to_owned(),
             worker_spawn_id: None,
             worker_coalitions: None,
+            worker_control_group: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {
@@ -8533,6 +8540,7 @@ while os.getppid() == parent:
             boot_identity: "boot-test".to_owned(),
             worker_spawn_id: None,
             worker_coalitions: None,
+            worker_control_group: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {

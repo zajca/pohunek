@@ -273,9 +273,12 @@ RELAY_DB_VARIABLE = "POHUNEK_RELAY_TEST_DATABASE_URL"
 # Variables never passed to the commands the script runs: a failing
 # command's diagnostic is quoted into the report, and these hold secrets.
 CHILD_ENV_EXCLUDED = (RELAY_DB_VARIABLE,)
-# The real-systemd suites are `#[ignore]`d and opt in per command.
+# The real-systemd suites are `#[ignore]`d and opt in per command. The
+# `privileged_` scenarios start a bystander through `sudo` and run in CI only
+# (`POHUNEK_PRIVILEGED_E2E`), so a local run skips them.
 SYSTEMD_SUITE_COMMAND = (
-    "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1"
+    "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1 "
+    "--skip privileged_"
 )
 # The one real-systemd suite whose tests are not `#[ignore]`d: they run in every
 # lane, and the real-systemd lane (the variable below) gives them the real bus.

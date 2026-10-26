@@ -88,6 +88,25 @@ puts in a resource and a jetsam coalition that both differ from the worker's,
 such as a job launchd started after the worker, is ignored as well: a descendant
 keeps the worker's coalitions through every fork, exec and reparenting.
 
+Linux decides such a process by its cgroup. The worker journals the unified
+cgroup path it runs in as the optional `worker_control_group` (no schema bump,
+used only in the boot it was recorded in). A skipped process whose own `0::` path
+lies outside the `user@<uid>.service` subtree of that path, such as a Docker
+scope or a logind session scope, is ignored and not reported: cgroup v2 lets an
+unprivileged process migrate only within the user manager's subtree, because
+everything above it is root-owned. A process inside the subtree (a user unit,
+`app-*.scope`, `systemd-run --user --scope`) proves nothing and keeps the
+cleanup unconfirmed. The evidence only excludes: it never selects or signals a
+process, and a readable marker or an older start time decides first. A journal
+without the field, a malformed path, another boot or an unreadable record give no
+proof, and so does a daemon or worker outside the initial cgroup namespace,
+whose paths are relative to another root. A same-user process with
+`CAP_DAC_OVERRIDE` or `CAP_SYS_ADMIN` through a file capability can migrate
+anywhere, and a root-owned service that starts same-user jobs with a recorded
+copy of the submitter's environment (for example `at(1)`) runs them outside the
+subtree, so they count as foreign; the marker scheme does not defend against a
+descendant that drops its markers either.
+
 Darwin adds a privilege boundary Linux does not have: the kernel serves most
 process records only to the owner of the target process and refuses everyone
 else, so ownership is settled first through the short process record, the one

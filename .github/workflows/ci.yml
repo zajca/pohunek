@@ -1373,8 +1373,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test all -- --test-threads 1 'service_config_migration::'
 
+      # Issue #186: the `privileged_` scenarios start a bystander in a scope of
+      # the system manager through `sudo systemd-run --scope`, which only a CI
+      # runner (passwordless sudo) may do; a local run skips them with
+      # `--skip privileged_`.
       - name: Supervised worker lifecycle
         if: ${{ !cancelled() }}
+        env:
+          POHUNEK_PRIVILEGED_E2E: "1"
         run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --ignored --test-threads 1
 
       - name: pohunek service upgrade with live workers

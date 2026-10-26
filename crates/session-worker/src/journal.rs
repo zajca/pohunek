@@ -418,7 +418,7 @@ pub struct JournalRecord {
     /// Worker process start identity.
     pub worker_start_identity: String,
     /// Operating-system boot identity that scopes process start identities,
-    /// the worker's spawn id and its coalitions.
+    /// the worker's spawn id, its coalitions and its control group.
     pub boot_identity: String,
     /// Kernel creation number of the worker process, as a decimal string, valid
     /// only within the boot named by `boot_identity`. Absent when the host
@@ -430,6 +430,12 @@ pub struct JournalRecord {
     /// the host has no coalitions or the worker could not read them.
     #[serde(default)]
     pub worker_coalitions: Option<String>,
+    /// Unified control-group path of the worker process (the `0::` line of
+    /// `/proc/self/cgroup`), read at initialization before the PTY child starts
+    /// and valid only within the boot named by `boot_identity`. Absent when the
+    /// host reports no unified control group or the worker could not read it.
+    #[serde(default)]
+    pub worker_control_group: Option<String>,
     /// Managed PTY root identity.
     pub child: Option<ChildIdentity>,
     /// PTY creation timestamp.
@@ -508,6 +514,7 @@ impl Debug for JournalRecord {
             .field("boot_identity", &self.boot_identity)
             .field("worker_spawn_id", &self.worker_spawn_id)
             .field("worker_coalitions", &self.worker_coalitions)
+            .field("worker_control_group", &self.worker_control_group)
             .field("child", &self.child)
             .field("pty_created_at", &self.pty_created_at)
             .field("cols", &self.cols)
@@ -567,6 +574,7 @@ impl JournalRecord {
             boot_identity,
             worker_spawn_id: None,
             worker_coalitions: None,
+            worker_control_group: None,
             child: None,
             pty_created_at: None,
             cols: None,
