@@ -349,7 +349,7 @@ impl ClaudeRig {
             .chain(self.additional_sessions.clone())
             .chain(std::iter::once(self.session.id.clone()))
         {
-            let _ = self.stop(&id).await;
+            self.stop(&id).await;
             let request = Request::make(
                 "claude-recovery-remove",
                 method::SESSION_REMOVE,

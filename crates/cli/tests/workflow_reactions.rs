@@ -18,16 +18,18 @@
 mod workflow_units;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::OFlag;
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use nix::sys::stat::Mode;
+use nix::unistd::{mkfifo, Pid};
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::wait::poll_until;
+use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 use pohunek_test_support::workers::WorkerGuard;
 use pohunek_test_support::{bin_exe, worker_binary};
 use serde_json::Value;
@@ -47,8 +49,20 @@ const CONTEXT_PREFIX: &str = "context.";
 /// Origin files of the fixture reaction.
 const ORIGIN_PREFIX: &str = "origin.";
 
-/// Marker file that makes the fixture reaction sleep per run.
-const SLOW_MARKER: &str = "slow";
+/// Marker file that makes the fixture reaction block at the gate per run.
+const HOLD_MARKER: &str = "hold";
+
+/// Marker files a blocked reaction writes once it waits at the gate.
+const HELD_PREFIX: &str = "held.";
+
+/// FIFO the blocked reaction reads; opening it for writing ends the wait.
+const GATE: &str = "gate";
+
+/// Plugin id of the barrier plugin, which reacts to `session_stopped` only.
+const BARRIER_PLUGIN: &str = "acme.barrier";
+
+/// Events created in the burst that overflows the queue.
+const BURST: usize = 10;
 
 /// Context cap that admits the context without its event and refuses the
 /// event itself: the session event is far larger than the bare context.
@@ -64,9 +78,6 @@ const WEDGED_PREFIX: &str = "wedged.";
 /// reaction: the dispatcher never waits for reactions, so this only has to
 /// cover the commands' own work, with generous headroom on a loaded host.
 const WEDGE_TOLERANCE: Duration = Duration::from_secs(20);
-
-/// How long the reaction must stay idle before a scenario counts its runs.
-const SETTLE: Duration = Duration::from_secs(2);
 
 /// The `[reactions]` knobs of the drop scenario: one queued event per plugin.
 const ONE_QUEUED_EVENT: &str = "[reactions]\nqueue_depth = 1\n";
@@ -114,9 +125,14 @@ impl Drop for Daemon {
 
 /// The plugin's state directory in `env`.
 fn state_dir(env: &TestEnv) -> PathBuf {
+    plugin_state_dir(env, PLUGIN)
+}
+
+/// The state directory of plugin `id` in `env`.
+fn plugin_state_dir(env: &TestEnv, id: &str) -> PathBuf {
     env.state_home()
         .join("pohunek/workflow-plugin-state")
-        .join(PLUGIN)
+        .join(id)
 }
 
 /// Declares the agent profile and creates one session with it, returning the
@@ -226,46 +242,100 @@ async fn session_created_reaches_the_reaction_with_no_origin_pair() {
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn a_full_queue_drops_events_and_keeps_delivering_later_ones() {
     let mut managed = Managed::new(&format!("{KNOBS}\n{ONE_QUEUED_EVENT}"));
-    let plugin = Plugin::new(PLUGIN).reaction("on_created", &["session_created"], "react");
+    // The held run outlives the burst, the stop and the barrier, so its
+    // deadline is the hang guard, not the runner's default.
+    let hang_guard_ms = u64::try_from(HANG_GUARD.as_millis()).expect("hang guard fits u64");
+    let plugin = Plugin::new(PLUGIN).reaction_within(
+        "on_created",
+        &["session_created"],
+        "react",
+        hang_guard_ms,
+    );
+    // The barrier plugin shares the dispatcher's event stream and its own
+    // queue stays empty, so its reaction proves how far the stream was routed.
+    let barrier = Plugin::new(BARRIER_PLUGIN).reaction("on_stopped", &["session_stopped"], "react");
     managed.enable(&plugin).await;
+    managed.enable(&barrier).await;
     let env = &managed.units.env;
     let dir = state_dir(env);
+    let barrier_dir = plugin_state_dir(env, BARRIER_PLUGIN);
     let _daemon = Daemon::start(env);
 
-    // Sessions created before the dispatcher subscribes go unnoticed. Once one
-    // reaction has run, the stream is connected and the reaction is idle.
-    poll_until("the dispatcher to react to a session", || {
-        create_session(env);
-        (!contexts(&dir).is_empty()).then_some(())
-    });
-    // Probe sessions may still be queued behind the first run, so wait until
-    // the reaction has been idle for a while before counting from here.
-    let before = settled_contexts(&dir);
-    fs::write(dir.join(SLOW_MARKER), b"").expect("mark the reaction slow");
+    // Every reaction of the plugin blocks at the gate until the test opens it.
+    let gate = dir.join(GATE);
+    mkfifo(&gate, Mode::from_bits_truncate(0o600)).expect("create the gate");
+    fs::write(dir.join(HOLD_MARKER), b"").expect("hold the reactions at the gate");
 
-    for _ in 0..10 {
-        create_session(env);
+    // Sessions created before the dispatcher subscribes go unnoticed. Once a
+    // reaction waits at the gate, the stream is connected and that reaction
+    // occupies the plugin's only worker.
+    let mut sessions = Vec::new();
+    poll_until("a reaction to wait at the gate", || {
+        sessions.push(create_session(env));
+        files_with(&dir, HELD_PREFIX).first().map(drop)
+    });
+    let first = contexts(&dir);
+    assert_eq!(first.len(), 1, "{first:?}");
+    let held_session = first[0]["event"]["payload"]["session"]["id"]
+        .as_str()
+        .expect("the held run names its session")
+        .to_owned();
+
+    // The worker is blocked: one event waits in the queue and the rest of the
+    // burst is shed.
+    for _ in 0..BURST {
+        sessions.push(create_session(env));
     }
-    // Drops are summed over every record, since a probe session can already
-    // have been shed before the burst started.
-    let dropped = poll_until("drop records counting the shed events", || {
-        let total: u64 = run_records(&dir)
-            .iter()
-            .filter(|record| record["outcome"] == "dropped")
-            .filter_map(|record| record["dropped"].as_u64())
-            .sum();
-        (total >= 8).then_some(total)
-    });
-    assert!(dropped >= 8, "dropped count {dropped}");
 
-    // One run was in progress and one event waited in the queue, so exactly
-    // two runs happen for the ten events.
-    poll_until("the two queued runs", || {
-        (contexts(&dir).len() == before + 2).then_some(())
+    // The stop of the last session follows every `session_created` event of
+    // the burst on the stream, and the barrier plugin's reaction runs only
+    // once the dispatcher has routed it.
+    let last = sessions.last().expect("the burst created sessions");
+    let stopped = env
+        .command(bin_exe("pohunek"))
+        .args(["session", "stop", last, "--json"])
+        .output()
+        .expect("stop the last session");
+    assert_eq!(stopped.status.code(), Some(0), "{}", describe(&stopped));
+    poll_until(
+        "the dispatcher to route the stop of the last session",
+        || (!contexts(&barrier_dir).is_empty()).then_some(()),
+    );
+    assert_eq!(
+        contexts(&dir).len(),
+        1,
+        "a second run started behind the held one"
+    );
+
+    // Releasing the gate ends the held run. The worker then records the drops
+    // and runs the one queued event, which is not held any more.
+    fs::remove_file(dir.join(HOLD_MARKER)).expect("clear the hold marker");
+    open_gate(&gate);
+    poll_until("the queued event to run", || {
+        (contexts(&dir).len() >= 2).then_some(())
     });
+
+    // Every event the stream delivered either ran or was counted as shed, and
+    // no event is left that could start a third run.
+    let delivered = sessions.len()
+        - sessions
+            .iter()
+            .position(|session| *session == held_session)
+            .expect("the held session was created by the scenario");
+    let dropped: u64 = run_records(&dir)
+        .iter()
+        .filter(|record| record["outcome"] == "dropped")
+        .filter_map(|record| record["dropped"].as_u64())
+        .sum();
+    assert!(dropped >= 8, "dropped count {dropped}");
+    assert_eq!(contexts(&dir).len(), 2, "{:?}", contexts(&dir));
+    assert_eq!(
+        usize::try_from(dropped).expect("drop count fits usize") + 2,
+        delivered,
+        "dropped count {dropped} of {delivered} delivered events"
+    );
 
     // Events arriving after the overflow are still delivered.
-    fs::remove_file(dir.join(SLOW_MARKER)).expect("clear the slow marker");
     let later = create_session(env);
     poll_until("a run for a session created after the overflow", || {
         contexts(&dir)
@@ -275,16 +345,18 @@ async fn a_full_queue_drops_events_and_keeps_delivering_later_ones() {
     });
 }
 
-/// The number of contexts once the count has stayed unchanged for a while.
-fn settled_contexts(dir: &Path) -> usize {
-    let mut last = (0, Instant::now());
-    poll_until("the reaction to settle", || {
-        let now = contexts(dir).len();
-        if now != last.0 {
-            last = (now, Instant::now());
-        }
-        (now > 0 && last.1.elapsed() >= SETTLE).then_some(now)
-    })
+/// Opens the gate FIFO for writing and closes it, which ends the read of the
+/// reaction waiting at it.
+fn open_gate(gate: &Path) {
+    // The open fails with `ENXIO` until the reaction has opened its end.
+    poll_until("the held reaction to read the gate", || {
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(OFlag::O_NONBLOCK.bits())
+            .open(gate)
+            .ok()
+            .map(drop)
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]

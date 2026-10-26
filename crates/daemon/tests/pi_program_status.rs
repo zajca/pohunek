@@ -446,7 +446,11 @@ async fn the_shipped_pi_package_opts_in_and_the_worker_answers_its_probe_once() 
     fixture.wait_activity(&created.id, IDLE).await;
     let (reason, _) = fixture.wait_turn(&created.id, NO_TURN_WAIT_MS, None).await;
     assert_eq!(reason, SessionWaitTurnReason::Timeout);
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -489,7 +493,11 @@ async fn a_pi_turn_armed_by_input_completes_once_through_the_records() {
     let idle = idle.expect("input until idle");
     assert_eq!(idle.activity, Some(AgentActivity::Idle));
     assert_eq!(idle.activity_source, Some(StateSource::OscProgress));
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -516,7 +524,11 @@ async fn a_pi_turn_shorter_than_one_sample_is_latched_working() {
         .wait_turn(&created.id, NO_TURN_WAIT_MS, Some(cursor))
         .await;
     assert_eq!(reason, SessionWaitTurnReason::Timeout, "once");
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -551,7 +563,11 @@ async fn a_pi_confirm_record_is_blocked_and_pis_own_confirm_stays_blocked_by_scr
     fixture
         .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
         .await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -577,7 +593,11 @@ async fn a_pi_busy_border_with_an_idle_record_stays_idle() {
         "only the blocked edge: the busy border changed nothing"
     );
     wait_screen(&fixture, &created.id, "Working", true).await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -603,7 +623,11 @@ async fn a_pi_screen_no_rule_matches_leaves_the_record_in_charge() {
         1,
         "only the done edge: the unmatched screen changed nothing"
     );
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -627,7 +651,11 @@ async fn a_held_pi_record_outlives_screen_changes_until_pi_clears_it() {
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
         .await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -658,7 +686,11 @@ async fn a_pi_release_without_program_status_is_classified_from_the_screen() {
         !fixture.scratch_file("reply.hex").exists(),
         "an agent that sent no probe got no reply"
     );
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -722,7 +754,11 @@ async fn an_attached_clients_probe_reply_never_reaches_pi() {
     fixture.wait_activity(&created.id, WORKING).await;
     command(&fixture, b'd');
     fixture.wait_activity(&created.id, IDLE).await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -749,7 +785,11 @@ async fn a_record_is_ignored_under_a_manifest_without_the_table() {
         .await
         .expect("inspect session");
     assert_ne!(info.state_source, StateSource::OscProgress, "{info:?}");
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }
 
@@ -782,6 +822,10 @@ async fn a_nested_pis_held_record_does_not_outlive_the_pi() {
         .then_some(info)
     })
     .await;
-    let _ = fixture.registry.stop(&created.id).await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
     fixture.end().await;
 }

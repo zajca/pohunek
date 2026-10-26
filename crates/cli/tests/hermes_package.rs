@@ -1590,6 +1590,7 @@ if os.environ.get('HERMES_TEST_CHILD_PROBE') == '1' and not any(arg in ('--versi
     .await
     else {
         // A launch that already exited cannot be killed; its output is still collected.
+        // lifecycle-result-allowed: #1601 a launch that already exited cannot be killed
         let _ = launch.kill().await;
         let output = guard("the stopped session launch", launch.wait_with_output())
             .await
