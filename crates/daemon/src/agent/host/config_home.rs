@@ -13,8 +13,11 @@
 //!
 //! `env` names the variable the agent reads to relocate its home and `default`
 //! is the directory below the user's home directory that applies while the
-//! variable is unset or empty. The table only names where to look; the daemon
-//! decides what it does there.
+//! variable is unset or empty. An optional `subdir` names a directory below the
+//! `env` value for an agent whose variable holds a parent of its home
+//! (`env = "XDG_CONFIG_HOME"`, `subdir = "muse"`, `default = ".config/muse"`);
+//! `default` stays the complete home-relative path. The table only names where
+//! to look; the daemon decides what it does there.
 
 // Rust guideline compliant 2026-10-05
 
@@ -32,6 +35,7 @@ const HOME_ENV: &str = "HOME";
 pub struct ConfigHome {
     env: String,
     default: String,
+    subdir: Option<String>,
 }
 
 impl ConfigHome {
@@ -59,7 +63,26 @@ impl ConfigHome {
         Ok(Self {
             env: env.to_owned(),
             default: default.to_owned(),
+            subdir: None,
         })
+    }
+
+    /// This declaration with `subdir` joined below the `env` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] when `subdir` is not a bounded
+    /// relative path of plain components (no absolute path, no `..`, no glob or
+    /// shell metacharacter).
+    pub fn with_subdir(mut self, subdir: &str) -> Result<Self, DefinitionError> {
+        if !is_plain_relative_path(subdir) {
+            return Err(DefinitionError::Field {
+                field: "config_home.subdir",
+                reason: "must be a relative path of plain components",
+            });
+        }
+        self.subdir = Some(subdir.to_owned());
+        Ok(self)
     }
 
     /// The variable the agent reads to relocate its home.
@@ -75,9 +98,15 @@ impl ConfigHome {
         &self.default
     }
 
+    /// The directory below the `env` value that is the home, when declared.
+    #[must_use]
+    pub fn subdir(&self) -> Option<&str> {
+        self.subdir.as_deref()
+    }
+
     /// The config home a launch would give the agent: the declared variable
-    /// when `lookup` finds it non-empty, else the declared default below the
-    /// `HOME` `lookup` finds.
+    /// (with the declared `subdir` below it) when `lookup` finds it non-empty,
+    /// else the declared default below the `HOME` `lookup` finds.
     ///
     /// `lookup` is the environment the launched agent sees, so the answer is
     /// the agent's own. Neither value is expanded: a `~` is a relative path
@@ -91,7 +120,13 @@ impl ConfigHome {
     pub fn resolve(&self, lookup: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, HomeError> {
         let (path, source) =
             if let Some(value) = lookup(&self.env).filter(|value| !value.is_empty()) {
-                (PathBuf::from(value), self.env.as_str())
+                let base = PathBuf::from(value);
+                (
+                    self.subdir
+                        .as_ref()
+                        .map_or_else(|| base.clone(), |subdir| base.join(subdir)),
+                    self.env.as_str(),
+                )
             } else {
                 let home = lookup(HOME_ENV)
                     .filter(|value| !value.is_empty())

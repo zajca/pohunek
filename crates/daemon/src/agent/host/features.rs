@@ -35,7 +35,7 @@ pub(super) struct RuntimeFeature {
     not(test),
     expect(
         dead_code,
-        reason = "no production feature row declares a gate yet; the first feature adds one"
+        reason = "no production feature row gates a compiled value yet"
     )
 )]
 pub(super) enum GateRule {
@@ -86,10 +86,16 @@ pub(super) struct FeatureTables<'a> {
 ///
 /// `fixtures/features.txt` snapshots this table; a removal or rename fails the
 /// guard test.
-pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[];
+pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[RuntimeFeature {
+    id: "config-home-subdir-v1",
+    since: "0.38.0",
+}];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
-pub(super) const FEATURE_GATES: &[FeatureGate] = &[];
+pub(super) const FEATURE_GATES: &[FeatureGate] = &[FeatureGate {
+    feature: "config-home-subdir-v1",
+    rule: GateRule::Key("config_home.subdir"),
+}];
 
 impl FeatureTables<'static> {
     /// The tables a production descriptor parse uses.

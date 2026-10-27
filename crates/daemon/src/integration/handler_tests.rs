@@ -27,6 +27,7 @@ use super::{
 };
 use crate::agent::host::fixture::{
     official_host, pi_shaped_integration_host, pi_shaped_integration_host_as,
+    pi_shaped_integration_host_with_homes,
 };
 use crate::agent::host::RuntimeHost;
 
@@ -845,6 +846,124 @@ fn a_home_several_runtimes_reach_through_one_handler_is_attributed_to_none() {
     assert_eq!(refused.code, "integration_home_ambiguous_owner");
     assert!(refused.msg.contains("`claude`, `pi`"), "{refused:?}");
     assert!(content_snapshot(&claude).is_empty(), "nothing is installed");
+}
+
+/// A `subdir` home sits below the variable's value, so a runtime declaring one
+/// does not share the home of another runtime that uses the variable bare,
+/// while two runtimes declaring the same variable and subdir do share it.
+#[test]
+fn homes_below_one_variable_are_told_apart_by_their_resolved_path() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let claude = scoped_dir("subdir-claude");
+    let codex = scoped_dir("subdir-codex");
+    let home_table = |subdir: &str| {
+        format!(
+            "\n[config_home]\nenv = \"CLAUDE_CONFIG_DIR\"\nsubdir = \"{subdir}\"\ndefault = \".claude/{subdir}\"\n"
+        )
+    };
+    let targets = |homes: &[(&str, &str)]| -> Vec<(String, Result<PathBuf, String>)> {
+        let host = pi_shaped_integration_host_with_homes(
+            Path::new("/bin/sh"),
+            CLAUDE_ID,
+            "identity-subagent-v1",
+            "\"config-home-subdir-v1\"",
+            homes,
+        );
+        with_config_dirs(&claude, &codex, || {
+            super::config_homes_for_tests(&host).targets(None, &super::HomeSelection::Runtime)
+        })
+        .expect("targets")
+        .iter()
+        .filter(|target| target.resolved.handler.id() == CLAUDE_ID)
+        .map(|target| {
+            (
+                target.resolved.runtime_id.as_str().to_owned(),
+                target
+                    .dir()
+                    .map(Path::to_path_buf)
+                    .map_err(|error| error.code),
+            )
+        })
+        .collect()
+    };
+
+    let apart = targets(&[("pi", &home_table("muse")), ("pi2", &home_table("other"))]);
+    assert_eq!(
+        apart,
+        [
+            ("claude".to_owned(), Ok(claude.clone())),
+            ("pi".to_owned(), Ok(claude.join("muse"))),
+            ("pi2".to_owned(), Ok(claude.join("other"))),
+        ]
+    );
+
+    let ambiguous = Err("integration_home_ambiguous_owner".to_owned());
+    let shared = targets(&[("pi", &home_table("muse")), ("pi2", &home_table("muse"))]);
+    assert_eq!(
+        shared,
+        [
+            ("claude".to_owned(), Ok(claude.clone())),
+            ("pi".to_owned(), ambiguous.clone()),
+            ("pi2".to_owned(), ambiguous),
+        ]
+    );
+}
+
+/// The home a launch gives an agent that declares a `subdir`: below the
+/// variable's value, below a host profile's override of it, the complete
+/// `default` while the variable is unset or empty, and an error, never the
+/// default, for a value that is not an absolute path.
+#[test]
+fn a_subdir_home_follows_the_variable_the_profile_and_the_default() {
+    use std::ffi::OsString;
+
+    use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
+
+    use crate::agent::host::ConfigHome;
+    use crate::runtime::environment::{base_environment, EnvironmentSource};
+
+    const VARIABLE: &str = "XDG_CONFIG_HOME";
+    let declared = ConfigHome::new(VARIABLE, ".config/muse")
+        .and_then(|home| home.with_subdir("muse"))
+        .expect("valid declaration");
+    let resolve = |variable: Option<&str>, profile: &[(&str, &str)]| {
+        let mut variables = vec![(OsString::from("HOME"), OsString::from("/home/u"))];
+        variables.extend(variable.map(|value| (OsString::from(VARIABLE), OsString::from(value))));
+        let allowlist: Vec<&str> = DEFAULT_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .copied()
+            .chain([VARIABLE])
+            .collect();
+        let base = base_environment(&allowlist, &EnvironmentSource::fixed(variables))
+            .expect("a base environment");
+        let profile: Vec<(String, String)> = profile
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        super::Home::resolve(&declared, &base, &profile)
+            .map(|home| home.dir)
+            .map_err(|error| error.code)
+    };
+
+    assert_eq!(resolve(Some("/x"), &[]), Ok(PathBuf::from("/x/muse")));
+    assert_eq!(
+        resolve(Some("/x"), &[(VARIABLE, "/p")]),
+        Ok(PathBuf::from("/p/muse"))
+    );
+    assert_eq!(
+        resolve(None, &[]),
+        Ok(PathBuf::from("/home/u/.config/muse"))
+    );
+    assert_eq!(
+        resolve(Some(""), &[]),
+        Ok(PathBuf::from("/home/u/.config/muse"))
+    );
+    assert_eq!(
+        resolve(Some("relative"), &[]),
+        Err("agent_config_dir_invalid".to_owned())
+    );
 }
 
 #[test]

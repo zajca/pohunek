@@ -659,6 +659,89 @@ async fn a_descriptor_requiring_an_unknown_runtime_feature_is_refused() {
     servers.stop().await;
 }
 
+/// The Pi-shaped descriptor listing `requires` (a TOML array body) before its
+/// first table, followed by `tables`.
+fn descriptor_requiring(requires: &str, tables: &str) -> String {
+    descriptor("/bin/sh").replace(
+        "runtime_api = 1\n",
+        &format!("runtime_api = 1\nrequires = [{requires}]\n"),
+    ) + tables
+}
+
+/// A `[config_home]` table declaring `subdir` below `ACME_HOME`.
+fn subdir_home_table(subdir: &str) -> String {
+    format!("\n[config_home]\nenv = \"ACME_HOME\"\nsubdir = \"{subdir}\"\ndefault = \".acme\"\n")
+}
+
+#[tokio::test]
+async fn a_config_home_subdir_installs_only_with_its_feature_and_as_a_plain_path() {
+    use pohunek_daemon::agent::host::{MAX_TRANSCRIPT_DIR_BYTES, MAX_TRANSCRIPT_DIR_COMPONENTS};
+
+    let servers = spawn_servers("pkg-subdir").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let feature = "\"config-home-subdir-v1\"";
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "without-requires",
+        &descriptor_requiring("", &subdir_home_table("muse")),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a gated key without requires").code,
+        "runtime_feature_unsupported"
+    );
+
+    let too_long = "a".repeat(MAX_TRANSCRIPT_DIR_BYTES + 1);
+    let too_deep = ["a"; MAX_TRANSCRIPT_DIR_COMPONENTS + 1].join("/");
+    for (name, subdir) in [
+        ("absolute", "/etc"),
+        ("empty", ""),
+        ("parent", "../muse"),
+        ("nested-parent", "a/../b"),
+        ("empty-segment", "a//b"),
+        ("tilde", "~/muse"),
+        ("glob", "mu*"),
+        ("space", "a b"),
+        ("too-long", too_long.as_str()),
+        ("too-deep", too_deep.as_str()),
+    ] {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(feature, &subdir_home_table(subdir)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "valid",
+        &descriptor_requiring(feature, &subdir_home_table("muse")),
+        false,
+    )
+    .await;
+    result.expect("a plain subdir with its feature installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
 #[tokio::test]
 async fn a_fork_assignment_installs_only_next_to_an_assigned_fork_and_is_shown_for_review() {
     let servers = spawn_servers("pkg-assign-fork").await;

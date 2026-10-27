@@ -671,7 +671,13 @@ impl RuntimeDefinition {
         let config_home = raw
             .config_home
             .as_ref()
-            .map(|declared| ConfigHome::new(&declared.env, &declared.default))
+            .map(|declared| {
+                let home = ConfigHome::new(&declared.env, &declared.default)?;
+                match &declared.subdir {
+                    Some(subdir) => home.with_subdir(subdir),
+                    None => Ok(home),
+                }
+            })
             .transpose()?;
         let transcripts = raw
             .transcripts
@@ -1290,6 +1296,9 @@ struct RawIntegration {
 struct RawConfigHome {
     env: String,
     default: String,
+    /// Directory below the `env` value; absent means the value is the home.
+    #[serde(default)]
+    subdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
