@@ -808,6 +808,10 @@ async fn a_stalled_await_of_the_wait_test_fails_with_a_state_dump() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the three wake reasons share one registry and one paused clock"
+)]
 async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -912,7 +916,7 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
         )
         .await;
     probe
-        .at("stop", registry.stop(&created.id))
+        .at("stop", Box::pin(registry.stop(&created.id)))
         .await
         .expect("stop session");
     let state = probe
