@@ -1542,6 +1542,22 @@ and uninstall in `crates/daemon/src/session/package_lifecycle/`.
 | Workflow plugin | The archive digest the owner supplies (`pohunek workflow install --sha256`). Not a runtime package: the archive carries `workflow.toml` and never `runtime.toml`. | Shipped ([#148](https://github.com/zajca/pohunek/issues/148)): the CLI-owned store `<state>/pohunek/workflow-plugins/` (a package registry of its own, never read by the daemon), the strict manifest, the consent install, and `pohunek workflow run`, which runs one action without a shell under the owner limits of `<config>/pohunek/workflow.toml` with a minimal environment that keeps the complete session origin pair, and logs a content-free record per run (`crates/cli/src/workflow/`, `crates/cli/src/commands/workflow.rs`). `workflow run --json` places the action's single JSON document byte for byte in the CLI envelope. Declared jobs and services run as user service manager units of the `pohunek service` installation that `workflow enable` installs and `disable`/`uninstall` remove; each unit runs the CLI's hidden `pohunek workflow __exec` trampoline, which owns the overlap lock, the wall-clock job schedule, the service backoff and the stop handling (`crates/cli/src/workflow/units.rs`, `crates/cli/src/workflow/supervised.rs`). Shipped: event reactions. A plugin's `[reactions.<name>]` tables run its argv once per matching public event (the protocol's event table minus `attach_opened` and `attach_closed`). One dispatcher unit per namespace, running the CLI's hidden `pohunek workflow __dispatch`, reads the daemon's `subscribe` stream as a separate process: it never starts the daemon, reconnects with bounded backoff, drops events for a full per-plugin queue with one `dropped` record per overflow episode, and never delays the daemon or another plugin (`crates/cli/src/workflow/dispatch.rs`). A plugin is an external command that runs as the owner and calls the public CLI or SDK. The v1 boundary ([#480](https://github.com/zajca/pohunek/issues/480)) gives core no channel or record for plugin data and no launch-time policy hook; a launch still names one concrete, locally approved profile. |
 | Daemon, overlay, session worker or GUI extension | None. | Unsupported. Protocol methods, overlay providers, worker behavior and GUI code stay compiled and audited in core or in the client that owns them. |
 
+An integration handler may also contribute per-launch input
+(`crates/daemon/src/integration/launch_input.rs`). The handler's contributor
+returns pure data for one launch: environment pairs, root-position arguments
+and private files. Core validates it, writes the files atomically as
+`launch-input.<name>` (owner-only) in the session's worker state directory, which is
+outside the paths a runtime's sandbox lets the agent write (the worktree, the
+session `TMPDIR`, the config home) though not outside the owner's account, and
+which is deleted with the session's journals, and resolves `{file:<name>}` placeholders to their absolute
+paths. The contribution is rebuilt for every create, resume and fork and applied
+in one place per launch: the environment between the profile `[env]` and the
+daemon handshake, the arguments after the frozen arguments and before the native
+session arguments. It is never part of the frozen resume snapshot, so a relaunch
+applies it exactly once. A contribution outside the bounds is refused with
+`launch_input_invalid`, one that cannot be written with
+`launch_input_unavailable`; either refuses the launch before a worker starts.
+
 Plugins live outside core. A new runtime package or workflow plugin is never
 added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,
 a third-party plugin in its author's account, and a plugin becomes installable

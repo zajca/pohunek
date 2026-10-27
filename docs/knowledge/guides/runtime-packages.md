@@ -380,6 +380,19 @@ names the official package install and then `--agent <runtime>`.
 well: status, doctor and uninstall reach the home their own `[env]` names, and
 install lists them as failing.
 
+### Per-launch input
+
+A compiled handler can contribute input to each launch of its runtimes: the
+environment pairs, root-position arguments and private files that depend on the
+session (a hook overlay and the reporter it names, say). A descriptor never
+carries this; only the handler's compiled code does. Core writes the files as
+`launch-input.<name>` (owner-only) in the session's worker state directory,
+outside the paths the runtime's sandbox lets the agent write, resolves `{file:<name>}` placeholders to their
+absolute paths, applies the result to every create, resume and fork, and never
+stores it in the resume snapshot. A contribution core cannot accept refuses the
+launch with `launch_input_invalid`; one it cannot write refuses it with
+`launch_input_unavailable`.
+
 ## Local only
 
 Package commands act on the daemon on this machine through its local control

@@ -42,6 +42,7 @@ use protocol::{
 
 use super::commit::StepGate;
 use super::homes::{ConfigHomes, HomeSelection, Target};
+use super::launch_input::LaunchContributor;
 use super::{config_dir_is_symlink, config_path_kind, report, ConfigPath, InstallPaths};
 use crate::agent::host::{is_reserved, ConfigHome, RuntimeHost};
 
@@ -155,6 +156,12 @@ pub trait DaemonHandler: Send + Sync + Debug {
         runtime: &RuntimeRef,
         dir: &Path,
     ) -> Result<IntegrationUninstallReport, ProtocolError>;
+
+    /// The contributor of per-launch input for runtimes that use this handler,
+    /// if the handler needs any.
+    fn launch_contributor(&self) -> Option<&'static dyn LaunchContributor> {
+        None
+    }
 
     /// The built-in runtime of an earlier release that used this handler and
     /// that this build does not compile in, if any.
@@ -286,6 +293,28 @@ impl Handler {
             Self::Daemon(handler) => handler.reported_actions(),
             Self::CliRun(handler) => handler.actions,
         }
+    }
+}
+
+/// The launch-input contributor of the handler `definition` names, if any.
+#[must_use]
+pub(crate) fn launch_contributor(
+    definition: &crate::agent::host::RuntimeDefinition,
+) -> Option<&'static dyn LaunchContributor> {
+    #[cfg(test)]
+    if let Some((named, contributor)) = crate::test_support::thread_launch_contributor() {
+        if definition
+            .integration_handler()
+            .map(crate::agent::host::HandlerId::as_str)
+            == Some(named)
+        {
+            return Some(contributor);
+        }
+    }
+    let id = definition.integration_handler()?;
+    match handler(id.as_str())? {
+        Handler::Daemon(handler) => handler.launch_contributor(),
+        Handler::CliRun(_) => None,
     }
 }
 

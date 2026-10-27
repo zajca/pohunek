@@ -20,6 +20,7 @@ use crate::agent::{
     ReferenceCheckFailure, ReferenceExistence, StoreRoot,
 };
 use crate::detect::Manifest;
+use crate::integration::launch_input::LaunchKind;
 use crate::runtime::environment::{base_environment, effective_variable};
 use package::PackageDigest;
 use pohunek_worker_protocol::BaseEnv;
@@ -794,6 +795,10 @@ impl SessionRegistry {
     /// absent or cannot be verified, `agent_native_store_relocated` when the
     /// agent would keep its conversations outside the declared store,
     /// and otherwise the source lookup, launch-template, or launch error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fork transaction stays linear so every refusal precedes the registration"
+    )]
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
@@ -840,18 +845,24 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let env_extra =
-            self.launch_env(&relaunch.definition, &env, binding.agent_base.clone(), &id);
+        let inputs = self.launch_inputs(
+            &relaunch.definition,
+            &env,
+            binding.agent_base.clone(),
+            &id,
+            LaunchKind::Fork,
+            &binding.args,
+        )?;
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: params.cols,
             rows: params.rows,
-            env_extra,
+            env_extra: inputs.env,
             validated_program,
         };
         let (command, fork_reference) = fork_pty_command_from_launch(
             &program,
-            binding.args.clone(),
+            command_args(&binding.args, &inputs.root_args),
             &launch,
             &session_ref,
             &opts,
@@ -1213,18 +1224,24 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let env_extra =
-            self.launch_env(&relaunch.definition, &env, binding.agent_base.clone(), &id);
+        let inputs = self.launch_inputs(
+            &relaunch.definition,
+            &env,
+            binding.agent_base.clone(),
+            &id,
+            LaunchKind::Resume,
+            &binding.args,
+        )?;
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
             rows: binding.rows,
-            env_extra,
+            env_extra: inputs.env,
             validated_program,
         };
         let command = resume_pty_command_from_launch(
             &program,
-            binding.args.clone(),
+            command_args(&binding.args, &inputs.root_args),
             &launch,
             &session_ref,
             &opts,
@@ -1990,4 +2007,10 @@ fn join_error_to_io<T>(err: tokio::task::JoinError) -> io::Result<T> {
     Err(io::Error::other(format!(
         "blocking store task failed: {err}"
     )))
+}
+
+/// The frozen arguments of a relaunch followed by the launch-input arguments,
+/// for the command only: the snapshot keeps the frozen arguments alone.
+fn command_args(frozen: &[String], root_args: &[String]) -> Vec<String> {
+    frozen.iter().chain(root_args).cloned().collect()
 }

@@ -1027,6 +1027,57 @@ pub fn parse_journal_temp_name(name: &str) -> Option<(&str, u32)> {
     Some((worker_id, pid.parse().ok().filter(|_| digits(pid))?))
 }
 
+/// Name prefix of a launch-input file in a session's worker state directory.
+///
+/// The daemon writes the private files a runtime's launch contributor asks for
+/// (a hook overlay, a reporter script) there as `launch-input.<name>`; a
+/// journal-directory deletion unlinks them with the journals.
+pub const LAUNCH_INPUT_PREFIX: &str = "launch-input.";
+
+/// Longest launch-input file name after [`LAUNCH_INPUT_PREFIX`], in bytes.
+const MAX_LAUNCH_INPUT_NAME_BYTES: usize = 48;
+
+/// Whether `name` is a valid launch-input file name: lower-case ASCII letters,
+/// digits, `-`, `_` and interior `.`, so it is one safe path component that
+/// cannot be `.` or `..`.
+#[must_use]
+pub fn valid_launch_input_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_LAUNCH_INPUT_NAME_BYTES
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+/// The file name of launch-input file `name` in a session's state directory.
+#[must_use]
+pub fn launch_input_file_name(name: &str) -> String {
+    format!("{LAUNCH_INPUT_PREFIX}{name}")
+}
+
+/// The name of the unfinished write of launch-input file `name`.
+#[must_use]
+pub fn launch_input_temp_name(name: &str) -> String {
+    format!(".{LAUNCH_INPUT_PREFIX}{name}.tmp")
+}
+
+/// Whether `entry` is a launch-input file or the unfinished write of one.
+#[must_use]
+pub fn is_launch_input_entry(entry: &str) -> bool {
+    let finished = entry.strip_prefix(LAUNCH_INPUT_PREFIX);
+    let unfinished = entry
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_prefix(LAUNCH_INPUT_PREFIX))
+        .and_then(|rest| rest.strip_suffix(".tmp"));
+    finished
+        .into_iter()
+        .chain(unfinished)
+        .any(valid_launch_input_name)
+}
+
 /// Whether `text` is a non-empty run of ASCII digits.
 fn digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())

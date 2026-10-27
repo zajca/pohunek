@@ -56,6 +56,20 @@ impl SessionRegistry {
         agent: RuntimeRef,
         id: &SessionId,
     ) -> LaunchEnv {
+        self.launch_env_with(definition, profile_env, &[], agent, id)
+    }
+
+    /// [`Self::launch_env`] with the `contributed` pairs of the runtime's
+    /// launch-input contributor between the profile `[env]` and the daemon
+    /// handshake. A contributed name cannot be `POHUNEK_*`.
+    pub(super) fn launch_env_with(
+        &self,
+        definition: &RuntimeDefinition,
+        profile_env: &[(String, String)],
+        contributed: &[(String, String)],
+        agent: RuntimeRef,
+        id: &SessionId,
+    ) -> LaunchEnv {
         let mut env = LaunchEnv::default();
         env.extend(definition.launch_env().iter().cloned());
         // A path that is not UTF-8 cannot travel in the launch environment;
@@ -70,6 +84,7 @@ impl SessionRegistry {
             env.extend([(TMPDIR.to_owned(), private)]);
         }
         env.extend(profile_env.iter().cloned());
+        env.extend(contributed.iter().cloned());
         env.extend(self.session_pty_env(agent, id));
         env
     }

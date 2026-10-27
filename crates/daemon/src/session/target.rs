@@ -1418,13 +1418,15 @@ impl SessionRegistry {
 
 /// Builds the launch command of a new session.
 ///
-/// `native_args` is the argv fragment that hands an assigned native reference
-/// to the agent; it follows the runtime's fixed arguments and precedes the
-/// initial prompt argument.
+/// `root_args` are the runtime's launch-input arguments; they follow the
+/// runtime's fixed arguments. `native_args` is the argv fragment that hands an
+/// assigned native reference to the agent; it follows `root_args` and precedes
+/// the initial prompt argument.
 pub(super) fn build_launch_command(
     resolved: &ResolvedAgent,
     runtimes: &RuntimeHost,
     opts: &LaunchOpts,
+    root_args: &[String],
     native_args: &[String],
     initial_input: Option<String>,
 ) -> Result<LaunchCommandPlan, ProtocolError> {
@@ -1439,6 +1441,7 @@ pub(super) fn build_launch_command(
         // A bare base kind launches its definition's program and arguments.
         None => host::launch_command(runtimes, &resolved.definition, opts)?,
     };
+    command.args.extend_from_slice(root_args);
     command.args.extend_from_slice(native_args);
     Ok(plan_initial_input_delivery(
         resolved,
