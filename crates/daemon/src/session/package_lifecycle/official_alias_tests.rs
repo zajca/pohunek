@@ -5956,3 +5956,79 @@ async fn listing_sessions_of_one_package_verifies_its_root_once_per_runtime_sour
         "the listing cost does not grow with the number of sessions"
     );
 }
+
+/// Seeds the journal directory of a removed session `id` below `root`: one
+/// schema-1 journal of a worker that is not running, last changed `age` ago.
+fn seed_orphan_journals(root: &Path, id: &str, age: std::time::Duration) -> PathBuf {
+    let directory = root.join(id);
+    fs::create_dir_all(&directory).expect("create the orphan journal directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .expect("secure the directory");
+    let journal = directory.join("worker-aaaa.json");
+    fs::write(
+        &journal,
+        format!(
+            r#"{{"schema_version":1,"session_id":"{id}","worker_pid":4194000,"worker_start_identity":"1","phase":"live"}}"#
+        ),
+    )
+    .expect("write the journal");
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).expect("secure the journal");
+    let changed = std::time::SystemTime::now() - age;
+    for path in [&journal, &directory] {
+        fs::File::open(path)
+            .expect("open for aging")
+            .set_modified(changed)
+            .expect("age the path");
+    }
+    directory
+}
+
+/// Startup deletes the aged journal directories of sessions the store no
+/// longer holds and keeps those of stored sessions and those inside the
+/// retention window.
+#[tokio::test]
+async fn startup_collects_orphaned_journals_and_keeps_the_rest() {
+    let session = stopped_built_in_claude("claude-journal-collect").await;
+    let root = session
+        .fixture
+        .registry
+        .inner
+        .config
+        .worker_state_root
+        .clone()
+        .expect("worker state root");
+    let aged = std::time::Duration::from_hours(720);
+    let orphan = seed_orphan_journals(&root, "s-9001", aged);
+    let recent = seed_orphan_journals(&root, "s-9002", std::time::Duration::ZERO);
+    let stored = root.join(&session.id.0);
+    assert!(stored.is_dir());
+
+    let _restarted = restart(&session.fixture).await;
+
+    assert!(!orphan.exists(), "an aged orphan with a dead worker goes");
+    assert!(recent.is_dir(), "a directory inside the window stays");
+    assert!(stored.is_dir(), "the journals of a stored session stay");
+}
+
+/// A store line that names no session leaves every owner in doubt, so startup
+/// collects nothing.
+#[tokio::test]
+async fn startup_collects_no_journals_while_the_owners_are_in_doubt() {
+    let session = stopped_built_in_claude("claude-journal-doubt").await;
+    let root = session
+        .fixture
+        .registry
+        .inner
+        .config
+        .worker_state_root
+        .clone()
+        .expect("worker state root");
+    let orphan = seed_orphan_journals(&root, "s-9001", std::time::Duration::from_hours(720));
+    let mut store = fs::read(&session.store_path).expect("read the store");
+    store.extend_from_slice(b"{not a record\n");
+    fs::write(&session.store_path, store).expect("append an unattributable line");
+
+    let _restarted = restart(&session.fixture).await;
+
+    assert!(orphan.is_dir(), "no collection while ownership is unknown");
+}

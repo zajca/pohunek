@@ -94,6 +94,14 @@
 //! omits the table while every key equals its default, so a previous release
 //! still reads the file unless the operator set a key.
 //!
+//! `[worker_journals]` bounds how long the daemon keeps the journal directory of
+//! a session that no longer exists; see [`DEFAULT_WORKER_JOURNAL_MAX_AGE`]. The
+//! table and its `max_age_days` key are optional, a file that lacks them means
+//! the default, and the writer omits the table while the key equals the
+//! default, so a previous release still reads the file unless the operator set
+//! it. A previous release that reads a file with the table reports it as an
+//! unknown table and keeps the journals.
+//!
 //! # Compatibility
 //!
 //! `schema_version` changes only for a breaking change: a removed or renamed
@@ -305,6 +313,24 @@ pub const DEFAULT_EVENT_RETENTION: EventRetention = EventRetention {
     max_files: 8,
     max_age: Duration::from_secs(14 * SECONDS_PER_DAY),
 };
+
+/// How long the journal directory of a session that no longer exists is kept
+/// before the daemon's startup collection may delete it, used when
+/// `[worker_journals]` names none.
+///
+/// The journals of a removed session are evidence for cleaning up its worker
+/// and for a replayed removal. Seven days is long enough for the owner to
+/// notice and investigate a failed removal or a crashed worker, and short
+/// enough that orphans of a busy host do not accumulate for weeks. Raising it
+/// keeps the evidence longer; lowering it frees the disk sooner but narrows the
+/// forensic window.
+pub const DEFAULT_WORKER_JOURNAL_MAX_AGE: Duration = Duration::from_secs(7 * SECONDS_PER_DAY);
+
+/// Smallest accepted `worker_journals.max_age_days`.
+pub const MIN_WORKER_JOURNAL_AGE_DAYS: u64 = 1;
+
+/// Largest accepted `worker_journals.max_age_days`.
+pub const MAX_WORKER_JOURNAL_AGE_DAYS: u64 = 365;
 
 /// Seconds in one day, the unit of `events.max_age_days`.
 const SECONDS_PER_DAY: u64 = 86_400;
@@ -891,6 +917,10 @@ pub struct ConfigSpec {
     pub event_retention: EventRetention,
     /// Version-probe cache of `host.inspect`.
     pub inventory_probe: InventoryProbe,
+    /// Age after which the journal directory of a removed session is collected
+    /// at daemon start; a whole number of days within
+    /// [`MIN_WORKER_JOURNAL_AGE_DAYS`]`..=`[`MAX_WORKER_JOURNAL_AGE_DAYS`].
+    pub worker_journal_max_age: Duration,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -917,6 +947,7 @@ pub struct ServiceConfig {
     hook_required: Vec<RequiredHook>,
     event_retention: EventRetention,
     inventory_probe: InventoryProbe,
+    worker_journal_max_age: Duration,
     open_files: u64,
     unknown: UnknownKeys,
 }
@@ -990,6 +1021,7 @@ impl ServiceConfig {
         validate_required_hooks(&spec.hook_required)?;
         validate_event_retention(spec.event_retention)?;
         validate_inventory_probe(spec.inventory_probe)?;
+        validate_worker_journal_max_age(spec.worker_journal_max_age)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -1016,6 +1048,7 @@ impl ServiceConfig {
             hook_required: spec.hook_required,
             event_retention: spec.event_retention,
             inventory_probe: spec.inventory_probe,
+            worker_journal_max_age: spec.worker_journal_max_age,
             open_files: spec.open_files,
             unknown: UnknownKeys::default(),
         })
@@ -1198,6 +1231,7 @@ impl ServiceConfig {
             },
             events: RawEvents::from(self.event_retention),
             inventory: RawInventory::from(self.inventory_probe),
+            worker_journals: RawWorkerJournals::from(self.worker_journal_max_age),
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -1233,6 +1267,7 @@ impl ServiceConfig {
             hook_required: self.hook_required.clone(),
             event_retention: self.event_retention,
             inventory_probe: self.inventory_probe,
+            worker_journal_max_age: self.worker_journal_max_age,
             open_files: self.open_files,
         }
     }
@@ -1396,6 +1431,13 @@ impl ServiceConfig {
         self.inventory_probe
     }
 
+    /// Age after which the journal directory of a removed session is collected
+    /// at daemon start.
+    #[must_use]
+    pub fn worker_journal_max_age(&self) -> Duration {
+        self.worker_journal_max_age
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -1465,6 +1507,8 @@ struct RawConfig {
     events: RawEvents,
     #[serde(default, skip_serializing_if = "RawInventory::is_default")]
     inventory: RawInventory,
+    #[serde(default, skip_serializing_if = "RawWorkerJournals::is_default")]
+    worker_journals: RawWorkerJournals,
     limits: RawLimits,
 }
 
@@ -1712,6 +1756,58 @@ struct RawInventory {
     probe_parallelism: u32,
 }
 
+/// The optional `[worker_journals]` table: its key is optional and omitted
+/// while it equals its default.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RawWorkerJournals {
+    #[serde(
+        default = "default_worker_journal_max_age_days",
+        skip_serializing_if = "is_default_worker_journal_max_age_days"
+    )]
+    max_age_days: u64,
+}
+
+impl RawWorkerJournals {
+    /// Whether the key equals its default, so the whole table is omitted.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A value of the key that is not its default, used only to derive the set
+    /// of known keys.
+    fn known_keys_sample() -> Self {
+        Self {
+            max_age_days: default_worker_journal_max_age_days() + 1,
+        }
+    }
+}
+
+impl Default for RawWorkerJournals {
+    fn default() -> Self {
+        Self::from(DEFAULT_WORKER_JOURNAL_MAX_AGE)
+    }
+}
+
+impl From<Duration> for RawWorkerJournals {
+    fn from(max_age: Duration) -> Self {
+        Self {
+            max_age_days: max_age.as_secs() / SECONDS_PER_DAY,
+        }
+    }
+}
+
+fn default_worker_journal_max_age_days() -> u64 {
+    DEFAULT_WORKER_JOURNAL_MAX_AGE.as_secs() / SECONDS_PER_DAY
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_worker_journal_max_age_days(value: &u64) -> bool {
+    *value == default_worker_journal_max_age_days()
+}
+
 impl RawInventory {
     /// Whether every key equals its default, so the whole table is omitted.
     fn is_default(&self) -> bool {
@@ -1913,6 +2009,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
                 inventory: RawInventory::default(),
+                worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
@@ -1938,6 +2035,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
                 inventory: RawInventory::default(),
+                worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
@@ -1959,6 +2057,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
                 inventory: RawInventory::default(),
+                worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 5);
@@ -1980,6 +2079,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 hooks: previous.hooks,
                 events: RawEvents::DEFAULT,
                 inventory: RawInventory::default(),
+                worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 6);
@@ -2005,6 +2105,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
                 inventory: RawInventory::default(),
+                worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
@@ -2080,6 +2181,7 @@ impl RawConfig {
             },
             events: RawEvents::DEFAULT,
             inventory: RawInventory::known_keys_sample(),
+            worker_journals: RawWorkerJournals::known_keys_sample(),
             limits: RawLimits { open_files: 0 },
         }
     }
@@ -2352,6 +2454,15 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             max: MAX_EVENT_AGE_DAYS,
         });
     }
+    let journal_age_days = raw.worker_journals.max_age_days;
+    if journal_age_days > MAX_WORKER_JOURNAL_AGE_DAYS {
+        return Err(ConfigError::OutOfRange {
+            key: "worker_journals.max_age_days",
+            value: journal_age_days,
+            min: MIN_WORKER_JOURNAL_AGE_DAYS,
+            max: MAX_WORKER_JOURNAL_AGE_DAYS,
+        });
+    }
     ServiceConfig::new(ConfigSpec {
         prefix: PathBuf::from(raw.prefix),
         active_version: raw.active_version,
@@ -2398,6 +2509,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             cache_max_entries: raw.inventory.probe_cache_max_entries,
             parallelism: raw.inventory.probe_parallelism,
         },
+        worker_journal_max_age: Duration::from_secs(journal_age_days * SECONDS_PER_DAY),
         open_files: raw.limits.open_files,
     })
 }
@@ -2620,6 +2732,25 @@ fn validate_inventory_probe(probe: InventoryProbe) -> Result<(), ConfigError> {
             value: u64::from(probe.parallelism),
             min: u64::from(MIN_PROBE_PARALLELISM),
             max: u64::from(MAX_PROBE_PARALLELISM),
+        });
+    }
+    Ok(())
+}
+
+/// Validates the `[worker_journals]` bound.
+fn validate_worker_journal_max_age(max_age: Duration) -> Result<(), ConfigError> {
+    if !max_age.as_secs().is_multiple_of(SECONDS_PER_DAY) || max_age.subsec_nanos() != 0 {
+        return Err(ConfigError::Precision {
+            key: "worker_journals.max_age_days",
+        });
+    }
+    let days = max_age.as_secs() / SECONDS_PER_DAY;
+    if !(MIN_WORKER_JOURNAL_AGE_DAYS..=MAX_WORKER_JOURNAL_AGE_DAYS).contains(&days) {
+        return Err(ConfigError::OutOfRange {
+            key: "worker_journals.max_age_days",
+            value: days,
+            min: MIN_WORKER_JOURNAL_AGE_DAYS,
+            max: MAX_WORKER_JOURNAL_AGE_DAYS,
         });
     }
     Ok(())

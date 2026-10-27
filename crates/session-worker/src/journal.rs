@@ -627,6 +627,18 @@ pub struct OutdatedJournal {
 }
 
 impl OutdatedJournal {
+    /// Reads the liveness facts of a journal an older build wrote.
+    ///
+    /// Returns `None` for bytes that are not a JSON object with a
+    /// `schema_version` below this build's, so a current or newer journal is
+    /// never mistaken for an outdated one.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let schema_version = u32::try_from(value.get("schema_version")?.as_u64()?).ok()?;
+        (schema_version < JOURNAL_SCHEMA_VERSION).then(|| Self::from_value(schema_version, &value))
+    }
+
     fn from_value(schema_version: u32, value: &serde_json::Value) -> Self {
         Self {
             schema_version,

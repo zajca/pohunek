@@ -804,6 +804,7 @@ fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceC
     config.hook_required = service.hook_required().to_vec();
     config.event_retention = service.event_retention();
     config.inventory_probe = service.inventory_probe();
+    config.worker_journal_max_age = service.worker_journal_max_age();
 }
 
 /// Applies the validated `session.wait_turn` default and ceiling and the

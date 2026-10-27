@@ -107,7 +107,7 @@ impl EntryIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MoveOutcome {
-    /// The source was moved and directory metadata was synchronized.
+    /// The source was moved.
     Moved,
     /// The destination already existed and neither entry was changed.
     DestinationExists,
@@ -123,6 +123,18 @@ pub enum RemoveOutcome {
     Missing,
     /// The staged name referred to a different inode and was preserved.
     IdentityChanged,
+}
+
+/// The result of removing an empty child directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EmptyRemoval {
+    /// The empty directory was removed.
+    Removed,
+    /// The name no longer existed.
+    Missing,
+    /// The directory holds entries and was left in place.
+    NotEmpty,
 }
 
 /// The result of moving an entry to an inode-bound staging name.
@@ -1024,6 +1036,50 @@ impl TrustedDir {
         Ok(names)
     }
 
+    /// Unlinks the entry `name` of this directory without following a link.
+    ///
+    /// Returns `false` when the name does not exist. A directory is not
+    /// removed: `unlinkat` refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] for an invalid name or an unlink failure other than
+    /// absence.
+    pub fn remove_entry(&self, name: impl AsRef<OsStr>) -> FsResult<bool> {
+        let name = validate_component(name.as_ref())?;
+        match fs::unlinkat(&self.file, name, AtFlags::empty()) {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(source) => Err(io_error(
+                "remove directory entry",
+                &self.path.join(name),
+                source,
+            )),
+        }
+    }
+
+    /// Removes the child directory `name` only if it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] for an invalid name or a failure other than absence
+    /// or a non-empty directory.
+    pub fn remove_empty_child(&self, name: impl AsRef<OsStr>) -> FsResult<EmptyRemoval> {
+        let name = validate_component(name.as_ref())?;
+        match fs::unlinkat(&self.file, name, AtFlags::REMOVEDIR) {
+            Ok(()) => Ok(EmptyRemoval::Removed),
+            Err(rustix::io::Errno::NOENT) => Ok(EmptyRemoval::Missing),
+            Err(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST) => {
+                Ok(EmptyRemoval::NotEmpty)
+            }
+            Err(source) => Err(io_error(
+                "remove empty directory",
+                &self.path.join(name),
+                source,
+            )),
+        }
+    }
+
     /// Lists at most `limit` names through the retained descriptor.
     ///
     /// Names are never resolved, so a symbolic link is listed as a name and
@@ -1741,12 +1797,42 @@ impl TrustedDir {
         Ok(Some(staged))
     }
 
-    /// Atomically moves one entry without replacing an existing destination.
+    /// Atomically moves one entry without replacing an existing destination,
+    /// then synchronizes both directories.
     ///
     /// # Errors
     ///
     /// Returns [`FsError`] for invalid names, unsupported kernel primitives, or I/O.
     pub fn move_no_replace(
+        &self,
+        source: impl AsRef<OsStr>,
+        destination_dir: &TrustedDir,
+        destination: impl AsRef<OsStr>,
+    ) -> FsResult<MoveOutcome> {
+        let source = validate_component(source.as_ref())?;
+        let destination = validate_component(destination.as_ref())?;
+        let destination_path = destination_dir.path.join(destination);
+        match self.move_no_replace_unsynced(source, destination_dir, destination)? {
+            MoveOutcome::Moved => {}
+            other => return Ok(other),
+        }
+        self.sync()
+            .map_err(|error| committed_error("move entry", &self.path.join(source), error))?;
+        destination_dir
+            .sync()
+            .map_err(|error| committed_error("move entry", &destination_path, error))?;
+        Ok(MoveOutcome::Moved)
+    }
+
+    /// [`Self::move_no_replace`] without synchronizing either directory.
+    ///
+    /// For a move whose loss in a crash only repeats work, such as renaming a
+    /// directory to a tombstone that the next start finishes deleting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] for invalid names, unsupported kernel primitives, or I/O.
+    pub fn move_no_replace_unsynced(
         &self,
         source: impl AsRef<OsStr>,
         destination_dir: &TrustedDir,
@@ -1790,11 +1876,6 @@ impl TrustedDir {
                 ));
             }
         }
-        self.sync()
-            .map_err(|error| committed_error("move entry", &self.path.join(source), error))?;
-        destination_dir
-            .sync()
-            .map_err(|error| committed_error("move entry", &destination_path, error))?;
         Ok(MoveOutcome::Moved)
     }
 

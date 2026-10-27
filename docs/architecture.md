@@ -487,6 +487,11 @@ invoke native resume. A job whose worker is proven dead has its generation's
 leftover processes swept by ownership marker before the session is reported
 `lost`; unavailable or ambiguous supervisor evidence never kills anything.
 
+The directory of a session's worker journal is deleted only after the session
+record is gone, or by the startup collection of record-less sessions whose
+workers are gone and whose journals are older than `[worker_journals]
+max_age_days` in `service.toml`; see `docs/runbooks/durable-session-workers.md`.
+
 The private worker protocol is local-only and owner-private. It uses bounded
 newline-delimited JSON for control requests and binary-safe framed data
 connections for output and attach traffic. A worker accepts one leased daemon

@@ -15,8 +15,8 @@ use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, InputTiming, InventoryProbe, KeepaliveTiming, RequiredHook,
     ServiceConfig, WaitTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES,
     DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE, DEFAULT_KEEPALIVE_TIMING, DEFAULT_WAIT_TIMING,
-    MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
-    MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE,
+    MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
@@ -180,6 +180,7 @@ fn spec() -> ConfigSpec {
         hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
         inventory_probe: DEFAULT_INVENTORY_PROBE,
+        worker_journal_max_age: DEFAULT_WORKER_JOURNAL_MAX_AGE,
         open_files: 8192,
     }
 }
@@ -2867,4 +2868,72 @@ fn inventory_values_outside_their_bounds_are_refused_by_key() {
             "probe_cache_ttl_ms = 1\nprobe_failure_ttl_ms = 600000\nprobe_cache_max_entries = 4096\nprobe_parallelism = 1",
         ))
         .expect("bounds are inclusive");
+}
+
+/// Appends a `[worker_journals]` table with `lines` to the golden file, before `[limits]`.
+fn with_worker_journals(lines: &str) -> String {
+    replace(
+        GOLDEN,
+        "[limits]",
+        &format!("[worker_journals]\n{lines}\n\n[limits]"),
+    )
+}
+
+/// A file without `[worker_journals]` means the documented default, and a
+/// rewrite does not add the table, so a release that predates it still reads
+/// the file.
+#[test]
+fn a_file_without_worker_journals_loads_the_default_and_rewrites_unchanged() {
+    let fixture = Fixture::new();
+    let loaded = fixture.load(GOLDEN).expect("load the golden file");
+    assert_eq!(
+        loaded.worker_journal_max_age(),
+        DEFAULT_WORKER_JOURNAL_MAX_AGE
+    );
+    let rendered = loaded.to_toml();
+    assert!(!rendered.contains("worker_journals"), "{rendered}");
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+}
+
+/// A non-default age is loaded, known, and written back.
+#[test]
+fn a_custom_worker_journal_age_round_trips_and_is_not_unknown() {
+    let fixture = Fixture::new();
+    let loaded = fixture
+        .load(&with_worker_journals("max_age_days = 30"))
+        .expect("load a custom age");
+    assert_eq!(loaded.worker_journal_max_age(), Duration::from_hours(720));
+    assert!(
+        loaded.unknown_keys().is_empty(),
+        "{:?}",
+        loaded.unknown_keys()
+    );
+    let rendered = loaded.to_toml();
+    assert!(rendered.contains("max_age_days = 30"), "{rendered}");
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+}
+
+/// The age is bounded in whole days, and the bounds are inclusive.
+#[test]
+fn worker_journal_ages_outside_their_bounds_are_refused_by_key() {
+    let fixture = Fixture::new();
+    for days in [0_u64, 366] {
+        match fixture.load(&with_worker_journals(&format!("max_age_days = {days}"))) {
+            Err(ConfigError::OutOfRange {
+                key,
+                value,
+                min,
+                max,
+            }) => assert_eq!(
+                (key, value, min, max),
+                ("worker_journals.max_age_days", days, 1, 365)
+            ),
+            other => panic!("{days} days must be refused, got {other:?}"),
+        }
+    }
+    for days in [1_u64, 365] {
+        fixture
+            .load(&with_worker_journals(&format!("max_age_days = {days}")))
+            .expect("the bounds are inclusive");
+    }
 }

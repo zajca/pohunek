@@ -980,6 +980,58 @@ pub fn valid_worker_id(id: &str) -> Option<&str> {
     .then_some(id)
 }
 
+/// Name prefix of a worker journal directory the daemon is deleting.
+///
+/// Collection renames `workers/<session>` to a tombstone with this prefix
+/// before it unlinks anything, so a reader never sees a half-deleted session.
+/// The dot keeps a tombstone out of [`valid_worker_session_id`].
+pub const WORKER_TOMBSTONE_PREFIX: &str = ".gc.";
+
+/// Builds the tombstone name of the journal directory of `session_id`.
+///
+/// `pid` is the deleting process and `sequence` distinguishes tombstones it
+/// makes; the result matches [`parse_worker_tombstone`].
+#[must_use]
+pub fn worker_tombstone_name(session_id: &str, pid: u32, sequence: u64) -> String {
+    format!("{WORKER_TOMBSTONE_PREFIX}{session_id}.{pid}.{sequence}")
+}
+
+/// Parses a tombstone name into its session id, process id and sequence.
+///
+/// Returns `None` for any other name, including a valid session id.
+#[must_use]
+pub fn parse_worker_tombstone(name: &str) -> Option<(&str, u32, u64)> {
+    let rest = name.strip_prefix(WORKER_TOMBSTONE_PREFIX)?;
+    let (rest, sequence) = rest.rsplit_once('.')?;
+    let (session_id, pid) = rest.rsplit_once('.')?;
+    Some((
+        valid_worker_session_id(session_id)?,
+        pid.parse().ok().filter(|_| digits(pid))?,
+        sequence.parse().ok().filter(|_| digits(sequence))?,
+    ))
+}
+
+/// Parses the name of an unfinished journal write, `.<journal>.<pid>.<seq>.tmp`,
+/// into the journal's worker id and the writer's process id.
+///
+/// `<journal>` is `<worker id>.json`. Returns `None` for any other name.
+#[must_use]
+pub fn parse_journal_temp_name(name: &str) -> Option<(&str, u32)> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (rest, sequence) = rest.rsplit_once('.')?;
+    let (journal, pid) = rest.rsplit_once('.')?;
+    if !digits(sequence) {
+        return None;
+    }
+    let worker_id = valid_worker_id(journal.strip_suffix(".json")?)?;
+    Some((worker_id, pid.parse().ok().filter(|_| digits(pid))?))
+}
+
+/// Whether `text` is a non-empty run of ASCII digits.
+fn digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Length of a daemon-issued worker generation token.
 ///
 /// A generation names one worker process of a session in service-manager
