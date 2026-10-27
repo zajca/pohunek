@@ -56,9 +56,11 @@ different feature unification inside the stress deadline. They build with
 `--all-features`, as CI's Linux test archive does, except under the `macos`
 profile: CI's macOS lane and tier archives build default features, so the
 step builds default features there too, and a test gated behind a Cargo
-feature is then absent from the list and fails by name instead of running a
-binary CI never builds. The
-stress run is `scripts/stress-run --cpus 4 -- cargo nextest run --stress-count
+feature is then absent from the list. Without `--allow-missing-on-host` it
+fails by name instead of running a binary CI never builds; with the flag the
+`feature` predicate counts as a non-`test` cfg, so the test is reported as NOT
+STRESSED and belongs to the Linux run that builds it with `--all-features`.
+The stress run is `scripts/stress-run --cpus 4 -- cargo nextest run --stress-count
 N ...`.
 
 `--print` prints the static selection (target, test, source line) and the
