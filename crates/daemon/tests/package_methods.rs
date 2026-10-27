@@ -1149,6 +1149,23 @@ async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
         );
     }
 
+    // A namespace that only resembles a refused one is usable, and `-` and `.`
+    // in the runtime id map to `_` in the namespace.
+    for (index, (runtime, name)) in [("sshx", "SSHX_FLAG"), ("my-agent.x", "MY_AGENT_X_FLAG")]
+        .into_iter()
+        .enumerate()
+    {
+        let document = descriptor_requiring(
+            LAUNCH_ENV_FEATURE,
+            &launch_env_table(&[format!("{name} = \"1\"")]),
+        )
+        .replace("\nid = \"pi\"\n", &format!("\nid = \"{runtime}\"\n"))
+        .replace("version = \"1.0.0\"", &format!("version = \"1.0.{index}\""));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, runtime, &document, false).await;
+        result.unwrap_or_else(|error| panic!("{runtime} installs: {error:?}"));
+    }
+
     drop(local);
     servers.stop().await;
 }

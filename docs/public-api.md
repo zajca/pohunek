@@ -991,7 +991,7 @@ version probe get (runtime feature `launch-env-v1`, listed in `requires`):
 requires = ["launch-env-v1"]
 
 [launch_env]
-ACME_NO_AUTO_UPDATE = "1"
+ACME_NO_AUTO_UPDATE = "1"    # runtime id `acme`
 ```
 
 The table holds at most 16 string entries and its pairs are behaviour flags.
