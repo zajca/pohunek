@@ -959,6 +959,76 @@ daemon-run integration handlers install into this home, so a runtime that names
 one needs the table. The official Codex and Claude Code packages declare it;
 any package may too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
 
+An agent whose variable holds a parent of its home, such as `XDG_CONFIG_HOME`,
+declares the optional `subdir`, a directory below the variable's value (runtime
+feature `config-home-subdir-v1`, so the descriptor lists it in `requires`; see
+"Runtime features" in the runtime packages guide):
+
+```toml
+requires = ["config-home-subdir-v1"]
+
+[config_home]
+env = "XDG_CONFIG_HOME"
+subdir = "muse"
+default = ".config/muse"
+```
+
+`subdir` follows the `default` rule (a relative path of plain components,
+bounded) and joins the variable's value only: while the variable is set the
+home is `$XDG_CONFIG_HOME/muse`, and while it is unset or empty the home is
+`default` below `HOME`, which stays the complete path. A relative or non-UTF-8
+variable value is a typed error (`agent_config_dir_invalid`) and never falls
+back to `default`, unlike the XDG specification. Two runtimes that reach one
+directory through one integration handler are ambiguous by their resolved path,
+not by `env`, so the same `env` with different `subdir` values is not.
+
+### Launch environment
+
+A runtime may declare literal environment variables its launches and its
+version probe get (runtime feature `launch-env-v1`, listed in `requires`):
+
+```toml
+requires = ["launch-env-v1"]
+
+[launch_env]
+ACME_NO_AUTO_UPDATE = "1"    # runtime id `acme`
+```
+
+The table holds at most 16 string entries and its pairs are behaviour flags.
+A name must start with the runtime's own namespace, derived from `runtime.id`:
+upper case, `-` and `.` mapped to `_`, then `_` (`muse` gives `MUSE_`), with at
+least one character after it. The core allowlist outside the namespace is empty.
+A runtime whose namespace begins with a refused prefix, so a variable of the
+loader, the owner's tools or an interpreter, package-manager, privilege or
+network tool the agent runs (`BASH_ENV`, `NODE_OPTIONS`, `SUDO_ASKPASS`,
+`PYTHONSTARTUP`, `CURL_CA_BUNDLE`) cannot be set by a descriptor, has no usable
+`[launch_env]`. The prefixes are `POHUNEK_`, `LD_`, `DYLD_`, `XDG_`, `LC_`,
+`SYSTEMD_`, `DBUS_`, `WAYLAND_`, `DISPLAY_`, `SSH_`, `GPG_`, `GNUPG`, `AWS_`,
+`AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `GIT_`, `GH_`, `GITHUB_`, `GITLAB_`,
+`DOCKER_`, `KUBE`, `HELM_`, `HTTP_`, `HTTPS_`, `FTP_`, `ALL_`, `NO_`, `SOCKS`,
+`CURL_`, `WGET_`, `REQUESTS_`, `SSL_`, `OPENSSL_`, `BASH_`, `ZSH_`, `SH_`,
+`SUDO_`, `NODE_`, `NPM_`, `YARN_`, `PNPM_`, `JAVA_`, `JDK_`, `PYTHON`, `PIP_`,
+`PERL`, `RUBY`, `GEM_`, `CARGO_`, `RUST` and `GO` (the last group match any
+runtime id that starts with those letters, such as `python3` or `gopher`). The
+list only grows. Inside the namespace a name is refused when it is
+a service-manager variable the worker never passes to an agent
+(`NOTIFY_SOCKET`, `INVOCATION_ID`, ...), the variable the same descriptor reads
+its `[config_home]` or `[native_reference.existence]` root from, secret-shaped
+(ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_CREDENTIALS`
+or `_AUTH`), or location- or identity-shaped (ending in `_PATH`, `_DIR`, `_HOME`,
+`_ROOT`, `_FILE`, `_SOCK`, `_SOCKET`, `_URL`, `_URI`, `_HOST`, `_ENDPOINT`,
+`_PROXY`, `_COMMAND`, `_PROFILE`, `_CONFIG` or `_ID`), so a public descriptor
+cannot redirect or blank owner or core state. Each value is at most 256 bytes without control characters and is
+never expanded. A refusal is `descriptor_invalid` and names the field, never a
+name or a value. The pairs are not persisted: each launch (a new session, a
+resume, a fork) reads them from the definition that serves it. A launch applies
+them first, then the session's private `TMPDIR`, then the host profile's
+`[env]`, then the reserved `POHUNEK_*` values, so a profile entry of the same
+name wins. The version probe applies the descriptor pairs after clearing its
+environment; a profile entry reaches the launch only. A program the user starts
+by hand inside a shell session gets no descriptor environment. A built-in
+descriptor digest covers the table only while it holds a pair.
+
 ### Transcripts
 
 A runtime may declare where below its config home the agent writes JSON Lines
@@ -1345,8 +1415,10 @@ the next major release (codex `[0.160.0, 1.0.0)`, claude
 `[2.1.289, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
 update the agent CLIs independently of pohunek. The
 declaration is rejected unless `args`, `min` and `below` are all present, `min`
-is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH`. The daemon
-compiles only the data-driven `semver-v1` and `semver-line-v1` parsers; a
+is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH` (for
+`semver-revision-line-v1`, also `MAJOR.MINOR.PATCH-R<n>[.<m>]`). The daemon
+compiles only the data-driven `semver-v1`, `semver-line-v1` and
+`semver-revision-line-v1` parsers; a
 descriptor that names any other parser id still parses, but its runtime reports
 `supported: false` and a launch is refused with `agent_runtime_unsupported`.
 
@@ -1367,6 +1439,18 @@ an invalid template is rejected when the package is validated, naming
 `runtime.version_probe.line`. Pre-release and build suffixes
 (`0.160.0-rc.1`) never match: a pre-release cannot be ordered against
 `[min, below)`, so such a runtime is unsupported.
+
+`semver-revision-line-v1` (runtime feature `version-probe-revision-v1`, so the
+descriptor lists it in `requires`) reads the same `line` templates but its
+release token is `MAJOR.MINOR.PATCH-R<n>` or `MAJOR.MINOR.PATCH-R<n>.<m>`
+(canonical digits, at most 64 bytes in all, and `n` and `m` below 2^32). The revision is a number, not a
+pre-release: the order is `(MAJOR, MINOR, PATCH, n, m)` with an absent part as
+0, so `1.4.13` equals `1.4.13-R0` and `1.4.13-R2` precedes `1.4.13-R2.1`, and
+`min` and `below` accept both forms (`min = "1.4.13"` supports `1.4.13-R2`;
+`1.4.12-R9` is below it). It requires `line` like `semver-line-v1`. The
+existing parsers stay strict, and `AgentRuntime.version` stays an opaque string
+that reports the release as printed (`"1.4.13-R2"`), read by `host.inspect` and
+the launch gate through the same grammar.
 
 Before `session.new`, `session.resume` and `session.fork`, and for the `host.inspect` runtime inventory
 (`version`, `supported`), the daemon resolves the program once, runs it with the

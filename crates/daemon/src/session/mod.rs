@@ -4110,6 +4110,7 @@ impl SessionRegistry {
             .as_ref()
             .and_then(|profile| profile.manifest.clone());
         let env_extra = self.launch_env(
+            &resolved.definition,
             resolved
                 .profile
                 .as_ref()

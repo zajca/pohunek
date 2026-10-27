@@ -11837,7 +11837,10 @@ fn every_launch_announces_the_hook_admission_retry_policy() {
         RuntimeRef::codex(),
         RuntimeRef::claude(),
     ] {
-        let env = registry.launch_env(&[], agent.clone(), &id);
+        let definition = crate::agent::host::fixture::official_host()
+            .resolve_id(&protocol::RuntimeId::parse(agent.as_wire()).expect("runtime id"))
+            .expect("the fixture host serves the runtime");
+        let env = registry.launch_env(&definition, &[], agent.clone(), &id);
         for (name, value) in &expected {
             let values: Vec<&str> = env
                 .iter()
@@ -11850,7 +11853,14 @@ fn every_launch_announces_the_hook_admission_retry_policy() {
     // A registry without a daemon socket announces nothing.
     let silent = SessionRegistry::default();
     assert!(silent
-        .launch_env(&[], RuntimeRef::claude(), &id)
+        .launch_env(
+            &crate::agent::host::fixture::official_host()
+                .resolve_id(&protocol::RuntimeId::parse("claude").expect("runtime id"))
+                .expect("the fixture host serves claude"),
+            &[],
+            RuntimeRef::claude(),
+            &id,
+        )
         .iter()
         .all(|(key, _)| key != protocol::ENV_HOOK_ADMISSION_RETRY));
 }

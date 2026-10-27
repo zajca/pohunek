@@ -716,6 +716,52 @@ pub(crate) fn pi_shaped_integration_host_as(
     RuntimeHost::new(registry)
 }
 
+/// A host serving the built-in runtimes, the official fixture packages and one
+/// Pi-shaped package runtime per `(runtime id, [config_home] table)` entry of
+/// `homes`, each driven by the integration `handler` and `hook_schema` and
+/// listing the runtime features `requires` (a TOML array body).
+///
+/// # Panics
+///
+/// Panics when a document or the registry is invalid, which would be a defect
+/// of the fixture.
+pub(crate) fn pi_shaped_integration_host_with_homes(
+    program: &Path,
+    handler: &str,
+    hook_schema: &str,
+    requires: &str,
+    homes: &[(&str, &str)],
+) -> RuntimeHost {
+    let definitions = homes
+        .iter()
+        .map(|(runtime_id, home_table)| {
+            let document = format!(
+                "{}\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{hook_schema}\"\n{home_table}",
+                pi_shaped_document(program, PI_SHAPED_NO_CHECK)
+                    .replace(
+                        &format!("id = \"{PI_SHAPED_ID}\""),
+                        &format!("id = \"{runtime_id}\"")
+                    )
+                    .replace("runtime_api = 1\n", &format!("runtime_api = 1\nrequires = [{requires}]\n")),
+            );
+            RuntimeDefinition::from_toml(
+                &document,
+                |package| DefinitionOrigin::Package {
+                    package,
+                    digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+                },
+                |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+            )
+            .expect("the integration fixture document is valid")
+        })
+        .collect();
+    let builtin = BuiltinSource::new("/bin/sh");
+    let fixture = FixtureSource(definitions);
+    let registry = RuntimeRegistry::from_sources(&[&builtin, &OfficialFixtureSource, &fixture])
+        .expect("the fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
 #[derive(Debug)]
 struct FixtureSource(Vec<RuntimeDefinition>);
 

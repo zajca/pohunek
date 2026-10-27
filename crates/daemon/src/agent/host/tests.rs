@@ -277,6 +277,18 @@ fn descriptor_digest_tracks_structural_launch_fields_only() {
         assert_eq!(digest(&first, name), digest(&second, name), "{name}");
     }
     assert_ne!(digest(&first, "shell"), digest(&first, "hermes"));
+    // The digest persisted sessions record (`store/fixtures/schema-8/
+    // metadata.jsonl`): a runtime without `[launch_env]` hashes to it.
+    let BindingProvenance::Builtin {
+        descriptor_digest, ..
+    } = digest(&first, "shell")
+    else {
+        panic!("the shell is a built-in");
+    };
+    assert_eq!(
+        descriptor_digest.as_str(),
+        "sha256:5d05952fb8bd48c7ffb202c2c2ba7e47971dc5b9dc9c44151e17c629dedde38a"
+    );
 }
 
 #[test]
@@ -303,6 +315,31 @@ fn descriptor_digest_changes_with_launch_fields() {
     assert_ne!(base, build("other", Vec::new(), false, "Demo"));
     assert_ne!(base, build("demo", vec!["--x".to_owned()], false, "Demo"));
     assert_ne!(base, build("demo", Vec::new(), true, "Demo"));
+
+    // `[launch_env]` joins the digest only when it holds a pair.
+    let with_env = |pairs: &[(&str, &str)]| {
+        let declared = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        RuntimeDefinition::new_with_env(
+            builtin_parts(),
+            super::DescriptorLaunchEnv::new("demo", declared).expect("valid pairs"),
+        )
+        .expect("valid")
+        .binding()
+        .clone()
+    };
+    let plain = RuntimeDefinition::new(builtin_parts())
+        .expect("valid")
+        .binding()
+        .clone();
+    assert_eq!(plain, with_env(&[]));
+    assert_ne!(plain, with_env(&[("DEMO_FLAG", "1")]));
+    assert_ne!(
+        with_env(&[("DEMO_FLAG", "1")]),
+        with_env(&[("DEMO_FLAG", "2")])
+    );
 }
 
 #[test]

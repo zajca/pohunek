@@ -11,6 +11,7 @@
 mod support;
 
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,6 +80,8 @@ struct Servers {
     addr: SocketAddr,
     socket: PathBuf,
     plugins: PathBuf,
+    /// Directory the daemon reads host profiles from.
+    agents: PathBuf,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
@@ -96,6 +99,14 @@ async fn spawn_servers(tag: &str) -> Servers {
         .expect("create the socket directory");
     let socket = socket_dir.path().join("daemon.sock");
     let plugins = socket_dir.path().join("plugins");
+    let agents = socket_dir.path().join("agents");
+    std::fs::create_dir(&agents).expect("create the agents directory");
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o700))
+        .expect("make the agents directory owner-private");
+    let host_state = socket_dir.path().join("host-state");
+    std::fs::create_dir(&host_state).expect("create the host-state directory");
+    std::fs::set_permissions(&host_state, std::fs::Permissions::from_mode(0o700))
+        .expect("make the host-state directory owner-private");
     let worker_home_dir =
         pohunek_test_support::tempdir_with_prefix("pw-p-").expect("create the worker home");
     let worker_home = worker_home_dir.path().to_path_buf();
@@ -111,6 +122,8 @@ async fn spawn_servers(tag: &str) -> Servers {
     let config = SessionRegistryConfig {
         socket_path: Some(socket.clone()),
         plugins_dir: Some(plugins.clone()),
+        agents_dir: Some(agents.clone()),
+        host_state_dir: Some(host_state),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
         worker_state_root: Some(environment.state_home.join("pohunek/workers")),
         supervision: Some(
@@ -165,6 +178,7 @@ async fn spawn_servers(tag: &str) -> Servers {
         addr,
         socket,
         plugins,
+        agents,
         shutdown,
         task,
         _dirs: (socket_dir, worker_home_dir),
@@ -654,6 +668,753 @@ async fn a_descriptor_requiring_an_unknown_runtime_feature_is_refused() {
     )
     .await;
     result.expect("an empty requires installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// The Pi-shaped descriptor listing `requires` (a TOML array body) before its
+/// first table, followed by `tables`.
+fn descriptor_requiring(requires: &str, tables: &str) -> String {
+    descriptor("/bin/sh").replace(
+        "runtime_api = 1\n",
+        &format!("runtime_api = 1\nrequires = [{requires}]\n"),
+    ) + tables
+}
+
+/// A `[config_home]` table declaring `subdir` below `ACME_HOME`.
+fn subdir_home_table(subdir: &str) -> String {
+    format!("\n[config_home]\nenv = \"ACME_HOME\"\nsubdir = \"{subdir}\"\ndefault = \".acme\"\n")
+}
+
+#[tokio::test]
+async fn a_config_home_subdir_installs_only_with_its_feature_and_as_a_plain_path() {
+    use pohunek_daemon::agent::host::{MAX_TRANSCRIPT_DIR_BYTES, MAX_TRANSCRIPT_DIR_COMPONENTS};
+
+    let servers = spawn_servers("pkg-subdir").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let feature = "\"config-home-subdir-v1\"";
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "without-requires",
+        &descriptor_requiring("", &subdir_home_table("muse")),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a gated key without requires").code,
+        "runtime_feature_unsupported"
+    );
+
+    let too_long = "a".repeat(MAX_TRANSCRIPT_DIR_BYTES + 1);
+    let too_deep = ["a"; MAX_TRANSCRIPT_DIR_COMPONENTS + 1].join("/");
+    for (name, subdir) in [
+        ("absolute", "/etc"),
+        ("empty", ""),
+        ("parent", "../muse"),
+        ("nested-parent", "a/../b"),
+        ("empty-segment", "a//b"),
+        ("tilde", "~/muse"),
+        ("glob", "mu*"),
+        ("space", "a b"),
+        ("too-long", too_long.as_str()),
+        ("too-deep", too_deep.as_str()),
+    ] {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(feature, &subdir_home_table(subdir)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "valid",
+        &descriptor_requiring(feature, &subdir_home_table("muse")),
+        false,
+    )
+    .await;
+    result.expect("a plain subdir with its feature installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// Writes the executable shell `script` next to the plugin root and returns
+/// its path.
+fn write_program(plugins: &Path, name: &str, script: &str) -> PathBuf {
+    let path = plugins.with_file_name(name);
+    std::fs::write(&path, script).expect("write the program");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the program executable");
+    path
+}
+
+/// A probe program that prints `output` for any arguments.
+fn probe_program(plugins: &Path, name: &str, output: &str) -> PathBuf {
+    write_program(
+        plugins,
+        name,
+        &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"),
+    )
+}
+
+/// The Pi-shaped descriptor at `version`, launching `program` and probing it
+/// with `parser` over `fixture {version}` lines for the range `[min, below)`.
+/// `requires` is a TOML array body.
+fn probed_descriptor(
+    program: &Path,
+    version: &str,
+    parser: &str,
+    range: (&str, &str),
+    requires: &str,
+) -> String {
+    let (min, below) = range;
+    let probe = format!(
+        "version_probe = {{ parser = \"{parser}\", args = [\"--version\"], min = \"{min}\", below = \"{below}\", line = \"fixture {{version}}\" }}\n"
+    );
+    descriptor(&program.display().to_string())
+        .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
+        .replace(
+            "prompt_arg = true\n",
+            &format!("prompt_arg = true\n{probe}"),
+        )
+        .replace(
+            "runtime_api = 1\n",
+            &format!("runtime_api = 1\nrequires = [{requires}]\n"),
+        )
+}
+
+/// The inventory entry `host.inspect` reports for the fixture runtime.
+async fn inspected_runtime<S>(framed: &mut Framed<S, LinesCodec>) -> protocol::AgentRuntime
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let capabilities: HostCapabilities = call(framed, method::HOST_INSPECT, Value::Null).await;
+    capabilities
+        .runtimes
+        .into_iter()
+        .find(|runtime| runtime.agent == RUNTIME)
+        .expect("the fixture runtime is inventoried")
+}
+
+/// The refusal of a `session.new` of the fixture runtime.
+async fn refused_launch<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    cwd: &Path,
+) -> protocol::ProtocolError
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let params = protocol::SessionNewParams {
+        name: None,
+        agent: RUNTIME.to_owned(),
+        cwd: Some(cwd.to_path_buf()),
+        cols: 80,
+        rows: 24,
+        project: None,
+        repo: None,
+        branch: None,
+        base_branch: None,
+        input: None,
+        extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
+        input_ack_timeout_ms: None,
+        metadata: std::collections::BTreeMap::new(),
+    };
+    exchange(
+        framed,
+        method::SESSION_NEW,
+        serde_json::to_value(params).expect("session.new params"),
+    )
+    .await
+    .into_result()
+    .expect_err("the launch gate refuses the runtime")
+}
+
+const REVISION_PARSER: &str = "semver-revision-line-v1";
+const REVISION_FEATURE: &str = "\"version-probe-revision-v1\"";
+
+#[tokio::test]
+async fn the_revision_parser_installs_only_with_its_feature_and_a_line_template() {
+    let servers = spawn_servers("pkg-revision-install").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = probe_program(&servers.plugins, "probe-gate", "fixture 1.4.13-R2");
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "no-requires",
+        &probed_descriptor(&program, "1.0.0", REVISION_PARSER, ("1.4.13", "2.0.0"), ""),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("the parser needs its feature").code,
+        "runtime_feature_unsupported"
+    );
+    // A range that names a revision on a strict parser, and the revision parser
+    // without a line template, are not valid descriptors.
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "strict-range",
+        &probed_descriptor(
+            &program,
+            "1.0.0",
+            "semver-line-v1",
+            ("1.4.13-R1", "2.0.0"),
+            "",
+        ),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a strict parser takes no revision").code,
+        "package_descriptor_invalid"
+    );
+    let no_line = probed_descriptor(
+        &program,
+        "1.0.0",
+        REVISION_PARSER,
+        ("1.4.13", "2.0.0"),
+        REVISION_FEATURE,
+    )
+    .replace(", line = \"fixture {version}\"", "");
+    let (_digest, result) =
+        install_descriptor(&mut local, &servers.plugins, "no-line", &no_line, false).await;
+    assert_eq!(
+        result.expect_err("the parser needs a line template").code,
+        "package_descriptor_invalid"
+    );
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn revision_versions_are_read_by_inspect_and_the_launch_gate() {
+    let servers = spawn_servers("pkg-revision-read").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+
+    // (printed release, min, below, reported version, supported); a printed
+    // release that is not read reports no version.
+    let reads = |printed: &'static str, min, below, supported| {
+        (printed, min, below, Some(printed), supported)
+    };
+    let mut cases = vec![
+        reads("1.4.13-R2", "1.4.13", "2.0.0", true),
+        reads("1.4.12-R9", "1.4.13", "2.0.0", false),
+        reads("1.4.13", "1.4.13-R0", "2.0.0", true),
+        reads("1.4.13-R0", "1.4.13", "2.0.0", true),
+        reads("1.4.13", "1.4.13-R1", "2.0.0", false),
+        reads("1.4.13-R2.1", "1.4.13-R2", "1.4.13-R2.1", false),
+        reads("1.4.13-R2.1", "1.4.13-R2", "1.4.13-R3", true),
+        reads("1.4.13-R2.0", "1.4.13-R2", "1.4.13-R2.1", true),
+    ];
+    for printed in [
+        "1.4.13-r2",
+        "1.4.13-R",
+        "1.4.13-R02",
+        "1.4.13-R1.2.3",
+        "1.4.13-R1.",
+        "1.4.13-R2-x",
+        "1.4.13-R4294967296",
+        "1.4.13-R99999999999999999999999999999999999999999999999999999999999",
+        "1.4.13+b",
+        "1.4-R2",
+    ] {
+        cases.push((printed, "1.4.13", "2.0.0", None, false));
+    }
+    for (index, (printed, min, below, version, supported)) in cases.into_iter().enumerate() {
+        let program = probe_program(
+            &servers.plugins,
+            &format!("probe-{index}"),
+            &format!("fixture {printed}"),
+        );
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("case-{index}"),
+            &probed_descriptor(
+                &program,
+                &format!("1.0.{index}"),
+                REVISION_PARSER,
+                (min, below),
+                REVISION_FEATURE,
+            ),
+            false,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{printed}: the descriptor installs: {error:?}"));
+
+        let runtime = inspected_runtime(&mut local).await;
+        assert_eq!(
+            runtime.version.as_deref(),
+            version,
+            "{printed} [{min}, {below})"
+        );
+        assert_eq!(
+            runtime.supported,
+            Some(supported),
+            "{printed} [{min}, {below})"
+        );
+
+        // The launch gate refuses exactly what the inventory reports as
+        // unsupported; a supported runtime is not launched here.
+        if !supported {
+            let error = refused_launch(&mut local, &cwd).await;
+            assert_eq!(error.code, "agent_runtime_unsupported", "{printed}");
+            let expected = if version.is_some() {
+                "outside its runtime's supported range"
+            } else {
+                "does not match its runtime's declared format"
+            };
+            assert!(error.msg.contains(expected), "{printed}: {error:?}");
+        }
+    }
+
+    // The strict parsers still refuse a revision.
+    let program = probe_program(&servers.plugins, "probe-strict", "fixture 1.4.13-R2");
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "strict",
+        &probed_descriptor(&program, "2.0.0", "semver-line-v1", ("1.4.13", "2.0.0"), ""),
+        false,
+    )
+    .await;
+    result.expect("the strict descriptor installs");
+    let runtime = inspected_runtime(&mut local).await;
+    assert_eq!((runtime.version, runtime.supported), (None, Some(false)));
+
+    drop(local);
+    servers.stop().await;
+}
+
+const LAUNCH_ENV_FEATURE: &str = "\"launch-env-v1\"";
+
+/// A `[launch_env]` table with the given `KEY = "value"` lines.
+fn launch_env_table(lines: &[String]) -> String {
+    format!("\n[launch_env]\n{}\n", lines.join("\n"))
+}
+
+#[tokio::test]
+async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_names() {
+    let servers = spawn_servers("pkg-launch-env").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let pair = |name: &str| launch_env_table(&[format!("{name} = \"1\"")]);
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "without-requires",
+        &descriptor_requiring("", &pair("PI_NO_UPDATE")),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a gated table without requires").code,
+        "runtime_feature_unsupported"
+    );
+
+    let numbered: Vec<String> = (0..=16).map(|n| format!("PI_FLAG_{n} = \"1\"")).collect();
+    // Names outside the runtime's namespace, names inside it that say where
+    // something lives or who it is, then values and shapes outside the bounds.
+    let mut refused: Vec<(String, String)> = [
+        "SSH_AUTH_SOCK",
+        "DISPLAY",
+        "AWS_REGION",
+        "OTHER_FLAG",
+        "POHUNEK_X",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "XDG_CONFIG_HOME",
+        "LC_ALL",
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "NOTIFY_SOCKET",
+        "pi_flag",
+        "PI_",
+        "PI_CONFIG_DIR",
+        "PI_AUTH_PATH",
+        "PI_HOST",
+        "PI_SESSION_ID",
+        "PI_API_KEY",
+        "PI_TOKEN",
+        "PI_BAD-NAME",
+    ]
+    .iter()
+    .map(|name| ((*name).to_owned(), pair(name)))
+    .collect();
+    refused.extend([
+        (
+            "config-home-variable".to_owned(),
+            format!(
+                "\n[config_home]\nenv = \"PI_STATE\"\ndefault = \".pi\"\n{}",
+                pair("PI_STATE")
+            ),
+        ),
+        ("too-many".to_owned(), launch_env_table(&numbered)),
+        (
+            "long-value".to_owned(),
+            launch_env_table(&[format!("PI_FLAG = \"{}\"", "v".repeat(257))]),
+        ),
+        (
+            "control-value".to_owned(),
+            launch_env_table(&["PI_FLAG = \"a\\u0007b\"".to_owned()]),
+        ),
+        (
+            "number-value".to_owned(),
+            launch_env_table(&["PI_FLAG = 1".to_owned()]),
+        ),
+        (
+            "nested-table".to_owned(),
+            "\n[launch_env.PI_FLAG]\nvalue = \"1\"\n".to_owned(),
+        ),
+    ]);
+    for (name, tables) in &refused {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(LAUNCH_ENV_FEATURE, tables),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
+    use pohunek_daemon::agent::host::REFUSED_NAMESPACES;
+
+    let servers = spawn_servers("pkg-launch-env-namespace").await;
+    let mut local = connect_unix(&servers.socket).await;
+    // One scenario per refused family: the runtime named after the family
+    // declares a flag in its own namespace and is refused.
+    for family in REFUSED_NAMESPACES {
+        let runtime = family.trim_end_matches('_').to_ascii_lowercase();
+        let name = format!("{}_FLAG", runtime.to_ascii_uppercase());
+        let document = descriptor_requiring(
+            LAUNCH_ENV_FEATURE,
+            &launch_env_table(&[format!("{name} = \"1\"")]),
+        )
+        .replace("\nid = \"pi\"\n", &format!("\nid = \"{runtime}\"\n"));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, &runtime, &document, false).await;
+        assert_eq!(
+            result.expect_err(&runtime).code,
+            "package_descriptor_invalid",
+            "{family}"
+        );
+    }
+
+    // A namespace that only resembles a refused one is usable, and `-` and `.`
+    // in the runtime id map to `_` in the namespace.
+    for (index, (runtime, name)) in [("sshx", "SSHX_FLAG"), ("my-agent.x", "MY_AGENT_X_FLAG")]
+        .into_iter()
+        .enumerate()
+    {
+        let document = descriptor_requiring(
+            LAUNCH_ENV_FEATURE,
+            &launch_env_table(&[format!("{name} = \"1\"")]),
+        )
+        .replace("\nid = \"pi\"\n", &format!("\nid = \"{runtime}\"\n"))
+        .replace("version = \"1.0.0\"", &format!("version = \"1.0.{index}\""));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, runtime, &document, false).await;
+        result.unwrap_or_else(|error| panic!("{runtime} installs: {error:?}"));
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn launch_env_tables_within_the_bounds_install() {
+    let servers = spawn_servers("pkg-launch-env-bounds").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let pair = |name: &str| launch_env_table(&[format!("{name} = \"1\"")]);
+
+    let sixteen: Vec<String> = (0..16).map(|n| format!("PI_FLAG_{n} = \"1\"")).collect();
+    let accepted = [
+        ("one-pair", pair("PI_NO_UPDATE")),
+        ("bounds", launch_env_table(&sixteen)),
+        (
+            "long-value",
+            launch_env_table(&[format!("PI_FLAG = \"{}\"", "v".repeat(256))]),
+        ),
+    ];
+    for (index, (name, tables)) in accepted.iter().enumerate() {
+        let document = descriptor_requiring(LAUNCH_ENV_FEATURE, tables)
+            .replace("version = \"1.0.0\"", &format!("version = \"1.0.{index}\""));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, name, &document, false).await;
+        result.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn launch_env_pairs_reach_the_version_probe_and_key_its_cache() {
+    let servers = spawn_servers("pkg-probe-env").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let features = format!("{REVISION_FEATURE}, {LAUNCH_ENV_FEATURE}");
+    // The program prints its revision from PI_REVISION and nothing else
+    // of its environment, so the version is the observation of the pair.
+    let program = write_program(
+        &servers.plugins,
+        "probe-env",
+        "#!/bin/sh\nprintf 'fixture 1.4.13-R%s\\n' \"$PI_REVISION\"\n",
+    );
+    let install = |version: &str, tables: &str| -> String {
+        let mut document = probed_descriptor(
+            &program,
+            version,
+            REVISION_PARSER,
+            ("1.4.13", "2.0.0"),
+            &features,
+        );
+        document.push_str(tables);
+        document
+    };
+
+    // Without the table the variable is unset: the probe line has no revision.
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "no-table",
+        &install("1.0.0", ""),
+        false,
+    )
+    .await;
+    result.expect("installs");
+    let runtime = inspected_runtime(&mut local).await;
+    assert_eq!((runtime.version, runtime.supported), (None, Some(false)));
+
+    // The same program path under a declared pair reports the pair's revision;
+    // a later package with another value reports its own, so the probe cache
+    // keys on the pairs.
+    for (version, value) in [("1.0.1", "2"), ("1.0.2", "3")] {
+        let table = launch_env_table(&[format!("PI_REVISION = \"{value}\"")]);
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("pair-{value}"),
+            &install(version, &table),
+            false,
+        )
+        .await;
+        result.expect("installs");
+        let runtime = inspected_runtime(&mut local).await;
+        assert_eq!(
+            runtime.version.as_deref(),
+            Some(format!("1.4.13-R{value}").as_str())
+        );
+        assert_eq!(runtime.supported, Some(true));
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// The text the session's PTY has printed so far.
+async fn terminal_text<S>(framed: &mut Framed<S, LinesCodec>, id: &protocol::SessionId) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use base64::Engine as _;
+
+    let params = protocol::SessionOutputParams::new(id.clone(), None, None, 4096, None)
+        .expect("valid output params");
+    let output: protocol::SessionOutputResult = call(
+        framed,
+        method::SESSION_OUTPUT,
+        serde_json::to_value(params).expect("output params"),
+    )
+    .await;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(output.data_base64())
+        .expect("base64 output");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Starts a session of `agent` and returns its id.
+async fn start_session<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    agent: &str,
+    cwd: &Path,
+) -> protocol::SessionId
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let params = protocol::SessionNewParams {
+        name: None,
+        agent: agent.to_owned(),
+        cwd: Some(cwd.to_path_buf()),
+        cols: 80,
+        rows: 24,
+        project: None,
+        repo: None,
+        branch: None,
+        base_branch: None,
+        input: None,
+        extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
+        input_ack_timeout_ms: None,
+        metadata: std::collections::BTreeMap::new(),
+    };
+    let created: protocol::SessionNewResult = call(
+        framed,
+        method::SESSION_NEW,
+        serde_json::to_value(params).expect("session.new params"),
+    )
+    .await;
+    created.session.id
+}
+
+/// Waits until the session prints `marker`.
+async fn wait_for_text<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+    marker: &str,
+) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let shared = tokio::sync::Mutex::new(framed);
+    let shared = &shared;
+    pohunek_test_support::wait::wait_until(
+        &format!("the session to print {marker}"),
+        || async move {
+            let mut framed = shared.lock().await;
+            let text = terminal_text(&mut **framed, id).await;
+            text.contains(marker).then_some(text)
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_overrides_them() {
+    let servers = spawn_servers("pkg-launch-env-session").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    // The program prints only the variable under test, never its environment.
+    let program = write_program(
+        &servers.plugins,
+        "agent-env",
+        "#!/bin/sh\nprintf 'LAUNCH_ENV_PAIR=<%s>\\n' \"$PI_MARK\"\nexec sleep 600\n",
+    );
+    let document = descriptor_requiring(
+        LAUNCH_ENV_FEATURE,
+        &launch_env_table(&["PI_MARK = \"from-descriptor\"".to_owned()]),
+    )
+    .replace(
+        "program = \"/bin/sh\"",
+        &format!("program = \"{}\"", program.display()),
+    );
+    let (digest, installed) =
+        install_descriptor(&mut local, &servers.plugins, "agent-env", &document, false).await;
+    installed.expect("the package installs");
+    std::fs::write(
+        servers.agents.join("overridden.toml"),
+        format!(
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\n\n[env]\nPI_MARK = \"from-profile\"\n",
+            digest.as_str()
+        ),
+    )
+    .expect("write the profile");
+
+    // A new session gets the descriptor pair.
+    let id = start_session(&mut local, RUNTIME, &cwd).await;
+    wait_for_text(&mut local, &id, "LAUNCH_ENV_PAIR=<from-descriptor>").await;
+
+    // A resumed session is relaunched with the pair of the definition that
+    // serves the relaunch.
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(id)).await;
+    wait_for_text(
+        &mut local,
+        &resumed.session.id,
+        "LAUNCH_ENV_PAIR=<from-descriptor>",
+    )
+    .await;
+
+    // A fork is launched the same way.
+    let forked: protocol::SessionForkResult = call(
+        &mut local,
+        method::SESSION_FORK,
+        json!({ "session_id": resumed.session.id, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    wait_for_text(
+        &mut local,
+        &forked.session.id,
+        "LAUNCH_ENV_PAIR=<from-descriptor>",
+    )
+    .await;
+    for stopped in [&resumed.session.id, &forked.session.id] {
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(stopped)).await;
+    }
+
+    // A host profile's `[env]` entry of the same name wins.
+    let overridden = start_session(&mut local, "overridden", &cwd).await;
+    let text = wait_for_text(&mut local, &overridden, "LAUNCH_ENV_PAIR=<from-profile>").await;
+    assert!(!text.contains("from-descriptor"), "{text:?}");
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(overridden)).await;
 
     drop(local);
     servers.stop().await;

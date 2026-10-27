@@ -23,7 +23,7 @@ use tracing::debug;
 
 use crate::agent::host::{
     LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy, VersionRefusal,
-    RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
+    RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 use crate::integration::Home;
@@ -46,10 +46,11 @@ const PROBE_LOCALE: &str = "C";
 /// Version-probe parsers the daemon compiles in, selected by the parser id a
 /// runtime definition names under `version_probe.parser`.
 ///
-/// The compiled parsers (`semver-v1` and `semver-line-v1`) are data-driven:
-/// the declared arguments print one `MAJOR.MINOR.PATCH` release, bare or
-/// inside the declared line template, that must lie in the declared range, so
-/// a package update moves the range without a daemon release.
+/// The compiled parsers (`semver-v1`, `semver-line-v1` and
+/// `semver-revision-line-v1`) are data-driven: the declared arguments print one
+/// `MAJOR.MINOR.PATCH` release (with a `-R<n>[.<m>]` revision for the last),
+/// bare or inside the declared line template, that must lie in the declared
+/// range, so a package update moves the range without a daemon release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VersionProbe<'a>(&'a VersionProbePolicy);
 
@@ -58,7 +59,9 @@ impl<'a> VersionProbe<'a> {
     /// not compile in or a data-driven parser without its policy.
     fn for_definition(definition: &'a RuntimeDefinition) -> Option<Self> {
         match definition.version_probe_parser()?.as_str() {
-            SEMVER_PARSER_ID | SEMVER_LINE_PARSER_ID => definition.version_probe_policy().map(Self),
+            SEMVER_PARSER_ID | SEMVER_LINE_PARSER_ID | SEMVER_REVISION_LINE_PARSER_ID => {
+                definition.version_probe_policy().map(Self)
+            }
             _ => None,
         }
     }
@@ -72,8 +75,12 @@ impl<'a> VersionProbe<'a> {
 
     /// Whether this daemon accepts `version` for launch.
     fn accepts(self, version: &str) -> bool {
-        crate::agent::host::ProbeVersion::parse(version)
-            .is_some_and(|version| self.0.supports(version))
+        let parsed = if self.0.reads_revisions() {
+            crate::agent::host::ProbeVersion::parse_revision(version)
+        } else {
+            crate::agent::host::ProbeVersion::parse(version)
+        };
+        parsed.is_some_and(|version| self.0.supports(version))
     }
 }
 
@@ -459,7 +466,12 @@ fn plan_versioned_runtime(
 
     let probe = VersionProbe::for_definition(definition).map(|probe| {
         (
-            ProbeRequest::new(program.as_path(), probe.0.args(), launch_path),
+            ProbeRequest::new(
+                program.as_path(),
+                probe.0.args(),
+                launch_path,
+                definition.launch_env(),
+            ),
             probe.0.clone(),
         )
     });
@@ -635,6 +647,7 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
         program.as_path(),
         policy,
         launch_path,
+        definition.launch_env(),
         timeout,
         &[],
         &Instant::now,
@@ -680,6 +693,7 @@ fn run_request(request: &ProbeRequest) -> Option<String> {
         request.program(),
         request.args(),
         request.launch_path(),
+        request.launch_env(),
         VERSION_PROBE_TIMEOUT,
         &[],
         &Instant::now,
@@ -696,11 +710,20 @@ fn spawn_and_collect_probe(
     path: &std::path::Path,
     policy: &VersionProbePolicy,
     launch_path: Option<&OsStr>,
+    launch_env: &[(String, String)],
     timeout: Duration,
     seeded_env: &[(&str, &str)],
     now: &impl Fn() -> Instant,
 ) -> Option<ProbeOutcome> {
-    collect_probe(path, policy.args(), launch_path, timeout, seeded_env, now)
+    collect_probe(
+        path,
+        policy.args(),
+        launch_path,
+        launch_env,
+        timeout,
+        seeded_env,
+        now,
+    )
 }
 
 /// Spawns `path` with `args` and collects at most [`VERSION_OUTPUT_LIMIT`]
@@ -714,6 +737,7 @@ fn collect_probe(
     path: &std::path::Path,
     args: &[String],
     launch_path: Option<&OsStr>,
+    launch_env: &[(String, String)],
     timeout: Duration,
     seeded_env: &[(&str, &str)],
     now: &impl Fn() -> Instant,
@@ -721,8 +745,11 @@ fn collect_probe(
     let sandbox = VersionProbeSandbox::create()?;
     let mut command = Command::new(path);
     command.envs(seeded_env.iter().copied());
+    // The runtime's `[launch_env]` pairs go in right after the clear: they
+    // never name a variable the sandbox below sets, and a program that
+    // self-updates unless one is set needs it during the probe too.
+    command.env_clear().envs(launch_env.iter().cloned());
     command
-        .env_clear()
         .current_dir(&sandbox.cwd_path)
         .env("LANG", PROBE_LOCALE)
         .env("LC_ALL", PROBE_LOCALE)
@@ -1485,6 +1512,7 @@ strategy = "none"
             path,
             policy,
             process_path().as_deref(),
+            &[],
             timeout,
             seeded_env,
             now,
@@ -2068,6 +2096,7 @@ strategy = "none"
             &tool,
             policy,
             process_path().as_deref(),
+            &[],
             HANG_GUARD,
             &seeded_env,
             &Instant::now,

@@ -1,0 +1,3 @@
+## Unreleased (2026-10-27, runtime features for out-of-tree runtimes, #1645)
+
+- A runtime descriptor can read a numeric `1.4.13-R2` release (`semver-revision-line-v1`, feature `version-probe-revision-v1`), set literal launch and probe environment variables (`[launch_env]`, feature `launch-env-v1`) and name its config home below a variable's value (`[config_home] subdir`, feature `config-home-subdir-v1`). Each is listed in the descriptor's `requires`; core refuses a descriptor that uses one without it with `runtime_feature_unsupported`. See [Runtime features](guides/runtime-packages.md#runtime-features), [Launch environment](guides/runtime-packages.md#launch-environment) and [Declaring a version probe](guides/runtime-packages.md#declaring-a-version-probe).

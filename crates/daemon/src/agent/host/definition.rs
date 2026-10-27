@@ -8,6 +8,7 @@
 //! [`NativeSessionLaunch`] template rules with host profiles, so a reference
 //! slot is always one whole argv token.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use super::config_home::ConfigHome;
 use super::features::{check_gates, check_requires, FeatureTables};
+use super::launch_env::DescriptorLaunchEnv;
 use super::transcripts::Transcripts;
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
@@ -32,7 +34,7 @@ use crate::agent::{
 use crate::detect::Manifest;
 use package::version_probe::{
     VersionProbeDeclaration, VersionProbeError, VersionProbePolicy, SEMVER_LINE_PARSER_ID,
-    SEMVER_PARSER_ID,
+    SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
 
 /// `schema` value this build accepts in a runtime definition.
@@ -414,6 +416,9 @@ pub struct RuntimeDefinition {
     version_probe_parser: Option<HandlerId>,
     version_probe_policy: Option<VersionProbePolicy>,
     integration: Option<Integration>,
+    /// The literal environment pairs every launch and version probe of the
+    /// runtime gets, from `[launch_env]`.
+    launch_env: DescriptorLaunchEnv,
     config_home: Option<ConfigHome>,
     /// Where below the config home the agent writes transcripts and which
     /// compiled parser reads them; `None` for a runtime that declares none.
@@ -439,6 +444,19 @@ impl RuntimeDefinition {
     /// rule on a region that readiness reads, since it would then never be
     /// observed.
     pub fn new(parts: DefinitionParts) -> Result<Self, DefinitionError> {
+        Self::new_with_env(parts, DescriptorLaunchEnv::default())
+    }
+
+    /// [`Self::new`] with the validated `[launch_env]` pairs the runtime's
+    /// launches and version probes get.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_with_env(
+        parts: DefinitionParts,
+        launch_env: DescriptorLaunchEnv,
+    ) -> Result<Self, DefinitionError> {
         let DefinitionParts {
             runtime_id,
             origin,
@@ -501,6 +519,7 @@ impl RuntimeDefinition {
                     submit_delay_configurable,
                     prompt_arg,
                     native: native.as_ref(),
+                    launch_env: launch_env.as_slice(),
                 });
                 BindingProvenance::Builtin {
                     package,
@@ -529,6 +548,7 @@ impl RuntimeDefinition {
             version_probe_parser,
             version_probe_policy,
             integration,
+            launch_env,
             config_home: None,
             transcripts: None,
             hook_existence: None,
@@ -671,51 +691,55 @@ impl RuntimeDefinition {
         let config_home = raw
             .config_home
             .as_ref()
-            .map(|declared| ConfigHome::new(&declared.env, &declared.default))
+            .map(RawConfigHome::validated)
             .transpose()?;
         let transcripts = raw
             .transcripts
             .as_ref()
             .map(|declared| Transcripts::new(&declared.parser, &declared.dir))
             .transpose()?;
-        let definition = Self::new(DefinitionParts {
-            runtime_id,
-            origin: origin(package),
-            display_name: raw.runtime.name,
-            program: LaunchProgram::Fixed(raw.runtime.program),
-            default_args: raw.runtime.args,
-            input_rules,
-            input_readiness,
-            submit_delay_configurable: raw.input.submit_delay_configurable,
-            manifest,
-            native,
-            prompt_arg: raw.runtime.prompt_arg,
-            version_probe_parser: raw
-                .runtime
-                .version_probe
-                .as_ref()
-                .map(|probe| HandlerId::parse(&probe.parser, "runtime.version_probe.parser"))
-                .transpose()?,
-            version_probe_policy: raw
-                .runtime
-                .version_probe
-                .as_ref()
-                .map(VersionProbeDeclaration::policy)
-                .transpose()?
-                .flatten(),
-            integration: raw
-                .integration
-                .map(|integration| {
-                    Integration::new(
-                        Some(HandlerId::parse(
-                            &integration.handler,
-                            "integration.handler",
-                        )?),
-                        &integration.hook_schema,
-                    )
-                })
-                .transpose()?,
-        })?;
+        let launch_env = raw.validated_launch_env(config_home.as_ref())?;
+        let definition = Self::new_with_env(
+            DefinitionParts {
+                runtime_id,
+                origin: origin(package),
+                display_name: raw.runtime.name,
+                program: LaunchProgram::Fixed(raw.runtime.program),
+                default_args: raw.runtime.args,
+                input_rules,
+                input_readiness,
+                submit_delay_configurable: raw.input.submit_delay_configurable,
+                manifest,
+                native,
+                prompt_arg: raw.runtime.prompt_arg,
+                version_probe_parser: raw
+                    .runtime
+                    .version_probe
+                    .as_ref()
+                    .map(|probe| HandlerId::parse(&probe.parser, "runtime.version_probe.parser"))
+                    .transpose()?,
+                version_probe_policy: raw
+                    .runtime
+                    .version_probe
+                    .as_ref()
+                    .map(VersionProbeDeclaration::policy)
+                    .transpose()?
+                    .flatten(),
+                integration: raw
+                    .integration
+                    .map(|integration| {
+                        Integration::new(
+                            Some(HandlerId::parse(
+                                &integration.handler,
+                                "integration.handler",
+                            )?),
+                            &integration.hook_schema,
+                        )
+                    })
+                    .transpose()?,
+            },
+            launch_env,
+        )?;
         let definition = match hook_existence {
             Some(existence) => definition.with_hook_existence(existence),
             None => definition,
@@ -840,6 +864,14 @@ impl RuntimeDefinition {
         self.config_home.as_ref()
     }
 
+    /// The literal environment pairs, in name order, that every launch and
+    /// version probe of this runtime gets; empty when the descriptor declares
+    /// none.
+    #[must_use]
+    pub fn launch_env(&self) -> &[(String, String)] {
+        self.launch_env.as_slice()
+    }
+
     /// Where the agent writes transcripts below its config home and which
     /// compiled parser reads them, when the descriptor declares it.
     #[must_use]
@@ -933,7 +965,10 @@ fn validate_version_probe(
     policy: Option<&VersionProbePolicy>,
 ) -> Result<(), DefinitionError> {
     let parser = parser.map(HandlerId::as_str);
-    let data_driven = matches!(parser, Some(SEMVER_PARSER_ID | SEMVER_LINE_PARSER_ID));
+    let data_driven = matches!(
+        parser,
+        Some(SEMVER_PARSER_ID | SEMVER_LINE_PARSER_ID | SEMVER_REVISION_LINE_PARSER_ID)
+    );
     match (data_driven, policy) {
         (true, None) => Err(DefinitionError::Field {
             field: "runtime.version_probe",
@@ -941,19 +976,21 @@ fn validate_version_probe(
         }),
         (false, Some(_)) => Err(DefinitionError::Field {
             field: "runtime.version_probe",
-            reason:
-                "args, min and below are only accepted by the semver-v1 and semver-line-v1 parsers",
+            reason: "args, min and below are only accepted by the semver-v1, semver-line-v1 and semver-revision-line-v1 parsers",
         }),
         (true, Some(policy)) => {
-            let wants_line = parser == Some(SEMVER_LINE_PARSER_ID);
+            let wants_line = matches!(
+                parser,
+                Some(SEMVER_LINE_PARSER_ID | SEMVER_REVISION_LINE_PARSER_ID)
+            );
             match (wants_line, policy.has_line_template()) {
                 (true, false) => Err(DefinitionError::Field {
                     field: "runtime.version_probe.line",
-                    reason: "is required by the semver-line-v1 parser",
+                    reason: "is required by the semver-line-v1 and semver-revision-line-v1 parsers",
                 }),
                 (false, true) => Err(DefinitionError::Field {
                     field: "runtime.version_probe.line",
-                    reason: "is only accepted by the semver-line-v1 parser",
+                    reason: "is only accepted by the semver-line-v1 and semver-revision-line-v1 parsers",
                 }),
                 _ => Ok(()),
             }
@@ -1083,6 +1120,10 @@ struct DescriptorFacts<'a> {
     submit_delay_configurable: bool,
     prompt_arg: bool,
     native: Option<&'a NativeSessionLaunch>,
+    /// Omitted while empty, so a descriptor without `[launch_env]` hashes to
+    /// the value persisted sessions record.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    launch_env: &'a [(String, String)],
 }
 
 #[derive(Serialize)]
@@ -1154,6 +1195,8 @@ struct RawDefinition {
     #[serde(default)]
     integration: Option<RawIntegration>,
     #[serde(default)]
+    launch_env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
     config_home: Option<RawConfigHome>,
     #[serde(default)]
     transcripts: Option<RawTranscripts>,
@@ -1212,6 +1255,41 @@ fn parse_document(
     check_requires(&document, features)?;
     let raw = toml::from_str(source).map_err(|error| malformed(&error))?;
     Ok((document, raw))
+}
+
+impl RawDefinition {
+    /// The `[launch_env]` pairs, refused when one names a variable this
+    /// descriptor reads its config home or conversation root from.
+    fn validated_launch_env(
+        &self,
+        config_home: Option<&ConfigHome>,
+    ) -> Result<DescriptorLaunchEnv, DefinitionError> {
+        let launch_env = self
+            .launch_env
+            .clone()
+            .map(|declared| DescriptorLaunchEnv::new(&self.runtime.id, declared))
+            .transpose()?
+            .unwrap_or_default();
+        launch_env.refuse_owned(
+            config_home.map(ConfigHome::env).into_iter().chain(
+                self.native_reference
+                    .existence
+                    .as_ref()
+                    .and_then(|existence| existence.root_env.as_deref()),
+            ),
+        )?;
+        Ok(launch_env)
+    }
+}
+
+impl RawConfigHome {
+    fn validated(&self) -> Result<ConfigHome, DefinitionError> {
+        let home = ConfigHome::new(&self.env, &self.default)?;
+        match &self.subdir {
+            Some(subdir) => home.with_subdir(subdir),
+            None => Ok(home),
+        }
+    }
 }
 
 /// Readiness names accepted in `[input]`.
@@ -1290,6 +1368,9 @@ struct RawIntegration {
 struct RawConfigHome {
     env: String,
     default: String,
+    /// Directory below the `env` value; absent means the value is the home.
+    #[serde(default)]
+    subdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
