@@ -1389,12 +1389,20 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
             .home
             .as_ref()
             .map_or_else(String::new, |home| format!(" ({})", home_label(home)));
-        let _ = writeln!(
-            output,
-            "installed {} hook{home}: {}",
-            agent_label(&report.agent),
-            report.hook_path
-        );
+        if report.hook_path.is_empty() {
+            let _ = writeln!(
+                output,
+                "{} hooks{home} are set up for each launch; nothing was written",
+                agent_label(&report.agent)
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "installed {} hook{home}: {}",
+                agent_label(&report.agent),
+                report.hook_path
+            );
+        }
         for path in &report.config_paths {
             let _ = writeln!(output, "  config: {path}");
         }

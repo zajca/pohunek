@@ -163,7 +163,7 @@ fn ok_gate(_index: usize, _name: &str) -> Result<(), ProtocolError> {
 #[test]
 fn the_registry_is_a_closed_set_of_unique_ids() {
     let ids: Vec<&str> = handlers().iter().map(|handler| handler.id()).collect();
-    assert_eq!(ids, [CODEX_ID, CLAUDE_ID, "hermes-hook-v1"]);
+    assert_eq!(ids, [CODEX_ID, CLAUDE_ID, "hermes-hook-v1", "muse-hook-v1"]);
     for id in &ids {
         assert_eq!(handler(id).map(Handler::id), Some(*id));
     }

@@ -40,6 +40,8 @@ mod doctor;
 mod handler;
 mod homes;
 pub mod launch_input;
+mod muse;
+
 mod provider_handlers;
 mod reporter;
 use reporter::ReporterIdentity;
@@ -331,6 +333,12 @@ const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Env var the tests set to relocate Codex's config dir.
 #[cfg(test)]
 pub(crate) const CODEX_HOME_ENV: &str = "CODEX_HOME";
+
+/// The `POHUNEK_*` names the Muse reporter reads from the hook environment.
+#[cfg(test)]
+pub(crate) fn muse_hook_env_vars() -> &'static [&'static str] {
+    muse::hook_env_vars()
+}
 
 /// Files the installer wrote for one agent.
 #[derive(Debug, Clone, PartialEq, Eq)]

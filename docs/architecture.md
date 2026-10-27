@@ -1555,8 +1555,16 @@ in one place per launch: the environment between the profile `[env]` and the
 daemon handshake, the arguments after the frozen arguments and before the native
 session arguments. It is never part of the frozen resume snapshot, so a relaunch
 applies it exactly once. A contribution outside the bounds is refused with
-`launch_input_invalid`, one that cannot be written with
-`launch_input_unavailable`; either refuses the launch before a worker starts.
+`launch_input_invalid`, one that cannot be written, or whose runtime declares a
+config home that does not resolve (a relative or unusable `config_home.env`
+value), with `launch_input_unavailable`; either refuses the launch before a worker starts.
+
+The Muse Code handler is the first user of this seam
+(`crates/daemon/src/integration/muse/`, removed with #1643): its contribution
+is a per-session managed hooks overlay plus the reporter script, in the state
+directory, never in the session `TMPDIR`, the worktree or the Muse config home
+(Muse hooks run outside Muse's sandbox, so a sandbox-writable overlay would be
+a sandbox escape). The reporter is stateless and reaches the worker only.
 
 Plugins live outside core. A new runtime package or workflow plugin is never
 added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,

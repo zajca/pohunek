@@ -38,8 +38,10 @@ impl SessionRegistry {
     ///
     /// The contributor's own refusal, `launch_input_invalid` for a
     /// contribution outside core's bounds, and `launch_input_unavailable` when
-    /// a private file cannot be written or the registry has no worker state
-    /// directory to write it in.
+    /// a private file cannot be written, the registry has no worker state
+    /// directory to write it in, or the runtime's declared config home does
+    /// not resolve; `worker_initialize_invalid` when the base environment
+    /// cannot be built.
     pub(super) fn launch_inputs(
         &self,
         definition: &RuntimeDefinition,

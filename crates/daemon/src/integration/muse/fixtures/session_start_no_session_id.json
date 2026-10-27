@@ -1,0 +1,10 @@
+{
+  "x_fixture": {
+    "status": "unverified",
+    "source": "Muse Code documentation (extending: hooks), MIT Muse Code SDK msp.schema.json HookEventName and CHANGELOG 1.4.x; field values are synthetic",
+    "muse_release": "1.4.13"
+  },
+  "hook_event_name": "SessionStart",
+  "cwd": "/workspace",
+  "source": "startup"
+}

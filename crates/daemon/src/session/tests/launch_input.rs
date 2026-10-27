@@ -376,11 +376,11 @@ async fn a_file_no_longer_contributed_is_removed_on_the_next_launch() {
 }
 
 #[tokio::test]
-async fn a_relaunch_served_without_the_handler_gets_no_contribution() {
+async fn a_relaunch_served_by_another_definition_does_not_ask_the_original_contributor() {
     let fixture = install_fixture();
-    let rig = Rig::new("launch-input-unserved", true).await;
+    let mut rig = Rig::new("launch-input-unserved", true).await;
     stop_with_reference(&rig).await;
-    crate::test_support::set_thread_launch_contributor("other-hook-v1", Some(fixture));
+    rig.serve_with_handler("claude-hook-v1").await;
 
     rig.registry.resume(&rig.session.id).await.expect("resume");
     let log = wait_for_file_contains(&rig.launches, &format!("resume {NATIVE_ID}")).await;

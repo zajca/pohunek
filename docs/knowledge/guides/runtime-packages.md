@@ -108,6 +108,7 @@ The features this core implements:
 | `version-probe-revision-v1` | 0.38.0 | `version_probe.parser = "semver-revision-line-v1"` |
 | `launch-env-v1` | 0.38.0 | `[launch_env]` |
 | `transcripts-data-root-v1` | 0.38.0 | `[transcripts] root_env`, `root_home`, `max_depth`; `parser = "muse-session-v1"`; `[native_reference.existence] dir_name` |
+| `integration-muse-hook-v1` | 0.38.0 | `integration.handler = "muse-hook-v1"` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -365,6 +366,46 @@ rendered bytes are what is installed and what drift is compared against. A
 package never supplies script bytes.
 `hermes-hook-v1` is registered but its lifecycle runs
 in the CLI; the daemon answers `agent_not_installable` for it.
+`muse-hook-v1` (feature `integration-muse-hook-v1`, hook schema
+`identity-subagent-v1`, reference kind `id`) installs nothing persistent: Muse
+runs hooks with a cleared environment, so every launch contributes a
+session-private managed hooks overlay (selected through
+`TBH_MANAGED_HOOKS_PATH`) and the arguments `-c managed_hooks_env_vars=[...]`
+as per-launch input, and `integration install`, `status` and `uninstall` only
+inspect the Muse config home. The overlay keeps every hook of a managed hooks
+file the launch selects (`TBH_MANAGED_HOOKS_PATH` in the launch environment, that is a
+profile `[env]` entry or a variable the service environment allowlist passes, else
+`managed_hooks_path` in the Muse `settings.json`) verbatim and appends the reporter for
+`SessionStart`, `SubagentStart` and `SubagentStop`; a selected file that is
+unreadable, larger than 64 KiB or not a JSON object refuses the launch with
+`integration_overlay_unavailable`, because dropping it would drop policy hooks.
+The variable list is the names the reporter reads and the user's own
+`managed_hooks_env_vars`; a launch argument that contains `managed_hooks_env_vars`
+or `managed_hooks_path` anywhere is refused
+with `integration_launch_arg_conflict`, because the accepted `-c` spellings are
+unverified; a Muse config home that does not resolve refuses the launch with
+`launch_input_unavailable`, and a descriptor that names `muse-hook-v1` without a
+`[config_home]` refuses it with `integration_overlay_unavailable`, because the settings
+file that may name a policy hooks file could not be found. The overlay copies the
+managed hooks file at each create and resume, so an edit of the policy file applies
+from the next launch, not to a running session. `integration status` builds the
+overlay the config home would produce and reports a file a launch would refuse as
+`outdated` with `repair_configuration`, and `install` refuses it with
+`integration_overlay_unavailable`; a managed hooks file named only by
+`TBH_MANAGED_HOOKS_PATH` in a profile `[env]` or the service environment is checked
+at launch, not there. The reporter rebuilds its search path from the absolute entries
+of the `PATH` Muse leaves it, else a fixed system path, so a `python3` that only the
+daemon's `PATH` finds (Homebrew or Nix, say) is found by `integration doctor` but not
+by the hook. The reporter is stateless, reports the
+root session only (`session_id` equal to `MUSE_SESSION_ID`, `-reminder` threads
+dropped), reports subagents without a role, and reaches the worker only. A
+foreground `muse` started inside a shell session gets no overlay and no
+identity. The payload fields, the hooks file layout and the `-c` spelling are
+unverified against a real Muse run.
+A daemon without the handler (a rollback) reads the session directories of earlier
+launches as unknown entries: garbage collection keeps them, which leaks a few
+small files until the session is removed, and a relaunch served without a
+contributor does not unlink the files an earlier launch wrote.
 The `--agent` flag of `pohunek integration` takes the runtime id of a package runtime that
 names a daemon-run handler, and the recovery commands in status and doctor name
 that id. Several runtimes may name one handler; a home that several of them reach
@@ -390,8 +431,9 @@ carries this; only the handler's compiled code does. Core writes the files as
 outside the paths the runtime's sandbox lets the agent write, resolves `{file:<name>}` placeholders to their
 absolute paths, applies the result to every create, resume and fork, and never
 stores it in the resume snapshot. A contribution core cannot accept refuses the
-launch with `launch_input_invalid`; one it cannot write refuses it with
-`launch_input_unavailable`.
+launch with `launch_input_invalid`; one it cannot write, or a declared
+config home that does not resolve (for example a relative `XDG_CONFIG_HOME`),
+refuses it with `launch_input_unavailable`.
 
 ## Local only
 

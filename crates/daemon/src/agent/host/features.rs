@@ -98,6 +98,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "transcripts-data-root-v1",
         since: "0.38.0",
     },
+    RuntimeFeature {
+        id: "integration-muse-hook-v1",
+        since: "0.38.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -136,6 +140,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "transcripts-data-root-v1",
         rule: GateRule::Key("native_reference.existence.dir_name"),
+    },
+    FeatureGate {
+        feature: "integration-muse-hook-v1",
+        rule: GateRule::Value("integration.handler", "muse-hook-v1"),
     },
 ];
 
