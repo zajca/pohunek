@@ -1026,6 +1026,57 @@ fn launch_env_table(lines: &[String]) -> String {
     format!("\n[launch_env]\n{}\n", lines.join("\n"))
 }
 
+/// Names a `pi` descriptor cannot declare: outside its namespace, or inside it
+/// and saying where something lives, who it is or what to run.
+const REFUSED_LAUNCH_ENV_NAMES: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "DISPLAY",
+    "AWS_REGION",
+    "OTHER_FLAG",
+    "POHUNEK_X",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    "XDG_CONFIG_HOME",
+    "LC_ALL",
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "NOTIFY_SOCKET",
+    "pi_flag",
+    "PI_",
+    "PI_CONFIG_DIR",
+    "PI_AUTH_PATH",
+    // Every word after the namespace counts, last or not.
+    "PI_EDITOR_DIRS",
+    "PI_X_PATHS",
+    "PI_RUN_CMD",
+    "PI_BIN",
+    "PI_NODE_OPTS",
+    "PI_OPTIONS",
+    "PI_ARGS",
+    "PI_FLAGS",
+    "PI_EXEC",
+    "PI_SHELL",
+    "PI_EDITOR",
+    "PI_HOOK",
+    "PI_PLUGIN",
+    "PI_LIB",
+    "PI_PRELOAD",
+    "PI_CERT",
+    "PI_CA",
+    "PI_KEYRING",
+    "PI_HOME_MODE",
+    "PI_CONFIG_LEVEL",
+    "PI_PATH_STYLE",
+    "PI_PRELOAD_MODE",
+    "PI_EXEC_TIMEOUT_MS",
+    "PI_HOST",
+    "PI_SESSION_ID",
+    "PI_API_KEY",
+    "PI_TOKEN",
+    "PI_BAD-NAME",
+];
+
 #[tokio::test]
 async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_names() {
     let servers = spawn_servers("pkg-launch-env").await;
@@ -1048,57 +1099,10 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
     let numbered: Vec<String> = (0..=16).map(|n| format!("PI_FLAG_{n} = \"1\"")).collect();
     // Names outside the runtime's namespace, names inside it that say where
     // something lives or who it is, then values and shapes outside the bounds.
-    let mut refused: Vec<(String, String)> = [
-        "SSH_AUTH_SOCK",
-        "DISPLAY",
-        "AWS_REGION",
-        "OTHER_FLAG",
-        "POHUNEK_X",
-        "LD_PRELOAD",
-        "DYLD_INSERT_LIBRARIES",
-        "XDG_CONFIG_HOME",
-        "LC_ALL",
-        "PATH",
-        "HOME",
-        "TMPDIR",
-        "NOTIFY_SOCKET",
-        "pi_flag",
-        "PI_",
-        "PI_CONFIG_DIR",
-        "PI_AUTH_PATH",
-        // Every word after the namespace counts, last or not.
-        "PI_EDITOR_DIRS",
-        "PI_X_PATHS",
-        "PI_RUN_CMD",
-        "PI_BIN",
-        "PI_NODE_OPTS",
-        "PI_OPTIONS",
-        "PI_ARGS",
-        "PI_FLAGS",
-        "PI_EXEC",
-        "PI_SHELL",
-        "PI_EDITOR",
-        "PI_HOOK",
-        "PI_PLUGIN",
-        "PI_LIB",
-        "PI_PRELOAD",
-        "PI_CERT",
-        "PI_CA",
-        "PI_KEYRING",
-        "PI_HOME_MODE",
-        "PI_CONFIG_LEVEL",
-        "PI_PATH_STYLE",
-        "PI_PRELOAD_MODE",
-        "PI_EXEC_TIMEOUT_MS",
-        "PI_HOST",
-        "PI_SESSION_ID",
-        "PI_API_KEY",
-        "PI_TOKEN",
-        "PI_BAD-NAME",
-    ]
-    .iter()
-    .map(|name| ((*name).to_owned(), pair(name)))
-    .collect();
+    let mut refused: Vec<(String, String)> = REFUSED_LAUNCH_ENV_NAMES
+        .iter()
+        .map(|name| ((*name).to_owned(), pair(name)))
+        .collect();
     refused.extend([
         (
             "config-home-variable".to_owned(),
