@@ -20630,15 +20630,119 @@ async fn retention_sweep_counts_a_removal_it_could_not_complete() {
     );
 }
 
+/// A session from [`record_only_session`]. When the test panics while it is
+/// alive, it prints the state of the session's worker journal directory, so a
+/// failed sweep assertion shows whether a journal had reappeared.
+struct RecordOnlySession {
+    info: SessionInfo,
+    journals: PathBuf,
+    deleted_at_micros: u128,
+}
+
+impl std::ops::Deref for RecordOnlySession {
+    type Target = SessionInfo;
+
+    fn deref(&self) -> &SessionInfo {
+        &self.info
+    }
+}
+
+impl RecordOnlySession {
+    /// Microseconds since the Unix epoch, the clock of the file mtimes.
+    fn epoch_micros(time: std::time::SystemTime) -> u128 {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros())
+    }
+
+    /// Lists the journal directory with each file's mtime relative to the
+    /// fixture's deletion, and names the sweep a removal would run now: a
+    /// worker journal bounds the sweep by the worker start identity (a
+    /// journaled sweep), none leaves it unbounded (a record-only sweep).
+    fn report(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut report = format!(
+            "record-only session {}: the fixture deleted its worker journals at {} us since the epoch\n",
+            self.info.id.0, self.deleted_at_micros
+        );
+        let mut journaled = false;
+        match fs::read_dir(&self.journals) {
+            Err(error) => {
+                let _ = writeln!(report, "  journal directory unreadable: {error}");
+            }
+            Ok(entries) => {
+                for entry in entries.filter_map(Result::ok) {
+                    let path = entry.path();
+                    let modified = entry
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .map(Self::epoch_micros);
+                    let relative = modified.map_or_else(
+                        |error| format!("mtime unreadable: {error}"),
+                        |micros| {
+                            format!(
+                                "mtime {micros} us ({:+} us from the deletion)",
+                                i128::try_from(micros).unwrap_or(i128::MAX)
+                                    - i128::try_from(self.deleted_at_micros).unwrap_or(0)
+                            )
+                        },
+                    );
+                    let content = fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .map_or_else(String::new, |journal| {
+                            format!(
+                                ", phase {}, terminal_acknowledged {}",
+                                journal["phase"], journal["terminal_acknowledged"]
+                            )
+                        });
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        journaled = true;
+                    }
+                    let _ = writeln!(
+                        report,
+                        "  {}: {relative}{content}",
+                        entry.file_name().to_string_lossy()
+                    );
+                }
+            }
+        }
+        let _ = writeln!(
+            report,
+            "  a removal now would run a {} sweep",
+            if journaled {
+                "journaled (a worker journal is present)"
+            } else {
+                "record-only (no worker journal)"
+            }
+        );
+        report
+    }
+}
+
+impl Drop for RecordOnlySession {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", self.report());
+        }
+    }
+}
+
 /// Creates an exited session whose worker journals are deleted, so the record
 /// is the only evidence of its runtime and its removal sweep has no worker
 /// start bound.
-async fn record_only_session(registry: &SessionRegistry) -> SessionInfo {
+async fn record_only_session(registry: &SessionRegistry) -> RecordOnlySession {
     record_only_session_in(registry, None).await
 }
 
 /// [`record_only_session`] on its own worktree of `repo`, when given.
-async fn record_only_session_in(registry: &SessionRegistry, repo: Option<&PathBuf>) -> SessionInfo {
+async fn record_only_session_in(
+    registry: &SessionRegistry,
+    repo: Option<&PathBuf>,
+) -> RecordOnlySession {
     let session = exited_session(registry, repo).await;
     let journals = registry
         .inner
@@ -20679,7 +20783,11 @@ async fn record_only_session_in(registry: &SessionRegistry, repo: Option<&PathBu
         }
     }
     assert!(removed_journals > 0, "the worker journaled its runtime");
-    session
+    RecordOnlySession {
+        info: session,
+        journals,
+        deleted_at_micros: RecordOnlySession::epoch_micros(std::time::SystemTime::now()),
+    }
 }
 
 /// Replaces a terminal session's recorded runtime while retaining its journal.
