@@ -109,6 +109,7 @@ struct Rig {
     session: SessionInfo,
     commands: fs::File,
     acks: PathBuf,
+    hook_runs: PathBuf,
     launches: PathBuf,
     state_root: PathBuf,
     muse_home: PathBuf,
@@ -157,11 +158,12 @@ impl Rig {
         }
         let commands = hook_gate(&dir.join("commands.fifo"));
         let acks = dir.join("acks.txt");
+        let hook_runs = dir.join("hook-runs.txt");
         let launches = dir.join("launches.txt");
         let script = dir.join("muse-agent.sh");
         write_executable(
             &script,
-            &fake_muse(&dir.join("commands.fifo"), &acks, &launches),
+            &fake_muse(&dir.join("commands.fifo"), &acks, &hook_runs, &launches),
         );
         let program = dir.join(MUSE_BIN);
         pohunek_test_support::fs::copy_shell_image(native_supersede::bash_path(), &program)
@@ -210,6 +212,7 @@ impl Rig {
             session,
             commands,
             acks,
+            hook_runs,
             launches,
             state_root,
             muse_home,
@@ -240,6 +243,26 @@ impl Rig {
             (now > before).then_some(())
         })
         .await;
+    }
+
+    /// The exit status and combined output size of every hook command the fake
+    /// Muse ran, one `rc=<status> bytes=<count>` line per hook.
+    fn hook_runs(&self) -> Vec<String> {
+        fs::read_to_string(&self.hook_runs)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Asserts that exactly `count` hook commands ran and every one exited 0
+    /// without writing to stdout or stderr.
+    fn assert_hooks_quiet(&self, count: usize) {
+        assert_eq!(
+            self.hook_runs(),
+            vec!["rc=0 bytes=0".to_owned(); count],
+            "every reporter run exits 0 and prints nothing"
+        );
     }
 
     async fn worker(&self) -> Worker {
@@ -303,8 +326,10 @@ fn fixture_path(name: &str) -> PathBuf {
 /// managed_hooks_env_vars` list and the overlay named by
 /// `TBH_MANAGED_HOOKS_PATH`, and on `fire` runs the overlay's hooks for an
 /// event in a cleared environment that keeps only the listed variables plus
-/// `MUSE_SESSION_ID` and `MUSE_THREAD_ID`, with the payload on stdin.
-fn fake_muse(fifo: &Path, acks: &Path, launches: &Path) -> String {
+/// `MUSE_SESSION_ID` and `MUSE_THREAD_ID`, with the payload on stdin. Each hook's
+/// exit status and combined output size is appended to `hook_runs`; the hook
+/// runs as a direct child so its `$PPID` is the fake Muse.
+fn fake_muse(fifo: &Path, acks: &Path, hook_runs: &Path, launches: &Path) -> String {
     format!(
         r#"#!/bin/bash
 printf '%s\n' "$*" >> '{launches}'
@@ -336,7 +361,9 @@ while read -r command event payload root < '{fifo}'; do
         assign="$assign $name=$(printf '%q' "$value")"
       done
       while IFS= read -r hook; do
-        eval "env -i$assign MUSE_SESSION_ID=$root MUSE_THREAD_ID=$root $hook" < "$payload"
+        eval "env -i$assign MUSE_SESSION_ID=$root MUSE_THREAD_ID=$root $hook" < "$payload" > '{hook_runs}.out' 2>&1
+        status=$?
+        printf 'rc=%s bytes=%s\n' "$status" "$(wc -c < '{hook_runs}.out' | tr -d ' ')" >> '{hook_runs}'
       done < <(hook_commands "$event")
       printf 'fired %s\n' "$event" >> '{acks}' ;;
     exit) exit 0 ;;
@@ -345,6 +372,7 @@ done
 "#,
         fifo = fifo.display(),
         acks = acks.display(),
+        hook_runs = hook_runs.display(),
         launches = launches.display(),
     )
 }
@@ -368,6 +396,7 @@ async fn a_root_session_start_binds_and_reminder_or_child_threads_are_refused() 
         snapshot.launch_identity.is_some(),
         "the muse-bin process is the launch process"
     );
+    rig.assert_hooks_quiet(4);
     let trace = rig.trace();
     for reason in ["reminder_thread", "thread_not_root", "source_unknown"] {
         assert!(
@@ -782,11 +811,16 @@ async fn status_and_doctor_report_a_misshapen_hooks_file_that_a_launch_would_ref
     )
     .expect("doctor");
     assert!(
+        !doctor.agents[0].ok,
+        "an error finding fails the diagnosis: {:?}",
         doctor.agents[0]
-            .findings
-            .iter()
-            .any(|finding| finding.summary.contains("policy-hooks.json")),
-        "a finding names the misshapen file: {:?}",
+    );
+    assert!(
+        doctor.agents[0].findings.iter().any(|finding| {
+            finding.summary.contains("policy-hooks.json")
+                && finding.severity == protocol::IntegrationFindingSeverity::Error
+        }),
+        "an error finding names the misshapen file: {:?}",
         doctor.agents[0].findings
     );
     let error = crate::integration::install_in(
@@ -822,6 +856,7 @@ async fn malformed_hook_input_exits_quietly_and_names_its_reason_in_the_trace() 
         .await;
     rig.fire("SessionStart", "session_start_startup", "").await;
 
+    rig.assert_hooks_quiet(6);
     let trace = rig.trace();
     for reason in [
         "not_json",
