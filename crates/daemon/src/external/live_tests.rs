@@ -126,6 +126,7 @@ impl Live {
             agent_base: RuntimeRef::claude(),
             path: root.clone(),
             private: false,
+            max_depth: None,
         }];
         let (index, handle) = start_transcript_index(&roots, &sessions).await;
         if let Some(probe) = probe {
@@ -535,12 +536,14 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
             agent_base: RuntimeRef::claude(),
             path: outer.clone(),
             private: false,
+            max_depth: None,
         },
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
             private: false,
+            max_depth: None,
         },
     ];
 

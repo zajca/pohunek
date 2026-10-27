@@ -14,6 +14,7 @@ use package::version_probe::SEMVER_REVISION_LINE_PARSER_ID;
 use toml::{Table, Value};
 
 use super::definition::{DefinitionError, MAX_LABEL_BYTES};
+use super::transcripts::MUSE_SESSION_PARSER_ID;
 
 /// Maximum number of entries in a descriptor's `requires`.
 pub(super) const MAX_REQUIRES: usize = 16;
@@ -93,6 +94,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "launch-env-v1",
         since: "0.38.0",
     },
+    RuntimeFeature {
+        id: "transcripts-data-root-v1",
+        since: "0.38.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -111,6 +116,26 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "launch-env-v1",
         rule: GateRule::Key("launch_env"),
+    },
+    FeatureGate {
+        feature: "transcripts-data-root-v1",
+        rule: GateRule::Key("transcripts.root_env"),
+    },
+    FeatureGate {
+        feature: "transcripts-data-root-v1",
+        rule: GateRule::Key("transcripts.root_home"),
+    },
+    FeatureGate {
+        feature: "transcripts-data-root-v1",
+        rule: GateRule::Key("transcripts.max_depth"),
+    },
+    FeatureGate {
+        feature: "transcripts-data-root-v1",
+        rule: GateRule::Value("transcripts.parser", MUSE_SESSION_PARSER_ID),
+    },
+    FeatureGate {
+        feature: "transcripts-data-root-v1",
+        rule: GateRule::Key("native_reference.existence.dir_name"),
     },
 ];
 

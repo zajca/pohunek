@@ -76,6 +76,9 @@ pub(super) struct InotifyBackend {
     wd_by_path: HashMap<PathBuf, libc::c_int>,
     lister: DirLister,
     add_watch: AddWatch,
+    /// Directory levels below a root its tree registers, for roots that bound
+    /// the walk.
+    depth_limits: HashMap<PathBuf, u8>,
 }
 
 /// One directory entry as seen by the tree walk.
@@ -155,6 +158,7 @@ impl InotifyBackend {
             wd_by_path: HashMap::new(),
             lister: list_directory,
             add_watch: inotify_add_watch,
+            depth_limits: HashMap::new(),
         })
     }
 
@@ -205,9 +209,15 @@ impl InotifyBackend {
         let mut failed_dirs = 0_usize;
         let mut first_error: Option<io::Error> = None;
         let mut budget = MAX_WALK_ENTRIES;
-        let mut queue = VecDeque::from([root.to_path_buf()]);
+        let (limit, start_depth) = self.depth_limit_of(root);
+        if limit.is_some_and(|max| start_depth > max) {
+            // Below the bound nothing is watched, so a directory that appears
+            // there is neither registered nor walked.
+            return RootRegistration::Complete;
+        }
+        let mut queue = VecDeque::from([(root.to_path_buf(), start_depth)]);
         let mut is_root = true;
-        'walk: while let Some(dir) = queue.pop_front() {
+        'walk: while let Some((dir, depth)) = queue.pop_front() {
             if cancelled(cancel, &mut failed_dirs, &mut first_error) {
                 break 'walk;
             }
@@ -268,12 +278,15 @@ impl InotifyBackend {
                     }
                 };
                 if entry.is_dir {
+                    if limit.is_some_and(|max| depth >= max) {
+                        continue;
+                    }
                     if queue.len() + self.wd_by_path.len() >= MAX_WALK_DIRECTORIES {
                         failed_dirs += 1;
                         first_error.get_or_insert(limit_error("watched directory limit reached"));
                         break 'walk;
                     }
-                    queue.push_back(entry.path);
+                    queue.push_back((entry.path, depth + 1));
                 } else if let Some(found) = discovery.as_deref_mut() {
                     if is_jsonl_path(&entry.path) {
                         if found.paths.len() < MAX_DISCOVERED_TRANSCRIPTS {
@@ -292,6 +305,19 @@ impl InotifyBackend {
             },
             None => RootRegistration::Complete,
         }
+    }
+
+    /// The depth limit of the root that holds `dir`, and how many levels `dir`
+    /// lies below that root.
+    fn depth_limit_of(&self, dir: &Path) -> (Option<u8>, u8) {
+        self.depth_limits
+            .iter()
+            .find_map(|(root, limit)| {
+                let below = dir.strip_prefix(root).ok()?;
+                let levels = u8::try_from(below.components().count()).unwrap_or(u8::MAX);
+                Some((Some(*limit), levels))
+            })
+            .unwrap_or((None, 0))
     }
 
     /// Watches `path`. Returns `false` when the directory is already watched
@@ -329,6 +355,13 @@ impl InotifyBackend {
 }
 
 impl WatchBackend for InotifyBackend {
+    fn limit_depth(&mut self, root: &Path, max_depth: Option<u8>) {
+        match max_depth {
+            Some(limit) => self.depth_limits.insert(root.to_path_buf(), limit),
+            None => self.depth_limits.remove(root),
+        };
+    }
+
     fn register_root(&mut self, root: &Path, cancel: &CancellationToken) -> RootRegistration {
         match fs::metadata(root) {
             Ok(metadata) if metadata.is_dir() => self.register_tree(root, None, cancel),

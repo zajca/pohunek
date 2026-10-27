@@ -33,6 +33,10 @@ use protocol::{ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod dir_name;
+
+pub use dir_name::{DirNameExistence, ExistenceDecl};
+
 use super::{NativeArgs, NativeLaunchError, SessionRef};
 
 /// Placeholder that marks the reference inside an existence file name.
@@ -246,13 +250,29 @@ pub fn generate_assigned_reference() -> Result<SessionRef, ProtocolError> {
 }
 
 /// What a recovery verifies about an assigned reference before relaunch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "ExistenceSpec", into = "ExistenceSpec")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "ExistenceSpec")]
 pub enum ReferenceExistence {
     /// No verification: recovery relaunches from the reference unchecked.
     Unchecked,
     /// The conversation exists as a regular file below a declared directory.
     File(FileExistence),
+    /// The conversation exists as a file inside a directory named after the
+    /// reference. Only a hook runtime declares it and no snapshot stores it,
+    /// so it never serializes.
+    DirName(DirNameExistence),
+}
+
+impl Serialize for ReferenceExistence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unchecked => ExistenceSpec::from_unchecked().serialize(serializer),
+            Self::File(file) => ExistenceSpec::from_file(file.clone()).serialize(serializer),
+            Self::DirName(_) => Err(serde::ser::Error::custom(
+                "a directory-name existence check is not persisted",
+            )),
+        }
+    }
 }
 
 impl ReferenceExistence {
@@ -260,7 +280,7 @@ impl ReferenceExistence {
     /// reference reads nothing, so no scan budget applies to it.
     #[must_use]
     pub fn scans_store(&self) -> bool {
-        matches!(self, Self::File(_))
+        matches!(self, Self::File(_) | Self::DirName(_))
     }
 }
 
@@ -443,36 +463,37 @@ impl TryFrom<ExistenceSpec> for ReferenceExistence {
     }
 }
 
-impl From<ReferenceExistence> for ExistenceSpec {
-    fn from(existence: ReferenceExistence) -> Self {
-        match existence {
-            ReferenceExistence::Unchecked => Self {
-                check: ExistenceCheckKind::None,
-                root_env: None,
-                root_home: None,
-                dir: None,
-                file_name: None,
-                name_match: None,
-                max_depth: None,
-                store_env: None,
-                store_max_depth: None,
-                relocating_args: None,
-                relocating_settings: None,
-            },
-            ReferenceExistence::File(file) => Self {
-                check: ExistenceCheckKind::File,
-                root_env: file.root_env,
-                root_home: file.root_home,
-                dir: file.dir,
-                file_name: Some(file.file_name),
-                name_match: Some(file.name_match),
-                max_depth: Some(file.max_depth),
-                store_max_depth: file.store.as_ref().map(|store| store.max_depth),
-                store_env: file.store.map(|store| store.name),
-                relocating_args: (!file.relocating_args.is_empty()).then_some(file.relocating_args),
-                relocating_settings: (!file.relocating_settings.is_empty())
-                    .then_some(file.relocating_settings),
-            },
+impl ExistenceSpec {
+    fn from_unchecked() -> Self {
+        Self {
+            check: ExistenceCheckKind::None,
+            root_env: None,
+            root_home: None,
+            dir: None,
+            file_name: None,
+            name_match: None,
+            max_depth: None,
+            store_env: None,
+            store_max_depth: None,
+            relocating_args: None,
+            relocating_settings: None,
+        }
+    }
+
+    fn from_file(file: FileExistence) -> Self {
+        Self {
+            check: ExistenceCheckKind::File,
+            root_env: file.root_env,
+            root_home: file.root_home,
+            dir: file.dir,
+            file_name: Some(file.file_name),
+            name_match: Some(file.name_match),
+            max_depth: Some(file.max_depth),
+            store_max_depth: file.store.as_ref().map(|store| store.max_depth),
+            store_env: file.store.map(|store| store.name),
+            relocating_args: (!file.relocating_args.is_empty()).then_some(file.relocating_args),
+            relocating_settings: (!file.relocating_settings.is_empty())
+                .then_some(file.relocating_settings),
         }
     }
 }
@@ -829,7 +850,7 @@ impl ReferenceExistence {
     /// The declared launch arguments that move the store.
     fn relocating_args(&self) -> &[String] {
         match self {
-            Self::Unchecked => &[],
+            Self::Unchecked | Self::DirName(_) => &[],
             Self::File(file) => &file.relocating_args,
         }
     }
@@ -849,7 +870,7 @@ impl ReferenceExistence {
     /// Returns the relocation [`ReferenceCheckFailure`] the launch shows.
     pub fn check_relocation(&self, launch: &LaunchView<'_>) -> Result<(), ReferenceCheckFailure> {
         match self {
-            Self::Unchecked => Ok(()),
+            Self::Unchecked | Self::DirName(_) => Ok(()),
             Self::File(file) => file.check_relocation(launch),
         }
     }
@@ -864,7 +885,7 @@ impl ReferenceExistence {
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Option<StoreRoot>, ReferenceCheckFailure> {
         match self {
-            Self::Unchecked => Ok(None),
+            Self::Unchecked | Self::DirName(_) => Ok(None),
             Self::File(file) => file.resolve_store(env).map(Some),
         }
     }
@@ -929,6 +950,7 @@ impl ReferenceExistence {
         match self {
             Self::Unchecked => Ok(()),
             Self::File(file) => file.stat(reference.value(), env).map(|_| ()),
+            Self::DirName(dir) => dir.stat(reference.value(), env).map(|_| ()),
         }
     }
 
@@ -945,10 +967,11 @@ impl ReferenceExistence {
         reference: &SessionRef,
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Option<i128>, ReferenceCheckFailure> {
-        let Self::File(file) = self else {
-            return Ok(None);
+        let stat = match self {
+            Self::Unchecked => return Ok(None),
+            Self::File(file) => file.stat(reference.value(), env)?,
+            Self::DirName(dir) => dir.stat(reference.value(), env)?,
         };
-        let stat = file.stat(reference.value(), env)?;
         let nanos = i128::from(stat.st_mtime_nsec);
         if !(0..1_000_000_000).contains(&nanos) {
             return Ok(None);
@@ -1258,29 +1281,7 @@ impl FileExistence {
         &self,
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<PathBuf, ReferenceCheckFailure> {
-        let from_env = self
-            .root_env
-            .as_deref()
-            .and_then(env)
-            .filter(|value| !value.is_empty());
-        if let Some(value) = from_env {
-            let path = PathBuf::from(value);
-            return if path.is_absolute() {
-                Ok(path)
-            } else {
-                Err(ReferenceCheckFailure::RootUnavailable)
-            };
-        }
-        let relative = self
-            .root_home
-            .as_deref()
-            .ok_or(ReferenceCheckFailure::RootUnavailable)?;
-        let home = env(HOME_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .ok_or(ReferenceCheckFailure::RootUnavailable)?;
-        Ok(home.join(relative))
+        resolve_declared_root(self.root_env.as_deref(), self.root_home.as_deref(), env)
     }
 
     fn name_matches(&self, name: &str, wanted: &str) -> bool {
@@ -1343,6 +1344,31 @@ fn sets_key(path: &Path, key: &str) -> Result<bool, ReferenceCheckFailure> {
         Some(serde_json::Value::Number(number)) => number.as_f64() != Some(0.0),
         Some(_) => true,
     })
+}
+
+/// The root a declaration names: `root_env` when it is set to an absolute path,
+/// else `root_home` below the user's home directory.
+fn resolve_declared_root(
+    root_env: Option<&str>,
+    root_home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, ReferenceCheckFailure> {
+    let from_env = root_env.and_then(env).filter(|value| !value.is_empty());
+    if let Some(value) = from_env {
+        let path = PathBuf::from(value);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(ReferenceCheckFailure::RootUnavailable)
+        };
+    }
+    let relative = root_home.ok_or(ReferenceCheckFailure::RootUnavailable)?;
+    let home = env(HOME_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(ReferenceCheckFailure::RootUnavailable)?;
+    Ok(home.join(relative))
 }
 
 /// Opens the canonical store root as a directory descriptor.

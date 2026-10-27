@@ -224,6 +224,11 @@ pub(super) trait WatchBackend: Send + 'static {
     /// performs no I/O opts out.
     const OFFLOAD_REGISTRATION: bool = true;
 
+    /// Bounds the directories registered below `root` to `max_depth` levels, for
+    /// a backend that registers directory by directory. A backend that watches
+    /// a tree natively keeps the default; the scan applies the bound itself.
+    fn limit_depth(&mut self, _root: &Path, _max_depth: Option<u8>) {}
+
     /// Registers `root` and everything below it. Registering an already covered
     /// root is a cheap no-op that only fills in missing directories.
     fn register_root(&mut self, root: &Path, cancel: &CancellationToken) -> RootRegistration;
@@ -787,9 +792,13 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
     /// shutdown interrupted the registration.
     async fn register(&mut self, index: usize) -> bool {
         let path = self.roots[index].path.clone();
+        let max_depth = self.roots[index].max_depth;
         let cancel = self.shutdown.clone();
         let Some(outcome) = self
-            .offload(move |backend| backend.register_root(&path, &cancel))
+            .offload(move |backend| {
+                backend.limit_depth(&path, max_depth);
+                backend.register_root(&path, &cancel)
+            })
             .await
         else {
             return false;

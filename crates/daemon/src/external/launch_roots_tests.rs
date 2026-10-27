@@ -62,7 +62,13 @@ impl Rig {
     /// packages and the packages `install` puts into the plugin root it is
     /// given.
     fn with_packages(install: impl FnOnce(&Path)) -> Self {
-        Self::build(&[], |root| {
+        Self::with_packages_and_env(&[], install)
+    }
+
+    /// [`Self::with_packages`] over a daemon environment holding `daemon_env`
+    /// on top of `HOME`.
+    fn with_packages_and_env(daemon_env: &[(&str, &Path)], install: impl FnOnce(&Path)) -> Self {
+        Self::build(daemon_env, |root| {
             let plugins = root.join("plugins");
             install_official_packages(&plugins);
             install(&plugins);
@@ -595,6 +601,7 @@ fn plain_root(agent: &RuntimeRef, path: &Path, private: bool) -> TranscriptRoot 
         agent_base: agent.clone(),
         path: path.to_path_buf(),
         private,
+        max_depth: None,
     }
 }
 
@@ -1159,4 +1166,272 @@ async fn a_tree_symlinked_into_another_runtimes_tree_is_attributed_to_neither() 
     ];
 
     assert_codex_tree_attributed_to_neither(&rig, &shared).await;
+}
+
+/// Feature that lets a descriptor keep its transcripts outside the config home.
+const DATA_ROOT_FEATURE: &str = "transcripts-data-root-v1";
+
+/// A `[transcripts]` table for a log tree below `XDG_DATA_HOME`.
+const DATA_ROOT_TABLE: &str = "\n[transcripts]\nparser = \"muse-session-v1\"\n\
+     root_env = \"XDG_DATA_HOME\"\nroot_home = \".local/share\"\n\
+     dir = \"muse/sessions\"\nmax_depth = 4\n";
+
+/// The descriptor of [`ACME_RUNTIME`] keeping its session logs in the data root.
+fn data_root_descriptor() -> String {
+    acme_descriptor(DATA_ROOT_TABLE).replace(
+        "runtime_api = 1\n",
+        &format!("runtime_api = 1\nrequires = [\"{DATA_ROOT_FEATURE}\"]\n"),
+    )
+}
+
+/// A session log fixture with its session id and workspace filled in.
+fn session_fixture(name: &str, session: &str, workspace: &str) -> String {
+    let template = match name {
+        "framed" => include_str!("../../tests/fixtures/muse/session-framed.jsonl"),
+        "bare" => include_str!("../../tests/fixtures/muse/session-bare.jsonl"),
+        other => panic!("no session log fixture {other}"),
+    };
+    template
+        .replace("@SESSION@", session)
+        .replace("@WORKSPACE@", workspace)
+}
+
+/// Writes `content` as the log of `session` on `date` (`YYYY/MM/DD`) below
+/// `tree` and returns its path.
+fn write_session(tree: &Path, date: &str, session: &str, content: &str) -> PathBuf {
+    let path = tree.join(date).join(session).join("session.jsonl");
+    fs::create_dir_all(path.parent().expect("session directory")).expect("session directory");
+    fs::write(&path, content).expect("write the session log");
+    path
+}
+
+const FRAMED_SESSION: &str = "0b9a4a8e-6d1f-4a64-9b5e-2c0f3a7d1e01";
+const BARE_SESSION: &str = "5f2c7d90-3b1a-4e8f-8a47-9d6e0c4b2f02";
+
+#[tokio::test]
+async fn a_runtime_that_keeps_session_logs_in_the_data_root_is_attributed_by_them() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &data_root_descriptor()));
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+    let tree = rig.home().join(".local/share/muse/sessions");
+    let framed = write_session(
+        &tree,
+        "2026/10/08",
+        FRAMED_SESSION,
+        &session_fixture("framed", FRAMED_SESSION, "/work"),
+    );
+    let bare = write_session(
+        &tree,
+        "2026/10/09",
+        BARE_SESSION,
+        &session_fixture("bare", BARE_SESSION, "/other"),
+    );
+    // The config home holds a tree of its own that is not the log tree.
+    let config_tree = rig.home().join(".acme/muse/sessions");
+    let stray = write_session(
+        &config_tree,
+        "2026/10/08",
+        FRAMED_SESSION,
+        &session_fixture("framed", FRAMED_SESSION, "/work"),
+    );
+
+    let mut expected = official_roots(&rig);
+    expected.insert(root(&acme, tree));
+    assert_eq!(pairs(&rig.roots()), expected);
+
+    let watched = Watched::start(&rig).await;
+    watched.wait_for_session(&framed, FRAMED_SESSION).await;
+    watched.wait_for_session(&bare, BARE_SESSION).await;
+    assert_eq!(watched.session_of(&stray), None);
+    // A foreground `acme` process of a shell session is told from its
+    // workspace, framed and bare logs alike.
+    let candidate = watched
+        .index
+        .best_match(&acme, Path::new("/work"), &fact())
+        .expect("the framed log names the workspace");
+    assert_eq!(candidate.native_session_id.as_deref(), Some(FRAMED_SESSION));
+    let candidate = watched
+        .index
+        .best_match(&acme, Path::new("/other"), &fact())
+        .expect("the bare log names the workspace");
+    assert_eq!(candidate.native_session_id.as_deref(), Some(BARE_SESSION));
+    assert!(watched
+        .index
+        .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+        .is_none());
+    watched.sessions.shutdown();
+}
+
+/// The session ids, with their working directories, a full pass over the data
+/// root of `rig` indexes.
+async fn indexed_sessions(rig: &Rig) -> std::collections::BTreeMap<String, Option<PathBuf>> {
+    use tokio_util::sync::CancellationToken;
+
+    let index = super::TranscriptIndex::default();
+    index
+        .scan_roots(rig.roots(), CancellationToken::new())
+        .await;
+    let indexed = index.inner.lock().expect("index");
+    indexed
+        .values()
+        .filter_map(|candidate| Some((candidate.native_session_id.clone()?, candidate.cwd.clone())))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_log_outside_the_session_shape_or_with_a_foreign_id_is_no_session() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &data_root_descriptor()));
+    let tree = rig.home().join(".local/share/muse/sessions");
+    let good = "11111111-1111-4111-8111-111111111111";
+    write_session(
+        &tree,
+        "2026/10/08",
+        good,
+        &session_fixture("bare", good, "/work"),
+    );
+
+    // The id in the record must be the directory's.
+    let foreign = "22222222-2222-4222-8222-222222222222";
+    write_session(
+        &tree,
+        "2026/10/08",
+        foreign,
+        &session_fixture("bare", good, "/work"),
+    );
+    // A log nested below a session, one at another depth, and one not dated.
+    for (index, log) in [
+        format!("2026/10/08/{good}/subagent/aaaa/session.jsonl"),
+        format!("2026/10/08/{good}/subagents/bbbb/session.jsonl"),
+        "2026/10/session.jsonl".to_owned(),
+        "2026/10/08/session.jsonl".to_owned(),
+        format!("x/y/z/{good}/session.jsonl"),
+        format!("2026/10/08/{good}/session.json"),
+        format!("26/10/08/{good}/session.jsonl"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let nested = format!("33333333-3333-4333-8333-33333333333{index}");
+        let path = tree.join(log);
+        fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+        fs::write(&path, session_fixture("bare", &nested, "/work")).expect("write");
+    }
+    // A directory name that is no UUID.
+    write_session(
+        &tree,
+        "2026/10/08",
+        "not-a-uuid",
+        &session_fixture("bare", "not-a-uuid", "/work"),
+    );
+
+    assert_eq!(
+        indexed_sessions(&rig).await,
+        [(good.to_owned(), Some(PathBuf::from("/work")))].into()
+    );
+}
+
+#[tokio::test]
+async fn a_session_log_is_read_within_the_record_and_byte_bounds() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &data_root_descriptor()));
+    let tree = rig.home().join(".local/share/muse/sessions");
+    let filler = "{\"payload_type\":\"runtime.session.other\"}\n";
+    let with_metadata_at = |line: usize, session: &str| {
+        let mut content = filler.repeat(line - 1);
+        content.push_str(&session_fixture("bare", session, "/work"));
+        content
+    };
+    let at_limit = "44444444-4444-4444-8444-444444444444";
+    let past_limit = "55555555-5555-4555-8555-555555555555";
+    let past_bytes = "66666666-6666-4666-8666-666666666666";
+    let first_wins = "77777777-7777-4777-8777-777777777777";
+    write_session(
+        &tree,
+        "2026/10/08",
+        at_limit,
+        &with_metadata_at(32, at_limit),
+    );
+    write_session(
+        &tree,
+        "2026/10/08",
+        past_limit,
+        &with_metadata_at(33, past_limit),
+    );
+    // The record starts after the byte bound, in a very long first line.
+    let mut long = "x".repeat(70_000);
+    long.push('\n');
+    long.push_str(&session_fixture("bare", past_bytes, "/work"));
+    write_session(&tree, "2026/10/08", past_bytes, &long);
+    // Only the first metadata record counts: a later one for another
+    // workspace changes nothing.
+    let mut twice = session_fixture("bare", first_wins, "/first");
+    twice.push_str(&session_fixture("bare", first_wins, "/second"));
+    write_session(&tree, "2026/10/08", first_wins, &twice);
+
+    assert_eq!(
+        indexed_sessions(&rig).await,
+        [
+            (at_limit.to_owned(), Some(PathBuf::from("/work"))),
+            (first_wins.to_owned(), Some(PathBuf::from("/first"))),
+        ]
+        .into()
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_that_is_not_absolute_leaves_the_log_without_a_working_directory() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &data_root_descriptor()));
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+    let tree = rig.home().join(".local/share/muse/sessions");
+    let relative = "88888888-8888-4888-8888-888888888888";
+    write_session(
+        &tree,
+        "2026/10/08",
+        relative,
+        &session_fixture("bare", relative, "work"),
+    );
+
+    let watched = Watched::start(&rig).await;
+    watched
+        .wait_for_session(
+            &tree.join(format!("2026/10/08/{relative}/session.jsonl")),
+            relative,
+        )
+        .await;
+    for cwd in ["work", "/work", "/"] {
+        assert!(
+            watched
+                .index
+                .best_match(&acme, Path::new(cwd), &fact())
+                .is_none(),
+            "{cwd}"
+        );
+    }
+    watched.sessions.shutdown();
+}
+
+#[test]
+fn the_data_root_follows_the_environment_and_falls_back_to_the_home() {
+    let moved = scoped_dir("pohunek-roots-data-moved");
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+    let install = |plugins: &Path| install_acme(plugins, &data_root_descriptor());
+
+    let unset = Rig::with_packages(install);
+    assert!(pairs(&unset.roots()).contains(&root(
+        &acme,
+        unset.home().join(".local/share/muse/sessions")
+    )));
+
+    let set = Rig::with_packages_and_env(&[("XDG_DATA_HOME", moved.as_path())], install);
+    let roots = pairs(&set.roots());
+    assert!(roots.contains(&root(&acme, moved.join("muse/sessions"))));
+    assert!(!roots.contains(&root(&acme, set.home().join(".local/share/muse/sessions"))));
+
+    // A relative value is no root and no fallback: the home is reported.
+    let relative = Rig::with_packages_and_env(&[("XDG_DATA_HOME", Path::new("data"))], install);
+    assert!(pairs(&relative.roots())
+        .iter()
+        .all(|(runtime, _path)| runtime != ACME_RUNTIME));
+    assert!(relative
+        .skipped()
+        .iter()
+        .any(|home| home.runtime == ACME_RUNTIME && home.profile.is_none() && home.code.is_some()));
 }

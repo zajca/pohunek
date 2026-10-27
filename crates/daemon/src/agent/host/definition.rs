@@ -27,7 +27,7 @@ use super::features::{check_gates, check_requires, FeatureTables};
 use super::launch_env::DescriptorLaunchEnv;
 use super::transcripts::Transcripts;
 use crate::agent::{
-    AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
+    AssignedReference, ExistenceDecl, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
     NativeReferenceError, NativeReferenceStrategy, NativeSessionLaunch, ReferenceExistence,
     SessionRefKind,
 };
@@ -609,12 +609,13 @@ impl RuntimeDefinition {
     /// # Errors
     ///
     /// Returns a [`DefinitionError::Field`] when the definition declares no
-    /// config home, because the transcript tree is relative to it.
+    /// config home and the transcripts name no root of their own, because the
+    /// transcript tree is then relative to the config home.
     pub fn with_transcripts(mut self, transcripts: Transcripts) -> Result<Self, DefinitionError> {
-        if self.config_home.is_none() {
+        if self.config_home.is_none() && transcripts.root().is_none() {
             return Err(DefinitionError::Field {
                 field: "transcripts",
-                reason: "requires a [config_home] table",
+                reason: "requires a [config_home] table or its own root_env and root_home",
             });
         }
         self.transcripts = Some(transcripts);
@@ -696,7 +697,7 @@ impl RuntimeDefinition {
         let transcripts = raw
             .transcripts
             .as_ref()
-            .map(|declared| Transcripts::new(&declared.parser, &declared.dir))
+            .map(RawTranscripts::validated)
             .transpose()?;
         let launch_env = raw.validated_launch_env(config_home.as_ref())?;
         let definition = Self::new_with_env(
@@ -1271,12 +1272,20 @@ impl RawDefinition {
             .transpose()?
             .unwrap_or_default();
         launch_env.refuse_owned(
-            config_home.map(ConfigHome::env).into_iter().chain(
-                self.native_reference
-                    .existence
-                    .as_ref()
-                    .and_then(|existence| existence.root_env.as_deref()),
-            ),
+            config_home
+                .map(ConfigHome::env)
+                .into_iter()
+                .chain(
+                    self.native_reference
+                        .existence
+                        .as_ref()
+                        .and_then(|existence| existence.root_env.as_deref()),
+                )
+                .chain(
+                    self.transcripts
+                        .as_ref()
+                        .and_then(|transcripts| transcripts.root_env.as_deref()),
+                ),
         )?;
         Ok(launch_env)
     }
@@ -1353,7 +1362,7 @@ struct RawNativeReference {
     /// How recovery confirms the conversation exists; `assigned` always, or
     /// `hook` with an id-kind reference.
     #[serde(default)]
-    existence: Option<ExistenceSpec>,
+    existence: Option<ExistenceDecl>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1378,6 +1387,43 @@ struct RawConfigHome {
 struct RawTranscripts {
     parser: String,
     dir: String,
+    /// Variable that relocates the transcript root; with `root_home`, replaces
+    /// the config home as the root `dir` is relative to.
+    #[serde(default)]
+    root_env: Option<String>,
+    /// Root below the user's home directory while `root_env` is unset.
+    #[serde(default)]
+    root_home: Option<String>,
+    /// Directory levels below `dir` the observer lists.
+    #[serde(default)]
+    max_depth: Option<u64>,
+}
+
+impl RawTranscripts {
+    /// The validated declaration; `root_env` and `root_home` come together.
+    fn validated(&self) -> Result<Transcripts, DefinitionError> {
+        let mut transcripts = Transcripts::new(&self.parser, &self.dir)?;
+        match (&self.root_env, &self.root_home) {
+            (Some(env), Some(home)) => transcripts = transcripts.with_root(env, home)?,
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(DefinitionError::Field {
+                    field: "transcripts.root_home",
+                    reason: "is required with root_env",
+                })
+            }
+            (None, Some(_)) => {
+                return Err(DefinitionError::Field {
+                    field: "transcripts.root_env",
+                    reason: "is required with root_home",
+                })
+            }
+        }
+        if let Some(depth) = self.max_depth {
+            transcripts = transcripts.with_max_depth(depth)?;
+        }
+        Ok(transcripts)
+    }
 }
 
 impl RawDefinition {
@@ -1449,8 +1495,9 @@ impl RawDefinition {
                 let existence = declaration
                     .existence
                     .as_ref()
-                    .map(|spec| {
-                        ReferenceExistence::try_from(spec.clone())
+                    .map(|decl| {
+                        decl.clone()
+                            .into_hook()
                             .map_err(|source| invalid(NativeReferenceError::Existence(source)))
                     })
                     .transpose()?;
@@ -1470,7 +1517,8 @@ impl RawDefinition {
                     .existence
                     .clone()
                     .ok_or(invalid(NativeReferenceError::AssignedRequiresExistence))?;
-                let existence = ReferenceExistence::try_from(existence)
+                let existence = existence
+                    .into_assigned()
                     .map_err(|source| invalid(NativeReferenceError::Existence(source)))?;
                 let mut assigned = AssignedReference::new(launch_args, existence);
                 if declaration.assign_fork == Some(true) {
