@@ -17091,6 +17091,21 @@ generation "$1"
             );
         }
 
+        /// Waits until the journal directory of `session_id` is gone.
+        ///
+        /// A removal retried in the background deletes the record, and only
+        /// then the journals, so the record being gone does not yet mean the
+        /// directory is.
+        async fn wait_journals_deleted(fixture: &Fixture, session_id: &str) {
+            pohunek_test_support::wait::wait_until(
+                "the removal deletes the journal directory",
+                || async {
+                    (!fixture.root.join("state/workers").join(session_id).exists()).then_some(())
+                },
+            )
+            .await;
+        }
+
         /// Asserts that the journal directory of `session_id` is gone.
         fn assert_journals_deleted(fixture: &Fixture, session_id: &str) {
             assert!(
@@ -17180,7 +17195,7 @@ generation "$1"
 
             wait_removed(&fixture, "s-372").await;
             assert_removal_finished(&fixture, "s-372").await;
-            assert_journals_deleted(&fixture, "s-372");
+            wait_journals_deleted(&fixture, "s-372").await;
             assert_eq!(retire_count(&fixture.supervisor, &id), 2);
         }
 
@@ -24917,7 +24932,7 @@ generation "$1"
                 SessionRegistryConfig {
                     shell_command: hermetic_shell(),
                     store_path: Some(store_path),
-                    worker_runtime_root: Some(runtime_root),
+                    worker_runtime_root: Some(runtime_root.clone()),
                     worker_state_root: Some(state_root),
                     worker_connect_deadline: Duration::from_millis(300),
                     procwatch_poll: Duration::from_secs(60),
@@ -24951,7 +24966,15 @@ generation "$1"
                 entry.procwatch_cancel.cancel();
             }
             if child_pid != 0 {
-                end_worker_runtime(pty_root, &journal_path).await;
+                end_worker_runtime(
+                    pty_root,
+                    &journal_path,
+                    &runtime_root
+                        .join(session_id)
+                        .join(pohunek_paths::WORKER_SOCKET_NAME),
+                    session_id,
+                )
+                .await;
             }
             task.abort();
 
@@ -25132,8 +25155,10 @@ generation "$1"
     /// removed recreates the directory. Ending the root first and waiting for the
     /// terminal record leaves no writer behind.
     ///
-    /// A journal a finished removal deleted counts as ended once the worker
-    /// has reaped the PTY root.
+    /// The worker reaps the root before it persists the terminal journal and
+    /// reports the `Exited` phase only after that write. A journal a finished
+    /// removal deleted therefore cannot show the end, so the wait polls a fresh
+    /// controller on `socket` until the worker reports it.
     ///
     /// `root` is the identity the root had while it ran, or `None` when it had
     /// already exited then. A root the worker has reaped since leaves its PID
@@ -25142,6 +25167,8 @@ generation "$1"
     async fn end_worker_runtime(
         root: Option<crate::procwatch::ProcessIdentity>,
         journal_path: &Path,
+        socket: &Path,
+        session_id: &str,
     ) {
         if let Some(root) = root {
             crate::procwatch::scoped_host::kill_if_current(
@@ -25152,17 +25179,8 @@ generation "$1"
         wait_until("the worker journals the end of its PTY root", || async {
             let bytes = match std::fs::read(journal_path) {
                 Ok(bytes) => bytes,
-                // A removal that finished deleted the journal after it proved
-                // the worker's end. The worker journals the root's exit only
-                // after it reaped the root, so a root still present, even as
-                // a zombie, has yet to be journaled again.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let present = root.is_some_and(|root| {
-                        crate::procwatch::HostInspector::new()
-                            .identity(root.pid)
-                            .map_or(true, |found| found == Some(root))
-                    });
-                    return (!present).then_some(());
+                    return worker_reports_end(socket, session_id).await;
                 }
                 Err(_unreadable) => return None,
             };
@@ -25170,6 +25188,25 @@ generation "$1"
             (journal["phase"] == "terminal").then_some(())
         })
         .await;
+    }
+
+    /// Yields once the worker on `socket` reports an ended runtime, which it
+    /// does after its final journal write. A worker that no longer serves
+    /// has no writer left either.
+    async fn worker_reports_end(socket: &Path, session_id: &str) -> Option<()> {
+        match crate::runtime::Worker::connect(socket, session_id, "journal-end-probe").await {
+            Ok(worker) => {
+                let phase = worker.inspect().await.ok()?.phase;
+                matches!(
+                    phase,
+                    pohunek_worker_protocol::RuntimePhase::Exited
+                        | pohunek_worker_protocol::RuntimePhase::Faulted
+                )
+                .then_some(())
+            }
+            Err(_) if !socket.exists() => Some(()),
+            Err(_busy) => None,
+        }
     }
 
     /// Session of the differential cases.
