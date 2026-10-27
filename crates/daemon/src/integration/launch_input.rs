@@ -11,8 +11,9 @@
 //! The contribution is rebuilt for every launch and never persisted: it is not
 //! part of the frozen resume snapshot, so a relaunch applies it exactly once.
 //! The files live in `worker_state_root/<session>` as `launch-input.<name>`,
-//! outside every directory the launched agent or its sandbox can write, and
-//! are deleted with the session's journals.
+//! outside the paths a runtime's sandbox lets the agent write (the worktree,
+//! the session `TMPDIR`, the config home), and are deleted with the session's
+//! journals. Processes of the owner's account can still write them.
 
 // Rust guideline compliant 2026-10-27
 
@@ -82,11 +83,13 @@ pub struct LaunchInputContext<'a> {
     pub kind: LaunchKind,
     /// The config home the runtime's descriptor declares, resolved against the
     /// environment the launched agent sees; `None` when the descriptor
-    /// declares none or the environment names no usable home.
+    /// declares none. A declared home that does not resolve refuses the launch
+    /// with `launch_input_unavailable`.
     pub config_home: Option<&'a Path>,
-    /// The effective launch environment before the contribution: descriptor
-    /// pairs, the private `TMPDIR`, the profile `[env]` and the daemon
-    /// handshake. Secret-bearing; a contributor must not copy it elsewhere.
+    /// The effective launch environment before the contribution: the daemon's
+    /// allowlisted base environment, then the descriptor pairs, the private
+    /// `TMPDIR`, the profile `[env]` and the daemon handshake, later entries
+    /// winning. Secret-bearing; a contributor must not copy it elsewhere.
     pub env: &'a [(String, String)],
     /// The frozen launch arguments (definition or profile arguments).
     pub args: &'a [String],
@@ -311,15 +314,13 @@ pub(crate) fn place(
         .iter()
         .map(|arg| resolve_placeholders(arg, &path, &input.files))
         .collect::<Result<Vec<_>, _>>()?;
+    remove_stale(&directory, &input.files)?;
     for file in &input.files {
         let mode = match file.kind {
             FileKind::Data => DATA_MODE,
             FileKind::Executable => EXECUTABLE_MODE,
         };
-        // A write the daemon died in the middle of leaves its temporary name
-        // behind, and the exclusive create of the next write would refuse it.
         let temporary = pohunek_paths::launch_input_temp_name(&file.name);
-        directory.remove_entry(&temporary).map_err(unavailable)?;
         directory
             .replace_file(
                 pohunek_paths::launch_input_file_name(&file.name),
@@ -330,4 +331,26 @@ pub(crate) fn place(
             .map_err(unavailable)?;
     }
     Ok(PlacedLaunchInput { env, root_args })
+}
+
+/// Unlinks the launch-input entries of earlier launches that this
+/// contribution does not name again, and any unfinished write.
+///
+/// A file whose name is no longer contributed (an executable of an earlier
+/// release, say) must not outlive the launch that stopped contributing it, and
+/// an unfinished write would be refused by the exclusive create of the next one.
+fn remove_stale(directory: &TrustedDir, files: &[PrivateFile]) -> Result<(), ProtocolError> {
+    let current: Vec<String> = files
+        .iter()
+        .map(|file| pohunek_paths::launch_input_file_name(&file.name))
+        .collect();
+    for entry in directory.entry_names().map_err(unavailable)? {
+        let Some(name) = entry.to_str() else {
+            continue;
+        };
+        if pohunek_paths::is_launch_input_entry(name) && !current.iter().any(|kept| kept == name) {
+            directory.remove_entry(&entry).map_err(unavailable)?;
+        }
+    }
+    Ok(())
 }

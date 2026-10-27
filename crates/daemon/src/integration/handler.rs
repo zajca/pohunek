@@ -302,8 +302,14 @@ pub(crate) fn launch_contributor(
     definition: &crate::agent::host::RuntimeDefinition,
 ) -> Option<&'static dyn LaunchContributor> {
     #[cfg(test)]
-    if let Some(contributor) = crate::test_support::thread_launch_contributor() {
-        return Some(contributor);
+    if let Some((named, contributor)) = crate::test_support::thread_launch_contributor() {
+        if definition
+            .integration_handler()
+            .map(crate::agent::host::HandlerId::as_str)
+            == Some(named)
+        {
+            return Some(contributor);
+        }
     }
     let id = definition.integration_handler()?;
     match handler(id.as_str())? {

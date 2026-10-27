@@ -19,6 +19,10 @@ const NATIVE_ID: &str = "fixture-launch-input-conversation";
 /// Overlay file name the fixture contributor asks for.
 const OVERLAY: &str = "overlay.json";
 
+/// Executable file the fixture contributor also asks for; its bytes name the
+/// launch that wrote it.
+const TOOL: &str = "tool.sh";
+
 /// Bytes of the overlay file.
 const OVERLAY_BYTES: &[u8] = b"{\"fixture\":true}\n";
 
@@ -28,6 +32,7 @@ struct Seen {
     kind: LaunchKind,
     args: Vec<String>,
     overlay: PathBuf,
+    sees_base_env: bool,
 }
 
 /// A contributor that adds an overlay file, an environment pair naming it and
@@ -35,8 +40,8 @@ struct Seen {
 #[derive(Debug, Default)]
 struct Fixture {
     seen: Mutex<Vec<Seen>>,
-    /// Name of the file to ask for on a resume, instead of [`OVERLAY`].
-    resume_file_name: Mutex<Option<String>>,
+    /// Contribution returned verbatim for a resume, instead of the usual one.
+    resume_input: Mutex<Option<LaunchInput>>,
     /// Refuse a resume with this code.
     refuse_resume: Mutex<Option<String>>,
 }
@@ -47,6 +52,8 @@ impl LaunchContributor for Fixture {
             kind: ctx.kind,
             args: ctx.args.to_vec(),
             overlay: ctx.file_path(OVERLAY),
+            sees_base_env: ctx.env.iter().any(|(name, _)| name == "HOME")
+                && ctx.env.iter().any(|(name, _)| name == "TMPDIR"),
         });
         if ctx.kind == LaunchKind::Resume {
             if let Some(code) = self.refuse_resume.lock().expect("refusal").clone() {
@@ -58,21 +65,28 @@ impl LaunchContributor for Fixture {
                 ));
             }
         }
-        let name = if ctx.kind == LaunchKind::Resume {
-            self.resume_file_name.lock().expect("name").clone()
-        } else {
-            None
+        if ctx.kind == LaunchKind::Resume {
+            if let Some(input) = self.resume_input.lock().expect("input").clone() {
+                return Ok(input);
+            }
         }
-        .unwrap_or_else(|| OVERLAY.to_owned());
-        let placeholder = format!("{{file:{name}}}");
+        let launches = self.seen.lock().expect("seen").len();
+        let placeholder = format!("{{file:{OVERLAY}}}");
         Ok(LaunchInput {
             env: vec![("TEST_LAUNCH_INPUT".to_owned(), placeholder.clone())],
             root_args: vec!["--overlay".to_owned(), placeholder],
-            files: vec![PrivateFile {
-                name,
-                bytes: OVERLAY_BYTES.to_vec(),
-                kind: FileKind::Data,
-            }],
+            files: vec![
+                PrivateFile {
+                    name: OVERLAY.to_owned(),
+                    bytes: OVERLAY_BYTES.to_vec(),
+                    kind: FileKind::Data,
+                },
+                PrivateFile {
+                    name: TOOL.to_owned(),
+                    bytes: format!("#!/bin/sh\n# launch {launches}\n").into_bytes(),
+                    kind: FileKind::Executable,
+                },
+            ],
         })
     }
 }
@@ -80,7 +94,7 @@ impl LaunchContributor for Fixture {
 /// Installs a fresh [`Fixture`] as this thread's contributor.
 fn install_fixture() -> &'static Fixture {
     let fixture: &'static Fixture = Box::leak(Box::default());
-    crate::test_support::set_thread_launch_contributor(fixture);
+    crate::test_support::set_thread_launch_contributor("codex-hook-v1", Some(fixture));
     fixture
 }
 
@@ -127,9 +141,23 @@ async fn a_create_launch_gets_the_contributed_env_args_and_private_file() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600, "a data file is owner read/write");
+    let tool = path.with_file_name(pohunek_paths::launch_input_file_name(TOOL));
+    let tool_mode = fs::metadata(&tool)
+        .expect("tool metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        tool_mode & 0o777,
+        0o500,
+        "an executable is owner read/execute"
+    );
     let seen = fixture.seen.lock().expect("seen").clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].kind, LaunchKind::Create);
+    assert!(
+        seen[0].sees_base_env,
+        "the context env holds the inherited base and the launch extras"
+    );
     assert_eq!(
         seen[0].overlay, path,
         "the context names the path core writes the file at"
@@ -168,6 +196,12 @@ async fn a_resume_applies_the_contribution_once_and_never_persists_it() {
             "once per relaunch: {line}"
         );
     }
+    let tool = overlay_path(&rig).with_file_name(pohunek_paths::launch_input_file_name(TOOL));
+    assert_eq!(
+        fs::read_to_string(&tool).expect("tool"),
+        "#!/bin/sh\n# launch 3\n",
+        "every launch rewrites the files"
+    );
     let seen = fixture.seen.lock().expect("seen").clone();
     let kinds: Vec<LaunchKind> = seen.iter().map(|seen| seen.kind).collect();
     assert_eq!(
@@ -213,23 +247,153 @@ async fn a_refused_resume_launches_nothing_and_keeps_the_session_resumable() {
     rig.remove().await;
 }
 
+/// A contribution with one file `overlay.json` and the given parts.
+fn input(env: Vec<(&str, String)>, root_args: Vec<String>, files: Vec<PrivateFile>) -> LaunchInput {
+    LaunchInput {
+        env: env.into_iter().map(|(n, v)| (n.to_owned(), v)).collect(),
+        root_args,
+        files,
+    }
+}
+
+fn file(name: &str, bytes: Vec<u8>) -> PrivateFile {
+    PrivateFile {
+        name: name.to_owned(),
+        bytes,
+        kind: FileKind::Data,
+    }
+}
+
 #[tokio::test]
-async fn a_hostile_contribution_is_refused_before_any_launch() {
+async fn every_bound_of_a_contribution_refuses_the_launch() {
     let fixture = install_fixture();
     let rig = Rig::new("launch-input-hostile", true).await;
     stop_with_reference(&rig).await;
     let before = launch_log(&rig);
+    let ok = || file(OVERLAY, b"{}".to_vec());
+    let mut hostile: Vec<(&str, LaunchInput)> = Vec::new();
+    for name in ["../escape", "UPPER", "a/b", ".hidden", "", "a..b", "trail."] {
+        hostile.push((name, input(vec![], vec![], vec![file(name, vec![])])));
+    }
+    hostile.extend([
+        (
+            "unknown placeholder",
+            input(vec![], vec!["{file:nope}".into()], vec![ok()]),
+        ),
+        (
+            "unterminated placeholder",
+            input(vec![("A", "{file:overlay.json".into())], vec![], vec![ok()]),
+        ),
+        (
+            "oversized file",
+            input(vec![], vec![], vec![file(OVERLAY, vec![0; 128 * 1024 + 1])]),
+        ),
+        (
+            "too many files",
+            input(
+                vec![],
+                vec![],
+                (0..5).map(|n| file(&format!("f{n}"), vec![])).collect(),
+            ),
+        ),
+        ("duplicate file", input(vec![], vec![], vec![ok(), ok()])),
+        (
+            "too many env pairs",
+            input(
+                ["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"]
+                    .into_iter()
+                    .map(|name| (name, String::new()))
+                    .collect(),
+                vec![],
+                vec![],
+            ),
+        ),
+        (
+            "too many args",
+            input(vec![], (0..9).map(|n| n.to_string()).collect(), vec![]),
+        ),
+        (
+            "reserved env name",
+            input(vec![("POHUNEK_X", "1".into())], vec![], vec![]),
+        ),
+        (
+            "lower-case env name",
+            input(vec![("path", "1".into())], vec![], vec![]),
+        ),
+        (
+            "env name with a digit first",
+            input(vec![("1A", "1".into())], vec![], vec![]),
+        ),
+        (
+            "NUL in a value",
+            input(vec![("A", "a\0b".into())], vec![], vec![]),
+        ),
+        (
+            "overlong value",
+            input(vec![("A", "x".repeat(4097))], vec![], vec![]),
+        ),
+    ]);
 
-    for name in ["../escape", "UPPER", "a/b", ".hidden", ""] {
-        *fixture.resume_file_name.lock().expect("name") = Some(name.to_owned());
+    for (label, contribution) in hostile {
+        *fixture.resume_input.lock().expect("input") = Some(contribution);
         let error = rig
             .registry
             .resume(&rig.session.id)
             .await
-            .expect_err("a hostile file name is refused");
-        assert_eq!(error.code, "launch_input_invalid", "{name:?}");
+            .expect_err("a contribution outside the bounds is refused");
+        assert_eq!(error.code, "launch_input_invalid", "{label}");
     }
     assert_eq!(launch_log(&rig), before, "no agent was launched");
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn a_file_no_longer_contributed_is_removed_on_the_next_launch() {
+    let fixture = install_fixture();
+    let rig = Rig::new("launch-input-stale", true).await;
+    let overlay = overlay_path(&rig);
+    let tool = overlay.with_file_name(pohunek_paths::launch_input_file_name(TOOL));
+    stop_with_reference(&rig).await;
+    assert!(overlay.exists() && tool.exists());
+    *fixture.resume_input.lock().expect("input") = Some(input(
+        vec![],
+        vec![],
+        vec![file("other.json", b"{}".to_vec())],
+    ));
+
+    rig.registry.resume(&rig.session.id).await.expect("resume");
+    wait_for_file_contains(&rig.launches, &format!("resume {NATIVE_ID}")).await;
+
+    assert!(
+        !overlay.exists() && !tool.exists(),
+        "earlier files are unlinked"
+    );
+    assert!(overlay
+        .with_file_name(pohunek_paths::launch_input_file_name("other.json"))
+        .exists());
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn a_relaunch_served_without_the_handler_gets_no_contribution() {
+    let fixture = install_fixture();
+    let rig = Rig::new("launch-input-unserved", true).await;
+    stop_with_reference(&rig).await;
+    crate::test_support::set_thread_launch_contributor("other-hook-v1", Some(fixture));
+
+    rig.registry.resume(&rig.session.id).await.expect("resume");
+    let log = wait_for_file_contains(&rig.launches, &format!("resume {NATIVE_ID}")).await;
+
+    let line = log.lines().rev().nth(1).expect("relaunch argv line");
+    assert_eq!(line, format!("resume {NATIVE_ID}"), "no root args: {log}");
+    assert_eq!(log.lines().next_back(), Some("env="));
+    assert_eq!(
+        fixture.seen.lock().expect("seen").len(),
+        1,
+        "only the create asked"
+    );
+    rig.finish().await;
     rig.remove().await;
 }
 

@@ -1546,9 +1546,10 @@ An integration handler may also contribute per-launch input
 (`crates/daemon/src/integration/launch_input.rs`). The handler's contributor
 returns pure data for one launch: environment pairs, root-position arguments
 and private files. Core validates it, writes the files atomically as
-`launch-input.<name>` (owner-only) in the session's worker state directory, which
-neither the agent nor its sandbox can write and which is deleted with the
-session's journals, and resolves `{file:<name>}` placeholders to their absolute
+`launch-input.<name>` (owner-only) in the session's worker state directory, which is
+outside the paths a runtime's sandbox lets the agent write (the worktree, the
+session `TMPDIR`, the config home) though not outside the owner's account, and
+which is deleted with the session's journals, and resolves `{file:<name>}` placeholders to their absolute
 paths. The contribution is rebuilt for every create, resume and fork and applied
 in one place per launch: the environment between the profile `[env]` and the
 daemon handshake, the arguments after the frozen arguments and before the native

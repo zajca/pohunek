@@ -64,16 +64,31 @@ impl SessionRegistry {
                 None,
             ));
         };
-        let config_home = definition.config_home().and_then(|home| {
-            let environment = self.launch_base_environment().ok()?;
-            home.resolve(&|name| effective_variable(&environment, &base, name))
-                .ok()
-        });
+        let environment = self.launch_base_environment()?;
+        let config_home = match definition.config_home() {
+            Some(home) => Some(
+                home.resolve(&|name| effective_variable(&environment, &base, name))
+                    .map_err(|error| {
+                        ProtocolError::new(
+                            ErrorClass::Runtime,
+                            LAUNCH_INPUT_UNAVAILABLE_CODE,
+                            format!("the runtime's config home cannot be resolved: {error}"),
+                            None,
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let effective: Vec<(String, String)> = environment
+            .iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .chain(base.iter().cloned())
+            .collect();
         let contribution = contributor.contribute(&LaunchInputContext {
             session_id: id,
             kind,
             config_home: config_home.as_deref(),
-            env: &base,
+            env: &effective,
             args: frozen_args,
             private_dir: &state_root.join(&id.0),
         })?;

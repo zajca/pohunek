@@ -387,7 +387,7 @@ environment pairs, root-position arguments and private files that depend on the
 session (a hook overlay and the reporter it names, say). A descriptor never
 carries this; only the handler's compiled code does. Core writes the files as
 `launch-input.<name>` (owner-only) in the session's worker state directory,
-outside the agent's sandbox, resolves `{file:<name>}` placeholders to their
+outside the paths the runtime's sandbox lets the agent write, resolves `{file:<name>}` placeholders to their
 absolute paths, applies the result to every create, resume and fork, and never
 stores it in the resume snapshot. A contribution core cannot accept refuses the
 launch with `launch_input_invalid`; one it cannot write refuses it with

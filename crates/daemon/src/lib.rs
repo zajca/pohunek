@@ -206,26 +206,31 @@ pub(crate) mod test_support {
         THREAD_PATH_PREFIX.with(|prefix| prefix.borrow_mut().insert(0, directory.to_path_buf()));
     }
 
+    /// A launch-input contributor and the integration handler id whose runtimes
+    /// it serves.
+    type ThreadContributor = (
+        &'static str,
+        &'static dyn crate::integration::launch_input::LaunchContributor,
+    );
+
     std::thread_local! {
-        /// The launch-input contributor every runtime launched on the current
-        /// test thread uses.
-        static THREAD_CONTRIBUTOR: std::cell::Cell<
-            Option<&'static dyn crate::integration::launch_input::LaunchContributor>,
-        > = const { std::cell::Cell::new(None) };
+        /// The contributor runtimes launched on the current test thread get.
+        static THREAD_CONTRIBUTOR: std::cell::Cell<Option<ThreadContributor>> =
+            const { std::cell::Cell::new(None) };
     }
 
-    /// Makes `contributor` the launch-input contributor of every runtime
-    /// launched on this test thread. Call it before the registry under test is
-    /// built.
+    /// Makes `contributor` the launch-input contributor of every runtime whose
+    /// definition names the integration handler `handler` on this test thread;
+    /// `None` clears it. Call it before the registry under test is built.
     pub(crate) fn set_thread_launch_contributor(
-        contributor: &'static dyn crate::integration::launch_input::LaunchContributor,
+        handler: &'static str,
+        contributor: Option<&'static dyn crate::integration::launch_input::LaunchContributor>,
     ) {
-        THREAD_CONTRIBUTOR.with(|cell| cell.set(Some(contributor)));
+        THREAD_CONTRIBUTOR.with(|cell| cell.set(contributor.map(|c| (handler, c))));
     }
 
     /// The contributor of [`set_thread_launch_contributor`], if this thread set one.
-    pub(crate) fn thread_launch_contributor(
-    ) -> Option<&'static dyn crate::integration::launch_input::LaunchContributor> {
+    pub(crate) fn thread_launch_contributor() -> Option<ThreadContributor> {
         THREAD_CONTRIBUTOR.with(std::cell::Cell::get)
     }
 
