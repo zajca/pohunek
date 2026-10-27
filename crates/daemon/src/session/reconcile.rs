@@ -8845,8 +8845,8 @@ while os.getppid() == parent:
         std::fs::create_dir_all(&state_root).expect("create the journal root");
         std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o755))
             .expect("loosen the journal root");
-        assert!(super::scan_worker_journals(&state_root).is_err());
-        assert!(super::scan_session_journals(&state_root, "s-1").is_err());
+        super::scan_worker_journals(&state_root).unwrap_err();
+        super::scan_session_journals(&state_root, "s-1").unwrap_err();
     }
 
     #[test]
