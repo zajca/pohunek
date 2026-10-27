@@ -149,7 +149,8 @@ pub(crate) struct TranscriptRoot {
     path: PathBuf,
     /// The compiled parser the runtime's descriptor names for its transcripts.
     parser: TranscriptParser,
-    /// Directory levels below `path` a walk lists; `None` bounds nothing.
+    /// The declared bound on the directory levels below `path`; see
+    /// [`TranscriptRoot::depth_limit`] for what a walk lists.
     max_depth: Option<u8>,
     /// Whether the directory derives from a host profile's environment. Such a
     /// path never reaches a log line or a remote response.
@@ -170,7 +171,8 @@ impl TranscriptRoot {
         }
     }
 
-    /// The bound of the walk of this root, when its descriptor declares one.
+    /// The bound of the walk of this root, when its descriptor or a
+    /// date-sharded parser bounds it.
     fn walk_bound(&self) -> Option<watch::WalkBound> {
         let dated_depth = self.parser.dated_depth();
         self.depth_limit().map(|max_depth| watch::WalkBound {

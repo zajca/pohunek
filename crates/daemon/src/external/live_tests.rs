@@ -643,15 +643,16 @@ fn write_session_log(tree: &Path, day: &str, name: &str) -> PathBuf {
     path
 }
 
-/// A dated tree whose descriptor declares no `max_depth`: the share of session
-/// watches follows the parser, not the bound.
+/// A dated tree whose descriptor declares a `max_depth` that would reach the
+/// subagent directories: the walk and the share of session watches follow the
+/// parser, never the larger bound.
 fn dated_root(path: &Path) -> TranscriptRoot {
     TranscriptRoot {
         parser: TranscriptParser::MuseSessionV1,
         agent_base: RuntimeRef::codex(),
         path: path.to_path_buf(),
         private: false,
-        max_depth: None,
+        max_depth: Some(6),
     }
 }
 
