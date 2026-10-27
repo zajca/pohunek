@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity, supervisor::WorkerKey};
 use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
+use pohunek_session_worker::OutdatedJournal;
 use pohunek_worker_protocol::{
     AncestryMatcher, ControlCode, InspectSnapshot, PtyRelation, ReleasedIdentityClaim,
     RuntimePhase, SubagentField, BACKGROUND_MAX_ITEMS,
@@ -1057,7 +1058,7 @@ impl SessionRegistry {
             );
             self.publish(event);
         }
-        let tmpdir_owners = tmpdir_owners(
+        let session_owners = session_owners(
             &records,
             &resume_bindings,
             &rejected,
@@ -1070,6 +1071,19 @@ impl SessionRegistry {
             &journals,
         );
         *self.inner.runtime_inventory.lock().await = inventory;
+        let journal_sessions: HashSet<String> = journals
+            .as_ref()
+            .map(|journals| journals.keys().cloned().collect())
+            .unwrap_or_default();
+        // The scans of sessions no startup evidence names are the candidates of
+        // the journal collection; the per-record loop below consumes the rest.
+        let orphan_scans: HashMap<String, WorkerJournalScan> =
+            match (&mut journals, &session_owners) {
+                (Ok(scans), TmpdirOwners::Known(owners)) => {
+                    scans.extract_if(|id, _| !owners.contains(id)).collect()
+                }
+                _ => HashMap::new(),
+            };
 
         // Every record is reconciled inline in this task before the daemon
         // reports readiness, so the sweeps of all of them share one settle
@@ -1114,23 +1128,28 @@ impl SessionRegistry {
             }
         }))
         .await;
-        self.sweep_orphaned_session_tmpdirs(tmpdir_owners, lifecycle.as_ref())
+        let owners = self
+            .complete_session_owners(session_owners, lifecycle.as_ref())
             .await;
+        self.delete_orphaned_session_tmpdirs(owners.clone().with_sessions(journal_sessions))
+            .await;
+        self.collect_worker_journals(owners, orphan_scans).await;
         Ok(())
     }
 
-    /// Deletes the private temporary directories no startup evidence names.
+    /// Completes the owners startup evidence names with a strict discovery of
+    /// the supervisor's jobs.
     ///
     /// The supervisor's lenient discovery may omit a job whose inspection
-    /// raced, so the owners are completed with a strict discovery first; a
-    /// strict discovery that cannot list every job leaves every directory in
-    /// place.
-    async fn sweep_orphaned_session_tmpdirs(
+    /// raced; a strict discovery that cannot list every job leaves the
+    /// ownership unknown, so neither temporary directories nor journal
+    /// directories are deleted.
+    async fn complete_session_owners(
         &self,
         owners: TmpdirOwners,
         lifecycle: Option<&Lifecycle<'_>>,
-    ) {
-        let owners = match (owners, lifecycle) {
+    ) -> TmpdirOwners {
+        match (owners, lifecycle) {
             (TmpdirOwners::Known(mut known), Some(lifecycle)) => {
                 match lifecycle.supervisor.discover_strict().await {
                     Ok(jobs) => {
@@ -1147,8 +1166,7 @@ impl SessionRegistry {
                 }
             }
             (owners, _) => owners,
-        };
-        self.delete_orphaned_session_tmpdirs(owners).await;
+        }
     }
 
     /// The detector configuration of a session whose active agent is `active`,
@@ -3256,8 +3274,9 @@ impl SessionRegistry {
     ///
     /// Returns why the scan failed instead of an empty scan: a failed scan is
     /// no proof that the session never journaled. A session without a journal
-    /// directory yields an empty scan. Only startup reconciliation reads every
-    /// session's journals ([`scan_all_worker_journals`]).
+    /// directory yields an empty scan. Only startup reconciliation
+    /// ([`scan_all_worker_journals`]) and the upgrade preflight read every
+    /// session's journals.
     async fn session_journals(&self, id: &str) -> Result<WorkerJournalScan, String> {
         let Some(state_root) = self.inner.config.worker_state_root.clone() else {
             return Ok(WorkerJournalScan::default());
@@ -6440,13 +6459,13 @@ struct DiscoveryFailures<'a> {
     jobs: Option<&'a str>,
 }
 
-/// The sessions whose private temporary directory startup keeps: every
-/// session any startup evidence names, whether a record, a resume binding, a
-/// store line no loader accepted, a worker runtime slot, a worker's claim, a
-/// supervisor job, or a worker journal. Ownership is unknown when worker or
-/// job discovery or the journal scan failed, or when a rejected store line
-/// names no session.
-fn tmpdir_owners(
+/// The sessions startup evidence names, whether by a record, a resume binding,
+/// a store line no loader accepted, a worker runtime slot, a worker's claim,
+/// or a supervisor job. A worker journal alone does not name an owner: the
+/// journal collection judges the directories that only a journal names.
+/// Ownership is unknown when worker or job discovery or the journal scan
+/// failed, or when a rejected store line names no session.
+fn session_owners(
     records: &[SessionRecord],
     resume_bindings: &HashMap<String, ResumeBinding>,
     rejected: &[crate::store::RejectedLine],
@@ -6463,14 +6482,11 @@ fn tmpdir_owners(
             "worker job discovery failed: {detail}"
         ));
     }
-    let journals = match journals {
-        Ok(journals) => journals,
-        Err(detail) => {
-            return TmpdirOwners::unknown_after_failure(format!(
-                "the worker journal scan failed: {detail}"
-            ));
-        }
-    };
+    if let Err(detail) = journals {
+        return TmpdirOwners::unknown_after_failure(format!(
+            "the worker journal scan failed: {detail}"
+        ));
+    }
     if rejected.iter().any(|line| line.session_id.is_none()) {
         return TmpdirOwners::unknown(
             "the store holds a rejected line that names no session".to_owned(),
@@ -6493,7 +6509,6 @@ fn tmpdir_owners(
             owners.insert(key.session_id().to_owned());
         }
     }
-    owners.extend(journals.keys().cloned());
     TmpdirOwners::Known(owners)
 }
 
@@ -6850,6 +6865,9 @@ pub(super) struct WorkerJournalScan {
     pub(super) conflict: bool,
     /// The journal files behind `conflict`, by file name.
     pub(super) rejected: Vec<(String, JournalReject)>,
+    /// The liveness facts of each rejected journal an older build wrote, by
+    /// file name.
+    pub(super) outdated: Vec<(String, OutdatedJournal)>,
 }
 
 impl WorkerJournalScan {
@@ -6875,6 +6893,7 @@ impl WorkerJournalScan {
                 .collect(),
             conflict: self.conflict,
             rejected: self.rejected.clone(),
+            outdated: self.outdated.clone(),
         }
     }
 
@@ -6983,7 +7002,7 @@ pub(super) fn scan_session_journals(
 }
 
 /// Opens the worker state root; `None` when it does not exist.
-fn open_journal_root(state_root: &Path) -> std::io::Result<Option<TrustedDir>> {
+pub(super) fn open_journal_root(state_root: &Path) -> std::io::Result<Option<TrustedDir>> {
     let root_metadata = match std::fs::symlink_metadata(state_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -7036,19 +7055,24 @@ fn scan_session_directory(
         else {
             continue;
         };
-        let evidence = session_directory
+        let bytes = session_directory
             .read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
-            .map_err(|_unreadable| JournalReject::Unreadable)
-            .and_then(|bytes| {
-                let path = state_root.join(session_name).join(&journal_name);
-                journal_evidence(&bytes, &path, session_id, journal_stem)
-            });
+            .map_err(|_unreadable| JournalReject::Unreadable);
+        let name = journal_name.to_string_lossy().into_owned();
+        let evidence = bytes.as_ref().map_err(Clone::clone).and_then(|bytes| {
+            let path = state_root.join(session_name).join(&journal_name);
+            journal_evidence(bytes, &path, session_id, journal_stem)
+        });
         match evidence {
             Ok(evidence) => scan.evidence.push(evidence),
             Err(reject) => {
+                if let (JournalReject::UnsupportedSchema(_), Ok(bytes)) = (&reject, &bytes) {
+                    if let Some(outdated) = OutdatedJournal::from_bytes(bytes) {
+                        scan.outdated.push((name.clone(), outdated));
+                    }
+                }
                 scan.conflict = true;
-                scan.rejected
-                    .push((journal_name.to_string_lossy().into_owned(), reject));
+                scan.rejected.push((name, reject));
             }
         }
     }
@@ -8748,6 +8772,7 @@ while os.getppid() == parent:
                     evidence: accepted.evidence.clone(),
                     conflict: accepted.conflict,
                     rejected: accepted.rejected.clone(),
+                    outdated: accepted.outdated.clone(),
                 },
                 &identity_record()
             ),
@@ -8846,11 +8871,80 @@ while os.getppid() == parent:
         let state_root = root.join("workers");
         let absent = super::scan_session_journals(&state_root, "s-1").expect("no root");
         assert!(!absent.conflict && absent.evidence.is_empty());
+        assert!(super::scan_worker_journals(&state_root)
+            .expect("no root")
+            .is_empty());
         std::fs::create_dir_all(&state_root).expect("create the journal root");
         std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o755))
             .expect("loosen the journal root");
         super::scan_worker_journals(&state_root).unwrap_err();
         super::scan_session_journals(&state_root, "s-1").unwrap_err();
+    }
+
+    fn rejected_line(session_id: Option<&str>) -> crate::store::RejectedLine {
+        crate::store::RejectedLine {
+            kind: None,
+            session_id: session_id.map(ToOwned::to_owned),
+            may_own_runtime: false,
+            removal_intent: false,
+            reason: "fixture".to_owned(),
+            text: String::new(),
+        }
+    }
+
+    /// A journal alone never owns its directory, every other piece of startup
+    /// evidence does, and any discovery failure leaves the owners unknown.
+    #[test]
+    fn journal_owners_exclude_a_bare_journal_and_every_failure_makes_them_unknown() {
+        use super::TmpdirOwners;
+        use std::collections::HashMap;
+        let journals: Result<HashMap<String, super::WorkerJournalScan>, String> = Ok(
+            HashMap::from([("s-1".to_owned(), super::WorkerJournalScan::default())]),
+        );
+        let job = protocol::RuntimeInventoryEntry {
+            runtime_slot: "s-3".to_owned(),
+            claimed_session_id: Some("s-4".to_owned()),
+            worker_id: None,
+            worker_instance_id: None,
+            status: protocol::RuntimeInventoryStatus::Managed,
+            reason: None,
+        };
+        let owners =
+            |rejected: &[crate::store::RejectedLine],
+             sockets: Option<&str>,
+             jobs: Option<&str>,
+             journals: &Result<HashMap<String, super::WorkerJournalScan>, String>| {
+                super::session_owners(
+                    &[],
+                    &HashMap::new(),
+                    rejected,
+                    &super::WorkerDiscovery::default(),
+                    std::slice::from_ref(&job),
+                    super::DiscoveryFailures { sockets, jobs },
+                    journals,
+                )
+            };
+
+        let TmpdirOwners::Known(known) =
+            owners(&[rejected_line(Some("s-2"))], None, None, &journals)
+        else {
+            panic!("the owners are known");
+        };
+        assert!(known.contains("s-2"), "a rejected line naming it owns it");
+        assert!(
+            known.contains("s-3") && known.contains("s-4"),
+            "a worker slot owns it"
+        );
+        assert!(!known.contains("s-1"), "a bare journal owns nothing");
+
+        for unknown in [
+            owners(&[], Some("socket scan failed"), None, &journals),
+            owners(&[], None, Some("job discovery failed"), &journals),
+            owners(&[], None, None, &Err("journal scan failed".to_owned())),
+            owners(&[rejected_line(None)], None, None, &journals),
+        ] {
+            assert!(matches!(unknown, TmpdirOwners::Unknown { .. }));
+        }
     }
 
     #[test]
@@ -25131,6 +25225,8 @@ generation "$1"
     /// removed recreates the directory. Ending the root first and waiting for the
     /// terminal record leaves no writer behind.
     ///
+    /// A journal a finished removal deleted counts as ended.
+    ///
     /// `root` is the identity the root had while it ran, or `None` when it had
     /// already exited then. A root the worker has reaped since leaves its PID
     /// free for another process, so the root is signalled only while its PID
@@ -25146,8 +25242,14 @@ generation "$1"
             );
         }
         wait_until("the worker journals the end of its PTY root", || async {
-            let journal: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(journal_path).ok()?).ok()?;
+            let bytes = match std::fs::read(journal_path) {
+                Ok(bytes) => bytes,
+                // A removal that finished deleted the journal after it proved
+                // the worker's end.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(()),
+                Err(_unreadable) => return None,
+            };
+            let journal: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
             (journal["phase"] == "terminal").then_some(())
         })
         .await;

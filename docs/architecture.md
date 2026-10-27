@@ -509,7 +509,10 @@ cancellation of its own, and waits, bounded by `shutdown_timeout` (`deadlines.re
 tracked is left; tasks still running at the deadline are named in the log. After
 that the registry writes nothing: a store write through it is refused with
 `registry_shut_down` and logged at ERROR with its location. The worker seals its
-journal in the same spirit: once the terminal record is committed, the only
+journal in the same spirit (the directory of a session is deleted only after
+its record, or by the startup collection of record-less sessions whose workers
+are gone and whose journals are older than `[worker_journals] max_age_days`;
+see `docs/runbooks/durable-session-workers.md`): once the terminal record is committed, the only
 replacement it accepts is the terminal acknowledgement (`terminal_acknowledged`
 turning true). Any other write is refused and logged as
 `worker.journal.sealed_write_refused`, because it would change an outcome the

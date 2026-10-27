@@ -199,7 +199,7 @@ once it reconciles the lost generation.
 Do not:
 
 - unlink a worker socket because the daemon cannot connect;
-- delete a journal or a launchd definition while its job is active;
+- delete a journal of a session that still has a record, or a launchd definition while its job is active (the daemon alone deletes the journals of sessions that no longer exist, as described under "Worker journal retention");
 - kill a worker by hand to clear `conflict` or `incompatible`; use `session stop` for a provable `conflict`;
 - interpret daemon disconnection as child exit;
 - invoke `session.resume` for a live or reconnecting runtime;
@@ -261,6 +261,50 @@ The old generation must be proven ended first; two generations of one session
 are never live at once. Clients receive
 `session_native_recovered` and must present the generation change visibly.
 Shell sessions and uncaptured agent sessions cannot be reconstructed.
+
+## Worker journal retention
+
+`<state>/workers/<session>/` holds the journals of every worker a session ever
+had. The daemon deletes that directory in two cases and never otherwise:
+
+- **Removal.** `session rm` deletes the directory after the session record is
+  gone. The order is the reverse of the logs and the private temporary
+  directory, which go before the record: until the record is deleted, a removal
+  replayed after a failure still reads the journals to prove the session's
+  workers gone. A failed store delete therefore leaves the journals in place,
+  and the retried removal deletes them. A removal that proceeded past an
+  unconfirmed process (`--accept-unconfirmed-cleanup`) keeps the directory as evidence
+  for the startup collection. A failed directory delete is only logged,
+  because the removal already succeeded.
+- **Startup collection.** Before the control server accepts requests, the
+  daemon collects the directories no startup evidence names: no store record,
+  resume binding, rejected store line, worker socket or claim, or supervisor
+  job. A directory goes only when everything in it is untouched for
+  `[worker_journals] max_age_days` (default 7, `1..=365`), holds only worker
+  journals and unfinished writes, every journal is understood, and every
+  worker the journals name is gone from one snapshot of the process table
+  taken for the pass. A journal of a newer schema, an unreadable file, or an
+  unknown file name keeps the directory. The collection is skipped as a
+  whole, with one log line, when the owners cannot be established (a failed
+  socket, job or journal discovery, or a store line that names no session) or
+  the process table cannot be read. A stale `.<journal>.<pid>.<seq>.tmp` file
+  of a writer that is gone, or older than the window, is removed from any
+  directory.
+
+A directory is deleted by renaming it to `workers/.gc.<session>.<pid>.<seq>`
+first and then unlinking only journal and unfinished-write names, so a reader
+never sees a half-deleted session. Startup finishes a tombstone a crash left;
+one that still holds an unknown name is kept and counted in the summary. One
+`worker journal collection finished` line per start reports the deleted
+directories, files and bytes, and the directories kept by reason.
+
+The journals of a session that still has a record are never deleted: resume,
+terminal import, native-claim checks and the lost-runtime sweeps read them. A
+store restored from a backup older than a removal shows that session without
+journals; that reads as `worker_unavailable` or `lost`, which is fail-closed
+(no process is killed), exactly as for the logs, worktrees and temporary
+directory the same removal deleted. A 0.37 daemon on the same state ignores
+tombstones and the `[worker_journals]` table (with one unknown-key warning).
 
 ## Upgrade and Rollback
 

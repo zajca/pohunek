@@ -81,6 +81,7 @@ mod diff;
 mod forward;
 mod hooks;
 mod input;
+mod journal_gc;
 mod lag;
 mod native_attestation;
 mod native_repair;
@@ -501,6 +502,11 @@ pub struct SessionRegistryConfig {
     /// `host.inspect` (`[inventory]` of `service.toml`). Defaults to
     /// [`pohunek_service_config::DEFAULT_INVENTORY_PROBE`].
     pub inventory_probe: pohunek_service_config::InventoryProbe,
+    /// Age after which the startup collection may delete the journal
+    /// directory of a session that no longer exists (`[worker_journals]` of
+    /// `service.toml`). Defaults to
+    /// [`pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE`].
+    pub worker_journal_max_age: std::time::Duration,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
@@ -651,6 +657,7 @@ impl Default for SessionRegistryConfig {
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             remote_keepalive: pohunek_service_config::DEFAULT_KEEPALIVE_TIMING,
             inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
+            worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
             retention_policy_path: None,
             idle_stop_policy_path: None,
             idle_stop_min_secs: idle_stop::DEFAULT_IDLE_STOP_MIN_SECS,
@@ -6399,6 +6406,14 @@ impl SessionRegistry {
                     .or_insert(entry);
             }
             return Err(error);
+        }
+        // The record is gone, so nothing replays this removal any more. Logs
+        // and the temporary directory go before the record; the journals go
+        // after it, because a replayed removal proves its workers gone from
+        // them. A cleanup accepted without confirmation keeps its journals as
+        // evidence for the startup collection.
+        if accepted_unconfirmed.is_empty() {
+            self.delete_session_journals(id).await;
         }
         if let Some(entry) = &evicted {
             self.emit(event::SESSION_REMOVED, &entry.info);
