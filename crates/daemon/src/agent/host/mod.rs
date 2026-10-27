@@ -44,7 +44,8 @@ pub(crate) use launch::{
     validate_launch_runtime, validate_launch_runtime_with_timeout_detailed, version_order, Spawn,
 };
 pub use launch_env::{
-    DescriptorLaunchEnv, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_VALUE_BYTES, REFUSED_NAMESPACES,
+    DescriptorLaunchEnv, GLUED_ENDINGS, LAUNCH_ENV_VALUES, LOCATION_WORDS, MAX_LAUNCH_ENV_ENTRIES,
+    REFUSED_NAMESPACES, SECRET_WORDS,
 };
 pub(crate) use package::may_serve_reserved;
 pub use package::{

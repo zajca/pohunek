@@ -1,3 +1,4 @@
 ## Unreleased (2026-10-27, launch_env key policy, #1667)
 
 - `[launch_env]` refuses a name when any `_`-separated word after the runtime namespace is a location, identity or code-shaped word (`PATH`, `DIRS`, `CMD`, `OPTS`, `PRELOAD`, `CERT`, `KEYRING`, ...), not only the last one, and the refused runtime namespaces grew (`GLIBC_`, `MALLOC_`, `LUA_`, `DOTNET_`, `CGO_`, toolchains, TLS, container and cloud families). The bare `GO` prefix is replaced by `GO_` and the exact Go variable names, so a runtime such as `goose` keeps a usable table. See [Launch environment](guides/runtime-packages.md#launch-environment).
+- `[launch_env]` values are a closed set of flag literals (`0`, `1`, `true`, `false`); the 256-byte bound is gone, and widening the set needs a new feature id. The name word lists are a second layer behind this rule, and the refused namespaces gained `RSYNC_`, `CCACHE_`, `SCCACHE_`, `CMAKE_`, `ELECTRON_`, `SVN_`, `BORG_`, `RESTIC_`, `HEX_` and `R_`.

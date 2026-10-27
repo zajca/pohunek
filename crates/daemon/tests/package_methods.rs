@@ -1113,14 +1113,6 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
         ),
         ("too-many".to_owned(), launch_env_table(&numbered)),
         (
-            "long-value".to_owned(),
-            launch_env_table(&[format!("PI_FLAG = \"{}\"", "v".repeat(257))]),
-        ),
-        (
-            "control-value".to_owned(),
-            launch_env_table(&["PI_FLAG = \"a\\u0007b\"".to_owned()]),
-        ),
-        (
             "number-value".to_owned(),
             launch_env_table(&["PI_FLAG = 1".to_owned()]),
         ),
@@ -1242,11 +1234,8 @@ async fn launch_env_tables_within_the_bounds_install() {
         ("argsort", pair("PI_ARGSORT")),
         ("editorial", pair("PI_EDITORIAL")),
         ("log-level", pair("PI_LOG_LEVEL")),
+        ("theme", pair("PI_THEME")),
         ("bounds", launch_env_table(&sixteen)),
-        (
-            "long-value",
-            launch_env_table(&[format!("PI_FLAG = \"{}\"", "v".repeat(256))]),
-        ),
     ];
     for (index, (name, tables)) in accepted.iter().enumerate() {
         let document = descriptor_requiring(LAUNCH_ENV_FEATURE, tables)
@@ -1254,6 +1243,104 @@ async fn launch_env_tables_within_the_bounds_install() {
         let (_digest, result) =
             install_descriptor(&mut local, &servers.plugins, name, &document, false).await;
         result.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn launch_env_values_are_flag_literals() {
+    let servers = spawn_servers("pkg-launch-env-values").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let long = format!("\"{}\"", "v".repeat(257));
+    // TOML sources of values a flag cannot be: a program, a path, a host, a
+    // port, a credential, an expansion, another spelling or no value.
+    let refused = [
+        "\"less\"",
+        "\"x\"",
+        "\"a/b\"",
+        "\"https://h\"",
+        "\"h:1\"",
+        "\"user@h\"",
+        "\"$HOME\"",
+        "\"~\"",
+        "\"\"",
+        "\" 1\"",
+        "\"1 \"",
+        "\"TRUE\"",
+        "\"yes\"",
+        "\"2\"",
+        "\"-1\"",
+        "\"1.5\"",
+        "\"8080\"",
+        "\"a\\u0007b\"",
+        long.as_str(),
+    ];
+    for (index, value) in refused.iter().enumerate() {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("value-{index}"),
+            &descriptor_requiring(
+                LAUNCH_ENV_FEATURE,
+                &launch_env_table(&[format!("PI_FLAG = {value}")]),
+            ),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(value).code,
+            "package_descriptor_invalid",
+            "{value}"
+        );
+    }
+    for (index, value) in ["0", "1", "true", "false"].into_iter().enumerate() {
+        let document = descriptor_requiring(
+            LAUNCH_ENV_FEATURE,
+            &launch_env_table(&[format!("PI_FLAG = \"{value}\"")]),
+        )
+        .replace("version = \"1.0.0\"", &format!("version = \"1.0.{index}\""));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, value, &document, false).await;
+        result.unwrap_or_else(|error| panic!("{value} installs: {error:?}"));
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn every_listed_name_word_is_refused_in_any_position() {
+    use pohunek_daemon::agent::host::{GLUED_ENDINGS, LOCATION_WORDS, SECRET_WORDS};
+
+    let servers = spawn_servers("pkg-launch-env-words").await;
+    let mut local = connect_unix(&servers.socket).await;
+    // Each listed word last, not last, and each glued ending after a letter, so
+    // dropping an entry from a list fails here.
+    let mut names: Vec<String> = Vec::new();
+    for word in SECRET_WORDS.iter().chain(LOCATION_WORDS) {
+        names.push(format!("PI_{word}"));
+        names.push(format!("PI_{word}_MODE"));
+    }
+    names.extend(GLUED_ENDINGS.iter().map(|ending| format!("PI_X{ending}")));
+    for name in &names {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(
+                LAUNCH_ENV_FEATURE,
+                &launch_env_table(&[format!("{name} = \"1\"")]),
+            ),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
     }
 
     drop(local);
@@ -1300,7 +1387,7 @@ async fn launch_env_pairs_reach_the_version_probe_and_key_its_cache() {
     // The same program path under a declared pair reports the pair's revision;
     // a later package with another value reports its own, so the probe cache
     // keys on the pairs.
-    for (version, value) in [("1.0.1", "2"), ("1.0.2", "3")] {
+    for (version, value) in [("1.0.1", "0"), ("1.0.2", "1")] {
         let table = launch_env_table(&[format!("PI_REVISION = \"{value}\"")]);
         let (_digest, result) = install_descriptor(
             &mut local,
@@ -1418,7 +1505,7 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
     );
     let document = descriptor_requiring(
         LAUNCH_ENV_FEATURE,
-        &launch_env_table(&["PI_MARK = \"from-descriptor\"".to_owned()]),
+        &launch_env_table(&["PI_MARK = \"1\"".to_owned()]),
     )
     .replace(
         "program = \"/bin/sh\"",
@@ -1438,19 +1525,14 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
 
     // A new session gets the descriptor pair.
     let id = start_session(&mut local, RUNTIME, &cwd).await;
-    wait_for_text(&mut local, &id, "LAUNCH_ENV_PAIR=<from-descriptor>").await;
+    wait_for_text(&mut local, &id, "LAUNCH_ENV_PAIR=<1>").await;
 
     // A resumed session is relaunched with the pair of the definition that
     // serves the relaunch.
     let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
     let resumed: protocol::SessionResumeResult =
         call(&mut local, method::SESSION_RESUME, json!(id)).await;
-    wait_for_text(
-        &mut local,
-        &resumed.session.id,
-        "LAUNCH_ENV_PAIR=<from-descriptor>",
-    )
-    .await;
+    wait_for_text(&mut local, &resumed.session.id, "LAUNCH_ENV_PAIR=<1>").await;
 
     // A fork is launched the same way.
     let forked: protocol::SessionForkResult = call(
@@ -1459,12 +1541,7 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
         json!({ "session_id": resumed.session.id, "cols": 80, "rows": 24 }),
     )
     .await;
-    wait_for_text(
-        &mut local,
-        &forked.session.id,
-        "LAUNCH_ENV_PAIR=<from-descriptor>",
-    )
-    .await;
+    wait_for_text(&mut local, &forked.session.id, "LAUNCH_ENV_PAIR=<1>").await;
     for stopped in [&resumed.session.id, &forked.session.id] {
         let _: protocol::SessionStopResult =
             call(&mut local, method::SESSION_STOP, json!(stopped)).await;
@@ -1473,7 +1550,7 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
     // A host profile's `[env]` entry of the same name wins.
     let overridden = start_session(&mut local, "overridden", &cwd).await;
     let text = wait_for_text(&mut local, &overridden, "LAUNCH_ENV_PAIR=<from-profile>").await;
-    assert!(!text.contains("from-descriptor"), "{text:?}");
+    assert!(!text.contains("LAUNCH_ENV_PAIR=<1>"), "{text:?}");
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(overridden)).await;
 

@@ -6,9 +6,11 @@
 //! ACME_NO_AUTO_UPDATE = "1"
 //! ```
 //!
-//! The pairs are plain strings, never expanded, and behaviour flags: they say
-//! what the agent does, never where credentials, configuration, data, the
-//! install or a socket live, which program to run or which session it is.
+//! The pairs are behaviour flags: a value is one of `0`, `1`, `true` or
+//! `false`, never expanded, so a pair says what the agent does and cannot name
+//! where credentials, configuration, data, the install or a socket live, which
+//! program to run or which session it is. Widening the value set needs a new
+//! feature id.
 //! A name is accepted only inside the runtime's own namespace, derived from its
 //! runtime id (`acme` gives `ACME_`, `my-agent.x` gives `MY_AGENT_X_`) with at
 //! least one character after the prefix. The core's own allowlist outside the
@@ -17,7 +19,9 @@
 //! `HTTPS_`, ...) has no usable `[launch_env]`. Inside the namespace the
 //! service-manager names, the descriptor's own config home variables,
 //! any secret-shaped word and any location, identity or code-shaped word
-//! (`_DIR`, `_CMD`, `_OPTS`, `_PRELOAD`, ...) are refused.
+//! (`_DIR`, `_CMD`, `_OPTS`, `_PRELOAD`, ...) are refused. The word lists are a
+//! second layer behind the value rule (`0` and `1` are also valid file names),
+//! not a complete vocabulary.
 //! A host profile `[env]` is owner-authored and not subject to these rules; it
 //! overrides a pair of the same name. The values reach only the declaring
 //! runtime's own launches and probes, and nothing persists them, so each launch
@@ -40,10 +44,10 @@ use crate::agent::env_name_problem;
 /// descriptor that configures the agent wholesale.
 pub const MAX_LAUNCH_ENV_ENTRIES: usize = 16;
 
-/// Maximum size of one `[launch_env]` value, in bytes.
-///
-/// Values are flags or small identifiers.
-pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 256;
+/// The only values a `[launch_env]` pair can hold: flag literals. A value
+/// outside this set could name a program, a path, a host or a credential, which
+/// no list of names can rule out; widening the set needs a new feature id.
+pub const LAUNCH_ENV_VALUES: &[&str] = &["0", "1", "true", "false"];
 
 /// Separator that ends a runtime namespace.
 const NAMESPACE_SEPARATOR: char = '_';
@@ -173,10 +177,21 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "VOLTA_",
     "ASDF_",
     "MISE_",
+    // Tools whose boolean variables change trust or behaviour.
+    "RSYNC_",
+    "CCACHE_",
+    "SCCACHE_",
+    "CMAKE_",
+    "ELECTRON_",
+    "SVN_",
+    "BORG_",
+    "RESTIC_",
+    "HEX_",
+    "R_",
 ];
 
 /// Words of secret-shaped names, which only the owner's profile sets.
-const SECRET_WORDS: &[&str] = &[
+pub const SECRET_WORDS: &[&str] = &[
     "KEY",
     "KEYS",
     "TOKEN",
@@ -185,6 +200,8 @@ const SECRET_WORDS: &[&str] = &[
     "SECRETS",
     "PASSWORD",
     "PASSWD",
+    "PASSPHRASE",
+    "PASSPHRASES",
     "CREDENTIAL",
     "CREDENTIALS",
     "AUTH",
@@ -193,7 +210,7 @@ const SECRET_WORDS: &[&str] = &[
 /// Words of location-, identity- and code-shaped names: where something
 /// lives, which program, library, plugin or hook to run, with which options, or
 /// which session this is is never a behaviour flag.
-const LOCATION_WORDS: &[&str] = &[
+pub const LOCATION_WORDS: &[&str] = &[
     "PATH",
     "PATHS",
     "DIR",
@@ -251,7 +268,7 @@ const LOCATION_WORDS: &[&str] = &[
 /// Endings of a longer word that make it location- or code-shaped when the
 /// separator is missing (`TMPDIR`, `CAFILE`, `LIBPATH`, `AFLAGS`). Short words
 /// such as `ID` or `CA` are matched whole only, so `VALID` is not touched.
-const GLUED_ENDINGS: &[&str] = &[
+pub const GLUED_ENDINGS: &[&str] = &[
     "PATH", "DIR", "FILE", "HOME", "ROOT", "FLAGS", "OPTS", "CONF", "CERT", "CERTS",
 ];
 
@@ -297,8 +314,7 @@ impl DescriptorLaunchEnv {
     /// whose namespace is unusable or refused, a name outside the namespace or
     /// with nothing after it, a name that is not an upper-case variable outside
     /// the `POHUNEK_` namespace, a service-manager, secret-shaped or
-    /// location-shaped name, or a value over [`MAX_LAUNCH_ENV_VALUE_BYTES`] or
-    /// holding a control character.
+    /// location-shaped name, or a value outside [`LAUNCH_ENV_VALUES`].
     pub fn new(
         runtime_id: &str,
         declared: BTreeMap<String, String>,
@@ -337,11 +353,8 @@ impl DescriptorLaunchEnv {
             if rest.split(NAMESPACE_SEPARATOR).any(location_shaped) {
                 return Err(field("cannot name a location or identity variable"));
             }
-            if value.len() > MAX_LAUNCH_ENV_VALUE_BYTES {
-                return Err(field("holds a value over the size bound"));
-            }
-            if value.chars().any(char::is_control) {
-                return Err(field("holds a value with a control character"));
+            if !LAUNCH_ENV_VALUES.contains(&value.as_str()) {
+                return Err(field("values must be one of 0, 1, true or false"));
             }
         }
         Ok(Self(declared.into_iter().collect()))
