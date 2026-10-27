@@ -37,7 +37,17 @@ impl RuntimeSource for MuseSource {
     }
 }
 
-fn muse_host(program: &Path, script: &Path, extra_args: &[&str]) -> RuntimeHost {
+fn muse_host(
+    program: &Path,
+    script: &Path,
+    extra_args: &[&str],
+    declare_home: bool,
+) -> RuntimeHost {
+    let config_home = if declare_home {
+        "[config_home]\nenv = \"XDG_CONFIG_HOME\"\nsubdir = \"muse\"\ndefault = \".config/muse\"\n"
+    } else {
+        ""
+    };
     let args: Vec<String> = std::iter::once(script.display().to_string())
         .chain(extra_args.iter().map(|arg| (*arg).to_owned()))
         .collect();
@@ -76,11 +86,7 @@ strategy = "hook"
 handler = "muse-hook-v1"
 hook_schema = "identity-subagent-v1"
 
-[config_home]
-env = "XDG_CONFIG_HOME"
-subdir = "muse"
-default = ".config/muse"
-"#
+{config_home}"#
     );
     let definition = RuntimeDefinition::from_toml(
         &document,
@@ -115,7 +121,7 @@ impl Rig {
         settings: Option<&str>,
         extra_args: &[&str],
     ) -> Result<Self, ProtocolError> {
-        Self::start(tag, settings, extra_args, None).await
+        Self::start(tag, settings, extra_args, None, true).await
     }
 
     /// [`Self::new`] launched from a profile whose `[env]` is `profile_env`.
@@ -124,7 +130,12 @@ impl Rig {
         settings: Option<&str>,
         profile_env: (&str, &Path),
     ) -> Result<Self, ProtocolError> {
-        Self::start(tag, settings, &[], Some(profile_env)).await
+        Self::start(tag, settings, &[], Some(profile_env), true).await
+    }
+
+    /// [`Self::new`] for a descriptor that declares no `[config_home]`.
+    async fn without_config_home(tag: &str) -> Result<Self, ProtocolError> {
+        Self::start(tag, None, &[], None, false).await
     }
 
     async fn start(
@@ -132,6 +143,7 @@ impl Rig {
         settings: Option<&str>,
         extra_args: &[&str],
         profile_env: Option<(&str, &Path)>,
+        declare_home: bool,
     ) -> Result<Self, ProtocolError> {
         let dir = temp_dir(tag);
         let xdg = PathBuf::from(
@@ -154,7 +166,7 @@ impl Rig {
         let program = dir.join(MUSE_BIN);
         pohunek_test_support::fs::copy_shell_image(native_supersede::bash_path(), &program)
             .expect("copy the fixture agent image");
-        let host = muse_host(&program, &script, extra_args);
+        let host = muse_host(&program, &script, extra_args, declare_home);
         let mut config = SessionRegistryConfig {
             shell_command: hermetic_shell(),
             store_path: Some(temp_store_path(tag)),
@@ -207,7 +219,11 @@ impl Rig {
     /// Runs the hooks of `event` with `payload` as Muse would, in a cleared
     /// environment, and waits until the fake Muse finished them.
     async fn fire(&self, event: &str, payload: &str, root: &str) {
-        let fixture = fixture_path(payload);
+        self.fire_file(event, &fixture_path(payload), root).await;
+    }
+
+    /// [`Self::fire`] with the payload read from `fixture`.
+    async fn fire_file(&self, event: &str, fixture: &Path, root: &str) {
         let before = fs::read_to_string(&self.acks)
             .unwrap_or_default()
             .lines()
@@ -376,8 +392,17 @@ async fn clear_rebinds_the_session_to_the_new_conversation() {
         .await;
 
     rig.wait_identity(CLEARED).await;
-    rig.fire("SessionStart", "session_start_resume", ROOT).await;
-    rig.wait_identity(ROOT).await;
+    for source in [
+        "session_start_resume",
+        "session_start_fork",
+        "session_start_compact",
+    ] {
+        rig.fire("SessionStart", "session_start_clear", CLEARED)
+            .await;
+        rig.wait_identity(CLEARED).await;
+        rig.fire("SessionStart", source, ROOT).await;
+        rig.wait_identity(ROOT).await;
+    }
     rig.finish().await;
     rig.remove().await;
 }
@@ -465,8 +490,8 @@ async fn create_and_every_resume_carry_the_overlay_env_and_the_variable_list_onc
     for line in &launches {
         assert_eq!(line.matches("managed_hooks_env_vars").count(), 1, "{line}");
         assert!(
-            line.contains("\"PATH\""),
-            "the hook environment keeps PATH: {line}"
+            !line.contains("\"PATH\""),
+            "the variable list stays the reporter's names: {line}"
         );
     }
     assert!(launches[1].ends_with(&format!("resume {ROOT}")));
@@ -658,12 +683,171 @@ async fn an_unreadable_or_unparsable_foreign_file_refuses_the_launch() {
 }
 
 #[tokio::test]
-async fn a_launch_argument_that_sets_the_variable_list_is_refused() {
-    let error = Rig::new("muse-dup", None, &["-c", "managed_hooks_env_vars=[\"X\"]"])
+async fn a_launch_argument_that_sets_an_overlay_key_is_refused() {
+    for (tag, arg) in [
+        ("muse-dup-vars", "managed_hooks_env_vars=[\"X\"]"),
+        ("muse-dup-path", "managed_hooks_path=/etc/acme/policy.json"),
+    ] {
+        let error = Rig::new(tag, None, &["-c", arg])
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(error.code, "integration_launch_arg_conflict", "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn a_descriptor_without_a_config_home_refuses_the_launch() {
+    let error = Rig::without_config_home("muse-no-home")
         .await
         .err()
-        .expect("refused");
-    assert_eq!(error.code, "integration_launch_arg_conflict");
+        .expect("refused: the settings file that may name a policy file cannot be found");
+    assert_eq!(error.code, "integration_overlay_unavailable");
+    assert!(error.msg.contains("config_home"), "{}", error.msg);
+}
+
+#[tokio::test]
+async fn a_directory_or_fifo_as_the_foreign_file_refuses_the_launch() {
+    for tag in ["muse-foreign-dir", "muse-foreign-fifo"] {
+        let dir = temp_dir(tag);
+        let foreign = dir.join("policy-hooks.json");
+        if tag.ends_with("dir") {
+            fs::create_dir(&foreign).expect("directory");
+        } else {
+            nix::unistd::mkfifo(&foreign, nix::sys::stat::Mode::S_IRWXU).expect("fifo");
+        }
+        let settings = format!(
+            r#"{{"schema_version":1,"managed_hooks_path":{:?}}}"#,
+            foreign.display().to_string()
+        );
+        let error = Rig::new(tag, Some(&settings), &[])
+            .await
+            .err()
+            .expect("refused without blocking on the fifo");
+        assert_eq!(error.code, "integration_overlay_unavailable", "{tag}");
+        assert!(error.msg.contains("is not a regular file"), "{}", error.msg);
+    }
+}
+
+#[tokio::test]
+async fn status_and_doctor_report_a_misshapen_hooks_file_that_a_launch_would_refuse() {
+    let dir = temp_dir("muse-status-misshapen");
+    let foreign = dir.join("policy-hooks.json");
+    fs::write(&foreign, r#"{"hooks":{}}"#).expect("foreign file");
+    let settings = format!(
+        r#"{{"schema_version":1,"managed_hooks_path":{:?}}}"#,
+        foreign.display().to_string()
+    );
+    let rig = Rig::new("muse-status-misshapen", Some(&settings), &[])
+        .await
+        .expect("create the Muse session");
+    let homes = crate::integration::ConfigHomes::new(
+        rig.registry.profiles().clone(),
+        rig.registry.inspect_base_environment(),
+    );
+    let agent = protocol::RuntimeRef::from_wire("muse");
+    let status = |homes: &crate::integration::ConfigHomes| {
+        crate::integration::status_in(
+            homes,
+            protocol::IntegrationStatusParams {
+                agent: Some(agent.clone()),
+                profile: None,
+                all_profiles: false,
+            },
+        )
+        .expect("status")
+        .agents
+        .remove(0)
+    };
+    assert_eq!(
+        status(&homes).state,
+        protocol::IntegrationInstallState::Current
+    );
+
+    fs::write(&foreign, r#"{"hooks":[]}"#).expect("break the foreign file");
+
+    let broken = status(&homes);
+    assert_eq!(broken.state, protocol::IntegrationInstallState::Outdated);
+    assert_eq!(
+        broken.recovery,
+        protocol::IntegrationRecovery::RepairConfiguration
+    );
+    let doctor = crate::integration::doctor_in(
+        &homes,
+        protocol::IntegrationDoctorParams {
+            agent: Some(agent.clone()),
+            profile: None,
+            all_profiles: false,
+        },
+    )
+    .expect("doctor");
+    assert!(
+        doctor.agents[0]
+            .findings
+            .iter()
+            .any(|finding| finding.summary.contains("policy-hooks.json")),
+        "a finding names the misshapen file: {:?}",
+        doctor.agents[0].findings
+    );
+    let error = crate::integration::install_in(
+        &homes,
+        Some(&agent),
+        &crate::integration::HomeSelection::Runtime,
+        &crate::integration::RetainedSchemas::default(),
+    )
+    .expect_err("install refuses the file a launch would refuse");
+    assert_eq!(error.code, "integration_overlay_unavailable");
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn malformed_hook_input_exits_quietly_and_names_its_reason_in_the_trace() {
+    let rig = Rig::new("muse-malformed", None, &[])
+        .await
+        .expect("create the Muse session");
+    let oversized = temp_dir("muse-malformed-big").join("big.json");
+    fs::write(
+        &oversized,
+        format!(r#"{{"pad":"{}"}}"#, "x".repeat(70 * 1024)),
+    )
+    .expect("big");
+
+    rig.fire("SessionStart", "malformed_not_json", ROOT).await;
+    rig.fire("SessionStart", "malformed_empty", ROOT).await;
+    rig.fire_file("SessionStart", &oversized, ROOT).await;
+    rig.fire("SessionStart", "session_start_no_session_id", ROOT)
+        .await;
+    rig.fire("SubagentStart", "subagent_start_no_id", ROOT)
+        .await;
+    rig.fire("SessionStart", "session_start_startup", "").await;
+
+    let trace = rig.trace();
+    for reason in [
+        "not_json",
+        "empty",
+        "input_too_large",
+        "session_id_missing",
+        "subagent_id_missing",
+        "muse_session_missing",
+    ] {
+        assert!(
+            trace.contains(reason),
+            "a trace line names {reason}: {trace}"
+        );
+    }
+    assert!(
+        rig.worker()
+            .await
+            .inspect()
+            .await
+            .expect("inspect")
+            .active_identity
+            .is_none(),
+        "no malformed input binds an identity"
+    );
+    rig.finish().await;
+    rig.remove().await;
 }
 
 #[tokio::test]

@@ -19,8 +19,10 @@
 //! descriptor that names `muse-hook-v1` is then refused because the build
 //! provides no such handler.
 //!
-//! `status` and `install` inspect the config home only, so a managed hooks
-//! file named by a profile `[env]` is read at launch, not by them.
+//! `status` and `install` check the config home only (the settings file and the
+//! overlay it would produce), so a managed hooks file named by
+//! `TBH_MANAGED_HOOKS_PATH` in a profile `[env]` or the service environment is
+//! read at launch, not by them.
 //!
 //! UNVERIFIED: the managed hooks file layout, the accepted `-c` spellings, the
 //! hook payload fields and the hook process ancestry are taken from the Muse
@@ -90,6 +92,11 @@ pub(super) static MUSE_HOOK: MuseHook = MuseHook;
 impl LaunchContributor for MuseHook {
     fn contribute(&self, ctx: &LaunchInputContext<'_>) -> Result<LaunchInput, ProtocolError> {
         overlay::refuse_conflicting_args(ctx.args)?;
+        // Without a declared config home the settings file, which may name a
+        // policy hooks file the overlay must keep, cannot be found.
+        if ctx.config_home.is_none() {
+            return Err(overlay_unavailable(&Problem::NoConfigHome));
+        }
         let inputs = Inputs::read(ctx.config_home, ctx.env)
             .map_err(|problem| overlay_unavailable(&problem))?;
         let reporter = ctx.file_path(REPORTER_FILE);
@@ -121,6 +128,12 @@ impl LaunchContributor for MuseHook {
 #[cfg(test)]
 pub(super) fn hook_env_vars() -> &'static [&'static str] {
     overlay::HOOK_ENV_VARS
+}
+
+/// Reads the config home `dir` as a launch would, without a profile or service
+/// environment, and builds the overlay it would produce.
+fn check_home(dir: &Path) -> Result<(), Problem> {
+    overlay::validate(&Inputs::read(Some(dir), &[])?)
 }
 
 /// `integration_overlay_unavailable` for `problem`.
@@ -207,8 +220,8 @@ impl DaemonHandler for MuseHook {
                 Vec::new(),
             );
         }
-        match Inputs::read(Some(dir), &[]) {
-            Ok(_inputs) => {
+        match check_home(dir) {
+            Ok(()) => {
                 let mut current = status(
                     true,
                     IntegrationInstallState::Current,
@@ -240,7 +253,7 @@ impl DaemonHandler for MuseHook {
                 Some("install Muse Code first".to_owned()),
             ));
         }
-        Inputs::read(Some(dir), &[]).map_err(|problem| overlay_unavailable(&problem))?;
+        check_home(dir).map_err(|problem| overlay_unavailable(&problem))?;
         Ok(Box::new(StagedMuse {
             manifest: AssetManifest {
                 version: ASSET_VERSION,

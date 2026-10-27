@@ -16,11 +16,23 @@
 
 set -eu
 
-# Muse clears the hook environment; the launch lists PATH among the variables it
-# keeps, and the fallback below covers a Muse that passes none. A host whose
-# python3 is elsewhere (or a stub that is not a working interpreter) makes the
-# hook exit without a report.
-[ -n "${PATH:-}" ] || PATH=/usr/local/bin:/usr/bin:/bin
+# Muse clears the hook environment and passes no PATH of its own choosing, so the
+# search path is rebuilt from the absolute entries of what it left, else a fixed
+# system path. A relative or empty entry would let the working directory choose
+# the python3 this script runs. A host whose python3 is elsewhere (or a stub that
+# is not a working interpreter) makes the hook exit without a report.
+safe_path=
+old_ifs=$IFS
+set -f
+IFS=:
+for entry in ${PATH:-}; do
+  case "$entry" in
+    /*) safe_path="${safe_path:+$safe_path:}$entry" ;;
+  esac
+done
+IFS=$old_ifs
+set +f
+PATH="${safe_path:-/usr/local/bin:/usr/bin:/bin}"
 export PATH
 
 action="${1:-}"
@@ -97,7 +109,7 @@ trace_path = os.environ.get("POHUNEK_HOOK_TRACE_PATH")
 trace_max_raw = os.environ.get("POHUNEK_HOOK_TRACE_MAX_BYTES")
 reference_kind = os.environ.get("POHUNEK_NATIVE_REFERENCE_KIND")
 # Muse sets the root session id for every hook command, whatever thread fires it.
-muse_session_id = os.environ.get("MUSE_SESSION_ID")
+muse_session_id = os.environ.get("MUSE_SESSION_ID") or None
 
 
 def positive_int(raw):

@@ -66,10 +66,6 @@ pub(super) const HOOK_ENV_VARS: &[&str] = &[
     "POHUNEK_NATIVE_REFERENCE_KIND",
 ];
 
-/// Names beyond the reporter's own that the hook environment receives: `PATH`,
-/// so the reporter finds the `python3` the launch environment resolves.
-const INHERITED_VARS: &[&str] = &["PATH"];
-
 /// Why the overlay inputs cannot be used.
 #[derive(Debug, Error)]
 pub(super) enum Problem {
@@ -103,6 +99,10 @@ pub(super) enum Problem {
     /// The overlay cannot be encoded.
     #[error("the Muse hook overlay cannot be encoded: {0}")]
     Encode(#[from] serde_json::Error),
+    /// The runtime declares no config home, so the settings file that may name
+    /// a managed hooks file cannot be found.
+    #[error("the runtime declares no [config_home], so the Muse settings file cannot be read")]
+    NoConfigHome,
     /// The managed hooks path is not absolute.
     #[error("the managed hooks path {0:?} is not an absolute path")]
     RelativePath(String),
@@ -254,11 +254,7 @@ fn read_object(
 
 /// The `-c` value that lists the reporter's variables and the user's own.
 pub(super) fn env_vars_arg(inputs: &Inputs) -> String {
-    let mut names: Vec<&str> = HOOK_ENV_VARS
-        .iter()
-        .chain(INHERITED_VARS)
-        .copied()
-        .collect();
+    let mut names: Vec<&str> = HOOK_ENV_VARS.to_vec();
     for name in &inputs.user_vars {
         if !names.contains(&name.as_str()) {
             names.push(name);
@@ -267,17 +263,26 @@ pub(super) fn env_vars_arg(inputs: &Inputs) -> String {
     format!("{ENV_VARS_KEY}={}", json!(names))
 }
 
-/// Refuses a launch whose arguments already set the variable list, which Muse
-/// refuses as a duplicate `-c` key. Every spelling that contains the key is
-/// refused, because the accepted spellings are not documented.
+/// Keys of the managed hooks configuration the overlay owns. A launch
+/// argument that contains one of them is refused: Muse refuses a duplicate `-c`
+/// key, and which of an argument and `TBH_MANAGED_HOOKS_PATH` wins for the path
+/// is not documented, so either could bypass a policy file or drop the reporter.
+const OWNED_KEYS: &[&str] = &[ENV_VARS_KEY, MANAGED_PATH_KEY];
+
+/// Refuses a launch whose arguments already set a key the overlay owns. Every
+/// spelling that contains the key is refused, because the accepted spellings
+/// are not documented.
 pub(super) fn refuse_conflicting_args(args: &[String]) -> Result<(), ProtocolError> {
-    if args.iter().any(|arg| arg.contains(ENV_VARS_KEY)) {
+    if let Some(key) = OWNED_KEYS
+        .iter()
+        .find(|key| args.iter().any(|arg| arg.contains(**key)))
+    {
         return Err(ProtocolError::new(
             ErrorClass::Runtime,
             ARG_CONFLICT_CODE,
-            format!("the launch arguments already set {ENV_VARS_KEY}, which the Muse hook overlay needs to set itself"),
+            format!("the launch arguments already set {key}, which the Muse hook overlay needs to set itself"),
             Some(format!(
-                "remove {ENV_VARS_KEY} from the runtime or profile arguments; list extra variables in the Muse settings file instead"
+                "remove {key} from the runtime or profile arguments; list extra variables in the Muse settings file and name a managed hooks file there or in TBH_MANAGED_HOOKS_PATH instead"
             )),
         ));
     }
@@ -289,6 +294,11 @@ pub(super) fn refuse_conflicting_args(args: &[String]) -> Result<(), ProtocolErr
 fn command(reporter: &Path, action: &str) -> String {
     let quoted = reporter.to_string_lossy().replace('\'', "'\\''");
     format!("'{quoted}' {action}")
+}
+
+/// Checks that `inputs` can produce an overlay, as a launch would build it.
+pub(super) fn validate(inputs: &Inputs) -> Result<(), Problem> {
+    build(inputs, Path::new("/reporter")).map(|_overlay| ())
 }
 
 /// The overlay file: the foreign hooks verbatim plus the reporter per event.

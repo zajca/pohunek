@@ -379,11 +379,24 @@ profile `[env]` entry or a variable the service environment allowlist passes, el
 `SessionStart`, `SubagentStart` and `SubagentStop`; a selected file that is
 unreadable, larger than 64 KiB or not a JSON object refuses the launch with
 `integration_overlay_unavailable`, because dropping it would drop policy hooks.
-The variable list is the names the reporter reads, `PATH`, and the user's own
-`managed_hooks_env_vars`; a launch argument that contains the key name anywhere is refused
+The variable list is the names the reporter reads and the user's own
+`managed_hooks_env_vars`; a launch argument that contains `managed_hooks_env_vars`
+or `managed_hooks_path` anywhere is refused
 with `integration_launch_arg_conflict`, because the accepted `-c` spellings are
 unverified; a Muse config home that does not resolve refuses the launch with
-`launch_input_unavailable`. The reporter is stateless, reports the
+`launch_input_unavailable`, and a descriptor that names `muse-hook-v1` without a
+`[config_home]` refuses it with `integration_overlay_unavailable`, because the settings
+file that may name a policy hooks file could not be found. The overlay copies the
+managed hooks file at each create and resume, so an edit of the policy file applies
+from the next launch, not to a running session. `integration status` builds the
+overlay the config home would produce and reports a file a launch would refuse as
+`outdated` with `repair_configuration`, and `install` refuses it with
+`integration_overlay_unavailable`; a managed hooks file named only by
+`TBH_MANAGED_HOOKS_PATH` in a profile `[env]` or the service environment is checked
+at launch, not there. The reporter rebuilds its search path from the absolute entries
+of the `PATH` Muse leaves it, else a fixed system path, so a `python3` that only the
+daemon's `PATH` finds (Homebrew or Nix, say) is found by `integration doctor` but not
+by the hook. The reporter is stateless, reports the
 root session only (`session_id` equal to `MUSE_SESSION_ID`, `-reminder` threads
 dropped), reports subagents without a role, and reaches the worker only. A
 foreground `muse` started inside a shell session gets no overlay and no
