@@ -694,7 +694,147 @@ fn wait_params(
     .expect("wait params")
 }
 
+/// Real-time ceiling of one await in the wait test: a quarter of [`HANG_GUARD`],
+/// so a stalled await fails with a state dump before nextest terminates the
+/// test and before the inhibitor's own ceiling lets the paused clock run.
+// timing-allowed: #1675 the ceiling must undercut the inhibitor's HANG_GUARD
+const STALL_CEILING: Duration = Duration::from_secs(HANG_GUARD.as_secs() / 4);
+
+/// Real-time ceiling of the state probes inside a stall dump.
+// timing-allowed: #1675 the dump probes must end well inside STALL_CEILING
+const DUMP_PROBE_CEILING: Duration = Duration::from_secs(HANG_GUARD.as_secs() / 40);
+
+/// A parked blocking task that finishes after `ceiling` of real time, or as
+/// soon as the returned sender is dropped.
+///
+/// The paused tokio clock has no timer to bound an await with, so real time
+/// is measured on a blocking thread.
+fn real_time_ceiling(
+    ceiling: Duration,
+) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+    // timing-allowed: #1675 real-time bound on a paused clock
+    let timer = tokio::task::spawn_blocking(move || {
+        let _ = cancelled.recv_timeout(ceiling);
+    });
+    (cancel, timer)
+}
+
+/// Awaits `future` for at most `ceiling` of real time; `None` means the future
+/// was still pending.
+async fn within_real_time<T>(
+    ceiling: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let (cancel, timer) = real_time_ceiling(ceiling);
+    tokio::pin!(future);
+    let outcome = tokio::select! {
+        output = &mut future => Some(output),
+        _ = timer => None,
+    };
+    drop(cancel);
+    outcome
+}
+
+/// Fails a stalled await of the session wait test with the state that tells
+/// which side is stuck: the waiter registrations, the stored `updated_at`
+/// against the metadata waiter's cursor, and whether the registry locks are
+/// held.
+struct StallProbe<'a> {
+    registry: &'a SessionRegistry,
+    id: &'a SessionId,
+    /// `after_updated_at` of the metadata waiter.
+    cursor: &'a str,
+    ceiling: Duration,
+}
+
+impl StallProbe<'_> {
+    /// Awaits `future`; panics with a dump when it is pending after the
+    /// probe's ceiling of real time. The dump is taken while `future` is
+    /// still alive, so a lock it holds shows as held.
+    async fn at<T>(&self, label: &str, future: impl std::future::Future<Output = T>) -> T {
+        let started = Instant::now();
+        let (cancel, timer) = real_time_ceiling(self.ceiling);
+        tokio::pin!(future);
+        tokio::select! {
+            output = &mut future => {
+                drop(cancel);
+                return output;
+            }
+            _ = timer => {}
+        }
+        let dump = self.dump().await;
+        panic!(
+            "stalled at `{label}` after {:?} of real time on a frozen clock\n{dump}",
+            started.elapsed()
+        );
+    }
+
+    async fn dump(&self) -> String {
+        let registered = self
+            .registry
+            .inner
+            .observation_session_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self.id)
+            .copied();
+        let sessions_lock_held = self.registry.inner.sessions.try_lock().is_err();
+        let persist_lock_held = self.registry.inner.persist_lock.try_lock().is_err();
+        let stored = within_real_time(DUMP_PROBE_CEILING, self.registry.inspect(self.id)).await;
+        let stored = match stored {
+            None => "inspect itself is pending".to_owned(),
+            Some(Err(error)) => format!("inspect failed: {error:?}"),
+            Some(Ok(info)) => format!(
+                "state={:?} updated_at={} newer_than_cursor={} metadata={:?}",
+                info.state,
+                info.updated_at,
+                info.updated_at.as_str() > self.cursor,
+                info.metadata
+            ),
+        };
+        format!(
+            "metadata waiter cursor (after_updated_at)={}\nregistered waiters={registered:?}\n\
+             sessions lock held={sessions_lock_held} persist lock held={persist_lock_held}\n\
+             stored session: {stored}",
+            self.cursor
+        )
+    }
+}
+
 #[tokio::test]
+#[should_panic(expected = "stalled at `a future that never completes`")]
+async fn a_stalled_await_of_the_wait_test_fails_with_a_state_dump() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
+    let probe = StallProbe {
+        registry: &registry,
+        id: &created.id,
+        cursor: &created.updated_at,
+        ceiling: Duration::ZERO,
+    };
+    let dump = probe.dump().await;
+    assert!(dump.contains("registered waiters=None"), "{dump}");
+    assert!(dump.contains("newer_than_cursor=false"), "{dump}");
+    probe
+        .at(
+            "a future that never completes",
+            std::future::pending::<()>(),
+        )
+        .await;
+    inhibitor.release().await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the three wake reasons share one registry and one paused clock"
+)]
 async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -707,6 +847,12 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     // and the sockets are real.
     let inhibitor = AutoAdvanceInhibitor::new();
     tokio::time::pause();
+    let probe = StallProbe {
+        registry: &registry,
+        id: &created.id,
+        cursor: &created.updated_at,
+        ceiling: STALL_CEILING,
+    };
 
     let metadata_params = wait_params(
         &created.id,
@@ -717,15 +863,24 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     );
     let metadata_registry = registry.clone();
     let metadata_wait = tokio::spawn(async move { metadata_registry.wait(&metadata_params).await });
-    await_registered_waiters(&registry, &created.id, &[&metadata_wait]).await;
-    registry
-        .set_metadata(
-            &created.id,
-            BTreeMap::from([("phase".to_owned(), Some("review".to_owned()))]),
+    probe
+        .at(
+            "the metadata waiter registering",
+            await_registered_waiters(&registry, &created.id, &[&metadata_wait]),
+        )
+        .await;
+    probe
+        .at(
+            "set_metadata",
+            registry.set_metadata(
+                &created.id,
+                BTreeMap::from([("phase".to_owned(), Some("review".to_owned()))]),
+            ),
         )
         .await
         .expect("update metadata");
-    let metadata = metadata_wait
+    let metadata = probe
+        .at("the metadata waiter", metadata_wait)
         .await
         .expect("metadata waiter task")
         .expect("metadata waiter result");
@@ -740,9 +895,15 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     );
     let timeout_registry = registry.clone();
     let timeout_wait = tokio::spawn(async move { timeout_registry.wait(&timeout_params).await });
-    await_registered_waiters(&registry, &created.id, &[&timeout_wait]).await;
+    probe
+        .at(
+            "the timeout waiter registering",
+            await_registered_waiters(&registry, &created.id, &[&timeout_wait]),
+        )
+        .await;
     tokio::time::advance(Duration::from_millis(u64::from(TIMEOUT_BUDGET_MS)) + TIMER_TICK).await;
-    let timeout = timeout_wait
+    let timeout = probe
+        .at("the timeout waiter", timeout_wait)
         .await
         .expect("timeout waiter task")
         .expect("timeout is a normal wait result");
@@ -771,14 +932,24 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     let runtime_params = wait_params(&created.id, Some(live_runtime), None, None, WAKE_BUDGET_MS);
     let runtime_registry = registry.clone();
     let runtime_wait = tokio::spawn(async move { runtime_registry.wait(&runtime_params).await });
-    await_registered_waiters(&registry, &created.id, &[&state_wait, &runtime_wait]).await;
-    registry.stop(&created.id).await.expect("stop session");
-    let state = state_wait
+    probe
+        .at(
+            "the state and runtime waiters registering",
+            await_registered_waiters(&registry, &created.id, &[&state_wait, &runtime_wait]),
+        )
+        .await;
+    probe
+        .at("stop", Box::pin(registry.stop(&created.id)))
+        .await
+        .expect("stop session");
+    let state = probe
+        .at("the state waiter", state_wait)
         .await
         .expect("state waiter task")
         .expect("state waiter result");
     assert_eq!(state.reason, SessionWaitReason::StateMatched);
-    let runtime = runtime_wait
+    let runtime = probe
+        .at("the runtime waiter", runtime_wait)
         .await
         .expect("runtime waiter task")
         .expect("runtime waiter result");

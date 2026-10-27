@@ -81,7 +81,9 @@ They build with `--all-features`, like CI's Linux test archive, so
 feature-gated tests (relay `postgres-tests`) run. CI's macOS lane and tier
 archives build default features, so under `--profile macos` the step builds
 default features too: a test that exists only behind a Cargo feature is not in
-the list and fails by name, because CI's macOS lane never builds it either.
+the list, because CI's macOS lane never builds it either. Without
+`--allow-missing-on-host` it fails by name; with the flag it is reported NOT
+STRESSED and belongs to the Linux run that builds it with `--all-features`.
 `--print` shows the selection without running anything. A test
 the script cannot map or list fails the step by name; a `macro_rules!` that
 generates tests fails by the macro's name (stress the whole partition then). A
