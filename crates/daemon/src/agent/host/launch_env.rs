@@ -334,10 +334,7 @@ impl DescriptorLaunchEnv {
             {
                 return Err(field("cannot name a secret-shaped variable"));
             }
-            if rest
-                .split(NAMESPACE_SEPARATOR)
-                .any(|word| location_shaped(word))
-            {
+            if rest.split(NAMESPACE_SEPARATOR).any(location_shaped) {
                 return Err(field("cannot name a location or identity variable"));
             }
             if value.len() > MAX_LAUNCH_ENV_VALUE_BYTES {
