@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 
-use super::watch::{RootRegistration, WatchBackend, WatchEvent};
+use super::watch::{RootRegistration, WalkBound, WatchBackend, WatchEvent};
 use super::{is_absent_error, is_jsonl_path, MAX_WALK_DIRECTORIES, MAX_WALK_ENTRIES};
 
 /// Cause reported when the inotify instance cannot be created.
@@ -78,10 +78,10 @@ pub(super) struct InotifyBackend {
     add_watch: AddWatch,
     /// Directory levels below a root its tree registers, for roots that bound
     /// the walk.
-    depth_limits: HashMap<PathBuf, u8>,
+    walk_bounds: HashMap<PathBuf, WalkBound>,
     /// The deepest-level directories of bounded roots (a session directory of
     /// a dated tree) that hold a watch, oldest first.
-    recent_deepest: VecDeque<PathBuf>,
+    recent_deepest: VecDeque<(PathBuf, PathBuf)>,
 }
 
 /// One directory entry as seen by the tree walk.
@@ -199,7 +199,7 @@ impl Failures {
     }
 }
 
-/// Most deepest-level directories of bounded roots that hold a watch.
+/// Most deepest-level directories of one dated root that hold a watch.
 ///
 /// A dated tree grows by a directory per session, so it would fill the
 /// backend-wide [`MAX_WALK_DIRECTORIES`] budget. The newest ones are watched, a
@@ -228,7 +228,7 @@ impl InotifyBackend {
             wd_by_path: HashMap::new(),
             lister: list_directory,
             add_watch: inotify_add_watch,
-            depth_limits: HashMap::new(),
+            walk_bounds: HashMap::new(),
             recent_deepest: VecDeque::new(),
         })
     }
@@ -279,7 +279,13 @@ impl InotifyBackend {
     ) -> RootRegistration {
         let mut failures = Failures::default();
         let mut budget = MAX_WALK_ENTRIES;
-        let (limit, start_depth) = self.depth_limit_of(root);
+        let (bound, start_depth) = self.bound_of(root);
+        let limit = bound.as_ref().map(|(_, bound)| bound.max_depth);
+        // The root of a dated tree, whose deepest directories share a bounded
+        // number of watches.
+        let share_root = bound
+            .filter(|(_, bound)| bound.dated)
+            .map(|(bound_root, _)| bound_root);
         if limit.is_some_and(|max| start_depth > max) {
             // Below the bound nothing is watched, so a directory that appears
             // there is neither registered nor walked.
@@ -294,12 +300,16 @@ impl InotifyBackend {
             }
             // Only a directory that is new, at the deepest level of a bounded
             // root, counts against the share of deepest-level watches.
-            let new_deepest =
-                limit == Some(depth) && depth > 0 && !self.wd_by_path.contains_key(&dir);
+            let new_deepest = share_root.is_some()
+                && limit == Some(depth)
+                && depth > 0
+                && !self.wd_by_path.contains_key(&dir);
             if new_deepest
                 && discovery.is_none()
-                && self.recent_deepest.len() + registered_deepest.len()
-                    >= MAX_WATCHED_DEEPEST_DIRECTORIES
+                && share_root.as_deref().is_some_and(|share_root| {
+                    self.watched_deepest(share_root) + registered_deepest.len()
+                        >= MAX_WATCHED_DEEPEST_DIRECTORIES
+                })
             {
                 // A pass over the whole tree keeps the newest session
                 // directories it met first; the rest wait for the reconcile.
@@ -307,9 +317,7 @@ impl InotifyBackend {
             }
             match self.add_dir(&dir) {
                 Ok(true) => {
-                    if new_deepest && discovery.is_some() {
-                        self.note_new_deepest(dir.clone());
-                    } else if new_deepest {
+                    if new_deepest {
                         registered_deepest.push(dir.clone());
                     }
                 }
@@ -338,7 +346,8 @@ impl InotifyBackend {
                 }
             }
             is_root = false;
-            let Some(entries) = self.list_for_walk(&dir, limit.is_some(), &mut failures) else {
+            let Some(entries) = self.list_for_walk(&dir, share_root.is_some(), &mut failures)
+            else {
                 continue;
             };
             let mut subdirectories = Vec::new();
@@ -363,7 +372,9 @@ impl InotifyBackend {
                     if limit.is_some_and(|max| depth >= max) {
                         continue;
                     }
-                    if queue.len() + self.wd_by_path.len() >= MAX_WALK_DIRECTORIES {
+                    if queue.len() + subdirectories.len() + self.wd_by_path.len()
+                        >= MAX_WALK_DIRECTORIES
+                    {
                         failures.record(limit_error("watched directory limit reached"));
                         break 'walk;
                     }
@@ -372,12 +383,19 @@ impl InotifyBackend {
                     found.note(entry.path);
                 }
             }
-            enqueue(&mut queue, subdirectories, depth, limit.is_some());
+            enqueue(&mut queue, subdirectories, depth, share_root.is_some());
         }
         // The first met are the newest, so they go in last: the oldest watch is
         // the first to be evicted.
-        self.recent_deepest
-            .extend(registered_deepest.into_iter().rev());
+        if let Some(share_root) = share_root {
+            self.recent_deepest.extend(
+                registered_deepest
+                    .into_iter()
+                    .rev()
+                    .map(|dir| (share_root.clone(), dir)),
+            );
+            self.evict_beyond_share(&share_root);
+        }
         match failures.first {
             Some(first_error) => RootRegistration::Partial {
                 failed_dirs: failures.directories,
@@ -407,12 +425,27 @@ impl InotifyBackend {
         }
     }
 
-    /// Records a newly watched deepest-level directory and evicts the oldest
-    /// watches beyond [`MAX_WATCHED_DEEPEST_DIRECTORIES`].
-    fn note_new_deepest(&mut self, dir: PathBuf) {
-        self.recent_deepest.push_back(dir);
-        while self.recent_deepest.len() > MAX_WATCHED_DEEPEST_DIRECTORIES {
-            let Some(oldest) = self.recent_deepest.pop_front() else {
+    /// How many deepest-level directories of the dated tree at `root` hold a
+    /// watch.
+    fn watched_deepest(&self, root: &Path) -> usize {
+        self.recent_deepest
+            .iter()
+            .filter(|(owner, _dir)| owner == root)
+            .count()
+    }
+
+    /// Drops the oldest watches of the dated tree at `root` beyond
+    /// [`MAX_WATCHED_DEEPEST_DIRECTORIES`].
+    fn evict_beyond_share(&mut self, root: &Path) {
+        while self.watched_deepest(root) > MAX_WATCHED_DEEPEST_DIRECTORIES {
+            let Some(position) = self
+                .recent_deepest
+                .iter()
+                .position(|(owner, _dir)| owner == root)
+            else {
+                break;
+            };
+            let Some((_owner, oldest)) = self.recent_deepest.remove(position) else {
                 break;
             };
             if let Some(wd) = self.wd_by_path.remove(&oldest) {
@@ -422,15 +455,15 @@ impl InotifyBackend {
         }
     }
 
-    /// The depth limit of the root that holds `dir`, and how many levels `dir`
-    /// lies below that root.
-    fn depth_limit_of(&self, dir: &Path) -> (Option<u8>, u8) {
-        self.depth_limits
+    /// The bound of the root that holds `dir` with that root's path, and how
+    /// many levels `dir` lies below it.
+    fn bound_of(&self, dir: &Path) -> (Option<(PathBuf, WalkBound)>, u8) {
+        self.walk_bounds
             .iter()
-            .find_map(|(root, limit)| {
+            .find_map(|(root, bound)| {
                 let below = dir.strip_prefix(root).ok()?;
                 let levels = u8::try_from(below.components().count()).unwrap_or(u8::MAX);
-                Some((Some(*limit), levels))
+                Some((Some((root.clone(), *bound)), levels))
             })
             .unwrap_or((None, 0))
     }
@@ -470,10 +503,10 @@ impl InotifyBackend {
 }
 
 impl WatchBackend for InotifyBackend {
-    fn limit_depth(&mut self, root: &Path, max_depth: Option<u8>) {
-        match max_depth {
-            Some(limit) => self.depth_limits.insert(root.to_path_buf(), limit),
-            None => self.depth_limits.remove(root),
+    fn bound_walk(&mut self, root: &Path, bound: Option<WalkBound>) {
+        match bound {
+            Some(bound) => self.walk_bounds.insert(root.to_path_buf(), bound),
+            None => self.walk_bounds.remove(root),
         };
     }
 

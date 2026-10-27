@@ -160,6 +160,14 @@ pub(crate) struct TranscriptRoot {
 const PRIVATE_PATH_LABEL: &str = "<profile config home>";
 
 impl TranscriptRoot {
+    /// The bound of the walk of this root, when its descriptor declares one.
+    fn walk_bound(&self) -> Option<watch::WalkBound> {
+        self.max_depth.map(|max_depth| watch::WalkBound {
+            max_depth,
+            dated: self.parser.is_dated_tree(),
+        })
+    }
+
     /// Whether `path` lies in a directory below this root's depth bound.
     fn is_beyond_depth(&self, path: &Path) -> bool {
         let Some(max) = self.max_depth else {
@@ -874,9 +882,9 @@ fn backend_not_open() -> io::Error {
 }
 
 impl WatchBackend for ReopenableBackend {
-    fn limit_depth(&mut self, root: &Path, max_depth: Option<u8>) {
+    fn bound_walk(&mut self, root: &Path, bound: Option<watch::WalkBound>) {
         if let Some(backend) = &mut self.inner {
-            backend.limit_depth(root, max_depth);
+            backend.bound_walk(root, bound);
         }
     }
 

@@ -616,8 +616,8 @@ async fn a_transcript_that_becomes_readable_is_indexed_without_a_content_change(
 }
 
 /// Session directories per day of the dated tree scenario: two days exceed the
-/// share of deepest-level watches.
-const SESSIONS_PER_DAY: usize = 1100;
+/// backend-wide directory budget, and one exceeds a root's share of watches.
+const SESSIONS_PER_DAY: usize = 4500;
 
 /// A session directory name below a dated day, ascending with `number`.
 fn session_name(number: usize) -> String {
@@ -653,11 +653,11 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
     let base = pohunek_test_support::tempdir().expect("base");
     let dated = base.path().join("muse/sessions");
     let other = base.path().join("claude");
-    // More session directories than the watcher registers: the newest day's
-    // are all registered, the oldest day's lowest names are left to the pass.
+    // More session directories than the backend-wide watch budget: the dated
+    // root keeps its share, so the root registered after it still gets its
+    // watches. The newest day is created first, so a walk in creation order or
+    // in reverse creation order would not meet it first by luck.
     let (old_day, new_day) = ("2026/09/01", "2026/10/09");
-    // The newest day is created first, so a walk in creation order or in
-    // reverse creation order would not reach it first by luck.
     for day in [new_day, old_day] {
         for number in 0..SESSIONS_PER_DAY {
             fs::create_dir_all(dated.join(day).join(session_name(number))).expect("session dir");
@@ -691,10 +691,15 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
                 .unwrap_or_else(|_elapsed| panic!("timed out waiting for {}", path.display()));
         }
     };
-    assert_eq!(
-        handle.state(),
-        TranscriptWatch::Active,
-        "the share is no failure"
+    // A store beyond the pass's directory bound is an incomplete pass; the
+    // watch budget is not exhausted, so no registration fails.
+    assert!(
+        !matches!(
+            handle.state(),
+            TranscriptWatch::Degraded(WatcherDegraded::RegistrationFailed)
+        ),
+        "{:?}",
+        handle.state()
     );
 
     // A log in the newest day's last session directory, one in a session
@@ -708,8 +713,9 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
     write_transcript(&claude, "claude-live");
     wait_for(claude, LIVE_EVENT_TIMEOUT).await;
 
-    // The oldest day's lowest session directory is reached by a pass.
-    let oldest = write_session_log(&dated, old_day, &session_name(0));
+    // The newest day's lowest session directory holds no watch (only the
+    // highest 1024 names do): a pass reaches it.
+    let oldest = write_session_log(&dated, new_day, &session_name(0));
     handle.request_reconcile();
     wait_for(oldest.clone(), STATE_TIMEOUT).await;
     assert!(indexed(&oldest));

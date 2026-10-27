@@ -214,6 +214,16 @@ pub(crate) enum RootScan {
     Incomplete,
 }
 
+/// How far the walk of a transcript root goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WalkBound {
+    /// Directory levels below the root that are registered.
+    pub(super) max_depth: u8,
+    /// Whether the tree is sharded by date, so its deepest directories are the
+    /// ones that multiply and only the newest hold a watch.
+    pub(super) dated: bool,
+}
+
 /// Platform file-watch backend.
 ///
 /// Implementations report hints only and never read transcript contents. The
@@ -224,11 +234,10 @@ pub(super) trait WatchBackend: Send + 'static {
     /// performs no I/O opts out.
     const OFFLOAD_REGISTRATION: bool = true;
 
-    /// Bounds the directories registered below `root` to `max_depth` levels, for
-    /// a backend that registers directory by directory. A backend that watches
-    /// a tree natively keeps the default; the scan and the change handling apply the
-    /// bound themselves.
-    fn limit_depth(&mut self, _root: &Path, _max_depth: Option<u8>) {}
+    /// Bounds the walk of `root` to `bound`, for a backend that registers
+    /// directory by directory. A backend that watches a tree natively keeps the
+    /// default; the scan and the change handling apply the bound themselves.
+    fn bound_walk(&mut self, _root: &Path, _bound: Option<WalkBound>) {}
 
     /// Registers `root` and everything below it. Registering an already covered
     /// root is a cheap no-op that only fills in missing directories.
@@ -793,11 +802,11 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
     /// shutdown interrupted the registration.
     async fn register(&mut self, index: usize) -> bool {
         let path = self.roots[index].path.clone();
-        let max_depth = self.roots[index].max_depth;
+        let bound = self.roots[index].walk_bound();
         let cancel = self.shutdown.clone();
         let Some(outcome) = self
             .offload(move |backend| {
-                backend.limit_depth(&path, max_depth);
+                backend.bound_walk(&path, bound);
                 backend.register_root(&path, &cancel)
             })
             .await

@@ -249,7 +249,8 @@ A log nested below a session (a subagent log), at another depth or in a
 directory that is not a UUID is not a session. The walk visits the highest
 directory names first, so a tree that outgrows the per-pass entry bound has its
 newest sessions indexed. On Linux the watcher keeps a live watch on every date
-directory and on the newest 1024 session directories, registered newest first;
+directory and on the newest 1024 session directories of each dated root,
+registered newest first;
 a new session directory evicts the oldest watch, and older sessions are reached
 by the periodic pass, so a large store never takes watches from other runtimes.
 A foreground agent started inside a shell session is
