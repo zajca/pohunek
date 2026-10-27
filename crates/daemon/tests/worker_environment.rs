@@ -33,7 +33,8 @@ use pohunek_worker_protocol::{
 
 /// Hang guard for every wait on the worker socket, the child's exit and the
 /// streams. The scenarios synchronize on readiness signals, never on this
-/// bound. Whether `await_pty_echo` can miss the echo is open in #1596.
+/// bound; `await_pty_echo` reads live `Output` frames from an observer that
+/// attached before the input existed.
 const DEADLINE: Duration = HANG_GUARD;
 /// Output page size; an environment listing fits in a few pages.
 const PAGE_BYTES: u32 = 16 * 1024;
@@ -597,6 +598,20 @@ async fn a_stalled_attach_write_keeps_its_stream_while_control_input_fails_with_
         .await
         .expect("initialize the gated child");
 
+    // The echo is observed on a second attach stream, as another client of
+    // the session sees it. The observer attaches before any input exists, so
+    // the echo is produced after its watermark and arrives as live `Output`
+    // frames. A stream holds the dimension ordering guard until it is
+    // dropped, and a later attach waits for that guard, so release it first.
+    let mut observer = worker
+        .open_attach(
+            StreamId::new(OBSERVER_STREAM_ID).expect("observer stream id"),
+            AttachStart { dimensions: None },
+        )
+        .await
+        .expect("open observer attach stream");
+    observer.dimension_update = None;
+
     let stream_id = StreamId::new(ATTACH_STREAM_ID).expect("stream id");
     let mut attach = worker
         .open_attach(stream_id.clone(), AttachStart { dimensions: None })
@@ -620,19 +635,6 @@ async fn a_stalled_attach_write_keeps_its_stream_while_control_input_fails_with_
     write_frame(&mut attach.stream, &attach_input)
         .await
         .expect("send attach input");
-
-    // The echo is observed on a second attach stream, as another client of
-    // the session sees it. The attach stream holds the dimension ordering
-    // guard until it is dropped, and a second attach waits for that guard, so
-    // release it first.
-    attach.dimension_update = None;
-    let mut observer = worker
-        .open_attach(
-            StreamId::new(OBSERVER_STREAM_ID).expect("observer stream id"),
-            AttachStart { dimensions: None },
-        )
-        .await
-        .expect("open observer attach stream");
 
     await_pty_echo(&mut observer, &[b'x'; OVERSIZED_LINE_BYTES]).await;
 
