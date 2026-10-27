@@ -66,6 +66,10 @@ pub(super) const HOOK_ENV_VARS: &[&str] = &[
     "POHUNEK_NATIVE_REFERENCE_KIND",
 ];
 
+/// Names beyond the reporter's own that the hook environment receives: `PATH`,
+/// so the reporter finds the `python3` the launch environment resolves.
+const INHERITED_VARS: &[&str] = &["PATH"];
+
 /// Why the overlay inputs cannot be used.
 #[derive(Debug, Error)]
 pub(super) enum Problem {
@@ -122,11 +126,13 @@ impl Inputs {
         env: &[(String, String)],
     ) -> Result<Self, Problem> {
         let mut inputs = Self::default();
+        // The last entry wins; an empty value means the variable is unset.
         let mut selected = env
             .iter()
             .rev()
-            .find(|(name, value)| name == MANAGED_PATH_ENV && !value.is_empty())
-            .map(|(_name, value)| value.clone());
+            .find(|(name, _value)| name == MANAGED_PATH_ENV)
+            .map(|(_name, value)| value.clone())
+            .filter(|value| !value.is_empty());
         if let Some(home) = config_home {
             let path = home.join(SETTINGS_FILE);
             if let Some(settings) =
@@ -248,7 +254,11 @@ fn read_object(
 
 /// The `-c` value that lists the reporter's variables and the user's own.
 pub(super) fn env_vars_arg(inputs: &Inputs) -> String {
-    let mut names: Vec<&str> = HOOK_ENV_VARS.to_vec();
+    let mut names: Vec<&str> = HOOK_ENV_VARS
+        .iter()
+        .chain(INHERITED_VARS)
+        .copied()
+        .collect();
     for name in &inputs.user_vars {
         if !names.contains(&name.as_str()) {
             names.push(name);

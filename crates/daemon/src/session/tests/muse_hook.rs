@@ -157,7 +157,6 @@ impl Rig {
         let host = muse_host(&program, &script, extra_args);
         let mut config = SessionRegistryConfig {
             shell_command: hermetic_shell(),
-            stop_grace: Duration::from_millis(50),
             store_path: Some(temp_store_path(tag)),
             ..SessionRegistryConfig::default()
         };
@@ -177,13 +176,13 @@ impl Rig {
         config.supervision = Some(crate::session::test_supervision(&runtime_root, &state_root));
         config.worker_runtime_root = Some(runtime_root.clone());
         config.worker_state_root = Some(state_root.clone());
-        let launcher: Arc<dyn crate::runtime::WorkerLauncher> = Arc::new(
+        let spawner: Arc<dyn crate::runtime::WorkerLauncher> = Arc::new(
             crate::runtime::InProcessWorkerLauncher::new(runtime_root, state_root.clone()),
         );
         let registry = SessionRegistry::new_with_runtimes_and_launcher(
             config,
             host,
-            launcher,
+            spawner,
             Arc::new(ReadableHost::new()),
         );
         let session = registry
@@ -279,7 +278,7 @@ impl Rig {
 
 /// Absolute path of the payload fixture `name`.
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    pohunek_test_support::manifest_dir()
         .join("src/integration/muse/fixtures")
         .join(format!("{name}.json"))
 }
@@ -377,6 +376,8 @@ async fn clear_rebinds_the_session_to_the_new_conversation() {
         .await;
 
     rig.wait_identity(CLEARED).await;
+    rig.fire("SessionStart", "session_start_resume", ROOT).await;
+    rig.wait_identity(ROOT).await;
     rig.finish().await;
     rig.remove().await;
 }
@@ -463,6 +464,10 @@ async fn create_and_every_resume_carry_the_overlay_env_and_the_variable_list_onc
     assert_eq!(launches.len(), 3, "create and two resumes: {log}");
     for line in &launches {
         assert_eq!(line.matches("managed_hooks_env_vars").count(), 1, "{line}");
+        assert!(
+            line.contains("\"PATH\""),
+            "the hook environment keeps PATH: {line}"
+        );
     }
     assert!(launches[1].ends_with(&format!("resume {ROOT}")));
     assert_eq!(
@@ -586,6 +591,37 @@ async fn the_profile_env_selected_managed_file_wins_over_the_settings_path() {
 }
 
 #[tokio::test]
+async fn an_empty_profile_value_leaves_the_settings_path_in_charge() {
+    let dir = temp_dir("muse-env-empty");
+    let from_settings = dir.join("settings-hooks.json");
+    fs::write(
+        &from_settings,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"settings-selected"}]}]}}"#,
+    )
+    .expect("settings file");
+    let settings = format!(
+        r#"{{"schema_version":1,"managed_hooks_path":{:?}}}"#,
+        from_settings.display().to_string()
+    );
+    let rig = Rig::with_profile_env(
+        "muse-env-empty",
+        Some(&settings),
+        ("TBH_MANAGED_HOOKS_PATH", Path::new("")),
+    )
+    .await
+    .expect("create the Muse session");
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&fs::read(rig.overlay_path()).expect("overlay")).expect("JSON");
+    assert_eq!(
+        parsed["hooks"]["Stop"][0]["hooks"][0]["command"], "settings-selected",
+        "an empty variable is unset, so Muse reads the settings path"
+    );
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
 async fn an_unresolvable_config_home_refuses_the_launch() {
     let error = Rig::with_profile_env(
         "muse-home-unresolved",
@@ -687,7 +723,7 @@ async fn install_status_and_uninstall_write_nothing_into_the_muse_home() {
 }
 
 #[tokio::test]
-async fn a_malformed_settings_file_is_reported_by_status_and_refuses_the_launch() {
+async fn a_malformed_settings_file_refuses_the_launch() {
     let error = Rig::new("muse-bad-settings", Some("{broken"), &[])
         .await
         .err()

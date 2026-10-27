@@ -376,7 +376,7 @@ async fn a_file_no_longer_contributed_is_removed_on_the_next_launch() {
 }
 
 #[tokio::test]
-async fn a_relaunch_served_by_a_different_definition_asks_that_definitions_contributor() {
+async fn a_relaunch_served_by_another_definition_does_not_ask_the_original_contributor() {
     let fixture = install_fixture();
     let mut rig = Rig::new("launch-input-unserved", true).await;
     stop_with_reference(&rig).await;

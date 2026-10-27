@@ -16,7 +16,10 @@
 
 set -eu
 
-# Muse clears the hook environment, which may leave no PATH to find python3 on.
+# Muse clears the hook environment; the launch lists PATH among the variables it
+# keeps, and the fallback below covers a Muse that passes none. A host whose
+# python3 is elsewhere (or a stub that is not a working interpreter) makes the
+# hook exit without a report.
 [ -n "${PATH:-}" ] || PATH=/usr/local/bin:/usr/bin:/bin
 export PATH
 

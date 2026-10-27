@@ -10,8 +10,17 @@
 //! `uninstall` only inspect and never write to the Muse config home.
 //!
 //! The handler is self-contained: removing Muse support deletes this module
-//! and its rows in the handler registry, the hook schema provider lists and the
-//! runtime feature table.
+//! and its rows in the handler registry, the hook schema provider lists and
+//! the `mod muse;` line and test accessor in the integration module, the
+//! `muse_hook` scenarios with their `mod` line in the session tests, the
+//! `thread_environment_variable` test helper and the handler count in the
+//! closed-set assertion of `handler_tests`. The
+//! `integration-muse-hook-v1` row of the append-only feature table stays: a
+//! descriptor that names `muse-hook-v1` is then refused because the build
+//! provides no such handler.
+//!
+//! `status` and `install` inspect the config home only, so a managed hooks
+//! file named by a profile `[env]` is read at launch, not by them.
 //!
 //! UNVERIFIED: the managed hooks file layout, the accepted `-c` spellings, the
 //! hook payload fields and the hook process ancestry are taken from the Muse
@@ -81,9 +90,11 @@ pub(super) static MUSE_HOOK: MuseHook = MuseHook;
 impl LaunchContributor for MuseHook {
     fn contribute(&self, ctx: &LaunchInputContext<'_>) -> Result<LaunchInput, ProtocolError> {
         overlay::refuse_conflicting_args(ctx.args)?;
-        let inputs = Inputs::read(ctx.config_home, ctx.env).map_err(overlay_unavailable)?;
+        let inputs = Inputs::read(ctx.config_home, ctx.env)
+            .map_err(|problem| overlay_unavailable(&problem))?;
         let reporter = ctx.file_path(REPORTER_FILE);
-        let hooks = overlay::build(&inputs, &reporter).map_err(overlay_unavailable)?;
+        let hooks =
+            overlay::build(&inputs, &reporter).map_err(|problem| overlay_unavailable(&problem))?;
         Ok(LaunchInput {
             env: vec![(
                 overlay::MANAGED_PATH_ENV.to_owned(),
@@ -113,7 +124,7 @@ pub(super) fn hook_env_vars() -> &'static [&'static str] {
 }
 
 /// `integration_overlay_unavailable` for `problem`.
-fn overlay_unavailable(problem: Problem) -> ProtocolError {
+fn overlay_unavailable(problem: &Problem) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         OVERLAY_UNAVAILABLE_CODE,
@@ -229,7 +240,7 @@ impl DaemonHandler for MuseHook {
                 Some("install Muse Code first".to_owned()),
             ));
         }
-        Inputs::read(Some(dir), &[]).map_err(overlay_unavailable)?;
+        Inputs::read(Some(dir), &[]).map_err(|problem| overlay_unavailable(&problem))?;
         Ok(Box::new(StagedMuse {
             manifest: AssetManifest {
                 version: ASSET_VERSION,

@@ -379,7 +379,7 @@ profile `[env]` entry or a variable the service environment allowlist passes, el
 `SessionStart`, `SubagentStart` and `SubagentStop`; a selected file that is
 unreadable, larger than 64 KiB or not a JSON object refuses the launch with
 `integration_overlay_unavailable`, because dropping it would drop policy hooks.
-The variable list is the names the reporter reads plus the user's own
+The variable list is the names the reporter reads, `PATH`, and the user's own
 `managed_hooks_env_vars`; a launch argument that contains the key name anywhere is refused
 with `integration_launch_arg_conflict`, because the accepted `-c` spellings are
 unverified; a Muse config home that does not resolve refuses the launch with
