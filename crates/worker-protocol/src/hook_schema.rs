@@ -391,17 +391,17 @@ impl HookSchema {
 /// Provider ids whose hooks may report identity inside any session that has
 /// an identity schema: the session's own runtime and the agents a session can
 /// host in the foreground.
-const HOOKED_PROVIDERS: &[&str] = &["shell", "codex", "claude", "hermes"];
+const HOOKED_PROVIDERS: &[&str] = &["shell", "codex", "claude", "hermes", "muse"];
 
 /// Provider ids whose hooks report provider-managed subagents.
-const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude"];
+const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude", "muse"];
 
 /// Subagent providers whose stop is admitted only after a recorded start.
 ///
 /// Claude Code fires `SubagentStop` without a preceding `SubagentStart` for its
 /// prompt-suggestion helper after every main-agent turn, which is not a
 /// subagent. Codex reports a resumed child with a stop alone, so it is absent.
-const STOP_REQUIRES_START_PROVIDERS: &[&str] = &["claude"];
+const STOP_REQUIRES_START_PROVIDERS: &[&str] = &["claude", "muse"];
 
 /// Provider ids whose hooks report prompt acceptance.
 const PROMPT_PROVIDERS: &[&str] = &["claude"];
@@ -447,7 +447,7 @@ const IDENTITY_V1: HookSchema = HookSchema {
 /// Identity, release, notification, and subagent lifecycle reports.
 const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
     id: "identity-subagent-v1",
-    handlers: &["codex-hook-v1", "claude-hook-v1"],
+    handlers: &["codex-hook-v1", "claude-hook-v1", "muse-hook-v1"],
     identity_providers: HOOKED_PROVIDERS,
     subagent_providers: SUBAGENT_PROVIDERS,
     prompt_providers: PROMPT_PROVIDERS,

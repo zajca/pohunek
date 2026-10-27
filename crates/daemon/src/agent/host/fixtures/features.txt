@@ -2,3 +2,4 @@ config-home-subdir-v1 0.38.0
 version-probe-revision-v1 0.38.0
 launch-env-v1 0.38.0
 transcripts-data-root-v1 0.38.0
+integration-muse-hook-v1 0.38.0

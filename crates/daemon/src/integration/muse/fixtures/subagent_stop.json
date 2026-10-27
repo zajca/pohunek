@@ -1,0 +1,13 @@
+{
+  "x_fixture": {
+    "status": "unverified",
+    "source": "Muse Code documentation (extending: hooks), MIT Muse Code SDK msp.schema.json HookEventName and CHANGELOG 1.4.x; field values are synthetic",
+    "muse_release": "1.4.13"
+  },
+  "hook_event_name": "SubagentStop",
+  "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+  "cwd": "/workspace",
+  "model": "muse-spark-1.2",
+  "subagent_id": "sub-1",
+  "child_session_id": "cccccccc-0000-4000-8000-000000000003"
+}

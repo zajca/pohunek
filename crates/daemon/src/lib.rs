@@ -234,6 +234,19 @@ pub(crate) mod test_support {
         THREAD_CONTRIBUTOR.with(std::cell::Cell::get)
     }
 
+    /// The value of `name` in the current test thread's hermetic environment.
+    pub(crate) fn thread_environment_variable(name: &str) -> Option<std::ffi::OsString> {
+        THREAD_ENV.with(|cell| {
+            cell.get_or_init(|| {
+                pohunek_test_support::env::TestEnv::new()
+                    .expect("create the thread-scoped test environment")
+            })
+            .environment()
+            .get(std::ffi::OsStr::new(name))
+            .cloned()
+        })
+    }
+
     /// The `HOME` of the current test thread's hermetic environment.
     pub(crate) fn thread_environment_home() -> std::path::PathBuf {
         THREAD_ENV.with(|cell| {

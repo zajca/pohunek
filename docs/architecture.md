@@ -1558,6 +1558,13 @@ applies it exactly once. A contribution outside the bounds is refused with
 `launch_input_invalid`, one that cannot be written with
 `launch_input_unavailable`; either refuses the launch before a worker starts.
 
+The Muse Code handler is the first user of this seam
+(`crates/daemon/src/integration/muse/`, removed with #1643): its contribution
+is a per-session managed hooks overlay plus the reporter script, in the state
+directory, never in the session `TMPDIR`, the worktree or the Muse config home
+(Muse hooks run outside Muse's sandbox, so a sandbox-writable overlay would be
+a sandbox escape). The reporter is stateless and reaches the worker only.
+
 Plugins live outside core. A new runtime package or workflow plugin is never
 added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,
 a third-party plugin in its author's account, and a plugin becomes installable
