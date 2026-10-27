@@ -226,7 +226,8 @@ pub(super) trait WatchBackend: Send + 'static {
 
     /// Bounds the directories registered below `root` to `max_depth` levels, for
     /// a backend that registers directory by directory. A backend that watches
-    /// a tree natively keeps the default; the scan applies the bound itself.
+    /// a tree natively keeps the default; the scan and the change handling apply the
+    /// bound themselves.
     fn limit_depth(&mut self, _root: &Path, _max_depth: Option<u8>) {}
 
     /// Registers `root` and everything below it. Registering an already covered

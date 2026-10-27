@@ -262,7 +262,7 @@ root_home = ".local/share"
 dir = "muse/sessions"
 dir_name = "{reference}"
 file_name = "session.jsonl"   # a plain name, no placeholder
-max_depth = 3                 # dir_name sits this many levels below dir
+max_depth = 3                 # levels the scan descends below dir (YYYY/MM/DD)
 ```
 
 Recovery refuses (`agent_native_reference_missing`) a reference without a

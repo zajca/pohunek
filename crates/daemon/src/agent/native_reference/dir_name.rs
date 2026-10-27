@@ -17,8 +17,9 @@
 //! ```
 //!
 //! `max_depth` is the number of levels the scan descends below `dir`: the
-//! directory named after the reference sits exactly that many levels down, and
-//! entries of shallower levels are only descended into, newest name first.
+//! directory named after the reference is an entry of the directory reached
+//! after that many levels (`dir/YYYY/MM/DD` for 3), and the entries of
+//! shallower levels are only descended into, newest name first.
 //!
 //! The declaration is descriptor-only. It is not an [`ExistenceSpec`], which is
 //! shared with the persisted assigned-reference snapshot, so the stored shape

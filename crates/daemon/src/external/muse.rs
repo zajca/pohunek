@@ -105,7 +105,7 @@ fn session_directory_id<'p>(root: &Path, path: &'p Path) -> Option<&'p str> {
         .into_iter()
         .zip(DATE_DIGITS)
         .all(|(name, digits)| name.len() == digits && name.bytes().all(|b| b.is_ascii_digit()));
-    (dated && file == SESSION_FILE && Uuid::parse_str(id).is_ok()).then_some(id)
+    (dated && file == SESSION_FILE && is_canonical_uuid(id)).then_some(id)
 }
 
 /// The first metadata record of `line`: the line itself when it is a bare
@@ -123,4 +123,10 @@ fn metadata_record(line: &Value) -> Option<Value> {
         .filter_map(|child| child.get("record_json")?.as_str())
         .filter_map(|json| serde_json::from_str::<Value>(json).ok())
         .find(is_metadata)
+}
+
+/// Whether `id` is a UUID in its lower-case hyphenated form, the only spelling
+/// a session directory has.
+fn is_canonical_uuid(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
 }

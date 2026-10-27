@@ -531,6 +531,36 @@ mod tests {
     };
     use crate::external::watch::{RootRegistration, WatchBackend};
 
+    #[tokio::test]
+    async fn registration_stops_below_the_depth_bound() {
+        let root = pohunek_test_support::tempdir().expect("root");
+        fs::create_dir_all(root.path().join("a/b/c")).expect("tree");
+        let mut backend = InotifyBackend::open().expect("open inotify");
+        backend.limit_depth(root.path(), Some(2));
+
+        let outcome = backend.register_root(root.path(), &CancellationToken::new());
+
+        assert!(matches!(outcome, RootRegistration::Complete));
+        let mut watched: Vec<_> = backend.wd_by_path.keys().cloned().collect();
+        watched.sort();
+        assert_eq!(
+            watched,
+            [
+                root.path().to_path_buf(),
+                root.path().join("a"),
+                root.path().join("a/b"),
+            ]
+        );
+        // A directory that appears below the bound is not registered.
+        let mut hints = Vec::new();
+        backend.watch_new_directory(
+            &root.path().join("a/b/c"),
+            &mut hints,
+            &CancellationToken::new(),
+        );
+        assert!(!backend.wd_by_path.contains_key(&root.path().join("a/b/c")));
+    }
+
     fn event(wd: libc::c_int, mask: u32, name: Option<&str>) -> InotifyEvent {
         InotifyEvent {
             wd,

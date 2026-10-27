@@ -160,6 +160,15 @@ pub(crate) struct TranscriptRoot {
 const PRIVATE_PATH_LABEL: &str = "<profile config home>";
 
 impl TranscriptRoot {
+    /// Whether `path` lies in a directory below this root's depth bound.
+    fn is_beyond_depth(&self, path: &Path) -> bool {
+        let Some(max) = self.max_depth else {
+            return false;
+        };
+        path.strip_prefix(&self.path)
+            .is_ok_and(|relative| relative.components().count() > usize::from(max) + 1)
+    }
+
     /// The root's path as a log line may show it.
     fn log_path(&self) -> String {
         self.log_path_of(&self.path)
@@ -531,12 +540,15 @@ impl TranscriptIndex {
     /// meanwhile is kept.
     pub(crate) fn upsert_path(&self, owner: &TranscriptRoot, path: &Path) -> io::Result<bool> {
         let gone = transcript_is_gone(path);
-        let signature = if gone {
+        // A change event beyond the root's depth bound (a backend that watches
+        // the whole tree reports one) indexes nothing.
+        let ignored = gone || owner.is_beyond_depth(path);
+        let signature = if ignored {
             None
         } else {
             FileSignature::read(path)
         };
-        let candidate = if gone {
+        let candidate = if ignored {
             None
         } else {
             #[cfg(test)]
@@ -1784,6 +1796,26 @@ mod scan_tests {
 
         assert!(levels[..3].iter().all(|path| indexed(&index, path)));
         assert!(!indexed(&index, &levels[3]), "below the bound");
+    }
+
+    #[test]
+    fn a_change_beyond_the_depth_bound_indexes_nothing() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        let within = dir.path().join("a/one.jsonl");
+        let beyond = dir.path().join("a/b/two.jsonl");
+        write_transcript(&within, "within");
+        write_transcript(&beyond, "beyond");
+        let index = TranscriptIndex::default();
+        let bounded = TranscriptRoot {
+            max_depth: Some(1),
+            ..root(dir.path())
+        };
+
+        index.upsert_path(&bounded, &within).expect("within");
+        index.upsert_path(&bounded, &beyond).expect("beyond");
+
+        assert!(indexed(&index, &within));
+        assert!(!indexed(&index, &beyond));
     }
 
     #[test]

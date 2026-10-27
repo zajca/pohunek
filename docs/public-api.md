@@ -1119,7 +1119,8 @@ A hook runtime whose conversation is `<reference>/<file_name>` below a
 date-sharded tree declares `dir_name = "{reference}"` in
 `[native_reference.existence]` (same feature) next to `check = "file"`,
 `root_env`/`root_home`, `dir`, a plain `file_name` and `max_depth`, the number
-of levels below `dir` at which the named directory sits. It is accepted only
+of levels the scan descends below `dir`; the named directory is an entry of
+the directory reached after that many levels (`dir/YYYY/MM/DD` for 3). It is accepted only
 with `strategy = "hook"` and an id-kind reference and without `name_match`,
 `store_env`, `store_max_depth` or `relocating_*`. Recovery returns
 `agent_native_reference_missing` when no regular `<reference>/<file_name>`

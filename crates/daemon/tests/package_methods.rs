@@ -816,6 +816,10 @@ fn invalid_data_root_tables(plain: &str) -> Vec<(&'static str, String)> {
         ("absolute-home", plain.replace(".local/share", "/srv/share")),
         ("parent-home", plain.replace(".local/share", "../share")),
         (
+            "dir-too-deep",
+            plain.replace("acme/sessions", &["a"; 9].join("/")),
+        ),
+        (
             "depth-zero",
             data_root_transcripts("jsonl-head-v1", "max_depth = 0\n"),
         ),
@@ -975,6 +979,16 @@ async fn a_directory_name_existence_installs_only_for_a_hook_runtime_with_its_fe
             with(&format!(
                 "{DIR_NAME_EXISTENCE}\nrelocating_args = [\"--store\"]"
             )),
+        ),
+        (
+            "relocating-settings",
+            with(&format!(
+                "{DIR_NAME_EXISTENCE}\nrelocating_settings = [{{ base = \"root\", path = \"s.json\", key = \"k\" }}]"
+            )),
+        ),
+        (
+            "store-depth-only",
+            with(&format!("{DIR_NAME_EXISTENCE}\nstore_max_depth = 1")),
         ),
         (
             "placeholder-file",

@@ -1306,6 +1306,14 @@ async fn a_log_outside_the_session_shape_or_with_a_foreign_id_is_no_session() {
         format!("x/y/z/{good}/session.jsonl"),
         format!("2026/10/08/{good}/session.json"),
         format!("26/10/08/{good}/session.jsonl"),
+        format!(
+            "2026/10/08/{}/session.jsonl",
+            "ABCDEF12-3456-4789-8ABC-DEF012345678"
+        ),
+        format!(
+            "2026/10/08/{}/session.jsonl",
+            "abcdef12345647898abcdef012345678"
+        ),
     ]
     .iter()
     .enumerate()
