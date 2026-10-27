@@ -43,8 +43,8 @@ impl SessionRegistry {
     /// Composes the environment of a launch of `id`.
     ///
     /// The runtime definition's `[launch_env]` pairs come first, then the
-    /// session's private `TMPDIR`, then `profile_env`, then the daemon
-    /// handshake env: a profile entry replaces a descriptor pair of the same
+    /// session's private `TMPDIR`, then `profile_env`, then the contributed
+    /// launch-input pairs, then the daemon handshake env: a profile entry replaces a descriptor pair of the same
     /// name and a profile `TMPDIR` replaces the private one, and every
     /// reserved `POHUNEK_*` key takes the daemon's value (the loader also
     /// strips `POHUNEK_*` from the profile env, and a descriptor cannot name
@@ -53,6 +53,20 @@ impl SessionRegistry {
         &self,
         definition: &RuntimeDefinition,
         profile_env: &[(String, String)],
+        agent: RuntimeRef,
+        id: &SessionId,
+    ) -> LaunchEnv {
+        self.launch_env_with(definition, profile_env, &[], agent, id)
+    }
+
+    /// [`Self::launch_env`] with the `contributed` pairs of the runtime's
+    /// launch-input contributor between the profile `[env]` and the daemon
+    /// handshake.
+    pub(super) fn launch_env_with(
+        &self,
+        definition: &RuntimeDefinition,
+        profile_env: &[(String, String)],
+        contributed: &[(String, String)],
         agent: RuntimeRef,
         id: &SessionId,
     ) -> LaunchEnv {
@@ -70,6 +84,7 @@ impl SessionRegistry {
             env.extend([(TMPDIR.to_owned(), private)]);
         }
         env.extend(profile_env.iter().cloned());
+        env.extend(contributed.iter().cloned());
         env.extend(self.session_pty_env(agent, id));
         env
     }

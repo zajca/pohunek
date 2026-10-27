@@ -50,6 +50,7 @@ use crate::external::{
     external_session_id, ExternalSessionChange, ExternalSessions, TranscriptCandidate,
     TranscriptIndex, EXTERNAL_TERMINAL_COLS, EXTERNAL_TERMINAL_ROWS,
 };
+use crate::integration::launch_input::LaunchKind;
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
@@ -83,6 +84,7 @@ mod hooks;
 mod input;
 mod journal_gc;
 mod lag;
+mod launch_input;
 mod native_attestation;
 mod native_repair;
 mod observation;
@@ -4122,7 +4124,7 @@ impl SessionRegistry {
             .profile
             .as_ref()
             .and_then(|profile| profile.manifest.clone());
-        let env_extra = self.launch_env(
+        let inputs = self.launch_inputs(
             &resolved.definition,
             resolved
                 .profile
@@ -4130,18 +4132,21 @@ impl SessionRegistry {
                 .map_or(&[][..], |profile| profile.env.as_slice()),
             base.clone(),
             id,
-        );
+            LaunchKind::Create,
+            &snapshot.args,
+        )?;
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),
             cols: params.cols,
             rows: params.rows,
-            env_extra,
+            env_extra: inputs.env,
             validated_program,
         };
         let plan = build_launch_command(
             resolved,
             self.inner.profiles.runtimes(),
             &opts,
+            &inputs.root_args,
             assigned
                 .as_ref()
                 .map_or(&[][..], |(_, argv)| argv.as_slice()),

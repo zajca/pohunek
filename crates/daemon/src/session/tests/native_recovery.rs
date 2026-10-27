@@ -29,7 +29,7 @@ impl RuntimeSource for CodexSource {
 }
 
 /// Builds a Codex hook runtime whose executable is selected by this test.
-fn codex_host(program: &std::path::Path, script: &std::path::Path) -> RuntimeHost {
+pub(super) fn codex_host(program: &std::path::Path, script: &std::path::Path) -> RuntimeHost {
     let document = format!(
         r#"schema = 1
 id = "pohunek.runtime.codex"
@@ -85,20 +85,20 @@ default = ".codex"
 }
 
 /// A launch backed by a real worker, official-shaped Codex hook and store.
-struct Rig {
-    registry: SessionRegistry,
+pub(super) struct Rig {
+    pub(super) registry: SessionRegistry,
     host: RuntimeHost,
     launcher: Arc<dyn crate::runtime::WorkerLauncher>,
-    config: SessionRegistryConfig,
-    session: SessionInfo,
+    pub(super) config: SessionRegistryConfig,
+    pub(super) session: SessionInfo,
     commands: fs::File,
     ack: PathBuf,
-    launches: PathBuf,
+    pub(super) launches: PathBuf,
     store_path: PathBuf,
 }
 
 impl Rig {
-    async fn new(tag: &str, verified_launch: bool) -> Self {
+    pub(super) async fn new(tag: &str, verified_launch: bool) -> Self {
         let dir = temp_dir(tag);
         let commands_path = dir.join("commands.fifo");
         let commands = hook_gate(&commands_path);
@@ -111,6 +111,7 @@ impl Rig {
             &format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$*\" >> '{launches}'\n\
+                 printf 'env=%s\\n' \"${{TEST_LAUNCH_INPUT:-}}\" >> '{launches}'\n\
                  while read -r command reference < '{commands_path}'; do\n\
                    case \"$command\" in\n\
                      report) printf '{{\"session_id\":\"%s\"}}' \"$reference\" | sh '{adapter}' session; printf '%s\\n' \"$reference\" >> '{ack}' ;;\n\
@@ -189,7 +190,7 @@ impl Rig {
         )
     }
 
-    async fn report(&self, reference: &str) -> pohunek_worker_protocol::InspectSnapshot {
+    pub(super) async fn report(&self, reference: &str) -> pohunek_worker_protocol::InspectSnapshot {
         let mut writer = &self.commands;
         writer
             .write_all(format!("report {reference}\n").as_bytes())
@@ -211,7 +212,7 @@ impl Rig {
         .await
     }
 
-    async fn settle(&self, snapshot: &pohunek_worker_protocol::InspectSnapshot) {
+    pub(super) async fn settle(&self, snapshot: &pohunek_worker_protocol::InspectSnapshot) {
         let outcome = wait_until("daemon to settle Codex worker identity", || async {
             match Box::pin(
                 self.registry
@@ -227,7 +228,7 @@ impl Rig {
         assert_eq!(outcome, WorkerMetadataApplyOutcome::Applied);
     }
 
-    fn durable_record(&self) -> crate::store::SessionRecord {
+    pub(super) fn durable_record(&self) -> crate::store::SessionRecord {
         crate::store::Store::new(self.store_path.clone())
             .load_sessions()
             .expect("load session store")
@@ -316,7 +317,7 @@ impl Rig {
     /// outcome, which the stop leaves to a background transaction: the worker
     /// rewrites its journal and the daemon retires the generation. A caller
     /// that corrupts or reads the journal first races that rewrite.
-    async fn finish(&self) {
+    pub(super) async fn finish(&self) {
         self.registry
             .stop(&self.session.id)
             .await
@@ -324,7 +325,7 @@ impl Rig {
         self.registry.settle_transactions().await;
     }
 
-    async fn remove(&self) {
+    pub(super) async fn remove(&self) {
         self.registry
             .remove(&self.session.id)
             .await

@@ -20,6 +20,7 @@ use crate::agent::{
     ReferenceCheckFailure, ReferenceExistence, StoreRoot,
 };
 use crate::detect::Manifest;
+use crate::integration::launch_input::LaunchKind;
 use crate::runtime::environment::{base_environment, effective_variable};
 use package::PackageDigest;
 use pohunek_worker_protocol::BaseEnv;
@@ -840,18 +841,24 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let env_extra =
-            self.launch_env(&relaunch.definition, &env, binding.agent_base.clone(), &id);
+        let inputs = self.launch_inputs(
+            &relaunch.definition,
+            &env,
+            binding.agent_base.clone(),
+            &id,
+            LaunchKind::Fork,
+            &binding.args,
+        )?;
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: params.cols,
             rows: params.rows,
-            env_extra,
+            env_extra: inputs.env,
             validated_program,
         };
         let (command, fork_reference) = fork_pty_command_from_launch(
             &program,
-            binding.args.clone(),
+            command_args(&binding.args, &inputs.root_args),
             &launch,
             &session_ref,
             &opts,
@@ -1213,18 +1220,24 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let env_extra =
-            self.launch_env(&relaunch.definition, &env, binding.agent_base.clone(), &id);
+        let inputs = self.launch_inputs(
+            &relaunch.definition,
+            &env,
+            binding.agent_base.clone(),
+            &id,
+            LaunchKind::Resume,
+            &binding.args,
+        )?;
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
             rows: binding.rows,
-            env_extra,
+            env_extra: inputs.env,
             validated_program,
         };
         let command = resume_pty_command_from_launch(
             &program,
-            binding.args.clone(),
+            command_args(&binding.args, &inputs.root_args),
             &launch,
             &session_ref,
             &opts,
@@ -1990,4 +2003,10 @@ fn join_error_to_io<T>(err: tokio::task::JoinError) -> io::Result<T> {
     Err(io::Error::other(format!(
         "blocking store task failed: {err}"
     )))
+}
+
+/// The frozen arguments of a relaunch followed by the launch-input arguments,
+/// for the command only: the snapshot keeps the frozen arguments alone.
+fn command_args(frozen: &[String], root_args: &[String]) -> Vec<String> {
+    frozen.iter().chain(root_args).cloned().collect()
 }

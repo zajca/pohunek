@@ -72,7 +72,9 @@ fn is_journal_file(name: &str) -> bool {
 
 /// Whether `name` is a file a journal directory may hold.
 fn is_journal_directory_name(name: &str) -> bool {
-    is_journal_file(name) || pohunek_paths::parse_journal_temp_name(name).is_some()
+    is_journal_file(name)
+        || pohunek_paths::parse_journal_temp_name(name).is_some()
+        || pohunek_paths::is_launch_input_entry(name)
 }
 
 /// Deletes the journal directory of `session_id` below `state_root`.

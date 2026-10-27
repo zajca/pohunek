@@ -59,6 +59,7 @@ use super::{
 
 mod conflict_cleanup;
 mod data_root_recovery;
+mod launch_input;
 mod lifecycle_queue;
 mod native_recovery;
 mod native_supersede;

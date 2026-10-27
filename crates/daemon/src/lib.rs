@@ -206,6 +206,29 @@ pub(crate) mod test_support {
         THREAD_PATH_PREFIX.with(|prefix| prefix.borrow_mut().insert(0, directory.to_path_buf()));
     }
 
+    std::thread_local! {
+        /// The launch-input contributor every runtime launched on the current
+        /// test thread uses.
+        static THREAD_CONTRIBUTOR: std::cell::Cell<
+            Option<&'static dyn crate::integration::launch_input::LaunchContributor>,
+        > = const { std::cell::Cell::new(None) };
+    }
+
+    /// Makes `contributor` the launch-input contributor of every runtime
+    /// launched on this test thread. Call it before the registry under test is
+    /// built.
+    pub(crate) fn set_thread_launch_contributor(
+        contributor: &'static dyn crate::integration::launch_input::LaunchContributor,
+    ) {
+        THREAD_CONTRIBUTOR.with(|cell| cell.set(Some(contributor)));
+    }
+
+    /// The contributor of [`set_thread_launch_contributor`], if this thread set one.
+    pub(crate) fn thread_launch_contributor(
+    ) -> Option<&'static dyn crate::integration::launch_input::LaunchContributor> {
+        THREAD_CONTRIBUTOR.with(std::cell::Cell::get)
+    }
+
     /// The `HOME` of the current test thread's hermetic environment.
     pub(crate) fn thread_environment_home() -> std::path::PathBuf {
         THREAD_ENV.with(|cell| {
