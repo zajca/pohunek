@@ -44,11 +44,20 @@ variants, `#[path]` inside an inline module) fails the run and names the test.
 Every selected test is then checked against `cargo nextest list` for the
 profile, which also builds the test binaries before the pinned run starts: a
 test missing from the list (compiled out on this host, for example a macOS
-`cfg`; `--allow-missing-on-host` names it as NOT STRESSED and stresses the rest)
+`cfg`; `--allow-missing-on-host` names it as NOT STRESSED and stresses the rest,
+but only when a non-`test` `cfg` on the test's declaring chain can have
+compiled it out: its own attributes, enclosing inline modules, the file's
+`#![cfg]` and the `mod x;` declarations above it)
 or excluded by the profile's filter fails by name, and an `#[ignore]`d
 test is reported as skipped because nextest does not run it. Both cargo
-invocations use `--all-features`, as CI's test archive does, and are limited
-to the packages of the selected tests (`-p`). The
+invocations are limited to the packages of the selected tests (`-p`), and the
+run reuses the list's `-p` set unchanged, so the run does not rebuild with a
+different feature unification inside the stress deadline. They build with
+`--all-features`, as CI's Linux test archive does, except under the `macos`
+profile: CI's macOS lane and tier archives build default features, so the
+step builds default features there too, and a test gated behind a Cargo
+feature is then absent from the list and fails by name instead of running a
+binary CI never builds. The
 stress run is `scripts/stress-run --cpus 4 -- cargo nextest run --stress-count
 N ...`.
 
@@ -79,9 +88,11 @@ STRESS_CPUS = 4
 # exact-name filter cannot select, so they fail the run by name.
 TEST_ATTRIBUTE = "test"
 VARIANT_ATTRIBUTES = ("rstest", "test_case", "bench")
-# CI builds every test lane from one `--all-features` archive, so feature-gated
-# tests (for example relay `postgres-tests`) exist only with it.
-BUILD_FLAGS = ("--all-features",)
+# CI's Linux test archive builds with `--all-features`, so feature-gated tests
+# (for example relay `postgres-tests`) exist only with it. The macOS lane and
+# tier archives build default features, so the profiles below do the same.
+ALL_FEATURES_FLAGS = ("--all-features",)
+DEFAULT_FEATURE_PROFILES = ("macos",)
 STRESS_RUN = Path(__file__).resolve().parent / "stress-run"
 EXIT_UNMAPPED = 1
 EXIT_USAGE = 2
@@ -95,13 +106,92 @@ QUALIFIERS = {"pub", "async", "unsafe", "const", "extern", "default"}
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
-# Files whose text mentions a `cfg`; a test missing from the nextest list is
-# accepted as "not built on this host" only for these files.
-CFG_GATED = set()
+# `(binary id, test name)` of selected tests whose declaring chain carries a
+# non-`test` `cfg`; a test missing from the nextest list is accepted as "not
+# built on this host" only for these.
+HOST_DEPENDENT = set()
 
 
 class SelectionError(Exception):
     """A changed test cannot be selected exactly."""
+
+
+def build_flags(profile):
+    """Cargo feature flags matching the CI archive that builds `profile`'s tests."""
+    return () if profile in DEFAULT_FEATURE_PROFILES else ALL_FEATURES_FLAGS
+
+
+CFG_TOKEN = re.compile(r'\s*(r#[A-Za-z_]\w*|[A-Za-z_]\w*|"(?:[^"\\]|\\.)*"|[(),=])')
+
+
+def parse_cfg_predicate(text):
+    """`(name, args)` of a `cfg(...)` predicate; a bare option is `(name, None)`.
+
+    Returns None when `text` is not a well-formed predicate.
+    """
+    tokens = []
+    position = 0
+    text = text.strip()
+    while position < len(text):
+        match = CFG_TOKEN.match(text, position)
+        if not match:
+            return None
+        tokens.append(match.group(1))
+        position = match.end()
+    cursor = 0
+
+    def predicate():
+        nonlocal cursor
+        if cursor >= len(tokens) or not re.match(r"(?:r#)?[A-Za-z_]", tokens[cursor]):
+            return None
+        name = tokens[cursor]
+        cursor += 1
+        if cursor < len(tokens) and tokens[cursor] == "(":
+            cursor += 1
+            args = []
+            while cursor < len(tokens) and tokens[cursor] != ")":
+                inner = predicate()
+                if inner is None:
+                    return None
+                args.append(inner)
+                if cursor < len(tokens) and tokens[cursor] == ",":
+                    cursor += 1
+            if cursor >= len(tokens):
+                return None
+            cursor += 1
+            return (name, args)
+        if cursor < len(tokens) and tokens[cursor] == "=":
+            cursor += 1
+            if cursor >= len(tokens) or not tokens[cursor].startswith('"'):
+                return None
+            cursor += 1
+            return (name + "=", None)
+        return (name, None)
+
+    parsed = predicate()
+    return parsed if parsed is not None and cursor == len(tokens) else None
+
+
+def test_only(predicate):
+    """True when `predicate` only ever adds the `test` option: `test`, `all(test, ..)`."""
+    if predicate is None:
+        return False
+    name, args = predicate
+    if args is None:
+        return name == "test"
+    return name == "all" and bool(args) and all(test_only(arg) for arg in args)
+
+
+def host_dependent_cfg(attribute_body):
+    """True when a `cfg(<predicate>)` attribute body may compile code out on some host.
+
+    `cfg(test)` and `cfg(all(test, ..))` do not: every test build sets `test`.
+    Anything else (an OS or feature predicate, `any(..)`, `not(..)`, an
+    unparsable predicate) counts, because the script cannot prove the code is
+    built everywhere.
+    """
+    match = re.match(r"\s*cfg\s*\((.*)\)\s*$", attribute_body, re.DOTALL)
+    return not (match and test_only(parse_cfg_predicate(match.group(1))))
 
 
 def blank_literals(text):
@@ -197,13 +287,20 @@ def matching_back(text, end, opener, closer):
 class Item:
     """A function with its attributes, range (1-based lines) and module chain."""
 
-    def __init__(self, name, attrs, first_line, last_line, mods, nested):
+    def __init__(self, name, attrs, first_line, last_line, mods, nested, mod_cfgs=()):
         self.name = name
         self.attrs = attrs
         self.first_line = first_line
         self.last_line = last_line
         self.mods = mods
         self.nested = nested
+        self.mod_cfgs = tuple(mod_cfgs)  # `cfg` bodies of the enclosing inline modules
+
+    @property
+    def host_dependent(self):
+        """True when a non-`test` `cfg` on the item or an enclosing inline module gates it."""
+        return any(host_dependent_cfg(body) for body in self.mod_cfgs) or any(
+            a["last"] == "cfg" and host_dependent_cfg(a["body"]) for a in self.attrs)
 
     @property
     def is_test(self):
@@ -230,7 +327,10 @@ class Module:
         for match in re.finditer("\n", text):
             self.line_starts.append(match.end())
         self.items = []
-        self.declarations = []  # (name, inline mod chain, path attr or None)
+        # (name, inline mod chain, path attr or None, nested in a block, cfg bodies
+        # on the declaration and on the inline modules around it)
+        self.declarations = []
+        self.file_cfgs = []  # bodies of the file's inner `#![cfg(..)]` attributes
         if scan:
             self.scan()
 
@@ -322,7 +422,8 @@ class Module:
         skeleton = self.skeleton
         fn_positions = [m for m in FN_PATTERN.finditer(skeleton)]
         decl_positions = {m.start(): m for m in MOD_DECLARATION.finditer(skeleton)}
-        stack = []  # entries: ("mod", name) or ("block", None)
+        stack = []  # entries: ("mod", name, cfg bodies) or ("block", None, ())
+        self.file_cfgs = self.inner_cfgs()
         fn_index = 0
         i = 0
         length = len(skeleton)
@@ -338,13 +439,23 @@ class Module:
                     if attr["last"] == "path":
                         literal = re.search(r'"([^"]*)"', attr["body"])
                         path_attr = literal.group(1) if literal else ""
-                chain = tuple(name for kind, name in stack if kind == "mod")
-                nested_in_block = any(kind == "block" for kind, _ in stack)
-                self.declarations.append((match.group(1), chain, path_attr, nested_in_block))
+                chain = tuple(name for kind, name, _ in stack if kind == "mod")
+                nested_in_block = any(kind == "block" for kind, _, _ in stack)
+                cfgs = [body for _, _, bodies in stack for body in bodies]
+                cfgs += [a["body"] for a in attrs if a["last"] == "cfg"]
+                self.declarations.append(
+                    (match.group(1), chain, path_attr, nested_in_block, tuple(cfgs)))
             char = skeleton[i]
             if char == "{":
-                tail = MOD_BLOCK_TAIL.search(skeleton[max(0, i - 200):i])
-                stack.append(("mod", tail.group(1)) if tail else ("block", None))
+                window = max(0, i - 200)
+                tail = MOD_BLOCK_TAIL.search(skeleton[window:i])
+                if tail:
+                    keyword = window + tail.start() + tail.group(0).index("mod")
+                    mod_attrs, _ = self.attributes_before(self.skip_qualifiers(keyword))
+                    stack.append(("mod", tail.group(1),
+                                  tuple(a["body"] for a in mod_attrs if a["last"] == "cfg")))
+                else:
+                    stack.append(("block", None, ()))
             elif char == "}" and stack:
                 stack.pop()
             i += 1
@@ -379,9 +490,25 @@ class Module:
         lines = self.text.split("\n")
         while first_line > 1 and lines[first_line - 2].lstrip().startswith("//"):
             first_line -= 1
-        mods = tuple(name for kind, name in stack if kind == "mod")
-        nested = any(kind == "block" for kind, _ in stack)
-        self.items.append(Item(name, attrs, first_line, self.line_of(end), mods, nested))
+        mods = tuple(name for kind, name, _ in stack if kind == "mod")
+        nested = any(kind == "block" for kind, _, _ in stack)
+        mod_cfgs = [body for _, _, bodies in stack for body in bodies]
+        self.items.append(
+            Item(name, attrs, first_line, self.line_of(end), mods, nested, mod_cfgs))
+
+    def inner_cfgs(self):
+        """Bodies of the `#![cfg(..)]` attributes before the file's first item."""
+        found = []
+        for match in re.finditer(r"#\s*!\s*\[", self.skeleton):
+            if re.search(r"[{;]", self.skeleton[:match.start()]):
+                break
+            end = matching(self.skeleton, match.end() - 1, "[", "]")
+            if end == -1:
+                break
+            body = self.text[match.end():end]
+            if re.match(r"\s*cfg\b", body):
+                found.append(body)
+        return found
 
 
 def run(argv, cwd, check=True):
@@ -393,9 +520,35 @@ def run(argv, cwd, check=True):
     return result
 
 
+def strip_line_comment(line):
+    """`line` without a trailing `//` comment; a `//` inside a string literal stays."""
+    i = 0
+    while i < len(line):
+        raw = re.match(r'r(#*)"', line[i:]) if line[i] == "r" and (
+            i == 0 or not (line[i - 1].isalnum() or line[i - 1] == "_")) else None
+        if raw:
+            closing = '"' + raw.group(1)
+            end = line.find(closing, i + raw.end())
+            i = len(line) if end == -1 else end + len(closing)
+        elif line[i] == '"':
+            i += 1
+            while i < len(line) and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+            i += 1
+        elif line.startswith("//", i):
+            return line[:i]
+        else:
+            i += 1
+    return line
+
+
 def only_attributes_and_comments(lines):
-    """True when the removed `lines` are whole attributes and comment lines."""
-    code = "\n".join(l for l in lines if not l.lstrip().startswith("//")).strip()
+    """True when the removed `lines` are whole attributes and comment lines.
+
+    An attribute line may end in a `//` comment.
+    """
+    code = "\n".join(strip_line_comment(l) for l in lines
+                     if not l.lstrip().startswith("//")).strip()
     if not code:
         return bool(lines)
     # Every top-level item must be an attribute with balanced brackets.
@@ -510,31 +663,42 @@ def load_targets(root):
 
 
 class ModuleTree:
-    """File to `(target, module path)` placements for every target."""
+    """File to `(target, module path)` placements for every target.
+
+    `host_dependent` says per `(file, binary id, module path)` placement
+    whether a non-`test` `cfg` on the way down (a `mod x;` declaration, an
+    inline module around it, or a `#![cfg]` of a file on the path) can
+    compile the file out.
+    """
 
     def __init__(self, targets, modules):
         self.modules = modules
         self.placements = {}
+        self.host_dependent = {}
         for target in targets:
-            self.walk(target, target.root_file, (), True, set())
+            self.walk(target, target.root_file, (), True, set(), False)
 
     def parse(self, path):
         if path not in self.modules:
             self.modules[path] = Module(path.read_text(errors="replace"))
         return self.modules[path]
 
-    def walk(self, target, path, modpath, mod_rs, seen):
+    def walk(self, target, path, modpath, mod_rs, seen, gated):
         key = (target.binary_id, path, modpath)
         if key in seen:
             return
         seen.add(key)
         self.placements.setdefault(path, []).append((target, modpath))
         if not path.exists():
+            self.host_dependent[key] = gated
             return
         module = self.parse(path)
-        for name, chain, path_attr, in_block in module.declarations:
+        gated = gated or any(host_dependent_cfg(body) for body in module.file_cfgs)
+        self.host_dependent[key] = gated
+        for name, chain, path_attr, in_block, cfgs in module.declarations:
             if in_block:
                 continue
+            child_gated = gated or any(host_dependent_cfg(body) for body in cfgs)
             directory = path.parent if mod_rs else path.parent / path.stem
             if path_attr is not None:
                 if chain:
@@ -548,7 +712,7 @@ class ModuleTree:
                 if child is None:
                     continue
                 child_mod_rs = child.name == "mod.rs"
-            self.walk(target, child, modpath + chain + (name,), child_mod_rs, seen)
+            self.walk(target, child, modpath + chain + (name,), child_mod_rs, seen, child_gated)
 
 
 def workspace_test_macros(root):
@@ -584,8 +748,6 @@ def select(root, base):
         if not path.exists():
             continue  # deleted file
         module = tree.parse(path)
-        if re.search(r"\bcfg(?:_attr)?\s*\(", module.skeleton):
-            CFG_GATED.add(rel)
         for name, first, last in module.test_macro_definitions() + module.macro_invocations(
                 test_macros):
             probe = Item(name, [], first, last, (), False)
@@ -620,6 +782,8 @@ def select(root, base):
             for target, modpath in placements:
                 name = "::".join(modpath + item.mods + (item.name,))
                 selected.append((target, name, rel, item.first_line))
+                if item.host_dependent or tree.host_dependent[(target.binary_id, path, modpath)]:
+                    HOST_DEPENDENT.add((target.binary_id, name))
     if problems:
         raise SelectionError("\n".join(problems))
     return selected, skipped
@@ -648,15 +812,17 @@ def package_args(selected):
     return args
 
 
-def verify_listed(root, profile, expression, selected, allow_missing):
+def verify_listed(root, profile, expression, selected, allow_missing, packages):
     """Check every selected test against `cargo nextest list`; builds the binaries.
 
     Returns the tests the run will stress. A test missing from the list
-    fails the check, unless `allow_missing` names it as not stressed here.
+    fails the check, unless `allow_missing` names it as not stressed here and
+    a non-`test` `cfg` can have compiled it out. `packages` is the `-p` set
+    the run reuses.
     """
     result = run(
-        ["cargo", "nextest", "list", "--profile", profile, *BUILD_FLAGS,
-         *package_args(selected), "-E", expression, "--message-format", "json"],
+        ["cargo", "nextest", "list", "--profile", profile, *build_flags(profile),
+         *packages, "-E", expression, "--message-format", "json"],
         root, check=False)
     if result.returncode != 0:
         raise SelectionError(
@@ -668,7 +834,7 @@ def verify_listed(root, profile, expression, selected, allow_missing):
         suite = suites.get(target.binary_id)
         case = suite["testcases"].get(name) if suite else None
         if case is None:
-            if allow_missing and rel in CFG_GATED:
+            if allow_missing and (target.binary_id, name) in HOST_DEPENDENT:
                 print(f"stress-changed-tests: NOT STRESSED on this host: {rel}:{line} `{name}` "
                       f"({target.binary_id}) is not built here; it must be stressed on a host "
                       "that builds it, and the report must say so", file=sys.stderr)
@@ -677,7 +843,7 @@ def verify_listed(root, profile, expression, selected, allow_missing):
                 f"{rel}:{line}: `{name}` ({target.binary_id}) is not in the nextest list: "
                 "not built on this host (for example a cfg for another OS; run the gate "
                 "there, or pass --allow-missing-on-host to stress only this host's share; "
-                "that flag applies only to files with a cfg) or the identity is wrong")
+                "that flag applies only to tests under a non-`test` cfg) or the identity is wrong")
         elif case.get("ignored"):
             print(f"stress-changed-tests: skipped {rel} `{name}`: ignored in the nextest "
                   "list, so nextest does not run it", file=sys.stderr)
@@ -753,9 +919,10 @@ def main(argv):
             print(f"{target.binary_id} {name} ({rel}:{line})")
         print(f"filter: {expression}")
         return 0
+    packages = package_args(selected)
     try:
         selected = verify_listed(root, args.profile, expression, selected,
-                                 args.allow_missing_on_host)
+                                 args.allow_missing_on_host, packages)
     except SelectionError as error:
         print(f"stress-changed-tests: {error}", file=sys.stderr)
         return EXIT_UNMAPPED
@@ -766,8 +933,8 @@ def main(argv):
     command = [
         str(STRESS_RUN), "--deadline", args.deadline, "--cpus", str(STRESS_CPUS),
         *(["--unpinned"] if args.unpinned else []),
-        "--", "cargo", "nextest", "run", "--profile", args.profile, *BUILD_FLAGS,
-        *package_args(selected), "--stress-count", str(args.count), "--retries", "0", "--no-tests=fail",
+        "--", "cargo", "nextest", "run", "--profile", args.profile, *build_flags(args.profile),
+        *packages, "--stress-count", str(args.count), "--retries", "0", "--no-tests=fail",
         "-E", expression,
     ]
     print(f"stress-changed-tests: {len(selected)} test(s); {shlex.join(command)}", file=sys.stderr)
