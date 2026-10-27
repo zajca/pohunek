@@ -24,6 +24,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use tracing::{info, warn};
 
 use super::SessionRegistry;
+use crate::agent::host::RuntimeDefinition;
 use crate::agent::LaunchEnv;
 
 /// Name of the variable that carries the directory to the session.
@@ -41,17 +42,22 @@ const REMOVAL_PREFIX: &str = ".pohunek-session-tmp-";
 impl SessionRegistry {
     /// Composes the environment of a launch of `id`.
     ///
-    /// The session's private `TMPDIR` comes first, then `profile_env`, then
-    /// the daemon handshake env: a profile `TMPDIR` replaces the private one,
-    /// and every reserved `POHUNEK_*` key takes the daemon's value (the loader
-    /// also strips `POHUNEK_*` from the profile env).
+    /// The runtime definition's `[launch_env]` pairs come first, then the
+    /// session's private `TMPDIR`, then `profile_env`, then the daemon
+    /// handshake env: a profile entry replaces a descriptor pair of the same
+    /// name and a profile `TMPDIR` replaces the private one, and every
+    /// reserved `POHUNEK_*` key takes the daemon's value (the loader also
+    /// strips `POHUNEK_*` from the profile env, and a descriptor cannot name
+    /// `TMPDIR` or `POHUNEK_*`).
     pub(super) fn launch_env(
         &self,
+        definition: &RuntimeDefinition,
         profile_env: &[(String, String)],
         agent: RuntimeRef,
         id: &SessionId,
     ) -> LaunchEnv {
         let mut env = LaunchEnv::default();
+        env.extend(definition.launch_env().iter().cloned());
         // A path that is not UTF-8 cannot travel in the launch environment;
         // `prepare_session_tmpdir` then refuses the launch.
         let private = self

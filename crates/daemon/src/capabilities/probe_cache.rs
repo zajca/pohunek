@@ -1,7 +1,8 @@
 //! Cache of the version probes behind `host.inspect`.
 //!
 //! A probe is identified by the program it runs, the identity of that file on
-//! disk, the arguments and the `PATH` the probe sees. Only the raw stdout (or
+//! disk, the arguments, the `PATH` the probe sees and the runtime's
+//! `[launch_env]` pairs. Only the raw stdout (or
 //! the fact that the probe failed) is stored, so the supported range and the
 //! output grammar of a runtime are applied on every read and never go stale.
 //! An inventory hands over all of its requests at once: the distinct ones that
@@ -19,21 +20,28 @@ use std::time::Instant;
 
 use pohunek_service_config::InventoryProbe;
 
-/// One version probe to run: the resolved program, its probe arguments and the
-/// `PATH` the probed program sees.
+/// One version probe to run: the resolved program, its probe arguments, the
+/// `PATH` the probed program sees and the runtime's `[launch_env]` pairs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ProbeRequest {
     program: PathBuf,
     args: Vec<String>,
     launch_path: Option<OsString>,
+    launch_env: Vec<(String, String)>,
 }
 
 impl ProbeRequest {
-    pub(crate) fn new(program: &Path, args: &[String], launch_path: Option<&OsStr>) -> Self {
+    pub(crate) fn new(
+        program: &Path,
+        args: &[String],
+        launch_path: Option<&OsStr>,
+        launch_env: &[(String, String)],
+    ) -> Self {
         Self {
             program: program.to_path_buf(),
             args: args.to_vec(),
             launch_path: launch_path.map(OsStr::to_os_string),
+            launch_env: launch_env.to_vec(),
         }
     }
 
@@ -47,6 +55,10 @@ impl ProbeRequest {
 
     pub(super) fn launch_path(&self) -> Option<&OsStr> {
         self.launch_path.as_deref()
+    }
+
+    pub(super) fn launch_env(&self) -> &[(String, String)] {
+        &self.launch_env
     }
 }
 

@@ -840,7 +840,8 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let env_extra = self.launch_env(&env, binding.agent_base.clone(), &id);
+        let env_extra =
+            self.launch_env(&relaunch.definition, &env, binding.agent_base.clone(), &id);
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: params.cols,
@@ -1212,7 +1213,8 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let env_extra = self.launch_env(&env, binding.agent_base.clone(), &id);
+        let env_extra =
+            self.launch_env(&relaunch.definition, &env, binding.agent_base.clone(), &id);
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,

@@ -100,6 +100,14 @@ rest of the descriptor:
 - An entry that is not a feature id, a repeated entry or more than 16 entries
   is `descriptor_invalid`.
 
+The features this core implements:
+
+| Feature | Since | Gated descriptor key or value |
+|---|---|---|
+| `config-home-subdir-v1` | 0.38.0 | `[config_home] subdir` |
+| `version-probe-revision-v1` | 0.38.0 | `version_probe.parser = "semver-revision-line-v1"` |
+| `launch-env-v1` | 0.38.0 | `[launch_env]` |
+
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
 snapshot file that a test compares. Which core version first has a feature is
@@ -128,6 +136,38 @@ never expands a `~`. A runtime that names a daemon-run integration handler
 needs the table, or `integration install` answers `agent_config_home_undeclared`
 for it. A runtime without an integration (Pi) may omit it; Pi keeps declaring
 its conversation root under `[native_reference.existence]`.
+
+A runtime whose variable holds a parent of its home declares `subdir`
+(`requires = ["config-home-subdir-v1"]`): with `env = "XDG_CONFIG_HOME"`,
+`subdir = "muse"` and `default = ".config/muse"` the home is
+`$XDG_CONFIG_HOME/muse` while the variable is set and `~/.config/muse`
+otherwise. `subdir` joins the variable's value only; `default` stays the
+complete path. A relative or non-UTF-8 value is an error and never falls back
+to `default`, unlike the XDG specification. Two runtimes are ambiguous owners of
+a home by its resolved path, so the same variable with different `subdir` values
+is not.
+
+## Launch environment
+
+A descriptor sets literal environment variables for its launches and its
+version probe with `[launch_env]` (`requires = ["launch-env-v1"]`):
+
+```toml
+requires = ["launch-env-v1"]
+
+[launch_env]
+ACME_NO_AUTO_UPDATE = "1"        # stops a launcher that updates itself
+```
+
+Use it for switches the agent reads at start. At most 16 entries; values are
+at most 256 bytes, never expanded. Names the core or the owner own are refused
+at install (`descriptor_invalid`): `POHUNEK_*`, `LD_*`, `DYLD_*`, `XDG_*`,
+`LC_*`, `PATH`, `HOME`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`, `TERM`,
+`COLORTERM`, `LANG`, `TBH_MANAGED_HOOKS_PATH` and any secret-shaped name
+(`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`, `*_CREDENTIALS`,
+`*_AUTH`). A host profile's `[env]` entry of the same name overrides a declared
+pair on a launch. A program the user starts by hand inside a shell session
+gets no descriptor environment, so it keeps its own defaults.
 
 ## Transcripts
 
@@ -349,6 +389,13 @@ over-broad one (no literal next to `{version}`, an unknown placeholder, a
 repeated `{version}`) fails package validation. A pre-release banner such as
 `codex-cli 0.161.0-rc.1` never matches, so the runtime reports unsupported.
 Verify the real banner of the runtime before declaring the template.
+
+A release printed as `MAJOR.MINOR.PATCH-R<n>[.<m>]` (`1.4.13-R2`) is a numeric
+revision, not a pre-release. Declare `parser = "semver-revision-line-v1"` with
+a `line` template and `requires = ["version-probe-revision-v1"]`: it orders
+`(MAJOR, MINOR, PATCH, n, m)` with an absent part as 0 (`1.4.13` equals
+`1.4.13-R0`), and `min` and `below` accept both forms. `semver-v1` and
+`semver-line-v1` keep refusing any suffix.
 
 ## Declaring input readiness
 

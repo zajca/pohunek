@@ -1079,7 +1079,9 @@ variable name and a home-relative default. One resolver
 agent: the variable read from the launch environment (the daemon's base
 environment overridden by the host profile's `[env]`), else the default below
 that environment's `HOME`. A non-absolute value is a typed error and is never
-expanded with the daemon's `HOME`. The integration handlers take the resolved
+expanded with the daemon's `HOME`. An optional `subdir` joins the variable's
+value only (never `default`), and two runtimes are ambiguous owners of a home by
+its resolved path. The integration handlers take the resolved
 directory instead of resolving one themselves, so install, status, doctor,
 removal and a launched agent agree; `profile` and `all_profiles` on the
 integration methods select one profile's home or every distinct home (one

@@ -4,10 +4,11 @@
 //! runtime's version output through this one grammar, from the `version_probe`
 //! declaration of the runtime package descriptor ([`VersionProbeDeclaration`]).
 //!
-//! A runtime descriptor that names the [`SEMVER_PARSER_ID`] or
-//! [`SEMVER_LINE_PARSER_ID`] parser declares the probe arguments and the
-//! half-open release range `[min, below)` the runtime is supported for, so a
-//! package update can move the range without a daemon release.
+//! A runtime descriptor that names the [`SEMVER_PARSER_ID`],
+//! [`SEMVER_LINE_PARSER_ID`] or [`SEMVER_REVISION_LINE_PARSER_ID`] parser
+//! declares the probe arguments and the half-open release range
+//! `[min, below)` the runtime is supported for, so a package update can move
+//! the range without a daemon release.
 //!
 //! `semver-v1` reads a first output line that is exactly one release,
 //! `MAJOR.MINOR.PATCH`. `semver-line-v1` reads a first output line of the shape
@@ -15,8 +16,12 @@
 //! covers the official runtimes: `codex-cli 0.160.0`, `2.1.289 (Claude Code)`
 //! and `Hermes Agent v0.20.0 (2026.8.3)`. Both grammars take the release as a
 //! bare numeric triple: a pre-release or build suffix cannot be ordered against
-//! `[min, below)`, so a line carrying one is an unsupported runtime. Anything
-//! unreadable is an unsupported runtime too.
+//! `[min, below)`, so a line carrying one is an unsupported runtime.
+//! `semver-revision-line-v1` reads the same templates but its release token is
+//! `MAJOR.MINOR.PATCH-R<n>[.<m>]`, a numeric revision that orders after the
+//! triple (an absent revision part is 0, so `1.4.13` equals `1.4.13-R0`), and
+//! its `min` and `below` accept both forms. Anything unreadable is an
+//! unsupported runtime.
 
 // Rust guideline compliant 2026-10-04
 
@@ -30,6 +35,14 @@ pub const SEMVER_PARSER_ID: &str = "semver-v1";
 /// Parser id of the data-driven version probe whose first output line follows
 /// a declared [`LineTemplate`].
 pub const SEMVER_LINE_PARSER_ID: &str = "semver-line-v1";
+
+/// Parser id of the data-driven version probe whose first output line follows
+/// a declared [`LineTemplate`] and whose release carries a numeric revision,
+/// `MAJOR.MINOR.PATCH-R<n>[.<m>]`.
+pub const SEMVER_REVISION_LINE_PARSER_ID: &str = "semver-revision-line-v1";
+
+/// Marker between the release triple and its revision.
+const REVISION_MARKER: &str = "-R";
 
 /// Maximum size of one probe argument, in bytes.
 ///
@@ -84,13 +97,17 @@ impl VersionProbeDeclaration {
     /// declared together, or when [`VersionProbePolicy::new`] or
     /// [`VersionProbePolicy::with_line_template`] rejects them.
     pub fn policy(&self) -> Result<Option<VersionProbePolicy>, VersionProbeError> {
+        let revisions = self.parser == SEMVER_REVISION_LINE_PARSER_ID;
         match (&self.args, &self.min, &self.below) {
             (None, None, None) if self.line.is_none() => Ok(None),
-            (Some(args), Some(min), Some(below)) => match &self.line {
-                Some(line) => {
+            (Some(args), Some(min), Some(below)) => match (&self.line, revisions) {
+                (Some(line), true) => {
+                    VersionProbePolicy::with_revision_line_template(args.clone(), min, below, line)
+                }
+                (Some(line), false) => {
                     VersionProbePolicy::with_line_template(args.clone(), min, below, line)
                 }
-                None => VersionProbePolicy::new(args.clone(), min, below),
+                (None, _) => VersionProbePolicy::new(args.clone(), min, below),
             }
             .map(Some),
             _ => Err(VersionProbeError {
@@ -132,17 +149,47 @@ const VERSION_PLACEHOLDER: &str = "{version}";
 /// line after one separating space.
 const ANNOTATION_PLACEHOLDER: &str = "{annotation}";
 
-/// A `MAJOR.MINOR.PATCH` release without pre-release or build metadata.
+/// A `MAJOR.MINOR.PATCH` release without pre-release or build metadata,
+/// optionally followed by a numeric `-R<n>[.<m>]` revision.
 ///
-/// Components compare numerically, so `1.10.0` is newer than `1.9.0`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Components compare numerically, so `1.10.0` is newer than `1.9.0`. An absent
+/// revision part compares as 0, so `1.4.13` equals `1.4.13-R0` and `1.4.13-R2`
+/// equals `1.4.13-R2.0`; [`fmt::Display`] still prints the form that was
+/// parsed. Only [`Self::parse_revision`] produces a revision.
+#[derive(Debug, Clone, Copy)]
 pub struct ProbeVersion {
     major: u64,
     minor: u64,
     patch: u64,
+    revision: Option<Revision>,
+}
+
+/// The `-R<n>[.<m>]` part of a [`ProbeVersion`].
+///
+/// Both numbers are `u32`, which keeps a [`VersionRefusal`] small enough to
+/// return by value; a real revision counts releases of one version.
+#[derive(Debug, Clone, Copy)]
+struct Revision {
+    number: u32,
+    sub: Option<u32>,
 }
 
 impl ProbeVersion {
+    /// The ordering key: the triple, then the revision parts with absent parts
+    /// as 0.
+    fn key(self) -> (u64, u64, u64, u64, u64) {
+        let (number, sub) = self.revision.map_or((0, 0), |revision| {
+            (revision.number, revision.sub.unwrap_or(0))
+        });
+        (
+            self.major,
+            self.minor,
+            self.patch,
+            u64::from(number),
+            u64::from(sub),
+        )
+    }
+
     /// Parses exactly `MAJOR.MINOR.PATCH`: ASCII digits only, no leading
     /// zeros, no sign, no pre-release or build suffix.
     #[must_use]
@@ -151,29 +198,83 @@ impl ProbeVersion {
             return None;
         }
         let mut parts = value.split('.');
-        let mut component = || {
-            let part = parts.next()?;
-            let canonical = !part.is_empty()
-                && (part == "0" || !part.starts_with('0'))
-                && part.bytes().all(|byte| byte.is_ascii_digit());
-            if canonical {
-                part.parse::<u64>().ok()
-            } else {
-                None
-            }
-        };
         let version = Self {
-            major: component()?,
-            minor: component()?,
-            patch: component()?,
+            major: canonical_component(parts.next()?)?,
+            minor: canonical_component(parts.next()?)?,
+            patch: canonical_component(parts.next()?)?,
+            revision: None,
         };
         parts.next().is_none().then_some(version)
+    }
+
+    /// Parses `MAJOR.MINOR.PATCH` optionally followed by `-R<n>` or
+    /// `-R<n>.<m>`, with the digit rules of [`Self::parse`] for every number.
+    #[must_use]
+    pub fn parse_revision(value: &str) -> Option<Self> {
+        let Some((release, revision)) = value.split_once(REVISION_MARKER) else {
+            return Self::parse(value);
+        };
+        if value.len() > MAX_VERSION_BYTES {
+            return None;
+        }
+        let mut numbers = revision.split('.');
+        let number = u32::try_from(canonical_component(numbers.next()?)?).ok()?;
+        let sub = match numbers.next() {
+            Some(text) => Some(u32::try_from(canonical_component(text)?).ok()?),
+            None => None,
+        };
+        if numbers.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            revision: Some(Revision { number, sub }),
+            ..Self::parse(release)?
+        })
+    }
+}
+
+/// One canonical decimal component: ASCII digits, no leading zero.
+fn canonical_component(part: &str) -> Option<u64> {
+    let canonical = !part.is_empty()
+        && (part == "0" || !part.starts_with('0'))
+        && part.bytes().all(|byte| byte.is_ascii_digit());
+    if canonical {
+        part.parse::<u64>().ok()
+    } else {
+        None
+    }
+}
+
+impl PartialEq for ProbeVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for ProbeVersion {}
+
+impl PartialOrd for ProbeVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ProbeVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
     }
 }
 
 impl fmt::Display for ProbeVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(revision) = self.revision {
+            write!(f, "{REVISION_MARKER}{}", revision.number)?;
+            if let Some(sub) = revision.sub {
+                write!(f, ".{sub}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -307,12 +408,34 @@ impl LineTemplate {
     /// does not have exactly the declared shape.
     #[must_use]
     pub fn read(&self, line: &str) -> Option<ProbeVersion> {
+        self.read_with(line, ProbeVersion::parse, false)
+    }
+
+    /// Like [`Self::read`], with a release token that may carry the
+    /// `-R<n>[.<m>]` revision of [`ProbeVersion::parse_revision`].
+    #[must_use]
+    pub fn read_revision(&self, line: &str) -> Option<ProbeVersion> {
+        self.read_with(line, ProbeVersion::parse_revision, true)
+    }
+
+    fn read_with(
+        &self,
+        line: &str,
+        parse: fn(&str) -> Option<ProbeVersion>,
+        revision: bool,
+    ) -> Option<ProbeVersion> {
         let rest = line.strip_prefix(self.prefix.as_str())?;
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .unwrap_or(rest.len());
+        let numeric_end = |text: &str| {
+            text.find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(text.len())
+        };
+        let mut end = numeric_end(rest);
+        if revision && rest[end..].starts_with(REVISION_MARKER) {
+            end += REVISION_MARKER.len();
+            end += numeric_end(&rest[end..]);
+        }
         let (token, tail) = rest.split_at(end);
-        let version = ProbeVersion::parse(token)?;
+        let version = parse(token)?;
         let tail = tail.strip_prefix(self.suffix.as_str())?;
         let tail_matches = if self.annotation {
             tail.strip_prefix(' ')
@@ -368,6 +491,9 @@ enum OutputGrammar {
     Bare,
     /// The first line follows a declared template.
     Line(LineTemplate),
+    /// The first line follows a declared template and its release may carry a
+    /// numeric revision.
+    RevisionLine(LineTemplate),
 }
 
 /// The probe arguments and supported release range a descriptor declares.
@@ -387,6 +513,22 @@ impl VersionProbePolicy {
     ///
     /// Returns a [`VersionProbeError`] naming the offending field.
     pub fn new(args: Vec<String>, min: &str, below: &str) -> Result<Self, VersionProbeError> {
+        Self::build(
+            args,
+            min,
+            below,
+            ProbeVersion::parse,
+            "must be MAJOR.MINOR.PATCH",
+        )
+    }
+
+    fn build(
+        args: Vec<String>,
+        min: &str,
+        below: &str,
+        parse: fn(&str) -> Option<ProbeVersion>,
+        shape: &'static str,
+    ) -> Result<Self, VersionProbeError> {
         const ARGS: &str = "runtime.version_probe.args";
         if args.is_empty() || args.len() > MAX_PROBE_ARGS {
             return Err(VersionProbeError {
@@ -405,13 +547,13 @@ impl VersionProbePolicy {
                 reason: "must be 1..=1024 bytes without control characters",
             });
         }
-        let min = ProbeVersion::parse(min).ok_or(VersionProbeError {
+        let min = parse(min).ok_or(VersionProbeError {
             field: "runtime.version_probe.min",
-            reason: "must be MAJOR.MINOR.PATCH",
+            reason: shape,
         })?;
-        let below = ProbeVersion::parse(below).ok_or(VersionProbeError {
+        let below = parse(below).ok_or(VersionProbeError {
             field: "runtime.version_probe.below",
-            reason: "must be MAJOR.MINOR.PATCH",
+            reason: shape,
         })?;
         if min >= below {
             return Err(VersionProbeError {
@@ -448,10 +590,46 @@ impl VersionProbePolicy {
         Ok(policy)
     }
 
+    /// Like [`Self::with_line_template`], for a release that may carry a
+    /// numeric `-R<n>[.<m>]` revision; `min` and `below` accept both forms.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VersionProbeError`] naming the offending field.
+    pub fn with_revision_line_template(
+        args: Vec<String>,
+        min: &str,
+        below: &str,
+        line: &str,
+    ) -> Result<Self, VersionProbeError> {
+        let mut policy = Self::build(
+            args,
+            min,
+            below,
+            ProbeVersion::parse_revision,
+            "must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-R<n>[.<m>]",
+        )?;
+        let template = LineTemplate::parse(line).map_err(|error| VersionProbeError {
+            field: "runtime.version_probe.line",
+            reason: error.reason(),
+        })?;
+        policy.grammar = OutputGrammar::RevisionLine(template);
+        Ok(policy)
+    }
+
     /// Whether the output is read through a `line` template.
     #[must_use]
     pub fn has_line_template(&self) -> bool {
-        matches!(self.grammar, OutputGrammar::Line(_))
+        matches!(
+            self.grammar,
+            OutputGrammar::Line(_) | OutputGrammar::RevisionLine(_)
+        )
+    }
+
+    /// Whether the release may carry a numeric `-R<n>[.<m>]` revision.
+    #[must_use]
+    pub fn reads_revisions(&self) -> bool {
+        matches!(self.grammar, OutputGrammar::RevisionLine(_))
     }
 
     /// The arguments the probe passes to the runtime program.
@@ -514,12 +692,16 @@ impl VersionProbePolicy {
     pub fn read_output(&self, output: &str) -> Option<ProbeVersion> {
         match &self.grammar {
             OutputGrammar::Bare => Self::parse_output(output),
-            OutputGrammar::Line(template) => {
+            OutputGrammar::Line(template) | OutputGrammar::RevisionLine(template) => {
                 let line = output.lines().next()?.trim();
                 if line.len() > MAX_OUTPUT_LINE_BYTES {
                     return None;
                 }
-                template.read(line)
+                if self.reads_revisions() {
+                    template.read_revision(line)
+                } else {
+                    template.read(line)
+                }
             }
         }
     }

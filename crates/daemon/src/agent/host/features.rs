@@ -10,6 +10,7 @@
 
 // Rust guideline compliant 2026-10-26
 
+use package::version_probe::SEMVER_REVISION_LINE_PARSER_ID;
 use toml::{Table, Value};
 
 use super::definition::{DefinitionError, MAX_LABEL_BYTES};
@@ -31,13 +32,6 @@ pub(super) struct RuntimeFeature {
 
 /// What in a descriptor belongs to a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production feature row gates a compiled value yet"
-    )
-)]
 pub(super) enum GateRule {
     /// A descriptor key at this dotted path is present.
     Key(&'static str),
@@ -86,16 +80,39 @@ pub(super) struct FeatureTables<'a> {
 ///
 /// `fixtures/features.txt` snapshots this table; a removal or rename fails the
 /// guard test.
-pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[RuntimeFeature {
-    id: "config-home-subdir-v1",
-    since: "0.38.0",
-}];
+pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
+    RuntimeFeature {
+        id: "config-home-subdir-v1",
+        since: "0.38.0",
+    },
+    RuntimeFeature {
+        id: "version-probe-revision-v1",
+        since: "0.38.0",
+    },
+    RuntimeFeature {
+        id: "launch-env-v1",
+        since: "0.38.0",
+    },
+];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
-pub(super) const FEATURE_GATES: &[FeatureGate] = &[FeatureGate {
-    feature: "config-home-subdir-v1",
-    rule: GateRule::Key("config_home.subdir"),
-}];
+pub(super) const FEATURE_GATES: &[FeatureGate] = &[
+    FeatureGate {
+        feature: "config-home-subdir-v1",
+        rule: GateRule::Key("config_home.subdir"),
+    },
+    FeatureGate {
+        feature: "version-probe-revision-v1",
+        rule: GateRule::Value(
+            "runtime.version_probe.parser",
+            SEMVER_REVISION_LINE_PARSER_ID,
+        ),
+    },
+    FeatureGate {
+        feature: "launch-env-v1",
+        rule: GateRule::Key("launch_env"),
+    },
+];
 
 impl FeatureTables<'static> {
     /// The tables a production descriptor parse uses.
