@@ -1039,7 +1039,7 @@ its `[config_home]` or `[native_reference.existence]` root from, secret-shaped
 `EDITOR`, `HOOK`, `HOOKS`, `PLUGIN`, `PLUGINS`, `MODULES`, `LIB`, `LIBS`,
 `PRELOAD`, `CERT`, `CERTS`, `CA`, `KEYRING`, `PROFILE`, `CONF`, `CONFIG` or
 `ID`, or a longer word ending in `PATH`, `DIR`, `FILE`, `HOME`, `ROOT`,
-`FLAGS`, `OPTS`, `CONF` or `CERT`, such as `TMPDIR` or `LIBPATH`; `PI_PATHOLOGY`
+`FLAGS`, `OPTS`, `CONF`, `CERT` or `CERTS`, such as `TMPDIR` or `LIBPATH`; `PI_PATHOLOGY`
 is fine and `PI_LOG_DIR_MODE` is not; these word lists are a second layer, not
 a complete vocabulary, because `0` and `1` are also valid file names), so a
 public descriptor cannot redirect or blank owner or core state. Each value is
