@@ -4064,6 +4064,10 @@ impl SessionRegistry {
 
     /// Builds the first-launch registration of a `session.new` in `target`,
     /// with the initial input its launch command does not carry.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the create registration freezes the snapshot, composes the launch and builds the spec in one ordered pass"
+    )]
     fn create_spec(
         &self,
         id: &SessionId,

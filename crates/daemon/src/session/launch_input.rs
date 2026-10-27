@@ -75,8 +75,9 @@ impl SessionRegistry {
             config_home: config_home.as_deref(),
             env: &base,
             args: frozen_args,
+            private_dir: &state_root.join(&id.0),
         })?;
-        let placed = place(contribution, state_root, id)?;
+        let placed = place(&contribution, state_root, id)?;
         Ok(LaunchInputs {
             env: self.launch_env_with(definition, profile_env, &placed.env, agent, id),
             root_args: placed.root_args,

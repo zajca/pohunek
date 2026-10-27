@@ -6000,6 +6000,25 @@ async fn startup_collects_orphaned_journals_and_keeps_the_rest() {
         .expect("worker state root");
     let aged = std::time::Duration::from_hours(720);
     let orphan = seed_orphan_journals(&root, "s-9001", aged);
+    // A launch that failed after its files were placed leaves them (and an
+    // unfinished write) beside the journals.
+    let changed = std::time::SystemTime::now() - aged;
+    for name in [
+        pohunek_paths::launch_input_file_name("overlay.json"),
+        pohunek_paths::launch_input_temp_name("overlay.json"),
+    ] {
+        let path = orphan.join(name);
+        fs::write(&path, b"{}").expect("write a launch-input file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the file");
+        fs::File::open(&path)
+            .expect("open for aging")
+            .set_modified(changed)
+            .expect("age the file");
+    }
+    fs::File::open(&orphan)
+        .expect("open the directory for aging")
+        .set_modified(changed)
+        .expect("age the directory");
     let recent = seed_orphan_journals(&root, "s-9002", std::time::Duration::ZERO);
     let stored = root.join(&session.id.0);
     assert!(stored.is_dir());

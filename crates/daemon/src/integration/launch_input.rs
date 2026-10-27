@@ -90,6 +90,19 @@ pub struct LaunchInputContext<'a> {
     pub env: &'a [(String, String)],
     /// The frozen launch arguments (definition or profile arguments).
     pub args: &'a [String],
+    /// The session's private directory; core writes the contribution's file
+    /// `<name>` at [`Self::file_path`]. A contributor that must embed a
+    /// file's path inside another file builds it from here.
+    pub private_dir: &'a Path,
+}
+
+impl LaunchInputContext<'_> {
+    /// Where core writes the private file `name` of this launch.
+    #[must_use]
+    pub fn file_path(&self, name: &str) -> PathBuf {
+        self.private_dir
+            .join(pohunek_paths::launch_input_file_name(name))
+    }
 }
 
 /// How a private file is protected.
@@ -272,19 +285,19 @@ fn open_session_directory(
 /// Validates `input`, writes its files below `state_root` and resolves its
 /// placeholders.
 ///
-/// Each file is written atomically over any earlier launch's copy, so a name
-/// that an attacker pre-planted as a symlink is replaced, never followed.
+/// Each file is written atomically over any earlier launch's copy; a name that
+/// is not a regular file (a planted symlink, say) is refused, never followed.
 ///
 /// # Errors
 ///
 /// `launch_input_invalid` for a contribution outside the bounds above, and
 /// `launch_input_unavailable` when a file cannot be written.
 pub(crate) fn place(
-    input: LaunchInput,
+    input: &LaunchInput,
     state_root: &Path,
     session_id: &SessionId,
 ) -> Result<PlacedLaunchInput, ProtocolError> {
-    validate(&input)?;
+    validate(input)?;
     let (directory, path) = open_session_directory(state_root, session_id)?;
     let env = input
         .env
@@ -303,10 +316,14 @@ pub(crate) fn place(
             FileKind::Data => DATA_MODE,
             FileKind::Executable => EXECUTABLE_MODE,
         };
+        // A write the daemon died in the middle of leaves its temporary name
+        // behind, and the exclusive create of the next write would refuse it.
+        let temporary = pohunek_paths::launch_input_temp_name(&file.name);
+        directory.remove_entry(&temporary).map_err(unavailable)?;
         directory
             .replace_file(
                 pohunek_paths::launch_input_file_name(&file.name),
-                pohunek_paths::launch_input_temp_name(&file.name),
+                temporary,
                 &file.bytes,
                 mode,
             )

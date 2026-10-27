@@ -795,6 +795,10 @@ impl SessionRegistry {
     /// absent or cannot be verified, `agent_native_store_relocated` when the
     /// agent would keep its conversations outside the declared store,
     /// and otherwise the source lookup, launch-template, or launch error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fork transaction stays linear so every refusal precedes the registration"
+    )]
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;

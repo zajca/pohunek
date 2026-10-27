@@ -27,6 +27,7 @@ const OVERLAY_BYTES: &[u8] = b"{\"fixture\":true}\n";
 struct Seen {
     kind: LaunchKind,
     args: Vec<String>,
+    overlay: PathBuf,
 }
 
 /// A contributor that adds an overlay file, an environment pair naming it and
@@ -45,6 +46,7 @@ impl LaunchContributor for Fixture {
         self.seen.lock().expect("seen").push(Seen {
             kind: ctx.kind,
             args: ctx.args.to_vec(),
+            overlay: ctx.file_path(OVERLAY),
         });
         if ctx.kind == LaunchKind::Resume {
             if let Some(code) = self.refuse_resume.lock().expect("refusal").clone() {
@@ -128,6 +130,10 @@ async fn a_create_launch_gets_the_contributed_env_args_and_private_file() {
     let seen = fixture.seen.lock().expect("seen").clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].kind, LaunchKind::Create);
+    assert_eq!(
+        seen[0].overlay, path,
+        "the context names the path core writes the file at"
+    );
     rig.finish().await;
     rig.remove().await;
 }
@@ -272,4 +278,62 @@ async fn removing_the_session_deletes_its_launch_input_without_a_tombstone() {
         (!path.exists() && !tombstone).then_some(())
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_fork_gets_its_own_contribution_and_the_source_snapshot_stays_clean() {
+    let fixture = install_fixture();
+    let rig = Rig::new("launch-input-fork", true).await;
+    let source_path = overlay_path(&rig);
+    let snapshot = rig.report(NATIVE_ID).await;
+    rig.settle(&snapshot).await;
+
+    let forked = rig
+        .registry
+        .fork(protocol::SessionForkParams {
+            session_id: rig.session.id.clone(),
+            name: None,
+            cwd_mode: protocol::ForkCwdMode::default(),
+            cols: 80,
+            rows: 24,
+            accept_profile_change: false,
+        })
+        .await
+        .expect("fork the conversation");
+
+    let fork_path = source_path.with_file_name(pohunek_paths::launch_input_file_name(OVERLAY));
+    let fork_path = fork_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("state root")
+        .join(&forked.id.0)
+        .join(pohunek_paths::launch_input_file_name(OVERLAY));
+    let expected = format!("--overlay {} fork {NATIVE_ID}", fork_path.display());
+    wait_for_file_contains(&rig.launches, &expected).await;
+    assert_ne!(
+        fork_path, source_path,
+        "the fork has a directory of its own"
+    );
+    assert_eq!(fs::read(&fork_path).expect("fork overlay"), OVERLAY_BYTES);
+    let kinds: Vec<LaunchKind> = fixture
+        .seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .map(|seen| seen.kind)
+        .collect();
+    assert_eq!(kinds, [LaunchKind::Create, LaunchKind::Fork]);
+    let record = format!("{:?}", rig.durable_record());
+    assert!(
+        !record.contains("--overlay"),
+        "the source snapshot is clean: {record}"
+    );
+    rig.registry.stop(&forked.id).await.expect("stop the fork");
+    rig.registry.settle_transactions().await;
+    rig.registry
+        .remove(&forked.id)
+        .await
+        .expect("remove the fork");
+    rig.finish().await;
+    rig.remove().await;
 }

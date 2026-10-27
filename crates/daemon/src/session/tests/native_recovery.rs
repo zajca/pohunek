@@ -55,7 +55,8 @@ reference_kind = "id"
 args = ["resume", "{{reference}}"]
 
 [fork]
-supported = false
+supported = true
+args = ["fork", "{{reference}}"]
 
 [native_reference]
 strategy = "hook"

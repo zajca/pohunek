@@ -323,7 +323,7 @@ impl Collection<'_> {
     /// Decides whether the directory of an unowned session may go.
     ///
     /// `Ok` only when it is untouched for the window, holds nothing but the
-    /// journal grammar, every journal is understood, and every worker they
+    /// journal and launch-input grammar, every journal is understood, and every worker they
     /// name is gone from the process snapshot.
     fn judge(
         &self,
@@ -345,6 +345,7 @@ impl Collection<'_> {
         for entry in remaining {
             match entry.to_str() {
                 Some(name) if is_journal_file(name) => journal_files += 1,
+                Some(name) if pohunek_paths::is_launch_input_entry(name) => {}
                 _ => return Err(Kept::Unreadable),
             }
         }
