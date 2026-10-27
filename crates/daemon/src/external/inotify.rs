@@ -79,8 +79,8 @@ pub(super) struct InotifyBackend {
     /// Directory levels below a root its tree registers, for roots that bound
     /// the walk.
     walk_bounds: HashMap<PathBuf, WalkBound>,
-    /// The deepest-level directories of bounded roots (a session directory of
-    /// a dated tree) that hold a watch, oldest first.
+    /// The session directories of dated trees, with the root of each, that hold
+    /// a watch, oldest first.
     recent_deepest: VecDeque<(PathBuf, PathBuf)>,
 }
 
@@ -142,7 +142,7 @@ fn is_limit_error(error: &io::Error) -> bool {
 }
 
 /// Queues `subdirectories`, found at `depth`, for the walk: breadth first, or
-/// for a bounded root depth first with the highest names first, so the newest
+/// for a dated tree depth first with the highest names first, so the newest
 /// directories are registered before an exhausted budget cuts the walk.
 fn enqueue(
     queue: &mut VecDeque<(PathBuf, u8)>,
@@ -210,7 +210,9 @@ impl Failures {
     }
 }
 
-/// Most deepest-level directories of one dated root that hold a watch.
+/// Most session directories of one dated root that hold a watch. A new one
+/// evicts the watch registered longest ago, which is the oldest session except
+/// after a whole older subtree appears at once.
 ///
 /// A dated tree grows by a directory per session, so it would fill the
 /// backend-wide [`MAX_WALK_DIRECTORIES`] budget. The newest ones are watched, a
@@ -290,7 +292,9 @@ impl InotifyBackend {
     ) -> RootRegistration {
         let mut failures = Failures::default();
         let mut budget = MAX_WALK_ENTRIES;
-        let (limit, share_root, start_depth) = self.walk_of(root);
+        let (limit, dated, start_depth) = self.walk_of(root);
+        let session_depth = dated.as_ref().map(|(_, depth)| *depth);
+        let share_root = dated.map(|(root, _)| root);
         if limit.is_some_and(|max| start_depth > max) {
             // Below the bound nothing is watched, so a directory that appears
             // there is neither registered nor walked.
@@ -303,12 +307,9 @@ impl InotifyBackend {
             if failures.cancelled(cancel) {
                 break 'walk;
             }
-            // Only a directory that is new, at the deepest level of a bounded
-            // root, counts against the share of deepest-level watches.
-            let new_deepest = share_root.is_some()
-                && limit == Some(depth)
-                && depth > 0
-                && !self.wd_by_path.contains_key(&dir);
+            // Only a directory that is new, at the session level of a dated
+            // tree, counts against the share of session watches.
+            let new_deepest = session_depth == Some(depth) && !self.wd_by_path.contains_key(&dir);
             if new_deepest
                 && discovery.is_none()
                 && self.share_is_full(share_root.as_deref(), registered_deepest.len())
@@ -393,17 +394,17 @@ impl InotifyBackend {
         failures.into_registration()
     }
 
-    /// The entries of `dir`, highest names first for a bounded root. A
+    /// The entries of `dir`, highest names first for a dated tree. A
     /// directory that vanished yields nothing; one that cannot be listed
     /// yields nothing and is recorded in `failures`.
     fn list_for_walk(
         &self,
         dir: &Path,
-        bounded: bool,
+        dated: bool,
         failures: &mut Failures,
     ) -> Option<Box<dyn Iterator<Item = io::Result<ListedEntry>>>> {
         match (self.lister)(dir) {
-            Ok(entries) if bounded => Some(newest_entry_first(entries)),
+            Ok(entries) if dated => Some(newest_entry_first(entries)),
             Ok(entries) => Some(entries),
             Err(error) if is_absent_error(&error) => None,
             Err(error) => {
@@ -413,14 +414,14 @@ impl InotifyBackend {
         }
     }
 
-    /// The depth limit of the walk of `dir`, the root of its dated tree when its
-    /// deepest directories share a bounded number of watches, and how many
-    /// levels `dir` lies below its root.
-    fn walk_of(&self, dir: &Path) -> (Option<u8>, Option<PathBuf>, u8) {
+    /// The depth limit of the walk of `dir`, the root and session level of its
+    /// dated tree when its session directories share a bounded number of
+    /// watches, and how many levels `dir` lies below its root.
+    fn walk_of(&self, dir: &Path) -> (Option<u8>, Option<(PathBuf, u8)>, u8) {
         let (bound, levels) = self.bound_of(dir);
-        let limit = bound.as_ref().map(|(_, bound)| bound.max_depth);
-        let share_root = bound.filter(|(_, bound)| bound.dated).map(|(root, _)| root);
-        (limit, share_root, levels)
+        let limit = bound.as_ref().and_then(|(_, bound)| bound.max_depth);
+        let dated = bound.and_then(|(root, bound)| Some((root, bound.dated_depth?)));
+        (limit, dated, levels)
     }
 
     /// Records the deepest-level directories a walk registered, newest first,

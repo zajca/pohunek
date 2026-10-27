@@ -638,13 +638,15 @@ fn write_session_log(tree: &Path, day: &str, name: &str) -> PathBuf {
     path
 }
 
+/// A dated tree whose descriptor declares no `max_depth`: the share of session
+/// watches follows the parser, not the bound.
 fn dated_root(path: &Path) -> TranscriptRoot {
     TranscriptRoot {
         parser: TranscriptParser::MuseSessionV1,
         agent_base: RuntimeRef::codex(),
         path: path.to_path_buf(),
         private: false,
-        max_depth: Some(4),
+        max_depth: None,
     }
 }
 
@@ -706,9 +708,32 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
     // directory of a day that appears later, and one under another root are
     // all seen by a live event.
     let newest = write_session_log(&dated, new_day, &session_name(SESSIONS_PER_DAY - 1));
-    wait_for(newest, LIVE_EVENT_TIMEOUT).await;
+    wait_for(newest.clone(), LIVE_EVENT_TIMEOUT).await;
     let later = write_session_log(&dated, "2026/10/10", &session_name(7));
     wait_for(later, LIVE_EVENT_TIMEOUT).await;
+    // The watch of the newest session directory survives the eviction a new
+    // session directory causes: rewriting its log is seen live.
+    let rewritten = fs::read_to_string(&newest)
+        .expect("the log")
+        .replace("/work", "/rewritten");
+    fs::write(&newest, rewritten).expect("rewrite the log");
+    let wait = async {
+        loop {
+            let moved = index
+                .inner
+                .lock()
+                .expect("index")
+                .get(&newest)
+                .is_some_and(|candidate| candidate.cwd.as_deref() == Some(Path::new("/rewritten")));
+            if moved {
+                return;
+            }
+            sessions.inner.rescan.notified().await;
+        }
+    };
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, wait)
+        .await
+        .expect("the newest session's rewrite is seen live");
     let claude = other.join("p/live.jsonl");
     write_transcript(&claude, "claude-live");
     wait_for(claude, LIVE_EVENT_TIMEOUT).await;

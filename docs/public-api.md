@@ -1113,7 +1113,7 @@ other depths are not sessions. A pass visits the highest directory names first,
 so the newest sessions are indexed when a tree outgrows the per-pass entry
 bound. On Linux the watcher keeps a live watch on every date directory and on
 the newest 1024 session directories of each dated root (newest first; a new
-one evicts the oldest), and the periodic pass reaches the older sessions, so a large store
+one evicts the watch registered longest ago), and the periodic pass reaches the older sessions, so a large store
 never takes the backend-wide watch budget from other runtimes. These keys are refused without the feature
 (`runtime_feature_unsupported`), and a `root_env` or `root_home` without its
 partner, an unsafe path or a `max_depth` out of range is `descriptor_invalid`.

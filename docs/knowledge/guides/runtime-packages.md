@@ -251,7 +251,7 @@ directory names first, so a tree that outgrows the per-pass entry bound has its
 newest sessions indexed. On Linux the watcher keeps a live watch on every date
 directory and on the newest 1024 session directories of each dated root,
 registered newest first;
-a new session directory evicts the oldest watch, and older sessions are reached
+a new session directory evicts the watch registered longest ago, and older sessions are reached
 by the periodic pass, so a large store never takes watches from other runtimes.
 A foreground agent started inside a shell session is
 attributed through this root; the agent's session log is the only evidence.

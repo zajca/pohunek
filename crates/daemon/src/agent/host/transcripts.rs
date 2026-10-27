@@ -103,11 +103,16 @@ impl TranscriptParser {
         }
     }
 
-    /// Whether the transcript tree is sharded by date, so a walk that ends at
-    /// a bound must have visited the newest directories first.
+    /// The depth of the session directories below the root when the tree is
+    /// sharded by date, so a walk that ends at a bound must have visited the
+    /// newest directories first and only the newest session directories hold
+    /// a watch.
     #[must_use]
-    pub fn is_dated_tree(self) -> bool {
-        matches!(self, Self::MuseSessionV1)
+    pub fn dated_depth(self) -> Option<u8> {
+        match self {
+            Self::MuseSessionV1 => Some(4),
+            Self::JsonlHeadV1 => None,
+        }
     }
 }
 

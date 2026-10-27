@@ -162,9 +162,10 @@ const PRIVATE_PATH_LABEL: &str = "<profile config home>";
 impl TranscriptRoot {
     /// The bound of the walk of this root, when its descriptor declares one.
     fn walk_bound(&self) -> Option<watch::WalkBound> {
-        self.max_depth.map(|max_depth| watch::WalkBound {
-            max_depth,
-            dated: self.parser.is_dated_tree(),
+        let dated_depth = self.parser.dated_depth();
+        (self.max_depth.is_some() || dated_depth.is_some()).then_some(watch::WalkBound {
+            max_depth: self.max_depth,
+            dated_depth,
         })
     }
 
@@ -698,7 +699,7 @@ impl TranscriptIndex {
         let mut entries_left = limits.entries;
         let mut directories_left = limits.directories;
         let mut transcripts_left = limits.transcripts;
-        let newest_first = root.parser.is_dated_tree();
+        let newest_first = root.parser.dated_depth().is_some();
         let mut queue = VecDeque::from([(root.path.clone(), 0_u8)]);
         'walk: while let Some((dir, depth)) = queue.pop_front() {
             if cancel.is_cancelled() {
