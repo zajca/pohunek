@@ -13,6 +13,7 @@ use super::{
     MockInspector, DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID, PID_REUSE_AGENT_PID,
 };
 use crate::procwatch::{ProcessInspector, StartIdentity};
+use crate::runtime::Worker;
 use crate::session::{RuntimeHandle, SessionRegistry, SessionRegistryConfig, ShellCommand};
 use crate::store::DesiredState;
 use pohunek_test_support::wait::{guard, HANG_GUARD};
@@ -24,11 +25,16 @@ use std::time::Duration;
 const AGENT_PID: u32 = PID_REUSE_AGENT_PID;
 
 /// A stop parked after it marked the session stopping. The controller lease is
-/// released first, so once the stop is let go the worker refuses it while the
-/// PTY stays up.
+/// released as the stop is let go, so the worker refuses it while the PTY stays
+/// up. The lease stays valid while the stop is parked: the worker answers an
+/// inspect only to the lease holder, so a released lease would fail every poll
+/// of the worker exit watcher, whose lost-worker classification then waits for
+/// the lifecycle lock the parked stop holds and keeps the session from ever
+/// settling.
 struct FailingStop {
     registry: SessionRegistry,
     id: SessionId,
+    worker: Worker,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     task: JoinHandle<Result<protocol::SessionStopResult, protocol::ProtocolError>>,
@@ -60,16 +66,22 @@ impl FailingStop {
             };
             worker.clone()
         };
-        worker
-            .release_controller()
-            .await
-            .expect("release the controller lease");
         let gate = registry.hold_next_stop_intent(id);
         let task = start(registry, id);
         gate.entered.notified().await;
+        // The worker exit watcher polls while the stop is parked; one poll
+        // applied here shows the parked stop leaves the session settleable.
+        let poll = registry.hold_next_input(id, "worker_snapshot");
+        guard(
+            "a worker poll reached its snapshot during the parked stop",
+            poll.entered.notified(),
+        )
+        .await;
+        poll.release.notify_one();
         Self {
             registry: registry.clone(),
             id: id.clone(),
+            worker,
             entered: gate.entered,
             release: gate.release,
             task,
@@ -79,6 +91,10 @@ impl FailingStop {
     /// Lets the parked stop go on and returns its error.
     async fn fail(self) -> protocol::ProtocolError {
         let _ = &self.entered;
+        self.worker
+            .release_controller()
+            .await
+            .expect("release the controller lease");
         self.release.notify_one();
         let result = tokio::time::timeout(HANG_GUARD, self.task)
             .await
