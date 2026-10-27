@@ -248,7 +248,11 @@ working directory (`payload.record.workspace_root`, used only when absolute).
 A log nested below a session (a subagent log), at another depth or in a
 directory that is not a UUID is not a session. The walk visits the highest
 directory names first, so a tree that outgrows the per-pass entry bound has its
-newest sessions indexed. A foreground agent started inside a shell session is
+newest sessions indexed. On Linux the watcher keeps a live watch on every date
+directory and on the newest 1024 session directories, registered newest first;
+a new session directory evicts the oldest watch, and older sessions are reached
+by the periodic pass, so a large store never takes watches from other runtimes.
+A foreground agent started inside a shell session is
 attributed through this root; the agent's session log is the only evidence.
 
 A hook runtime whose conversation is a directory named after its id declares

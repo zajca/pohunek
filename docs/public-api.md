@@ -1111,7 +1111,10 @@ the `<uuid>` directory name) and the absolute working directory
 (`payload.record.workspace_root`). Logs nested below a session and logs at
 other depths are not sessions. A pass visits the highest directory names first,
 so the newest sessions are indexed when a tree outgrows the per-pass entry
-bound. These keys are refused without the feature
+bound. On Linux the watcher keeps a live watch on every date directory and on
+the newest 1024 session directories (newest first; a new one evicts the
+oldest), and the periodic pass reaches the older sessions, so a large store
+never takes the backend-wide watch budget from other runtimes. These keys are refused without the feature
 (`runtime_feature_unsupported`), and a `root_env` or `root_home` without its
 partner, an unsafe path or a `max_depth` out of range is `descriptor_invalid`.
 

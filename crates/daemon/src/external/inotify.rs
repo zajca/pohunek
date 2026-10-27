@@ -79,6 +79,9 @@ pub(super) struct InotifyBackend {
     /// Directory levels below a root its tree registers, for roots that bound
     /// the walk.
     depth_limits: HashMap<PathBuf, u8>,
+    /// The deepest-level directories of bounded roots (a session directory of
+    /// a dated tree) that hold a watch, oldest first.
+    recent_deepest: VecDeque<PathBuf>,
 }
 
 /// One directory entry as seen by the tree walk.
@@ -124,6 +127,22 @@ fn is_limit_error(error: &io::Error) -> bool {
     )
 }
 
+/// `entries` with the highest names first and entry errors last.
+fn newest_entry_first(
+    entries: Box<dyn Iterator<Item = io::Result<ListedEntry>>>,
+) -> Box<dyn Iterator<Item = io::Result<ListedEntry>>> {
+    let (mut listed, failed): (Vec<_>, Vec<_>) = entries.partition(Result::is_ok);
+    listed.sort_by_key(|entry| {
+        std::cmp::Reverse(
+            entry
+                .as_ref()
+                .ok()
+                .and_then(|entry| entry.path.file_name().map(std::ffi::OsStr::to_os_string)),
+        )
+    });
+    Box::new(listed.into_iter().chain(failed))
+}
+
 /// Records a cancelled walk as a failed one; returns whether to stop.
 fn cancelled(
     cancel: &CancellationToken,
@@ -137,6 +156,15 @@ fn cancelled(
     first_error.get_or_insert(io::Error::from(io::ErrorKind::Interrupted));
     true
 }
+
+/// Most deepest-level directories of bounded roots that hold a watch.
+///
+/// A dated tree grows by a directory per session, so it would fill the
+/// backend-wide [`MAX_WALK_DIRECTORIES`] budget. The newest ones are watched, a
+/// new one evicts the oldest, and the date levels above them always keep their
+/// watches: a new session is seen live whatever the age of the store, while
+/// older sessions are reached by the periodic reconcile.
+const MAX_WATCHED_DEEPEST_DIRECTORIES: usize = 1024;
 
 fn limit_error(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::QuotaExceeded, reason)
@@ -159,6 +187,7 @@ impl InotifyBackend {
             lister: list_directory,
             add_watch: inotify_add_watch,
             depth_limits: HashMap::new(),
+            recent_deepest: VecDeque::new(),
         })
     }
 
@@ -216,13 +245,34 @@ impl InotifyBackend {
             return RootRegistration::Complete;
         }
         let mut queue = VecDeque::from([(root.to_path_buf(), start_depth)]);
+        let mut registered_deepest = Vec::new();
         let mut is_root = true;
         'walk: while let Some((dir, depth)) = queue.pop_front() {
             if cancelled(cancel, &mut failed_dirs, &mut first_error) {
                 break 'walk;
             }
+            let deepest = limit == Some(depth) && depth > 0;
+            let watched_before = self.wd_by_path.contains_key(&dir);
+            if deepest
+                && !watched_before
+                && discovery.is_none()
+                && self.recent_deepest.len() + registered_deepest.len()
+                    >= MAX_WATCHED_DEEPEST_DIRECTORIES
+            {
+                // A pass over the whole tree keeps the newest session
+                // directories it met first; the rest wait for the reconcile.
+                continue;
+            }
             match self.add_dir(&dir) {
-                Ok(true) => {}
+                Ok(true) => {
+                    if deepest && !watched_before {
+                        if discovery.is_some() {
+                            self.note_new_deepest(dir.clone());
+                        } else {
+                            registered_deepest.push(dir.clone());
+                        }
+                    }
+                }
                 Ok(false) => {
                     // Another path already watches this directory; that path's
                     // registration covers the tree.
@@ -258,6 +308,12 @@ impl InotifyBackend {
                     continue;
                 }
             };
+            let entries = if limit.is_some() {
+                newest_entry_first(entries)
+            } else {
+                entries
+            };
+            let mut subdirectories = Vec::new();
             for entry in entries {
                 if cancelled(cancel, &mut failed_dirs, &mut first_error) {
                     break 'walk;
@@ -286,7 +342,7 @@ impl InotifyBackend {
                         first_error.get_or_insert(limit_error("watched directory limit reached"));
                         break 'walk;
                     }
-                    queue.push_back((entry.path, depth + 1));
+                    subdirectories.push(entry.path);
                 } else if let Some(found) = discovery.as_deref_mut() {
                     if is_jsonl_path(&entry.path) {
                         if found.paths.len() < MAX_DISCOVERED_TRANSCRIPTS {
@@ -297,13 +353,41 @@ impl InotifyBackend {
                     }
                 }
             }
+            if limit.is_some() {
+                // Depth first, highest names first, so the newest directories
+                // are registered before an exhausted budget cuts the walk.
+                for path in subdirectories.into_iter().rev() {
+                    queue.push_front((path, depth + 1));
+                }
+            } else {
+                queue.extend(subdirectories.into_iter().map(|path| (path, depth + 1)));
+            }
         }
+        // The first met are the newest, so they go in last: the oldest watch is
+        // the first to be evicted.
+        self.recent_deepest
+            .extend(registered_deepest.into_iter().rev());
         match first_error {
             Some(first_error) => RootRegistration::Partial {
                 failed_dirs,
                 first_error,
             },
             None => RootRegistration::Complete,
+        }
+    }
+
+    /// Records a newly watched deepest-level directory and evicts the oldest
+    /// watches beyond [`MAX_WATCHED_DEEPEST_DIRECTORIES`].
+    fn note_new_deepest(&mut self, dir: PathBuf) {
+        self.recent_deepest.push_back(dir);
+        while self.recent_deepest.len() > MAX_WATCHED_DEEPEST_DIRECTORIES {
+            let Some(oldest) = self.recent_deepest.pop_front() else {
+                break;
+            };
+            if let Some(wd) = self.wd_by_path.remove(&oldest) {
+                self.paths_by_wd.remove(&wd);
+                inotify_rm_watch(self.fd.get_ref().as_raw_fd(), wd);
+            }
         }
     }
 
@@ -393,12 +477,14 @@ impl WatchBackend for InotifyBackend {
         self.fd = AsyncFd::new(inotify_init()?)?;
         self.paths_by_wd.clear();
         self.wd_by_path.clear();
+        self.recent_deepest.clear();
         Ok(())
     }
 
     fn unregister_all(&mut self) {
         let fd = self.fd.get_ref().as_raw_fd();
         self.wd_by_path.clear();
+        self.recent_deepest.clear();
         // The mapping is cleared first so the `IN_IGNORED` records queued by the
         // removals below resolve to no path and are dropped.
         for (wd, _path) in self.paths_by_wd.drain() {
@@ -530,36 +616,6 @@ mod tests {
         MAX_WALK_DIRECTORIES,
     };
     use crate::external::watch::{RootRegistration, WatchBackend};
-
-    #[tokio::test]
-    async fn registration_stops_below_the_depth_bound() {
-        let root = pohunek_test_support::tempdir().expect("root");
-        fs::create_dir_all(root.path().join("a/b/c")).expect("tree");
-        let mut backend = InotifyBackend::open().expect("open inotify");
-        backend.limit_depth(root.path(), Some(2));
-
-        let outcome = backend.register_root(root.path(), &CancellationToken::new());
-
-        assert!(matches!(outcome, RootRegistration::Complete));
-        let mut watched: Vec<_> = backend.wd_by_path.keys().cloned().collect();
-        watched.sort();
-        assert_eq!(
-            watched,
-            [
-                root.path().to_path_buf(),
-                root.path().join("a"),
-                root.path().join("a/b"),
-            ]
-        );
-        // A directory that appears below the bound is not registered.
-        let mut hints = Vec::new();
-        backend.watch_new_directory(
-            &root.path().join("a/b/c"),
-            &mut hints,
-            &CancellationToken::new(),
-        );
-        assert!(!backend.wd_by_path.contains_key(&root.path().join("a/b/c")));
-    }
 
     fn event(wd: libc::c_int, mask: u32, name: Option<&str>) -> InotifyEvent {
         InotifyEvent {
