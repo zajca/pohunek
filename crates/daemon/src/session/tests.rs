@@ -696,23 +696,36 @@ fn wait_params(
 /// Real-time ceiling of one await in the wait test: a quarter of [`HANG_GUARD`],
 /// so a stalled await fails with a state dump before nextest terminates the
 /// test and before the inhibitor's own ceiling lets the paused clock run.
+// timing-allowed: #1675 the ceiling must undercut the inhibitor's HANG_GUARD
 const STALL_CEILING: Duration = Duration::from_secs(HANG_GUARD.as_secs() / 4);
 
 /// Real-time ceiling of the state probes inside a stall dump.
+// timing-allowed: #1675 the dump probes must end well inside STALL_CEILING
 const DUMP_PROBE_CEILING: Duration = Duration::from_secs(HANG_GUARD.as_secs() / 40);
 
-/// Awaits `future` for at most `ceiling` of real time.
+/// A parked blocking task that finishes after `ceiling` of real time, or as
+/// soon as the returned sender is dropped.
 ///
-/// The paused tokio clock has no timer to bound the await with, so the ceiling
-/// is a parked blocking task; `None` means the future was still pending.
+/// The paused tokio clock has no timer to bound an await with, so real time
+/// is measured on a blocking thread.
+fn real_time_ceiling(
+    ceiling: Duration,
+) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+    // timing-allowed: #1675 real-time bound on a paused clock
+    let timer = tokio::task::spawn_blocking(move || {
+        let _ = cancelled.recv_timeout(ceiling);
+    });
+    (cancel, timer)
+}
+
+/// Awaits `future` for at most `ceiling` of real time; `None` means the future
+/// was still pending.
 async fn within_real_time<T>(
     ceiling: Duration,
     future: impl std::future::Future<Output = T>,
 ) -> Option<T> {
-    let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
-    let timer = tokio::task::spawn_blocking(move || {
-        let _ = cancelled.recv_timeout(ceiling);
-    });
+    let (cancel, timer) = real_time_ceiling(ceiling);
     tokio::pin!(future);
     let outcome = tokio::select! {
         output = &mut future => Some(output),
@@ -724,21 +737,30 @@ async fn within_real_time<T>(
 
 /// Fails a stalled await of the session wait test with the state that tells
 /// which side is stuck: the waiter registrations, the stored `updated_at`
-/// against the waiter's cursor, and whether the registry locks are held.
+/// against the metadata waiter's cursor, and whether the registry locks are
+/// held.
 struct StallProbe<'a> {
     registry: &'a SessionRegistry,
     id: &'a SessionId,
+    /// `after_updated_at` of the metadata waiter.
     cursor: &'a str,
     ceiling: Duration,
 }
 
 impl StallProbe<'_> {
     /// Awaits `future`; panics with a dump when it is pending after the
-    /// probe's ceiling of real time.
+    /// probe's ceiling of real time. The dump is taken while `future` is
+    /// still alive, so a lock it holds shows as held.
     async fn at<T>(&self, label: &str, future: impl std::future::Future<Output = T>) -> T {
         let started = Instant::now();
-        if let Some(output) = within_real_time(self.ceiling, future).await {
-            return output;
+        let (cancel, timer) = real_time_ceiling(self.ceiling);
+        tokio::pin!(future);
+        tokio::select! {
+            output = &mut future => {
+                drop(cancel);
+                return output;
+            }
+            _ = timer => {}
         }
         let dump = self.dump().await;
         panic!(
@@ -771,7 +793,7 @@ impl StallProbe<'_> {
             ),
         };
         format!(
-            "waiter cursor (after_updated_at)={}\nregistered waiters={registered:?}\n\
+            "metadata waiter cursor (after_updated_at)={}\nregistered waiters={registered:?}\n\
              sessions lock held={sessions_lock_held} persist lock held={persist_lock_held}\n\
              stored session: {stored}",
             self.cursor
