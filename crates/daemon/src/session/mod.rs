@@ -81,6 +81,7 @@ mod diff;
 mod forward;
 mod hooks;
 mod input;
+mod journal_gc;
 mod lag;
 mod native_attestation;
 mod native_repair;
@@ -501,6 +502,11 @@ pub struct SessionRegistryConfig {
     /// `host.inspect` (`[inventory]` of `service.toml`). Defaults to
     /// [`pohunek_service_config::DEFAULT_INVENTORY_PROBE`].
     pub inventory_probe: pohunek_service_config::InventoryProbe,
+    /// Age after which the startup collection may delete the journal
+    /// directory of a session that no longer exists (`[worker_journals]` of
+    /// `service.toml`). Defaults to
+    /// [`pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE`].
+    pub worker_journal_max_age: std::time::Duration,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
@@ -651,6 +657,7 @@ impl Default for SessionRegistryConfig {
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             remote_keepalive: pohunek_service_config::DEFAULT_KEEPALIVE_TIMING,
             inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
+            worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
             retention_policy_path: None,
             idle_stop_policy_path: None,
             idle_stop_min_secs: idle_stop::DEFAULT_IDLE_STOP_MIN_SECS,
@@ -2040,8 +2047,14 @@ impl SessionRegistry {
     }
 
     async fn delete_session_record(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        self.delete_session_record_durably(id).await.map(|_| ())
+    }
+
+    /// Removes the record and reports whether the removal is durable: `false`
+    /// means it is visible but a crash may bring the record back.
+    async fn delete_session_record_durably(&self, id: &SessionId) -> Result<bool, ProtocolError> {
         let Some(store) = self.store_for_write()? else {
-            return Ok(());
+            return Ok(true);
         };
         let session_id = id.0.clone();
         self.inner
@@ -2054,7 +2067,7 @@ impl SessionRegistry {
                     format!("session record removal task panicked for {}", id.0),
                 )
             })?
-            .map(|_| ())
+            .map(|mutation| matches!(mutation, crate::store::StoreMutation::Synced(_)))
             .map_err(|error| {
                 runtime_error(
                     "session_store_failed",
@@ -6386,20 +6399,32 @@ impl SessionRegistry {
         // lingering resume binding (idempotent for a session that already dropped
         // its binding on exit or stop).
         self.persist_resume_binding(id).await;
-        if let Err(error) = self.delete_session_record(id).await {
-            // The entry leaves first so the binding cleanup above cannot re-read
-            // it as live. The record still holds the removal intent, so the
-            // entry is listed again for a retried removal; the callers hold the
-            // lifecycle lock, so no other entry can have taken its place.
-            if let Some(entry) = evicted {
-                self.inner
-                    .sessions
-                    .lock()
-                    .await
-                    .entry(id.clone())
-                    .or_insert(entry);
+        let record_durably_gone = match self.delete_session_record_durably(id).await {
+            Ok(durable) => durable,
+            Err(error) => {
+                // The entry leaves first so the binding cleanup above cannot
+                // re-read it as live. The record still holds the removal
+                // intent, so the entry is listed again for a retried removal;
+                // the callers hold the lifecycle lock, so no other entry can
+                // have taken its place.
+                if let Some(entry) = evicted {
+                    self.inner
+                        .sessions
+                        .lock()
+                        .await
+                        .entry(id.clone())
+                        .or_insert(entry);
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        // The record is gone, so nothing replays this removal any more. Logs
+        // and the temporary directory go before the record; the journals go
+        // after it, because a replayed removal proves its workers gone from
+        // them. A cleanup accepted without confirmation, or a record delete a
+        // crash could undo, keeps its journals for the startup collection.
+        if record_durably_gone && accepted_unconfirmed.is_empty() {
+            self.delete_session_journals(id).await;
         }
         if let Some(entry) = &evicted {
             self.emit(event::SESSION_REMOVED, &entry.info);

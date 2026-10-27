@@ -137,6 +137,14 @@ limit) and logs one WARN with its path and size to `pohunekd.jsonl` (the same
 WARN covers an age-expired active file); the
 history it held is not kept. A daemon started without `service.toml` uses the
 values above.
+The optional `[worker_journals]` table holds `max_age_days = 7` (`1..=365`): how
+long the journal directory `<state>/workers/<session>/` of a session that no
+longer exists must be untouched before the daemon's startup collection may
+delete it, once every worker its journals name is gone. The writer omits the
+table while the key equals its default, so a previous release still reads the
+file; a previous release that reads the table reports it as an unknown table
+and keeps the journals. Removing a session deletes its journal directory right
+after its record.
 `<ns>` is a 12-hex-digit namespace derived from the user ID and the state and
 runtime roots, so separate installations never touch each other's jobs.
 They never share a prefix either: the first install claims it in

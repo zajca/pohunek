@@ -107,6 +107,7 @@ pub(crate) fn config_with_search_path(
         hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
         inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
+        worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
         open_files: settings::OPEN_FILES,
     })?)
 }

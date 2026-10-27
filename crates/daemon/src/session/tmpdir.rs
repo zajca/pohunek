@@ -177,6 +177,7 @@ impl SessionRegistry {
 }
 
 /// The sessions whose private temporary directory startup keeps.
+#[derive(Clone)]
 pub(super) enum TmpdirOwners {
     /// Every session that may own a directory; any other entry is orphaned.
     Known(HashSet<String>),
@@ -190,6 +191,17 @@ pub(super) enum TmpdirOwners {
 }
 
 impl TmpdirOwners {
+    /// The same owners plus `sessions`; unknown ownership stays unknown.
+    pub(super) fn with_sessions(self, sessions: impl IntoIterator<Item = String>) -> Self {
+        match self {
+            Self::Known(mut known) => {
+                known.extend(sessions);
+                Self::Known(known)
+            }
+            unknown @ Self::Unknown { .. } => unknown,
+        }
+    }
+
     /// Ownership is unknown because of an expected store condition.
     pub(super) fn unknown(reason: String) -> Self {
         Self::Unknown {

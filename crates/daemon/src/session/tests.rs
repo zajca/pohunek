@@ -21353,6 +21353,84 @@ async fn a_removal_that_fails_after_the_sweep_still_logs_that_it_proceeded() {
     assert_eq!(logs.text().matches(proceeds_log).count(), 2);
 }
 
+/// The journal directory of session `id`, and the names the worker state root
+/// holds.
+fn journal_directory_of(registry: &SessionRegistry, id: &SessionId) -> (PathBuf, PathBuf) {
+    let root = registry
+        .inner
+        .config
+        .worker_state_root
+        .clone()
+        .expect("worker state root");
+    (root.join(&id.0), root)
+}
+
+/// Names below `root` that are tombstones of a journal directory being deleted.
+fn tombstones_in(root: &std::path::Path) -> Vec<String> {
+    fs::read_dir(root)
+        .expect("read the worker state root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(pohunek_paths::WORKER_TOMBSTONE_PREFIX))
+        .collect()
+}
+
+/// Removing a session deletes its journal directory with no tombstone left.
+#[tokio::test]
+async fn removing_a_session_deletes_its_journal_directory() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("remove-journal-dir");
+    let session = exited_session(&registry, None).await;
+    let (directory, root) = journal_directory_of(&registry, &session.id);
+    assert!(directory.is_dir(), "the worker journaled the session");
+
+    registry.remove(&session.id).await.expect("remove");
+
+    assert!(!directory.exists(), "the journals go with the session");
+    assert_eq!(tombstones_in(&root), Vec::<String>::new());
+}
+
+/// A removal whose record delete fails keeps the journals, so the replay still
+/// proves its workers gone, and the replay deletes them.
+#[tokio::test]
+async fn a_failed_record_delete_keeps_the_journals_until_the_replay_completes() {
+    let (registry, data_dir, _worktree_root) = retention_registry("remove-journal-replay");
+    let session = exited_session(&registry, None).await;
+    let (directory, _root) = journal_directory_of(&registry, &session.id);
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500))
+        .expect("make the store directory read-only");
+    let failed = registry.remove(&session.id).await;
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))
+        .expect("restore the store directory");
+    let failed = failed.expect_err("the record cannot be deleted");
+    assert_eq!(failed.code, "session_store_failed", "{failed:?}");
+    assert!(directory.is_dir(), "the journals outlive a failed delete");
+
+    registry.remove(&session.id).await.expect("the replay");
+    assert!(!directory.exists());
+}
+
+/// A removal that proceeded past an unconfirmed process keeps its journal
+/// directory as evidence; a removal that needed no consent deletes it.
+#[tokio::test]
+async fn an_unconfirmed_cleanup_keeps_the_journal_directory() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-journal-unconfirmed",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session_in(&registry, None).await;
+    let (directory, _root) = journal_directory_of(&registry, &session.id);
+    inspector.set_live_candidates(true);
+    inspector.set_candidate(true);
+
+    registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("the removal proceeds");
+
+    assert!(directory.is_dir(), "an accepted cleanup keeps the evidence");
+}
+
 /// A removal that needs no consent reports no accepted processes even when
 /// the caller consented.
 #[tokio::test]
