@@ -1,0 +1,3 @@
+## Unreleased (2026-10-27, transcripts below a data root, #1649)
+
+- A runtime descriptor can keep its session logs outside the config home (`[transcripts] root_env`, `root_home`, `max_depth`), read dated session logs with the `muse-session-v1` parser, and verify a hook reference through a directory named after it (`[native_reference.existence] dir_name`). All three are feature `transcripts-data-root-v1`; core refuses a descriptor that uses one without it in `requires` with `runtime_feature_unsupported`. See [Transcripts outside the config home](guides/runtime-packages.md#transcripts-outside-the-config-home).

@@ -107,6 +107,7 @@ The features this core implements:
 | `config-home-subdir-v1` | 0.38.0 | `[config_home] subdir` |
 | `version-probe-revision-v1` | 0.38.0 | `version_probe.parser = "semver-revision-line-v1"` |
 | `launch-env-v1` | 0.38.0 | `[launch_env]` |
+| `transcripts-data-root-v1` | 0.38.0 | `[transcripts] root_env`, `root_home`, `max_depth`; `parser = "muse-session-v1"`; `[native_reference.existence] dir_name` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -195,7 +196,7 @@ parser = "jsonl-head-v1"   # compiled parser core provides
 dir = "sessions"           # transcript tree below [config_home]
 ```
 
-`parser` names a parser compiled into core; `jsonl-head-v1` is the only one. It
+`parser` names a parser compiled into core: `jsonl-head-v1`, or `muse-session-v1` (below). It
 reads at most the first 32 records (64 KiB) of each `*.jsonl` file and takes the
 first `session_id`, `sessionId`, `conversation_id` or `conversationId` (in that
 order within the first record that has one), `transcript_path` or
@@ -213,6 +214,68 @@ tree), the observer attributes both trees to neither and logs a warning
 `external.transcript_roots.ambiguous` with code `transcripts_ambiguous_owner`
 for each home; the other roots stay watched. The official `codex` package
 declares `sessions` and the official `claude` package declares `projects`.
+
+### Transcripts outside the config home
+
+An agent that keeps its session logs elsewhere, under `XDG_DATA_HOME` for
+instance, names the root itself (runtime feature `transcripts-data-root-v1`,
+listed in `requires`) and bounds the walk of a deep tree:
+
+```toml
+requires = ["transcripts-data-root-v1"]
+
+[transcripts]
+parser = "muse-session-v1"
+root_env = "XDG_DATA_HOME"   # variable that relocates the root
+root_home = ".local/share"   # root below the user's home while it is unset
+dir = "muse/sessions"        # log tree below the root
+max_depth = 4                # directory levels below dir the observer lists
+```
+
+`root_env` and `root_home` come together and resolve like `env` and `default`
+of a `[config_home]` (a host profile's `[env]` over the daemon's base
+environment, else the default below `HOME`; a relative value is a typed error,
+never a fallback). With them the table needs no `[config_home]`, and the
+variable cannot be a `[launch_env]` name. `max_depth` is 1 to 6; the observer
+lists no directory below it and registers no watch there. A dated tree is
+never walked below its session directories (level 4), whatever `max_depth` says.
+
+`muse-session-v1` reads a session log at exactly
+`YYYY/MM/DD/<uuid>/session.jsonl` below `dir`. A line is a framed transaction
+(`children[].record_json`) or a bare record; within the first 32 lines (64 KiB)
+the first record whose `payload_type` is `runtime.session.metadata` gives the
+session id (`stream.id`, which must equal the `<uuid>` directory name) and the
+working directory (`payload.record.workspace_root`, used only when absolute).
+A log nested below a session (a subagent log), at another depth or in a
+directory that is not a UUID is not a session. The walk visits the highest
+directory names first, so a tree that outgrows the per-pass entry bound has its
+newest sessions indexed. On Linux the watcher keeps a live watch on every date
+directory and on the newest 1024 session directories of each dated root,
+registered newest first;
+a new session directory evicts the watch registered longest ago, and older sessions are reached
+by the periodic pass, so a large store never takes watches from other runtimes.
+A foreground agent started inside a shell session is
+attributed through this root; the agent's session log is the only evidence.
+
+A hook runtime whose conversation is a directory named after its id declares
+that next to its `hook` strategy:
+
+```toml
+[native_reference.existence]
+check = "file"
+root_env = "XDG_DATA_HOME"
+root_home = ".local/share"
+dir = "muse/sessions"
+dir_name = "{reference}"
+file_name = "session.jsonl"   # a plain name, no placeholder
+max_depth = 3                 # levels the scan descends below dir (YYYY/MM/DD)
+```
+
+Recovery refuses (`agent_native_reference_missing`) a reference without a
+regular `<dir_name>/<file_name>` there. The scan never follows a symlink, goes
+through the highest names first and is bounded like the other existence checks.
+`dir_name` must be `{reference}`; it is not accepted with `strategy =
+"assigned"`, `name_match`, `store_env`, `store_max_depth` or `relocating_*`.
 
 ## Hook schemas and integration handlers
 

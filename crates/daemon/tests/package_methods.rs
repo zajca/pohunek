@@ -756,6 +756,297 @@ async fn a_config_home_subdir_installs_only_with_its_feature_and_as_a_plain_path
     servers.stop().await;
 }
 
+const DATA_ROOT_FEATURE: &str = "\"transcripts-data-root-v1\"";
+
+/// A `[transcripts]` table whose tree lies below a root of its own.
+fn data_root_transcripts(parser: &str, extra: &str) -> String {
+    format!(
+        "\n[transcripts]\nparser = \"{parser}\"\ndir = \"acme/sessions\"\n\
+         root_env = \"ACME_DATA\"\nroot_home = \".local/share\"\n{extra}"
+    )
+}
+
+/// The Pi-shaped descriptor with a `hook` strategy declaring `existence`.
+fn hook_descriptor(requires: &str, existence: &str, tables: &str) -> String {
+    descriptor_requiring(requires, tables)
+        .replace(
+            "strategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]\n",
+            "strategy = \"hook\"\n",
+        )
+        .replace("check = \"none\"\n", &format!("{existence}\n"))
+}
+
+/// A `[native_reference.existence]` body naming the conversation directory.
+const DIR_NAME_EXISTENCE: &str = "check = \"file\"\nroot_env = \"ACME_DATA\"\n\
+     root_home = \".local/share\"\ndir = \"acme/sessions\"\ndir_name = \"{reference}\"\n\
+     file_name = \"session.jsonl\"\nmax_depth = 3";
+
+/// Installs each `(name, document)` and asserts the result code of all of them.
+async fn assert_install_codes(
+    local: &mut Framed<UnixStream, LinesCodec>,
+    plugins: &Path,
+    cases: &[(&str, String)],
+    code: &str,
+) {
+    for (name, document) in cases {
+        let (_digest, result) = install_descriptor(local, plugins, name, document, false).await;
+        assert_eq!(result.expect_err(name).code, code, "{name}");
+    }
+}
+
+/// Descriptors whose `[transcripts]` table (derived from `plain`) is invalid.
+fn invalid_data_root_tables(plain: &str) -> Vec<(&'static str, String)> {
+    [
+        (
+            "only-root-env",
+            "\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"a\"\nroot_env = \"ACME_DATA\"\n"
+                .to_owned(),
+        ),
+        (
+            "only-root-home",
+            "\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"a\"\nroot_home = \".local\"\n"
+                .to_owned(),
+        ),
+        (
+            "no-root-no-home",
+            "\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"a\"\n".to_owned(),
+        ),
+        ("lower-env", plain.replace("ACME_DATA", "acme_data")),
+        ("reserved-env", plain.replace("ACME_DATA", "POHUNEK_DATA")),
+        ("absolute-home", plain.replace(".local/share", "/srv/share")),
+        ("parent-home", plain.replace(".local/share", "../share")),
+        (
+            "dir-too-deep",
+            plain.replace("acme/sessions", &["a"; 9].join("/")),
+        ),
+        (
+            "depth-zero",
+            data_root_transcripts("jsonl-head-v1", "max_depth = 0\n"),
+        ),
+        (
+            "depth-over",
+            data_root_transcripts("jsonl-head-v1", "max_depth = 7\n"),
+        ),
+        (
+            "depth-huge",
+            data_root_transcripts("jsonl-head-v1", "max_depth = 300\n"),
+        ),
+        (
+            "depth-negative",
+            data_root_transcripts("jsonl-head-v1", "max_depth = -1\n"),
+        ),
+        (
+            "depth-text",
+            data_root_transcripts("jsonl-head-v1", "max_depth = \"4\"\n"),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, tables)| (name, descriptor_requiring(DATA_ROOT_FEATURE, &tables)))
+    .collect()
+}
+
+#[tokio::test]
+async fn a_transcript_root_of_its_own_installs_only_with_its_feature_and_valid() {
+    let servers = spawn_servers("pkg-data-root").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let plain = data_root_transcripts("jsonl-head-v1", "");
+
+    // Every key and the parser the feature owns is refused without `requires`.
+    let gated = [
+        ("root-keys", plain.clone()),
+        (
+            "max-depth",
+            "\n[config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n\
+             [transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"sessions\"\nmax_depth = 2\n"
+                .to_owned(),
+        ),
+        (
+            "parser",
+            "\n[config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n\
+             [transcripts]\nparser = \"muse-session-v1\"\ndir = \"sessions\"\n"
+                .to_owned(),
+        ),
+    ]
+    .map(|(name, tables)| (name, descriptor_requiring("", &tables)));
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &gated,
+        "runtime_feature_unsupported",
+    )
+    .await;
+
+    let refused = invalid_data_root_tables(&plain);
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &refused,
+        "package_descriptor_invalid",
+    )
+    .await;
+    // The variable that relocates the root is not a `[launch_env]` name.
+    let both = format!("{DATA_ROOT_FEATURE}, \"launch-env-v1\"");
+    let owned = [(
+        "launch-env-root",
+        descriptor_requiring(
+            &both,
+            &(plain.replace("ACME_DATA", "PI_DATA") + "\n[launch_env]\nPI_DATA = \"1\"\n"),
+        ),
+    )];
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &owned,
+        "package_descriptor_invalid",
+    )
+    .await;
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let accepted = [
+        ("own-root", plain),
+        (
+            "bounded-walk",
+            data_root_transcripts("jsonl-head-v1", "max_depth = 6\n"),
+        ),
+        (
+            "muse-parser",
+            data_root_transcripts("muse-session-v1", "max_depth = 4\n"),
+        ),
+    ];
+    for (index, (name, tables)) in accepted.iter().enumerate() {
+        let document = descriptor_requiring(DATA_ROOT_FEATURE, tables)
+            .replace("version = \"1.0.0\"", &format!("version = \"1.0.{index}\""));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, name, &document, false).await;
+        result.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// Hook descriptors whose directory-name existence is invalid.
+fn invalid_dir_name_existences() -> Vec<(&'static str, String)> {
+    let with = |existence: &str| hook_descriptor(DATA_ROOT_FEATURE, existence, "");
+    let without = |field: &str| {
+        DIR_NAME_EXISTENCE
+            .lines()
+            .filter(|line| !line.starts_with(field))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    [
+        (
+            "assigned-strategy",
+            descriptor_requiring(DATA_ROOT_FEATURE, "")
+                .replace("check = \"none\"\n", &format!("{DIR_NAME_EXISTENCE}\n")),
+        ),
+        (
+            "other-dir-name",
+            with(&DIR_NAME_EXISTENCE.replace("dir_name = \"{reference}\"", "dir_name = \"x\"")),
+        ),
+        (
+            "name-match",
+            with(&format!("{DIR_NAME_EXISTENCE}\nname_match = \"exact\"")),
+        ),
+        (
+            "store-env",
+            with(&format!(
+                "{DIR_NAME_EXISTENCE}\nstore_env = \"ACME_STORE\"\nstore_max_depth = 1"
+            )),
+        ),
+        (
+            "relocating-args",
+            with(&format!(
+                "{DIR_NAME_EXISTENCE}\nrelocating_args = [\"--store\"]"
+            )),
+        ),
+        (
+            "relocating-settings",
+            with(&format!(
+                "{DIR_NAME_EXISTENCE}\nrelocating_settings = [{{ base = \"root\", path = \"s.json\", key = \"k\" }}]"
+            )),
+        ),
+        (
+            "store-depth-only",
+            with(&format!("{DIR_NAME_EXISTENCE}\nstore_max_depth = 1")),
+        ),
+        (
+            "placeholder-file",
+            with(&DIR_NAME_EXISTENCE.replace("session.jsonl", "{reference}.jsonl")),
+        ),
+        (
+            "path-file",
+            with(&DIR_NAME_EXISTENCE.replace("session.jsonl", "a/session.jsonl")),
+        ),
+        ("no-file", with(&without("file_name"))),
+        ("no-depth", with(&without("max_depth"))),
+        (
+            "deep",
+            with(&DIR_NAME_EXISTENCE.replace("max_depth = 3", "max_depth = 5")),
+        ),
+        (
+            "no-root",
+            with(&without("root_env").replace("root_home = \".local/share\"\n", "")),
+        ),
+        (
+            "check-none",
+            with(&DIR_NAME_EXISTENCE.replace("check = \"file\"", "check = \"none\"")),
+        ),
+    ]
+    .into()
+}
+
+#[tokio::test]
+async fn a_directory_name_existence_installs_only_for_a_hook_runtime_with_its_feature() {
+    let servers = spawn_servers("pkg-dir-name").await;
+    let mut local = connect_unix(&servers.socket).await;
+
+    let gated = [(
+        "without-requires",
+        hook_descriptor("", DIR_NAME_EXISTENCE, ""),
+    )];
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &gated,
+        "runtime_feature_unsupported",
+    )
+    .await;
+
+    let with = |existence: &str| hook_descriptor(DATA_ROOT_FEATURE, existence, "");
+    let refused = invalid_dir_name_existences();
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &refused,
+        "package_descriptor_invalid",
+    )
+    .await;
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "valid",
+        &with(DIR_NAME_EXISTENCE),
+        false,
+    )
+    .await;
+    result.expect("a directory-name existence of a hook runtime installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
 /// Writes the executable shell `script` next to the plugin root and returns
 /// its path.
 fn write_program(plugins: &Path, name: &str, script: &str) -> PathBuf {

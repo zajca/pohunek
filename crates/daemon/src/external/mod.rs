@@ -35,6 +35,7 @@ use crate::session::SessionRegistry;
 mod fsevents;
 #[cfg(target_os = "linux")]
 mod inotify;
+mod muse;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
 mod watch;
@@ -148,6 +149,9 @@ pub(crate) struct TranscriptRoot {
     path: PathBuf,
     /// The compiled parser the runtime's descriptor names for its transcripts.
     parser: TranscriptParser,
+    /// The declared bound on the directory levels below `path`; see
+    /// [`TranscriptRoot::depth_limit`] for what a walk lists.
+    max_depth: Option<u8>,
     /// Whether the directory derives from a host profile's environment. Such a
     /// path never reaches a log line or a remote response.
     private: bool,
@@ -157,6 +161,35 @@ pub(crate) struct TranscriptRoot {
 const PRIVATE_PATH_LABEL: &str = "<profile config home>";
 
 impl TranscriptRoot {
+    /// The directory levels below the root a walk lists: the declared
+    /// `max_depth`, never below the session level of a date-sharded tree, whose
+    /// session directories hold nothing the parser reads.
+    fn depth_limit(&self) -> Option<u8> {
+        match (self.max_depth, self.parser.dated_depth()) {
+            (Some(declared), Some(dated)) => Some(declared.min(dated)),
+            (declared, dated) => declared.or(dated),
+        }
+    }
+
+    /// The bound of the walk of this root, when its descriptor or a
+    /// date-sharded parser bounds it.
+    fn walk_bound(&self) -> Option<watch::WalkBound> {
+        let dated_depth = self.parser.dated_depth();
+        self.depth_limit().map(|max_depth| watch::WalkBound {
+            max_depth,
+            dated_depth,
+        })
+    }
+
+    /// Whether `path` lies in a directory below this root's depth bound.
+    fn is_beyond_depth(&self, path: &Path) -> bool {
+        let Some(max) = self.depth_limit() else {
+            return false;
+        };
+        path.strip_prefix(&self.path)
+            .is_ok_and(|relative| relative.components().count() > usize::from(max) + 1)
+    }
+
     /// The root's path as a log line may show it.
     fn log_path(&self) -> String {
         self.log_path_of(&self.path)
@@ -528,18 +561,21 @@ impl TranscriptIndex {
     /// meanwhile is kept.
     pub(crate) fn upsert_path(&self, owner: &TranscriptRoot, path: &Path) -> io::Result<bool> {
         let gone = transcript_is_gone(path);
-        let signature = if gone {
+        // A change event beyond the root's depth bound (a backend that watches
+        // the whole tree reports one) indexes nothing.
+        let ignored = gone || owner.is_beyond_depth(path);
+        let signature = if ignored {
             None
         } else {
             FileSignature::read(path)
         };
-        let candidate = if gone {
+        let candidate = if ignored {
             None
         } else {
             #[cfg(test)]
             self.parses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match parse_transcript(owner.parser, owner.agent_base.clone(), path) {
+            match parse_transcript(owner.parser, owner.agent_base.clone(), &owner.path, path) {
                 Ok(candidate) => candidate.map(|candidate| TranscriptCandidate {
                     owner: Arc::new(owner.clone()),
                     ..candidate
@@ -675,25 +711,18 @@ impl TranscriptIndex {
         let mut entries_left = limits.entries;
         let mut directories_left = limits.directories;
         let mut transcripts_left = limits.transcripts;
-        let mut queue = VecDeque::from([root.path.clone()]);
-        'walk: while let Some(dir) = queue.pop_front() {
+        let newest_first = root.parser.dated_depth().is_some();
+        let mut queue = VecDeque::from([(root.path.clone(), 0_u8)]);
+        'walk: while let Some((dir, depth)) = queue.pop_front() {
             if cancel.is_cancelled() {
                 incomplete = true;
                 break;
             }
-            let entries = match fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(err) if is_absent_error(&err) => continue,
-                Err(err) => {
-                    debug!(
-                        agent = ?root.agent_base,
-                        error = %err,
-                        "failed to list a directory below an external transcript root"
-                    );
-                    incomplete = true;
-                    continue;
-                }
+            let Some(entries) = list_walked_directory(root, &dir, newest_first, &mut incomplete)
+            else {
+                continue;
             };
+            let mut subdirectories = Vec::new();
             for entry in entries {
                 if entries_left == 0 {
                     incomplete = true;
@@ -731,12 +760,15 @@ impl TranscriptIndex {
                     {
                         continue;
                     }
+                    if root.depth_limit().is_some_and(|max| depth >= max) {
+                        continue;
+                    }
                     if directories_left == 0 {
                         incomplete = true;
                         break 'walk;
                     }
                     directories_left -= 1;
-                    queue.push_back(path);
+                    subdirectories.push(path);
                 } else if is_jsonl_path(&path) {
                     if !self.is_unchanged(&path, root) {
                         if transcripts_left == 0 {
@@ -755,6 +787,13 @@ impl TranscriptIndex {
                     }
                     visited.insert(path);
                 }
+            }
+            if newest_first {
+                for child in subdirectories.into_iter().rev() {
+                    queue.push_front((child, depth + 1));
+                }
+            } else {
+                queue.extend(subdirectories.into_iter().map(|child| (child, depth + 1)));
             }
         }
         let scan = if incomplete {
@@ -856,6 +895,12 @@ fn backend_not_open() -> io::Error {
 }
 
 impl WatchBackend for ReopenableBackend {
+    fn bound_walk(&mut self, root: &Path, bound: Option<watch::WalkBound>) {
+        if let Some(backend) = &mut self.inner {
+            backend.bound_walk(root, bound);
+        }
+    }
+
     fn register_root(
         &mut self,
         root: &Path,
@@ -1020,6 +1065,7 @@ struct Declared {
     /// symlink into another tree is seen where it leads.
     tree: PathBuf,
     parser: TranscriptParser,
+    max_depth: Option<u8>,
 }
 
 /// The transcript roots of `homes`, and the homes that contribute none.
@@ -1075,6 +1121,7 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
             path,
             tree,
             parser: transcripts.parser(),
+            max_depth: transcripts.max_depth(),
         });
     }
 
@@ -1107,10 +1154,48 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
                 path: entry.path,
                 parser: entry.parser,
                 private: entry.profile.is_some(),
+                max_depth: entry.max_depth,
             });
         }
     }
     (roots, skipped)
+}
+
+/// The entries of `dir`, a directory of a walk over `root`, newest name first
+/// when `newest_first`. A directory that vanished yields nothing; one that
+/// cannot be listed yields nothing and marks the walk `incomplete`.
+fn list_walked_directory(
+    root: &TranscriptRoot,
+    dir: &Path,
+    newest_first: bool,
+    incomplete: &mut bool,
+) -> Option<Box<dyn Iterator<Item = io::Result<fs::DirEntry>>>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if is_absent_error(&err) => return None,
+        Err(err) => {
+            debug!(
+                agent = ?root.agent_base,
+                error = %err,
+                "failed to list a directory below an external transcript root"
+            );
+            *incomplete = true;
+            return None;
+        }
+    };
+    Some(if newest_first {
+        newest_name_first(entries)
+    } else {
+        Box::new(entries)
+    })
+}
+
+/// `entries` with the highest names first and listing errors last, so a walk
+/// that ends at a bound has visited the newest entries of a date-sharded tree.
+fn newest_name_first(entries: fs::ReadDir) -> Box<dyn Iterator<Item = io::Result<fs::DirEntry>>> {
+    let (mut listed, failed): (Vec<_>, Vec<_>) = entries.partition(Result::is_ok);
+    listed.sort_by_key(|entry| std::cmp::Reverse(entry.as_ref().ok().map(fs::DirEntry::file_name)));
+    Box::new(listed.into_iter().chain(failed))
 }
 
 /// Whether `path` is known not to be a directory: missing, or something else.
@@ -1254,10 +1339,12 @@ fn transcript_matches_process(
 fn parse_transcript(
     parser: TranscriptParser,
     agent_base: RuntimeRef,
+    root: &Path,
     path: &Path,
 ) -> io::Result<Option<TranscriptCandidate>> {
     match parser {
         TranscriptParser::JsonlHeadV1 => parse_jsonl_head(agent_base, path),
+        TranscriptParser::MuseSessionV1 => muse::parse_session(agent_base, root, path),
     }
 }
 
@@ -1316,6 +1403,23 @@ fn parse_jsonl_head(
     }
     let native_session_path =
         native_session_path.unwrap_or_else(|| path.to_string_lossy().into_owned());
+    Ok(Some(unattributed_candidate(
+        agent_base,
+        native_session_id,
+        native_session_path,
+        cwd,
+        path,
+    )))
+}
+
+/// A candidate no root has claimed yet; `path` supplies its modification time.
+fn unattributed_candidate(
+    agent_base: RuntimeRef,
+    native_session_id: Option<String>,
+    native_session_path: String,
+    cwd: Option<PathBuf>,
+    path: &Path,
+) -> TranscriptCandidate {
     let updated_at = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(UNIX_EPOCH);
@@ -1323,9 +1427,10 @@ fn parse_jsonl_head(
         agent_base: agent_base.clone(),
         path: PathBuf::new(),
         parser: TranscriptParser::JsonlHeadV1,
+        max_depth: None,
         private: true,
     });
-    Ok(Some(TranscriptCandidate {
+    TranscriptCandidate {
         agent_base,
         native_session_id,
         native_session_path,
@@ -1334,7 +1439,7 @@ fn parse_jsonl_head(
         owner,
         cwd,
         updated_at,
-    }))
+    }
 }
 
 fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1393,6 +1498,7 @@ mod tests {
             let result = parse_transcript(
                 TranscriptParser::JsonlHeadV1,
                 RuntimeRef::claude(),
+                Path::new(""),
                 &parser_path,
             );
             let _ = result_tx.send(result);
@@ -1557,6 +1663,7 @@ mod observer_tests {
             agent_base: RuntimeRef::claude(),
             path: root.path().to_path_buf(),
             private: false,
+            max_depth: None,
         }];
         let sessions = ExternalSessions::new();
 
@@ -1615,6 +1722,7 @@ mod scan_tests {
             agent_base: RuntimeRef::claude(),
             path: path.to_path_buf(),
             private: false,
+            max_depth: None,
         }
     }
 
@@ -1892,6 +2000,7 @@ mod scan_tests {
             agent_base: RuntimeRef::codex(),
             path: inner_path.clone(),
             private: false,
+            max_depth: None,
         };
         let outer_file = dir.path().join("p/c.jsonl");
         let inner_file = inner_path.join("x/s.jsonl");
@@ -1976,6 +2085,7 @@ mod scan_tests {
             agent_base: RuntimeRef::codex(),
             path: link.clone(),
             private: false,
+            max_depth: None,
         };
         let both = [claude.clone(), codex.clone()];
         let index = TranscriptIndex::default();
@@ -2018,6 +2128,7 @@ mod scan_tests {
                 agent_base: RuntimeRef::codex(),
                 path: link.clone(),
                 private: false,
+                max_depth: None,
             },
         ];
         let canonical = super::canonical_roots(&roots);

@@ -1,0 +1,1 @@
+{"stream":{"kind":"session","id":"@SESSION@"},"payload_type":"runtime.session.metadata","payload":{"record":{"workspace_root":"@WORKSPACE@"}}}

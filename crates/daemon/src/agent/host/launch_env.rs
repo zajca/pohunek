@@ -397,3 +397,35 @@ impl DescriptorLaunchEnv {
         self.0.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `NAME entry` lines of every frozen list, in table order.
+    fn current() -> Vec<String> {
+        let lists: [(&str, &[&str]); 4] = [
+            ("REFUSED_NAMESPACES", REFUSED_NAMESPACES),
+            ("SECRET_WORDS", SECRET_WORDS),
+            ("LOCATION_WORDS", LOCATION_WORDS),
+            ("GLUED_ENDINGS", GLUED_ENDINGS),
+        ];
+        lists
+            .into_iter()
+            .flat_map(|(name, entries)| entries.iter().map(move |entry| format!("{name} {entry}")))
+            .collect()
+    }
+
+    #[test]
+    fn the_frozen_lists_equal_the_snapshot() {
+        let snapshot: Vec<&str> = include_str!("fixtures/launch_env_lists.txt")
+            .lines()
+            .collect();
+        assert_eq!(
+            current(),
+            snapshot,
+            "a list entry is removed, renamed or added without an issue naming the variable; \
+             edit fixtures/launch_env_lists.txt only to append an entry"
+        );
+    }
+}

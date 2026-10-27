@@ -803,8 +803,45 @@ pub(crate) fn pi_shaped_hooked_host_as(
         &format!("id = \"{PI_SHAPED_ID}\""),
         &format!("id = \"{runtime_id}\""),
     ));
+    host_serving_document(&document)
+}
+
+/// `[native_reference.existence]` body of a hook runtime whose conversation is
+/// `<reference>/session.jsonl` below a date-sharded tree under
+/// `XDG_DATA_HOME`.
+pub(crate) const DATA_ROOT_DIR_NAME_CHECK: &str = r#"check = "file"
+root_env = "XDG_DATA_HOME"
+root_home = ".local/share"
+dir = "fixture/sessions"
+dir_name = "{reference}"
+file_name = "session.jsonl"
+max_depth = 3"#;
+
+/// Like [`pi_shaped_hooked_host`], for the fixture variant that reports its
+/// reference through a hook and verifies it with [`DATA_ROOT_DIR_NAME_CHECK`].
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn data_root_hooked_host(program: &Path) -> RuntimeHost {
+    let document = pi_shaped_document(program, DATA_ROOT_DIR_NAME_CHECK)
+        .replace(
+            "strategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]\n",
+            "strategy = \"hook\"\n",
+        )
+        .replace(
+            "runtime_api = 1\n",
+            "runtime_api = 1\nrequires = [\"transcripts-data-root-v1\"]\n",
+        );
+    host_serving_document(&with_integration(&document))
+}
+
+/// A host serving the built-in runtimes, the official fixture and the runtime
+/// `document` declares as a package.
+fn host_serving_document(document: &str) -> RuntimeHost {
     let definition = RuntimeDefinition::from_toml(
-        &document,
+        document,
         |package| DefinitionOrigin::Package {
             package,
             digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),

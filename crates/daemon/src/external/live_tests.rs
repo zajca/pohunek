@@ -126,6 +126,7 @@ impl Live {
             agent_base: RuntimeRef::claude(),
             path: root.clone(),
             private: false,
+            max_depth: None,
         }];
         let (index, handle) = start_transcript_index(&roots, &sessions).await;
         if let Some(probe) = probe {
@@ -535,12 +536,14 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
             agent_base: RuntimeRef::claude(),
             path: outer.clone(),
             private: false,
+            max_depth: None,
         },
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
             private: false,
+            max_depth: None,
         },
     ];
 
@@ -610,4 +613,202 @@ async fn a_transcript_that_becomes_readable_is_indexed_without_a_content_change(
         .expect("make readable");
 
     live.wait_for_session(&path, "readable-later").await;
+}
+
+/// Session directories per day of the dated tree scenario: two days exceed the
+/// backend-wide directory budget, and one exceeds a root's share of watches.
+const SESSIONS_PER_DAY: usize = 4500;
+
+/// The newest sessions that get subagent directories in the dated tree scenario,
+/// and how many each gets.
+const NEWEST_WITH_SUBAGENTS: usize = 1100;
+const SUBAGENTS_PER_SESSION: usize = 8;
+
+/// A session directory name below a dated day, ascending with `number`.
+fn session_name(number: usize) -> String {
+    format!("00000000-0000-4000-8000-{number:012}")
+}
+
+/// Writes the log of session `name` below `day` of `tree`.
+fn write_session_log(tree: &Path, day: &str, name: &str) -> PathBuf {
+    let path = tree.join(day).join(name).join("session.jsonl");
+    fs::create_dir_all(path.parent().expect("session directory")).expect("session directory");
+    let bare = include_str!("../../tests/fixtures/muse/session-bare.jsonl");
+    fs::write(
+        &path,
+        bare.replace("@SESSION@", name)
+            .replace("@WORKSPACE@", "/work"),
+    )
+    .expect("write the session log");
+    path
+}
+
+/// A dated tree whose descriptor declares a `max_depth` that would reach the
+/// subagent directories: the walk and the share of session watches follow the
+/// parser, never the larger bound.
+fn dated_root(path: &Path) -> TranscriptRoot {
+    TranscriptRoot {
+        parser: TranscriptParser::MuseSessionV1,
+        agent_base: RuntimeRef::codex(),
+        path: path.to_path_buf(),
+        private: false,
+        max_depth: Some(6),
+    }
+}
+
+#[tokio::test]
+async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live() {
+    let base = pohunek_test_support::tempdir().expect("base");
+    let dated = base.path().join("muse/sessions");
+    let other = base.path().join("claude");
+    // More session directories than the backend-wide watch budget: the dated
+    // root keeps its share, so the root registered after it still gets its
+    // watches. The newest day is created first, so a walk in creation order or
+    // in reverse creation order would not meet it first by luck.
+    let (old_day, new_day) = ("2026/09/01", "2026/10/09");
+    for day in [new_day, old_day] {
+        for number in 0..SESSIONS_PER_DAY {
+            fs::create_dir_all(dated.join(day).join(session_name(number))).expect("session dir");
+        }
+    }
+    // Subagent directories below the newest sessions: registered under the
+    // session watches they would exhaust the backend-wide budget, and the
+    // parser reads nothing there.
+    for number in SESSIONS_PER_DAY - NEWEST_WITH_SUBAGENTS..SESSIONS_PER_DAY {
+        for subagent in 0..SUBAGENTS_PER_SESSION {
+            let dir = dated
+                .join(new_day)
+                .join(session_name(number))
+                .join(format!("subagents/s{subagent}"));
+            fs::create_dir_all(dir).expect("subagent dir");
+        }
+    }
+    // The lowest session of each day has a log from the start. The pass visits
+    // the highest names first and stops at its directory bound inside the older
+    // day, so only the newest day's is indexed.
+    let new_day_log = write_session_log(&dated, new_day, &session_name(0));
+    let old_day_log = write_session_log(&dated, old_day, &session_name(0));
+    let probe = prepare_arming_probe(&other);
+    let sessions = ExternalSessions::new();
+    let roots = vec![
+        dated_root(&dated),
+        TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
+            agent_base: RuntimeRef::claude(),
+            path: other.clone(),
+            private: false,
+            max_depth: None,
+        },
+    ];
+    let (index, handle) = start_transcript_index(&roots, &sessions).await;
+    arm(&index, &sessions, &probe).await;
+    let indexed = |path: &Path| index.inner.lock().expect("index").contains_key(path);
+    let wait_for = |path: PathBuf, bound: Duration| {
+        let (index, sessions) = (&index, &sessions);
+        async move {
+            let wait = async {
+                while !index.inner.lock().expect("index").contains_key(&path) {
+                    sessions.inner.rescan.notified().await;
+                }
+            };
+            tokio::time::timeout(bound, wait)
+                .await
+                .unwrap_or_else(|_elapsed| panic!("timed out waiting for {}", path.display()));
+        }
+    };
+    // A store beyond the pass's directory bound is an incomplete pass, not a
+    // failed registration: the watch budget is not exhausted.
+    let mut states = handle.subscribe();
+    tokio::time::timeout(
+        STATE_TIMEOUT,
+        states
+            .wait_for(|state| *state == TranscriptWatch::Degraded(WatcherDegraded::ScanIncomplete)),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| panic!("the pass is not reported incomplete: {:?}", handle.state()))
+    .expect("watcher state");
+    assert!(indexed(&new_day_log), "the newest day is visited first");
+    assert!(!indexed(&old_day_log), "the older day is left at the bound");
+
+    // A log in the newest day's last session directory, one in a session
+    // directory of a day that appears later, and one under another root are
+    // all seen by a live event.
+    let newest = write_session_log(&dated, new_day, &session_name(SESSIONS_PER_DAY - 1));
+    wait_for(newest.clone(), LIVE_EVENT_TIMEOUT).await;
+    let later = write_session_log(&dated, "2026/10/10", &session_name(7));
+    wait_for(later, LIVE_EVENT_TIMEOUT).await;
+    // The watch of the newest session directory survives the eviction a new
+    // session directory causes: rewriting its log is seen live.
+    let rewritten = fs::read_to_string(&newest)
+        .expect("the log")
+        .replace("/work", "/rewritten");
+    fs::write(&newest, rewritten).expect("rewrite the log");
+    let wait = async {
+        loop {
+            let moved = index
+                .inner
+                .lock()
+                .expect("index")
+                .get(&newest)
+                .is_some_and(|candidate| candidate.cwd.as_deref() == Some(Path::new("/rewritten")));
+            if moved {
+                return;
+            }
+            sessions.inner.rescan.notified().await;
+        }
+    };
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, wait)
+        .await
+        .expect("the newest session's rewrite is seen live");
+    let claude = other.join("p/live.jsonl");
+    write_transcript(&claude, "claude-live");
+    wait_for(claude, LIVE_EVENT_TIMEOUT).await;
+
+    // The newest day's lowest session directory holds no watch (only the
+    // highest 1024 names do): a pass reaches it.
+    let unwatched = write_session_log(&dated, new_day, &session_name(1));
+    handle.request_reconcile();
+    wait_for(unwatched.clone(), STATE_TIMEOUT).await;
+    assert!(indexed(&unwatched));
+    sessions.shutdown();
+}
+
+#[tokio::test]
+async fn a_transcript_below_the_depth_bound_is_never_indexed() {
+    let base = pohunek_test_support::tempdir().expect("base");
+    let root = base.path().join("bounded");
+    write_transcript(&root.join("a/before.jsonl"), "before");
+    write_transcript(&root.join("a/b/deep-before.jsonl"), "deep-before");
+    let probe = prepare_arming_probe(&root);
+    let sessions = ExternalSessions::new();
+    let roots = vec![TranscriptRoot {
+        parser: TranscriptParser::JsonlHeadV1,
+        agent_base: RuntimeRef::claude(),
+        path: root.clone(),
+        private: false,
+        max_depth: Some(1),
+    }];
+    let (index, _handle) = start_transcript_index(&roots, &sessions).await;
+    arm(&index, &sessions, &probe).await;
+    let indexed = |path: &Path| index.inner.lock().expect("index").contains_key(path);
+
+    // A deep log written first, then one within the bound: once the later one
+    // is indexed, the earlier event has been handled too.
+    let deep = root.join("a/b/deep-live.jsonl");
+    write_transcript(&deep, "deep-live");
+    let within = root.join("a/within.jsonl");
+    write_transcript(&within, "within");
+    let wait = async {
+        while !indexed(&within) {
+            sessions.inner.rescan.notified().await;
+        }
+    };
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, wait)
+        .await
+        .expect("the log within the bound is indexed");
+
+    assert!(indexed(&root.join("a/before.jsonl")));
+    assert!(!indexed(&root.join("a/b/deep-before.jsonl")));
+    assert!(!indexed(&deep));
+    sessions.shutdown();
 }

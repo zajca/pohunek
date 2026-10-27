@@ -1082,6 +1082,55 @@ the same directory or nested in each other are attributed to neither; the
 daemon logs the warning `external.transcript_roots.ambiguous` with code
 `transcripts_ambiguous_owner`.
 
+#### Transcripts outside the config home
+
+A runtime that keeps its session logs outside the config home names the root
+itself (runtime feature `transcripts-data-root-v1`, listed in `requires`):
+
+```toml
+requires = ["transcripts-data-root-v1"]
+
+[transcripts]
+parser = "muse-session-v1"
+root_env = "XDG_DATA_HOME"
+root_home = ".local/share"
+dir = "muse/sessions"
+max_depth = 4
+```
+
+`root_env` and `root_home` come together and follow the `env` and `default`
+rules of `[config_home]` and its resolution (the variable of a host profile's
+`[env]` over the daemon's base environment, else the default below `HOME`; a
+relative value is `agent_config_dir_invalid`); with them the table needs no
+`[config_home]`. `max_depth` (1 to 6) is the number of directory levels below
+`dir` the observer lists and watches. A date-sharded tree is never walked below its session
+directories. `muse-session-v1` reads only a log at
+`YYYY/MM/DD/<uuid>/session.jsonl` below `dir`, framed (`children[].record_json`)
+or bare, within the first 32 lines (64 KiB): the first
+`runtime.session.metadata` record gives the session id (`stream.id`, equal to
+the `<uuid>` directory name) and the absolute working directory
+(`payload.record.workspace_root`). Logs nested below a session and logs at
+other depths are not sessions. A pass visits the highest directory names first,
+so the newest sessions are indexed when a tree outgrows the per-pass entry
+bound. On Linux the watcher keeps a live watch on every date directory and on
+the newest 1024 session directories of each dated root (newest first; a new
+one evicts the watch registered longest ago), and the periodic pass reaches the older sessions, so a large store
+never takes the backend-wide watch budget from other runtimes. These keys are refused without the feature
+(`runtime_feature_unsupported`), and a `root_env` or `root_home` without its
+partner, an unsafe path or a `max_depth` out of range is `descriptor_invalid`.
+
+A hook runtime whose conversation is `<reference>/<file_name>` below a
+date-sharded tree declares `dir_name = "{reference}"` in
+`[native_reference.existence]` (same feature) next to `check = "file"`,
+`root_env`/`root_home`, `dir`, a plain `file_name` and `max_depth`, the number
+of levels the scan descends below `dir`; the named directory is an entry of
+the directory reached after that many levels (`dir/YYYY/MM/DD` for 3). It is accepted only
+with `strategy = "hook"` and an id-kind reference and without `name_match`,
+`store_env`, `store_max_depth` or `relocating_*`. Recovery returns
+`agent_native_reference_missing` when no regular `<reference>/<file_name>`
+exists there; no symlink is followed. The declaration is not stored with a
+session, so the stored shape of an assigned reference is unchanged.
+
 ### Hook schemas
 
 A runtime that reports lifecycle hooks (identity, release, notification,

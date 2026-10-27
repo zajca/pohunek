@@ -23,7 +23,7 @@ use protocol::{ErrorClass, IntegrationHome, IntegrationSelector, ProtocolError, 
 
 use super::handler::{self, Resolved};
 use super::{config_dir_invalid, config_path_kind, ConfigPath};
-use crate::agent::host::{ConfigHome, HomeError, RuntimeHost, Transcripts};
+use crate::agent::host::{ConfigHome, HomeError, RuntimeDefinition, RuntimeHost, Transcripts};
 use crate::agent::ProfileEnv;
 use crate::agent::{ProfileRegistry, ResolvedAgent};
 use crate::runtime::environment::effective_variable;
@@ -97,21 +97,23 @@ impl ConfigHomes {
         Home::resolve(declared, &self.base, profile_env)
     }
 
-    /// The config homes the host's agents launch with, for runtimes that
-    /// declare one.
+    /// The base directories the host's agents launch with, for runtimes that
+    /// declare one: the root a runtime's `[transcripts]` names for itself, else
+    /// its config home.
     ///
-    /// One entry per runtime's own home (in runtime id order) and per host
-    /// profile (in name order), each resolved exactly as a launch resolves it. A home that cannot be
-    /// resolved is reported with the profile that names it, never skipped
-    /// silently, so a caller decides what a missing home means. Entries are not
-    /// deduplicated: profiles that share a directory each appear.
+    /// One entry per runtime's own base (in runtime id order) and per host
+    /// profile (in name order), each resolved exactly as a launch resolves it.
+    /// A base that cannot be resolved is reported with the profile that names
+    /// it, never skipped silently, so a caller decides what a missing one
+    /// means. Entries are not deduplicated: profiles that share a directory
+    /// each appear.
     pub(crate) fn launch_homes(&self) -> Vec<LaunchHome> {
         let mut homes = Vec::new();
         let registry = self.host().registry();
         let mut definitions: Vec<_> = registry.definitions().collect();
         definitions.sort_by(|a, b| a.runtime_id().as_str().cmp(b.runtime_id().as_str()));
         for definition in definitions {
-            let Some(declared) = definition.config_home() else {
+            let Some(declared) = transcript_home(definition) else {
                 continue;
             };
             homes.push(LaunchHome {
@@ -123,7 +125,7 @@ impl ConfigHomes {
         }
         for agent in self.profiles.enumerate() {
             let (Some(declared), Some(profile)) =
-                (agent.definition.config_home(), agent.profile.as_ref())
+                (transcript_home(&agent.definition), agent.profile.as_ref())
             else {
                 continue;
             };
@@ -431,18 +433,29 @@ enum Reach {
     Existing,
 }
 
-/// One config home a launch gives an agent, and whom it belongs to.
+/// The directory the transcripts of `definition` are relative to: the root its
+/// `[transcripts]` names, else its config home.
+fn transcript_home(definition: &RuntimeDefinition) -> Option<&ConfigHome> {
+    definition
+        .transcripts()
+        .and_then(Transcripts::root)
+        .or_else(|| definition.config_home())
+}
+
+/// One base directory a launch gives an agent, and whom it belongs to: the
+/// root its transcripts are relative to, which is its config home unless the
+/// `[transcripts]` table names a root of its own.
 #[derive(Debug)]
 pub(crate) struct LaunchHome {
     /// The runtime the agent runs.
     pub(crate) runtime: RuntimeRef,
     /// The host profile that launches the agent; `None` for the runtime's own
-    /// home.
+    /// base directory.
     pub(crate) profile: Option<String>,
-    /// The transcript tree below the home and its parser, as the runtime's
+    /// The transcript tree below the base directory and its parser, as the runtime's
     /// descriptor declares them; `None` when it declares none.
     pub(crate) transcripts: Option<Transcripts>,
-    /// The resolved home, or why the launch environment names none.
+    /// The resolved base directory, or why the launch environment names none.
     pub(crate) home: Result<Home, ProtocolError>,
 }
 

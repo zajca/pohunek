@@ -275,6 +275,7 @@ fn claude_root(path: &Path) -> TranscriptRoot {
         agent_base: RuntimeRef::claude(),
         path: path.to_path_buf(),
         private: false,
+        max_depth: None,
     }
 }
 
@@ -521,6 +522,7 @@ async fn a_hint_under_a_symlinked_nested_root_is_owned_by_the_nested_provider() 
             agent_base: RuntimeRef::codex(),
             path: link,
             private: false,
+            max_depth: None,
         },
     ];
     start(
@@ -736,12 +738,14 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
             private: false,
+            max_depth: None,
         },
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::codex(),
             path: outer.clone(),
             private: false,
+            max_depth: None,
         },
     ];
     start(
