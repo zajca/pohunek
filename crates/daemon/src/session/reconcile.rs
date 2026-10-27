@@ -8826,7 +8826,10 @@ while os.getppid() == parent:
             let expected = full.get(session).cloned().unwrap_or_default();
             assert_eq!(format!("{scoped:?}"), format!("{expected:?}"), "{session}");
             let expected_opened = u64::from(session != "not a session id");
-            assert_eq!(opened, expected_opened, "{session} opened {opened} directories");
+            assert_eq!(
+                opened, expected_opened,
+                "{session} opened {opened} directories"
+            );
         }
         assert!(full["s-91"].evidence.len() == 1 && !full["s-91"].conflict);
         assert!(full["s-92"].conflict);
