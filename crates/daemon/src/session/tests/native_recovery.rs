@@ -30,6 +30,15 @@ impl RuntimeSource for CodexSource {
 
 /// Builds a Codex hook runtime whose executable is selected by this test.
 pub(super) fn codex_host(program: &std::path::Path, script: &std::path::Path) -> RuntimeHost {
+    codex_host_with_handler(program, script, "codex-hook-v1")
+}
+
+/// [`codex_host`] whose descriptor names the integration `handler`.
+pub(super) fn codex_host_with_handler(
+    program: &std::path::Path,
+    script: &std::path::Path,
+    handler: &str,
+) -> RuntimeHost {
     let document = format!(
         r#"schema = 1
 id = "pohunek.runtime.codex"
@@ -62,7 +71,7 @@ args = ["fork", "{{reference}}"]
 strategy = "hook"
 
 [integration]
-handler = "codex-hook-v1"
+handler = "{handler}"
 hook_schema = "identity-subagent-v1"
 
 [config_home]
@@ -96,6 +105,8 @@ pub(super) struct Rig {
     ack: PathBuf,
     pub(super) launches: PathBuf,
     store_path: PathBuf,
+    program: PathBuf,
+    script: PathBuf,
 }
 
 impl Rig {
@@ -175,7 +186,18 @@ impl Rig {
             ack,
             launches: launch_log_path,
             store_path,
+            program,
+            script,
         }
+    }
+
+    /// Rebuilds the daemon over the same store with a Codex descriptor that
+    /// names the integration `handler`, so the next launch is served by a
+    /// different definition than the one the session was created under.
+    pub(super) async fn serve_with_handler(&mut self, handler: &str) {
+        self.detach_daemon().await;
+        self.host = codex_host_with_handler(&self.program, &self.script, handler);
+        self.adopt_daemon().await;
     }
 
     fn registry(

@@ -1555,8 +1555,9 @@ in one place per launch: the environment between the profile `[env]` and the
 daemon handshake, the arguments after the frozen arguments and before the native
 session arguments. It is never part of the frozen resume snapshot, so a relaunch
 applies it exactly once. A contribution outside the bounds is refused with
-`launch_input_invalid`, one that cannot be written with
-`launch_input_unavailable`; either refuses the launch before a worker starts.
+`launch_input_invalid`, one that cannot be written, or whose runtime declares a
+config home that does not resolve (a relative or unusable `config_home.env`
+value), with `launch_input_unavailable`; either refuses the launch before a worker starts.
 
 The Muse Code handler is the first user of this seam
 (`crates/daemon/src/integration/muse/`, removed with #1643): its contribution

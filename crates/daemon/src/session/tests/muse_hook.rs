@@ -115,6 +115,24 @@ impl Rig {
         settings: Option<&str>,
         extra_args: &[&str],
     ) -> Result<Self, ProtocolError> {
+        Self::start(tag, settings, extra_args, None).await
+    }
+
+    /// [`Self::new`] launched from a profile whose `[env]` is `profile_env`.
+    async fn with_profile_env(
+        tag: &str,
+        settings: Option<&str>,
+        profile_env: (&str, &Path),
+    ) -> Result<Self, ProtocolError> {
+        Self::start(tag, settings, &[], Some(profile_env)).await
+    }
+
+    async fn start(
+        tag: &str,
+        settings: Option<&str>,
+        extra_args: &[&str],
+        profile_env: Option<(&str, &Path)>,
+    ) -> Result<Self, ProtocolError> {
         let dir = temp_dir(tag);
         let xdg = PathBuf::from(
             crate::test_support::thread_environment_variable("XDG_CONFIG_HOME")
@@ -143,6 +161,18 @@ impl Rig {
             store_path: Some(temp_store_path(tag)),
             ..SessionRegistryConfig::default()
         };
+        let mut agent = "muse";
+        if let Some((name, value)) = profile_env {
+            let body = format!(
+                "base = \"muse\"\npackage = \"pohunek.runtime.muse\"\ndigest = \"{}\"\nprogram = {:?}\nargs = {:?}\n[env]\n{name} = {:?}\n",
+                crate::agent::host::fixture::PACKAGE_DIGEST,
+                program.display().to_string(),
+                vec![script.display().to_string()],
+                value.display().to_string()
+            );
+            config.agents_dir = Some(temp_agents_dir_with(tag, "musenv", &body));
+            agent = "musenv";
+        }
         let (runtime_root, state_root) = test_worker_roots(&config);
         config.supervision = Some(crate::session::test_supervision(&runtime_root, &state_root));
         config.worker_runtime_root = Some(runtime_root.clone());
@@ -158,7 +188,7 @@ impl Rig {
         );
         let session = registry
             .create(SessionNewParams {
-                agent: "muse".to_owned(),
+                agent: agent.to_owned(),
                 cwd: Some(dir.clone()),
                 ..params()
             })
@@ -515,6 +545,57 @@ async fn a_foreign_managed_hooks_file_is_kept_verbatim_and_ours_is_appended() {
     assert!(log.contains("POHUNEK_SESSION_ID"), "{log}");
     rig.finish().await;
     rig.remove().await;
+}
+
+#[tokio::test]
+async fn the_profile_env_selected_managed_file_wins_over_the_settings_path() {
+    let dir = temp_dir("muse-env-selected");
+    let from_env = dir.join("env-hooks.json");
+    let from_settings = dir.join("settings-hooks.json");
+    fs::write(
+        &from_env,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"env-selected"}]}]}}"#,
+    )
+    .expect("env file");
+    fs::write(
+        &from_settings,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"settings-selected"}]}]}}"#,
+    )
+    .expect("settings file");
+    let settings = format!(
+        r#"{{"schema_version":1,"managed_hooks_path":{:?}}}"#,
+        from_settings.display().to_string()
+    );
+    let rig = Rig::with_profile_env(
+        "muse-env-selected",
+        Some(&settings),
+        ("TBH_MANAGED_HOOKS_PATH", &from_env),
+    )
+    .await
+    .expect("create the Muse session");
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&fs::read(rig.overlay_path()).expect("overlay")).expect("JSON");
+    assert_eq!(
+        parsed["hooks"]["Stop"][0]["hooks"][0]["command"], "env-selected",
+        "the profile env names the file Muse reads"
+    );
+    assert!(parsed["hooks"]["SessionStart"].is_array());
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn an_unresolvable_config_home_refuses_the_launch() {
+    let error = Rig::with_profile_env(
+        "muse-home-unresolved",
+        None,
+        ("XDG_CONFIG_HOME", Path::new("relative-config")),
+    )
+    .await
+    .err()
+    .expect("a relative XDG_CONFIG_HOME leaves the declared config home unresolved");
+    assert_eq!(error.code, "launch_input_unavailable");
 }
 
 #[tokio::test]
