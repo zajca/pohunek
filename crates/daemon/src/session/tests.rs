@@ -789,7 +789,7 @@ impl StallProbe<'_> {
                 "state={:?} updated_at={} newer_than_cursor={} metadata={:?}",
                 info.state,
                 info.updated_at,
-                super::observation::updated_after(&info.updated_at, self.cursor),
+                super::observation::updated_after(&self.id.0, &info.updated_at, self.cursor),
                 info.metadata
             ),
         };
