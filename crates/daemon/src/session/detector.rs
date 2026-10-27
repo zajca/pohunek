@@ -680,7 +680,10 @@ mod tests {
         async fn finish(self) {
             tokio::time::resume();
             self.cancel.cancel();
-            let _ = self.registry.stop(&self.session.id).await;
+            self.registry
+                .stop(&self.session.id)
+                .await
+                .expect("stop the session");
         }
     }
 

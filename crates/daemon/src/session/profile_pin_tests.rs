@@ -107,7 +107,7 @@ async fn an_owner_local_pinned_profile_launches_and_records_the_pinned_digest() 
 
     let retained = registry.retained_package_digests().await.expect("retained");
     assert!(retained.contains(&pinned.digest));
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -138,7 +138,7 @@ async fn a_disabled_package_refuses_a_fresh_launch_through_an_owner_local_pinned
         .resume(&created.id)
         .await
         .expect("the session pinned to the digest still resumes");
-    let _ = registry.stop(&created.id).await;
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]

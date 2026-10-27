@@ -346,7 +346,10 @@ impl Rig {
     }
 
     async fn finish(&self) {
-        let _ = self.registry.stop(self.id()).await;
+        self.registry
+            .stop(self.id())
+            .await
+            .expect("stop the session");
     }
 }
 
@@ -757,5 +760,8 @@ async fn a_session_of_another_runtime_gets_neither_the_field_nor_the_acceptance_
         result.prompt_accepted, None,
         "the runtime has no such field"
     );
-    let _ = rig.registry.stop(&session.id).await;
+    rig.registry
+        .stop(&session.id)
+        .await
+        .expect("stop the session");
 }
