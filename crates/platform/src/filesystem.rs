@@ -107,7 +107,7 @@ impl EntryIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MoveOutcome {
-    /// The source was moved and directory metadata was synchronized.
+    /// The source was moved.
     Moved,
     /// The destination already existed and neither entry was changed.
     DestinationExists,
@@ -1797,7 +1797,8 @@ impl TrustedDir {
         Ok(Some(staged))
     }
 
-    /// Atomically moves one entry without replacing an existing destination.
+    /// Atomically moves one entry without replacing an existing destination,
+    /// then synchronizes both directories.
     ///
     /// # Errors
     ///
