@@ -156,17 +156,23 @@ version probe with `[launch_env]` (`requires = ["launch-env-v1"]`):
 requires = ["launch-env-v1"]
 
 [launch_env]
-ACME_NO_AUTO_UPDATE = "1"        # stops a launcher that updates itself
+ACME_NO_AUTO_UPDATE = "1"        # in a runtime with id `acme`; stops a self-updating launcher
 ```
 
-Use it for switches the agent reads at start. At most 16 entries; values are
-at most 256 bytes, never expanded. Names the core or the owner own are refused
-at install (`descriptor_invalid`): `POHUNEK_*`, `LD_*`, `DYLD_*`, `XDG_*`,
-`LC_*`, `PATH`, `HOME`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`, `TERM`,
-`COLORTERM`, `LANG`, `TBH_MANAGED_HOOKS_PATH`, service-manager variables, the
-variable the same descriptor reads its config home from, and any secret-shaped name
-(`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`, `*_CREDENTIALS`,
-`*_AUTH`). A host profile's `[env]` entry of the same name overrides a declared
+Use it for behaviour flags the agent reads at start. At most 16 entries; values
+are at most 256 bytes, never expanded. A name must start with the runtime's own
+namespace: the `runtime.id` in upper case with `-` and `.` as `_`, then `_`
+(`muse` gives `MUSE_`, so `MUSE_NO_AUTO_UPDATE`), with something after it. The
+core allowlist outside the namespace is empty. A runtime whose namespace
+collides with a variable family of the loader or the owner's tools (`SSH_`,
+`AWS_`, `GIT_`, `HTTPS_`, `NO_`, `XDG_`, `POHUNEK_` and the rest listed in
+`docs/public-api.md`) has no usable table. Inside the namespace, service-manager
+variables, the variable the descriptor reads its config home from, secret-shaped
+names (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`,
+`*_CREDENTIALS`, `*_AUTH`) and location or identity names (`*_PATH`, `*_DIR`,
+`*_HOME`, `*_ROOT`, `*_FILE`, `*_SOCK`, `*_SOCKET`, `*_URL`, `*_URI`, `*_HOST`,
+`*_ENDPOINT`, `*_PROXY`, `*_COMMAND`, `*_PROFILE`, `*_CONFIG`, `*_ID`) are
+refused at install (`descriptor_invalid`). A host profile's `[env]` entry of the same name overrides a declared
 pair on a launch. A program the user starts by hand inside a shell session
 gets no descriptor environment, so it keeps its own defaults.
 

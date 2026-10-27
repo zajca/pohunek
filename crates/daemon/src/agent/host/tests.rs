@@ -324,7 +324,7 @@ fn descriptor_digest_changes_with_launch_fields() {
             .collect();
         RuntimeDefinition::new_with_env(
             builtin_parts(),
-            super::DescriptorLaunchEnv::new(declared).expect("valid pairs"),
+            super::DescriptorLaunchEnv::new("demo", declared).expect("valid pairs"),
         )
         .expect("valid")
         .binding()
@@ -335,10 +335,10 @@ fn descriptor_digest_changes_with_launch_fields() {
         .binding()
         .clone();
     assert_eq!(plain, with_env(&[]));
-    assert_ne!(plain, with_env(&[("ACME_FLAG", "1")]));
+    assert_ne!(plain, with_env(&[("DEMO_FLAG", "1")]));
     assert_ne!(
-        with_env(&[("ACME_FLAG", "1")]),
-        with_env(&[("ACME_FLAG", "2")])
+        with_env(&[("DEMO_FLAG", "1")]),
+        with_env(&[("DEMO_FLAG", "2")])
     );
 }
 

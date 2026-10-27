@@ -994,16 +994,23 @@ requires = ["launch-env-v1"]
 ACME_NO_AUTO_UPDATE = "1"
 ```
 
-The table holds at most 16 string entries. Each name is upper case, outside the
-reserved `POHUNEK_` namespace, without the prefixes `LD_`, `DYLD_`, `XDG_` or
-`LC_`, and is none of `PATH`, `HOME`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`,
-`TERM`, `COLORTERM`, `LANG` or `TBH_MANAGED_HOOKS_PATH`, and none of the
-service-manager variables the worker never passes to an agent (`NOTIFY_SOCKET`,
-`INVOCATION_ID`, ...), nor the variable the same descriptor reads its
-`[config_home]` or `[native_reference.existence]` root from. A secret-shaped name
+The table holds at most 16 string entries and its pairs are behaviour flags.
+A name must start with the runtime's own namespace, derived from `runtime.id`:
+upper case, `-` and `.` mapped to `_`, then `_` (`muse` gives `MUSE_`), with at
+least one character after it. The core allowlist outside the namespace is empty.
+A runtime whose namespace begins with `POHUNEK_`, `LD_`, `DYLD_`, `XDG_`, `LC_`,
+`SSH_`, `GPG_`, `GNUPG`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`,
+`GIT_`, `GH_`, `GITHUB_`, `GITLAB_`, `DOCKER_`, `KUBE`, `HTTP_`, `HTTPS_`,
+`FTP_`, `ALL_`, `NO_`, `SOCKS`, `DBUS_`, `WAYLAND_`, `DISPLAY_` or `SYSTEMD_`
+has no usable `[launch_env]`. Inside the namespace a name is refused when it is
+a service-manager variable the worker never passes to an agent
+(`NOTIFY_SOCKET`, `INVOCATION_ID`, ...), the variable the same descriptor reads
+its `[config_home]` or `[native_reference.existence]` root from, secret-shaped
 (ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_CREDENTIALS`
-or `_AUTH`) is refused, so a public descriptor cannot blank or shadow an owner
-credential. Each value is at most 256 bytes without control characters and is
+or `_AUTH`), or location- or identity-shaped (ending in `_PATH`, `_DIR`, `_HOME`,
+`_ROOT`, `_FILE`, `_SOCK`, `_SOCKET`, `_URL`, `_URI`, `_HOST`, `_ENDPOINT`,
+`_PROXY`, `_COMMAND`, `_PROFILE`, `_CONFIG` or `_ID`), so a public descriptor
+cannot redirect or blank owner or core state. Each value is at most 256 bytes without control characters and is
 never expanded. A refusal is `descriptor_invalid` and names the field, never a
 name or a value. The pairs are not persisted: each launch (a new session, a
 resume, a fork) reads them from the definition that serves it. A launch applies

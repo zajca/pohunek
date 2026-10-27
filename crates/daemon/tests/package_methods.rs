@@ -1036,7 +1036,7 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
         &mut local,
         &servers.plugins,
         "without-requires",
-        &descriptor_requiring("", &pair("ACME_NO_UPDATE")),
+        &descriptor_requiring("", &pair("PI_NO_UPDATE")),
         false,
     )
     .await;
@@ -1045,12 +1045,15 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
         "runtime_feature_unsupported"
     );
 
-    let numbered: Vec<String> = (0..=16).map(|n| format!("ACME_FLAG_{n} = \"1\"")).collect();
-    // Names the core, the loader, the owner or the descriptor's own config home
-    // own, then values and shapes outside the bounds.
+    let numbered: Vec<String> = (0..=16).map(|n| format!("PI_FLAG_{n} = \"1\"")).collect();
+    // Names outside the runtime's namespace, names inside it that say where
+    // something lives or who it is, then values and shapes outside the bounds.
     let mut refused: Vec<(String, String)> = [
-        "POHUNEK_MODE",
-        "acme_flag",
+        "SSH_AUTH_SOCK",
+        "DISPLAY",
+        "AWS_REGION",
+        "OTHER_FLAG",
+        "POHUNEK_X",
         "LD_PRELOAD",
         "DYLD_INSERT_LIBRARIES",
         "XDG_CONFIG_HOME",
@@ -1058,22 +1061,16 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
         "PATH",
         "HOME",
         "TMPDIR",
-        "SHELL",
-        "USER",
-        "LOGNAME",
-        "TERM",
-        "COLORTERM",
-        "LANG",
-        "TBH_MANAGED_HOOKS_PATH",
-        "META_API_KEY",
-        "SERVICE_TOKEN",
-        "APP_SECRET",
-        "DB_PASSWORD",
-        "DB_PASSWD",
-        "CLOUD_CREDENTIALS",
-        "PROXY_AUTH",
-        "TOKEN",
         "NOTIFY_SOCKET",
+        "pi_flag",
+        "PI_",
+        "PI_CONFIG_DIR",
+        "PI_AUTH_PATH",
+        "PI_HOST",
+        "PI_SESSION_ID",
+        "PI_API_KEY",
+        "PI_TOKEN",
+        "PI_BAD-NAME",
     ]
     .iter()
     .map(|name| ((*name).to_owned(), pair(name)))
@@ -1081,24 +1078,27 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
     refused.extend([
         (
             "config-home-variable".to_owned(),
-            format!("{CONFIG_HOME_TABLE}{}", pair("ACME_HOME")),
+            format!(
+                "\n[config_home]\nenv = \"PI_STATE\"\ndefault = \".pi\"\n{}",
+                pair("PI_STATE")
+            ),
         ),
         ("too-many".to_owned(), launch_env_table(&numbered)),
         (
             "long-value".to_owned(),
-            launch_env_table(&[format!("ACME_FLAG = \"{}\"", "v".repeat(257))]),
+            launch_env_table(&[format!("PI_FLAG = \"{}\"", "v".repeat(257))]),
         ),
         (
             "control-value".to_owned(),
-            launch_env_table(&["ACME_FLAG = \"a\\u0007b\"".to_owned()]),
+            launch_env_table(&["PI_FLAG = \"a\\u0007b\"".to_owned()]),
         ),
         (
             "number-value".to_owned(),
-            launch_env_table(&["ACME_FLAG = 1".to_owned()]),
+            launch_env_table(&["PI_FLAG = 1".to_owned()]),
         ),
         (
             "nested-table".to_owned(),
-            "\n[launch_env.ACME_FLAG]\nvalue = \"1\"\n".to_owned(),
+            "\n[launch_env.PI_FLAG]\nvalue = \"1\"\n".to_owned(),
         ),
     ]);
     for (name, tables) in &refused {
@@ -1127,18 +1127,45 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
 }
 
 #[tokio::test]
+async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
+    let servers = spawn_servers("pkg-launch-env-namespace").await;
+    let mut local = connect_unix(&servers.socket).await;
+    for (runtime, name) in [
+        ("ssh", "SSH_FLAG"),
+        ("https", "HTTPS_FLAG"),
+        ("aws", "AWS_FLAG"),
+    ] {
+        let document = descriptor_requiring(
+            LAUNCH_ENV_FEATURE,
+            &launch_env_table(&[format!("{name} = \"1\"")]),
+        )
+        .replace("\nid = \"pi\"\n", &format!("\nid = \"{runtime}\"\n"));
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, runtime, &document, false).await;
+        assert_eq!(
+            result.expect_err(runtime).code,
+            "package_descriptor_invalid",
+            "{runtime}"
+        );
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
 async fn launch_env_tables_within_the_bounds_install() {
     let servers = spawn_servers("pkg-launch-env-bounds").await;
     let mut local = connect_unix(&servers.socket).await;
     let pair = |name: &str| launch_env_table(&[format!("{name} = \"1\"")]);
 
-    let sixteen: Vec<String> = (0..16).map(|n| format!("ACME_FLAG_{n} = \"1\"")).collect();
+    let sixteen: Vec<String> = (0..16).map(|n| format!("PI_FLAG_{n} = \"1\"")).collect();
     let accepted = [
-        ("one-pair", pair("ACME_NO_UPDATE")),
+        ("one-pair", pair("PI_NO_UPDATE")),
         ("bounds", launch_env_table(&sixteen)),
         (
             "long-value",
-            launch_env_table(&[format!("ACME_FLAG = \"{}\"", "v".repeat(256))]),
+            launch_env_table(&[format!("PI_FLAG = \"{}\"", "v".repeat(256))]),
         ),
     ];
     for (index, (name, tables)) in accepted.iter().enumerate() {
@@ -1158,12 +1185,12 @@ async fn launch_env_pairs_reach_the_version_probe_and_key_its_cache() {
     let servers = spawn_servers("pkg-probe-env").await;
     let mut local = connect_unix(&servers.socket).await;
     let features = format!("{REVISION_FEATURE}, {LAUNCH_ENV_FEATURE}");
-    // The program prints its revision from FIXTURE_REVISION and nothing else
+    // The program prints its revision from PI_REVISION and nothing else
     // of its environment, so the version is the observation of the pair.
     let program = write_program(
         &servers.plugins,
         "probe-env",
-        "#!/bin/sh\nprintf 'fixture 1.4.13-R%s\\n' \"$FIXTURE_REVISION\"\n",
+        "#!/bin/sh\nprintf 'fixture 1.4.13-R%s\\n' \"$PI_REVISION\"\n",
     );
     let install = |version: &str, tables: &str| -> String {
         let mut document = probed_descriptor(
@@ -1194,7 +1221,7 @@ async fn launch_env_pairs_reach_the_version_probe_and_key_its_cache() {
     // a later package with another value reports its own, so the probe cache
     // keys on the pairs.
     for (version, value) in [("1.0.1", "2"), ("1.0.2", "3")] {
-        let table = launch_env_table(&[format!("FIXTURE_REVISION = \"{value}\"")]);
+        let table = launch_env_table(&[format!("PI_REVISION = \"{value}\"")]);
         let (_digest, result) = install_descriptor(
             &mut local,
             &servers.plugins,
@@ -1307,11 +1334,11 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
     let program = write_program(
         &servers.plugins,
         "agent-env",
-        "#!/bin/sh\nprintf 'LAUNCH_ENV_PAIR=<%s>\\n' \"$FIXTURE_FLAG\"\nexec sleep 600\n",
+        "#!/bin/sh\nprintf 'LAUNCH_ENV_PAIR=<%s>\\n' \"$PI_MARK\"\nexec sleep 600\n",
     );
     let document = descriptor_requiring(
         LAUNCH_ENV_FEATURE,
-        &launch_env_table(&["FIXTURE_FLAG = \"from-descriptor\"".to_owned()]),
+        &launch_env_table(&["PI_MARK = \"from-descriptor\"".to_owned()]),
     )
     .replace(
         "program = \"/bin/sh\"",
@@ -1323,7 +1350,7 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
     std::fs::write(
         servers.agents.join("overridden.toml"),
         format!(
-            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\n\n[env]\nFIXTURE_FLAG = \"from-profile\"\n",
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\n\n[env]\nPI_MARK = \"from-profile\"\n",
             digest.as_str()
         ),
     )

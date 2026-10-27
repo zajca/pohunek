@@ -1267,7 +1267,7 @@ impl RawDefinition {
         let launch_env = self
             .launch_env
             .clone()
-            .map(DescriptorLaunchEnv::new)
+            .map(|declared| DescriptorLaunchEnv::new(&self.runtime.id, declared))
             .transpose()?
             .unwrap_or_default();
         launch_env.refuse_owned(
