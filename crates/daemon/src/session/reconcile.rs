@@ -21402,7 +21402,11 @@ generation "$1"
                 "nothing was journaled"
             );
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// A request to a stopped worker that no deadline bounds (a periodic
@@ -21438,7 +21442,11 @@ generation "$1"
             );
             drop(stopped);
             let _ = busy.await;
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// Runs `operation` until it is about to call the worker (`points` is the
@@ -21608,7 +21616,11 @@ generation "$1"
             assert!(result.recorded);
             assert_eq!(pending_state_of(&fixture, &created.id).await, (None, None));
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// V-B: a release that timed out before it was written leaves no pending,
@@ -21664,7 +21676,11 @@ generation "$1"
                 "the claim the worker holds is not replaced by another process"
             );
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// X001: a report whose answer was lost after the request was sent may
@@ -21689,7 +21705,12 @@ generation "$1"
                 "the report the worker may hold stays pending"
             );
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            let refused = fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect_err("the stop of this session is refused");
+            assert_eq!(refused.code, "worker_operation_failed", "{refused:?}");
         }
 
         /// X001: the same for a release.
@@ -21728,7 +21749,12 @@ generation "$1"
                 "the release the worker may hold stays pending"
             );
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            let refused = fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect_err("the stop of this session is refused");
+            assert_eq!(refused.code, "worker_operation_failed", "{refused:?}");
         }
 
         /// The `session.active_identity.forward_failed` events logged on the
@@ -21870,8 +21896,14 @@ generation "$1"
             // once every forward and acknowledgement in flight is done.
             fixture.registry.settle_transactions().await;
             let events = (released, logs.messages(), logs.trace());
-            // The worker was killed in transit, so the stop cannot succeed.
-            let _ = fixture.registry.stop(&created.id).await;
+            let stop = fixture.registry.stop(&created.id).await;
+            if answer == Answer::Lost {
+                // The worker was killed in transit, so the stop cannot succeed.
+                let refused = stop.expect_err("the stop of this session is refused");
+                assert_eq!(refused.code, "worker_operation_failed", "{refused:?}");
+            } else {
+                stop.expect("stop the session");
+            }
             events
         }
 
@@ -21937,7 +21969,11 @@ generation "$1"
             assert!(!fixture.registry.release_agent(unbound).await.released);
 
             assert_eq!(logs.messages(), [RELEASE_NOT_FORWARDABLE]);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// T1 / V6: a forwarded report whose answer timed out and that the worker
@@ -21979,7 +22015,11 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// T2 / V7: a forwarded release whose answer timed out and that the worker
@@ -22040,7 +22080,11 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// A release whose answer timed out is ordered after a report the worker
@@ -22092,7 +22136,11 @@ generation "$1"
                 "a report older than the release is judged against the release, not against the waiting report"
             );
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         fn report_at(
@@ -22265,7 +22313,11 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// M2: the same when the worker rejects the newest of the two (its
@@ -22299,7 +22351,11 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// M3: a memory release of the report made after two lost operations
@@ -22335,7 +22391,11 @@ generation "$1"
             allow_imports(&fixture, true);
             sync_after_continue(&fixture, &created).await;
             assert_eq!(active_agent_name(&fixture, &created.id).await, None);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// H1: a report the worker accepted and the daemon has not committed
@@ -22368,7 +22428,11 @@ generation "$1"
                 Some(protocol::AgentActivity::Blocked),
                 "the accepted report keeps the activity it applies once adopted"
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// A release that lost the release slot to a later lost release still
@@ -22397,7 +22461,11 @@ generation "$1"
                 !memory_report_is_recorded(&fixture, unbound_report(&created, 2_005)).await,
                 "a report older than the journaled release is refused"
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         fn stored_activity(fixture: &Fixture, id: &SessionId) -> Option<protocol::AgentActivity> {
@@ -22445,7 +22513,11 @@ generation "$1"
                 None,
                 "a restart does not restore the activity of a released claim"
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// A forward lost after it was sent stays pending although the report
@@ -22516,7 +22588,11 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// M4 / V-A: two reports that time out before their request is written
@@ -22559,7 +22635,11 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// The claim of the session's root process the worker journaled and the
@@ -22685,7 +22765,11 @@ generation "$1"
             );
             assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 rows 2 and 7: the periodic sync reads the worker after it
@@ -22704,7 +22788,11 @@ generation "$1"
             wait_until_nothing_is_tracked(&fixture, &created.id).await;
 
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 14: the same for a release the worker rejects, which held
@@ -22732,7 +22820,11 @@ generation "$1"
             wait_until_nothing_is_tracked(&fixture, &created.id).await;
 
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_005)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 5: a snapshot read before the forward was sent says nothing
@@ -22756,7 +22848,11 @@ generation "$1"
             assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
             drop(stopped);
             wait_until_nothing_is_tracked(&fixture, &created.id).await;
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 6: a snapshot read before the forward that shows a newer
@@ -22780,7 +22876,11 @@ generation "$1"
             assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
             drop(stopped);
             wait_until_nothing_is_tracked(&fixture, &created.id).await;
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 4: the worker journaled the forward after the bound, so the
@@ -22815,7 +22915,11 @@ generation "$1"
             );
             // The adopted claim carries the caller's public order (2020).
             assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_015)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 8: the snapshot that shows the rejection is read before the
@@ -22896,7 +23000,11 @@ generation "$1"
 
             assert!(!lost.recorded);
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 7: a snapshot that is read after the worker rejected an
@@ -22922,7 +23030,11 @@ generation "$1"
 
             assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418: a snapshot of another worker instance says nothing about a
@@ -22959,7 +23071,11 @@ generation "$1"
 
             observe_worker(&fixture, &created).await;
             assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 9: the connection to the worker is lost after the request
@@ -22982,7 +23098,11 @@ generation "$1"
 
             assert_eq!(worker_instance_of(&fixture, &created.id).await, instance);
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 10: the same when the worker journaled the forward: the
@@ -23014,7 +23134,11 @@ generation "$1"
             );
             // The adopted claim carries the caller's public order (2020).
             assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_015)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// 1418 row 3: the worker answers the forward with a journal fault, so
@@ -23063,7 +23187,11 @@ generation "$1"
             // The dropped forward no longer holds the journal: a memory report
             // newer than it is admitted.
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// A worker that acknowledged a forwarded report and then stops answering
@@ -23131,7 +23259,11 @@ generation "$1"
                     .recorded
             );
             drop(stopped);
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         /// A worker that acknowledged a forwarded report and then stops answering
@@ -23216,7 +23348,11 @@ generation "$1"
             );
             drop(stopped);
             let _ = busy.await;
-            let _ = fixture.registry.stop(&created.id).await;
+            fixture
+                .registry
+                .stop(&created.id)
+                .await
+                .expect("stop the session");
         }
 
         #[tokio::test]
