@@ -10,6 +10,8 @@ use protocol::{
     SessionWaitParams, SessionWaitReason, SessionWaitResult, TerminalCursor, TerminalDimensions,
     TerminalWatermark,
 };
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::broadcast;
 
 use super::{
@@ -581,6 +583,28 @@ pub(crate) fn runtime_identity(
         .map_err(|_error| ProtocolError::session_terminal_unavailable())
 }
 
+/// True when `updated_at` is chronologically after `cursor`.
+///
+/// RFC3339 stamps are compared as instants: the fractional seconds are trimmed
+/// of trailing zeros and the offset may differ, so text order is not time
+/// order. The protocol rejects an unparsable cursor, so a parse failure here is
+/// a stored stamp that cannot be read; it never counts as newer.
+pub(super) fn updated_after(session_id: &str, updated_at: &str, cursor: &str) -> bool {
+    if let (Ok(updated), Ok(cursor)) = (
+        OffsetDateTime::parse(updated_at, &Rfc3339),
+        OffsetDateTime::parse(cursor, &Rfc3339),
+    ) {
+        return updated > cursor;
+    }
+    tracing::warn!(
+        session_id,
+        updated_at,
+        cursor,
+        "unreadable session update stamp in a wait"
+    );
+    false
+}
+
 fn evaluate_wait(params: &SessionWaitParams, snapshot: WaitSnapshot) -> Option<SessionWaitResult> {
     let reason = if params
         .states()
@@ -594,10 +618,9 @@ fn evaluate_wait(params: &SessionWaitParams, snapshot: WaitSnapshot) -> Option<S
             .is_some_and(|activity| activities.contains(&activity))
     }) {
         Some(SessionWaitReason::ActivityMatched)
-    } else if params
-        .after_updated_at()
-        .is_some_and(|updated| snapshot.session.updated_at.as_str() > updated)
-    {
+    } else if params.after_updated_at().is_some_and(|cursor| {
+        updated_after(&params.session_id().0, &snapshot.session.updated_at, cursor)
+    }) {
         Some(SessionWaitReason::SessionUpdated)
     } else if params.runtime().is_some_and(|expected| {
         snapshot

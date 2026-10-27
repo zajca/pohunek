@@ -2107,8 +2107,12 @@ screen or newest tail, never synthesize the missing bytes.
 
 `session.wait` requires a non-zero `timeout_ms` no greater than 8000 and at
 least one predicate. Runtime-scoped terminal/output cursors require `runtime`;
-`after_updated_at` is RFC 3339; present `states` and `activities` arrays cannot
-be empty:
+`after_updated_at` is RFC 3339 and is compared as an instant with the session's
+`updated_at`, so the offset and the length of the fractional seconds do not
+matter. Echo `SessionInfo.updated_at` verbatim: a cursor re-rendered at a lower
+precision (for example milliseconds) is earlier than the stored stamp, and the
+wait returns `session_updated` at once. Present `states` and `activities`
+arrays cannot be empty:
 
 ```json
 {
