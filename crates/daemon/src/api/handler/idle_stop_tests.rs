@@ -75,6 +75,7 @@ struct World {
     task: Option<SessionIdleStopTask>,
     events: broadcast::Receiver<protocol::Event>,
     inhibitor: Option<AutoAdvanceInhibitor>,
+    clock_paused: bool,
     sessions: Vec<String>,
 }
 
@@ -108,6 +109,7 @@ impl World {
             task: Some(task),
             events,
             inhibitor: Some(inhibitor),
+            clock_paused: true,
             sessions,
         }
     }
@@ -270,15 +272,24 @@ impl World {
             .expect("acknowledge the record");
     }
 
-    /// Returns to the real clock and stops the sessions still running.
-    async fn finish(mut self, running: &[usize]) {
+    /// Stops the idle-stop task and returns to the real clock, keeping the
+    /// sessions' working directories in place.
+    async fn release_clock(&mut self) {
         if let Some(task) = self.task.take() {
             task.shutdown().await;
         }
         if let Some(inhibitor) = self.inhibitor.take() {
             inhibitor.release().await;
         }
-        tokio::time::resume();
+        if self.clock_paused {
+            tokio::time::resume();
+            self.clock_paused = false;
+        }
+    }
+
+    /// Returns to the real clock and stops the sessions still running.
+    async fn finish(mut self, running: &[usize]) {
+        self.release_clock().await;
         let ids: Vec<String> = running
             .iter()
             .map(|index| self.id(*index).to_owned())
@@ -325,8 +336,10 @@ async fn an_opted_in_idle_session_stops_at_its_limit_and_records_why() {
         format!("idle_secs={LIMIT_SECS}")
     );
 
+    // The hook runs in the session's working directory, which the fixture
+    // removes when it is dropped, so the marker is awaited before `finish`.
     let id = world.id(0).to_owned();
-    world.finish(&[]).await;
+    world.release_clock().await;
     let expected = format!("{id}:stopped");
     let hook = pohunek_test_support::wait::wait_until("the session-stop hook marker", || async {
         std::fs::read_to_string(&marker)
@@ -335,6 +348,7 @@ async fn an_opted_in_idle_session_stops_at_its_limit_and_records_why() {
     })
     .await;
     assert_eq!(hook.lines().count(), 1, "the hook fires once: {hook:?}");
+    world.finish(&[]).await;
 }
 
 #[tokio::test]

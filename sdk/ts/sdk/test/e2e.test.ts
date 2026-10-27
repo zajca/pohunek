@@ -34,7 +34,6 @@ const SESSION_ROWS = 24;
 const DAEMON_READY_TIMEOUT_MS = 10_000;
 const DAEMON_READY_POLL_MS = 50;
 const DAEMON_CONNECT_TIMEOUT_MS = 750;
-const DAEMON_REQUEST_TIMEOUT_MS = 1_500;
 const EVENT_TIMEOUT_MS = 10_000;
 const ATTACH_TIMEOUT_MS = 10_000;
 const READ_MARKER_TIMEOUT_MS = 10_000;
@@ -569,11 +568,10 @@ async function waitForEvent<T extends ProtocolEvent>(
   throw new Error(`timed out waiting for ${description}; seen events: ${seen.join(", ")}`);
 }
 
-function connectOptions(): { connectTimeoutMs: number; requestTimeoutMs: number } {
-  return {
-    connectTimeoutMs: DAEMON_CONNECT_TIMEOUT_MS,
-    requestTimeoutMs: DAEMON_REQUEST_TIMEOUT_MS,
-  };
+// No explicit request timeout: an explicit one replaces the dedicated budgets
+// of session.new and the lifecycle calls, which a loaded runner can exceed.
+function connectOptions(): { connectTimeoutMs: number } {
+  return { connectTimeoutMs: DAEMON_CONNECT_TIMEOUT_MS };
 }
 
 async function closeRelay(relay: TestRelayHandle): Promise<void> {

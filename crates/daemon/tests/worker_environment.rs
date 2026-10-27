@@ -553,7 +553,7 @@ const OBSERVER_STREAM_ID: &str = "attach-observer";
 /// accepted and now holds the execution lock.
 async fn await_pty_echo(observer: &mut DataStream, marker: &[u8]) {
     let mut echoed = Vec::new();
-    tokio::time::timeout(DEADLINE, async {
+    let outcome = tokio::time::timeout(DEADLINE, async {
         while !echoed.windows(marker.len()).any(|window| window == marker) {
             let frame = read_frame(&mut observer.stream)
                 .await
@@ -573,8 +573,13 @@ async fn await_pty_echo(observer: &mut DataStream, marker: &[u8]) {
             }
         }
     })
-    .await
-    .expect("the attach write is accepted by the PTY");
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "the attach write is not echoed by the PTY: the observer saw {} bytes, tail {:?}",
+        echoed.len(),
+        String::from_utf8_lossy(&echoed[echoed.len().saturating_sub(120)..])
+    );
 }
 
 #[tokio::test]
