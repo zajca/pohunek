@@ -1007,7 +1007,7 @@ network tool the agent runs (`BASH_ENV`, `NODE_OPTIONS`, `SUDO_ASKPASS`,
 `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `OCI_`, `ALIBABA_`, `ALICLOUD_`,
 `DIGITALOCEAN_`, `HCLOUD_`, `TERRAFORM_`, `TF_`, `VAULT_`, `ANSIBLE_`, `GIT_`,
 `GH_`, `GITHUB_`, `GITLAB_`, `DOCKER_`, `KUBE`, `HELM_`, `PODMAN_`, `BUILDAH_`,
-`CONTAINER_`, `CONTAINERD_`, `COMPOSE_`, `HTTP_`, `HTTPS_`, `FTP_`, `ALL_`, `NO_`,
+`CONTAINER_`, `CONTAINERS_`, `CONTAINERD_`, `COMPOSE_`, `HTTP_`, `HTTPS_`, `FTP_`, `ALL_`, `NO_`,
 `SOCKS`, `CURL_`, `WGET_`, `REQUESTS_`, `SSL_`, `OPENSSL_`, `GNUTLS_`, `NSS_`,
 `SSLKEYLOGFILE`, `BASH_`, `ZSH_`, `SH_`, `ZDOTDIR`, `SUDO_`, `NODE_`, `NPM_`,
 `YARN_`, `PNPM_`, `JAVA_`, `JDK_`, `PYTHON`, `PIP_`, `PERL`, `RUBY`, `GEM_`,
@@ -1020,17 +1020,23 @@ network tool the agent runs (`BASH_ENV`, `NODE_OPTIONS`, `SUDO_ASKPASS`,
 `MISE_`. A prefix without a trailing `_` (such as `PYTHON`, `RUST` or `GOPATH`)
 matches any runtime id that starts with those letters (`python3`, `rustc`,
 `gopath-agent`); `goose` is unaffected, because only `GO_` and the exact Go
-variable names are listed. The list only grows. Inside the namespace a name is refused when it is
+variable names are listed. Entries such as `GOFLAGS` or `PHPRC` therefore
+reserve runtime ids; no declarable name can equal them. The list only grows. Inside the namespace a name is refused when it is
 a service-manager variable the worker never passes to an agent
 (`NOTIFY_SOCKET`, `INVOCATION_ID`, ...), the variable the same descriptor reads
 its `[config_home]` or `[native_reference.existence]` root from, secret-shaped
-(ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_CREDENTIALS`
-or `_AUTH`), or location-, identity- or code-shaped (any `_`-separated word after the
-namespace is `PATH`, `PATHS`, `DIR`, `DIRS`, `HOME`, `ROOT`, `FILE`, `SOCK`,
-`SOCKET`, `URL`, `URI`, `HOST`, `ENDPOINT`, `PROXY`, `COMMAND`, `CMD`, `BIN`,
-`OPTS`, `OPTIONS`, `ARGS`, `FLAGS`, `EXEC`, `SHELL`, `EDITOR`, `HOOK`, `PLUGIN`,
-`LIB`, `PRELOAD`, `CERT`, `CA`, `KEYRING`, `PROFILE`, `CONFIG` or `ID`; whole
-words, so `PI_PATHOLOGY` is fine and `PI_LOG_DIR_MODE` is not), so a public descriptor
+(any `_`-separated word after the namespace is `KEY`, `KEYS`, `TOKEN`, `TOKENS`,
+`SECRET`, `SECRETS`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `CREDENTIALS` or
+`AUTH`), or location-, identity- or code-shaped (any such word is `PATH`,
+`PATHS`, `DIR`, `DIRS`, `DIRECTORY`, `FOLDER`, `HOME`, `ROOT`, `FILE`, `FILES`,
+`SOCK`, `SOCKET`, `SOCKETS`, `URL`, `URLS`, `URI`, `HOST`, `HOSTS`, `SERVER`,
+`ADDR`, `ENDPOINT`, `REGISTRY`, `PROXY`, `COMMAND`, `CMD`, `BIN`, `BINARY`,
+`EXECUTABLE`, `SCRIPT`, `OPTS`, `OPTIONS`, `ARGS`, `FLAGS`, `EXEC`, `SHELL`,
+`EDITOR`, `HOOK`, `HOOKS`, `PLUGIN`, `PLUGINS`, `MODULES`, `LIB`, `LIBS`,
+`PRELOAD`, `CERT`, `CERTS`, `CA`, `KEYRING`, `PROFILE`, `CONF`, `CONFIG` or
+`ID`, or a longer word ending in `PATH`, `DIR`, `FILE`, `HOME`, `ROOT`,
+`FLAGS`, `OPTS`, `CONF` or `CERT`, such as `TMPDIR` or `LIBPATH`; `PI_PATHOLOGY`
+is fine and `PI_LOG_DIR_MODE` is not), so a public descriptor
 cannot redirect or blank owner or core state. Each value is at most 256 bytes without control characters and is
 never expanded. A refusal is `descriptor_invalid` and names the field, never a
 name or a value. The pairs are not persisted: each launch (a new session, a

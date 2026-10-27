@@ -1188,6 +1188,7 @@ async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
         ("goose", "GOOSE_MODE"),
         // A word of the runtime's own namespace is not a word of the name.
         ("home-agent", "HOME_AGENT_FLAG"),
+        ("containerx", "CONTAINERX_FLAG"),
     ]
     .into_iter()
     .enumerate()
@@ -1201,6 +1202,25 @@ async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
         let (_digest, result) =
             install_descriptor(&mut local, &servers.plugins, runtime, &document, false).await;
         result.unwrap_or_else(|error| panic!("{runtime} installs: {error:?}"));
+    }
+
+    // The id itself stays installable; only its `[launch_env]` is refused.
+    for (index, runtime) in ["glibc", "malloc", "lua", "dotnet", "cgo", "go"]
+        .into_iter()
+        .enumerate()
+    {
+        let document = descriptor_requiring("", "")
+            .replace("\nid = \"pi\"\n", &format!("\nid = \"{runtime}\"\n"))
+            .replace("version = \"1.0.0\"", &format!("version = \"1.1.{index}\""));
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("plain-{runtime}"),
+            &document,
+            false,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{runtime} without a table installs: {error:?}"));
     }
 
     drop(local);

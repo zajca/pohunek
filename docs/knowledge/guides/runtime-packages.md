@@ -169,8 +169,8 @@ collides with a variable family of the loader or the owner's tools (`SSH_`,
 privilege and network tools such as `BASH_`, `NODE_`, `PYTHON`, `SUDO_` and
 `CURL_`, and the rest listed in `docs/public-api.md`) has no usable table. Inside the namespace, service-manager
 variables, the variable the descriptor reads its config home from, secret-shaped
-names (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`,
-`*_CREDENTIALS`, `*_AUTH`) and location, identity or code-shaped names (any `_`-separated word after the
+names (a `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIALS` or `AUTH`
+word in any position) and location, identity or code-shaped names (any `_`-separated word after the
 namespace in the list in `docs/public-api.md`: `PATH`, `DIR`, `HOME`, `ROOT`,
 `FILE`, `URL`, `HOST`, `PROXY`, `CMD`, `BIN`, `OPTS`, `ARGS`, `FLAGS`, `EXEC`,
 `SHELL`, `EDITOR`, `HOOK`, `PLUGIN`, `LIB`, `PRELOAD`, `CERT`, `CA`, `KEYRING`,

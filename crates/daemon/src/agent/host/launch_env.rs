@@ -16,7 +16,7 @@
 //! of the loader, the owner's tools or the platform (`SSH_`, `AWS_`, `GIT_`,
 //! `HTTPS_`, ...) has no usable `[launch_env]`. Inside the namespace the
 //! service-manager names, the descriptor's own config home variables,
-//! secret-shaped suffixes and any location, identity or code-shaped word
+//! any secret-shaped word and any location, identity or code-shaped word
 //! (`_DIR`, `_CMD`, `_OPTS`, `_PRELOAD`, ...) are refused.
 //! A host profile `[env]` is owner-authored and not subject to these rules; it
 //! overrides a pair of the same name. The values reach only the declaring
@@ -92,6 +92,7 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "PODMAN_",
     "BUILDAH_",
     "CONTAINER_",
+    "CONTAINERS_",
     "CONTAINERD_",
     "COMPOSE_",
     // Network clients and TLS.
@@ -174,27 +175,94 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "MISE_",
 ];
 
-/// Suffixes of secret-shaped names, which only the owner's profile sets.
-const SECRET_SUFFIXES: &[&str] = &[
-    "_KEY",
-    "_TOKEN",
-    "_SECRET",
-    "_PASSWORD",
-    "_PASSWD",
-    "_CREDENTIALS",
-    "_AUTH",
+/// Words of secret-shaped names, which only the owner's profile sets.
+const SECRET_WORDS: &[&str] = &[
+    "KEY",
+    "KEYS",
+    "TOKEN",
+    "TOKENS",
+    "SECRET",
+    "SECRETS",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "AUTH",
 ];
 
 /// Words of location-, identity- and code-shaped names: where something
 /// lives, which program, library, plugin or hook to run, with which options, or
-/// which session this is is never a behaviour flag. A name is refused when any
-/// `_`-separated word after the runtime namespace is one of these.
+/// which session this is is never a behaviour flag.
 const LOCATION_WORDS: &[&str] = &[
-    "PATH", "PATHS", "DIR", "DIRS", "HOME", "ROOT", "FILE", "SOCK", "SOCKET", "URL", "URI", "HOST",
-    "ENDPOINT", "PROXY", "COMMAND", "CMD", "BIN", "OPTS", "OPTIONS", "ARGS", "FLAGS", "EXEC",
-    "SHELL", "EDITOR", "HOOK", "PLUGIN", "LIB", "PRELOAD", "CERT", "CA", "KEYRING", "PROFILE",
-    "CONFIG", "ID",
+    "PATH",
+    "PATHS",
+    "DIR",
+    "DIRS",
+    "DIRECTORY",
+    "FOLDER",
+    "HOME",
+    "ROOT",
+    "FILE",
+    "FILES",
+    "SOCK",
+    "SOCKET",
+    "SOCKETS",
+    "URL",
+    "URLS",
+    "URI",
+    "HOST",
+    "HOSTS",
+    "SERVER",
+    "ADDR",
+    "ENDPOINT",
+    "REGISTRY",
+    "PROXY",
+    "COMMAND",
+    "CMD",
+    "BIN",
+    "BINARY",
+    "EXECUTABLE",
+    "SCRIPT",
+    "OPTS",
+    "OPTIONS",
+    "ARGS",
+    "FLAGS",
+    "EXEC",
+    "SHELL",
+    "EDITOR",
+    "HOOK",
+    "HOOKS",
+    "PLUGIN",
+    "PLUGINS",
+    "MODULES",
+    "LIB",
+    "LIBS",
+    "PRELOAD",
+    "CERT",
+    "CERTS",
+    "CA",
+    "KEYRING",
+    "PROFILE",
+    "CONF",
+    "CONFIG",
+    "ID",
 ];
+
+/// Endings of a longer word that make it location- or code-shaped when the
+/// separator is missing (`TMPDIR`, `CAFILE`, `LIBPATH`, `AFLAGS`). Short words
+/// such as `ID` or `CA` are matched whole only, so `VALID` is not touched.
+const GLUED_ENDINGS: &[&str] = &[
+    "PATH", "DIR", "FILE", "HOME", "ROOT", "FLAGS", "OPTS", "CONF", "CERT", "CERTS",
+];
+
+/// Whether `word` is a location word, or a longer word ending in one of
+/// `GLUED_ENDINGS`.
+fn location_shaped(word: &str) -> bool {
+    LOCATION_WORDS.contains(&word)
+        || GLUED_ENDINGS
+            .iter()
+            .any(|ending| word.len() > ending.len() && word.ends_with(ending))
+}
 
 /// The validated `[launch_env]` pairs of a definition, ordered by name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -260,12 +328,15 @@ impl DescriptorLaunchEnv {
             if is_denylisted(name) {
                 return Err(field("cannot name a service-manager variable"));
             }
-            if SECRET_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+            if rest
+                .split(NAMESPACE_SEPARATOR)
+                .any(|word| SECRET_WORDS.contains(&word))
+            {
                 return Err(field("cannot name a secret-shaped variable"));
             }
             if rest
                 .split(NAMESPACE_SEPARATOR)
-                .any(|word| LOCATION_WORDS.contains(&word))
+                .any(|word| location_shaped(word))
             {
                 return Err(field("cannot name a location or identity variable"));
             }
