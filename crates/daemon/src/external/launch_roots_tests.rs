@@ -1443,3 +1443,47 @@ fn the_data_root_follows_the_environment_and_falls_back_to_the_home() {
         .iter()
         .any(|home| home.runtime == ACME_RUNTIME && home.profile.is_none() && home.code.is_some()));
 }
+
+#[test]
+fn a_profile_moves_the_data_root_with_its_environment() {
+    let mut digest = None;
+    let rig = Rig::with_packages(|plugins| {
+        digest = Some(install_acme_version(
+            plugins,
+            &data_root_descriptor(),
+            "1.0.0",
+            true,
+        ));
+    });
+    let digest = digest.expect("the package is installed");
+    let moved = rig.used_home("profile-data", "muse/sessions");
+    fs::write(
+        rig.root.join("agents/moved.toml"),
+        format!(
+            "base = \"{ACME_RUNTIME}\"\npackage = \"{ACME_PACKAGE_ID}\"\ndigest = \"{}\"\n\
+             [env]\nXDG_DATA_HOME = \"{}\"\n",
+            digest.as_str(),
+            moved.display()
+        ),
+    )
+    .expect("write the profile");
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+
+    let roots = rig.roots();
+
+    // The runtime's own root stays below `HOME`; the profile's follows its
+    // `XDG_DATA_HOME` and is private to it.
+    assert_eq!(
+        pairs(&roots)
+            .into_iter()
+            .filter(|(runtime, _path)| runtime == ACME_RUNTIME)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            root(&acme, rig.home().join(".local/share/muse/sessions")),
+            root(&acme, moved.join("muse/sessions")),
+        ])
+    );
+    assert!(roots
+        .iter()
+        .any(|root| root.path == moved.join("muse/sessions") && root.private));
+}

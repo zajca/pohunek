@@ -217,9 +217,8 @@ pub(crate) enum RootScan {
 /// How far the walk of a transcript root goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WalkBound {
-    /// Directory levels below the root that are registered; `None` bounds
-    /// nothing.
-    pub(super) max_depth: Option<u8>,
+    /// Directory levels below the root that are registered.
+    pub(super) max_depth: u8,
     /// The level of the session directories of a tree sharded by date, which
     /// are the ones that multiply: only the newest hold a watch.
     pub(super) dated_depth: Option<u8>,

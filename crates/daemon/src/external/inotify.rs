@@ -419,7 +419,7 @@ impl InotifyBackend {
     /// watches, and how many levels `dir` lies below its root.
     fn walk_of(&self, dir: &Path) -> (Option<u8>, Option<(PathBuf, u8)>, u8) {
         let (bound, levels) = self.bound_of(dir);
-        let limit = bound.as_ref().and_then(|(_, bound)| bound.max_depth);
+        let limit = bound.as_ref().map(|(_, bound)| bound.max_depth);
         let dated = bound.and_then(|(root, bound)| Some((root, bound.dated_depth?)));
         (limit, dated, levels)
     }

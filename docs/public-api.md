@@ -1103,7 +1103,8 @@ rules of `[config_home]` and its resolution (the variable of a host profile's
 `[env]` over the daemon's base environment, else the default below `HOME`; a
 relative value is `agent_config_dir_invalid`); with them the table needs no
 `[config_home]`. `max_depth` (1 to 6) is the number of directory levels below
-`dir` the observer lists and watches. `muse-session-v1` reads only a log at
+`dir` the observer lists and watches. A date-sharded tree is never walked below its session
+directories. `muse-session-v1` reads only a log at
 `YYYY/MM/DD/<uuid>/session.jsonl` below `dir`, framed (`children[].record_json`)
 or bare, within the first 32 lines (64 KiB): the first
 `runtime.session.metadata` record gives the session id (`stream.id`, equal to

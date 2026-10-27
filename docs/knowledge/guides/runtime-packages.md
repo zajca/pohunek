@@ -237,7 +237,8 @@ of a `[config_home]` (a host profile's `[env]` over the daemon's base
 environment, else the default below `HOME`; a relative value is a typed error,
 never a fallback). With them the table needs no `[config_home]`, and the
 variable cannot be a `[launch_env]` name. `max_depth` is 1 to 6; the observer
-lists no directory below it and registers no watch there.
+lists no directory below it and registers no watch there. A dated tree is
+never walked below its session directories (level 4), whatever `max_depth` says.
 
 `muse-session-v1` reads a session log at exactly
 `YYYY/MM/DD/<uuid>/session.jsonl` below `dir`. A line is a framed transaction

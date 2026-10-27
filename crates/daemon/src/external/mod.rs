@@ -160,18 +160,28 @@ pub(crate) struct TranscriptRoot {
 const PRIVATE_PATH_LABEL: &str = "<profile config home>";
 
 impl TranscriptRoot {
+    /// The directory levels below the root a walk lists: the declared
+    /// `max_depth`, never below the session level of a date-sharded tree, whose
+    /// session directories hold nothing the parser reads.
+    fn depth_limit(&self) -> Option<u8> {
+        match (self.max_depth, self.parser.dated_depth()) {
+            (Some(declared), Some(dated)) => Some(declared.min(dated)),
+            (declared, dated) => declared.or(dated),
+        }
+    }
+
     /// The bound of the walk of this root, when its descriptor declares one.
     fn walk_bound(&self) -> Option<watch::WalkBound> {
         let dated_depth = self.parser.dated_depth();
-        (self.max_depth.is_some() || dated_depth.is_some()).then_some(watch::WalkBound {
-            max_depth: self.max_depth,
+        self.depth_limit().map(|max_depth| watch::WalkBound {
+            max_depth,
             dated_depth,
         })
     }
 
     /// Whether `path` lies in a directory below this root's depth bound.
     fn is_beyond_depth(&self, path: &Path) -> bool {
-        let Some(max) = self.max_depth else {
+        let Some(max) = self.depth_limit() else {
             return false;
         };
         path.strip_prefix(&self.path)
@@ -748,7 +758,7 @@ impl TranscriptIndex {
                     {
                         continue;
                     }
-                    if root.max_depth.is_some_and(|max| depth >= max) {
+                    if root.depth_limit().is_some_and(|max| depth >= max) {
                         continue;
                     }
                     if directories_left == 0 {

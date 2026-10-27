@@ -619,6 +619,11 @@ async fn a_transcript_that_becomes_readable_is_indexed_without_a_content_change(
 /// backend-wide directory budget, and one exceeds a root's share of watches.
 const SESSIONS_PER_DAY: usize = 4500;
 
+/// The newest sessions that get subagent directories in the dated tree scenario,
+/// and how many each gets.
+const NEWEST_WITH_SUBAGENTS: usize = 1100;
+const SUBAGENTS_PER_SESSION: usize = 8;
+
 /// A session directory name below a dated day, ascending with `number`.
 fn session_name(number: usize) -> String {
     format!("00000000-0000-4000-8000-{number:012}")
@@ -665,6 +670,23 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
             fs::create_dir_all(dated.join(day).join(session_name(number))).expect("session dir");
         }
     }
+    // Subagent directories below the newest sessions: registered under the
+    // session watches they would exhaust the backend-wide budget, and the
+    // parser reads nothing there.
+    for number in SESSIONS_PER_DAY - NEWEST_WITH_SUBAGENTS..SESSIONS_PER_DAY {
+        for subagent in 0..SUBAGENTS_PER_SESSION {
+            let dir = dated
+                .join(new_day)
+                .join(session_name(number))
+                .join(format!("subagents/s{subagent}"));
+            fs::create_dir_all(dir).expect("subagent dir");
+        }
+    }
+    // The lowest session of each day has a log from the start. The pass visits
+    // the highest names first and stops at its directory bound inside the older
+    // day, so only the newest day's is indexed.
+    let new_day_log = write_session_log(&dated, new_day, &session_name(0));
+    let old_day_log = write_session_log(&dated, old_day, &session_name(0));
     let probe = prepare_arming_probe(&other);
     let sessions = ExternalSessions::new();
     let roots = vec![
@@ -693,16 +715,19 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
                 .unwrap_or_else(|_elapsed| panic!("timed out waiting for {}", path.display()));
         }
     };
-    // A store beyond the pass's directory bound is an incomplete pass; the
-    // watch budget is not exhausted, so no registration fails.
-    assert!(
-        !matches!(
-            handle.state(),
-            TranscriptWatch::Degraded(WatcherDegraded::RegistrationFailed)
-        ),
-        "{:?}",
-        handle.state()
-    );
+    // A store beyond the pass's directory bound is an incomplete pass, not a
+    // failed registration: the watch budget is not exhausted.
+    let mut states = handle.subscribe();
+    tokio::time::timeout(
+        STATE_TIMEOUT,
+        states
+            .wait_for(|state| *state == TranscriptWatch::Degraded(WatcherDegraded::ScanIncomplete)),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| panic!("the pass is not reported incomplete: {:?}", handle.state()))
+    .expect("watcher state");
+    assert!(indexed(&new_day_log), "the newest day is visited first");
+    assert!(!indexed(&old_day_log), "the older day is left at the bound");
 
     // A log in the newest day's last session directory, one in a session
     // directory of a day that appears later, and one under another root are
@@ -740,10 +765,10 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
 
     // The newest day's lowest session directory holds no watch (only the
     // highest 1024 names do): a pass reaches it.
-    let oldest = write_session_log(&dated, new_day, &session_name(0));
+    let unwatched = write_session_log(&dated, new_day, &session_name(1));
     handle.request_reconcile();
-    wait_for(oldest.clone(), STATE_TIMEOUT).await;
-    assert!(indexed(&oldest));
+    wait_for(unwatched.clone(), STATE_TIMEOUT).await;
+    assert!(indexed(&unwatched));
     sessions.shutdown();
 }
 
