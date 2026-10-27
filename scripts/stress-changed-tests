@@ -520,35 +520,42 @@ def run(argv, cwd, check=True):
     return result
 
 
-def strip_line_comment(line):
-    """`line` without a trailing `//` comment; a `//` inside a string literal stays."""
+def strip_line_comments(text):
+    """`text` without `//` comments; a `//` inside a string literal stays."""
+    out = []
     i = 0
-    while i < len(line):
-        raw = re.match(r'r(#*)"', line[i:]) if line[i] == "r" and (
-            i == 0 or not (line[i - 1].isalnum() or line[i - 1] == "_")) else None
+    while i < len(text):
+        raw = re.match(r'r(#*)"', text[i:]) if text[i] == "r" and (
+            i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) else None
         if raw:
             closing = '"' + raw.group(1)
-            end = line.find(closing, i + raw.end())
-            i = len(line) if end == -1 else end + len(closing)
-        elif line[i] == '"':
-            i += 1
-            while i < len(line) and line[i] != '"':
-                i += 2 if line[i] == "\\" else 1
-            i += 1
-        elif line.startswith("//", i):
-            return line[:i]
+            end = text.find(closing, i + raw.end())
+            end = len(text) if end == -1 else end + len(closing)
+            out.append(text[i:end])
+            i = end
+        elif text[i] == '"':
+            end = i + 1
+            while end < len(text) and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            end = min(end + 1, len(text))
+            out.append(text[i:end])
+            i = end
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end == -1 else end
         else:
+            out.append(text[i])
             i += 1
-    return line
+    return "".join(out)
 
 
 def only_attributes_and_comments(lines):
     """True when the removed `lines` are whole attributes and comment lines.
 
-    An attribute line may end in a `//` comment.
+    An attribute line may end in a `//` comment, and a string literal in an
+    attribute may span lines.
     """
-    code = "\n".join(strip_line_comment(l) for l in lines
-                     if not l.lstrip().startswith("//")).strip()
+    code = strip_line_comments("\n".join(lines)).strip()
     if not code:
         return bool(lines)
     # Every top-level item must be an attribute with balanced brackets.

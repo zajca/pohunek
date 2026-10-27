@@ -506,6 +506,11 @@ class DeletionRule(Fixture):
             '#[ignore = "see https://example.invalid/issue/1"] // reason')
         self.assertIn("tests::middle_case", result.stdout)
 
+    def test_removing_an_attribute_whose_string_spans_lines_selects_the_test(self):
+        result = self.remove_attribute_line(
+            '#[ignore = "flaky, see\n    https://example.invalid/issue/1"]')
+        self.assertIn("tests::middle_case", result.stdout)
+
     def test_removing_a_code_line_with_a_trailing_comment_selects_nothing_below(self):
         # Only whole attribute lines select the test below; a removed statement
         # that ends in a comment does not.
@@ -676,6 +681,9 @@ class DeclaringChain(Fixture):
                 self.commit(f"edit {name}")
                 result = self.selected_missing_with_flag()
                 self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
+                self.assertIn(f"{name}::{name}_case", result.stderr)
+                self.assertIn("NOT STRESSED" if accepted else "is not in the nextest list",
+                              result.stderr)
 
 
 class MultiLineAttribute(Fixture):
