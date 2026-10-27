@@ -47,14 +47,23 @@ pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 256;
 /// Separator that ends a runtime namespace.
 const NAMESPACE_SEPARATOR: char = '_';
 
-/// Namespaces no runtime can use: a runtime id that maps into one of these
-/// would name variables of the loader, the owner's tools or the platform.
-const REFUSED_NAMESPACES: &[&str] = &[
+/// Namespace prefixes no runtime can use: a runtime id that maps into one of
+/// these would name variables of the loader, the owner's tools, or an
+/// interpreter, package manager, privilege or network tool the agent runs, whose
+/// variables execute code or change trust (`BASH_ENV`, `NODE_OPTIONS`,
+/// `SUDO_ASKPASS`, `PYTHONSTARTUP`, `CURL_CA_BUNDLE`). The list only grows.
+pub const REFUSED_NAMESPACES: &[&str] = &[
+    // The core, the loader and the platform.
     "POHUNEK_",
     "LD_",
     "DYLD_",
     "XDG_",
     "LC_",
+    "SYSTEMD_",
+    "DBUS_",
+    "WAYLAND_",
+    "DISPLAY_",
+    // The owner's credentials, remotes and clouds.
     "SSH_",
     "GPG_",
     "GNUPG",
@@ -69,16 +78,39 @@ const REFUSED_NAMESPACES: &[&str] = &[
     "GITLAB_",
     "DOCKER_",
     "KUBE",
+    "HELM_",
+    // Network clients and TLS.
     "HTTP_",
     "HTTPS_",
     "FTP_",
     "ALL_",
     "NO_",
     "SOCKS",
-    "DBUS_",
-    "WAYLAND_",
-    "DISPLAY_",
-    "SYSTEMD_",
+    "CURL_",
+    "WGET_",
+    "REQUESTS_",
+    "SSL_",
+    "OPENSSL_",
+    // Shells and privilege.
+    "BASH_",
+    "ZSH_",
+    "SH_",
+    "SUDO_",
+    // Interpreters and package managers.
+    "NODE_",
+    "NPM_",
+    "YARN_",
+    "PNPM_",
+    "JAVA_",
+    "JDK_",
+    "PYTHON",
+    "PIP_",
+    "PERL",
+    "RUBY",
+    "GEM_",
+    "CARGO_",
+    "RUST",
+    "GO",
 ];
 
 /// Suffixes of secret-shaped names, which only the owner's profile sets.

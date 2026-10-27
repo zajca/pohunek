@@ -1128,24 +1128,26 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
 
 #[tokio::test]
 async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
+    use pohunek_daemon::agent::host::REFUSED_NAMESPACES;
+
     let servers = spawn_servers("pkg-launch-env-namespace").await;
     let mut local = connect_unix(&servers.socket).await;
-    for (runtime, name) in [
-        ("ssh", "SSH_FLAG"),
-        ("https", "HTTPS_FLAG"),
-        ("aws", "AWS_FLAG"),
-    ] {
+    // One scenario per refused family: the runtime named after the family
+    // declares a flag in its own namespace and is refused.
+    for family in REFUSED_NAMESPACES {
+        let runtime = family.trim_end_matches('_').to_ascii_lowercase();
+        let name = format!("{}_FLAG", runtime.to_ascii_uppercase());
         let document = descriptor_requiring(
             LAUNCH_ENV_FEATURE,
             &launch_env_table(&[format!("{name} = \"1\"")]),
         )
         .replace("\nid = \"pi\"\n", &format!("\nid = \"{runtime}\"\n"));
         let (_digest, result) =
-            install_descriptor(&mut local, &servers.plugins, runtime, &document, false).await;
+            install_descriptor(&mut local, &servers.plugins, &runtime, &document, false).await;
         assert_eq!(
-            result.expect_err(runtime).code,
+            result.expect_err(&runtime).code,
             "package_descriptor_invalid",
-            "{runtime}"
+            "{family}"
         );
     }
 

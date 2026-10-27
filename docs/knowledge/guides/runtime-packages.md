@@ -165,8 +165,9 @@ namespace: the `runtime.id` in upper case with `-` and `.` as `_`, then `_`
 (`muse` gives `MUSE_`, so `MUSE_NO_AUTO_UPDATE`), with something after it. The
 core allowlist outside the namespace is empty. A runtime whose namespace
 collides with a variable family of the loader or the owner's tools (`SSH_`,
-`AWS_`, `GIT_`, `HTTPS_`, `NO_`, `XDG_`, `POHUNEK_` and the rest listed in
-`docs/public-api.md`) has no usable table. Inside the namespace, service-manager
+`AWS_`, `GIT_`, `HTTPS_`, `NO_`, `XDG_`, `POHUNEK_`, interpreter, package-manager,
+privilege and network tools such as `BASH_`, `NODE_`, `PYTHON`, `SUDO_` and
+`CURL_`, and the rest listed in `docs/public-api.md`) has no usable table. Inside the namespace, service-manager
 variables, the variable the descriptor reads its config home from, secret-shaped
 names (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`,
 `*_CREDENTIALS`, `*_AUTH`) and location or identity names (`*_PATH`, `*_DIR`,

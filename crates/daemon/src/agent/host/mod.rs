@@ -43,7 +43,9 @@ pub(crate) use launch::{
     adopts, adopts_newer, honors_frozen_launch, launch_command, relaunch_launch, relaunch_pin,
     validate_launch_runtime, validate_launch_runtime_with_timeout_detailed, version_order, Spawn,
 };
-pub use launch_env::{DescriptorLaunchEnv, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_VALUE_BYTES};
+pub use launch_env::{
+    DescriptorLaunchEnv, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_VALUE_BYTES, REFUSED_NAMESPACES,
+};
 pub(crate) use package::may_serve_reserved;
 pub use package::{
     definition_from_archive, PackageLoad, PackageRejection, PackageSource, PackageStore,

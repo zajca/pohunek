@@ -998,11 +998,19 @@ The table holds at most 16 string entries and its pairs are behaviour flags.
 A name must start with the runtime's own namespace, derived from `runtime.id`:
 upper case, `-` and `.` mapped to `_`, then `_` (`muse` gives `MUSE_`), with at
 least one character after it. The core allowlist outside the namespace is empty.
-A runtime whose namespace begins with `POHUNEK_`, `LD_`, `DYLD_`, `XDG_`, `LC_`,
-`SSH_`, `GPG_`, `GNUPG`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`,
-`GIT_`, `GH_`, `GITHUB_`, `GITLAB_`, `DOCKER_`, `KUBE`, `HTTP_`, `HTTPS_`,
-`FTP_`, `ALL_`, `NO_`, `SOCKS`, `DBUS_`, `WAYLAND_`, `DISPLAY_` or `SYSTEMD_`
-has no usable `[launch_env]`. Inside the namespace a name is refused when it is
+A runtime whose namespace begins with a refused prefix, so a variable of the
+loader, the owner's tools or an interpreter, package-manager, privilege or
+network tool the agent runs (`BASH_ENV`, `NODE_OPTIONS`, `SUDO_ASKPASS`,
+`PYTHONSTARTUP`, `CURL_CA_BUNDLE`) cannot be set by a descriptor, has no usable
+`[launch_env]`. The prefixes are `POHUNEK_`, `LD_`, `DYLD_`, `XDG_`, `LC_`,
+`SYSTEMD_`, `DBUS_`, `WAYLAND_`, `DISPLAY_`, `SSH_`, `GPG_`, `GNUPG`, `AWS_`,
+`AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `GIT_`, `GH_`, `GITHUB_`, `GITLAB_`,
+`DOCKER_`, `KUBE`, `HELM_`, `HTTP_`, `HTTPS_`, `FTP_`, `ALL_`, `NO_`, `SOCKS`,
+`CURL_`, `WGET_`, `REQUESTS_`, `SSL_`, `OPENSSL_`, `BASH_`, `ZSH_`, `SH_`,
+`SUDO_`, `NODE_`, `NPM_`, `YARN_`, `PNPM_`, `JAVA_`, `JDK_`, `PYTHON`, `PIP_`,
+`PERL`, `RUBY`, `GEM_`, `CARGO_`, `RUST` and `GO` (the last group match any
+runtime id that starts with those letters, such as `python3` or `gopher`). The
+list only grows. Inside the namespace a name is refused when it is
 a service-manager variable the worker never passes to an agent
 (`NOTIFY_SOCKET`, `INVOCATION_ID`, ...), the variable the same descriptor reads
 its `[config_home]` or `[native_reference.existence]` root from, secret-shaped
