@@ -116,6 +116,20 @@ struct Discovery {
     overflowed: bool,
 }
 
+impl Discovery {
+    /// Records `path` when it is a transcript, within the discovery bound.
+    fn note(&mut self, path: PathBuf) {
+        if !is_jsonl_path(&path) {
+            return;
+        }
+        if self.paths.len() < MAX_DISCOVERED_TRANSCRIPTS {
+            self.paths.push(path);
+        } else {
+            self.overflowed = true;
+        }
+    }
+}
+
 /// Whether an error means the watch or walk budget is exhausted.
 ///
 /// The kernel reports an exhausted `fs.inotify.max_user_watches` as `ENOSPC`
@@ -125,6 +139,24 @@ fn is_limit_error(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded | io::ErrorKind::OutOfMemory
     )
+}
+
+/// Queues `subdirectories`, found at `depth`, for the walk: breadth first, or
+/// for a bounded root depth first with the highest names first, so the newest
+/// directories are registered before an exhausted budget cuts the walk.
+fn enqueue(
+    queue: &mut VecDeque<(PathBuf, u8)>,
+    subdirectories: Vec<PathBuf>,
+    depth: u8,
+    newest_first: bool,
+) {
+    if newest_first {
+        for path in subdirectories.into_iter().rev() {
+            queue.push_front((path, depth + 1));
+        }
+    } else {
+        queue.extend(subdirectories.into_iter().map(|path| (path, depth + 1)));
+    }
 }
 
 /// `entries` with the highest names first and entry errors last.
@@ -143,18 +175,28 @@ fn newest_entry_first(
     Box::new(listed.into_iter().chain(failed))
 }
 
-/// Records a cancelled walk as a failed one; returns whether to stop.
-fn cancelled(
-    cancel: &CancellationToken,
-    failed_dirs: &mut usize,
-    first_error: &mut Option<io::Error>,
-) -> bool {
-    if !cancel.is_cancelled() {
-        return false;
+/// The failures a tree walk met: how many directories failed and the first
+/// error, which a partial registration reports.
+#[derive(Debug, Default)]
+struct Failures {
+    directories: usize,
+    first: Option<io::Error>,
+}
+
+impl Failures {
+    fn record(&mut self, error: io::Error) {
+        self.directories += 1;
+        self.first.get_or_insert(error);
     }
-    *failed_dirs += 1;
-    first_error.get_or_insert(io::Error::from(io::ErrorKind::Interrupted));
-    true
+
+    /// Records a cancelled walk as a failed one; returns whether to stop.
+    fn cancelled(&mut self, cancel: &CancellationToken) -> bool {
+        if !cancel.is_cancelled() {
+            return false;
+        }
+        self.record(io::Error::from(io::ErrorKind::Interrupted));
+        true
+    }
 }
 
 /// Most deepest-level directories of bounded roots that hold a watch.
@@ -235,8 +277,7 @@ impl InotifyBackend {
         mut discovery: Option<&mut Discovery>,
         cancel: &CancellationToken,
     ) -> RootRegistration {
-        let mut failed_dirs = 0_usize;
-        let mut first_error: Option<io::Error> = None;
+        let mut failures = Failures::default();
         let mut budget = MAX_WALK_ENTRIES;
         let (limit, start_depth) = self.depth_limit_of(root);
         if limit.is_some_and(|max| start_depth > max) {
@@ -248,13 +289,14 @@ impl InotifyBackend {
         let mut registered_deepest = Vec::new();
         let mut is_root = true;
         'walk: while let Some((dir, depth)) = queue.pop_front() {
-            if cancelled(cancel, &mut failed_dirs, &mut first_error) {
+            if failures.cancelled(cancel) {
                 break 'walk;
             }
-            let deepest = limit == Some(depth) && depth > 0;
-            let watched_before = self.wd_by_path.contains_key(&dir);
-            if deepest
-                && !watched_before
+            // Only a directory that is new, at the deepest level of a bounded
+            // root, counts against the share of deepest-level watches.
+            let new_deepest =
+                limit == Some(depth) && depth > 0 && !self.wd_by_path.contains_key(&dir);
+            if new_deepest
                 && discovery.is_none()
                 && self.recent_deepest.len() + registered_deepest.len()
                     >= MAX_WATCHED_DEEPEST_DIRECTORIES
@@ -265,12 +307,10 @@ impl InotifyBackend {
             }
             match self.add_dir(&dir) {
                 Ok(true) => {
-                    if deepest && !watched_before {
-                        if discovery.is_some() {
-                            self.note_new_deepest(dir.clone());
-                        } else {
-                            registered_deepest.push(dir.clone());
-                        }
+                    if new_deepest && discovery.is_some() {
+                        self.note_new_deepest(dir.clone());
+                    } else if new_deepest {
+                        registered_deepest.push(dir.clone());
                     }
                 }
                 Ok(false) => {
@@ -290,8 +330,7 @@ impl InotifyBackend {
                     if is_root {
                         return RootRegistration::Failed(error);
                     }
-                    failed_dirs += 1;
-                    first_error.get_or_insert(error);
+                    failures.record(error);
                     if limit {
                         break 'walk;
                     }
@@ -299,28 +338,16 @@ impl InotifyBackend {
                 }
             }
             is_root = false;
-            let entries = match (self.lister)(&dir) {
-                Ok(entries) => entries,
-                Err(error) if is_absent_error(&error) => continue,
-                Err(error) => {
-                    failed_dirs += 1;
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-            };
-            let entries = if limit.is_some() {
-                newest_entry_first(entries)
-            } else {
-                entries
+            let Some(entries) = self.list_for_walk(&dir, limit.is_some(), &mut failures) else {
+                continue;
             };
             let mut subdirectories = Vec::new();
             for entry in entries {
-                if cancelled(cancel, &mut failed_dirs, &mut first_error) {
+                if failures.cancelled(cancel) {
                     break 'walk;
                 }
                 if budget == 0 {
-                    failed_dirs += 1;
-                    first_error.get_or_insert(limit_error("directory walk entry budget exhausted"));
+                    failures.record(limit_error("directory walk entry budget exhausted"));
                     break 'walk;
                 }
                 budget -= 1;
@@ -328,8 +355,7 @@ impl InotifyBackend {
                     Ok(entry) => entry,
                     Err(error) if is_absent_error(&error) => continue,
                     Err(error) => {
-                        failed_dirs += 1;
-                        first_error.get_or_insert(error);
+                        failures.record(error);
                         continue;
                     }
                 };
@@ -338,41 +364,46 @@ impl InotifyBackend {
                         continue;
                     }
                     if queue.len() + self.wd_by_path.len() >= MAX_WALK_DIRECTORIES {
-                        failed_dirs += 1;
-                        first_error.get_or_insert(limit_error("watched directory limit reached"));
+                        failures.record(limit_error("watched directory limit reached"));
                         break 'walk;
                     }
                     subdirectories.push(entry.path);
                 } else if let Some(found) = discovery.as_deref_mut() {
-                    if is_jsonl_path(&entry.path) {
-                        if found.paths.len() < MAX_DISCOVERED_TRANSCRIPTS {
-                            found.paths.push(entry.path);
-                        } else {
-                            found.overflowed = true;
-                        }
-                    }
+                    found.note(entry.path);
                 }
             }
-            if limit.is_some() {
-                // Depth first, highest names first, so the newest directories
-                // are registered before an exhausted budget cuts the walk.
-                for path in subdirectories.into_iter().rev() {
-                    queue.push_front((path, depth + 1));
-                }
-            } else {
-                queue.extend(subdirectories.into_iter().map(|path| (path, depth + 1)));
-            }
+            enqueue(&mut queue, subdirectories, depth, limit.is_some());
         }
         // The first met are the newest, so they go in last: the oldest watch is
         // the first to be evicted.
         self.recent_deepest
             .extend(registered_deepest.into_iter().rev());
-        match first_error {
+        match failures.first {
             Some(first_error) => RootRegistration::Partial {
-                failed_dirs,
+                failed_dirs: failures.directories,
                 first_error,
             },
             None => RootRegistration::Complete,
+        }
+    }
+
+    /// The entries of `dir`, highest names first for a bounded root. A
+    /// directory that vanished yields nothing; one that cannot be listed
+    /// yields nothing and is recorded in `failures`.
+    fn list_for_walk(
+        &self,
+        dir: &Path,
+        bounded: bool,
+        failures: &mut Failures,
+    ) -> Option<Box<dyn Iterator<Item = io::Result<ListedEntry>>>> {
+        match (self.lister)(dir) {
+            Ok(entries) if bounded => Some(newest_entry_first(entries)),
+            Ok(entries) => Some(entries),
+            Err(error) if is_absent_error(&error) => None,
+            Err(error) => {
+                failures.record(error);
+                None
+            }
         }
     }
 
