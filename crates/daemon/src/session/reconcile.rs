@@ -1026,7 +1026,8 @@ impl SessionRegistry {
         };
         let mut inventory = std::mem::take(&mut discovered.inventory);
         inventory.extend(unmigrated);
-        let mut journals = self.discover_worker_journals().await;
+        let mut journals =
+            scan_all_worker_journals(self.inner.config.worker_state_root.clone()).await;
         let stale_journal = |key: &WorkerKey| match &journals {
             Ok(journals) => journals.get(key.session_id()).map_or(Ok(None), |scan| {
                 scan.journal_of_generation(key.generation())
@@ -1311,10 +1312,7 @@ impl SessionRegistry {
         }
         let lifecycle = self.lifecycle().ok();
         let socket = self.session_socket_evidence(&record).await;
-        let scan = self
-            .discover_worker_journals()
-            .await
-            .map(|mut journals| journals.remove(&record.session_id).unwrap_or_default());
+        let scan = self.session_journals(&record.session_id).await;
         // One re-check waits at most one sweep grace for unreadable-marker
         // processes, whichever of its sweeps meet them.
         with_settle_window(Box::pin(self.reconcile_logical(
@@ -2408,8 +2406,8 @@ impl SessionRegistry {
         let Some(generation) = job else {
             return Unreachable::Mismatch("the session names no worker generation".to_owned());
         };
-        let scan = match self.discover_worker_journals().await {
-            Ok(mut journals) => journals.remove(&id.0).unwrap_or_default(),
+        let scan = match self.session_journals(&id.0).await {
+            Ok(scan) => scan,
             Err(detail) => return Unreachable::Ambiguous(detail),
         };
         // An unreadable journal of the session could be this worker's, so
@@ -2625,12 +2623,7 @@ impl SessionRegistry {
                 None,
             )
         };
-        let scan = self
-            .discover_worker_journals()
-            .await
-            .map_err(ambiguous)?
-            .remove(&id.0)
-            .unwrap_or_default();
+        let scan = self.session_journals(&id.0).await.map_err(ambiguous)?;
         if scan.conflict {
             return Err(ambiguous(
                 "the session has an unreadable or mismatched worker journal".to_owned(),
@@ -2700,11 +2693,9 @@ impl SessionRegistry {
             )
         };
         let scan = self
-            .discover_worker_journals()
+            .session_journals(&id.0)
             .await
-            .map_err(|detail| refusal(SUPERVISION_AMBIGUOUS, detail))?
-            .remove(&id.0)
-            .unwrap_or_default();
+            .map_err(|detail| refusal(SUPERVISION_AMBIGUOUS, detail))?;
         let journal = scan
             .journal_of_generation(generation.generation())
             .map_err(|detail| refusal(SUPERVISION_AMBIGUOUS, detail))?
@@ -2837,12 +2828,7 @@ impl SessionRegistry {
                 "the previous runtime has no complete journal identity".to_owned(),
             ));
         };
-        let scan = self
-            .discover_worker_journals()
-            .await
-            .map_err(refusal)?
-            .remove(&id.0)
-            .unwrap_or_default();
+        let scan = self.session_journals(&id.0).await.map_err(refusal)?;
         let journal = scan
             .journal_of_generation(generation.generation())
             .map_err(refusal)?
@@ -2919,12 +2905,7 @@ impl SessionRegistry {
         // The marker requirement applies only to a runtime no journal names.
         let mut runtimes: Vec<(String, WorkerBounds, bool)> = Vec::new();
         if let Some(generation) = generation {
-            let scan = self
-                .discover_worker_journals()
-                .await
-                .map_err(ambiguous)?
-                .remove(&id.0)
-                .unwrap_or_default();
+            let scan = self.session_journals(&id.0).await.map_err(ambiguous)?;
             if scan.conflict {
                 return Err(ambiguous(
                     "the session has an unreadable or mismatched worker journal".to_owned(),
@@ -3201,10 +3182,7 @@ impl SessionRegistry {
         &self,
         key: &WorkerKey,
     ) -> Result<Option<JournalEvidence>, String> {
-        let journals = self.discover_worker_journals().await?;
-        let Some(scan) = journals.get(key.session_id()) else {
-            return Ok(None);
-        };
+        let scan = self.session_journals(key.session_id()).await?;
         scan.journal_of_generation(key.generation())
             .map(Option::<&JournalEvidence>::cloned)
     }
@@ -3233,10 +3211,7 @@ impl SessionRegistry {
         let Some(generation) = record.runtime.generation.as_deref() else {
             return Ok(None);
         };
-        let journals = self.discover_worker_journals().await?;
-        let Some(scan) = journals.get(record.session_id.as_str()) else {
-            return Ok(None);
-        };
+        let scan = self.session_journals(&record.session_id).await?;
         scan.journal_of_generation(generation)?
             .map(|journal| journal.snapshot().map_err(str::to_owned))
             .transpose()
@@ -3259,10 +3234,7 @@ impl SessionRegistry {
         let Some(generation) = record.runtime.generation.as_deref() else {
             return Ok(false);
         };
-        let journals = self.discover_worker_journals().await?;
-        let Some(scan) = journals.get(record.session_id.as_str()) else {
-            return Ok(false);
-        };
+        let scan = self.session_journals(&record.session_id).await?;
         let Some(journal) = scan.journal_of_generation(generation)? else {
             return Ok(false);
         };
@@ -3274,23 +3246,27 @@ impl SessionRegistry {
             || journal.native_reference_claim.is_some())
     }
 
-    /// Scans every session's worker journals.
-    /// Scans every session's worker journals.
+    /// Scans the worker journals of session `id` alone.
     ///
-    /// Returns why the scan failed instead of an empty map: a failed scan is
-    /// no proof that any worker never journaled.
-    async fn discover_worker_journals(&self) -> Result<HashMap<String, WorkerJournalScan>, String> {
+    /// Returns why the scan failed instead of an empty scan: a failed scan is
+    /// no proof that the session never journaled. A session without a journal
+    /// directory yields an empty scan. Only startup reconciliation reads every
+    /// session's journals ([`scan_all_worker_journals`]).
+    async fn session_journals(&self, id: &str) -> Result<WorkerJournalScan, String> {
         let Some(state_root) = self.inner.config.worker_state_root.clone() else {
-            return Ok(HashMap::new());
+            return Ok(WorkerJournalScan::default());
         };
-        match tokio::task::spawn_blocking(move || scan_worker_journals(&state_root)).await {
-            Ok(Ok(journals)) => Ok(journals),
+        let session_id = id.to_owned();
+        match tokio::task::spawn_blocking(move || scan_session_journals(&state_root, &session_id))
+            .await
+        {
+            Ok(Ok(scan)) => Ok(scan),
             Ok(Err(error)) => {
-                tracing::warn!(error = %error, "failed to scan durable worker journals");
+                tracing::warn!(session_id = id, error = %error, "failed to scan durable worker journals");
                 Err(format!("worker journals cannot be scanned: {error}"))
             }
             Err(error) => {
-                tracing::warn!(error = %error, "durable worker journal scan task panicked");
+                tracing::warn!(session_id = id, error = %error, "durable worker journal scan task panicked");
                 Err(format!("worker journal scan failed: {error}"))
             }
         }
@@ -3385,9 +3361,8 @@ impl SessionRegistry {
                 return true;
             }
         }
-        let scan = match self.discover_worker_journals().await {
-            Ok(mut journals) => journals.remove(&record.session_id).unwrap_or_default(),
-            Err(_) => return false,
+        let Ok(scan) = self.session_journals(&record.session_id).await else {
+            return false;
         };
         let scoped = scan.scoped_to(Some(&generation));
         let TerminalJournalClassification::Exact(evidence) =
@@ -6869,6 +6844,11 @@ pub(super) struct WorkerJournalScan {
 }
 
 impl WorkerJournalScan {
+    /// Whether the scan holds any journal or rejection.
+    fn has_content(&self) -> bool {
+        self.conflict || !self.evidence.is_empty() || !self.rejected.is_empty()
+    }
+
     /// Keeps only the journals naming `generation`; `None` keeps every one.
     ///
     /// Journals of other generations are history, never evidence about the
@@ -6954,13 +6934,9 @@ pub(super) fn scan_worker_journals(
     state_root: &Path,
 ) -> std::io::Result<HashMap<String, WorkerJournalScan>> {
     let mut journals = HashMap::<String, WorkerJournalScan>::new();
-    let root_metadata = match std::fs::symlink_metadata(state_root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(journals),
-        Err(error) => return Err(error),
+    let Some(root) = open_journal_root(state_root)? else {
+        return Ok(journals);
     };
-    validate_discovery_path(state_root, &root_metadata, true)?;
-    let root = TrustedDir::open_absolute(state_root, 0o700).map_err(std::io::Error::other)?;
     for session_name in root.entry_names().map_err(std::io::Error::other)? {
         let Some(session_id) = session_name
             .to_str()
@@ -6969,45 +6945,128 @@ pub(super) fn scan_worker_journals(
         else {
             continue;
         };
-        // An unsafe or unreadable session directory may hold any worker's
-        // journal, so it is a conflict rather than an absence.
-        let Ok(session_directory) = root.open_child(&session_name, 0o700) else {
-            let scan = journals.entry(session_id).or_default();
-            scan.conflict = true;
-            scan.rejected
-                .push((String::new(), JournalReject::Unreadable));
-            continue;
-        };
-        for journal_name in session_directory
-            .entry_names()
-            .map_err(std::io::Error::other)?
-        {
-            let Some(journal_stem) = journal_name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".json"))
-                .filter(|stem| pohunek_paths::valid_worker_id(stem).is_some())
-            else {
-                continue;
-            };
-            let scan = journals.entry(session_id.clone()).or_default();
-            let evidence = session_directory
-                .read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
-                .map_err(|_unreadable| JournalReject::Unreadable)
-                .and_then(|bytes| {
-                    let path = state_root.join(&session_name).join(&journal_name);
-                    journal_evidence(&bytes, &path, &session_id, journal_stem)
-                });
-            match evidence {
-                Ok(evidence) => scan.evidence.push(evidence),
-                Err(reject) => {
-                    scan.conflict = true;
-                    scan.rejected
-                        .push((journal_name.to_string_lossy().into_owned(), reject));
-                }
-            }
+        let scan = scan_session_directory(&root, state_root, &session_name, &session_id)?;
+        if scan.has_content() {
+            journals.insert(session_id, scan);
         }
     }
     Ok(journals)
+}
+
+/// Scans the journals of `session_id` alone, equal to the entry of
+/// [`scan_worker_journals`] for that session (an empty scan when it has none).
+pub(super) fn scan_session_journals(
+    state_root: &Path,
+    session_id: &str,
+) -> std::io::Result<WorkerJournalScan> {
+    let Some(root) = open_journal_root(state_root)? else {
+        return Ok(WorkerJournalScan::default());
+    };
+    if pohunek_paths::valid_worker_session_id(session_id).is_none() {
+        return Ok(WorkerJournalScan::default());
+    }
+    scan_session_directory(
+        &root,
+        state_root,
+        std::ffi::OsStr::new(session_id),
+        session_id,
+    )
+}
+
+/// Opens the worker state root; `None` when it does not exist.
+fn open_journal_root(state_root: &Path) -> std::io::Result<Option<TrustedDir>> {
+    let root_metadata = match std::fs::symlink_metadata(state_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    validate_discovery_path(state_root, &root_metadata, true)?;
+    TrustedDir::open_absolute(state_root, 0o700)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Session directories the current thread opened for scanning.
+    static OPENED_SESSION_DIRECTORIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Decodes every journal of the session directory `session_name`.
+///
+/// A directory that does not exist yields an empty scan. An unsafe or
+/// unreadable one may hold any worker's journal, so it is a conflict rather
+/// than an absence.
+fn scan_session_directory(
+    root: &TrustedDir,
+    state_root: &Path,
+    session_name: &std::ffi::OsStr,
+    session_id: &str,
+) -> std::io::Result<WorkerJournalScan> {
+    #[cfg(test)]
+    OPENED_SESSION_DIRECTORIES.with(|opened| opened.set(opened.get() + 1));
+    let mut scan = WorkerJournalScan::default();
+    let session_directory = match root.open_child(session_name, 0o700) {
+        Ok(directory) => directory,
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => return Ok(scan),
+        Err(_unsafe) => {
+            scan.conflict = true;
+            scan.rejected
+                .push((String::new(), JournalReject::Unreadable));
+            return Ok(scan);
+        }
+    };
+    for journal_name in session_directory
+        .entry_names()
+        .map_err(std::io::Error::other)?
+    {
+        let Some(journal_stem) = journal_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|stem| pohunek_paths::valid_worker_id(stem).is_some())
+        else {
+            continue;
+        };
+        let evidence = session_directory
+            .read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
+            .map_err(|_unreadable| JournalReject::Unreadable)
+            .and_then(|bytes| {
+                let path = state_root.join(session_name).join(&journal_name);
+                journal_evidence(&bytes, &path, session_id, journal_stem)
+            });
+        match evidence {
+            Ok(evidence) => scan.evidence.push(evidence),
+            Err(reject) => {
+                scan.conflict = true;
+                scan.rejected
+                    .push((journal_name.to_string_lossy().into_owned(), reject));
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Scans every session's worker journals, for the startup reconciliation pass.
+///
+/// Returns why the scan failed instead of an empty map: a failed scan is no
+/// proof that any worker never journaled.
+async fn scan_all_worker_journals(
+    state_root: Option<PathBuf>,
+) -> Result<HashMap<String, WorkerJournalScan>, String> {
+    let Some(state_root) = state_root else {
+        return Ok(HashMap::new());
+    };
+    match tokio::task::spawn_blocking(move || scan_worker_journals(&state_root)).await {
+        Ok(Ok(journals)) => Ok(journals),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "failed to scan durable worker journals");
+            Err(format!("worker journals cannot be scanned: {error}"))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "durable worker journal scan task panicked");
+            Err(format!("worker journal scan failed: {error}"))
+        }
+    }
 }
 
 /// Decodes one journal file found under `session_id` as `journal_stem`.
@@ -8683,6 +8742,104 @@ while os.getppid() == parent:
             ),
             super::TerminalJournalClassification::Conflict
         ));
+    }
+
+    /// Writes a terminal journal of `worker` for session `session` below `dir`.
+    fn write_terminal_journal(dir: &Path, session: &str, worker: &str) {
+        let mut journal = JournalRecord::bootstrap(
+            session.to_owned(),
+            worker.to_owned(),
+            pohunek_session_worker::WorkerOrigin {
+                executable: PathBuf::from("/usr/libexec/pohunek-sessiond"),
+                version: "0.0.0-test".to_owned(),
+                generation: "abcd2345".to_owned(),
+            },
+            41,
+            "410".to_owned(),
+            "boot-test".to_owned(),
+            (1, 2),
+            "2026-09-20T00:00:00Z".to_owned(),
+        );
+        journal.phase = JournalRuntimePhase::Terminal;
+        Journal::new(dir.join(format!("{worker}.json")))
+            .write(&journal)
+            .expect("write the journal");
+    }
+
+    /// One session directory of the equivalence table.
+    fn journal_session_dir(state_root: &Path, name: &str) -> PathBuf {
+        let dir = state_root.join(name);
+        std::fs::create_dir_all(&dir).expect("create the session directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure the session directory");
+        dir
+    }
+
+    #[test]
+    fn a_session_scan_equals_its_entry_of_the_full_scan_and_opens_no_other_session() {
+        let root = temp_root();
+        let state_root = root.join("workers");
+        std::fs::create_dir_all(&state_root).expect("create the journal root");
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure the journal root");
+        write_terminal_journal(
+            &journal_session_dir(&state_root, "s-91"),
+            "s-91",
+            "worker-a",
+        );
+        std::fs::write(
+            journal_session_dir(&state_root, "s-92").join("worker-malformed.json"),
+            b"not json",
+        )
+        .expect("write the malformed journal");
+        journal_session_dir(&state_root, "s-93");
+        let loose = journal_session_dir(&state_root, "s-94");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the session directory");
+        std::os::unix::fs::symlink(root.join("elsewhere"), state_root.join("s-95"))
+            .expect("link a session directory");
+
+        let full = super::scan_worker_journals(&state_root).expect("full scan");
+        for session in [
+            "s-91",
+            "s-92",
+            "s-93",
+            "s-94",
+            "s-95",
+            "s-96",
+            "not a session id",
+        ] {
+            let before = super::OPENED_SESSION_DIRECTORIES.with(std::cell::Cell::get);
+            let scoped = super::scan_session_journals(&state_root, session).expect("session scan");
+            let opened = super::OPENED_SESSION_DIRECTORIES.with(std::cell::Cell::get) - before;
+            let expected = full.get(session).cloned().unwrap_or_default();
+            assert_eq!(format!("{scoped:?}"), format!("{expected:?}"), "{session}");
+            let expected_opened = u64::from(session != "not a session id");
+            assert_eq!(
+                opened, expected_opened,
+                "{session} opened {opened} directories"
+            );
+        }
+        assert!(full["s-91"].evidence.len() == 1 && !full["s-91"].conflict);
+        assert!(full["s-92"].conflict);
+        assert!(!full.contains_key("s-93"));
+        let mut keys: Vec<_> = full.keys().collect();
+        keys.sort();
+        // The loose directory and the link are conflicts; the empty one is absent.
+        assert_eq!(keys, ["s-91", "s-92", "s-94", "s-95"], "{keys:?}");
+    }
+
+    #[test]
+    fn a_session_scan_fails_like_the_full_scan_on_an_unsafe_root_and_is_empty_without_one() {
+        let root = temp_root();
+        let state_root = root.join("workers");
+        let absent = super::scan_session_journals(&state_root, "s-1").expect("no root");
+        assert!(!absent.conflict && absent.evidence.is_empty());
+        std::fs::create_dir_all(&state_root).expect("create the journal root");
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the journal root");
+        super::scan_worker_journals(&state_root).unwrap_err();
+        super::scan_session_journals(&state_root, "s-1").unwrap_err();
     }
 
     #[test]

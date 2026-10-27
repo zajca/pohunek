@@ -1379,3 +1379,31 @@ fn a_rejected_load_is_not_remembered_once_the_package_is_repaired() {
     assert_eq!(repaired.runtime_id(), &runtime("acme"));
     assert_eq!(store.cached_definitions(), 1);
 }
+
+#[test]
+fn a_build_failure_after_a_verified_root_is_not_cached() {
+    let plugins = Plugins::new();
+    // A descriptor that names an integration handler without a hook schema is
+    // recorded by the registry but is not a current definition, so the build
+    // fails after the root verified.
+    let stale = build(
+        &pre_schema_descriptor(Some("codex-hook-v1")),
+        "stale",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &stale, true, true);
+    let store = plugins.store();
+
+    for _ in 0..2 {
+        let refused = store
+            .load_pinned(&runtime("acme"), &stale.digest, &stale.identity)
+            .expect_err("the descriptor is not a current definition");
+        assert!(matches!(refused, PackageRejection::Descriptor(_)));
+        assert_eq!(store.cached_definitions(), 0);
+    }
+    assert_eq!(
+        store.root_verifications(),
+        2,
+        "each call verified the root and built again"
+    );
+}
