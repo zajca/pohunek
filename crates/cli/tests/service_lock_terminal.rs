@@ -118,12 +118,13 @@ fn blocked(pid: i32) -> bool {
 /// The kernel holds any `execve` of the copy until the lease is released or
 /// `lease-break-time` (45 s) passes, so while the lease is held the command
 /// cannot finish starting a `sleep`. A
-/// `sh` that starts programs with `vfork` (dash 0.5.11 and later) keeps its
-/// whole job in the kernel's vfork wait from the `vfork` until the child's
-/// `execve`. A `Ctrl-Z` that lands in that window stops only the child, so the
-/// job never reports a stop to `service lock` (#554). Holding every `sleep`
-/// start makes that window observable, and a `Ctrl-Z` typed while the command
-/// waits in a builtin never meets it.
+/// `sh` that starts programs with `vfork` (dash 0.5.11 and later) keeps the
+/// job's leader in the kernel's vfork wait from the `vfork` until the child's
+/// `execve`. A `Ctrl-Z` that lands in that window stops only the child while
+/// the leader stays blocked, so the job never reports a stop to
+/// `service lock` (#554). Holding every `sleep` start makes that window
+/// observable, and a `Ctrl-Z` typed while the command waits in a builtin
+/// never meets it.
 #[cfg(target_os = "linux")]
 struct SleepLease {
     bin: PathBuf,
@@ -490,11 +491,12 @@ fn answer_first(session: &mut Session) {
 }
 
 /// On Linux, `Ctrl-Z` is typed while the command waits in `read first`, where
-/// it runs only builtins. A `sh` that starts every program with `vfork` would hold
-/// the whole job in the kernel's vfork wait if the stop landed between the
-/// `vfork` and the `execve` of a `sleep`, and `service lock` would never see
-/// the job stop (#554). On Linux every `sleep` is held in its `execve` for the
-/// stop, so such a start fails the test instead of racing it.
+/// it runs only builtins. A `sh` that starts every program with `vfork` keeps
+/// the job's leader in the kernel's vfork wait until the `execve` of a `sleep`;
+/// if the stop landed in that window it would stop only the child, and
+/// `service lock` would never see the job stop (#554). On Linux every `sleep`
+/// is held in its `execve` for the stop, so such a start fails the test
+/// instead of racing it.
 #[test]
 fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
     let mut session = Session::start_stoppable();
