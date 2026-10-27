@@ -959,6 +959,112 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
     inhibitor.release().await;
 }
 
+/// Creates a session whose `updated_at` has a nonzero fractional second, so
+/// the whole-second rendering of it is a different, textually later string.
+async fn session_with_fractional_stamp(registry: &SessionRegistry) -> (SessionId, OffsetDateTime) {
+    let created = registry.create(params()).await.expect("create session");
+    let mut stamp = created.updated_at;
+    for attempt in 0..8 {
+        let parsed = OffsetDateTime::parse(&stamp, &Rfc3339).expect("stored stamp is RFC3339");
+        if parsed.nanosecond() != 0 {
+            return (created.id, parsed);
+        }
+        stamp = registry
+            .set_metadata(
+                &created.id,
+                BTreeMap::from([("bump".to_owned(), Some(attempt.to_string()))]),
+            )
+            .await
+            .expect("bump the stamp")
+            .session
+            .updated_at;
+    }
+    panic!("no stamp with a fractional second in eight updates");
+}
+
+/// Reason of a `session.wait` that carries `cursor` as `after_updated_at`, on
+/// the paused clock; the budget is spent by an explicit advance.
+async fn wait_reason_after(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    cursor: String,
+) -> SessionWaitReason {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
+    let params = wait_params(id, None, Some(cursor), None, TIMEOUT_BUDGET_MS);
+    let waiter_registry = registry.clone();
+    let waiter = tokio::spawn(async move { waiter_registry.wait(&params).await });
+    await_registered_waiters(registry, id, &[&waiter]).await;
+    tokio::time::advance(Duration::from_millis(u64::from(TIMEOUT_BUDGET_MS)) + TIMER_TICK).await;
+    let reason = waiter
+        .await
+        .expect("wait task")
+        .expect("wait result")
+        .reason;
+    tokio::time::resume();
+    inhibitor.release().await;
+    reason
+}
+
+fn new_wait_registry() -> SessionRegistry {
+    SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    })
+}
+
+#[tokio::test]
+async fn a_cursor_earlier_in_the_same_second_with_a_trimmed_fraction_is_updated() {
+    let registry = new_wait_registry();
+    let (id, stamp) = session_with_fractional_stamp(&registry).await;
+    // `...:05Z` sorts after `...:05.123Z` as text and is earlier as an instant.
+    let same_second = stamp.replace_nanosecond(0).expect("whole second");
+    let cursor = same_second.format(&Rfc3339).expect("format cursor");
+    assert_eq!(
+        wait_reason_after(&registry, &id, cursor).await,
+        SessionWaitReason::SessionUpdated
+    );
+    let earlier = (stamp - time::Duration::seconds(1))
+        .format(&Rfc3339)
+        .expect("format cursor");
+    assert_eq!(
+        wait_reason_after(&registry, &id, earlier).await,
+        SessionWaitReason::SessionUpdated
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_later_in_another_offset_is_not_updated() {
+    let registry = new_wait_registry();
+    let (id, stamp) = session_with_fractional_stamp(&registry).await;
+    // One second after the stamp, written at -12:00: the text starts an earlier
+    // day than the stamp's, so text order says the stamp is newer.
+    let offset = time::UtcOffset::from_hms(-12, 0, 0).expect("offset");
+    let cursor = (stamp + time::Duration::seconds(1))
+        .to_offset(offset)
+        .format(&Rfc3339)
+        .expect("format cursor");
+    assert_eq!(
+        wait_reason_after(&registry, &id, cursor).await,
+        SessionWaitReason::Timeout
+    );
+}
+
+#[tokio::test]
+async fn an_equal_instant_in_another_offset_is_not_updated() {
+    let registry = new_wait_registry();
+    let (id, stamp) = session_with_fractional_stamp(&registry).await;
+    let rendered = stamp.format(&Rfc3339).expect("format cursor");
+    let cursor = rendered
+        .strip_suffix('Z')
+        .map(|head| format!("{head}+00:00"))
+        .expect("a UTC stamp ends in Z");
+    assert_eq!(
+        wait_reason_after(&registry, &id, cursor).await,
+        SessionWaitReason::Timeout
+    );
+}
+
 async fn assert_runtime_change_precedes_cursor_access(
     registry: &SessionRegistry,
     session_id: &SessionId,
