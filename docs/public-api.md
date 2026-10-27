@@ -997,7 +997,10 @@ ACME_NO_AUTO_UPDATE = "1"
 The table holds at most 16 string entries. Each name is upper case, outside the
 reserved `POHUNEK_` namespace, without the prefixes `LD_`, `DYLD_`, `XDG_` or
 `LC_`, and is none of `PATH`, `HOME`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`,
-`TERM`, `COLORTERM`, `LANG` or `TBH_MANAGED_HOOKS_PATH`. A secret-shaped name
+`TERM`, `COLORTERM`, `LANG` or `TBH_MANAGED_HOOKS_PATH`, and none of the
+service-manager variables the worker never passes to an agent (`NOTIFY_SOCKET`,
+`INVOCATION_ID`, ...), nor the variable the same descriptor reads its
+`[config_home]` or `[native_reference.existence]` root from. A secret-shaped name
 (ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_CREDENTIALS`
 or `_AUTH`) is refused, so a public descriptor cannot blank or shadow an owner
 credential. Each value is at most 256 bytes without control characters and is
@@ -1397,7 +1400,8 @@ the next major release (codex `[0.160.0, 1.0.0)`, claude
 `[2.1.289, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
 update the agent CLIs independently of pohunek. The
 declaration is rejected unless `args`, `min` and `below` are all present, `min`
-is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH`. The daemon
+is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH` (for
+`semver-revision-line-v1`, also `MAJOR.MINOR.PATCH-R<n>[.<m>]`). The daemon
 compiles only the data-driven `semver-v1`, `semver-line-v1` and
 `semver-revision-line-v1` parsers; a
 descriptor that names any other parser id still parses, but its runtime reports
@@ -1424,7 +1428,7 @@ an invalid template is rejected when the package is validated, naming
 `semver-revision-line-v1` (runtime feature `version-probe-revision-v1`, so the
 descriptor lists it in `requires`) reads the same `line` templates but its
 release token is `MAJOR.MINOR.PATCH-R<n>` or `MAJOR.MINOR.PATCH-R<n>.<m>`
-(canonical digits, at most 64 bytes in all). The revision is a number, not a
+(canonical digits, at most 64 bytes in all, and `n` and `m` below 2^32). The revision is a number, not a
 pre-release: the order is `(MAJOR, MINOR, PATCH, n, m)` with an absent part as
 0, so `1.4.13` equals `1.4.13-R0` and `1.4.13-R2` precedes `1.4.13-R2.1`, and
 `min` and `below` accept both forms (`min = "1.4.13"` supports `1.4.13-R2`;

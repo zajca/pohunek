@@ -331,7 +331,8 @@ impl LineTemplateError {
 ///
 /// The template is `PREFIX{version}SUFFIX`, optionally followed by
 /// ` {annotation}`. `{version}` is a bare `MAJOR.MINOR.PATCH` (see
-/// [`ProbeVersion::parse`]); the annotation, when declared, is a space and at
+/// [`ProbeVersion::parse`]), or with [`Self::read_revision`] one that may carry
+/// a `-R<n>[.<m>]` revision; the annotation, when declared, is a space and at
 /// least one more character on the same line. The match is anchored at both
 /// ends of the trimmed line and linear: it compares literals and scans the
 /// release token once, with no backtracking.

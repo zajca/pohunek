@@ -163,7 +163,8 @@ Use it for switches the agent reads at start. At most 16 entries; values are
 at most 256 bytes, never expanded. Names the core or the owner own are refused
 at install (`descriptor_invalid`): `POHUNEK_*`, `LD_*`, `DYLD_*`, `XDG_*`,
 `LC_*`, `PATH`, `HOME`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`, `TERM`,
-`COLORTERM`, `LANG`, `TBH_MANAGED_HOOKS_PATH` and any secret-shaped name
+`COLORTERM`, `LANG`, `TBH_MANAGED_HOOKS_PATH`, service-manager variables, the
+variable the same descriptor reads its config home from, and any secret-shaped name
 (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`, `*_CREDENTIALS`,
 `*_AUTH`). A host profile's `[env]` entry of the same name overrides a declared
 pair on a launch. A program the user starts by hand inside a shell session

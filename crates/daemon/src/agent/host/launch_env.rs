@@ -11,12 +11,15 @@
 //! definition that serves it. A public descriptor must not blank or replace an
 //! owner credential, the search path or a variable the core owns, so loader,
 //! locale and XDG names, the core's own names and secret-shaped names are
-//! refused. The trust model stays same-UID (see "Runtime packages and trust"):
+//! refused, as are service-manager names and the variables the descriptor
+//! reads its own config home from. The trust model stays same-UID (see "Runtime packages and trust"):
 //! this guards against mistakes and shadowing, it is not a sandbox.
 
 // Rust guideline compliant 2026-10-27
 
 use std::collections::BTreeMap;
+
+use pohunek_worker_protocol::is_denylisted;
 
 use super::definition::DefinitionError;
 use crate::agent::env_name_problem;
@@ -96,6 +99,9 @@ impl DescriptorLaunchEnv {
             {
                 return Err(field("cannot name a variable the core or the loader owns"));
             }
+            if is_denylisted(name) {
+                return Err(field("cannot name a service-manager variable"));
+            }
             if SECRET_SUFFIXES
                 .iter()
                 .any(|suffix| name.ends_with(suffix) || *name == suffix[1..])
@@ -110,6 +116,31 @@ impl DescriptorLaunchEnv {
             }
         }
         Ok(Self(declared.into_iter().collect()))
+    }
+
+    /// Refuses a pair that names one of `owned`, the variables the same
+    /// descriptor reads its config home or conversation root from: the launch
+    /// would give the agent a home the daemon's own resolution never sees.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] naming `launch_env`.
+    pub fn refuse_owned<'a>(
+        &self,
+        owned: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), DefinitionError> {
+        let owned: Vec<&str> = owned.into_iter().collect();
+        if self
+            .0
+            .iter()
+            .any(|(name, _)| owned.contains(&name.as_str()))
+        {
+            return Err(DefinitionError::Field {
+                field: "launch_env",
+                reason: "cannot name a config home or conversation root variable",
+            });
+        }
+        Ok(())
     }
 
     /// The pairs in name order.

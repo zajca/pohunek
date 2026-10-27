@@ -698,11 +698,7 @@ impl RuntimeDefinition {
             .as_ref()
             .map(|declared| Transcripts::new(&declared.parser, &declared.dir))
             .transpose()?;
-        let launch_env = raw
-            .launch_env
-            .map(DescriptorLaunchEnv::new)
-            .transpose()?
-            .unwrap_or_default();
+        let launch_env = raw.validated_launch_env(config_home.as_ref())?;
         let definition = Self::new_with_env(
             DefinitionParts {
                 runtime_id,
@@ -1124,8 +1120,8 @@ struct DescriptorFacts<'a> {
     submit_delay_configurable: bool,
     prompt_arg: bool,
     native: Option<&'a NativeSessionLaunch>,
-    /// Absent while empty, so a descriptor without `[launch_env]` keeps the
-    /// digest it had before the table existed.
+    /// Omitted while empty, so a descriptor without `[launch_env]` hashes to
+    /// the value persisted sessions record.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     launch_env: &'a [(String, String)],
 }
@@ -1259,6 +1255,31 @@ fn parse_document(
     check_requires(&document, features)?;
     let raw = toml::from_str(source).map_err(|error| malformed(&error))?;
     Ok((document, raw))
+}
+
+impl RawDefinition {
+    /// The `[launch_env]` pairs, refused when one names a variable this
+    /// descriptor reads its config home or conversation root from.
+    fn validated_launch_env(
+        &self,
+        config_home: Option<&ConfigHome>,
+    ) -> Result<DescriptorLaunchEnv, DefinitionError> {
+        let launch_env = self
+            .launch_env
+            .clone()
+            .map(DescriptorLaunchEnv::new)
+            .transpose()?
+            .unwrap_or_default();
+        launch_env.refuse_owned(
+            config_home.map(ConfigHome::env).into_iter().chain(
+                self.native_reference
+                    .existence
+                    .as_ref()
+                    .and_then(|existence| existence.root_env.as_deref()),
+            ),
+        )?;
+        Ok(launch_env)
+    }
 }
 
 impl RawConfigHome {

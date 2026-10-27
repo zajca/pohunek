@@ -947,6 +947,7 @@ async fn revision_versions_are_read_by_inspect_and_the_launch_gate() {
         "1.4.13-R1.",
         "1.4.13-R2-x",
         "1.4.13-R4294967296",
+        "1.4.13-R99999999999999999999999999999999999999999999999999999999999",
         "1.4.13+b",
         "1.4-R2",
     ] {
@@ -1000,6 +1001,20 @@ async fn revision_versions_are_read_by_inspect_and_the_launch_gate() {
         }
     }
 
+    // The strict parsers still refuse a revision.
+    let program = probe_program(&servers.plugins, "probe-strict", "fixture 1.4.13-R2");
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "strict",
+        &probed_descriptor(&program, "2.0.0", "semver-line-v1", ("1.4.13", "2.0.0"), ""),
+        false,
+    )
+    .await;
+    result.expect("the strict descriptor installs");
+    let runtime = inspected_runtime(&mut local).await;
+    assert_eq!((runtime.version, runtime.supported), (None, Some(false)));
+
     drop(local);
     servers.stop().await;
 }
@@ -1031,49 +1046,61 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
     );
 
     let numbered: Vec<String> = (0..=16).map(|n| format!("ACME_FLAG_{n} = \"1\"")).collect();
-    let refused: Vec<(&str, String)> = vec![
-        ("reserved-prefix", pair("POHUNEK_MODE")),
-        ("lower-case", pair("acme_flag")),
-        ("loader-prefix", pair("LD_PRELOAD")),
-        ("dyld-prefix", pair("DYLD_INSERT_LIBRARIES")),
-        ("xdg-prefix", pair("XDG_CONFIG_HOME")),
-        ("locale-prefix", pair("LC_ALL")),
-        ("path", pair("PATH")),
-        ("home", pair("HOME")),
-        ("tmpdir", pair("TMPDIR")),
-        ("shell", pair("SHELL")),
-        ("user", pair("USER")),
-        ("logname", pair("LOGNAME")),
-        ("term", pair("TERM")),
-        ("colorterm", pair("COLORTERM")),
-        ("lang", pair("LANG")),
-        ("managed-hooks", pair("TBH_MANAGED_HOOKS_PATH")),
-        ("key-suffix", pair("META_API_KEY")),
-        ("token-suffix", pair("SERVICE_TOKEN")),
-        ("secret-suffix", pair("APP_SECRET")),
-        ("password-suffix", pair("DB_PASSWORD")),
-        ("passwd-suffix", pair("DB_PASSWD")),
-        ("credentials-suffix", pair("CLOUD_CREDENTIALS")),
-        ("auth-suffix", pair("PROXY_AUTH")),
-        ("bare-token", pair("TOKEN")),
-        ("too-many", launch_env_table(&numbered)),
+    // Names the core, the loader, the owner or the descriptor's own config home
+    // own, then values and shapes outside the bounds.
+    let mut refused: Vec<(String, String)> = [
+        "POHUNEK_MODE",
+        "acme_flag",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "XDG_CONFIG_HOME",
+        "LC_ALL",
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "SHELL",
+        "USER",
+        "LOGNAME",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "TBH_MANAGED_HOOKS_PATH",
+        "META_API_KEY",
+        "SERVICE_TOKEN",
+        "APP_SECRET",
+        "DB_PASSWORD",
+        "DB_PASSWD",
+        "CLOUD_CREDENTIALS",
+        "PROXY_AUTH",
+        "TOKEN",
+        "NOTIFY_SOCKET",
+    ]
+    .iter()
+    .map(|name| ((*name).to_owned(), pair(name)))
+    .collect();
+    refused.extend([
         (
-            "long-value",
+            "config-home-variable".to_owned(),
+            format!("{CONFIG_HOME_TABLE}{}", pair("ACME_HOME")),
+        ),
+        ("too-many".to_owned(), launch_env_table(&numbered)),
+        (
+            "long-value".to_owned(),
             launch_env_table(&[format!("ACME_FLAG = \"{}\"", "v".repeat(257))]),
         ),
         (
-            "control-value",
+            "control-value".to_owned(),
             launch_env_table(&["ACME_FLAG = \"a\\u0007b\"".to_owned()]),
         ),
         (
-            "number-value",
+            "number-value".to_owned(),
             launch_env_table(&["ACME_FLAG = 1".to_owned()]),
         ),
         (
-            "nested-table",
+            "nested-table".to_owned(),
             "\n[launch_env.ACME_FLAG]\nvalue = \"1\"\n".to_owned(),
         ),
-    ];
+    ]);
     for (name, tables) in &refused {
         let (_digest, result) = install_descriptor(
             &mut local,
@@ -1094,6 +1121,16 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
         listed.packages.is_empty(),
         "a refused descriptor records nothing"
     );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn launch_env_tables_within_the_bounds_install() {
+    let servers = spawn_servers("pkg-launch-env-bounds").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let pair = |name: &str| launch_env_table(&[format!("{name} = \"1\"")]);
 
     let sixteen: Vec<String> = (0..16).map(|n| format!("ACME_FLAG_{n} = \"1\"")).collect();
     let accepted = [

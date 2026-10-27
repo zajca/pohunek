@@ -277,9 +277,8 @@ fn descriptor_digest_tracks_structural_launch_fields_only() {
         assert_eq!(digest(&first, name), digest(&second, name), "{name}");
     }
     assert_ne!(digest(&first, "shell"), digest(&first, "hermes"));
-    // The digest a release before `[launch_env]` recorded in a persisted
-    // session (`store/fixtures/schema-8/metadata.jsonl`): a runtime without
-    // the table keeps it.
+    // The digest persisted sessions record (`store/fixtures/schema-8/
+    // metadata.jsonl`): a runtime without `[launch_env]` hashes to it.
     let BindingProvenance::Builtin {
         descriptor_digest, ..
     } = digest(&first, "shell")

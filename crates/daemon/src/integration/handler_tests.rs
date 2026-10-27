@@ -899,6 +899,40 @@ fn homes_below_one_variable_are_told_apart_by_their_resolved_path() {
         ]
     );
 
+    // Unset, the variable gives way to `default`, which is the complete path;
+    // a relative value is an error and never falls back to `default`.
+    let one = pi_shaped_integration_host_with_homes(
+        Path::new("/bin/sh"),
+        CLAUDE_ID,
+        "identity-subagent-v1",
+        "\"config-home-subdir-v1\"",
+        &[("pi", &home_table("muse"))],
+    );
+    let pi_dir = |claude_dir: Option<&Path>, home: &Path| {
+        super::tests::with_status_env(claude_dir, Some(&codex), Some(home), || {
+            super::config_homes_for_tests(&one).targets(None, &super::HomeSelection::Runtime)
+        })
+        .expect("targets")
+        .iter()
+        .find(|target| target.resolved.runtime_id.as_str() == "pi")
+        .map(|target| {
+            target
+                .dir()
+                .map(Path::to_path_buf)
+                .map_err(|error| error.code)
+        })
+        .expect("the pi target")
+    };
+    assert_eq!(
+        pi_dir(None, &claude),
+        Ok(claude.join(".claude/muse")),
+        "unset: default below HOME"
+    );
+    assert_eq!(
+        pi_dir(Some(Path::new("relative")), &claude),
+        Err("agent_config_dir_invalid".to_owned())
+    );
+
     let ambiguous = Err("integration_home_ambiguous_owner".to_owned());
     let shared = targets(&[("pi", &home_table("muse")), ("pi2", &home_table("muse"))]);
     assert_eq!(
