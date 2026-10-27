@@ -1565,6 +1565,14 @@ async fn daemon_launches_a_real_worker_with_an_unlimited_soft_descriptor_limit()
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
+    // An unprivileged process cannot raise a finite hard limit, so an unlimited
+    // soft limit is only settable when the inherited hard limit is unlimited.
+    if let Some(hard) = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum {
+        eprintln!(
+            "unsupported: hard RLIMIT_NOFILE is finite ({hard}); an unprivileged process cannot set an unlimited soft limit"
+        );
+        return;
+    }
     let env = TestEnv::new().expect("create isolated limit probe environment");
     let mut probe = env.command("/usr/bin/true");
     configure_descriptor_limit(&mut probe, true);
