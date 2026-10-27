@@ -789,7 +789,7 @@ impl StallProbe<'_> {
                 "state={:?} updated_at={} newer_than_cursor={} metadata={:?}",
                 info.state,
                 info.updated_at,
-                info.updated_at.as_str() > self.cursor,
+                super::observation::updated_after(&info.updated_at, self.cursor),
                 info.metadata
             ),
         };
@@ -1037,8 +1037,8 @@ async fn a_cursor_earlier_in_the_same_second_with_a_trimmed_fraction_is_updated(
 async fn a_cursor_later_in_another_offset_is_not_updated() {
     let registry = new_wait_registry();
     let (id, stamp) = session_with_fractional_stamp(&registry).await;
-    // One second after the stamp, written at -12:00: the text starts an earlier
-    // day than the stamp's, so text order says the stamp is newer.
+    // One second after the stamp, written at -12:00: the date and hour fields
+    // are earlier than the stamp's, so text order says the stamp is newer.
     let offset = time::UtcOffset::from_hms(-12, 0, 0).expect("offset");
     let cursor = (stamp + time::Duration::seconds(1))
         .to_offset(offset)

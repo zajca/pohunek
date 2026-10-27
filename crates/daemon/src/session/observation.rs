@@ -589,21 +589,19 @@ pub(crate) fn runtime_identity(
 /// of trailing zeros and the offset may differ, so text order is not time
 /// order. The protocol rejects an unparsable cursor, so a parse failure here is
 /// a stored stamp that cannot be read; it never counts as newer.
-fn updated_after(updated_at: &str, cursor: &str) -> bool {
-    match (
+pub(super) fn updated_after(updated_at: &str, cursor: &str) -> bool {
+    if let (Ok(updated), Ok(cursor)) = (
         OffsetDateTime::parse(updated_at, &Rfc3339),
         OffsetDateTime::parse(cursor, &Rfc3339),
     ) {
-        (Ok(updated), Ok(cursor)) => updated > cursor,
-        _ => {
-            tracing::warn!(
-                updated_at,
-                cursor,
-                "unreadable session update stamp in a wait"
-            );
-            false
-        }
+        return updated > cursor;
     }
+    tracing::warn!(
+        updated_at,
+        cursor,
+        "unreadable session update stamp in a wait"
+    );
+    false
 }
 
 fn evaluate_wait(params: &SessionWaitParams, snapshot: WaitSnapshot) -> Option<SessionWaitResult> {

@@ -1492,7 +1492,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       reason = "state_matched";
     } else if (session.activity !== undefined && params.activities?.includes(session.activity) === true) {
       reason = "activity_matched";
-    } else if (params.after_updated_at !== undefined && params.after_updated_at < session.updated_at) {
+    } else if (params.after_updated_at !== undefined && isLaterInstant(session.updated_at, params.after_updated_at)) {
       reason = "session_updated";
     } else if (
       terminalCursor !== undefined
@@ -2921,6 +2921,11 @@ function turnWaitShuttingDown(): ProtocolError {
     "daemon_shutting_down",
     "daemon shutdown cancelled the bounded session turn wait",
   );
+}
+
+/** True when RFC3339 `stamp` is a later instant than `cursor` (millisecond resolution; unparsable input is never later). */
+function isLaterInstant(stamp: string, cursor: string): boolean {
+  return Date.parse(stamp) > Date.parse(cursor);
 }
 
 function sameRuntime(

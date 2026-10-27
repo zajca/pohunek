@@ -126,6 +126,47 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session wait compares its update cursor as an instant", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("wait-cursor") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      const stamp = created.updated_at;
+      const utcPlusZero = stamp.replace(/Z$/u, "+00:00");
+      // The same instant is no update, although the text sorts before the stamp.
+      const equal = await client.call("session.wait", {
+        session_id: created.id,
+        after_updated_at: utcPlusZero,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(equal.reason).toBe("timeout");
+      // A cursor one second later, written at -12:00, is no update either.
+      const later = new Date(Date.parse(stamp) + 1_000);
+      const shifted = new Date(later.getTime() - 12 * 3_600_000).toISOString().replace(/Z$/u, "-12:00");
+      const notYet = await client.call("session.wait", {
+        session_id: created.id,
+        after_updated_at: shifted,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(notYet.reason).toBe("timeout");
+      // A cursor one second earlier is.
+      const earlier = new Date(Date.parse(stamp) - 1_000).toISOString();
+      const updated = await client.call("session.wait", {
+        session_id: created.id,
+        after_updated_at: earlier,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(updated.reason).toBe("session_updated");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session input wait returns runtime-scoped activity evidence", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-wait") } });
     try {
