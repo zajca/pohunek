@@ -929,23 +929,8 @@ async fn a_transcript_root_of_its_own_installs_only_with_its_feature_and_valid()
     servers.stop().await;
 }
 
-#[tokio::test]
-async fn a_directory_name_existence_installs_only_for_a_hook_runtime_with_its_feature() {
-    let servers = spawn_servers("pkg-dir-name").await;
-    let mut local = connect_unix(&servers.socket).await;
-
-    let gated = [(
-        "without-requires",
-        hook_descriptor("", DIR_NAME_EXISTENCE, ""),
-    )];
-    assert_install_codes(
-        &mut local,
-        &servers.plugins,
-        &gated,
-        "runtime_feature_unsupported",
-    )
-    .await;
-
+/// Hook descriptors whose directory-name existence is invalid.
+fn invalid_dir_name_existences() -> Vec<(&'static str, String)> {
     let with = |existence: &str| hook_descriptor(DATA_ROOT_FEATURE, existence, "");
     let without = |field: &str| {
         DIR_NAME_EXISTENCE
@@ -954,7 +939,7 @@ async fn a_directory_name_existence_installs_only_for_a_hook_runtime_with_its_fe
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let refused = [
+    [
         (
             "assigned-strategy",
             descriptor_requiring(DATA_ROOT_FEATURE, "")
@@ -1012,7 +997,29 @@ async fn a_directory_name_existence_installs_only_for_a_hook_runtime_with_its_fe
             "check-none",
             with(&DIR_NAME_EXISTENCE.replace("check = \"file\"", "check = \"none\"")),
         ),
-    ];
+    ]
+    .into()
+}
+
+#[tokio::test]
+async fn a_directory_name_existence_installs_only_for_a_hook_runtime_with_its_feature() {
+    let servers = spawn_servers("pkg-dir-name").await;
+    let mut local = connect_unix(&servers.socket).await;
+
+    let gated = [(
+        "without-requires",
+        hook_descriptor("", DIR_NAME_EXISTENCE, ""),
+    )];
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &gated,
+        "runtime_feature_unsupported",
+    )
+    .await;
+
+    let with = |existence: &str| hook_descriptor(DATA_ROOT_FEATURE, existence, "");
+    let refused = invalid_dir_name_existences();
     assert_install_codes(
         &mut local,
         &servers.plugins,
