@@ -5,6 +5,24 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.37.1
+
+### 2026-10-27, 0.37.1 upgrade and rollback notes, #1642, #1388
+
+- 0.37.1 is a patch release of 0.37.0 for `host.inspect` latency (#1388) and daemon memory growth (#1642). It changes none of `STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`, `MIN_PROTOCOL_VERSION`, the worker protocol versions, `WORKER_JOURNAL_SCHEMA_VERSION` or `EXPECTED_INTEGRATION_VERSION`, and keeps the `service.toml` `schema_version` at 7.
+- New optional `service.toml` keys, all additive and omitted by the writer while they equal their defaults: the `[inventory]` table (`probe_cache_ttl_ms`, `probe_failure_ttl_ms`, `probe_cache_max_entries`, `probe_parallelism`) and `[worker_journals] max_age_days` (default 7, `1..=365`). A 0.37.0 daemon ignores both. `host.inspect` also takes the optional parameter `skip_runtime_probes`, which a 0.37.0 daemon ignores.
+- Upgrade from 0.37.0 as usual. Rollback to 0.37.0 is supported: the store and the worker journals keep their formats, so 0.37.0 reads everything 0.37.1 wrote. The worker journal directories 0.37.1 already deleted with their session or collected as orphans do not come back.
+
+### 2026-10-27, worker journal retention, #1642
+
+- `pohunek session rm` now deletes the session's worker journal directory (`<state>/workers/<session>/`) after the session record is deleted; a removal that proceeded past an unconfirmed process keeps it.
+- The daemon collects, at start, the journal directories of sessions that no longer exist when their workers are gone and nothing in them changed within `[worker_journals] max_age_days` (optional table of `service.toml`, default 7 days, `1..=365`). Journals of sessions that have a record are never deleted. See [setup](guides/setup.md).
+
+### 2026-10-26, host.inspect probe cache, #1388
+
+- `host.inspect` reads its runtime version probes through a daemon-wide cache keyed by the program's file identity, probe arguments and launch `PATH`; each distinct program is probed once per inventory, in parallel, off the async runtime. The optional `[inventory]` table of `service.toml` sets the lifetimes (`probe_cache_ttl_ms`, `probe_failure_ttl_ms`), the entry cap and the parallelism. A result can therefore be as old as the cache lifetime; a replaced, relinked or touched program is probed again at once.
+- `host.inspect` accepts the optional parameter `skip_runtime_probes: true`, which answers only the feature flags, `daemon_version` and `git_available` (empty `supported_agents` and `runtimes`). `pohunek session new --cwd`, `--from-remote` and `--input-ack-timeout-ms` send it for their capability check; an older daemon ignores it and answers the full inventory.
+
 ## 0.37.0
 
 ### 2026-10-24, acceptance harness starts D4 sessions on a project, #1112
