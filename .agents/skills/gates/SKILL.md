@@ -75,14 +75,23 @@ changed tests N times under `scripts/stress-run` (4 pinned CPUs, no retries).
 Counts are lane suggestions, not defaults: 50 for heavy, 20 for relay-db; pick
 the deadline from the measured cost of one iteration. On macOS there is no CPU
 affinity, so the run needs `--unpinned` and the contention is host-wide; say so
-in the report. Both cargo calls build with `--all-features`, like CI's test
-archive, so feature-gated tests (relay `postgres-tests`) run. `--print` shows the selection without running anything. A test
+in the report. Both cargo calls share one `-p` package set, taken from the full
+selection, so the run does not rebuild with a different feature unification.
+They build with `--all-features`, like CI's Linux test archive, so
+feature-gated tests (relay `postgres-tests`) run. CI's macOS lane and tier
+archives build default features, so under `--profile macos` the step builds
+default features too: a test that exists only behind a Cargo feature is not in
+the list and fails by name, because CI's macOS lane never builds it either.
+`--print` shows the selection without running anything. A test
 the script cannot map or list fails the step by name; a `macro_rules!` that
 generates tests fails by the macro's name (stress the whole partition then). A
 diff that changes tests for two operating systems cannot pass on one host: run
 the step on each host with `--allow-missing-on-host`, which names every test the
 host does not build as NOT STRESSED, and carry those names to the host that
-builds them in the report.
+builds them in the report. The flag excuses only a test with a non-`test` `cfg`
+on its declaring chain (its own attributes, enclosing inline modules, the
+file's `#![cfg]`, the `mod x;` declarations above it); a missing test under
+plain `#[cfg(test)]` still fails.
 
 A failure is a FLAKY result under the flaky-test policy: open or reuse an issue
 with the root cause, fix the test or the product race, and run the step again.

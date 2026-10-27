@@ -482,6 +482,47 @@ class DeletionRule(Fixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("nothing to stress", result.stdout)
 
+    def remove_attribute_line(self, attribute_line):
+        """Add `attribute_line` above `middle_case` in one commit, remove it in the next."""
+        marker = "    #[test]\n    fn middle_case() {"
+        self.edit("crates/demo/src/lib.rs", marker, f"    {attribute_line}\n{marker}")
+        self.commit("add attribute")
+        self.edit("crates/demo/src/lib.rs", f"    {attribute_line}\n", "")
+        self.commit("remove attribute")
+        result = self.run_script("--print", base="HEAD~1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_removing_an_attribute_line_with_a_trailing_comment_selects_the_test(self):
+        result = self.remove_attribute_line("#[ignore] // flaky on slow hosts")
+        self.assertIn("tests::middle_case", result.stdout)
+
+    def test_removing_an_attribute_with_a_url_in_its_string_selects_the_test(self):
+        result = self.remove_attribute_line('#[ignore = "see https://example.invalid/issue/1"]')
+        self.assertIn("tests::middle_case", result.stdout)
+
+    def test_a_url_in_the_string_and_a_trailing_comment_are_both_handled(self):
+        result = self.remove_attribute_line(
+            '#[ignore = "see https://example.invalid/issue/1"] // reason')
+        self.assertIn("tests::middle_case", result.stdout)
+
+    def test_removing_an_attribute_whose_string_spans_lines_selects_the_test(self):
+        result = self.remove_attribute_line(
+            '#[ignore = "flaky, see\n    https://example.invalid/issue/1"]')
+        self.assertIn("tests::middle_case", result.stdout)
+
+    def test_removing_a_code_line_with_a_trailing_comment_selects_nothing_below(self):
+        # Only whole attribute lines select the test below; a removed statement
+        # that ends in a comment does not.
+        self.edit("crates/demo/src/lib.rs", "pub fn helper() -> u32 {\n    1\n}",
+                  "pub fn helper() -> u32 {\n    1\n}\n\nconst NOTE: u32 = 2; // note")
+        self.commit("add const")
+        self.edit("crates/demo/src/lib.rs", "\nconst NOTE: u32 = 2; // note", "")
+        self.commit("remove const")
+        result = self.run_script("--print", base="HEAD~1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("tests::", result.stdout)
+
 
 class HostShare(Fixture):
     def setUp(self):
@@ -520,12 +561,129 @@ class HostShare(Fixture):
         self.assertNotIn("flow_case", expression)
 
     def test_nothing_runs_when_the_host_builds_none_of_them(self):
+        self.gate_for_another_os("comment_edit")
         result = self.run_script("--allow-missing-on-host", list_json=listing({}))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("NOT STRESSED", result.stderr)
         self.assertIn("nothing stressed here", result.stdout)
         run_calls = [line for line in self.log.read_text().splitlines() if '"run"' in line]
         self.assertEqual(run_calls, [])
+
+
+    def gate_for_another_os(self, test_name):
+        """Mark `tests::<test_name>` in the demo lib as built only on another OS."""
+        self.edit("crates/demo/src/lib.rs", f"    #[test]\n    fn {test_name}() {{",
+                  f"    #[cfg(target_os = \"plan9\")]\n    #[test]\n    fn {test_name}() {{")
+        self.commit("gate for another os")
+
+    def test_a_cfg_test_only_module_fails_under_the_flag(self):
+        # `#[cfg(test)] mod tests` is compiled in every test build, so a missing
+        # name there is a wrong identity, not another host's share.
+        result = self.run_script("--allow-missing-on-host", list_json=listing({}))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("NOT STRESSED on this host", result.stderr)
+        self.assertIn("flow_case", result.stderr)
+        self.assertIn("tests::comment_edit", result.stderr)
+        self.assertIn("is not in the nextest list", result.stderr)
+
+    def test_the_list_and_the_run_carry_the_same_package_set(self):
+        self.edit("crates/cli/tests/mod_a.rs", "#[test]\nfn cli_case() {\n    assert!(true);",
+                  "#[cfg(target_os = \"plan9\")]\n#[test]\nfn cli_case() {\n    assert!(false);")
+        self.commit("gated cli test")
+        result = self.run_script(
+            "--allow-missing-on-host",
+            list_json=listing({"demo": {"tests::comment_edit": "matches"},
+                               "demo::flow": {"flow_case": "matches"}}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mod_a::cli_case", result.stderr)
+        self.assertIn("NOT STRESSED", result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        list_call = next(c for c in calls if c[:2] == ["nextest", "list"])
+        run_call = next(c for c in calls if c[:2] == ["nextest", "run"])
+        self.assertEqual(self.packages(list_call), ["demo", "pohunek-cli"])
+        self.assertEqual(self.packages(run_call), self.packages(list_call))
+        expression = run_call[run_call.index("-E") + 1]
+        self.assertNotIn("cli_case", expression)
+
+    @staticmethod
+    def packages(argv):
+        return [argv[i + 1] for i, word in enumerate(argv) if word == "-p"]
+
+
+class DeclaringChain(Fixture):
+    """Which `cfg` on the way to a test lets `--allow-missing-on-host` accept its absence."""
+
+    def selected_missing_with_flag(self, base="HEAD~1"):
+        return self.run_script("--allow-missing-on-host", base=base, list_json=listing({}))
+
+    def test_a_parent_mod_declaration_for_another_os_is_not_stressed_here(self):
+        self.write("crates/demo/src/gated.rs", "#[test]\nfn gated_case() {\n    assert!(true);\n}\n")
+        self.edit("crates/demo/src/lib.rs", "pub fn helper()",
+                  "#[cfg(target_os = \"plan9\")]\nmod gated;\n\npub fn helper()")
+        self.commit("add gated module")
+        self.edit("crates/demo/src/gated.rs", "assert!(true);", "assert!(1 == 1);")
+        self.commit("edit gated test")
+        result = self.selected_missing_with_flag()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NOT STRESSED on this host", result.stderr)
+        self.assertIn("gated::gated_case", result.stderr)
+
+    def test_a_grandparent_cfg_reaches_a_nested_module(self):
+        self.write("crates/demo/src/outer.rs", "mod inner;\n")
+        self.write("crates/demo/src/outer/inner.rs",
+                   "#[test]\nfn inner_case() {\n    assert!(true);\n}\n")
+        self.edit("crates/demo/src/lib.rs", "pub fn helper()",
+                  "#[cfg(unix)]\nmod outer;\n\npub fn helper()")
+        self.commit("add nested modules")
+        self.edit("crates/demo/src/outer/inner.rs", "assert!(true);", "assert!(1 == 1);")
+        self.commit("edit nested test")
+        result = self.selected_missing_with_flag()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("outer::inner::inner_case", result.stderr)
+
+    def test_an_inner_cfg_attribute_of_the_file_counts(self):
+        self.write("crates/demo/src/inner_cfg.rs",
+                   "#![cfg(target_os = \"plan9\")]\n\n#[test]\nfn inner_cfg_case() {\n    assert!(true);\n}\n")
+        self.edit("crates/demo/src/lib.rs", "pub fn helper()", "mod inner_cfg;\n\npub fn helper()")
+        self.commit("add module")
+        self.edit("crates/demo/src/inner_cfg.rs", "assert!(true);", "assert!(1 == 1);")
+        self.commit("edit test")
+        result = self.selected_missing_with_flag()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inner_cfg::inner_cfg_case", result.stderr)
+
+    def test_an_inline_module_for_another_os_counts(self):
+        self.edit("crates/demo/src/lib.rs", "    #[test]\n    fn middle_case() {",
+                  "    #[cfg(windows)]\n    mod windows_only {\n        #[test]\n"
+                  "        fn win_case() {\n            assert!(true);\n        }\n    }\n\n"
+                  "    #[test]\n    fn middle_case() {")
+        self.commit("add inline module")
+        self.edit("crates/demo/src/lib.rs", "fn win_case() {\n            assert!(true);",
+                  "fn win_case() {\n            assert!(1 == 1);")
+        self.commit("edit inline test")
+        result = self.selected_missing_with_flag()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tests::windows_only::win_case", result.stderr)
+
+    def test_forms_that_only_add_test_do_not_count_but_any_with_test_does(self):
+        for index, (predicate, accepted) in enumerate((
+                ("all(test)", False), ("all(test, test)", False),
+                ("any(test, target_os = \"plan9\")", True),
+                ("all(test, unix)", True), ("not(test)", True))):
+            with self.subTest(predicate=predicate):
+                name = f"form_{index}"
+                self.write(f"crates/demo/src/{name}.rs",
+                           f"#[cfg({predicate})]\n#[test]\nfn {name}_case() {{\n    assert!(true);\n}}\n")
+                self.edit("crates/demo/src/lib.rs", "pub fn helper()",
+                          f"mod {name};\n\npub fn helper()")
+                self.commit(f"add {name}")
+                self.edit(f"crates/demo/src/{name}.rs", "assert!(true);", "assert!(1 == 1);")
+                self.commit(f"edit {name}")
+                result = self.selected_missing_with_flag()
+                self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
+                self.assertIn(f"{name}::{name}_case", result.stderr)
+                self.assertIn("NOT STRESSED" if accepted else "is not in the nextest list",
+                              result.stderr)
 
 
 class MultiLineAttribute(Fixture):
@@ -540,6 +698,24 @@ class MultiLineAttribute(Fixture):
         result = self.run_script("--print", base="HEAD~1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("tests::middle_case", result.stdout)
+
+
+class BuildFeatures(Fixture):
+    def feature_flags_for(self, profile):
+        self.edit("crates/demo/src/lib.rs", "// original comment", "// edit")
+        self.commit()
+        result = self.run_script(
+            list_json=listing({"demo": {"tests::comment_edit": "matches"}}), profile=profile)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return ["--all-features" in call for call in calls
+                if call[:2] in (["nextest", "list"], ["nextest", "run"])]
+
+    def test_a_linux_profile_builds_all_features_in_the_list_and_the_run(self):
+        self.assertEqual(self.feature_flags_for("heavy"), [True, True])
+
+    def test_the_macos_profile_builds_default_features_like_ci(self):
+        self.assertEqual(self.feature_flags_for("macos"), [False, False])
 
 
 class Arguments(Fixture):
