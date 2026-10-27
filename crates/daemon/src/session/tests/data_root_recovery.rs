@@ -33,7 +33,6 @@ async fn recovery_needs_the_session_directory_below_the_data_root() {
     let registry = SessionRegistry::new_with_runtimes_and_environment(
         SessionRegistryConfig {
             shell_command: hermetic_shell(),
-            stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         },
         crate::agent::host::fixture::data_root_hooked_host(&script),
