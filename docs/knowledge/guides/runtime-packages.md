@@ -170,9 +170,11 @@ privilege and network tools such as `BASH_`, `NODE_`, `PYTHON`, `SUDO_` and
 `CURL_`, and the rest listed in `docs/public-api.md`) has no usable table. Inside the namespace, service-manager
 variables, the variable the descriptor reads its config home from, secret-shaped
 names (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`,
-`*_CREDENTIALS`, `*_AUTH`) and location or identity names (`*_PATH`, `*_DIR`,
-`*_HOME`, `*_ROOT`, `*_FILE`, `*_SOCK`, `*_SOCKET`, `*_URL`, `*_URI`, `*_HOST`,
-`*_ENDPOINT`, `*_PROXY`, `*_COMMAND`, `*_PROFILE`, `*_CONFIG`, `*_ID`) are
+`*_CREDENTIALS`, `*_AUTH`) and location, identity or code-shaped names (any `_`-separated word after the
+namespace in the list in `docs/public-api.md`: `PATH`, `DIR`, `HOME`, `ROOT`,
+`FILE`, `URL`, `HOST`, `PROXY`, `CMD`, `BIN`, `OPTS`, `ARGS`, `FLAGS`, `EXEC`,
+`SHELL`, `EDITOR`, `HOOK`, `PLUGIN`, `LIB`, `PRELOAD`, `CERT`, `CA`, `KEYRING`,
+`CONFIG`, `ID`, ...) are
 refused at install (`descriptor_invalid`). A host profile's `[env]` entry of the same name overrides a declared
 pair on a launch. A program the user starts by hand inside a shell session
 gets no descriptor environment, so it keeps its own defaults.

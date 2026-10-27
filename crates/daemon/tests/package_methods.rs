@@ -1066,6 +1066,30 @@ async fn a_launch_env_table_installs_only_with_its_feature_and_refuses_owned_nam
         "PI_",
         "PI_CONFIG_DIR",
         "PI_AUTH_PATH",
+        // Every word after the namespace counts, last or not.
+        "PI_EDITOR_DIRS",
+        "PI_X_PATHS",
+        "PI_RUN_CMD",
+        "PI_BIN",
+        "PI_NODE_OPTS",
+        "PI_OPTIONS",
+        "PI_ARGS",
+        "PI_FLAGS",
+        "PI_EXEC",
+        "PI_SHELL",
+        "PI_EDITOR",
+        "PI_HOOK",
+        "PI_PLUGIN",
+        "PI_LIB",
+        "PI_PRELOAD",
+        "PI_CERT",
+        "PI_CA",
+        "PI_KEYRING",
+        "PI_HOME_MODE",
+        "PI_CONFIG_LEVEL",
+        "PI_PATH_STYLE",
+        "PI_PRELOAD_MODE",
+        "PI_EXEC_TIMEOUT_MS",
         "PI_HOST",
         "PI_SESSION_ID",
         "PI_API_KEY",
@@ -1153,9 +1177,16 @@ async fn a_runtime_in_a_reserved_namespace_has_no_launch_env() {
 
     // A namespace that only resembles a refused one is usable, and `-` and `.`
     // in the runtime id map to `_` in the namespace.
-    for (index, (runtime, name)) in [("sshx", "SSHX_FLAG"), ("my-agent.x", "MY_AGENT_X_FLAG")]
-        .into_iter()
-        .enumerate()
+    for (index, (runtime, name)) in [
+        ("sshx", "SSHX_FLAG"),
+        ("my-agent.x", "MY_AGENT_X_FLAG"),
+        // Only `GO_` and the exact Go variable names are refused.
+        ("goose", "GOOSE_MODE"),
+        // A word of the runtime's own namespace is not a word of the name.
+        ("home-agent", "HOME_AGENT_FLAG"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let document = descriptor_requiring(
             LAUNCH_ENV_FEATURE,
@@ -1181,6 +1212,12 @@ async fn launch_env_tables_within_the_bounds_install() {
     let sixteen: Vec<String> = (0..16).map(|n| format!("PI_FLAG_{n} = \"1\"")).collect();
     let accepted = [
         ("one-pair", pair("PI_NO_UPDATE")),
+        // Whole words only: a refused word inside a longer one is fine.
+        ("pathology", pair("PI_PATHOLOGY")),
+        ("carbon", pair("PI_CARBON")),
+        ("argsort", pair("PI_ARGSORT")),
+        ("editorial", pair("PI_EDITORIAL")),
+        ("log-level", pair("PI_LOG_LEVEL")),
         ("bounds", launch_env_table(&sixteen)),
         (
             "long-value",

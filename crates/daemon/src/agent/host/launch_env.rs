@@ -16,7 +16,8 @@
 //! of the loader, the owner's tools or the platform (`SSH_`, `AWS_`, `GIT_`,
 //! `HTTPS_`, ...) has no usable `[launch_env]`. Inside the namespace the
 //! service-manager names, the descriptor's own config home variables,
-//! secret-shaped suffixes and location or identity suffixes are refused.
+//! secret-shaped suffixes and any location, identity or code-shaped word
+//! (`_DIR`, `_CMD`, `_OPTS`, `_PRELOAD`, ...) are refused.
 //! A host profile `[env]` is owner-authored and not subject to these rules; it
 //! overrides a pair of the same name. The values reach only the declaring
 //! runtime's own launches and probes, and nothing persists them, so each launch
@@ -72,6 +73,15 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "GOOGLE_",
     "GCLOUD_",
     "CLOUDSDK_",
+    "OCI_",
+    "ALIBABA_",
+    "ALICLOUD_",
+    "DIGITALOCEAN_",
+    "HCLOUD_",
+    "TERRAFORM_",
+    "TF_",
+    "VAULT_",
+    "ANSIBLE_",
     "GIT_",
     "GH_",
     "GITHUB_",
@@ -79,6 +89,11 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "DOCKER_",
     "KUBE",
     "HELM_",
+    "PODMAN_",
+    "BUILDAH_",
+    "CONTAINER_",
+    "CONTAINERD_",
+    "COMPOSE_",
     // Network clients and TLS.
     "HTTP_",
     "HTTPS_",
@@ -91,10 +106,14 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "REQUESTS_",
     "SSL_",
     "OPENSSL_",
+    "GNUTLS_",
+    "NSS_",
+    "SSLKEYLOGFILE",
     // Shells and privilege.
     "BASH_",
     "ZSH_",
     "SH_",
+    "ZDOTDIR",
     "SUDO_",
     // Interpreters and package managers.
     "NODE_",
@@ -110,7 +129,49 @@ pub const REFUSED_NAMESPACES: &[&str] = &[
     "GEM_",
     "CARGO_",
     "RUST",
-    "GO",
+    "GO_",
+    "GOFLAGS",
+    "GOPATH",
+    "GOROOT",
+    "GOPROXY",
+    "GONOSUMDB",
+    "GONOPROXY",
+    "GOSUMDB",
+    "GOINSECURE",
+    "GOPRIVATE",
+    "GOTOOLCHAIN",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOENV",
+    "GOWORK",
+    "CGO_",
+    "LUA_",
+    "DOTNET_",
+    "NUGET_",
+    "MSBUILD",
+    "PHP_",
+    "PHPRC",
+    "COMPOSER_",
+    "BUNDLE_",
+    "CONDA_",
+    "UV_",
+    "BUN_",
+    "DENO_",
+    "GRADLE_",
+    "MAVEN_",
+    // The C library and the system allocator.
+    "GLIBC_",
+    "MALLOC_",
+    // Version and environment managers that rewrite the toolchain on PATH.
+    "NIX_",
+    "GUIX_",
+    "HOMEBREW_",
+    "PYENV_",
+    "RBENV_",
+    "NVM_",
+    "VOLTA_",
+    "ASDF_",
+    "MISE_",
 ];
 
 /// Suffixes of secret-shaped names, which only the owner's profile sets.
@@ -124,25 +185,15 @@ const SECRET_SUFFIXES: &[&str] = &[
     "_AUTH",
 ];
 
-/// Suffixes of location- and identity-shaped names: where something lives,
-/// which program to run or which session this is is never a behaviour flag.
-const LOCATION_SUFFIXES: &[&str] = &[
-    "_PATH",
-    "_DIR",
-    "_HOME",
-    "_ROOT",
-    "_FILE",
-    "_SOCK",
-    "_SOCKET",
-    "_URL",
-    "_URI",
-    "_HOST",
-    "_ENDPOINT",
-    "_PROXY",
-    "_COMMAND",
-    "_PROFILE",
-    "_CONFIG",
-    "_ID",
+/// Words of location-, identity- and code-shaped names: where something
+/// lives, which program, library, plugin or hook to run, with which options, or
+/// which session this is is never a behaviour flag. A name is refused when any
+/// `_`-separated word after the runtime namespace is one of these.
+const LOCATION_WORDS: &[&str] = &[
+    "PATH", "PATHS", "DIR", "DIRS", "HOME", "ROOT", "FILE", "SOCK", "SOCKET", "URL", "URI", "HOST",
+    "ENDPOINT", "PROXY", "COMMAND", "CMD", "BIN", "OPTS", "OPTIONS", "ARGS", "FLAGS", "EXEC",
+    "SHELL", "EDITOR", "HOOK", "PLUGIN", "LIB", "PRELOAD", "CERT", "CA", "KEYRING", "PROFILE",
+    "CONFIG", "ID",
 ];
 
 /// The validated `[launch_env]` pairs of a definition, ordered by name.
@@ -197,9 +248,12 @@ impl DescriptorLaunchEnv {
         let namespace = namespace_of(runtime_id)
             .ok_or_else(|| field("is not available to a runtime with this id"))?;
         for (name, value) in &declared {
-            if name.strip_prefix(&namespace).is_none_or(str::is_empty) {
+            let Some(rest) = name
+                .strip_prefix(&namespace)
+                .filter(|rest| !rest.is_empty())
+            else {
                 return Err(field("names must start with the runtime's own namespace"));
-            }
+            };
             if let Some(reason) = env_name_problem(name) {
                 return Err(field(reason));
             }
@@ -209,9 +263,9 @@ impl DescriptorLaunchEnv {
             if SECRET_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
                 return Err(field("cannot name a secret-shaped variable"));
             }
-            if LOCATION_SUFFIXES
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
+            if rest
+                .split(NAMESPACE_SEPARATOR)
+                .any(|word| LOCATION_WORDS.contains(&word))
             {
                 return Err(field("cannot name a location or identity variable"));
             }
