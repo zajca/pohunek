@@ -189,6 +189,17 @@ impl Failures {
         self.first.get_or_insert(error);
     }
 
+    /// The registration outcome of a walk that met these failures.
+    fn into_registration(self) -> RootRegistration {
+        match self.first {
+            Some(first_error) => RootRegistration::Partial {
+                failed_dirs: self.directories,
+                first_error,
+            },
+            None => RootRegistration::Complete,
+        }
+    }
+
     /// Records a cancelled walk as a failed one; returns whether to stop.
     fn cancelled(&mut self, cancel: &CancellationToken) -> bool {
         if !cancel.is_cancelled() {
@@ -279,13 +290,7 @@ impl InotifyBackend {
     ) -> RootRegistration {
         let mut failures = Failures::default();
         let mut budget = MAX_WALK_ENTRIES;
-        let (bound, start_depth) = self.bound_of(root);
-        let limit = bound.as_ref().map(|(_, bound)| bound.max_depth);
-        // The root of a dated tree, whose deepest directories share a bounded
-        // number of watches.
-        let share_root = bound
-            .filter(|(_, bound)| bound.dated)
-            .map(|(bound_root, _)| bound_root);
+        let (limit, share_root, start_depth) = self.walk_of(root);
         if limit.is_some_and(|max| start_depth > max) {
             // Below the bound nothing is watched, so a directory that appears
             // there is neither registered nor walked.
@@ -306,10 +311,7 @@ impl InotifyBackend {
                 && !self.wd_by_path.contains_key(&dir);
             if new_deepest
                 && discovery.is_none()
-                && share_root.as_deref().is_some_and(|share_root| {
-                    self.watched_deepest(share_root) + registered_deepest.len()
-                        >= MAX_WATCHED_DEEPEST_DIRECTORIES
-                })
+                && self.share_is_full(share_root.as_deref(), registered_deepest.len())
             {
                 // A pass over the whole tree keeps the newest session
                 // directories it met first; the rest wait for the reconcile.
@@ -385,24 +387,10 @@ impl InotifyBackend {
             }
             enqueue(&mut queue, subdirectories, depth, share_root.is_some());
         }
-        // The first met are the newest, so they go in last: the oldest watch is
-        // the first to be evicted.
         if let Some(share_root) = share_root {
-            self.recent_deepest.extend(
-                registered_deepest
-                    .into_iter()
-                    .rev()
-                    .map(|dir| (share_root.clone(), dir)),
-            );
-            self.evict_beyond_share(&share_root);
+            self.keep_newest(&share_root, registered_deepest);
         }
-        match failures.first {
-            Some(first_error) => RootRegistration::Partial {
-                failed_dirs: failures.directories,
-                first_error,
-            },
-            None => RootRegistration::Complete,
-        }
+        failures.into_registration()
     }
 
     /// The entries of `dir`, highest names first for a bounded root. A
@@ -423,6 +411,37 @@ impl InotifyBackend {
                 None
             }
         }
+    }
+
+    /// The depth limit of the walk of `dir`, the root of its dated tree when its
+    /// deepest directories share a bounded number of watches, and how many
+    /// levels `dir` lies below its root.
+    fn walk_of(&self, dir: &Path) -> (Option<u8>, Option<PathBuf>, u8) {
+        let (bound, levels) = self.bound_of(dir);
+        let limit = bound.as_ref().map(|(_, bound)| bound.max_depth);
+        let share_root = bound.filter(|(_, bound)| bound.dated).map(|(root, _)| root);
+        (limit, share_root, levels)
+    }
+
+    /// Records the deepest-level directories a walk registered, newest first,
+    /// and drops the oldest watches beyond the share. The newest go in last,
+    /// so the oldest watch is the first to be evicted.
+    fn keep_newest(&mut self, root: &Path, registered: Vec<PathBuf>) {
+        self.recent_deepest.extend(
+            registered
+                .into_iter()
+                .rev()
+                .map(|dir| (root.to_path_buf(), dir)),
+        );
+        self.evict_beyond_share(root);
+    }
+
+    /// Whether the dated tree at `share_root`, with `pending` directories
+    /// registered by the running pass, holds its share of deepest-level watches.
+    fn share_is_full(&self, share_root: Option<&Path>, pending: usize) -> bool {
+        share_root.is_some_and(|root| {
+            self.watched_deepest(root) + pending >= MAX_WATCHED_DEEPEST_DIRECTORIES
+        })
     }
 
     /// How many deepest-level directories of the dated tree at `root` hold a
