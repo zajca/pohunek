@@ -338,7 +338,7 @@ fn descriptor_digest_changes_with_launch_fields() {
     assert_ne!(plain, with_env(&[("DEMO_FLAG", "1")]));
     assert_ne!(
         with_env(&[("DEMO_FLAG", "1")]),
-        with_env(&[("DEMO_FLAG", "2")])
+        with_env(&[("DEMO_FLAG", "0")])
     );
 }
 

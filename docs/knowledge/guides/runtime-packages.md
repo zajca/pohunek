@@ -149,7 +149,7 @@ is not.
 
 ## Launch environment
 
-A descriptor sets literal environment variables for its launches and its
+A descriptor sets flag environment variables for its launches and its
 version probe with `[launch_env]` (`requires = ["launch-env-v1"]`):
 
 ```toml
@@ -159,8 +159,9 @@ requires = ["launch-env-v1"]
 ACME_NO_AUTO_UPDATE = "1"        # in a runtime with id `acme`; stops a self-updating launcher
 ```
 
-Use it for behaviour flags the agent reads at start. At most 16 entries; values
-are at most 256 bytes, never expanded. A name must start with the runtime's own
+Use it for behaviour flags the agent reads at start. At most 16 entries; a value
+is exactly `0`, `1`, `true` or `false`, never expanded (widening the set needs a
+new feature id). A name must start with the runtime's own
 namespace: the `runtime.id` in upper case with `-` and `.` as `_`, then `_`
 (`muse` gives `MUSE_`, so `MUSE_NO_AUTO_UPDATE`), with something after it. The
 core allowlist outside the namespace is empty. A runtime whose namespace
@@ -169,10 +170,14 @@ collides with a variable family of the loader or the owner's tools (`SSH_`,
 privilege and network tools such as `BASH_`, `NODE_`, `PYTHON`, `SUDO_` and
 `CURL_`, and the rest listed in `docs/public-api.md`) has no usable table. Inside the namespace, service-manager
 variables, the variable the descriptor reads its config home from, secret-shaped
-names (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`,
-`*_CREDENTIALS`, `*_AUTH`) and location or identity names (`*_PATH`, `*_DIR`,
-`*_HOME`, `*_ROOT`, `*_FILE`, `*_SOCK`, `*_SOCKET`, `*_URL`, `*_URI`, `*_HOST`,
-`*_ENDPOINT`, `*_PROXY`, `*_COMMAND`, `*_PROFILE`, `*_CONFIG`, `*_ID`) are
+names (a `KEY`, `KEYS`, `TOKEN`, `TOKENS`, `SECRET`, `SECRETS`, `PASSWORD`, `PASSWD`,
+`PASSPHRASE`, `PASSPHRASES`, `CREDENTIAL`, `CREDENTIALS` or `AUTH` word in any
+position) and location, identity or code-shaped names (any `_`-separated word after the
+namespace in the list in `docs/public-api.md`: `PATH`, `DIR`, `HOME`, `ROOT`,
+`FILE`, `URL`, `HOST`, `PROXY`, `CMD`, `BIN`, `OPTS`, `ARGS`, `FLAGS`, `EXEC`,
+`SHELL`, `EDITOR`, `HOOK`, `PLUGIN`, `LIB`, `PRELOAD`, `CERT`, `CA`, `KEYRING`,
+`CONFIG`, `ID`, ...; a second layer behind the value rule, not a complete
+vocabulary) are
 refused at install (`descriptor_invalid`). A host profile's `[env]` entry of the same name overrides a declared
 pair on a launch. A program the user starts by hand inside a shell session
 gets no descriptor environment, so it keeps its own defaults.

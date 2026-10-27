@@ -984,7 +984,7 @@ not by `env`, so the same `env` with different `subdir` values is not.
 
 ### Launch environment
 
-A runtime may declare literal environment variables its launches and its
+A runtime may declare flag environment variables its launches and its
 version probe get (runtime feature `launch-env-v1`, listed in `requires`):
 
 ```toml
@@ -1004,22 +1004,48 @@ network tool the agent runs (`BASH_ENV`, `NODE_OPTIONS`, `SUDO_ASKPASS`,
 `PYTHONSTARTUP`, `CURL_CA_BUNDLE`) cannot be set by a descriptor, has no usable
 `[launch_env]`. The prefixes are `POHUNEK_`, `LD_`, `DYLD_`, `XDG_`, `LC_`,
 `SYSTEMD_`, `DBUS_`, `WAYLAND_`, `DISPLAY_`, `SSH_`, `GPG_`, `GNUPG`, `AWS_`,
-`AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `GIT_`, `GH_`, `GITHUB_`, `GITLAB_`,
-`DOCKER_`, `KUBE`, `HELM_`, `HTTP_`, `HTTPS_`, `FTP_`, `ALL_`, `NO_`, `SOCKS`,
-`CURL_`, `WGET_`, `REQUESTS_`, `SSL_`, `OPENSSL_`, `BASH_`, `ZSH_`, `SH_`,
-`SUDO_`, `NODE_`, `NPM_`, `YARN_`, `PNPM_`, `JAVA_`, `JDK_`, `PYTHON`, `PIP_`,
-`PERL`, `RUBY`, `GEM_`, `CARGO_`, `RUST` and `GO` (the last group match any
-runtime id that starts with those letters, such as `python3` or `gopher`). The
-list only grows. Inside the namespace a name is refused when it is
+`AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `OCI_`, `ALIBABA_`, `ALICLOUD_`,
+`DIGITALOCEAN_`, `HCLOUD_`, `TERRAFORM_`, `TF_`, `VAULT_`, `ANSIBLE_`, `GIT_`,
+`GH_`, `GITHUB_`, `GITLAB_`, `DOCKER_`, `KUBE`, `HELM_`, `PODMAN_`, `BUILDAH_`,
+`CONTAINER_`, `CONTAINERS_`, `CONTAINERD_`, `COMPOSE_`, `HTTP_`, `HTTPS_`, `FTP_`, `ALL_`, `NO_`,
+`SOCKS`, `CURL_`, `WGET_`, `REQUESTS_`, `SSL_`, `OPENSSL_`, `GNUTLS_`, `NSS_`,
+`SSLKEYLOGFILE`, `BASH_`, `ZSH_`, `SH_`, `ZDOTDIR`, `SUDO_`, `NODE_`, `NPM_`,
+`YARN_`, `PNPM_`, `JAVA_`, `JDK_`, `PYTHON`, `PIP_`, `PERL`, `RUBY`, `GEM_`,
+`CARGO_`, `RUST`, `GO_`, the Go variables `GOFLAGS`, `GOPATH`, `GOROOT`,
+`GOPROXY`, `GONOSUMDB`, `GONOPROXY`, `GOSUMDB`, `GOINSECURE`, `GOPRIVATE`,
+`GOTOOLCHAIN`, `GOCACHE`, `GOMODCACHE`, `GOENV` and `GOWORK`, `CGO_`, `LUA_`,
+`DOTNET_`, `NUGET_`, `MSBUILD`, `PHP_`, `PHPRC`, `COMPOSER_`, `BUNDLE_`,
+`CONDA_`, `UV_`, `BUN_`, `DENO_`, `GRADLE_`, `MAVEN_`, `GLIBC_`, `MALLOC_`,
+`NIX_`, `GUIX_`, `HOMEBREW_`, `PYENV_`, `RBENV_`, `NVM_`, `VOLTA_`, `ASDF_`,
+`MISE_`, `RSYNC_`, `CCACHE_`, `SCCACHE_`, `CMAKE_`, `ELECTRON_`, `SVN_`,
+`BORG_`, `RESTIC_`, `HEX_` and `R_`. A prefix without a trailing `_` (such as `PYTHON`, `RUST` or `GOPATH`)
+matches any runtime id that starts with those letters (`python3`, `rustc`,
+`gopath-agent`); `goose` is unaffected, because only `GO_` and the exact Go
+variable names are listed. Entries such as `GOFLAGS` or `PHPRC` therefore
+reserve runtime ids; no declarable name can equal them. The list grows only
+through an issue naming a concrete `<NAMESPACE>_*` variable whose value from the
+closed set below runs code, turns off verification, sets a credential or names a
+file. Inside the namespace a name is refused when it is
 a service-manager variable the worker never passes to an agent
 (`NOTIFY_SOCKET`, `INVOCATION_ID`, ...), the variable the same descriptor reads
 its `[config_home]` or `[native_reference.existence]` root from, secret-shaped
-(ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_CREDENTIALS`
-or `_AUTH`), or location- or identity-shaped (ending in `_PATH`, `_DIR`, `_HOME`,
-`_ROOT`, `_FILE`, `_SOCK`, `_SOCKET`, `_URL`, `_URI`, `_HOST`, `_ENDPOINT`,
-`_PROXY`, `_COMMAND`, `_PROFILE`, `_CONFIG` or `_ID`), so a public descriptor
-cannot redirect or blank owner or core state. Each value is at most 256 bytes without control characters and is
-never expanded. A refusal is `descriptor_invalid` and names the field, never a
+(any `_`-separated word after the namespace is `KEY`, `KEYS`, `TOKEN`, `TOKENS`,
+`SECRET`, `SECRETS`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `PASSPHRASES`,
+`CREDENTIAL`, `CREDENTIALS` or `AUTH`), or location-, identity- or code-shaped (any such word is `PATH`,
+`PATHS`, `DIR`, `DIRS`, `DIRECTORY`, `FOLDER`, `HOME`, `ROOT`, `FILE`, `FILES`,
+`SOCK`, `SOCKET`, `SOCKETS`, `URL`, `URLS`, `URI`, `HOST`, `HOSTS`, `SERVER`,
+`ADDR`, `ENDPOINT`, `REGISTRY`, `PROXY`, `COMMAND`, `CMD`, `BIN`, `BINARY`,
+`EXECUTABLE`, `SCRIPT`, `OPTS`, `OPTIONS`, `ARGS`, `FLAGS`, `EXEC`, `SHELL`,
+`EDITOR`, `HOOK`, `HOOKS`, `PLUGIN`, `PLUGINS`, `MODULES`, `LIB`, `LIBS`,
+`PRELOAD`, `CERT`, `CERTS`, `CA`, `KEYRING`, `PROFILE`, `CONF`, `CONFIG` or
+`ID`, or a longer word ending in `PATH`, `DIR`, `FILE`, `HOME`, `ROOT`,
+`FLAGS`, `OPTS`, `CONF`, `CERT` or `CERTS`, such as `TMPDIR` or `LIBPATH`; `PI_PATHOLOGY`
+is fine and `PI_LOG_DIR_MODE` is not; these word lists are a second layer, not
+a complete vocabulary, because `0` and `1` are also valid file names), so a
+public descriptor cannot redirect or blank owner or core state. Each value is
+exactly `0`, `1`, `true` or `false` (case-sensitive, never empty, never
+expanded); a program, path, host, port or credential cannot be a value, and
+widening the set needs a new feature id. A refusal is `descriptor_invalid` and names the field, never a
 name or a value. The pairs are not persisted: each launch (a new session, a
 resume, a fork) reads them from the definition that serves it. A launch applies
 them first, then the session's private `TMPDIR`, then the host profile's
