@@ -11,7 +11,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use pohunek_test_support::wait::HANG_GUARD;
 use protocol::{ForkCwdMode, SessionForkParams, SessionId, SessionNewParams, SessionSecretEnv};
@@ -22,7 +21,8 @@ use super::tests::{
 };
 use super::{SessionRegistry, SessionRegistryConfig};
 use crate::agent::host::fixture::{
-    pi_shaped_host, pi_shaped_integration_host_as, pi_shaped_profile_pin, PI_SHAPED_NO_CHECK,
+    pi_shaped_host, pi_shaped_integration_host_as, pi_shaped_integration_host_with_homes,
+    pi_shaped_profile_pin, PI_SHAPED_NO_CHECK,
 };
 
 /// Variable the profile declares as its credential slot.
@@ -393,6 +393,74 @@ async fn a_slot_naming_the_runtimes_config_home_variable_cannot_be_filled() {
         .create(slots.new_params("homed", &[("CLAUDE_CONFIG_DIR", SENTINEL)]))
         .await
         .expect_err("the runtime's own home variable is not a slot");
+    assert_refusal(&refused, "secret_env_not_declared");
+    assert!(slots.recorded().is_empty(), "no agent was launched");
+}
+
+#[tokio::test]
+async fn a_slot_naming_a_launch_env_variable_cannot_be_filled() {
+    let slots = Slots::new("secret-env-launch-env");
+    slots.write_profile("flagged", "secret_env = [\"PI_NO_UPDATE\"]\n");
+    let registry = SessionRegistry::new_with_runtimes(
+        slots.config(),
+        pi_shaped_integration_host_with_homes(
+            &slots.script,
+            "claude-hook-v1",
+            "identity-subagent-v1",
+            "\"launch-env-v1\"",
+            &[("pi", "\n[launch_env]\nPI_NO_UPDATE = \"1\"\n")],
+        ),
+    );
+
+    let refused = registry
+        .create(slots.new_params("flagged", &[("PI_NO_UPDATE", SENTINEL)]))
+        .await
+        .expect_err("a runtime launch flag is not a slot");
+    assert_refusal(&refused, "secret_env_not_declared");
+    assert!(slots.recorded().is_empty(), "no agent was launched");
+}
+
+/// Contributor that sets a variable a profile slot also names.
+#[derive(Debug)]
+struct EnvContributor;
+
+impl crate::integration::launch_input::LaunchContributor for EnvContributor {
+    fn contribute(
+        &self,
+        _ctx: &crate::integration::launch_input::LaunchInputContext<'_>,
+    ) -> Result<crate::integration::launch_input::LaunchInput, protocol::ProtocolError> {
+        Ok(crate::integration::launch_input::LaunchInput {
+            env: vec![("CONTRIBUTED_FLAG".to_owned(), "contributed".to_owned())],
+            root_args: Vec::new(),
+            files: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_slot_cannot_replace_a_variable_the_runtime_contributor_sets() {
+    let slots = Slots::new("secret-env-contributor");
+    slots.write_profile("shadow", "secret_env = [\"CONTRIBUTED_FLAG\"]\n");
+    let contributor: &'static EnvContributor = Box::leak(Box::new(EnvContributor));
+    crate::test_support::set_thread_launch_contributor("claude-hook-v1", Some(contributor));
+    let mut config = slots.config();
+    let (runtime_root, state_root) = super::tests::test_worker_roots(&config);
+    config.worker_runtime_root = Some(runtime_root);
+    config.worker_state_root = Some(state_root);
+    let registry = SessionRegistry::new_with_runtimes(
+        config,
+        pi_shaped_integration_host_as(
+            &slots.script,
+            "pi",
+            "claude-hook-v1",
+            "identity-subagent-v1",
+        ),
+    );
+
+    let refused = registry
+        .create(slots.new_params("shadow", &[("CONTRIBUTED_FLAG", SENTINEL)]))
+        .await
+        .expect_err("a slot never overrides the contributor's variable");
     assert_refusal(&refused, "secret_env_not_declared");
     assert!(slots.recorded().is_empty(), "no agent was launched");
 }
