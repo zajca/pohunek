@@ -63,10 +63,12 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
     assert_eq!(installed.package.origin, PackageOrigin::ExplicitDigest);
     assert!(!installed.package.enabled && !installed.package.selected);
     assert_eq!(installed.package.fault, None);
-    assert_eq!(installed.runtime.runtime_id.as_str(), RUNTIME);
-    assert_eq!(installed.runtime.program, INERT_PROGRAM);
-    assert_eq!(installed.runtime.args, ["--model", "fast"]);
-    assert!(installed.runtime.resumable && installed.runtime.forkable);
+    let runtime = installed.runtime.as_ref().expect("a runtime package");
+    assert_eq!(runtime.runtime_id.as_str(), RUNTIME);
+    assert_eq!(runtime.program, INERT_PROGRAM);
+    assert_eq!(runtime.args, ["--model", "fast"]);
+    assert!(runtime.resumable && runtime.forkable);
+    assert!(installed.commands.is_empty());
     assert_eq!(fixture.serving(RUNTIME), None, "recorded but not loaded");
 
     let listed = fixture.registry.package_list().await.expect("list");
@@ -296,7 +298,14 @@ async fn a_dry_run_validates_and_changes_nothing() {
     assert_eq!(preview.status, PackageInstallStatus::Preview);
     assert!(!preview.reloaded);
     assert!(preview.package.enabled && preview.package.selected);
-    assert_eq!(preview.runtime.runtime_id.as_str(), RUNTIME);
+    assert_eq!(
+        preview
+            .runtime
+            .expect("a runtime package")
+            .runtime_id
+            .as_str(),
+        RUNTIME
+    );
     assert!(fixture
         .registry
         .package_list()

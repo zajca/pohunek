@@ -56,6 +56,7 @@ pub(super) fn rejection_kind(rejection: &PackageRejection) -> PackageErrorKind {
         PackageRejection::Root(_) => PackageErrorKind::RootInvalid,
         PackageRejection::IdentityMismatch
         | PackageRejection::DescriptorMissing
+        | PackageRejection::RuntimeMissing
         | PackageRejection::Descriptor(_) => PackageErrorKind::DescriptorInvalid,
         PackageRejection::ReservedRuntimeId => PackageErrorKind::RuntimeNotClaimable,
         PackageRejection::RuntimeIdConflict => PackageErrorKind::RuntimeConflict,

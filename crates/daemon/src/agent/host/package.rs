@@ -35,10 +35,12 @@ use protocol::{BindingProvenance, PackageId, PackageIdentity, ProtocolError, Run
 use thiserror::Error;
 
 use super::claim::is_reserved;
+use super::commands::{classify, commands_of, parse_commands_only, Exports, PackageDescriptor};
 use super::definition::{
-    DefinitionError, DefinitionInvariant, DefinitionOrigin, HandlerId, RuntimeDefinition,
-    MAX_DEFINITION_BYTES,
+    malformed_at, DefinitionError, DefinitionInvariant, DefinitionOrigin, HandlerId,
+    RuntimeDefinition, MAX_DEFINITION_BYTES,
 };
+use super::features::FeatureTables;
 use crate::detect::Manifest;
 
 /// Package-relative path of the runtime descriptor inside every runtime
@@ -67,6 +69,9 @@ pub enum PackageRejection {
     /// The package has no `runtime.toml`.
     #[error("the package has no runtime descriptor")]
     DescriptorMissing,
+    /// The descriptor exports commands only, so the package serves no runtime.
+    #[error("the package exports no runtime")]
+    RuntimeMissing,
     /// The descriptor is not a valid runtime definition.
     #[error("the runtime descriptor is invalid: {0}")]
     Descriptor(DefinitionError),
@@ -440,6 +445,28 @@ impl PackageStore {
         definition_of_root(&root, digest, identity)
     }
 
+    /// Verifies the root of `digest` and reads everything its descriptor
+    /// exports: the runtime, the commands, or both.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageRejection`] when the package is not installed, its
+    /// root fails verification, the descriptor is missing or invalid, or it
+    /// names another package identity than `identity`.
+    pub fn read_descriptor(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Result<PackageDescriptor, PackageRejection> {
+        let root = self.ready_root(digest)?;
+        let descriptor = descriptor_from_files(&RootFiles(&root), digest)?;
+        if descriptor.identity() == identity {
+            Ok(descriptor)
+        } else {
+            Err(PackageRejection::IdentityMismatch)
+        }
+    }
+
     /// The integration handler a recorded package's descriptor names, read
     /// from a verified root without requiring the current descriptor shape.
     ///
@@ -537,6 +564,26 @@ fn definition_of_root(
     }
 }
 
+/// Builds everything a package archive's descriptor exports, from the archive
+/// entries alone.
+///
+/// Installation validates a package with this before anything is extracted or
+/// recorded, so the daemon never records a package whose descriptor it would
+/// reject. It runs the parser [`PackageStore::read_descriptor`] runs.
+///
+/// # Errors
+///
+/// Returns [`PackageRejection::DescriptorMissing`] without a `runtime.toml`,
+/// [`PackageRejection::ReservedRuntimeId`] for a descriptor that claims the
+/// shell, and [`PackageRejection::Descriptor`] for every other invalid
+/// descriptor.
+pub fn descriptor_from_archive(
+    entries: &[ArchiveEntry],
+    digest: &PackageDigest,
+) -> Result<PackageDescriptor, PackageRejection> {
+    descriptor_from_files(&ArchiveFiles(entries), digest)
+}
+
 /// Builds the definition a package archive declares, from the archive entries
 /// alone.
 ///
@@ -565,6 +612,10 @@ trait PackageFiles {
     /// Size of the file at `path`, `None` when the package has no such file.
     fn size(&self, path: &str) -> Option<u64>;
 
+    /// Whether the manifest marks the file at `path` executable, `None` when
+    /// the package has no such file.
+    fn executable(&self, path: &str) -> Option<bool>;
+
     /// Contents of the file at `path`.
     fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError>;
 }
@@ -581,6 +632,14 @@ impl PackageFiles for RootFiles<'_> {
             .map(|file| file.size)
     }
 
+    fn executable(&self, path: &str) -> Option<bool> {
+        self.0
+            .files()
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.executable)
+    }
+
     fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
         self.0.read_file(path)
     }
@@ -595,6 +654,13 @@ impl PackageFiles for ArchiveFiles<'_> {
             .iter()
             .find(|entry| entry.path == path)
             .and_then(|entry| u64::try_from(entry.contents.len()).ok())
+    }
+
+    fn executable(&self, path: &str) -> Option<bool> {
+        self.0
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.executable)
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
@@ -620,11 +686,24 @@ struct LegacyIntegration {
     handler: String,
 }
 
-/// Parses the descriptor of a package.
+/// Parses the runtime a package descriptor exports.
+///
+/// A descriptor that exports commands only has no runtime:
+/// [`PackageRejection::RuntimeMissing`].
 fn definition_from_files(
     files: &impl PackageFiles,
     digest: &PackageDigest,
 ) -> Result<RuntimeDefinition, PackageRejection> {
+    descriptor_from_files(files, digest)?
+        .into_runtime()
+        .ok_or(PackageRejection::RuntimeMissing)
+}
+
+/// Parses the descriptor of a package: its runtime, its commands, or both.
+fn descriptor_from_files(
+    files: &impl PackageFiles,
+    digest: &PackageDigest,
+) -> Result<PackageDescriptor, PackageRejection> {
     let size = files
         .size(RUNTIME_DESCRIPTOR_PATH)
         .ok_or(PackageRejection::DescriptorMissing)?;
@@ -637,15 +716,38 @@ fn definition_from_files(
     let text = std::str::from_utf8(&bytes).map_err(|_error| {
         PackageRejection::Descriptor(DefinitionError::Malformed { line: None })
     })?;
-    RuntimeDefinition::from_toml(
-        text,
-        |package| DefinitionOrigin::Package {
-            package,
-            digest: digest.clone(),
-        },
-        |name| detection_manifest(files, name),
-    )
-    .map_err(PackageRejection::Descriptor)
+    parse_descriptor(text, digest, files).map_err(PackageRejection::Descriptor)
+}
+
+fn parse_descriptor(
+    text: &str,
+    digest: &PackageDigest,
+    files: &impl PackageFiles,
+) -> Result<PackageDescriptor, DefinitionError> {
+    let document: toml::Table = toml::from_str(text).map_err(|error| malformed_at(text, &error))?;
+    let executable = |path: &str| files.executable(path);
+    match classify(&document, &FeatureTables::PRODUCTION)? {
+        Exports::CommandsOnly => parse_commands_only(text, &document, executable),
+        Exports::Runtime => {
+            let commands = commands_of(&document, executable)?;
+            let definition = RuntimeDefinition::from_toml(
+                text,
+                |package| DefinitionOrigin::Package {
+                    package,
+                    digest: digest.clone(),
+                },
+                |name| detection_manifest(files, name),
+            )?;
+            let BindingProvenance::Package { package, .. } = &definition.binding().provenance
+            else {
+                return Err(DefinitionError::Malformed { line: None });
+            };
+            let identity = package.clone();
+            Ok(PackageDescriptor::with_commands(
+                identity, definition, commands,
+            ))
+        }
+    }
 }
 
 /// Resolves the `detect_manifest` a package descriptor names: a package file,
@@ -732,6 +834,9 @@ impl PackageSource {
                         definition: RuntimeDefinition::clone(&definition),
                     });
                 }
+                // A package that exports commands only serves no runtime and
+                // has nothing to reject.
+                Err(PackageRejection::RuntimeMissing) => {}
                 Err(reason) => rejected.push(RejectedPackage {
                     digest: record.digest().clone(),
                     identity: record.identity().clone(),

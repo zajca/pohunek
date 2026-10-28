@@ -16,7 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId};
+use crate::{
+    CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+};
 
 /// How an installed package was authorized.
 ///
@@ -205,6 +207,52 @@ pub struct PackageRuntimeInfo {
     pub hook_schema: Option<String>,
 }
 
+/// Who may call a package command.
+///
+/// Declared by the package and consented to by the owner at install; the
+/// daemon enforces it by the transport a call arrives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CommandExposure.ts"))]
+pub enum CommandExposure {
+    /// Only the owner's local control socket reaches the command.
+    Local,
+    /// The command is also callable by every overlay peer the overlay policy
+    /// admits.
+    Peers,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one. A client
+    /// reads it as the widest exposure.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(CommandExposure);
+
+/// One command a package's descriptor exports, for review before and after
+/// installation.
+///
+/// The program and the fixed arguments are exactly what the daemon runs as the
+/// owner when the command is called; a call carries no argument, environment
+/// or input of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CommandInfo.ts"))]
+pub struct CommandInfo {
+    /// Command name, unique within the package.
+    pub name: CommandName,
+    /// Package-relative path of the executable the command runs.
+    pub program: String,
+    /// Fixed arguments, passed literally.
+    pub args: Vec<String>,
+    /// Who may call the command.
+    pub expose: CommandExposure,
+}
+
 /// How an archive is trusted when it is installed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -283,8 +331,16 @@ pub struct PackageInstallResult {
     pub status: PackageInstallStatus,
     /// The package as recorded (or as it would be recorded for a preview).
     pub package: PackageInfo,
-    /// What the package's runtime descriptor declares.
-    pub runtime: PackageRuntimeInfo,
+    /// What the package's runtime descriptor declares; absent for a package
+    /// that exports commands only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<PackageRuntimeInfo>,
+    /// The commands the descriptor exports, with their program, arguments and
+    /// exposure; absent when it exports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<CommandInfo>>", optional))]
+    pub commands: Vec<CommandInfo>,
     /// Whether the daemon rebuilt its runtime registry after the change.
     pub reloaded: bool,
 }

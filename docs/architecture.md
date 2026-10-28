@@ -1596,6 +1596,22 @@ installed package that fails the check is left out of the load while the other
 packages and the daemon start. A feature adds no protocol shape and no
 persisted field.
 
+A descriptor can also export package commands, `[commands.<name>]` tables
+gated by the runtime feature `package-commands-v1`, next to the runtime group
+(`[runtime]`, `[input]`, `[resume]`, `[fork]`, `[native_reference]`, all or
+none) or without it. A command is a separate owner process the daemon runs on
+request: a package-relative `program` that the manifest marks executable,
+literal `args` and an `expose` scope, all fixed by the digest, so a call can
+never supply an argument, environment variable or input. A package that exports
+commands only is recorded, enabled, selected and uninstalled like any package
+but serves no runtime, so it is absent from the runtime registry and no session
+starts under its id. The exposure is the model for peer-callable package
+capabilities: the package declares it (`expose`), the owner consents to it when
+reviewing the install (a new version is a new digest, so a changed exposure is
+reviewed again), and the daemon enforces it by the transport a call arrives on
+(never by a request field). This slice declares and records commands; running
+one is a separate method.
+
 Trust boundary:
 
 - **Same-UID owner trust, not a sandbox.** A descriptor may name any program,
@@ -2176,6 +2192,7 @@ never `unreachable!()`.
 | `PackageOrigin` | safe | the downgrade guard stays engaged | [#1338](https://github.com/zajca/pohunek/issues/1338) |
 | `PackageBindStatus` | safe | never `Unchanged`; consent is still asked | [#1338](https://github.com/zajca/pohunek/issues/1338) |
 | `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | [#1338](https://github.com/zajca/pohunek/issues/1338) |
+| `CommandExposure` | safe | read as the widest exposure (`peers`) wherever it is shown for consent | [#1690](https://github.com/zajca/pohunek/issues/1690) |
 | `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | [#1338](https://github.com/zajca/pohunek/issues/1338) |
 | `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | | [#1339](https://github.com/zajca/pohunek/issues/1339) |
 | `NotificationStatus` | safe | never matches `--unread` or `--status` filters | [#1339](https://github.com/zajca/pohunek/issues/1339) |

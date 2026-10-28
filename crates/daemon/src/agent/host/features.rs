@@ -102,6 +102,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "integration-muse-hook-v1",
         since: "0.38.0",
     },
+    RuntimeFeature {
+        id: "package-commands-v1",
+        since: "0.38.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -144,6 +148,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "integration-muse-hook-v1",
         rule: GateRule::Value("integration.handler", "muse-hook-v1"),
+    },
+    FeatureGate {
+        feature: "package-commands-v1",
+        rule: GateRule::Key("commands"),
     },
 ];
 

@@ -9,6 +9,7 @@
 
 mod builtin;
 mod claim;
+mod commands;
 mod config_home;
 mod definition;
 mod features;
@@ -28,6 +29,7 @@ pub use ::package::version_probe::{
 };
 pub use builtin::BuiltinSource;
 pub use claim::{decide_claim, is_reserved, Authority, ClaimRefusal, ServedBy};
+pub use commands::{PackageDescriptor, MAX_PACKAGE_COMMANDS};
 pub use config_home::{ConfigHome, HomeError};
 pub use definition::{
     DefinitionError, DefinitionInvariant, DefinitionOrigin, DefinitionParts, HandlerId,
@@ -49,8 +51,8 @@ pub use launch_env::{
 };
 pub(crate) use package::may_serve_reserved;
 pub use package::{
-    definition_from_archive, PackageLoad, PackageRejection, PackageSource, PackageStore,
-    RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
+    definition_from_archive, descriptor_from_archive, PackageLoad, PackageRejection, PackageSource,
+    PackageStore, RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
 };
 pub use registry::{
     InventoryEntry, RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust,

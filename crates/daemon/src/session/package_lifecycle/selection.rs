@@ -94,6 +94,8 @@ fn resolve(context: &Context, record: &PackageRecord) -> Integration {
         .read_definition(record.digest(), record.identity())
     {
         Ok(definition) => declared_by(&definition),
+        // A package that exports commands only declares no integration.
+        Err(PackageRejection::RuntimeMissing) => Integration::Known(None),
         Err(PackageRejection::Descriptor(_)) => legacy(context, record),
         Err(_unreadable) => Integration::Unresolvable,
     }

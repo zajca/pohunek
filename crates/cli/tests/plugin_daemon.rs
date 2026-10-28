@@ -252,6 +252,104 @@ async fn install_needs_consent_and_the_exact_digest() {
     harness.stop().await;
 }
 
+/// Package id of the fixture archive that exports commands only.
+const COMMANDS_PACKAGE_ID: &str = "means.fleet-state";
+
+/// Writes an archive that exports one peer-exposed command and no runtime.
+fn commands_archive(harness: &Harness) -> Built {
+    let document = format!(
+        r#"schema = 1
+id = "{COMMANDS_PACKAGE_ID}"
+version = "1.0.0"
+runtime_api = 1
+requires = ["package-commands-v1"]
+
+[commands.host-state]
+program = "bin/fleet-state"
+args = ["--json"]
+expose = "peers"
+"#
+    );
+    let entries = [
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: document.into_bytes(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bin/fleet-state".to_owned(),
+            contents: b"#!/bin/sh\necho ok\n".to_vec(),
+            executable: true,
+        },
+    ];
+    let bytes = build_archive(&entries, &Limits::DEFAULT).expect("the archive builds");
+    let digest = read_archive(&bytes, &Limits::DEFAULT)
+        .expect("the archive reads")
+        .digest()
+        .clone();
+    let path = harness.env.root().join("fleet-state-1.0.0.tar.zst");
+    fs::write(&path, bytes).expect("write the archive");
+    Built { path, digest }
+}
+
+#[tokio::test]
+async fn a_commands_only_package_is_reviewed_with_its_exposure_before_install() {
+    let harness = Harness::start().await;
+    let built = commands_archive(&harness);
+
+    // The review lists the command's program, arguments and exposure.
+    let output = harness
+        .run(&[
+            "plugin",
+            "install",
+            path_str(&built.path),
+            "--sha256",
+            built.digest.as_str(),
+        ])
+        .await;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_text(&output));
+    let stdout = stdout_text(&output);
+    for needle in [
+        COMMANDS_PACKAGE_ID,
+        "Runtime:     none (exports commands only)",
+        "Command:     host-state",
+        "\"bin/fleet-state\"",
+        "[\"--json\"]",
+        "peers (callable by every overlay peer the overlay policy admits)",
+    ] {
+        assert!(stdout.contains(needle), "missing {needle:?}: {stdout}");
+    }
+    assert!(harness.registry().packages().is_empty());
+
+    // With consent it installs enabled and selected, with no runtime.
+    let (code, document) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&built.path),
+            "--sha256",
+            built.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(document["ok"]["status"], "installed", "{document}");
+    assert!(document["ok"]["runtime"].is_null(), "{document}");
+    assert_eq!(document["ok"]["commands"][0]["name"], "host-state");
+    assert_eq!(document["ok"]["commands"][0]["expose"], "peers");
+    assert!(!serves_agent(&harness, COMMANDS_PACKAGE_ID).await);
+
+    let (code, document) = harness.json(&["plugin", "doctor"]).await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(
+        document["ok"]["findings"],
+        serde_json::json!([]),
+        "{document}"
+    );
+
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn disable_blocks_a_fresh_launch_and_enable_restores_it() {
     let harness = Harness::start().await;
