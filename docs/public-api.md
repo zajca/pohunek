@@ -5313,6 +5313,25 @@ SDK error mapping:
   previous one.
   `host_governance_inspect_contract_mismatch` is the separate fixed, redacted
   SDK-originated governance-response validation error.
+- `session.new` with a non-empty `secret_env` (through `Client.call` or
+  `Client.request` or `Client.subscribe`) is gated by the SDK before the request leaves the process:
+  - On a relay (`Client.connectWs`, or any transport whose `relayed` is not
+    `false`) the call fails with
+    `configuration/session_new_secret_env_relay_refused` (`ClientError.kind`
+    `sessionNewSecretEnvRelayRefused`) before a connection opens, because the
+    relay must never see raw secrets.
+  - Otherwise the SDK sends `host.inspect {skip_runtime_probes: true}` on the
+    connection that then carries `session.new`. Unless the daemon reports
+    `session_new_secret_env_supported`, the call fails with
+    `daemon/session_new_secret_env_unsupported` (`ClientError.kind`
+    `sessionNewSecretEnvUnsupported`) and no `session.new` is sent, because an
+    older daemon would drop the field silently. The result is remembered per
+    connection, so the check and the send always use the same daemon connection.
+    A version-3 request carrying `secret_env` is also refused by the request
+    adapter (`daemon_protocol_too_old`).
+  - Both errors use fixed text that names no variable and no value, and no
+    `ClientError` field, message or stack carries the `secret_env` contents. An
+    empty `secret_env` is treated as absent and skips the check.
 - `ClientError.toProtocolError()` returns the structured error
   (`ObservedProtocolError`, a `ProtocolError` whose `class` may be `"unknown"`)
   for CLI/API rendering, and `recoverHint()` returns the optional recovery text.

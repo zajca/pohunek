@@ -2193,6 +2193,7 @@ function defaultHostCapabilities(daemonVersion: string): HostCapabilities {
     session_wait_supported: true,
     session_wait_turn_supported: true,
     session_new_input_ack_supported: true,
+    session_new_secret_env_supported: true,
   };
 }
 
@@ -2488,6 +2489,10 @@ function readSessionNewParams(request: ControlRequest): SessionNewParams | undef
     return undefined;
   }
   if (!optionalString(params.input) || !optionalStringRecord(params.metadata)) {
+    return undefined;
+  }
+  // The fixture checks the shape and never stores or echoes the values.
+  if (!optionalStringRecord(params.secret_env)) {
     return undefined;
   }
   if (params.input_ack_timeout_ms !== undefined &&

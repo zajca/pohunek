@@ -9,6 +9,7 @@ type SocketTarget =
   | { kind: "tcp"; hostContext: string; host: string; port: number };
 
 export class SocketTransport implements Transport {
+  public readonly relayed = false;
   private readonly target: SocketTarget;
   private readonly options: ResolvedConnectOptions;
 

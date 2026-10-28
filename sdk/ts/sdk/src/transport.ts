@@ -28,6 +28,12 @@ export interface RawDuplex {
 }
 
 export interface Transport {
+  /**
+   * Whether frames pass through a relay service that must not see raw secrets.
+   * A transport that does not set `false` is treated as a relay, and a wrapper
+   * must pass the wrapped transport's value through.
+   */
+  readonly relayed?: boolean;
   control(): Promise<ControlChannel>;
   raw(): Promise<RawDuplex>;
 }
