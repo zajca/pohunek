@@ -63,10 +63,12 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
     assert_eq!(installed.package.origin, PackageOrigin::ExplicitDigest);
     assert!(!installed.package.enabled && !installed.package.selected);
     assert_eq!(installed.package.fault, None);
-    assert_eq!(installed.runtime.runtime_id.as_str(), RUNTIME);
-    assert_eq!(installed.runtime.program, INERT_PROGRAM);
-    assert_eq!(installed.runtime.args, ["--model", "fast"]);
-    assert!(installed.runtime.resumable && installed.runtime.forkable);
+    let runtime = installed.runtime.as_ref().expect("a runtime package");
+    assert_eq!(runtime.runtime_id.as_str(), RUNTIME);
+    assert_eq!(runtime.program, INERT_PROGRAM);
+    assert_eq!(runtime.args, ["--model", "fast"]);
+    assert!(runtime.resumable && runtime.forkable);
+    assert!(installed.commands.is_empty());
     assert_eq!(fixture.serving(RUNTIME), None, "recorded but not loaded");
 
     let listed = fixture.registry.package_list().await.expect("list");
@@ -198,6 +200,7 @@ async fn an_install_that_cannot_load_leaves_no_record_and_no_root() {
             enable: true,
             select: true,
             dry_run: false,
+            accept_commands: false,
         };
         assert_eq!(
             fixture
@@ -241,6 +244,7 @@ async fn an_unusable_archive_or_path_leaves_no_record_and_no_root() {
         enable: true,
         select: true,
         dry_run: false,
+        accept_commands: false,
     };
     assert_eq!(
         fixture
@@ -296,7 +300,14 @@ async fn a_dry_run_validates_and_changes_nothing() {
     assert_eq!(preview.status, PackageInstallStatus::Preview);
     assert!(!preview.reloaded);
     assert!(preview.package.enabled && preview.package.selected);
-    assert_eq!(preview.runtime.runtime_id.as_str(), RUNTIME);
+    assert_eq!(
+        preview
+            .runtime
+            .expect("a runtime package")
+            .runtime_id
+            .as_str(),
+        RUNTIME
+    );
     assert!(fixture
         .registry
         .package_list()
@@ -590,6 +601,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
     let link = |dry_run| PackageLinkParams {
         directory: directory.to_str().expect("utf-8").to_owned(),
         dry_run,
+        accept_commands: false,
     };
     let before = fixture.snapshot();
 
@@ -651,6 +663,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
                 .package_link(PackageLinkParams {
                     directory: relative,
                     dry_run: false,
+                    accept_commands: false,
                 })
                 .await
                 .expect_err("not absolute"),
@@ -682,6 +695,7 @@ async fn a_linked_directory_cannot_claim_a_reserved_runtime_id() {
         .package_link(PackageLinkParams {
             directory: directory.to_str().expect("utf-8").to_owned(),
             dry_run: false,
+            accept_commands: false,
         })
         .await
         .expect_err("alias");

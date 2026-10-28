@@ -293,6 +293,7 @@ mod tests {
             session_new_cwd_supported: true,
             session_new_input_ack_supported: true,
             session_idle_stop_supported: true,
+            package_install_commands_supported: true,
             session_new_branch_source_supported: true,
             supported_agents: vec![
                 "shell".to_owned(),
@@ -373,6 +374,7 @@ mod tests {
             session_new_cwd_supported: true,
             session_new_input_ack_supported: true,
             session_idle_stop_supported: true,
+            package_install_commands_supported: true,
             session_new_branch_source_supported: true,
         };
         let output = render_capabilities_human("host-b", &caps);

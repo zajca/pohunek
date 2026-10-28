@@ -45,11 +45,27 @@ pub const MAX_PACKAGE_ID_BYTES: usize = 128;
 /// Maximum UTF-8 bytes in a runtime package version string.
 pub const MAX_PACKAGE_VERSION_BYTES: usize = 64;
 
+/// Maximum UTF-8 bytes in a package command name.
+///
+/// A command name appears in install reviews and in every `command.*` request
+/// and log line; 32 bytes fits a short kebab-case verb phrase while keeping
+/// each carrying record bounded.
+pub const MAX_COMMAND_NAME_BYTES: usize = 32;
+
 /// Prefix that marks a content digest on the wire.
 const DIGEST_PREFIX: &str = "sha256:";
 
 /// Number of lowercase hexadecimal characters in a SHA-256 digest.
 const DIGEST_HEX_CHARS: usize = 64;
+
+/// Why a package command name is invalid.
+///
+/// Carries no part of the rejected text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "command name must be 1..={MAX_COMMAND_NAME_BYTES} bytes of [a-z0-9-] starting with a letter"
+)]
+pub struct CommandNameError;
 
 /// Why a runtime or package identifier is invalid.
 ///
@@ -233,6 +249,17 @@ validated_string!(
 );
 
 validated_string!(
+    /// Name of one command a package exports, valid by construction.
+    ///
+    /// `[a-z][a-z0-9-]{0,31}`: a lowercase letter, then lowercase ASCII
+    /// alphanumerics and `-`, at most [`MAX_COMMAND_NAME_BYTES`] bytes.
+    CommandName,
+    "CommandName.ts",
+    CommandNameError,
+    validate_command_name
+);
+
+validated_string!(
     /// Version string of one runtime package.
     ///
     /// Opaque to the protocol: 1..=[`MAX_PACKAGE_VERSION_BYTES`] bytes of ASCII
@@ -268,6 +295,22 @@ validated_string!(
     BindingFieldError,
     validate_digest
 );
+
+fn validate_command_name(value: &str) -> Result<(), CommandNameError> {
+    let valid = value.len() <= MAX_COMMAND_NAME_BYTES
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(CommandNameError)
+    }
+}
 
 fn validate_version(value: &str) -> Result<(), BindingFieldError> {
     let valid = !value.is_empty()

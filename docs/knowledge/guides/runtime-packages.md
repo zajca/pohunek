@@ -109,6 +109,7 @@ The features this core implements:
 | `launch-env-v1` | 0.38.0 | `[launch_env]` |
 | `transcripts-data-root-v1` | 0.38.0 | `[transcripts] root_env`, `root_home`, `max_depth`; `parser = "muse-session-v1"`; `[native_reference.existence] dir_name` |
 | `integration-muse-hook-v1` | 0.38.0 | `integration.handler = "muse-hook-v1"` |
+| `package-commands-v1` | 0.38.0 | `[commands.<name>]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -497,10 +498,67 @@ they need `--yes`.
   launch to pass the session reference, the resume and fork argument templates
   (`{reference}` marks the reference slot), whether the first prompt is
   appended to the arguments, the version probe and the integration handler; the
-  hook schema is part of the same descriptor), and fails with code `consent_required`. Nothing changed.
+  hook schema is part of the same descriptor), lists every exported
+  [command](#declaring-package-commands) with its program, fixed arguments and
+  exposure, and fails with code `consent_required`. Nothing changed.
 - With `--yes`, the CLI repeats the dry run and then performs the change.
 - Under `--json` without `--yes` only the error envelope is printed; its
   message names the package, so omit `--json` to see the full review.
+
+## Declaring package commands
+
+A package can export named commands: fixed programs the daemon runs as the
+owner when a command is called. `command.run` is the method that calls them;
+this release only declares, reviews and records them, so no call runs a command
+yet. A descriptor exports a runtime (`[runtime]`, `[input]`, `[resume]`,
+`[fork]` and `[native_reference]`, all or none), commands, or both, and at
+least one of the two. A package that exports commands only serves no runtime:
+it never appears among the supported agents and no session can be started
+under its id. It installs, enables, disables, selects, updates and uninstalls
+like any package, and `plugin doctor` reports nothing for it.
+
+```toml
+schema = 1
+id = "means.fleet-state"
+version = "1.0.0"
+runtime_api = 1
+requires = ["package-commands-v1"]
+
+[commands.host-state]
+program = "bin/fleet-state"   # a package file the manifest marks executable
+args = ["--json"]             # fixed literals, no placeholders
+expose = "peers"              # "local" (default) or "peers"
+```
+
+- `requires = ["package-commands-v1"]` is mandatory. A core without the
+  feature refuses the archive with `runtime_feature_unsupported`; a
+  `[commands]` table without the entry is refused the same way.
+- A command name is `[a-z][a-z0-9-]{0,31}`, and a package exports at most 16.
+- `program` is a normalized package-relative path (no leading `/`, no `..`)
+  that names a file of the package whose manifest entry carries the executable
+  bit. A path the manifest does not list, or lists without the bit, is
+  `descriptor_invalid`; an archive cannot contain a symbolic link.
+- `args` holds at most 64 arguments of 1 to 1024 bytes without control
+  characters, passed literally: there are no placeholders, and a call supplies
+  no argument, environment variable or input of its own.
+- `expose` says who may call the command. `local` (the default) means the
+  owner's local control socket only. `peers` means every overlay peer the
+  overlay policy admits, which can already launch any approved profile on the
+  host. The exposure is part of the descriptor, so a new version is a new
+  digest and the owner consents to a changed exposure again at install.
+- A catalog (`--catalog`) authorizes a package for the runtime it serves, so a
+  package that exports commands only is refused with `package_untrusted` and
+  installs with `--sha256` or `link`. An official package may not declare
+  commands yet.
+- The daemon refuses a package that declares commands unless the request opts
+  in (`accept_commands`), with `package_commands_client_unsupported`, so a
+  client that cannot show a command for consent never installs one unseen. The
+  CLI sends the opt-in when the host advertises
+  `package_install_commands_supported`; an older CLI does not send it and gets
+  the refusal, and an older daemon never sees the field.
+- A runtime-only table (`[integration]`, `[launch_env]`, `[config_home]`,
+  `[transcripts]`) next to commands without the runtime group is
+  `descriptor_invalid`.
 
 ## Declaring a version probe
 

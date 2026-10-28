@@ -171,10 +171,11 @@ pub(super) fn catalog_install(
         enable: true,
         select: true,
         dry_run,
+        accept_commands: false,
     }
 }
 
-fn state(fixture: &Fixture) -> package::catalog_state::CatalogState {
+pub(super) fn state(fixture: &Fixture) -> package::catalog_state::CatalogState {
     Registry::open_at(&fixture.plugins, Limits::DEFAULT)
         .expect("registry")
         .catalog_state()
@@ -487,6 +488,7 @@ async fn unreadable_catalog_and_archive_paths_are_source_errors() {
                 enable: true,
                 select: true,
                 dry_run: false,
+                accept_commands: false,
             })
             .await
             .expect_err("unreadable catalog");

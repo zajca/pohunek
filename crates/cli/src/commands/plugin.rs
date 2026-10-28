@@ -18,12 +18,13 @@ use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueHint};
 use protocol::{
-    method, ErrorClass, PackageChangeResult, PackageDigest, PackageDoctorParams,
-    PackageDoctorResult, PackageFault, PackageFindingKind, PackageId, PackageInfo,
-    PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
-    PackageInstallStatus, PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo,
-    PackageSelectParams, PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust,
-    PackageUninstallParams, PackageUninstallResult, PackageVersion,
+    method, CommandExposure, CommandInfo, ErrorClass, PackageChangeResult, PackageDigest,
+    PackageDoctorParams, PackageDoctorResult, PackageFault, PackageFindingKind, PackageId,
+    PackageInfo, PackageInspectParams, PackageInspectResult, PackageInstallParams,
+    PackageInstallResult, PackageInstallStatus, PackageLinkParams, PackageListResult,
+    PackageOrigin, PackageRuntimeInfo, PackageSelectParams, PackageSelectionBlockReason,
+    PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
+    PackageVersion,
 };
 
 use crate::client::Client;
@@ -832,7 +833,8 @@ async fn ingest_package(
         Ingest::Link => false,
         Ingest::Update => true,
     };
-    let preview = send_ingest(client, source, enable, false, true).await?;
+    let accept_commands = host_shows_commands(client).await?;
+    let preview = send_ingest(client, source, (enable, false, true), accept_commands).await?;
     let id = &preview.package.package.id;
     if let Some(expected) = expected_id {
         if id != expected {
@@ -874,7 +876,7 @@ async fn ingest_package(
         }
         .into());
     }
-    let mut result = send_ingest(client, source, enable, select, false).await?;
+    let mut result = send_ingest(client, source, (enable, select, false), accept_commands).await?;
     if ingest == Ingest::Update {
         converge_update(client, &mut result).await?;
     }
@@ -976,13 +978,28 @@ async fn converge_update(
     Ok(())
 }
 
+/// Whether the daemon can take the `accept_commands` opt-in, which this CLI
+/// then sends because it renders every exported command for consent.
+///
+/// An older daemon rejects the unknown field, so the opt-in is sent only to a
+/// host that advertises it.
+async fn host_shows_commands(client: &mut Client) -> Result<bool, CliError> {
+    Ok(client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_install_commands_supported)
+}
+
+/// Sends the install or link request; `flags` is `(enable, select, dry_run)`.
 async fn send_ingest(
     client: &mut Client,
     source: &Source,
-    enable: bool,
-    select: bool,
-    dry_run: bool,
+    flags: (bool, bool, bool),
+    accept_commands: bool,
 ) -> Result<PackageInstallResult, CliError> {
+    let (enable, select, dry_run) = flags;
     match source {
         Source::Archive { path, trust } => {
             client
@@ -992,6 +1009,7 @@ async fn send_ingest(
                     enable,
                     select,
                     dry_run,
+                    accept_commands,
                 })
                 .await
         }
@@ -1000,6 +1018,7 @@ async fn send_ingest(
                 .call::<method::PackageLink>(PackageLinkParams {
                     directory: directory.clone(),
                     dry_run,
+                    accept_commands,
                 })
                 .await
         }
@@ -1203,6 +1222,28 @@ fn template_text(tokens: Option<&[String]>) -> String {
     tokens.map_or_else(|| "none".to_owned(), |tokens| format!("{tokens:?}"))
 }
 
+/// The commands a package exports as the owner reads them before consenting:
+/// each one's program, fixed arguments and who may call it. An exposure this
+/// build does not know is shown as the widest one.
+fn render_command_details(output: &mut String, commands: &[CommandInfo]) {
+    for command in commands {
+        let _ = writeln!(output, "Command:     {}", command.name);
+        let _ = writeln!(output, "  program:   {:?}", command.program);
+        let _ = writeln!(output, "  arguments: {:?}", command.args);
+        let _ = writeln!(
+            output,
+            "  exposure:  {}",
+            match command.expose {
+                CommandExposure::Local => "local (only the owner's local control socket)",
+                CommandExposure::Peers => {
+                    "peers (callable by every overlay peer the overlay policy admits)"
+                }
+                _ => "unknown (treated as callable by every overlay peer)",
+            }
+        );
+    }
+}
+
 fn render_runtime_details(output: &mut String, runtime: &PackageRuntimeInfo) {
     let _ = writeln!(output, "Runtime:     {}", runtime.runtime_id);
     let _ = writeln!(output, "Name:        {}", sanitize(&runtime.display_name));
@@ -1280,6 +1321,9 @@ fn render_inspect(result: &PackageInspectResult) -> String {
     }
     match &result.runtime {
         Some(runtime) => render_runtime_details(&mut output, runtime),
+        None if info.fault.is_none() => {
+            let _ = writeln!(output, "Runtime:     none (exports commands only)");
+        }
         None => {
             let _ = writeln!(output, "Runtime:     descriptor unavailable");
         }
@@ -1314,7 +1358,13 @@ fn selection_after(
 fn render_install_review(preview: &PackageInstallResult, enable: bool, selected: bool) -> String {
     let mut output = String::from("The package declares:\n");
     render_package_details(&mut output, &preview.package);
-    render_runtime_details(&mut output, &preview.runtime);
+    match &preview.runtime {
+        Some(runtime) => render_runtime_details(&mut output, runtime),
+        None => {
+            let _ = writeln!(output, "Runtime:     none (exports commands only)");
+        }
+    }
+    render_command_details(&mut output, &preview.commands);
     let _ = writeln!(output, "Enabled:     {} after install", yes_no(enable));
     let _ = writeln!(output, "Selected:    {} after install", yes_no(selected));
     if !selected {
@@ -1346,7 +1396,12 @@ fn render_install_result(result: &PackageInstallResult, ingest: Ingest) -> Strin
     if !info.enabled {
         let _ = writeln!(
             output,
-            "Fresh sessions cannot launch it yet; enable it with `pohunek plugin enable {} --digest {}`.",
+            "{} enable it with `pohunek plugin enable {} --digest {}`.",
+            if result.runtime.is_some() {
+                "Fresh sessions cannot launch it yet;"
+            } else {
+                "Its commands are not available yet;"
+            },
             info.package.id,
             short_digest(&info.digest).trim_start_matches(DIGEST_PREFIX)
         );
@@ -1791,7 +1846,8 @@ mod tests {
         let preview = PackageInstallResult {
             status: PackageInstallStatus::Preview,
             package: info("acme.pi", "1.0.0", DIGEST_A, false),
-            runtime: runtime("Pi\u{1b}[31m red"),
+            runtime: Some(runtime("Pi\u{1b}[31m red")),
+            commands: Vec::new(),
             reloaded: false,
         };
         let text = render_install_review(&preview, true, false);
@@ -1858,7 +1914,8 @@ mod tests {
             &PackageInstallResult {
                 status: PackageInstallStatus::Installed,
                 package: blocked.clone(),
-                runtime: declared.clone(),
+                runtime: Some(declared.clone()),
+                commands: Vec::new(),
                 reloaded: true,
             },
             Ingest::Install { enable: true },
@@ -1876,7 +1933,8 @@ mod tests {
             &PackageInstallResult {
                 status: PackageInstallStatus::Preview,
                 package: blocked,
-                runtime: declared,
+                runtime: Some(declared),
+                commands: Vec::new(),
                 reloaded: false,
             },
             true,
@@ -1947,7 +2005,8 @@ mod tests {
                 &PackageInstallResult {
                     status: PackageInstallStatus::Preview,
                     package: fresh.clone(),
-                    runtime: runtime("Pi"),
+                    runtime: Some(runtime("Pi")),
+                    commands: Vec::new(),
                     reloaded: false,
                 },
                 true,

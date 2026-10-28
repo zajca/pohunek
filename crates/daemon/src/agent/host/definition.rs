@@ -1010,7 +1010,7 @@ fn validate_label(value: &str, field: &'static str) -> Result<(), DefinitionErro
     Ok(())
 }
 
-fn validate_token(value: &str, field: &'static str) -> Result<(), DefinitionError> {
+pub(super) fn validate_token(value: &str, field: &'static str) -> Result<(), DefinitionError> {
     if value.is_empty() || value.len() > MAX_ARG_BYTES || value.chars().any(char::is_control) {
         return Err(DefinitionError::Field {
             field,
@@ -1188,6 +1188,10 @@ struct RawDefinition {
     /// before this struct is parsed.
     #[serde(default, rename = "requires")]
     _requires: Vec<String>,
+    /// Commands the descriptor also exports; validated by
+    /// [`super::commands::commands_of`] against the package manifest.
+    #[serde(default, rename = "commands")]
+    _commands: Option<toml::Value>,
     runtime: RawRuntime,
     input: RawInput,
     resume: RawResume,
@@ -1242,20 +1246,24 @@ fn parse_document(
     source: &str,
     features: &FeatureTables<'_>,
 ) -> Result<(toml::Table, RawDefinition), DefinitionError> {
-    let malformed = |error: &toml::de::Error| {
-        let line = error.span().map(|span| {
-            source[..span.start.min(source.len())]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1
-        });
-        DefinitionError::Malformed { line }
-    };
-    let document: toml::Table = toml::from_str(source).map_err(|error| malformed(&error))?;
+    let document: toml::Table =
+        toml::from_str(source).map_err(|error| malformed_at(source, &error))?;
     check_requires(&document, features)?;
-    let raw = toml::from_str(source).map_err(|error| malformed(&error))?;
+    let raw = toml::from_str(source).map_err(|error| malformed_at(source, &error))?;
     Ok((document, raw))
+}
+
+/// The [`DefinitionError::Malformed`] of a TOML `error` in `source`, with the
+/// one-based line of the problem when the parser reports it.
+pub(super) fn malformed_at(source: &str, error: &toml::de::Error) -> DefinitionError {
+    let line = error.span().map(|span| {
+        source[..span.start.min(source.len())]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1
+    });
+    DefinitionError::Malformed { line }
 }
 
 impl RawDefinition {

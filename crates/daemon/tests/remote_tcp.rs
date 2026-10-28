@@ -2685,6 +2685,7 @@ async fn host_inspect_probes_each_program_once_in_parallel_without_blocking_the_
     assert_eq!(flags["supported_agents"], serde_json::json!([]));
     assert_eq!(flags["session_new_cwd_supported"], true);
     assert_eq!(flags["session_new_input_ack_supported"], true);
+    assert_eq!(flags["package_install_commands_supported"], true);
     assert_eq!(flags["session_new_branch_source_supported"], true);
     assert_eq!(rig.calls("prog-0"), 0, "the flags-only request probed");
 

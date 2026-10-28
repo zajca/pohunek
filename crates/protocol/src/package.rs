@@ -16,7 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId};
+use crate::{
+    CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+};
 
 /// How an installed package was authorized.
 ///
@@ -205,6 +207,52 @@ pub struct PackageRuntimeInfo {
     pub hook_schema: Option<String>,
 }
 
+/// Who may call a package command.
+///
+/// Declared by the package and consented to by the owner at install; the
+/// daemon enforces it by the transport a call arrives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CommandExposure.ts"))]
+pub enum CommandExposure {
+    /// Only the owner's local control socket reaches the command.
+    Local,
+    /// The command is also callable by every overlay peer the overlay policy
+    /// admits.
+    Peers,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one. A client
+    /// reads it as the widest exposure.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(CommandExposure);
+
+/// One command a package's descriptor exports, for review before and after
+/// installation.
+///
+/// The program and the fixed arguments are exactly what the daemon runs as the
+/// owner when the command is called; a call carries no argument, environment
+/// or input of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CommandInfo.ts"))]
+pub struct CommandInfo {
+    /// Command name, unique within the package.
+    pub name: CommandName,
+    /// Package-relative path of the executable the command runs.
+    pub program: String,
+    /// Fixed arguments, passed literally.
+    pub args: Vec<String>,
+    /// Who may call the command.
+    pub expose: CommandExposure,
+}
+
 /// How an archive is trusted when it is installed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -230,6 +278,10 @@ pub enum PackageTrust {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageInstallParams.ts"))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire parameters: each flag is an independent request option"
+)]
 pub struct PackageInstallParams {
     /// Absolute path of the package archive on the daemon host.
     pub archive_path: String,
@@ -241,6 +293,14 @@ pub struct PackageInstallParams {
     pub select: bool,
     /// Validate and report without changing anything.
     pub dry_run: bool,
+    /// The client renders the package's exported commands for consent. The
+    /// daemon refuses an archive whose descriptor declares commands when this
+    /// is absent, so a client that cannot show a command's program, arguments
+    /// and exposure never installs one unseen. Clients send it only to a host
+    /// that advertises `HostCapabilities::package_install_commands_supported`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub accept_commands: bool,
 }
 
 /// Parameters for `package.link`.
@@ -255,6 +315,10 @@ pub struct PackageLinkParams {
     pub directory: String,
     /// Validate and report without changing anything.
     pub dry_run: bool,
+    /// Same opt-in as [`PackageInstallParams::accept_commands`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub accept_commands: bool,
 }
 
 /// What an install did to the registry.
@@ -283,8 +347,16 @@ pub struct PackageInstallResult {
     pub status: PackageInstallStatus,
     /// The package as recorded (or as it would be recorded for a preview).
     pub package: PackageInfo,
-    /// What the package's runtime descriptor declares.
-    pub runtime: PackageRuntimeInfo,
+    /// What the package's runtime descriptor declares; absent for a package
+    /// that exports commands only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<PackageRuntimeInfo>,
+    /// The commands the descriptor exports, with their program, arguments and
+    /// exposure; absent when it exports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<CommandInfo>>", optional))]
+    pub commands: Vec<CommandInfo>,
     /// Whether the daemon rebuilt its runtime registry after the change.
     pub reloaded: bool,
 }
@@ -587,6 +659,10 @@ pub enum PackageErrorKind {
     /// The descriptor requires a runtime feature this core does not implement,
     /// or uses a key or compiled id of a feature it does not require.
     RuntimeFeatureUnsupported,
+    /// The descriptor declares commands and the request did not opt in with
+    /// `accept_commands`, so the client may not be able to show them for
+    /// consent.
+    CommandsClientUnsupported,
 }
 
 impl PackageErrorKind {
@@ -622,6 +698,7 @@ impl PackageErrorKind {
             Self::ProfileChanged => "package_profile_changed",
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
+            Self::CommandsClientUnsupported => "package_commands_client_unsupported",
         }
     }
 
@@ -681,6 +758,9 @@ impl PackageErrorKind {
             Self::RuntimeFeatureUnsupported => {
                 "the package descriptor requires a runtime feature this core does not support, or uses one without requiring it"
             }
+            Self::CommandsClientUnsupported => {
+                "the package exports commands and this client did not opt in to reviewing them"
+            }
         }
     }
 
@@ -727,6 +807,9 @@ impl PackageErrorKind {
             }
             Self::RuntimeFeatureUnsupported => {
                 "upgrade pohunek to a release that implements the feature, or list every feature the descriptor uses in `requires`"
+            }
+            Self::CommandsClientUnsupported => {
+                "upgrade the pohunek CLI or SDK to a release that shows package commands for consent"
             }
         }
     }
@@ -855,6 +938,7 @@ mod tests {
             PackageErrorKind::ProfileChanged,
             PackageErrorKind::IntegrationIncompatible,
             PackageErrorKind::RuntimeFeatureUnsupported,
+            PackageErrorKind::CommandsClientUnsupported,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

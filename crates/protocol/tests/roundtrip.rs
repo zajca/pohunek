@@ -3470,6 +3470,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_input_ack_supported: true,
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
+        package_install_commands_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3501,7 +3502,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_cwd_supported": true,
             "session_new_branch_source_supported": true,
             "session_new_input_ack_supported": true,
-            "session_idle_stop_supported": true
+            "session_idle_stop_supported": true,
+            "package_install_commands_supported": true
         })
     );
 
@@ -3544,6 +3546,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.session_idle_stop_supported,
         "a host that omits the idle-stop flag does not serve session.idle_stop"
+    );
+    assert!(
+        !caps.package_install_commands_supported,
+        "a host that omits the commands flag rejects accept_commands"
     );
 }
 

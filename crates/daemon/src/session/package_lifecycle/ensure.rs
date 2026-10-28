@@ -2315,7 +2315,8 @@ fn install(
             .map_err(|error| EnsureError::Registry(error.to_string()))?;
     }
     if state.selected(&record.identity().id) != Some(&digest) {
-        ensure_selectable(context, &retained, &digest, &definition).map_err(kind_error)?;
+        ensure_selectable(context, &retained, &digest, &declared_by(&definition))
+            .map_err(kind_error)?;
         context
             .store
             .registry()

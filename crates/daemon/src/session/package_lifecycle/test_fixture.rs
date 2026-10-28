@@ -128,6 +128,107 @@ impl Package {
     }
 }
 
+/// Package id of the command-only fixture package.
+pub(super) const COMMANDS_PACKAGE: &str = "means.fleet-state";
+
+/// One peer-exposed command whose program is [`COMMAND_PROGRAM`].
+pub(super) const HOST_STATE_COMMAND: &str = r#"
+[commands.host-state]
+program = "bin/fleet-state"
+args = ["--json"]
+expose = "peers"
+"#;
+
+/// Package-relative path of the executable the fixture commands run.
+pub(super) const COMMAND_PROGRAM: &str = "bin/fleet-state";
+
+/// Package-relative path of a fixture file that is not executable.
+pub(super) const PLAIN_FILE: &str = "bin/plain";
+
+impl Package {
+    /// A package that exports commands only: `commands` after the descriptor
+    /// header, with [`COMMAND_PROGRAM`] executable and [`PLAIN_FILE`] not.
+    pub(super) fn commands_only(package: &str, version: &str, commands: &str) -> Self {
+        Self::with_descriptor_and_command_files(&commands_document(
+            package, version, true, commands,
+        ))
+    }
+
+    /// An archive whose descriptor is `document`, next to the command fixture
+    /// files.
+    pub(super) fn with_descriptor_and_command_files(document: &str) -> Self {
+        let mut entries = vec![ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: document.as_bytes().to_vec(),
+            executable: false,
+        }];
+        entries.extend(command_files());
+        Self::from_entries(&entries)
+    }
+
+    /// Like [`Self::build`], also exporting `commands`.
+    pub(super) fn build_with_commands(
+        package: &str,
+        version: &str,
+        runtime: &str,
+        program: &str,
+        commands: &str,
+    ) -> Self {
+        let base = Self::build(package, version, runtime, program);
+        let mut entries = read_archive(&base.bytes, &Limits::DEFAULT)
+            .expect("the fixture archive reads")
+            .entries()
+            .to_vec();
+        for entry in &mut entries {
+            if entry.path == "runtime.toml" {
+                let text = String::from_utf8(entry.contents.clone()).expect("utf-8 descriptor");
+                let text = text.replacen(
+                    "runtime_api = 1\n",
+                    "runtime_api = 1\nrequires = [\"package-commands-v1\"]\n",
+                    1,
+                );
+                entry.contents = format!("{text}{commands}").into_bytes();
+            }
+        }
+        entries.extend(command_files());
+        Self::from_entries(&entries)
+    }
+}
+
+/// A command-only descriptor: the header, `requires` when `gated`, then
+/// `commands`.
+pub(super) fn commands_document(
+    package: &str,
+    version: &str,
+    gated: bool,
+    commands: &str,
+) -> String {
+    let requires = if gated {
+        "requires = [\"package-commands-v1\"]\n"
+    } else {
+        ""
+    };
+    format!(
+        "schema = 1\nid = \"{package}\"\nversion = \"{version}\"\nruntime_api = 1\n{requires}{commands}"
+    )
+}
+
+/// The programs the fixture commands name: one executable, one not.
+fn command_files() -> Vec<ArchiveEntry> {
+    vec![
+        ArchiveEntry {
+            path: COMMAND_PROGRAM.to_owned(),
+            contents: b"#!/bin/sh\necho ok\n".to_vec(),
+            executable: true,
+        },
+        ArchiveEntry {
+            path: PLAIN_FILE.to_owned(),
+            contents: b"not a program\n".to_vec(),
+            executable: false,
+        },
+    ]
+}
+
 /// The two files of a fixture package.
 pub(super) fn files(document: String) -> Vec<ArchiveEntry> {
     vec![
@@ -159,6 +260,7 @@ pub(super) fn explicit(
         enable,
         select,
         dry_run: false,
+        accept_commands: false,
     }
 }
 

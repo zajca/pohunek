@@ -218,11 +218,21 @@ async fn an_incompatible_update_stays_installed_and_unselected_while_a_live_sess
         Some(block_by(&v.old.digest))
     );
     assert_eq!(
-        installed.runtime.hook_schema.as_deref(),
+        installed
+            .runtime
+            .as_ref()
+            .expect("a runtime package")
+            .hook_schema
+            .as_deref(),
         Some("identity-v1")
     );
     assert_eq!(
-        installed.runtime.integration_handler.as_deref(),
+        installed
+            .runtime
+            .as_ref()
+            .expect("a runtime package")
+            .integration_handler
+            .as_deref(),
         Some("hermes-hook-v1")
     );
     assert_held_back(&v.fixture, &new, &v.old).await;

@@ -42,7 +42,7 @@ use package::{
     PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES,
 };
 use protocol::{
-    BindingProvenance, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
+    CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
     PackageFindingKind, PackageId, PackageIdentity, PackageInfo, PackageInspectResult,
     PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
     PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
@@ -53,14 +53,15 @@ use tracing::warn;
 
 use self::error::{registry_kind, rejection_kind};
 use self::fault::fault_of;
-use self::selection::{block_of, conflict, declared_by, Integrations};
+use self::selection::{block_of, conflict, declared_by, Integration, Integrations};
 use self::source::{build_directory, read_archive_file, read_regular_file};
 pub use self::trust::HostTrustAnchor;
 use super::packages::PackageUninstallError;
 use super::SessionRegistry;
 use crate::agent::host::{
-    decide_claim, definition_from_archive, is_reserved, may_serve_reserved, Authority,
-    ClaimRefusal, PackageRejection, PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
+    decide_claim, descriptor_from_archive, is_reserved, may_serve_reserved, Authority,
+    ClaimRefusal, PackageDescriptor, PackageRejection, PackageReport, PackageStore,
+    RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
 use crate::catalog_anchor::CatalogTrust;
@@ -80,11 +81,37 @@ struct Prepared {
     bytes: Vec<u8>,
     digest: PackageDigest,
     definition: RuntimeDefinition,
+    /// The commands the descriptor also exports; empty for a plain runtime
+    /// package.
+    commands: Vec<CommandInfo>,
     identity: PackageIdentity,
     authority: Authority,
     source: RecordSource,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
+}
+
+/// An archive whose descriptor exports commands only, checked like
+/// [`Prepared`].
+///
+/// It serves no runtime, so the runtime-id claim rules and the signed catalog
+/// do not apply to it: it is installed under the owner's exact-digest trust or
+/// as a linked directory.
+struct CommandsPrepared {
+    bytes: Vec<u8>,
+    digest: PackageDigest,
+    commands: Vec<CommandInfo>,
+    identity: PackageIdentity,
+    source: RecordSource,
+}
+
+/// An archive that passed every check an install makes before it writes, by
+/// what its descriptor exports.
+enum Candidate {
+    /// A runtime package, with or without commands.
+    Runtime(Box<Prepared>),
+    /// A package that exports commands only.
+    Commands(CommandsPrepared),
 }
 
 /// What a caller asked an install to do.
@@ -316,13 +343,14 @@ impl SessionRegistry {
         params: PackageInstallParams,
     ) -> Result<PackageInstallResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
-            let prepared = prepare_archive(context, &params.archive_path, &params.trust)?;
+            let candidate = prepare_archive(context, &params.archive_path, &params.trust)?;
+            require_commands_opt_in(&candidate, params.accept_commands)?;
             let plan = InstallPlan {
                 enable: params.enable,
                 select: params.select,
                 dry_run: params.dry_run,
             };
-            commit_install(context, prepared, plan, retained)
+            commit_candidate(context, candidate, plan, retained)
         })
         .await
     }
@@ -340,13 +368,14 @@ impl SessionRegistry {
         params: PackageLinkParams,
     ) -> Result<PackageInstallResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
-            let prepared = prepare_directory(&params.directory)?;
+            let candidate = prepare_directory(&params.directory)?;
+            require_commands_opt_in(&candidate, params.accept_commands)?;
             let plan = InstallPlan {
                 enable: false,
                 select: false,
                 dry_run: params.dry_run,
             };
-            commit_install(context, prepared, plan, retained)
+            commit_candidate(context, candidate, plan, retained)
         })
         .await
     }
@@ -397,8 +426,10 @@ impl SessionRegistry {
         params: PackageSelectParams,
     ) -> Result<PackageChangeResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
-            let definition = prove_loadable(context, &params.digest)?;
-            ensure_selectable(context, retained, &params.digest, &definition)?;
+            let integration = prove_loadable(context, &params.digest)?
+                .as_ref()
+                .map_or(Integration::Known(None), declared_by);
+            ensure_selectable(context, retained, &params.digest, &integration)?;
             context
                 .store
                 .registry()
@@ -692,29 +723,34 @@ fn inspect_record(
 ) -> Inspected {
     let digest = record.digest();
     let (runtime, fault, selection_blocked) =
-        match context.store.read_definition(digest, record.identity()) {
-            Ok(definition) => {
-                let fault = if is_reserved(definition.runtime_id())
-                    && !may_serve_reserved(record, &definition)
-                {
-                    fault_of(&PackageRejection::ReservedRuntimeId)
-                } else if report.rejected.iter().any(|rejected| {
-                    &rejected.digest == digest
-                        && matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
-                }) {
-                    fault_of(&PackageRejection::RuntimeIdConflict)
-                } else {
-                    None
-                };
-                let blocked = block_of(
-                    context,
-                    state,
-                    retained.gate(),
-                    record,
-                    &declared_by(&definition),
-                );
-                (Some(runtime_info(&definition)), fault, blocked)
-            }
+        match context.store.read_descriptor(digest, record.identity()) {
+            Ok(descriptor) => match descriptor.runtime() {
+                Some(definition) => {
+                    let fault = if is_reserved(definition.runtime_id())
+                        && !may_serve_reserved(record, definition)
+                    {
+                        fault_of(&PackageRejection::ReservedRuntimeId)
+                    } else if report.rejected.iter().any(|rejected| {
+                        &rejected.digest == digest
+                            && matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
+                    }) {
+                        fault_of(&PackageRejection::RuntimeIdConflict)
+                    } else {
+                        None
+                    };
+                    let blocked = block_of(
+                        context,
+                        state,
+                        retained.gate(),
+                        record,
+                        &declared_by(definition),
+                    );
+                    (Some(runtime_info(definition)), fault, blocked)
+                }
+                // A package that exports commands only serves no runtime and
+                // declares no integration: it is healthy and never blocked.
+                None => (None, None, None),
+            },
             Err(rejection) => (None, fault_of(&rejection), None),
         };
     Inspected {
@@ -755,31 +791,37 @@ fn check_claim(
     })
 }
 
-/// Proves that the installed package `digest` still loads and may serve its
-/// runtime id, so enabling or selecting it cannot create a conflict, and
-/// returns the definition it loaded.
+/// Proves that the installed package `digest` still loads and, when it
+/// exports a runtime, may serve its runtime id, so enabling or selecting it
+/// cannot create a conflict, and returns the runtime it loaded.
+///
+/// A package that exports commands only has no runtime to claim: it returns
+/// `None` once its root and descriptor verify.
 fn prove_loadable(
     context: &Context,
     digest: &PackageDigest,
-) -> Result<RuntimeDefinition, PackageErrorKind> {
+) -> Result<Option<RuntimeDefinition>, PackageErrorKind> {
     let state = read_state(context)?;
     let record = state
         .package(digest)
         .ok_or(PackageErrorKind::NotInstalled)?;
-    let definition = context
+    let descriptor = context
         .store
-        .read_definition(digest, record.identity())
+        .read_descriptor(digest, record.identity())
         .map_err(|rejection| {
             warn!(reason = %rejection, "an installed package cannot be loaded");
             rejection_kind(&rejection)
         })?;
+    let Some(definition) = descriptor.into_runtime() else {
+        return Ok(None);
+    };
     check_claim(
         &context.runtimes,
         &definition,
         &record.identity().id,
         authority_of(record.source()),
     )?;
-    Ok(definition)
+    Ok(Some(definition))
 }
 
 /// Refuses the selection of the installed package `digest` while a retained
@@ -792,7 +834,7 @@ fn ensure_selectable(
     context: &Context,
     retained: &RetainedPins,
     digest: &PackageDigest,
-    definition: &RuntimeDefinition,
+    integration: &Integration,
 ) -> Result<(), PackageErrorKind> {
     let state = read_state(context)?;
     let record = state
@@ -802,13 +844,7 @@ fn ensure_selectable(
     if state.selected(id) == Some(digest) {
         return Ok(());
     }
-    match conflict(
-        context,
-        &state,
-        retained.gate(),
-        (digest, id),
-        &declared_by(definition),
-    ) {
+    match conflict(context, &state, retained.gate(), (digest, id), integration) {
         None => Ok(()),
         Some(blocking) => {
             warn!(
@@ -842,12 +878,22 @@ fn reload_and_describe(
     })
 }
 
-/// The identity a descriptor declares.
-fn declared_identity(definition: &RuntimeDefinition) -> Result<PackageIdentity, PackageErrorKind> {
-    match &definition.binding().provenance {
-        BindingProvenance::Package { package, .. } => Ok(package.clone()),
-        BindingProvenance::Builtin { .. } => Err(PackageErrorKind::DescriptorInvalid),
+/// Refuses a package that declares commands unless the request opted in.
+///
+/// A client that does not send `accept_commands` cannot show a command's
+/// program, arguments and exposure for consent, and an older client drops the
+/// `commands` of the result without a trace. The check runs on the validated
+/// archive before any write, so a dry run is refused too.
+fn require_commands_opt_in(candidate: &Candidate, accept: bool) -> Result<(), PackageErrorKind> {
+    let declares = match candidate {
+        Candidate::Runtime(prepared) => !prepared.commands.is_empty(),
+        Candidate::Commands(_) => true,
+    };
+    if declares && !accept {
+        warn!("a package that declares commands was refused: the request did not opt in");
+        return Err(PackageErrorKind::CommandsClientUnsupported);
     }
+    Ok(())
 }
 
 /// Verifies and authorizes an archive file under `trust` without writing.
@@ -859,7 +905,7 @@ fn prepare_archive(
     context: &Context,
     path: &str,
     trust: &PackageTrust,
-) -> Result<Prepared, PackageErrorKind> {
+) -> Result<Candidate, PackageErrorKind> {
     match trust {
         PackageTrust::ExplicitDigest { digest } => prepare_local(path, digest),
         PackageTrust::Catalog { catalog_path } => {
@@ -870,30 +916,45 @@ fn prepare_archive(
                 .catalog_state()
                 .map_err(|error| registry_kind(&error))?;
             prepare_official(anchor, &state, path, catalog_path)
+                .map(|prepared| Candidate::Runtime(Box::new(prepared)))
         }
     }
 }
 
 /// Prepares an archive the owner trusts by its exact digest `pinned`.
-fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Prepared, PackageErrorKind> {
+fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = read_archive_file(path, &limits)?;
-    let (digest, definition, identity) = read_authorized(&bytes, pinned, &limits)?;
+    let (digest, descriptor) = read_authorized(&bytes, pinned, &limits)?;
+    let identity = descriptor.identity().clone();
+    let (definition, commands) = descriptor.into_parts();
+    let Some(definition) = definition else {
+        // The archive was read against `pinned`, so the exact-digest trust is
+        // already satisfied; there is no runtime id to check.
+        return Ok(Candidate::Commands(CommandsPrepared {
+            bytes,
+            digest,
+            commands,
+            identity,
+            source: RecordSource::ExplicitDigest,
+        }));
+    };
     LocalTrust::ExplicitDigest(pinned.clone())
         .authorize(definition.runtime_id(), &digest)
         .map_err(|error| match error {
             LocalTrustError::ReservedRuntime => PackageErrorKind::RuntimeNotClaimable,
             LocalTrustError::DigestMismatch => PackageErrorKind::ArchiveInvalid,
         })?;
-    Ok(Prepared {
+    Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
         definition,
+        commands,
         identity,
         authority: Authority::Local,
         source: RecordSource::ExplicitDigest,
         catalog: None,
-    })
+    })))
 }
 
 /// Prepares an archive that the signed catalog at `catalog_path` authorizes as
@@ -919,7 +980,24 @@ fn prepare_official(
         PackageErrorKind::ArchiveInvalid
     })?;
     trust::require_listed(&verified, &raw)?;
-    let (digest, definition, identity) = read_authorized(&bytes, &raw, &limits)?;
+    let (digest, descriptor) = read_authorized(&bytes, &raw, &limits)?;
+    let identity = descriptor.identity().clone();
+    let (definition, commands) = descriptor.into_parts();
+    // The catalog authorizes a package for the runtime it serves, so a package
+    // that exports commands only cannot be catalog-authorized.
+    let Some(definition) = definition else {
+        warn!(
+            "a package that exports commands only was refused: a catalog entry binds a runtime id"
+        );
+        return Err(PackageErrorKind::Untrusted);
+    };
+    // The release install paths (`ensure`, `setup host`) have no consent step
+    // that shows a command, so an official package declaring commands is not
+    // installable until they do.
+    if !commands.is_empty() {
+        warn!("an official package that declares commands was refused: no consent step shows them");
+        return Err(PackageErrorKind::Untrusted);
+    }
     trust::authorize_official(
         &verified,
         &identity,
@@ -932,6 +1010,7 @@ fn prepare_official(
         bytes,
         digest,
         definition,
+        commands,
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
@@ -948,22 +1027,21 @@ fn read_authorized(
     bytes: &[u8],
     authorized: &PackageDigest,
     limits: &Limits,
-) -> Result<(PackageDigest, RuntimeDefinition, PackageIdentity), PackageErrorKind> {
+) -> Result<(PackageDigest, PackageDescriptor), PackageErrorKind> {
     let archive = read_archive_with_digest(bytes, authorized, limits).map_err(|error| {
         warn!(%error, "a package archive was refused");
         PackageErrorKind::ArchiveInvalid
     })?;
     let digest = archive.digest().clone();
-    let definition = definition_from_archive(archive.entries(), &digest).map_err(|rejection| {
+    let descriptor = descriptor_from_archive(archive.entries(), &digest).map_err(|rejection| {
         warn!(reason = %rejection, "a package descriptor was refused");
         rejection_kind(&rejection)
     })?;
-    let identity = declared_identity(&definition)?;
-    Ok((digest, definition, identity))
+    Ok((digest, descriptor))
 }
 
 /// Archives and validates a developer directory.
-fn prepare_directory(directory: &str) -> Result<Prepared, PackageErrorKind> {
+fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = build_directory(directory, &limits)?;
     let archive = read_archive(&bytes, &limits).map_err(|error| {
@@ -971,20 +1049,74 @@ fn prepare_directory(directory: &str) -> Result<Prepared, PackageErrorKind> {
         PackageErrorKind::ArchiveInvalid
     })?;
     let digest = archive.digest().clone();
-    let definition = definition_from_archive(archive.entries(), &digest).map_err(|rejection| {
+    let descriptor = descriptor_from_archive(archive.entries(), &digest).map_err(|rejection| {
         warn!(reason = %rejection, "a linked package descriptor was refused");
         rejection_kind(&rejection)
     })?;
-    let identity = declared_identity(&definition)?;
-    Ok(Prepared {
+    let identity = descriptor.identity().clone();
+    let (definition, commands) = descriptor.into_parts();
+    let Some(definition) = definition else {
+        return Ok(Candidate::Commands(CommandsPrepared {
+            bytes,
+            digest,
+            commands,
+            identity,
+            source: RecordSource::Link,
+        }));
+    };
+    Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
         definition,
+        commands,
         identity,
         authority: Authority::Local,
         source: RecordSource::Link,
         catalog: None,
-    })
+    })))
+}
+
+/// What an install records and reports, whatever the package exports.
+struct Install {
+    bytes: Vec<u8>,
+    digest: PackageDigest,
+    identity: PackageIdentity,
+    source: RecordSource,
+    /// The catalog that authorized the package, recorded before the install.
+    catalog: Option<VerifiedCatalog>,
+    /// The integration the package declares; none for a package without a
+    /// runtime.
+    integration: Integration,
+    /// The runtime the descriptor declares, when it exports one.
+    runtime: Option<PackageRuntimeInfo>,
+    commands: Vec<CommandInfo>,
+}
+
+/// Installs a checked archive by what its descriptor exports.
+fn commit_candidate(
+    context: &Context,
+    candidate: Candidate,
+    plan: InstallPlan,
+    retained: &RetainedPins,
+) -> Result<PackageInstallResult, PackageErrorKind> {
+    match candidate {
+        Candidate::Runtime(prepared) => commit_install(context, *prepared, plan, retained),
+        Candidate::Commands(prepared) => install_package(
+            context,
+            Install {
+                bytes: prepared.bytes,
+                digest: prepared.digest,
+                identity: prepared.identity,
+                source: prepared.source,
+                catalog: None,
+                integration: Integration::Known(None),
+                runtime: None,
+                commands: prepared.commands,
+            },
+            plan,
+            retained,
+        ),
+    }
 }
 
 /// Applies the claim rules, then records the package and rebuilds the runtime
@@ -1001,7 +1133,66 @@ fn commit_install(
         &prepared.identity.id,
         prepared.authority,
     )?;
-    let runtime = runtime_info(&prepared.definition);
+    install_package(
+        context,
+        Install {
+            runtime: Some(runtime_info(&prepared.definition)),
+            integration: declared_by(&prepared.definition),
+            commands: prepared.commands,
+            bytes: prepared.bytes,
+            digest: prepared.digest,
+            identity: prepared.identity,
+            source: prepared.source,
+            catalog: prepared.catalog,
+        },
+        plan,
+        retained,
+    )
+}
+
+/// Disables the just-installed package `digest` and fails when the rebuilt
+/// runtime registry left it out.
+///
+/// Validation makes this unreachable for a package the daemon checked; a root
+/// that changed between the check and the load is disabled again rather than
+/// left recorded and enabled.
+fn refuse_loader_rejection(
+    context: &Context,
+    digest: &PackageDigest,
+    reloaded: &PackageReport,
+) -> Result<(), PackageErrorKind> {
+    let Some(rejected) = reloaded
+        .rejected
+        .iter()
+        .find(|rejected| &rejected.digest == digest)
+    else {
+        return Ok(());
+    };
+    warn!(reason = %rejected.reason, "a freshly installed package was refused by the loader");
+    let kind = rejection_kind(&rejected.reason);
+    let _ = context.store.registry().set_enabled(digest, false);
+    let _ = context.runtimes.reload();
+    Err(kind)
+}
+
+/// Records the package and rebuilds the runtime registry; a dry run stops
+/// before the first write.
+fn install_package(
+    context: &Context,
+    install: Install,
+    plan: InstallPlan,
+    retained: &RetainedPins,
+) -> Result<PackageInstallResult, PackageErrorKind> {
+    let Install {
+        bytes,
+        digest,
+        identity,
+        source,
+        catalog,
+        integration,
+        runtime,
+        commands,
+    } = install;
     let now = unix_now()?;
     // A package whose integration is incompatible with a retained version is
     // installed without being selected, so the install itself never fails on
@@ -1010,36 +1201,37 @@ fn commit_install(
         context,
         &read_state(context)?,
         retained.gate(),
-        (&prepared.digest, &prepared.identity.id),
-        &declared_by(&prepared.definition),
+        (&digest, &identity.id),
+        &integration,
     );
     let select = plan.select && held_back.is_none();
     if plan.dry_run {
         return Ok(PackageInstallResult {
             status: PackageInstallStatus::Preview,
             package: PackageInfo {
-                digest: prepared.digest.clone(),
-                package: prepared.identity,
-                origin: origin_of(prepared.source),
+                referenced: retained.known().contains(&digest),
+                digest,
+                package: identity,
+                origin: origin_of(source),
                 enabled: plan.enable,
                 selected: select,
                 installed_at_unix_seconds: now,
-                runtime_id: Some(runtime.runtime_id.clone()),
+                runtime_id: runtime.as_ref().map(|runtime| runtime.runtime_id.clone()),
                 fault: None,
-                referenced: retained.known().contains(&prepared.digest),
                 selection_blocked: held_back.map(|retained| PackageSelectionBlock {
                     reason: protocol::PackageSelectionBlockReason::IncompatibleWithRetained,
                     retained,
                 }),
             },
             runtime,
+            commands,
             reloaded: false,
         });
     }
     if let Some(blocking) = &held_back {
         if plan.select {
             warn!(
-                package = %prepared.identity.id,
+                package = %identity.id,
                 retained = %blocking,
                 "a package is installed but not selected: its integration is not compatible with a retained version"
             );
@@ -1052,17 +1244,17 @@ fn commit_install(
     // crash after it leaves nothing installed under a stale watermark, while
     // the reverse order would leave a package authorized by state that was
     // never recorded.
-    if let Some(catalog) = prepared.catalog.as_ref() {
+    if let Some(catalog) = catalog.as_ref() {
         registry
             .record_catalog(catalog)
             .map_err(|error| registry_kind(&error))?;
     }
     let report = registry
         .install(&InstallRequest {
-            archive: &prepared.bytes,
-            expected: &prepared.digest,
-            identity: prepared.identity.clone(),
-            source: prepared.source,
+            archive: &bytes,
+            expected: &digest,
+            identity: identity.clone(),
+            source,
             enabled: plan.enable,
             select,
             installed_at_unix_seconds: now,
@@ -1079,30 +1271,18 @@ fn commit_install(
         PackageErrorKind::ReloadFailed
     })?;
     if status == PackageInstallStatus::Installed {
-        if let Some(rejected) = reloaded
-            .rejected
-            .iter()
-            .find(|rejected| rejected.digest == prepared.digest)
-        {
-            // Validation makes this unreachable for a package the daemon
-            // checked; a root that changed between the check and the load is
-            // disabled again rather than left recorded and enabled.
-            warn!(reason = %rejected.reason, "a freshly installed package was refused by the loader");
-            let kind = rejection_kind(&rejected.reason);
-            let _ = registry.set_enabled(&prepared.digest, false);
-            let _ = context.runtimes.reload();
-            return Err(kind);
-        }
+        refuse_loader_rejection(context, &digest, &reloaded)?;
     }
     let state = read_state(context)?;
     let record = state
-        .package(&prepared.digest)
+        .package(&digest)
         .ok_or(PackageErrorKind::NotInstalled)?;
     let inspected = inspect_record(context, &state, record, retained, &reloaded);
     Ok(PackageInstallResult {
         status,
         package: inspected.info,
         runtime,
+        commands,
         reloaded: true,
     })
 }
@@ -1111,6 +1291,8 @@ fn commit_install(
 mod bind_tests;
 #[cfg(test)]
 mod catalog_tests;
+#[cfg(test)]
+mod commands_tests;
 #[cfg(test)]
 mod newer_version_tests;
 #[cfg(test)]
