@@ -64,6 +64,34 @@ fixture models no attention debounce or `turn_completed` drop rule, no hook
 admission or notification-policy coupling, no waiter-pool limit, and no
 hangup release.
 
+## Package commands
+
+`client.runCommand({ package, command, timeout_ms?, max_output_bytes? })`
+(also `call("command.run", ...)`) runs a command an installed package declared
+and returns the package identity, digest and verbatim stdout. Only those four
+fields reach the wire. It uses a dedicated connection whose deadline is the wire
+timeout (`MAX_COMMAND_TIMEOUT_MS` when omitted) plus response headroom, so the
+client's `requestTimeoutMs` never cuts a run short and the budget of other calls
+is unchanged; a `timeout_ms` or `max_output_bytes` that is not a nonzero `u32`
+fails with `bad_request` before sending. A `command_*` error keeps its code;
+`command_failed` exposes the exit status through `ClientError.details`
+(`process_exit.exit_code` or `signal`). A daemon that answers `method_not_found`
+or speaks protocol 3 fails with `command_unsupported`.
+
+`package.install` and `package.link` send `accept_commands` only after
+`host.inspect` reports `package_install_commands_supported` on the connection
+that carries the request; otherwise the call fails with
+`package_install_commands_unsupported` and nothing is sent, because an older
+daemon rejects the key. `accept_commands: false` is left off the wire.
+
+The testkit fixture daemon serves `command.run` for the commands its
+`commands` start option lists (`package`, `command`, `output` or `error`, and a
+`hold` promise that delays the reply). Without the option the method is unknown,
+like an older daemon. It answers `command_package_not_installed` for a package
+with no entry and `command_not_declared` for an unknown command of a listed
+package. It runs no process and models no exposure, limits, busy slots or
+shutdown.
+
 ## Test relay
 
 `startTestRelay` from `@pohunek/testkit/bun-relay` is a real relay over real sockets for

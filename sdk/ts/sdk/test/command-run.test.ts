@@ -97,6 +97,14 @@ describe("runCommand against the fixture daemon", () => {
     expect((await running).output).toBe(OUTPUT);
   });
 
+  test("an unconfigured package is not installed, a known package with an unknown command is not declared", async () => {
+    const { client } = await fixture([{ package: PACKAGE, command: COMMAND, output: OUTPUT }]);
+    const missing = await rejection(client.runCommand({ package: "means.other", command: COMMAND }));
+    expect(missing.code).toBe("command_package_not_installed");
+    const undeclared = await rejection(client.runCommand({ package: PACKAGE, command: "other" }));
+    expect(undeclared.code).toBe("command_not_declared");
+  });
+
   test("a timeout or output cap that is not a nonzero u32 is refused before sending", async () => {
     const { client } = await fixture([{ package: PACKAGE, command: COMMAND, output: OUTPUT }]);
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5]) {
@@ -229,6 +237,58 @@ describe("runCommand against a mock daemon", () => {
     const request = JSON.parse(await daemon.nextRequest()) as { method: string; params: unknown };
     expect(request.method).toBe("command.run");
     expect(request.params).toEqual({ package: PACKAGE, command: COMMAND, max_output_bytes: 1024 });
+  });
+
+  test("the widened command budget does not leak onto the shared connection", async () => {
+    let releaseCommand = (): void => {};
+    const commandHeld = new Promise<void>((resolve) => {
+      releaseCommand = resolve;
+    });
+    let releaseHealth = (): void => {};
+    const healthHeld = new Promise<void>((resolve) => {
+      releaseHealth = resolve;
+    });
+    const health = (ready: Promise<void>): ScriptStep => ({
+      kind: "gate",
+      ready,
+      line: (line) => okResponseLine(requestIdFromLine(line), {
+        status: "ok",
+        daemon_version: "0.0.0-test",
+        protocol_version: PROTOCOL_VERSION,
+      }),
+    });
+    const daemon = await startTcpDaemon([
+      health(Promise.resolve()),
+      {
+        kind: "gate",
+        ready: commandHeld,
+        line: (line) => okResponseLine(requestIdFromLine(line), {
+          package: { id: PACKAGE, version: "1.0.0" },
+          command: COMMAND,
+          digest: `sha256:${"0".repeat(64)}`,
+          output: OUTPUT,
+          duration_ms: 1,
+        }),
+      },
+      health(healthHeld),
+    ]);
+    open.push(daemon);
+    if (daemon.endpoint.kind !== "tcp") {
+      throw new Error("the mock daemon needs a TCP endpoint");
+    }
+    // timing-allowed: #1690 the default request deadline under test is shorter than the held replies
+    const client = await connectTcp(HOST, { host: daemon.endpoint.host, port: daemon.endpoint.port }, { requestTimeoutMs: 20 });
+    open.push(client);
+
+    const running = client.runCommand({ package: PACKAGE, command: COMMAND, timeout_ms: 5_000 });
+    // timing-allowed: #1690 the reply is released after the default request deadline has passed
+    setTimeout(releaseCommand, 80);
+    expect((await running).output).toBe(OUTPUT);
+
+    // A non-command reply held past the default deadline still times out.
+    const timedOut = await rejection(client.call("daemon.health", null));
+    expect(timedOut.kind).toBe("requestTimeout");
+    releaseHealth();
   });
 
   test("the ceiling constant is the protocol ceiling", () => {

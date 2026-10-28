@@ -899,6 +899,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     ) {
       return errResponse(request.id, invalidParams(request.method));
     }
+    if (!this.commands.some((candidate) => candidate.package === params.package)) {
+      return errResponse(request.id, protocolError("runtime", "command_package_not_installed", "no version of the package is installed"));
+    }
     const declared = this.commands.find(
       (candidate) => candidate.package === params.package && candidate.command === params.command,
     );
