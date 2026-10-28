@@ -21752,7 +21752,10 @@ generation "$1"
         async fn stop_after_the_killed_worker_is_lost(fixture: &Fixture, id: &SessionId) {
             wait_until("the killed worker's session to end as lost", || async {
                 let info = fixture.registry.inspect(id).await.expect("the session");
-                (info.state == protocol::SessionState::Failed).then_some(())
+                (info.state == protocol::SessionState::Failed
+                    && info.runtime.as_ref().map(|runtime| runtime.state)
+                        == Some(RuntimeState::Lost))
+                .then_some(())
             })
             .await;
             fixture.registry.settled(id).await;
