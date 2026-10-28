@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use package::registry::{IncompatibleReason, RegistryError, RetainedDigests, RetainedState};
 use package::verify::{VerifiedRoot, VerifyError};
 use package::{ArchiveEntry, Limits, PackageDigest};
-use protocol::{BindingProvenance, PackageId, PackageIdentity, ProtocolError, RuntimeId};
+use protocol::{
+    BindingProvenance, CommandInfo, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+};
 use thiserror::Error;
 
 use super::claim::is_reserved;
@@ -184,6 +186,25 @@ impl DefinitionCache {
     }
 }
 
+/// The commands of each installed digest, read once from its verified root.
+///
+/// A digest names the package content, so an entry never goes stale. The
+/// exposure gate of `command.run` reads it instead of the descriptor file on
+/// every call; the root is still verified before a program is run.
+#[derive(Debug, Default)]
+struct CommandCache {
+    entries: Mutex<CommandEntries>,
+}
+
+/// The identity each digest was read under and the commands it exports.
+type CommandEntries = BTreeMap<PackageDigest, (PackageIdentity, Arc<[CommandInfo]>)>;
+
+impl CommandCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CommandEntries> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Whether `definition` was built from a package recorded under `identity`.
 fn built_for(definition: &RuntimeDefinition, identity: &PackageIdentity) -> bool {
     matches!(
@@ -197,6 +218,7 @@ fn built_for(definition: &RuntimeDefinition, identity: &PackageIdentity) -> bool
 pub struct PackageStore {
     registry: Arc<package::registry::Registry>,
     definitions: Arc<DefinitionCache>,
+    commands: Arc<CommandCache>,
     /// Package roots verified so far, which tests read to bound the work of a
     /// listing.
     #[cfg(test)]
@@ -236,6 +258,7 @@ impl PackageStore {
         Self {
             registry: Arc::new(registry),
             definitions: Arc::default(),
+            commands: Arc::default(),
             #[cfg(test)]
             verifications: Arc::default(),
             #[cfg(test)]
@@ -395,6 +418,54 @@ impl PackageStore {
                 .package(digest)
                 .is_some_and(|record| built_for(definition, record.identity()))
         });
+        self.commands
+            .lock()
+            .retain(|digest, (identity, _commands)| {
+                state
+                    .package(digest)
+                    .is_some_and(|record| record.identity() == identity)
+            });
+    }
+
+    /// The commands the package `digest`, recorded under `identity`, exports.
+    ///
+    /// The descriptor is read from the verified root on the first call for a
+    /// digest and held afterwards, so a later call does not touch the disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageRejection`] of [`Self::read_descriptor`] on a miss.
+    pub fn commands(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Result<Arc<[CommandInfo]>, PackageRejection> {
+        if let Some((held, commands)) = self.commands.lock().get(digest) {
+            if held == identity {
+                return Ok(Arc::clone(commands));
+            }
+        }
+        let commands: Arc<[CommandInfo]> =
+            self.read_descriptor(digest, identity)?.commands().into();
+        self.commands
+            .lock()
+            .insert(digest.clone(), (identity.clone(), Arc::clone(&commands)));
+        Ok(commands)
+    }
+
+    /// Verifies the root of `digest` again and returns where its files are,
+    /// for resolving a program a command runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageRejection`] when the package is not installed or
+    /// its root fails verification.
+    pub fn verified_files_path(
+        &self,
+        digest: &PackageDigest,
+    ) -> Result<std::path::PathBuf, PackageRejection> {
+        self.ready_root(digest)
+            .map(|root| root.files_path().to_path_buf())
     }
 
     /// Loads the definition of exactly the package `digest` for a host

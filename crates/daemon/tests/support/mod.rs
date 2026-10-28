@@ -22,6 +22,10 @@ std::thread_local! {
 ///
 /// A session child then sees the fixture's private `HOME` and none of the
 /// developer's variables. The environment lives until the test thread ends.
+#[allow(
+    dead_code,
+    reason = "each test binary using this module needs a different subset of its helpers"
+)]
 pub(crate) fn hermetic_environment_source() -> EnvironmentSource {
     THREAD_ENV.with(|cell| {
         let env = cell.get_or_init(|| TestEnv::new().expect("create the thread test environment"));

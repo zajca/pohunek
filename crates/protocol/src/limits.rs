@@ -72,6 +72,20 @@ pub const MAX_SESSION_SECRET_ENV_VALUE_BYTES: usize = 16 * 1024;
 /// Matches the portable environment-name bound used for launch environments.
 pub const MAX_SESSION_SECRET_ENV_NAME_BYTES: usize = 128;
 
+/// Largest stdout a `command.run` reply carries, in bytes.
+///
+/// One response is a single control line of at most [`MAX_CONTROL_LINE_BYTES`],
+/// and JSON escaping of control characters can grow text six-fold, so an eighth
+/// of the line always fits with the envelope.
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = MAX_CONTROL_LINE_BYTES / 8;
+
+/// Longest run of one package command, in milliseconds.
+///
+/// Each run holds a blocking daemon thread and a process group for this long
+/// at most, so the ceiling bounds the cost of an abandoned or hostile call. The
+/// SDK reads it to size the request deadline.
+pub const MAX_COMMAND_TIMEOUT_MS: u32 = 60_000;
+
 /// Maximum bounded `session.wait` duration accepted on the public wire.
 ///
 /// Eight seconds releases abandoned daemon waiter slots promptly while still

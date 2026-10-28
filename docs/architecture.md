@@ -1609,8 +1609,9 @@ starts under its id. The exposure is the model for peer-callable package
 capabilities: the package declares it (`expose`), the owner consents to it when
 reviewing the install (a new version is a new digest, so a changed exposure is
 reviewed again), and the daemon enforces it by the transport a call arrives on
-(never by a request field). This slice declares and records commands; running
-one is a separate method.
+(never by a request field). `command.run` runs one: it resolves the selected
+version, re-verifies the package root, runs the declared program once under the
+bounded runner and returns its stdout (see Security Model).
 
 Trust boundary:
 
@@ -1640,6 +1641,26 @@ Trust boundary:
   separate owner process: the agent the worker execs in its PTY from the launch
   plan (`crates/daemon/src/agent/host/launch.rs`), and the bounded version
   probe the daemon spawns (`crates/daemon/src/capabilities.rs`).
+- **Package commands.** `command.run` runs a command an installed package
+  declared (`crates/daemon/src/package_command/`). It is an owner process the
+  daemon starts on request, so the same Unix-account trust as an agent launch
+  applies, bounded further: no request field reaches the argv, environment,
+  working directory or stdin (params are strict); the program is a file of the
+  package root verified against its digest again before every run; the
+  environment is cleared down to the runner's fixed set and the working
+  directory is a private scratch directory; one run per command and four per
+  host, over every transport, with no queue; stdout is capped (128 KiB) while
+  the program runs, the deadline is at most 60 s and the process group is killed
+  on timeout, overflow, exit, shutdown and caller disconnect. A `local` command
+  is served on the local socket only; a `peers` command is also served over the
+  overlay, where the overlay policy alone decides who reaches the daemon
+  (`command.run` adds no authentication). The gate keys on the connection's
+  `ControlTransport`, never on a request field, and runs before a program path
+  is built; a future relay transport must refuse the method. Errors are fixed
+  text, `details` appears only on `command_failed`, and the program's output
+  reaches the reply on success and no log. Residual: a program that calls
+  `setsid()` or double-forks escapes the group kill and lives until the daemon's
+  unit stops.
 - **Local lifecycle only.** `package.*` methods are served on the local control
   socket only (`crates/daemon/src/api/handler/package.rs`, error
   `local_only_method`), and the CLI refuses a remote `--host`

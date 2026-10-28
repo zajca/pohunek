@@ -347,6 +347,28 @@ async fn a_commands_only_package_is_reviewed_with_its_exposure_before_install() 
         "{document}"
     );
 
+    // Inspecting the installed package shows the same commands, with the
+    // daemon's explicit marker for a package that exports commands only.
+    let (code, inspected) = harness
+        .json(&["plugin", "inspect", COMMANDS_PACKAGE_ID])
+        .await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_eq!(inspected["ok"]["commands_only"], true, "{inspected}");
+    assert_eq!(inspected["ok"]["commands"][0]["name"], "host-state");
+    assert_eq!(inspected["ok"]["commands"][0]["expose"], "peers");
+    let output = harness
+        .run(&["plugin", "inspect", COMMANDS_PACKAGE_ID])
+        .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_text(&output));
+    let stdout = stdout_text(&output);
+    for needle in [
+        "Runtime:     none (exports commands only)",
+        "Command:     host-state",
+        "peers (callable by every overlay peer the overlay policy admits)",
+    ] {
+        assert!(stdout.contains(needle), "missing {needle:?}: {stdout}");
+    }
+
     harness.stop().await;
 }
 

@@ -535,6 +535,7 @@ All params and result type names below refer to structs exported by
 | `package.select` | `PackageSelectParams` | `PackageChangeResult` | Local-only. Selects the installed version bare requests of its package id resolve to. |
 | `package.uninstall` | `PackageUninstallParams` | `PackageUninstallResult` | Local-only. Removes an installed package that no session or host profile pins. |
 | `package.bind_profile` | `PackageBindProfileParams` | `PackageBindProfileResult` | Local-only. Pins a host agent profile to an installed package under the package lifecycle authority, or previews the change with `dry_run`. |
+| `command.run` | `CommandRunParams` | `CommandRunResult` | Runs one command an installed package declared, once, and returns its stdout. Served on the local socket and, for a `peers` command, on remote overlay connections. See [Package Commands](#package-commands). |
 
 `status` exists as a method constant in `crates/protocol` but is not a supported
 daemon method in this API version. It returns `daemon/method_not_found`.
@@ -642,7 +643,7 @@ Shared payloads:
   `package-commands-v1`; a call supplies no argument, environment or input of
   its own. `package.install` and `package.link` list them so the owner reviews
   and consents to the program, arguments and exposure before the install.
-  This release only declares and records commands; `command.run` is separate.
+  `command.run` calls one (see [Package Commands](#package-commands)).
 - `PackageTrust`, a tagged object: `{"kind":"explicit_digest","digest":...}`
   requires the archive digest to equal `digest` and never authorizes an
   official runtime alias; `{"kind":"catalog","catalog_path":...}` names a
@@ -651,7 +652,7 @@ Shared payloads:
 | Method | Params | Result | Behavior |
 |---|---|---|---|
 | `package.list` | `null` | `{generation, packages[]}` | `generation` counts committed registry changes. |
-| `package.inspect` | `{digest}` | `{package, runtime?}` | `runtime` is absent when the descriptor cannot be loaded. |
+| `package.inspect` | `{digest}` | `{package, runtime?, commands?, commands_only?}` | `runtime` is absent when the descriptor cannot be loaded and for a package that exports commands only. `commands` lists the exported `CommandInfo` (name, program, arguments, exposure) and is absent when there are none or the descriptor cannot be loaded, so an owner can review the exposure after install. `commands_only` is `true` when the descriptor loaded and exports commands only; a reply without it says nothing about the descriptor, so a client reads a missing `runtime` as "descriptor unavailable" and never infers a commands-only package. An older daemon omits both fields. |
 | `package.doctor` | `{package?}` or `null` | `{generation, findings[]}` | `package` restricts the report to one package id. A finding is `{kind, digest, package?, fault?, referenced}`; `kind` is `fault`, `unregistered_root` (a root on disk without a record; installing the same archive again adopts it after verification), `pinned_not_installed` (a session or host profile pins a digest the registry does not record) or `selection_blocked` (an installed, unselected package that cannot be selected until a retained reference to an incompatible version of the same package is gone; `blocked_by` is that digest). A finding carries `blocked_by?` besides the fields above. An empty list means everything verified. |
 | `package.install` | `{archive_path, trust, enable, select, dry_run, accept_commands?}` | `{status, package, runtime?, commands?, reloaded}` | All parameters except `accept_commands` are required. `runtime` is absent for a package that exports commands only (it serves no runtime and cannot be launched as a session); `commands` lists the exported `CommandInfo` and is absent when there are none. `accept_commands` (default `false`, omitted when `false`) is the client's statement that it shows every exported command for consent: a descriptor that declares `[commands]` (command-only or together with a runtime) is refused with `package_commands_client_unsupported` before anything is written, a dry run included, unless it is `true`. Send it only when `host.inspect` reports `package_install_commands_supported`; an older daemon rejects the unknown parameter. A catalog-trusted archive must export a runtime: a package that exports commands only is refused with `package_untrusted`, because a catalog entry binds a runtime id, and an official package that declares commands is refused the same way until the release install paths show commands for consent. `archive_path` is absolute on the daemon host. `status` is `preview` (dry run, nothing changed), `installed`, `already_installed` (recorded with a verified root) or `root_restored` (recorded, root was missing and extracted again). A package that is already recorded keeps its recorded `enabled`, `selected` and origin: `enable`, `select` and `trust` apply to a new record only. With `select: true`, a package whose integration is incompatible with a retained version of the same package is still installed, but unselected: the call succeeds with `package.selected: false` and `package.selection_blocked` set (a dry run reports the same). |
 | `package.link` | `{directory, dry_run, accept_commands?}` | `{status, package, runtime?, commands?, reloaded}` | Copies the directory into content-addressed storage and installs it disabled and unselected; the daemon never loads the directory itself. `accept_commands` works as for `package.install`. |
@@ -830,6 +831,65 @@ Errors use the error contract below. Every code has fixed message and
 | `package_profile_changed` | `runtime` | The profile changed while it was being rewritten and was left as found. |
 | `package_integration_incompatible` | `runtime` | The package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected, or that an unreadable `metadata.jsonl` line may reference; nothing changed. |
 | `runtime_feature_unsupported` | `runtime` | The descriptor's `requires` names a runtime feature this core does not implement, or the descriptor uses a key or compiled parser or handler id of a feature it does not list in `requires`; nothing was recorded. |
+
+### Package Commands
+
+`command.run` runs one command a package declared in its descriptor (see the
+[runtime package guide](knowledge/guides/runtime-packages.md#declaring-package-commands)).
+The call names a package id and a command; it carries no argument, environment
+variable, working directory or input.
+
+| Method | Params | `ok` result | Notes |
+|---|---|---|---|
+| `command.run` | `{package, command, timeout_ms?, max_output_bytes?}` | `{package, command, digest, output, duration_ms}` | Params are strict: an unknown field (`args`, `env`, `cwd`, `stdin`) is `bad_request` and nothing starts. `package` is the package id; the call resolves to the selected version, so `package` in the result is the id and exact version that ran and `digest` names its archive. `timeout_ms` and `max_output_bytes` are 1 to `MAX_COMMAND_TIMEOUT_MS` (60000) and 1 to `MAX_COMMAND_OUTPUT_BYTES` (128 KiB); absent means the ceiling, a larger value is lowered to it and zero is `bad_request`. `output` is the program's stdout verbatim and valid UTF-8. |
+
+The daemon runs the declared program once, as the owner:
+
+- the program is a file of the package root, which is verified against the
+  archive digest again before every run; the arguments are the descriptor's
+  literals;
+- the environment is cleared and holds only `PATH` (the one agent launches
+  inherit), `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+  `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `TMPDIR`, `LANG=C` and `LC_ALL=C`; the
+  home and XDG paths are a private scratch directory removed after the run,
+  which is also the working directory; stdin is closed and stderr is discarded;
+- the program runs in a process group of its own. The group is killed when the
+  deadline passes, when stdout exceeds the cap (checked while the program
+  runs), after the program exits (so a background child does not survive) and
+  when the daemon shuts down or the caller disconnects. A program that calls
+  `setsid()` or double-forks leaves the group and lives until the daemon's unit
+  stops;
+- one run per package command and four runs across the host at once, over every
+  transport: a call over a limit fails with `command_busy` at once and nothing
+  queues. A run keeps its slot until its process group is gone;
+- a call resolves in this order: package installed, version selected, command
+  declared, exposure, enabled, root verified, limits, run. The exposure gate
+  reads the commands from the descriptor the daemon holds for the selected
+  digest and is decided by the transport of the connection: the local socket
+  may call any declared command, an overlay connection only a `peers` command
+  (`command_not_exposed` otherwise). No program path is built and nothing
+  starts before it. The method is not served on a relay path.
+
+Errors are fixed text without a path, a value or program output:
+
+| Code | Class | When |
+|---|---|---|
+| `command_package_not_installed` | `runtime` | No version of the package is installed. |
+| `command_not_selected` | `runtime` | Versions are installed and none is selected. |
+| `command_not_declared` | `runtime` | The selected version declares no command of that name, or the package exports no commands. |
+| `command_not_exposed` | `runtime` | An overlay caller named a `local` command. |
+| `command_package_disabled` | `runtime` | The selected version is disabled. |
+| `command_busy` | `runtime` | The command already runs, or four runs are in flight. |
+| `command_failed` | `runtime` | The program exited non-zero or was ended by a signal the daemon did not send; `details.process_exit` carries `exit_code` or `signal`. |
+| `command_timed_out` | `runtime` | The deadline passed and the group was killed. |
+| `command_output_too_large` | `runtime` | Stdout exceeded the cap and the group was killed. |
+| `command_output_not_utf8` | `runtime` | Stdout is not valid UTF-8. |
+| `command_unavailable` | `runtime` | The package root fails verification, the run could not be set up, or the daemon is shutting down. |
+| `command_unsupported` | `daemon` | Produced by a client, never by a daemon: the daemon answered `method_not_found` (a release without `command.run`, protocol 4 included) or speaks protocol 3, which never defined it. |
+
+The log line of a run names the package, version, digest, command, transport,
+duration, outcome, exit status or signal and the number of output bytes, never
+the output.
 
 ### Daemon Runtime Configuration
 
@@ -3931,6 +3991,7 @@ Fields:
 | `code` | string | yes | Stable machine-readable code. Treat the set as open. |
 | `msg` | string | yes | Human-readable, non-secret diagnostic. |
 | `recover` | string | no | Optional recovery hint. |
+| `details` | object | no | Typed facts a caller reads instead of parsing `msg`. Only `command_failed` carries it: `{process_exit: {exit_code?, signal?}}`, exactly one of the two set. Decoders ignore members and kinds they do not know. No other error has the key, and only a client that called `command.run` can receive it, so older clients (whose strict decoder rejects unknown error fields) never see it. |
 
 Classes:
 
@@ -3947,9 +4008,9 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `overlay_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner`, `session_new_secret_env_relay_refused` |
-| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported` |
+| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported`, `command_unsupported` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `secret_env_not_declared`, `secret_env_missing`, `secret_env_invalid`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible`, `launch_input_invalid`, `launch_input_unavailable`, `integration_overlay_unavailable`, `integration_launch_arg_conflict` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `secret_env_not_declared`, `secret_env_missing`, `secret_env_invalid`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible`, `launch_input_invalid`, `launch_input_unavailable`, `integration_overlay_unavailable`, `integration_launch_arg_conflict`, `command_package_not_installed`, `command_not_selected`, `command_not_declared`, `command_not_exposed`, `command_package_disabled`, `command_busy`, `command_failed`, `command_timed_out`, `command_output_too_large`, `command_output_not_utf8`, `command_unavailable` |
 
 In the `discovery` row `<overlay>` is `netbird` or `tailscale`: `netbird_cli_missing`,
 `netbird_state_unavailable` and `netbird_listener_address_missing` come from the

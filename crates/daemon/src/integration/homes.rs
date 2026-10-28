@@ -75,6 +75,12 @@ impl ConfigHomes {
         Self { profiles, base }
     }
 
+    /// The executable search path an agent launch inherits, if the base
+    /// environment has one.
+    pub(crate) fn search_path(&self) -> Option<std::ffi::OsString> {
+        self.base.get("PATH").map(std::ffi::OsString::from)
+    }
+
     /// The runtimes this host serves.
     pub(super) fn host(&self) -> &RuntimeHost {
         self.profiles.runtimes()

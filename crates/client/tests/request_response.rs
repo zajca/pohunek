@@ -2079,3 +2079,146 @@ fn assert_sent_specific_request(request_line: &str, expected: &Request) {
 fn trim_line_end(line: &str) -> &str {
     line.trim_end_matches('\n').trim_end_matches('\r')
 }
+
+fn command_run_params(timeout_ms: Option<u32>) -> protocol::CommandRunParams {
+    protocol::CommandRunParams {
+        package: protocol::PackageId::parse("acme.fleet-state").expect("package id"),
+        command: protocol::CommandName::parse("host-state").expect("command name"),
+        timeout_ms,
+        max_output_bytes: None,
+    }
+}
+
+fn command_run_result() -> Value {
+    json!({
+        "package": { "id": "acme.fleet-state", "version": "1.0.0" },
+        "command": "host-state",
+        "digest": format!("sha256:{}", "a".repeat(64)),
+        "output": "state\n",
+        "duration_ms": 30_000
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_run_outlasts_the_default_request_timeout() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(command_run_result(), no_origin_options()).await;
+    let run = tokio::spawn(async move { client.command_run(command_run_params(None)).await });
+    let (request, dedicated) = fixture.request().await;
+    assert_eq!(request.method(), protocol::method::COMMAND_RUN);
+    assert!(dedicated, "a command runs on a dedicated connection");
+    // A run may take up to the protocol ceiling, far past the 5 second
+    // default response deadline of a shared connection.
+    tokio::time::advance(Duration::from_millis(u64::from(
+        protocol::MAX_COMMAND_TIMEOUT_MS,
+    )))
+    .await;
+    fixture.release();
+    let result = run
+        .await
+        .expect("command task completed")
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert_eq!(result.output, "state\n");
+    fixture.finish().await;
+}
+
+/// A daemon of the current protocol version that predates `command.run`: it
+/// answers the version probe and refuses every other method as unknown.
+async fn serve_without_command_run<S>(stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut stream = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        match stream.read_line(&mut line).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let request: Request =
+            serde_json::from_str(trim_line_end(&line)).expect("parse request line");
+        if request.method() == protocol::method::DAEMON_HEALTH {
+            write_health_reply(stream.get_mut(), request.id()).await;
+            continue;
+        }
+        let response = Response::err(
+            protocol::PROTOCOL_VERSION,
+            request.id(),
+            ProtocolError::method_not_found(request.method()),
+        )
+        .expect("method_not_found response");
+        stream
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("serialize response")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write method_not_found");
+    }
+}
+
+#[tokio::test]
+async fn a_current_protocol_daemon_without_command_run_is_command_unsupported() {
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let local = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept local client");
+            tokio::spawn(serve_without_command_run(stream));
+        }
+    });
+    let mut client = Client::connect_local_with_options(socket_file.path(), no_origin_options())
+        .await
+        .expect("connect fixture daemon");
+    let error = client
+        .command_run(command_run_params(None))
+        .await
+        .expect_err("the daemon has no command.run");
+    match error {
+        ClientError::Protocol(source) => {
+            assert_eq!(source.code, "command_unsupported");
+            assert_eq!(source.class, ErrorClass::Daemon);
+        }
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+    // The generic typed call takes the same path.
+    let error = client
+        .call::<protocol::method::CommandRun>(command_run_params(None))
+        .await
+        .expect_err("the daemon has no command.run");
+    assert!(
+        matches!(&error, ClientError::Protocol(source) if source.code == "command_unsupported"),
+        "{error:?}"
+    );
+    local.abort();
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind tcp fixture daemon");
+    let addr = listener.local_addr().expect("tcp fixture address");
+    let remote = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept remote client");
+            tokio::spawn(serve_without_command_run(stream));
+        }
+    });
+    let mut client = Client::connect_trusted_tcp_addr_with_options(HOST, addr, no_origin_options())
+        .await
+        .expect("connect tcp fixture daemon");
+    let error = client
+        .command_run(command_run_params(None))
+        .await
+        .expect_err("the remote daemon has no command.run");
+    match error {
+        ClientError::RemoteProtocol { host, source } => {
+            assert_eq!(host, HOST);
+            assert_eq!(source.code, "command_unsupported");
+        }
+        other => panic!("expected a remote protocol error, got {other:?}"),
+    }
+    remote.abort();
+}

@@ -3,6 +3,8 @@
 import type {
   AssistantMaterializeParams,
   AssistantMaterializeResult,
+  CommandRunParams,
+  CommandRunResult,
   DaemonDoctorResult,
   DaemonHealthResult,
   HostCapabilities,
@@ -118,6 +120,7 @@ import type {
 
 export interface Methods {
   "assistant.materialize": { params: AssistantMaterializeParams; output: AssistantMaterializeResult };
+  "command.run": { params: CommandRunParams; output: CommandRunResult };
   "daemon.doctor": { params: null; output: DaemonDoctorResult };
   "daemon.health": { params: null; output: DaemonHealthResult };
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
@@ -189,6 +192,7 @@ export interface Methods {
 /** Every public method name of this release. */
 export const METHOD_NAMES = [
   "assistant.materialize",
+  "command.run",
   "daemon.doctor",
   "daemon.health",
   "host.discover",
