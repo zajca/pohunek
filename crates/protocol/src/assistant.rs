@@ -51,8 +51,13 @@ pub struct ConceptMeta {
     pub title: String,
     /// Short concept description.
     pub description: String,
-    /// Assistant intents this concept can support.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Assistant intents this concept can support. Intents this build does not
+    /// know are dropped by the client's tolerant decode.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_known_intents"
+    )]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub intents: Option<Vec<ConceptIntent>>,
     /// First Pohunek version this concept applies to.
@@ -69,6 +74,23 @@ pub struct ConceptMeta {
     pub deprecated: Option<ConceptDeprecation>,
 }
 
+/// Decodes `intents`, dropping every intent a newer daemon sent that this build
+/// does not know.
+fn deserialize_known_intents<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ConceptIntent>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let intents = Option::<Vec<ConceptIntent>>::deserialize(deserializer)?;
+    Ok(intents.map(|intents| {
+        intents
+            .into_iter()
+            .filter(|intent| *intent != ConceptIntent::Unknown)
+            .collect()
+    }))
+}
+
 /// Protocol-local copy of the knowledge concept type enum.
 ///
 /// Mirrors `knowledge::ConceptType`; the two are bridged in the knowledge
@@ -76,7 +98,7 @@ pub struct ConceptMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ConceptType.ts"))]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", remote = "Self")]
 pub enum ConceptType {
     /// General explanatory concept.
     Concept,
@@ -106,20 +128,38 @@ pub enum ConceptType {
     SnapshotTemplate,
     /// Release note entry.
     ReleaseNote,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(ConceptType);
 
 /// Protocol-local copy of assistant intent names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ConceptIntent.ts"))]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", remote = "Self")]
 pub enum ConceptIntent {
     Setup,
     Project,
     Update,
     Debug,
     Help,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(ConceptIntent);
 
 /// Deprecation metadata exposed for concepts that describe retired behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

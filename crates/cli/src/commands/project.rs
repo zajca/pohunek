@@ -156,6 +156,7 @@ pub(crate) async fn run_prompt(
         let layer = match result.layer {
             PromptLayer::InRepo => "in-repo .pohunek/",
             PromptLayer::Host => "host config",
+            PromptLayer::Unknown => "unknown",
         };
         eprintln!("pohunek: prompt '{}' resolved from {layer}", result.name);
         print!("{}", result.content);
@@ -169,6 +170,7 @@ fn provider_label(provider: &ProviderKind) -> &'static str {
         ProviderKind::LinearIssue => "linear_issue",
         ProviderKind::GithubPr => "github_pr",
         ProviderKind::None => "none",
+        ProviderKind::Unknown => "unknown",
     }
 }
 
@@ -246,6 +248,7 @@ fn render_actions_human(actions: &[ActionSummary]) -> String {
         let layer = match action.layer {
             PromptLayer::InRepo => "in-repo",
             PromptLayer::Host => "host",
+            PromptLayer::Unknown => "unknown",
         };
         let _ = writeln!(
             out,
@@ -341,6 +344,7 @@ fn source_label(source: ProjectSource) -> &'static str {
     match source {
         ProjectSource::Auto => "auto",
         ProjectSource::Manual => "manual",
+        ProjectSource::Unknown => "unknown",
     }
 }
 

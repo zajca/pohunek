@@ -57,7 +57,7 @@ impl NotificationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationSeverity.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum NotificationSeverity {
     /// Informational notice.
     Info,
@@ -69,7 +69,16 @@ pub enum NotificationSeverity {
     Error,
     /// Action is required from the owner.
     ActionRequired,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(NotificationSeverity);
 
 impl NotificationSeverity {
     /// Returns the stable wire string.
@@ -81,6 +90,7 @@ impl NotificationSeverity {
             Self::Warning => "warning",
             Self::Error => "error",
             Self::ActionRequired => "action_required",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -89,7 +99,7 @@ impl NotificationSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationStatus.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum NotificationStatus {
     /// The owner has not opened or acted on the notification.
     Unread,
@@ -101,7 +111,16 @@ pub enum NotificationStatus {
     Archived,
     /// The owner deleted the notification.
     Deleted,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(NotificationStatus);
 
 impl NotificationStatus {
     /// Returns the stable wire string.
@@ -113,6 +132,7 @@ impl NotificationStatus {
             Self::Acknowledged => "acknowledged",
             Self::Archived => "archived",
             Self::Deleted => "deleted",
+            Self::Unknown => "unknown",
         }
     }
 }

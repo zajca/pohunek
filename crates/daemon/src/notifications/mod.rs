@@ -1364,6 +1364,8 @@ fn apply_status(record: &mut NotificationRecord, status: NotificationStatus, now
         NotificationStatus::Acknowledged => record.acked_at = Some(now.to_owned()),
         NotificationStatus::Archived => record.archived_at = Some(now.to_owned()),
         NotificationStatus::Deleted => record.deleted_at = Some(now.to_owned()),
+        // Rejected by `is_valid_status_transition` before a status is applied.
+        NotificationStatus::Unknown => {}
     }
 }
 

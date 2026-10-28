@@ -19,6 +19,11 @@ or label on that host without the local CLI sending a local filesystem path.
 Project records also carry the default base branch used when sessions create
 dedicated worktrees.
 
+A client of an older build shows a project source, an action provider or a
+prompt layer that a newer daemon adds as `unknown`; an unknown provider is never
+treated as the provider-less `none` kind. The daemon's own project store stays
+strict.
+
 Project configuration may come from host config and from repo-local
 `.pohunek/` files. Repo-local configuration is useful for shared actions and
 prompts, but it is not trusted just because it is in the repository. See

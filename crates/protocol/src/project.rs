@@ -19,13 +19,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ProjectSource.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum ProjectSource {
     /// Auto-registered when a session started inside the repository's work tree.
     Auto,
     /// Added (or re-added) explicitly by the operator.
     Manual,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(ProjectSource);
 
 impl ProjectSource {
     /// Returns the stable wire string.
@@ -34,6 +43,7 @@ impl ProjectSource {
         match self {
             Self::Auto => "auto",
             Self::Manual => "manual",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -212,13 +222,22 @@ pub struct ProjectShowResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PromptLayer.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum PromptLayer {
     /// Resolved from the repository's in-repo `.pohunek/` (travels with the repo).
     InRepo,
     /// Resolved from the host-default `~/.config/pohunek/` on the daemon's host.
     Host,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PromptLayer);
 
 /// Parameters for `project.prompt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,7 +271,7 @@ pub struct ProjectPromptResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ProviderKind.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum ProviderKind {
     /// A Linear issue reference; the launcher fetches Linear data caller-side.
     LinearIssue,
@@ -260,7 +279,16 @@ pub enum ProviderKind {
     GithubPr,
     /// No provider-derived branch/data; static action metadata is enough.
     None,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(ProviderKind);
 
 impl ProviderKind {
     /// Returns the stable wire string.
@@ -270,6 +298,7 @@ impl ProviderKind {
             Self::LinearIssue => "linear_issue",
             Self::GithubPr => "github_pr",
             Self::None => "none",
+            Self::Unknown => "unknown",
         }
     }
 }

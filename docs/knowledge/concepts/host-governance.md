@@ -40,7 +40,9 @@ A never-enrolled host reports `enrollment`, `owner`, `owner_revision`, and
 reference. An enrolled host has exactly one enrollment, exactly one tagged
 owner (`principal` or `team`), and non-zero canonical decimal enrollment and
 owner revisions. Co-ownership is not a state. Quarantine is present exactly
-when the enrollment is quarantined.
+when the enrollment is quarantined. A client of an older build reads a
+quarantine reason that a newer daemon adds as `unknown`; the daemon's own
+governance record stays strict and fails closed on a reason it does not know.
 
 The response intentionally excludes approval private material, proposal and
 outcome data, signatures, nonces, retired state, relay credentials, and all

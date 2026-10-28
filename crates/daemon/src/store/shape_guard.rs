@@ -673,7 +673,7 @@ macro_rules! unit_values {
                 $($($ty::$skipped => {})+)?
             }
         }
-        $($(assert_never_round_trips(&$ty::$skipped);)+)?
+        $($($crate::store::shape_guard::assert_never_round_trips(&$ty::$skipped);)+)?
         string_values(&listed, None)
     }};
 }
@@ -838,7 +838,7 @@ fn persisted_enums() -> Vec<EnumEntry> {
     );
     add(
         own("project.source"),
-        unit_values!(ProjectSource: Auto, Manual),
+        unit_values!(ProjectSource: Auto, Manual; skip Unknown),
     );
 
     add(

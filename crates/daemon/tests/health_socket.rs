@@ -5290,6 +5290,41 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
 }
 
 #[tokio::test]
+async fn notification_update_with_a_status_this_daemon_does_not_define_is_refused() {
+    // A client built against a newer protocol must get the typed refusal, never a
+    // status the daemon could store.
+    let socket = temp_socket("notification-unknown-status");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let created = create_notification(&mut control, notification_params(None)).await;
+
+    for (index, status) in ["a_status_from_a_newer_daemon", "unknown"]
+        .into_iter()
+        .enumerate()
+    {
+        let request_id = format!("notification-update-unknown-{index}");
+        let response = exchange(
+            &mut control,
+            &Request::make(
+                &request_id,
+                method::NOTIFICATION_UPDATE,
+                serde_json::json!({ "id": created.record.id.0, "status": status }),
+            ),
+        )
+        .await;
+        assert_eq!(response.id(), request_id);
+        assert_eq!(err_payload(response).code, "bad_request");
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn notification_create_enriches_live_session_context() {
     let socket = temp_socket("notification-session-context");
     let config = SessionRegistryConfig {
