@@ -973,3 +973,17 @@ directory and a closed stdin.
 
 `plugin inspect` lists a package's commands with their exposure, so an owner can
 review them after install.
+
+From a shell, `pohunek host command run <host> <package> <command>` makes the
+call on a named host (`local` or an overlay peer), with `--timeout-ms` and
+`--max-output-bytes` for the two caps and `--json` for the full reply. The CLI
+offers no way to pass an argument, environment variable, working directory or
+input. It prints the program's stdout verbatim and exits 0; each error class
+exits with a status of its own, so a script can branch without parsing text:
+40 `command_unsupported`, 41 `command_package_not_installed`, 42
+`command_not_selected`, 43 `command_package_disabled`, 44
+`command_not_declared`, 45 `command_not_exposed`, 46 `command_busy`, 47
+`command_failed`, 48 `command_timed_out`, 49 `command_output_too_large`, 50
+`command_output_not_utf8`, 51 `command_unavailable`. The program's own exit
+status or signal is in the `--json` error's `details.process_exit`, not in the
+exit status. Any other failure exits 1 and a usage error 2.

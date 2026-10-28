@@ -13,8 +13,13 @@
 //! `discover` share one core; they differ only in presentation.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
+use std::process::ExitCode;
 
-use protocol::{method, HostCapabilities, HostClass, HostGovernanceStatus, HostOwner, HostRecord};
+use protocol::{
+    method, CommandRunParams, HostCapabilities, HostClass, HostGovernanceStatus, HostOwner,
+    HostRecord,
+};
 
 use crate::client::Client;
 use crate::error::CliError;
@@ -96,6 +101,62 @@ pub(crate) async fn run_governance_inspect(
         print!("{}", render_governance_human(host, &status));
     }
     Ok(())
+}
+
+/// Run `host command run <host> <package> <command>`: one command the package
+/// declared, on the named host.
+///
+/// The request names only the package and the command and the two caps; the CLI
+/// has no way to hand the program an argument, a variable, a working directory
+/// or input. Success prints the program's stdout byte for byte (or the full
+/// reply under `--json`). A `command_*` error is rendered like any CLI error and
+/// ends the process with the status of its class; every other failure keeps the
+/// generic failure status.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the host cannot be resolved or reached, the reply
+/// cannot be decoded, or the daemon returns an error that is not a `command_*`
+/// error.
+pub(crate) async fn run_command(
+    host: &str,
+    params: CommandRunParams,
+    paths: &Paths,
+    json: bool,
+) -> Result<ExitCode, CliError> {
+    let mut client = Client::connect(host, paths).await?.into_sdk();
+    let result = match client.command_run(params).await {
+        Ok(result) => result,
+        Err(error) => {
+            let error = crate::client::map_client_error(error);
+            let Some(status) = command_error_status(&error) else {
+                return Err(error);
+            };
+            crate::error::render(&error, json);
+            return Ok(ExitCode::from(status));
+        }
+    };
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(result.output.as_bytes())?;
+        stdout.flush()?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The exit status of a `command_*` error, whether the local or a remote daemon
+/// returned it.
+fn command_error_status(error: &CliError) -> Option<u8> {
+    let (CliError::Protocol(protocol)
+    | CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+        source: protocol, ..
+    })) = error
+    else {
+        return None;
+    };
+    crate::error::command_exit_code(protocol)
 }
 
 /// Status label of this machine's own row.
