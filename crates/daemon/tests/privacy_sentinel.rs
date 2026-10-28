@@ -822,7 +822,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // Install the daemon's real JSON logging sink so this test scans the
     // exact structured-log path production uses (RFC §22/§23), not a stand-in.
     let log_guard =
-        pohunek_daemon::logging::init(&daemon_log_dir).expect("daemon logging initializes");
+        pohunek_daemon::logging::scoped(&daemon_log_dir).expect("daemon logging initializes");
 
     let socket_dir = temp_dir("privacy-sentinel-sock");
     let socket = socket_dir.path().join("daemon.sock");
@@ -1006,6 +1006,10 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
 
     let store_bytes = std::fs::read(&store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&daemon_log_dir);
+    assert!(
+        !daemon_log_bytes.is_empty(),
+        "the scoped sink captured no daemon log, so the scan would pass vacuously"
+    );
 
     let artifacts: [(&str, &[u8]); 5] = [
         ("logical store", &store_bytes),
@@ -1225,7 +1229,7 @@ fn assert_error_free_of_secret(response: Response, code: &str) {
 async fn session_secret_env_reaches_only_the_agent_process() {
     let host = SecretEnvHost::new("secret-env-sentinel");
     let log_guard =
-        pohunek_daemon::logging::init(&host.daemon_log_dir).expect("daemon logging initializes");
+        pohunek_daemon::logging::scoped(&host.daemon_log_dir).expect("daemon logging initializes");
     let socket = host.socket();
     let (shutdown, handle, worker_home) =
         spawn_worker_backed_server(&socket, "0.0.0", host.config()).await;
@@ -1429,6 +1433,10 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     let worker_home_bytes = collect_dir_bytes(worker_home.path());
     let store_bytes = std::fs::read(&host.store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&host.daemon_log_dir);
+    assert!(
+        !daemon_log_bytes.is_empty(),
+        "the scoped sink captured no daemon log, so the scan would pass vacuously"
+    );
 
     let artifacts: [(&str, &[u8]); 8] = [
         ("logical store", &store_bytes),
