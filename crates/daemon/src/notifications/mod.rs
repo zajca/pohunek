@@ -1359,13 +1359,12 @@ fn is_secret_metadata_key(normalized: &str) -> bool {
 fn apply_status(record: &mut NotificationRecord, status: NotificationStatus, now: &str) {
     record.status = status;
     match status {
-        NotificationStatus::Unread => {}
+        // `is_valid_status_transition` rejects `Unknown` before a status is applied.
+        NotificationStatus::Unread | NotificationStatus::Unknown => {}
         NotificationStatus::Read => record.read_at = Some(now.to_owned()),
         NotificationStatus::Acknowledged => record.acked_at = Some(now.to_owned()),
         NotificationStatus::Archived => record.archived_at = Some(now.to_owned()),
         NotificationStatus::Deleted => record.deleted_at = Some(now.to_owned()),
-        // Rejected by `is_valid_status_transition` before a status is applied.
-        NotificationStatus::Unknown => {}
     }
 }
 

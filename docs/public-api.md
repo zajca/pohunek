@@ -3301,8 +3301,8 @@ Important fields:
 - `severity`: `info`, `success`, `warning`, `error`, or `action_required`.
 - `status`: `unread`, `read`, `acknowledged`, `archived`, or `deleted`.
   A `severity` or `status` a newer daemon defines reads as `unknown` on the Rust
-  client and the CLI, so one such record no longer ends `notifications watch`;
-  an `unknown` status matches neither `--unread` nor `--status`. The daemon never
+  client and the CLI, so `notifications watch` keeps streaming past such a
+  record; an `unknown` status matches neither `--unread` nor `--status`. The daemon never
   emits `unknown`, rejects it in params and in its notification store, and the
   hidden variant is not in the TypeScript types.
 - `title` / `body`: bounded, sanitized user-facing text. Notification payloads

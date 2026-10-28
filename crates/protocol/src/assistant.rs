@@ -51,8 +51,7 @@ pub struct ConceptMeta {
     pub title: String,
     /// Short concept description.
     pub description: String,
-    /// Assistant intents this concept can support. Intents this build does not
-    /// know are dropped by the client's tolerant decode.
+    /// Assistant intents this concept can support.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
