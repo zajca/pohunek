@@ -731,6 +731,21 @@ pub(crate) fn hermes_error_code(error: &crate::hermes_integration::error::Error)
 /// [`render`] writes it to stderr.
 pub(crate) fn human_error_text(err: &CliError) -> String {
     let mut text = format!("pohunek: {err}\n");
+    if let Some(exit) = err
+        .to_protocol_error()
+        .details
+        .and_then(|details| details.process_exit)
+    {
+        match (exit.exit_code, exit.signal) {
+            (Some(code), _) => {
+                let _ = writeln!(text, "the program exited with status {code}");
+            }
+            (None, Some(signal)) => {
+                let _ = writeln!(text, "the program was ended by signal {signal}");
+            }
+            (None, None) => {}
+        }
+    }
     if let Some(hint) = err.recover_hint() {
         let _ = writeln!(text, "hint: {hint}");
     }
@@ -781,6 +796,68 @@ fn print_json_error(err: &ProtocolError) {
 /// Mirrors clap's own usage exit status (`2`) so that toggling `--json` changes
 /// only the output *format*, never the exit code a script observes.
 const CLI_USAGE_EXIT_CODE: u8 = 2;
+
+/// Process exit statuses of `pohunek host command run`, one per `command_*`
+/// error class.
+///
+/// The block 40..=51 is distinct from the generic failure (`1`), the usage error
+/// (`2`) and the workflow limits (`124`/`125`). A status never carries the
+/// program's own exit code: that travels in the `--json` error's
+/// `details.process_exit`.
+pub(crate) mod command_exit {
+    /// The daemon does not implement `command.run`.
+    pub(crate) const UNSUPPORTED: u8 = 40;
+    /// No version of the package is installed.
+    pub(crate) const PACKAGE_NOT_INSTALLED: u8 = 41;
+    /// Versions are installed but none is selected.
+    pub(crate) const NOT_SELECTED: u8 = 42;
+    /// The selected version is disabled.
+    pub(crate) const PACKAGE_DISABLED: u8 = 43;
+    /// The selected version declares no command of that name.
+    pub(crate) const NOT_DECLARED: u8 = 44;
+    /// The command is not callable over the overlay.
+    pub(crate) const NOT_EXPOSED: u8 = 45;
+    /// The command already runs, or the host-wide limit is reached.
+    pub(crate) const BUSY: u8 = 46;
+    /// The program exited non-zero or was ended by a signal.
+    pub(crate) const FAILED: u8 = 47;
+    /// The deadline passed.
+    pub(crate) const TIMED_OUT: u8 = 48;
+    /// Stdout exceeded the cap.
+    pub(crate) const OUTPUT_TOO_LARGE: u8 = 49;
+    /// Stdout is not valid UTF-8.
+    pub(crate) const OUTPUT_NOT_UTF8: u8 = 50;
+    /// The command could not be run on the host.
+    pub(crate) const UNAVAILABLE: u8 = 51;
+}
+
+/// The exit status of a `command.run` error, or `None` for any other error.
+///
+/// Every [`protocol::CommandErrorKind`] has a status; a kind added later falls
+/// back to the generic failure until it gets one.
+pub(crate) fn command_exit_code(error: &ProtocolError) -> Option<u8> {
+    use protocol::CommandErrorKind as Kind;
+    let table = [
+        (Kind::Unsupported, command_exit::UNSUPPORTED),
+        (
+            Kind::PackageNotInstalled,
+            command_exit::PACKAGE_NOT_INSTALLED,
+        ),
+        (Kind::NotSelected, command_exit::NOT_SELECTED),
+        (Kind::PackageDisabled, command_exit::PACKAGE_DISABLED),
+        (Kind::NotDeclared, command_exit::NOT_DECLARED),
+        (Kind::NotExposed, command_exit::NOT_EXPOSED),
+        (Kind::Busy, command_exit::BUSY),
+        (Kind::Failed, command_exit::FAILED),
+        (Kind::TimedOut, command_exit::TIMED_OUT),
+        (Kind::OutputTooLarge, command_exit::OUTPUT_TOO_LARGE),
+        (Kind::OutputNotUtf8, command_exit::OUTPUT_NOT_UTF8),
+        (Kind::Unavailable, command_exit::UNAVAILABLE),
+    ];
+    table
+        .into_iter()
+        .find_map(|(kind, status)| (kind.code() == error.code).then_some(status))
+}
 
 /// Whether a raw argv requested `--json`.
 ///

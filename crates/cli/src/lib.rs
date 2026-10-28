@@ -497,6 +497,45 @@ enum HostAction {
         #[command(subcommand)]
         action: HostGovernanceAction,
     },
+
+    /// Run commands that installed runtime packages declare on one host.
+    Command {
+        #[command(subcommand)]
+        action: HostCommandAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HostCommandAction {
+    /// Run one command a package declared, once, and print its stdout.
+    ///
+    /// The program and its arguments are fixed by the package descriptor the
+    /// owner consented to at install; the call carries no argument, environment
+    /// variable, working directory or input. Exit statuses: 0 success; 40
+    /// daemon without package commands; 41 package not installed; 42 no version
+    /// selected; 43 package disabled; 44 command not declared; 45 command not
+    /// callable over the overlay; 46 busy; 47 program failed; 48 timed out; 49
+    /// output too large; 50 output not UTF-8; 51 unavailable; 1 any other
+    /// failure.
+    Run {
+        /// Host name to run on (an overlay peer name, or `local`).
+        host: String,
+        /// Package that declares the command, e.g. `acme.fleet-state`.
+        package: protocol::PackageId,
+        /// Command name from the package descriptor.
+        command: protocol::CommandName,
+        /// Wall-clock limit in milliseconds; the daemon lowers a larger value
+        /// to its maximum (60000). Defaults to that maximum.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        timeout_ms: Option<u32>,
+        /// Largest stdout in bytes; the daemon lowers a larger value to its
+        /// maximum. Defaults to that maximum.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        max_output_bytes: Option<u32>,
+        /// Emit the full reply, or the typed error with its details, as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1720,7 +1759,10 @@ impl HostAction {
         match self {
             HostAction::Discover { json, .. }
             | HostAction::List { json, .. }
-            | HostAction::Inspect { json, .. } => *json,
+            | HostAction::Inspect { json, .. }
+            | HostAction::Command {
+                action: HostCommandAction::Run { json, .. },
+            } => *json,
             HostAction::Governance { action } => action.wants_json(),
         }
     }
@@ -2635,6 +2677,26 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 commands::host::run_governance_inspect(&host, &paths, json).await?;
                 Ok(ExitCode::SUCCESS)
             }
+            HostAction::Command {
+                action:
+                    HostCommandAction::Run {
+                        host,
+                        package,
+                        command,
+                        timeout_ms,
+                        max_output_bytes,
+                        json,
+                    },
+            } => {
+                let paths = Paths::resolve()?;
+                let params = protocol::CommandRunParams {
+                    package,
+                    command,
+                    timeout_ms,
+                    max_output_bytes,
+                };
+                commands::host::run_command(&host, params, &paths, json).await
+            }
         },
         Commands::Notifications { action } => {
             let paths = Paths::resolve()?;
@@ -2960,6 +3022,9 @@ fn command_line_hosts(cli: &Cli) -> Vec<&str> {
                 HostAction::Inspect { host, .. }
                 | HostAction::Governance {
                     action: HostGovernanceAction::Inspect { host, .. },
+                }
+                | HostAction::Command {
+                    action: HostCommandAction::Run { host, .. },
                 },
         } => vec![host.as_str()],
         Commands::Attach { target } => vec![target_host(target, global)],
