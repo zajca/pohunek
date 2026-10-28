@@ -278,6 +278,10 @@ pub enum PackageTrust {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageInstallParams.ts"))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire parameters: each flag is an independent request option"
+)]
 pub struct PackageInstallParams {
     /// Absolute path of the package archive on the daemon host.
     pub archive_path: String,
@@ -934,6 +938,7 @@ mod tests {
             PackageErrorKind::ProfileChanged,
             PackageErrorKind::IntegrationIncompatible,
             PackageErrorKind::RuntimeFeatureUnsupported,
+            PackageErrorKind::CommandsClientUnsupported,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

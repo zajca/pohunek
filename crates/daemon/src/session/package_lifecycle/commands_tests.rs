@@ -16,7 +16,7 @@ use protocol::{
 
 use super::test_fixture::{
     commands_document, explicit, Fixture, Package, COMMANDS_PACKAGE, COMMAND_PROGRAM,
-    HOST_STATE_COMMAND, PACKAGE, PLAIN_FILE, RUNTIME,
+    HOST_STATE_COMMAND, INERT_PROGRAM, PACKAGE, PLAIN_FILE, RUNTIME,
 };
 use crate::session::tests::{assigned_agent_script, params, temp_dir};
 
@@ -465,12 +465,13 @@ async fn a_request_without_the_opt_in_is_refused_for_every_package_that_declares
         commands_document("means.linked", "1.0.0", true, HOST_STATE_COMMAND),
     )
     .expect("write the descriptor");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let program = directory.join(LINK_PROGRAM);
-        fs::write(&program, b"#!/bin/sh\n").expect("write the program");
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("set the mode");
-    }
+    let program = directory.join(LINK_PROGRAM);
+    fs::write(&program, b"#!/bin/sh\n").expect("write the program");
+    fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("set the mode");
     let before = fixture.snapshot();
     let refusal = fixture
         .registry
@@ -519,4 +520,23 @@ async fn a_catalog_cannot_authorize_a_package_that_exports_commands_only() {
         None,
         "the watermark is unchanged"
     );
+
+    // An official runtime package that also declares commands is refused too:
+    // the release install paths have no consent step that shows a command.
+    let both =
+        Package::build_with_commands(PACKAGE, "1.0.0", RUNTIME, INERT_PROGRAM, HOST_STATE_COMMAND);
+    let document = signed_by(
+        &key,
+        catalog(8, vec![entry(&both, PACKAGE, RUNTIME, "1.0.0")]),
+    );
+    let refusal = fixture
+        .registry
+        .package_install(protocol::PackageInstallParams {
+            accept_commands: true,
+            ..catalog_install(&fixture, &both, &document, false)
+        })
+        .await
+        .expect_err("an official package may not declare commands yet");
+    assert_eq!(refusal, PackageErrorKind::Untrusted);
+    assert_eq!(state(&fixture).high_water(), None);
 }

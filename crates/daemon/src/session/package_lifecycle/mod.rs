@@ -991,6 +991,13 @@ fn prepare_official(
         );
         return Err(PackageErrorKind::Untrusted);
     };
+    // The release install paths (`ensure`, `setup host`) have no consent step
+    // that shows a command, so an official package declaring commands is not
+    // installable until they do.
+    if !commands.is_empty() {
+        warn!("an official package that declares commands was refused: no consent step shows them");
+        return Err(PackageErrorKind::Untrusted);
+    }
     trust::authorize_official(
         &verified,
         &identity,

@@ -548,7 +548,8 @@ expose = "peers"              # "local" (default) or "peers"
   digest and the owner consents to a changed exposure again at install.
 - A catalog (`--catalog`) authorizes a package for the runtime it serves, so a
   package that exports commands only is refused with `package_untrusted` and
-  installs with `--sha256` or `link`.
+  installs with `--sha256` or `link`. An official package may not declare
+  commands yet.
 - The daemon refuses a package that declares commands unless the request opts
   in (`accept_commands`), with `package_commands_client_unsupported`, so a
   client that cannot show a command for consent never installs one unseen. The
