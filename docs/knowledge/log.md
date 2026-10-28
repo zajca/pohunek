@@ -5,6 +5,19 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.38.1
+
+### 2026-10-28, host command run CLI, #1690
+
+- `pohunek host command run <host> <package> <command> [--timeout-ms <MS>] [--max-output-bytes <N>] [--json]` calls `command.run` on a named host. It prints the program's stdout verbatim (or the full reply with `--json`) and exits 0; each `command_*` error exits with its own status (40 to 51), and the CLI offers no argument, environment, working-directory or input option. See [Runtime Packages](guides/runtime-packages.md#calling-a-command).
+
+### 2026-10-28, package commands run, #1690
+
+- `command.run` runs a command an installed package declared in `[commands.<name>]`: `{package, command, timeout_ms?, max_output_bytes?}` returns the program's stdout, verbatim UTF-8, with the package identity and digest. A call carries no argument, environment, working directory or input; the program is a file of the re-verified package root and runs with a cleared environment, a private scratch directory and a closed stdin. Limits: 60 s, 128 KiB, one run per command and four per host, no queue. The local socket may call every declared command; an overlay peer only a `peers` command. See [Runtime Packages](guides/runtime-packages.md#calling-a-command).
+- Errors are `command_*` codes with fixed text; `command_failed` alone carries the new `details` object (`process_exit.exit_code` or `signal`). A client of an older daemon reports `command_unsupported`.
+- `package.inspect` and `plugin inspect` list a package's commands, and carry an explicit `commands_only` marker for a package that exports commands only.
+- The TypeScript SDK has `runCommand` (a dedicated connection, `ClientError.details`, `command_unsupported`) and sends `accept_commands` on `package.install` and `package.link` only to a daemon that reports `package_install_commands_supported`, else `package_install_commands_unsupported` (see [TypeScript SDK](guides/ts-sdk.md#package-commands)). The testkit fixture daemon serves `command.run` through its `commands` option.
+
 ## 0.38.0
 
 ### 2026-10-28, package commands descriptor, #1690
