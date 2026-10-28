@@ -283,8 +283,16 @@ export class Client {
     // The request is copied before the first await: the caller keeps ownership
     // of its parameters and may change them once this call has returned a promise.
     const request = snapshotRequest(applyRequestOrigin(req, this.options.origin));
+    this.refuseSessionNewSecretEnvOverRelay(request);
     const connection = await this.usableConnection();
     return this.negotiateAndExchange(connection, request);
+  }
+
+  /** Applies the relay refusal to a prepared `session.new` request. */
+  private refuseSessionNewSecretEnvOverRelay(request: Request): void {
+    if (request.method === "session.new") {
+      this.refuseSecretEnvOverRelay(request.params);
+    }
   }
 
   /**
@@ -521,6 +529,7 @@ export class Client {
   public async subscribe(request: Request): Promise<Subscription> {
     this.ensureOpen();
     const prepared = snapshotRequest(applyRequestOrigin(request, this.options.origin));
+    this.refuseSessionNewSecretEnvOverRelay(prepared);
     const connection = await this.usableConnection();
     try {
       await this.negotiateAndExchange(connection, prepared);

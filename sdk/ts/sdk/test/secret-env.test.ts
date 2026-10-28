@@ -3,13 +3,14 @@ import { PROTOCOL_VERSION, type HostCapabilities, type SessionNewParams } from "
 import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import { createFixtureRootSync, startFixtureDaemon, type FixtureDaemonHandle } from "@pohunek/testkit";
 import { rmSync } from "node:fs";
-import { Client, ClientError, CompatError, connectLocal, connectTcp, downgradeRequestParams } from "@pohunek/sdk";
+import { Client, ClientError, CompatError, type ControlChannel, type Transport, connectLocal, connectTcp, downgradeRequestParams } from "@pohunek/sdk";
 import {
   errResponseLine,
   minimalSessionInfo,
   okResponseLine,
   parseRequestLine,
   requestIdFromLine,
+  startMemoryDaemon,
   startTcpDaemon,
   startUnixDaemon,
   type MockDaemon,
@@ -305,7 +306,61 @@ describe("session.new secret_env over the relay transport", () => {
   });
 });
 
+describe("session.new secret_env over a relayed transport with a poisoned connection", () => {
+  test("is refused without opening a replacement connection", async () => {
+    const inner = startMemoryDaemon([{ kind: "silent" }]);
+    if (inner.endpoint.kind !== "memory") {
+      throw new Error("the memory daemon must expose a memory endpoint");
+    }
+    const wrapped = inner.endpoint.transport;
+    let controls = 0;
+    const relayed: Transport = {
+      relayed: true,
+      control: (): Promise<ControlChannel> => {
+        controls += 1;
+        return wrapped.control();
+      },
+      raw: () => wrapped.raw(),
+    };
+    // timing-allowed: #1691 a short request deadline poisons the shared connection
+    const client = track(await Client.connectTransport(relayed, { requestTimeoutMs: 20 }, RELAY_HOST));
+    const timedOut = await rejection(client.call("daemon.health", null));
+    expect(timedOut.kind).toBe("requestTimeout");
+    expect(controls).toBe(1);
+
+    const request = {
+      v: { minimum: PROTOCOL_VERSION, maximum: PROTOCOL_VERSION },
+      id: "poisoned-1",
+      method: "session.new",
+      params: newParams(),
+    };
+    expect((await rejection(client.request(request))).kind).toBe("sessionNewSecretEnvRelayRefused");
+    expect((await rejection(client.subscribe(request).then(() => undefined))).kind)
+      .toBe("sessionNewSecretEnvRelayRefused");
+    expect(controls).toBe(1);
+  });
+});
+
 describe("session.new secret_env against the previous protocol", () => {
+  test("a protocol 3 daemon gets the distinct refusal and no session.new", async () => {
+    const daemon = track(await startTcpDaemon([{
+      kind: "gate",
+      ready: Promise.resolve(),
+      line: (line) => JSON.stringify({
+        v: 3,
+        id: requestIdFromLine(line),
+        ok: { daemon_version: "0.37.0", protocol_version: 3, supported_agents: [], runtimes: [], git_available: true },
+      }),
+    }]));
+    const client = await connect(daemon);
+    const error = await rejection(client.call("session.new", newParams()));
+    expect(error.kind).toBe("sessionNewSecretEnvUnsupported");
+    expect(error.code).toBe("session_new_secret_env_unsupported");
+    expect((await methodsSeen(daemon, 1)).map((request) => request["method"])).toEqual(["host.inspect"]);
+    await daemon.expectNoRequest(SETTLE_MS);
+    await client.close();
+  });
+
   test("the version adapter refuses the field instead of dropping it", () => {
     expect(() => downgradeRequestParams(3, "session.new", newParams())).toThrow(CompatError);
     const plain = { agent: "codex", cols: 80, rows: 24 };
