@@ -654,6 +654,21 @@ fn create_dated_session_dirs(tree: &Path, days: &[&str]) {
     }
 }
 
+/// Creates subagent directories below the newest sessions of `day`: registered
+/// under the session watches they would exhaust the backend-wide budget, and
+/// the parser reads nothing there.
+fn create_subagent_dirs(tree: &Path, day: &str) {
+    for number in SESSIONS_PER_DAY - NEWEST_WITH_SUBAGENTS..SESSIONS_PER_DAY {
+        for subagent in 0..SUBAGENTS_PER_SESSION {
+            let dir = tree
+                .join(day)
+                .join(session_name(number))
+                .join(format!("subagents/s{subagent}"));
+            fs::create_dir_all(dir).expect("subagent dir");
+        }
+    }
+}
+
 /// A dated tree whose descriptor declares a `max_depth` that would reach the
 /// subagent directories: the walk and the share of session watches follow the
 /// parser, never the larger bound.
@@ -673,6 +688,7 @@ async fn a_pass_over_a_dated_tree_larger_than_its_bound_leaves_the_older_day() {
     let dated = base.path().join("muse/sessions");
     let (old_day, new_day) = ("2026/09/01", "2026/10/09");
     create_dated_session_dirs(&dated, &[new_day, old_day]);
+    create_subagent_dirs(&dated, new_day);
     // The lowest session of each day has a log. The pass visits the highest
     // names first and stops at its directory bound inside the older day, so
     // only the newest day's is indexed.
@@ -699,18 +715,7 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
     // in reverse creation order would not meet it first by luck.
     let (old_day, new_day) = ("2026/09/01", "2026/10/09");
     create_dated_session_dirs(&dated, &[new_day, old_day]);
-    // Subagent directories below the newest sessions: registered under the
-    // session watches they would exhaust the backend-wide budget, and the
-    // parser reads nothing there.
-    for number in SESSIONS_PER_DAY - NEWEST_WITH_SUBAGENTS..SESSIONS_PER_DAY {
-        for subagent in 0..SUBAGENTS_PER_SESSION {
-            let dir = dated
-                .join(new_day)
-                .join(session_name(number))
-                .join(format!("subagents/s{subagent}"));
-            fs::create_dir_all(dir).expect("subagent dir");
-        }
-    }
+    create_subagent_dirs(&dated, new_day);
     // The lowest session of the newest day has a log from the start. A log
     // written into the older day before the watcher starts could be reported
     // as a live event, which indexes it regardless of the pass's bound, so the
