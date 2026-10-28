@@ -928,9 +928,10 @@ async fn a_package_file_modified_after_install_is_not_run() {
 
 #[tokio::test]
 async fn daemon_shutdown_stops_a_run_and_refuses_new_ones() {
+    let captured = captured_log();
     let servers = spawn_servers("cmd-shutdown").await;
     let mut local = connect_unix(&servers.socket).await;
-    install_fixture(&mut local, &servers).await;
+    let digest = install_fixture(&mut local, &servers).await;
     make_fifos(&servers.work, "hold");
 
     let socket = servers.socket.clone();
@@ -946,6 +947,19 @@ async fn daemon_shutdown_stops_a_run_and_refuses_new_ones() {
     servers.state.package_commands.shutdown().await;
     assert_gone(pid, "the program").await;
     assert_gone(child, "its background child").await;
+
+    // The run that shutdown killed leaves its audit line.
+    let log = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("package command run") && line.contains(&digest.to_string()))
+        .collect();
+    assert_eq!(lines.len(), 1, "one line for the killed run: {log}");
+    assert!(
+        lines[0].contains("outcome=\"command_unavailable\""),
+        "{}",
+        lines[0]
+    );
 
     let refused = expect_code(&mut local, PACKAGE, "ok", json!({})).await;
     assert_eq!(refused.code, "command_unavailable");
