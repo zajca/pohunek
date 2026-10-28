@@ -1047,6 +1047,11 @@ fn a_failing_bind_reports_partial_stderr_while_a_git_grandchild_holds_output() {
 fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
     use std::os::unix::fs::PermissionsExt;
 
+    // A fork on a sibling test's thread copies the bind's pipe ends until it execs, so
+    // the grandchild would see the pipe still open. A process of its own has no sibling.
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let repo = init_repo("bounded-native-hook");
     let state = unique_dir("bounded-native-hook-state");
     let started = state.join("started");
