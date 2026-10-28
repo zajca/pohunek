@@ -93,4 +93,14 @@ export type HostCapabilities = {
    * Omitted when `false`, like [`Self::session_wait_turn_supported`].
    */
   session_idle_stop_supported?: boolean;
+  /**
+   * Whether `package.install` and `package.link` accept `accept_commands`
+   * and install packages that declare commands.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; its
+   * params are strict and would reject `accept_commands`, so a client sends
+   * the field only when this is `true`. `false` is likewise omitted on the
+   * wire.
+   */
+  package_install_commands_supported?: boolean;
 };

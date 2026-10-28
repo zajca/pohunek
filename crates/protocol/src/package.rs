@@ -289,6 +289,14 @@ pub struct PackageInstallParams {
     pub select: bool,
     /// Validate and report without changing anything.
     pub dry_run: bool,
+    /// The client renders the package's exported commands for consent. The
+    /// daemon refuses an archive whose descriptor declares commands when this
+    /// is absent, so a client that cannot show a command's program, arguments
+    /// and exposure never installs one unseen. Clients send it only to a host
+    /// that advertises `HostCapabilities::package_install_commands_supported`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub accept_commands: bool,
 }
 
 /// Parameters for `package.link`.
@@ -303,6 +311,10 @@ pub struct PackageLinkParams {
     pub directory: String,
     /// Validate and report without changing anything.
     pub dry_run: bool,
+    /// Same opt-in as [`PackageInstallParams::accept_commands`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub accept_commands: bool,
 }
 
 /// What an install did to the registry.
@@ -643,6 +655,10 @@ pub enum PackageErrorKind {
     /// The descriptor requires a runtime feature this core does not implement,
     /// or uses a key or compiled id of a feature it does not require.
     RuntimeFeatureUnsupported,
+    /// The descriptor declares commands and the request did not opt in with
+    /// `accept_commands`, so the client may not be able to show them for
+    /// consent.
+    CommandsClientUnsupported,
 }
 
 impl PackageErrorKind {
@@ -678,6 +694,7 @@ impl PackageErrorKind {
             Self::ProfileChanged => "package_profile_changed",
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
+            Self::CommandsClientUnsupported => "package_commands_client_unsupported",
         }
     }
 
@@ -737,6 +754,9 @@ impl PackageErrorKind {
             Self::RuntimeFeatureUnsupported => {
                 "the package descriptor requires a runtime feature this core does not support, or uses one without requiring it"
             }
+            Self::CommandsClientUnsupported => {
+                "the package exports commands and this client did not opt in to reviewing them"
+            }
         }
     }
 
@@ -783,6 +803,9 @@ impl PackageErrorKind {
             }
             Self::RuntimeFeatureUnsupported => {
                 "upgrade pohunek to a release that implements the feature, or list every feature the descriptor uses in `requires`"
+            }
+            Self::CommandsClientUnsupported => {
+                "upgrade the pohunek CLI or SDK to a release that shows package commands for consent"
             }
         }
     }

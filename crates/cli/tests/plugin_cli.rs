@@ -190,10 +190,31 @@ fn runtime() -> Value {
     })
 }
 
+/// The host capabilities a scripted daemon reports, with or without the
+/// package commands opt-in.
+fn capabilities(commands: bool) -> Value {
+    let mut value = json!({
+        "daemon_version": "0.38.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_agents": ["shell"],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "terminal_read_supported": false,
+        "output_read_supported": false,
+        "session_wait_supported": false
+    });
+    if commands {
+        value["package_install_commands_supported"] = json!(true);
+    }
+    value
+}
+
 /// A daemon with no packages installed; every install validates and succeeds.
 fn empty_daemon(method: &str, params: &Value) -> Value {
     match method {
         "package.list" => json!({ "generation": 1, "packages": [] }),
+        "host.inspect" => capabilities(true),
         "package.install" | "package.link" => json!({
             "status": if params["dry_run"] == true { "preview" } else { "installed" },
             "package": package("acme.pi", "1.0.0", DIGEST_NEW, true),
@@ -350,8 +371,11 @@ fn install_without_yes_previews_and_never_sends_the_install() {
     );
     assert!(stderr.contains("--yes"), "{stderr}");
     let recorded = daemon.finish();
-    assert_eq!(methods(&recorded), ["package.list", "package.install"]);
-    assert_eq!(recorded[1].1["dry_run"], true);
+    assert_eq!(
+        methods(&recorded),
+        ["package.list", "host.inspect", "package.install"]
+    );
+    assert_eq!(recorded[2].1["dry_run"], true);
 }
 
 #[test]
@@ -378,7 +402,7 @@ fn json_without_yes_reports_consent_required_as_the_only_document() {
         .contains("acme.pi 1.0.0"));
     assert_eq!(
         methods(&daemon.finish()),
-        ["package.list", "package.install"]
+        ["package.list", "host.inspect", "package.install"]
     );
 }
 
@@ -403,10 +427,15 @@ fn install_with_yes_sends_exactly_a_dry_run_then_the_install() {
     let recorded = daemon.finish();
     assert_eq!(
         methods(&recorded),
-        ["package.list", "package.install", "package.install"]
+        [
+            "package.list",
+            "host.inspect",
+            "package.install",
+            "package.install"
+        ]
     );
     let canonical = fs::canonicalize(&archive).expect("canonical archive");
-    for (index, dry_run) in [(1, true), (2, false)] {
+    for (index, dry_run) in [(2, true), (3, false)] {
         let params = &recorded[index].1;
         assert_eq!(params["dry_run"], dry_run);
         assert_eq!(
@@ -420,7 +449,49 @@ fn install_with_yes_sends_exactly_a_dry_run_then_the_install() {
         assert_eq!(params["enable"], true);
     }
     // First version of the id: it becomes the selected one.
-    assert_eq!(recorded[2].1["select"], true);
+    assert_eq!(recorded[3].1["select"], true);
+}
+
+/// A daemon that does not advertise the package commands opt-in.
+fn daemon_without_commands(method: &str, params: &Value) -> Value {
+    match method {
+        "host.inspect" => capabilities(false),
+        other => empty_daemon(other, params),
+    }
+}
+
+#[test]
+fn the_commands_opt_in_is_sent_only_to_a_host_that_advertises_it() {
+    for (reply, expected) in [
+        (empty_daemon as fn(&str, &Value) -> Value, Some(true)),
+        (daemon_without_commands, None),
+    ] {
+        let fixture = Fixture::new();
+        let archive = fixture.file("pi.tar");
+        let daemon = fixture.serve(reply);
+        let output = fixture.run(&[
+            "plugin",
+            "install",
+            archive.to_str().expect("utf-8 path"),
+            "--sha256",
+            DIGEST_NEW,
+            "--yes",
+            "--json",
+        ]);
+        assert!(output.status.success(), "{}", stderr_text(&output));
+        let recorded = daemon.finish();
+        for index in [2, 3] {
+            assert_eq!(
+                recorded[index]
+                    .1
+                    .get("accept_commands")
+                    .and_then(Value::as_bool),
+                expected,
+                "{:?}",
+                recorded[index]
+            );
+        }
+    }
 }
 
 #[test]
@@ -466,7 +537,7 @@ fn catalog_trust_is_sent_as_an_absolute_catalog_path() {
     assert!(output.status.success(), "{}", stderr_text(&output));
     let recorded = daemon.finish();
     assert_eq!(
-        recorded[1].1["trust"],
+        recorded[2].1["trust"],
         json!({
             "kind": "catalog",
             "catalog_path": fs::canonicalize(&catalog).expect("canonical").to_str().expect("utf-8 path")
@@ -484,7 +555,10 @@ fn link_follows_the_consent_pattern() {
     let daemon = fixture.serve(empty_daemon);
     let output = fixture.run(&["plugin", "link", directory]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(methods(&daemon.finish()), ["package.list", "package.link"]);
+    assert_eq!(
+        methods(&daemon.finish()),
+        ["package.list", "host.inspect", "package.link"]
+    );
     fs::remove_file(fixture.socket()).expect("remove socket");
 
     let daemon = fixture.serve(empty_daemon);
@@ -493,10 +567,15 @@ fn link_follows_the_consent_pattern() {
     let recorded = daemon.finish();
     assert_eq!(
         methods(&recorded),
-        ["package.list", "package.link", "package.link"]
+        [
+            "package.list",
+            "host.inspect",
+            "package.link",
+            "package.link"
+        ]
     );
-    assert_eq!(recorded[1].1["dry_run"], true);
-    assert_eq!(recorded[2].1["dry_run"], false);
+    assert_eq!(recorded[2].1["dry_run"], true);
+    assert_eq!(recorded[3].1["dry_run"], false);
     assert_eq!(
         recorded[2].1["directory"],
         fs::canonicalize(directory)
@@ -526,9 +605,14 @@ fn update_installs_side_by_side_selected_and_enabled() {
     let recorded = daemon.finish();
     assert_eq!(
         methods(&recorded),
-        ["package.list", "package.install", "package.install"]
+        [
+            "package.list",
+            "host.inspect",
+            "package.install",
+            "package.install"
+        ]
     );
-    let install = &recorded[2].1;
+    let install = &recorded[3].1;
     assert_eq!(install["enable"], true);
     assert_eq!(install["select"], true);
     assert_eq!(install["dry_run"], false);
@@ -573,8 +657,11 @@ fn update_requires_the_id_to_be_installed_and_the_archive_to_match_it() {
         "plugin_update_id_mismatch"
     );
     let recorded = daemon.finish();
-    assert_eq!(methods(&recorded), ["package.list", "package.install"]);
-    assert_eq!(recorded[1].1["dry_run"], true);
+    assert_eq!(
+        methods(&recorded),
+        ["package.list", "host.inspect", "package.install"]
+    );
+    assert_eq!(recorded[2].1["dry_run"], true);
 }
 
 #[test]

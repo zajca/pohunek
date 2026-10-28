@@ -344,6 +344,7 @@ impl SessionRegistry {
     ) -> Result<PackageInstallResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
             let candidate = prepare_archive(context, &params.archive_path, &params.trust)?;
+            require_commands_opt_in(&candidate, params.accept_commands)?;
             let plan = InstallPlan {
                 enable: params.enable,
                 select: params.select,
@@ -368,6 +369,7 @@ impl SessionRegistry {
     ) -> Result<PackageInstallResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
             let candidate = prepare_directory(&params.directory)?;
+            require_commands_opt_in(&candidate, params.accept_commands)?;
             let plan = InstallPlan {
                 enable: false,
                 select: false,
@@ -876,6 +878,24 @@ fn reload_and_describe(
     })
 }
 
+/// Refuses a package that declares commands unless the request opted in.
+///
+/// A client that does not send `accept_commands` cannot show a command's
+/// program, arguments and exposure for consent, and an older client drops the
+/// `commands` of the result without a trace. The check runs on the validated
+/// archive before any write, so a dry run is refused too.
+fn require_commands_opt_in(candidate: &Candidate, accept: bool) -> Result<(), PackageErrorKind> {
+    let declares = match candidate {
+        Candidate::Runtime(prepared) => !prepared.commands.is_empty(),
+        Candidate::Commands(_) => true,
+    };
+    if declares && !accept {
+        warn!("a package that declares commands was refused: the request did not opt in");
+        return Err(PackageErrorKind::CommandsClientUnsupported);
+    }
+    Ok(())
+}
+
 /// Verifies and authorizes an archive file under `trust` without writing.
 ///
 /// The raw archive digest is authorized before the archive is decompressed,
@@ -965,7 +985,12 @@ fn prepare_official(
     let (definition, commands) = descriptor.into_parts();
     // The catalog authorizes a package for the runtime it serves, so a package
     // that exports commands only cannot be catalog-authorized.
-    let definition = definition.ok_or(PackageErrorKind::DescriptorInvalid)?;
+    let Some(definition) = definition else {
+        warn!(
+            "a package that exports commands only was refused: a catalog entry binds a runtime id"
+        );
+        return Err(PackageErrorKind::Untrusted);
+    };
     trust::authorize_official(
         &verified,
         &identity,

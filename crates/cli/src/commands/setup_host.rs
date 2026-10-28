@@ -1119,6 +1119,7 @@ async fn apply_remaining(
                 enable: true,
                 select: true,
                 dry_run: false,
+                accept_commands: false,
             })
             .await?;
         applied.push(format!(

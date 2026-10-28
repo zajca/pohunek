@@ -200,6 +200,7 @@ async fn an_install_that_cannot_load_leaves_no_record_and_no_root() {
             enable: true,
             select: true,
             dry_run: false,
+            accept_commands: false,
         };
         assert_eq!(
             fixture
@@ -243,6 +244,7 @@ async fn an_unusable_archive_or_path_leaves_no_record_and_no_root() {
         enable: true,
         select: true,
         dry_run: false,
+        accept_commands: false,
     };
     assert_eq!(
         fixture
@@ -599,6 +601,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
     let link = |dry_run| PackageLinkParams {
         directory: directory.to_str().expect("utf-8").to_owned(),
         dry_run,
+        accept_commands: false,
     };
     let before = fixture.snapshot();
 
@@ -660,6 +663,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
                 .package_link(PackageLinkParams {
                     directory: relative,
                     dry_run: false,
+                    accept_commands: false,
                 })
                 .await
                 .expect_err("not absolute"),
@@ -691,6 +695,7 @@ async fn a_linked_directory_cannot_claim_a_reserved_runtime_id() {
         .package_link(PackageLinkParams {
             directory: directory.to_str().expect("utf-8").to_owned(),
             dry_run: false,
+            accept_commands: false,
         })
         .await
         .expect_err("alias");

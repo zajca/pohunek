@@ -127,6 +127,7 @@ impl OfficialCatalog {
                     enable: true,
                     select: true,
                     dry_run: false,
+                    accept_commands: false,
                 })
                 .await
                 .unwrap_or_else(|error| {
@@ -237,6 +238,7 @@ impl OfficialCatalog {
                 enable: flags.enable,
                 select: flags.select,
                 dry_run: false,
+                accept_commands: false,
             })
             .await
             .unwrap_or_else(|error| panic!("the official {runtime} package installs: {error:?}"));
@@ -269,6 +271,7 @@ impl OfficialCatalog {
                 enable: true,
                 select: true,
                 dry_run: false,
+                accept_commands: false,
             })
             .await
             .unwrap_or_else(|error| panic!("the release {runtime} package installs: {error:?}"));
@@ -350,6 +353,7 @@ pub(crate) async fn preinstall_third_party(
             enable: true,
             select: true,
             dry_run: false,
+            accept_commands: false,
         })
         .await
         .unwrap_or_else(|error| panic!("the third-party {runtime} package installs: {error:?}"));

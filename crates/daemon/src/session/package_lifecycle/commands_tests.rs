@@ -23,6 +23,20 @@ use crate::session::tests::{assigned_agent_script, params, temp_dir};
 /// Archive paths of the files a linked fixture directory ships.
 const LINK_PROGRAM: &str = "bin/fleet-state";
 
+/// An explicit-digest install that opts in to package commands, as the
+/// current CLI does.
+fn accepted(
+    path: &str,
+    package: &Package,
+    enable: bool,
+    select: bool,
+) -> protocol::PackageInstallParams {
+    protocol::PackageInstallParams {
+        accept_commands: true,
+        ..explicit(path, package, enable, select)
+    }
+}
+
 fn enable(digest: &package::PackageDigest, enabled: bool) -> PackageSetEnabledParams {
     PackageSetEnabledParams {
         digest: digest.clone(),
@@ -50,7 +64,7 @@ async fn a_commands_only_package_is_reviewed_installed_and_serves_no_runtime() {
     let path = fixture.write_archive(&package);
     let before = fixture.snapshot();
 
-    let mut review = explicit(&path, &package, true, true);
+    let mut review = accepted(&path, &package, true, true);
     review.dry_run = true;
     let preview = fixture
         .registry
@@ -70,7 +84,7 @@ async fn a_commands_only_package_is_reviewed_installed_and_serves_no_runtime() {
 
     let installed = fixture
         .registry
-        .package_install(explicit(&path, &package, true, true))
+        .package_install(accepted(&path, &package, true, true))
         .await
         .expect("install");
     assert_eq!(installed.status, PackageInstallStatus::Installed);
@@ -109,7 +123,7 @@ async fn a_command_exposure_defaults_to_local() {
 
     let installed = fixture
         .registry
-        .package_install(explicit(&path, &package, false, false))
+        .package_install(accepted(&path, &package, false, false))
         .await
         .expect("install");
     assert_eq!(installed.commands.len(), 1);
@@ -188,7 +202,7 @@ async fn an_invalid_command_export_is_refused_before_anything_is_recorded() {
         let path = fixture.write_archive(&package);
         let refusal = fixture
             .registry
-            .package_install(explicit(&path, &package, true, true))
+            .package_install(accepted(&path, &package, true, true))
             .await
             .expect_err(label);
         assert_eq!(refusal, PackageErrorKind::DescriptorInvalid, "{label}");
@@ -217,7 +231,7 @@ async fn commands_need_the_package_commands_feature() {
         let path = fixture.write_archive(&package);
         let refusal = fixture
             .registry
-            .package_install(explicit(&path, &package, true, true))
+            .package_install(accepted(&path, &package, true, true))
             .await
             .expect_err(label);
         assert_eq!(
@@ -249,6 +263,7 @@ async fn a_linked_directory_keeps_the_program_rules() {
     let link = |dry_run| PackageLinkParams {
         directory: directory.to_str().expect("utf-8 path").to_owned(),
         dry_run,
+        accept_commands: true,
     };
 
     let installed = fixture
@@ -282,7 +297,7 @@ async fn a_commands_only_package_follows_the_lifecycle_of_a_runtime_package() {
         let path = fixture.write_archive(package);
         fixture
             .registry
-            .package_install(explicit(&path, package, false, false))
+            .package_install(accepted(&path, package, false, false))
             .await
             .expect("install");
     }
@@ -367,7 +382,7 @@ async fn a_package_exporting_both_launches_sessions_and_carries_its_commands() {
 
     let installed = fixture
         .registry
-        .package_install(explicit(&path, &package, true, true))
+        .package_install(accepted(&path, &package, true, true))
         .await
         .expect("install");
     assert_eq!(installed.commands.len(), 1);
@@ -395,4 +410,113 @@ async fn a_package_exporting_both_launches_sessions_and_carries_its_commands() {
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("the session exits");
+}
+
+#[tokio::test]
+async fn a_request_without_the_opt_in_is_refused_for_every_package_that_declares_commands() {
+    let fixture = Fixture::new("commands-opt-in");
+    let tag = "commands-opt-in-agent";
+    let dir = temp_dir(tag);
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packages = [
+        Package::commands_only(COMMANDS_PACKAGE, "1.0.0", HOST_STATE_COMMAND),
+        Package::build_with_commands(
+            PACKAGE,
+            "1.0.0",
+            RUNTIME,
+            script.to_str().expect("utf-8 script path"),
+            HOST_STATE_COMMAND,
+        ),
+    ];
+    let before = fixture.snapshot();
+    for package in &packages {
+        let path = fixture.write_archive(package);
+        for dry_run in [true, false] {
+            let refusal = fixture
+                .registry
+                .package_install(protocol::PackageInstallParams {
+                    dry_run,
+                    ..explicit(&path, package, true, true)
+                })
+                .await
+                .expect_err("an old-style request is refused");
+            assert_eq!(refusal, PackageErrorKind::CommandsClientUnsupported);
+        }
+        assert_eq!(fixture.snapshot(), before, "nothing was written");
+    }
+
+    // The same requests with the opt-in install as before.
+    for package in &packages {
+        let path = fixture.write_archive(package);
+        let installed = fixture
+            .registry
+            .package_install(accepted(&path, package, true, true))
+            .await
+            .expect("an opted-in request installs");
+        assert_eq!(installed.commands.len(), 1);
+    }
+
+    // A linked directory is held to the same rule.
+    let directory = temp_dir("commands-opt-in-link");
+    fs::create_dir_all(directory.join("bin")).expect("create the program directory");
+    fs::write(
+        directory.join("runtime.toml"),
+        commands_document("means.linked", "1.0.0", true, HOST_STATE_COMMAND),
+    )
+    .expect("write the descriptor");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let program = directory.join(LINK_PROGRAM);
+        fs::write(&program, b"#!/bin/sh\n").expect("write the program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("set the mode");
+    }
+    let before = fixture.snapshot();
+    let refusal = fixture
+        .registry
+        .package_link(PackageLinkParams {
+            directory: directory.to_str().expect("utf-8 path").to_owned(),
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect_err("an old-style link is refused");
+    assert_eq!(refusal, PackageErrorKind::CommandsClientUnsupported);
+    assert_eq!(fixture.snapshot(), before, "nothing was written");
+}
+
+#[tokio::test]
+async fn a_catalog_cannot_authorize_a_package_that_exports_commands_only() {
+    use super::catalog_tests::{
+        anchor, catalog, catalog_install, entry, signed_by, signing_key, state,
+    };
+
+    let key = signing_key("root");
+    let fixture = Fixture::with_anchor("commands-catalog", anchor(&[&key], Vec::new()));
+    let package = Package::commands_only(COMMANDS_PACKAGE, "1.0.0", HOST_STATE_COMMAND);
+    let document = signed_by(
+        &key,
+        catalog(
+            7,
+            vec![entry(&package, COMMANDS_PACKAGE, "fleet-state", "1.0.0")],
+        ),
+    );
+    let before = fixture.snapshot();
+    for dry_run in [true, false] {
+        let refusal = fixture
+            .registry
+            .package_install(protocol::PackageInstallParams {
+                accept_commands: true,
+                ..catalog_install(&fixture, &package, &document, dry_run)
+            })
+            .await
+            .expect_err("a catalog binds a runtime id");
+        assert_eq!(refusal, PackageErrorKind::Untrusted);
+    }
+    assert_eq!(fixture.snapshot(), before, "no package was recorded");
+    assert_eq!(
+        state(&fixture).high_water(),
+        None,
+        "the watermark is unchanged"
+    );
 }

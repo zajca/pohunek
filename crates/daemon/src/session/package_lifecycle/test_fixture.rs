@@ -260,6 +260,7 @@ pub(super) fn explicit(
         enable,
         select,
         dry_run: false,
+        accept_commands: false,
     }
 }
 

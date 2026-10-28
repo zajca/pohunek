@@ -833,7 +833,8 @@ async fn ingest_package(
         Ingest::Link => false,
         Ingest::Update => true,
     };
-    let preview = send_ingest(client, source, enable, false, true).await?;
+    let accept_commands = host_shows_commands(client).await?;
+    let preview = send_ingest(client, source, (enable, false, true), accept_commands).await?;
     let id = &preview.package.package.id;
     if let Some(expected) = expected_id {
         if id != expected {
@@ -875,7 +876,7 @@ async fn ingest_package(
         }
         .into());
     }
-    let mut result = send_ingest(client, source, enable, select, false).await?;
+    let mut result = send_ingest(client, source, (enable, select, false), accept_commands).await?;
     if ingest == Ingest::Update {
         converge_update(client, &mut result).await?;
     }
@@ -977,13 +978,28 @@ async fn converge_update(
     Ok(())
 }
 
+/// Whether the daemon can take the `accept_commands` opt-in, which this CLI
+/// then sends because it renders every exported command for consent.
+///
+/// An older daemon rejects the unknown field, so the opt-in is sent only to a
+/// host that advertises it.
+async fn host_shows_commands(client: &mut Client) -> Result<bool, CliError> {
+    Ok(client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_install_commands_supported)
+}
+
+/// Sends the install or link request; `flags` is `(enable, select, dry_run)`.
 async fn send_ingest(
     client: &mut Client,
     source: &Source,
-    enable: bool,
-    select: bool,
-    dry_run: bool,
+    flags: (bool, bool, bool),
+    accept_commands: bool,
 ) -> Result<PackageInstallResult, CliError> {
+    let (enable, select, dry_run) = flags;
     match source {
         Source::Archive { path, trust } => {
             client
@@ -993,6 +1009,7 @@ async fn send_ingest(
                     enable,
                     select,
                     dry_run,
+                    accept_commands,
                 })
                 .await
         }
@@ -1001,6 +1018,7 @@ async fn send_ingest(
                 .call::<method::PackageLink>(PackageLinkParams {
                     directory: directory.clone(),
                     dry_run,
+                    accept_commands,
                 })
                 .await
         }

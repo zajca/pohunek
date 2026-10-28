@@ -26,4 +26,12 @@ export type PackageInstallParams = {
    * Validate and report without changing anything.
    */
   dry_run: boolean;
+  /**
+   * The client renders the package's exported commands for consent. The
+   * daemon refuses an archive whose descriptor declares commands when this
+   * is absent, so a client that cannot show a command's program, arguments
+   * and exposure never installs one unseen. Clients send it only to a host
+   * that advertises `HostCapabilities::package_install_commands_supported`.
+   */
+  accept_commands?: boolean;
 };

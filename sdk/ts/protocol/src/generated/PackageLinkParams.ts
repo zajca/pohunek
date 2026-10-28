@@ -14,4 +14,8 @@ export type PackageLinkParams = {
    * Validate and report without changing anything.
    */
   dry_run: boolean;
+  /**
+   * Same opt-in as [`PackageInstallParams::accept_commands`].
+   */
+  accept_commands?: boolean;
 };

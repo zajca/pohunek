@@ -547,7 +547,14 @@ expose = "peers"              # "local" (default) or "peers"
   host. The exposure is part of the descriptor, so a new version is a new
   digest and the owner consents to a changed exposure again at install.
 - A catalog (`--catalog`) authorizes a package for the runtime it serves, so a
-  package that exports commands only installs with `--sha256` or `link`.
+  package that exports commands only is refused with `package_untrusted` and
+  installs with `--sha256` or `link`.
+- The daemon refuses a package that declares commands unless the request opts
+  in (`accept_commands`), with `package_commands_client_unsupported`, so a
+  client that cannot show a command for consent never installs one unseen. The
+  CLI sends the opt-in when the host advertises
+  `package_install_commands_supported`; an older CLI does not send it and gets
+  the refusal, and an older daemon never sees the field.
 - A runtime-only table (`[integration]`, `[launch_env]`, `[config_home]`,
   `[transcripts]`) next to commands without the runtime group is
   `descriptor_invalid`.
