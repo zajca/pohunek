@@ -396,9 +396,9 @@ pub enum Error {
     Control {
         /// The request.
         operation: &'static str,
-        /// The client failure.
+        /// The client failure, boxed to keep the error type small.
         #[source]
-        source: pohunek_client::ClientError,
+        source: Box<pohunek_client::ClientError>,
     },
 
     /// Uninstall refused because sessions or workers are live.

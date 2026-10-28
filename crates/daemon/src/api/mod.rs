@@ -551,10 +551,16 @@ impl RemoteServer {
 /// changes no session state. A method that mutates state, or one whose permit
 /// a spawned task holds, must run to completion and never belongs here;
 /// supporting another read-only wait is one more entry in this list.
+///
+/// `command.run` is the other kind of member: its run is a blocking task that
+/// owns its admission until the process group is gone, and dropping the request
+/// future sets the run's cancel flag, so a hangup stops the program and frees
+/// its slot without leaving state behind.
 const CANCEL_ON_HANGUP: &[&str] = &[
     method::SESSION_WAIT,
     method::SESSION_OUTPUT,
     method::SESSION_WAIT_TURN,
+    method::COMMAND_RUN,
 ];
 
 /// Serve one control connection: read newline-delimited JSON requests, dispatch

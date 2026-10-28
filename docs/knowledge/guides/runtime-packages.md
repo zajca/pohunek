@@ -508,9 +508,8 @@ they need `--yes`.
 ## Declaring package commands
 
 A package can export named commands: fixed programs the daemon runs as the
-owner when a command is called. `command.run` is the method that calls them;
-this release only declares, reviews and records them, so no call runs a command
-yet. A descriptor exports a runtime (`[runtime]`, `[input]`, `[resume]`,
+owner when a command is called. `command.run` is the method that calls them
+(see [Calling a command](#calling-a-command)). A descriptor exports a runtime (`[runtime]`, `[input]`, `[resume]`,
 `[fork]` and `[native_reference]`, all or none), commands, or both, and at
 least one of the two. A package that exports commands only serves no runtime:
 it never appears among the supported agents and no session can be started
@@ -940,3 +939,37 @@ ids and `--digest` values from the local daemon within a short deadline, and
 (names only, no daemon). Completion never starts the daemon and stays silent
 when the daemon is unreachable. Archive and catalog arguments complete as files,
 `link` as a directory.
+
+## Calling a command
+
+`command.run` takes a package id and a command name and returns the program's
+stdout, verbatim, once the program exits with status 0. A call carries no
+argument, environment variable, working directory or input, so it can run
+nothing but the fixed argv the owner reviewed at install. The daemon resolves
+the id to the selected, enabled version, verifies its package root against the
+archive digest again and runs the declared program with a cleared environment
+(`PATH` of the agent launches, a private `HOME`, the `XDG_*` directories,
+`TMPDIR`, `LANG=C`, `LC_ALL=C`), a private scratch directory as the working
+directory and a closed stdin.
+
+- **Limits.** `timeout_ms` (at most 60 s) and `max_output_bytes` (at most
+  128 KiB) lower the ceilings and default to them. One run per command and four
+  per host at once; a call over a limit fails with `command_busy` and does not
+  queue. The program's process group is killed on timeout, on too much output,
+  after it exits and on daemon shutdown.
+- **Who may call.** The local socket may call every declared command. An overlay
+  peer may call only a command declared `expose = "peers"`; a `local` command
+  fails with `command_not_exposed`. The method is not served on a relay path.
+- **Errors.** `command_package_not_installed`, `command_not_selected`,
+  `command_not_declared`, `command_not_exposed`, `command_package_disabled`,
+  `command_busy`, `command_failed` (with `details.process_exit` holding
+  `exit_code` or `signal`), `command_timed_out`, `command_output_too_large`,
+  `command_output_not_utf8` and `command_unavailable`. A daemon that does not
+  implement the method, one of an older release included, makes a client report
+  `command_unsupported`.
+- **Limits of the isolation.** The program runs as the owner, like an agent. A
+  program that calls `setsid()` or double-forks leaves the process group the
+  daemon kills and lives until the daemon's unit stops.
+
+`plugin inspect` lists a package's commands with their exposure, so an owner can
+review them after install.

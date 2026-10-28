@@ -1,0 +1,5 @@
+## Unreleased (2026-10-28, package commands run, #1690)
+
+- `command.run` runs a command an installed package declared in `[commands.<name>]`: `{package, command, timeout_ms?, max_output_bytes?}` returns the program's stdout, verbatim UTF-8, with the package identity and digest. A call carries no argument, environment, working directory or input; the program is a file of the re-verified package root and runs with a cleared environment, a private scratch directory and a closed stdin. Limits: 60 s, 128 KiB, one run per command and four per host, no queue. The local socket may call every declared command; an overlay peer only a `peers` command. See [Runtime Packages](guides/runtime-packages.md#calling-a-command).
+- Errors are `command_*` codes with fixed text; `command_failed` alone carries the new `details` object (`process_exit.exit_code` or `signal`). A client of an older daemon reports `command_unsupported`.
+- `package.inspect` and `plugin inspect` list a package's commands, and carry an explicit `commands_only` marker for a package that exports commands only.

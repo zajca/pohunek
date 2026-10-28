@@ -15,6 +15,7 @@
 //! methods.
 
 mod assistant;
+mod command;
 mod daemon;
 mod governance;
 mod host;
@@ -45,6 +46,7 @@ use pohunek_client::OverlayRegistry;
 use crate::discovery::DiscoveryCache;
 use crate::governance::HostGovernanceService;
 use crate::notifications::{AttentionCoordinator, NotificationService};
+use crate::package_command::PackageCommandService;
 use crate::session::{ControlPeer, SessionRegistry};
 
 /// Static facts the daemon reports from `daemon.health`.
@@ -94,6 +96,9 @@ pub struct DaemonState {
     /// Set per accepted Unix connection. `None` on every other state, so a
     /// caller without an attested peer is refused where one is required.
     pub control_peer: Option<Arc<ControlPeer>>,
+    /// Runs package commands. States that serve one daemon share one service,
+    /// so its limits hold across transports.
+    pub package_commands: PackageCommandService,
 }
 
 /// Where a daemon's overlay registry came from.
@@ -153,6 +158,7 @@ impl DaemonState {
         discovery: DiscoveryCache,
         overlay_source: OverlaySource,
     ) -> Self {
+        let package_commands = PackageCommandService::new(sessions.package_command_host());
         Self {
             health,
             sessions,
@@ -163,7 +169,16 @@ impl DaemonState {
             overlay_source,
             transport: ControlTransport::default(),
             control_peer: None,
+            package_commands,
         }
+    }
+
+    /// Serve package commands with `service`, the one the daemon's other
+    /// states use, so the run limits are shared.
+    #[must_use]
+    pub fn with_package_commands(mut self, service: PackageCommandService) -> Self {
+        self.package_commands = service;
+        self
     }
 
     /// Mark the connections served with this state as arriving on `transport`.
@@ -495,6 +510,7 @@ async fn handle_negotiated(
         method::PACKAGE_SELECT => package::handle_package_select(request, state).await,
         method::PACKAGE_UNINSTALL => package::handle_package_uninstall(request, state).await,
         method::PACKAGE_BIND_PROFILE => package::handle_package_bind_profile(request, state).await,
+        method::COMMAND_RUN => command::handle_command_run(request, state).await,
         method::HOST_INSPECT => {
             host::handle_host_inspect(request, &state.health, &state.sessions).await
         }

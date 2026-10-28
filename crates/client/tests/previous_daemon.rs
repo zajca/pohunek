@@ -997,6 +997,39 @@ async fn a_turn_wait_on_its_dedicated_connection_fails_before_it_is_sent() {
 }
 
 #[tokio::test]
+async fn a_command_run_against_the_previous_daemon_is_command_unsupported_before_it_is_sent() {
+    guard("the command run", async {
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let params = protocol::CommandRunParams {
+            package: protocol::PackageId::parse("acme.fleet-state").expect("package id"),
+            command: protocol::CommandName::parse("host-state").expect("command name"),
+            timeout_ms: None,
+            max_output_bytes: None,
+        };
+        let error = client
+            .command_run(params)
+            .await
+            .expect_err("the previous daemon does not define command.run");
+        match &error {
+            ClientError::RemoteProtocol { host, source } => {
+                assert_eq!(host, HOST);
+                assert_eq!(source.code, "command_unsupported");
+                assert_eq!(source.class, ErrorClass::Daemon);
+            }
+            other => panic!("expected command_unsupported, got {other:?}"),
+        }
+        assert_eq!(
+            daemon.methods(),
+            [method::DAEMON_HEALTH],
+            "only the version probe reaches the previous daemon"
+        );
+        assert_eq!(daemon.violations(), Vec::<String>::new());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_typed_error_names_the_host_the_versions_and_the_upgrade() {
     guard("the typed error", async {
         let daemon = PreviousDaemon::start().await;

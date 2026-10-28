@@ -126,6 +126,10 @@ struct InstallPlan {
 struct Inspected {
     info: PackageInfo,
     runtime: Option<PackageRuntimeInfo>,
+    /// The commands the loaded descriptor exports.
+    commands: Vec<CommandInfo>,
+    /// Whether the descriptor loaded and exports commands only.
+    commands_only: bool,
 }
 
 impl Context {
@@ -185,6 +189,8 @@ impl SessionRegistry {
             Ok(PackageInspectResult {
                 package: inspected.info,
                 runtime: inspected.runtime,
+                commands: inspected.commands,
+                commands_only: inspected.commands_only,
             })
         })
         .await
@@ -486,6 +492,23 @@ impl SessionRegistry {
         })
     }
 
+    /// What the package command service needs from this registry: the package
+    /// store, the `PATH` every agent launch sees, and the daemon shutdown
+    /// signal.
+    ///
+    /// The search path is the launch base environment's, so an interpreter a
+    /// command program names with `#!/usr/bin/env` resolves as it does for an
+    /// agent. A base environment that cannot be formed leaves `search_path`
+    /// as an error and every run unavailable.
+    pub(crate) fn package_command_host(&self) -> crate::package_command::CommandHost {
+        let search_path = self.integration_homes().map(|homes| homes.search_path());
+        crate::package_command::CommandHost {
+            store: self.inner.profiles.runtimes().package_store().cloned(),
+            search_path,
+            shutdown: self.inner.daemon_shutdown.clone(),
+        }
+    }
+
     /// What resolves the config home a launch of a runtime gives its agent: the
     /// host profiles and the base environment this registry hands every agent.
     ///
@@ -722,35 +745,41 @@ fn inspect_record(
     report: &PackageReport,
 ) -> Inspected {
     let digest = record.digest();
+    let mut commands = Vec::new();
+    let mut commands_only = false;
     let (runtime, fault, selection_blocked) =
         match context.store.read_descriptor(digest, record.identity()) {
-            Ok(descriptor) => match descriptor.runtime() {
-                Some(definition) => {
-                    let fault = if is_reserved(definition.runtime_id())
-                        && !may_serve_reserved(record, definition)
-                    {
-                        fault_of(&PackageRejection::ReservedRuntimeId)
-                    } else if report.rejected.iter().any(|rejected| {
-                        &rejected.digest == digest
-                            && matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
-                    }) {
-                        fault_of(&PackageRejection::RuntimeIdConflict)
-                    } else {
-                        None
-                    };
-                    let blocked = block_of(
-                        context,
-                        state,
-                        retained.gate(),
-                        record,
-                        &declared_by(definition),
-                    );
-                    (Some(runtime_info(definition)), fault, blocked)
+            Ok(descriptor) => {
+                commands = descriptor.commands().to_vec();
+                commands_only = descriptor.runtime().is_none();
+                match descriptor.runtime() {
+                    Some(definition) => {
+                        let fault = if is_reserved(definition.runtime_id())
+                            && !may_serve_reserved(record, definition)
+                        {
+                            fault_of(&PackageRejection::ReservedRuntimeId)
+                        } else if report.rejected.iter().any(|rejected| {
+                            &rejected.digest == digest
+                                && matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
+                        }) {
+                            fault_of(&PackageRejection::RuntimeIdConflict)
+                        } else {
+                            None
+                        };
+                        let blocked = block_of(
+                            context,
+                            state,
+                            retained.gate(),
+                            record,
+                            &declared_by(definition),
+                        );
+                        (Some(runtime_info(definition)), fault, blocked)
+                    }
+                    // A package that exports commands only serves no runtime and
+                    // declares no integration: it is healthy and never blocked.
+                    None => (None, None, None),
                 }
-                // A package that exports commands only serves no runtime and
-                // declares no integration: it is healthy and never blocked.
-                None => (None, None, None),
-            },
+            }
             Err(rejection) => (None, fault_of(&rejection), None),
         };
     Inspected {
@@ -767,6 +796,8 @@ fn inspect_record(
             selection_blocked,
         },
         runtime,
+        commands,
+        commands_only,
     }
 }
 

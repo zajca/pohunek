@@ -511,6 +511,17 @@ pub struct PackageInspectResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub runtime: Option<PackageRuntimeInfo>,
+    /// The commands the descriptor exports, with their program, arguments and
+    /// exposure; absent when the descriptor exports none or cannot be loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<CommandInfo>>", optional))]
+    pub commands: Vec<CommandInfo>,
+    /// Set when the descriptor loaded and exports commands only, so a missing
+    /// `runtime` is not a fault. A reply without it says nothing about the
+    /// descriptor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub commands_only: bool,
 }
 
 /// Parameters for `package.doctor`.

@@ -1321,13 +1321,14 @@ fn render_inspect(result: &PackageInspectResult) -> String {
     }
     match &result.runtime {
         Some(runtime) => render_runtime_details(&mut output, runtime),
-        None if info.fault.is_none() => {
+        None if result.commands_only => {
             let _ = writeln!(output, "Runtime:     none (exports commands only)");
         }
         None => {
             let _ = writeln!(output, "Runtime:     descriptor unavailable");
         }
     }
+    render_command_details(&mut output, &result.commands);
     output
 }
 
@@ -1902,6 +1903,8 @@ mod tests {
         let inspect = render_inspect(&PackageInspectResult {
             package: blocked.clone(),
             runtime: Some(declared.clone()),
+            commands: Vec::new(),
+            commands_only: false,
         });
         assert!(inspect.contains("Selection:   blocked"), "{inspect}");
         assert!(inspect.contains("sha256:aaaaaaaaaaaa"), "{inspect}");

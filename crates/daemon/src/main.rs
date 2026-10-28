@@ -613,6 +613,7 @@ async fn run() -> Result<(), DaemonError> {
     )
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
+    let package_commands = state.package_commands.clone();
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
@@ -626,7 +627,8 @@ async fn run() -> Result<(), DaemonError> {
         overlay_source,
     )
     .with_notifications(notifications.clone())
-    .with_attention_coordinator(attention_coordinator.clone());
+    .with_attention_coordinator(attention_coordinator.clone())
+    .with_package_commands(package_commands.clone());
     // Reconciliation and every required local listener are ready. A manual
     // foreground launch has no NOTIFY_SOCKET and this is a no-op.
     pohunek_daemon::notify::ready()?;
@@ -660,6 +662,7 @@ async fn run() -> Result<(), DaemonError> {
     // In-flight creates commit or compensate before the runtime stops; shutdown
     // already refuses new ones.
     sessions.drain_creates().await;
+    package_commands.shutdown().await;
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
@@ -1135,7 +1138,7 @@ async fn serve_remote_with_retry<F, Fut>(
             match transition {
                 RemoteBind::Bound(remote) => {
                     info!(old_addr = %current_addr, new_addr = %remote.local_addr(), "overlay listener address changed; rebound remote control listener");
-                    active = Some(remote);
+                    active = Some(*remote);
                     retry_interval = initial_retry_interval;
                     continue;
                 }
@@ -1153,7 +1156,7 @@ async fn serve_remote_with_retry<F, Fut>(
             };
             match attempt {
                 RemoteBind::Bound(remote) => {
-                    active = Some(remote);
+                    active = Some(*remote);
                     retry_interval = initial_retry_interval;
                     continue;
                 }
@@ -1329,7 +1332,7 @@ where
     match RemoteServer::bind_with(addr, state, transport.as_ref(), open).await {
         Ok(remote) => {
             info!(overlay = %overlay_id, addr = %remote.local_addr(), "serving control protocol over overlay");
-            RemoteBind::Bound(remote)
+            RemoteBind::Bound(Box::new(remote))
         }
         Err(err) => {
             // Fail-closed validation or an OS bind error: log and stay local-only
@@ -1354,7 +1357,7 @@ enum MissingCli {
 /// Result of one remote-listener bind attempt.
 enum RemoteBind {
     /// The listener is bound and ready to serve.
-    Bound(RemoteServer),
+    Bound(Box<RemoteServer>),
     /// Current provider state still validates the active listener address.
     Unchanged,
     /// The condition may recover without restarting the daemon.
@@ -1486,7 +1489,7 @@ mod tests {
                 let result = if attempt == 0 {
                     RemoteBind::Retry
                 } else {
-                    RemoteBind::Bound(remote.take().expect("only one successful bind"))
+                    RemoteBind::Bound(Box::new(remote.take().expect("only one successful bind")))
                 };
                 std::future::ready(result)
             },

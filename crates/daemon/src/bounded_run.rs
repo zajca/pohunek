@@ -118,9 +118,14 @@ impl RunOutput {
         &self.stdout
     }
 
+    /// The number of retained stdout bytes.
+    #[must_use]
+    pub(crate) fn stdout_len(&self) -> usize {
+        self.stdout.len()
+    }
+
     /// The retained stdout as UTF-8, or the position of the first invalid
     /// byte.
-    #[expect(dead_code, reason = "first used by the package command runner")]
     pub(crate) fn stdout_utf8(&self) -> Result<&str, std::str::Utf8Error> {
         std::str::from_utf8(&self.stdout)
     }

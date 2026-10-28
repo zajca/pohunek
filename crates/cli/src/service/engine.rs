@@ -940,7 +940,7 @@ impl<'a> Engine<'a> {
                 .await
                 .map_err(|source| Error::Control {
                     operation: "session.list",
-                    source,
+                    source: Box::new(source),
                 })?,
             // An unreachable daemon proves no session of this installation
             // can be listed or stopped; without live sessions or workers the

@@ -87,6 +87,45 @@ pub struct ProtocolError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub recover: Option<String>,
+    /// Structured facts a caller reads instead of parsing `msg`.
+    ///
+    /// Only `command_failed` carries it, and only a client that called
+    /// `command.run` can receive that error, so no other error and no older
+    /// client sees the key. It is boxed so the error type stays small in
+    /// every `Result` that carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub details: Option<Box<ErrorDetails>>,
+}
+
+/// Typed facts attached to a [`ProtocolError`].
+///
+/// Deliberately not `deny_unknown_fields`, here and in its members: a later
+/// kind of detail is a new optional field, and a client of this build keeps
+/// decoding the error that carries it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ErrorDetails.ts"))]
+pub struct ErrorDetails {
+    /// How the process of a failed package command ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub process_exit: Option<ProcessExit>,
+}
+
+/// How a process ended abnormally: exactly one of the fields is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProcessExit.ts"))]
+pub struct ProcessExit {
+    /// The non-zero exit status the process returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub exit_code: Option<i32>,
+    /// The signal that ended the process, when the daemon did not send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub signal: Option<i32>,
 }
 
 /// Why a waited input stopped between its body and its Enter.
@@ -114,7 +153,15 @@ impl ProtocolError {
             code: code.into(),
             msg: msg.into(),
             recover,
+            details: None,
         }
+    }
+
+    /// This error with `details` attached.
+    #[must_use]
+    pub fn with_details(mut self, details: ErrorDetails) -> Self {
+        self.details = Some(Box::new(details));
+        self
     }
 
     /// The canonical `daemon/version_mismatch` error.

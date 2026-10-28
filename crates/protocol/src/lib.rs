@@ -22,6 +22,7 @@
 
 mod assistant;
 mod capabilities;
+mod command;
 pub mod compat;
 mod decimal;
 mod discovery;
@@ -51,6 +52,8 @@ pub use assistant::{
 #[doc(inline)]
 pub use capabilities::{AgentRuntime, HostCapabilities, HostInspectParams};
 #[doc(inline)]
+pub use command::{CommandErrorKind, CommandRunParams, CommandRunResult};
+#[doc(inline)]
 pub use decimal::{
     ActivityRevision, BackgroundRevision, DecimalWireError, OutputOffset, ProcessStartIdentity,
     ReportSequence, RuntimeGeneration, SubagentRevision, TerminalWatermark,
@@ -64,7 +67,7 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 #[doc(inline)]
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
-    ErrorClass, InputNotSubmittedReason, ProtocolError,
+    ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
 };
 #[doc(inline)]
 pub use governance::{
@@ -97,13 +100,13 @@ pub use integration::{
 #[doc(inline)]
 pub use limits::{
     ED25519_SIGNATURE_BYTES, ED25519_SIGNATURE_PAYLOAD_BYTES, GOVERNANCE_ID_PAYLOAD_BYTES,
-    MAX_CONTROL_LINE_BYTES, MAX_IDENTITY_CLAIM_TTL_SECS, MAX_REQUEST_ID_BYTES,
-    MAX_SESSION_DIFF_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES,
-    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_SECRET_ENV_ENTRIES,
-    MAX_SESSION_SECRET_ENV_NAME_BYTES, MAX_SESSION_SECRET_ENV_VALUE_BYTES,
-    MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS,
-    MAX_SESSION_WAIT_TURN_TARGETS, MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES,
+    MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS, MAX_CONTROL_LINE_BYTES,
+    MAX_IDENTITY_CLAIM_TTL_SECS, MAX_REQUEST_ID_BYTES, MAX_SESSION_DIFF_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES, MAX_SESSION_SCREEN_RESPONSE_BYTES,
+    MAX_SESSION_SECRET_ENV_ENTRIES, MAX_SESSION_SECRET_ENV_NAME_BYTES,
+    MAX_SESSION_SECRET_ENV_VALUE_BYTES, MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS, MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES,
     MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
 };

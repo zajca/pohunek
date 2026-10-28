@@ -5438,3 +5438,74 @@ fn malformed_secret_env_is_refused_with_text_that_quotes_nothing() {
     .expect("a map at the bounds is accepted");
     assert_eq!(accepted.secret_env.len(), MAX_SESSION_SECRET_ENV_ENTRIES);
 }
+
+/// The error body a v0.37 client decodes: strict, without `details`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(dead_code, reason = "the fields only prove the strict decode")]
+struct StrictV037Error {
+    class: String,
+    code: String,
+    msg: String,
+    recover: Option<String>,
+}
+
+#[test]
+fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
+    use protocol::{CommandErrorKind, ErrorDetails, PackageErrorKind, ProcessExit};
+
+    // Every error other than `command_failed` serializes without the key, so a
+    // strict decoder that predates `details` still reads it.
+    let others = [
+        ProtocolError::method_not_found("command.run"),
+        ProtocolError::bad_request("bad"),
+        ProtocolError::from(PackageErrorKind::LocalOnly),
+        ProtocolError::from(CommandErrorKind::Unsupported),
+        ProtocolError::from(CommandErrorKind::Busy),
+        ProtocolError::from(CommandErrorKind::TimedOut),
+        ProtocolError::from(CommandErrorKind::OutputTooLarge),
+        ProtocolError::from(CommandErrorKind::NotExposed),
+    ];
+    for error in others {
+        let value = serde_json::to_value(&error).expect("serialize");
+        assert!(value.get("details").is_none(), "{}", error.code);
+        serde_json::from_value::<StrictV037Error>(value).expect("a v0.37 client decodes it");
+    }
+
+    let failed = ProtocolError::command_failed(ProcessExit {
+        exit_code: Some(3),
+        signal: None,
+    });
+    assert_eq!(failed.code, "command_failed");
+    let value = serde_json::to_value(&failed).expect("serialize");
+    assert_eq!(
+        value["details"],
+        serde_json::json!({ "process_exit": { "exit_code": 3 } })
+    );
+    assert_eq!(
+        serde_json::from_value::<ProtocolError>(value).expect("round trip"),
+        failed
+    );
+
+    // A later kind of detail, or a later member of an existing one, does not
+    // break this build's decode of the error that carries it.
+    let future = serde_json::json!({
+        "class": "runtime",
+        "code": "command_failed",
+        "msg": "m",
+        "details": {
+            "process_exit": { "exit_code": 1, "core_dumped": true },
+            "future_kind": { "x": 1 }
+        }
+    });
+    let decoded = serde_json::from_value::<ProtocolError>(future).expect("forward compatible");
+    assert_eq!(
+        decoded.details,
+        Some(Box::new(ErrorDetails {
+            process_exit: Some(ProcessExit {
+                exit_code: Some(1),
+                signal: None
+            })
+        }))
+    );
+}

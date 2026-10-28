@@ -43,6 +43,7 @@ mod external;
 pub mod integration;
 pub mod notifications;
 pub mod notify;
+pub mod package_command;
 pub mod procwatch;
 pub mod project;
 pub mod store;

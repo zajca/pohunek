@@ -766,6 +766,15 @@ impl Client {
                 result,
             )?)?);
         }
+        if M::NAME == protocol::method::COMMAND_RUN {
+            let params = serde_json::from_value::<protocol::CommandRunParams>(
+                serde_json::to_value(params)?,
+            )?;
+            let result = self.command_run(params).await?;
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
+        }
         if M::NAME == protocol::method::SESSION_OUTPUT {
             let params =
                 serde_json::from_value::<SessionOutputParams>(serde_json::to_value(params)?)?;
@@ -932,6 +941,33 @@ impl Client {
             self.call_direct::<protocol::method::SessionOutput>(params)
                 .await
         }
+    }
+
+    /// Run a command an installed package declared, on a dedicated connection
+    /// whose response budget follows the run's wire timeout.
+    ///
+    /// A request that omits `timeout_ms` is bounded by
+    /// [`protocol::MAX_COMMAND_TIMEOUT_MS`], the ceiling the daemon applies.
+    /// A daemon that does not implement the method, whether it speaks the
+    /// previous protocol version or the current one, fails with
+    /// `command_unsupported`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails or the daemon reports a
+    /// `command_*` error.
+    pub async fn command_run(
+        &mut self,
+        params: protocol::CommandRunParams,
+    ) -> Result<protocol::CommandRunResult, ClientError> {
+        let timeout_ms = params
+            .timeout_ms
+            .map_or(protocol::MAX_COMMAND_TIMEOUT_MS, |ms| {
+                ms.min(protocol::MAX_COMMAND_TIMEOUT_MS)
+            });
+        self.call_dedicated::<protocol::method::CommandRun>(params, timeout_ms)
+            .await
+            .map_err(command_unsupported)
     }
 
     /// Wait for a session predicate on a dedicated bounded connection.
@@ -1685,6 +1721,39 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
         .checked_add(DEDICATED_WAIT_TRANSPORT_HEADROOM)
         .unwrap_or(Duration::MAX)
         .max(configured)
+}
+
+/// The error a daemon that lacks `command.run` produces, as the typed
+/// `command_unsupported`.
+///
+/// A daemon of the previous protocol version is refused before anything is
+/// sent; a daemon of the current version that predates the method answers
+/// `method_not_found`. Both mean the same to the caller.
+fn command_unsupported(error: ClientError) -> ClientError {
+    let unsupported = || ProtocolError::from(protocol::CommandErrorKind::Unsupported);
+    match error {
+        ClientError::Protocol(source) if source.code == "method_not_found" => {
+            ClientError::Protocol(unsupported())
+        }
+        ClientError::RemoteProtocol { host, source } if source.code == "method_not_found" => {
+            ClientError::RemoteProtocol {
+                host,
+                source: unsupported(),
+            }
+        }
+        ClientError::DaemonProtocolTooOld { host, method, .. }
+            if method == protocol::method::COMMAND_RUN =>
+        {
+            match host {
+                Some(host) => ClientError::RemoteProtocol {
+                    host,
+                    source: unsupported(),
+                },
+                None => ClientError::Protocol(unsupported()),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Response timeout of a lifecycle request whose daemon work is bounded by
