@@ -27,6 +27,7 @@ pub mod paths;
 
 pub mod api;
 pub mod assistant;
+pub(crate) mod bounded_run;
 pub mod capabilities;
 pub mod catalog_anchor;
 pub mod discovery;
