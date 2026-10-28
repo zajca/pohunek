@@ -1923,3 +1923,53 @@ async fn a_fork_assignment_installs_only_next_to_an_assigned_fork_and_is_shown_f
     drop(local);
     servers.stop().await;
 }
+
+/// A host profile slot equal to a `[launch_env]` name of its runtime cannot be
+/// filled by a request: the pair is the runtime's behaviour flag, not a secret.
+#[tokio::test]
+async fn a_secret_slot_naming_a_launch_env_pair_is_refused_at_session_new() {
+    const SECRET: &str = "SENTINEL_LAUNCH_ENV_SLOT_6f1e";
+    let servers = spawn_servers("pkg-launch-env-slot").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let (digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "launch-env-slot",
+        &descriptor_requiring(
+            LAUNCH_ENV_FEATURE,
+            &launch_env_table(&["PI_NO_UPDATE = \"1\"".to_owned()]),
+        ),
+        false,
+    )
+    .await;
+    installed.expect("a descriptor with a launch_env pair installs");
+    let profile = servers.agents.join("flagged.toml");
+    std::fs::write(
+        &profile,
+        format!(
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\nsecret_env = [\"PI_NO_UPDATE\"]\n"
+        ),
+    )
+    .expect("write the profile");
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o600))
+        .expect("secure the profile");
+
+    let refused = exchange(
+        &mut local,
+        method::SESSION_NEW,
+        json!({
+            "agent": "flagged", "cols": 80, "rows": 24,
+            "secret_env": { "PI_NO_UPDATE": SECRET }
+        }),
+    )
+    .await
+    .into_result()
+    .expect_err("a runtime launch flag is not a slot");
+
+    assert_eq!(refused.code, "secret_env_not_declared", "{refused:?}");
+    assert!(
+        !format!("{refused:?}").contains(SECRET),
+        "the refusal quotes the secret: {refused:?}"
+    );
+    servers.stop().await;
+}

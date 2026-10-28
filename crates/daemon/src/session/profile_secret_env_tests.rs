@@ -461,6 +461,17 @@ async fn a_slot_cannot_replace_a_variable_the_runtime_contributor_sets() {
         .create(slots.new_params("shadow", &[("CONTRIBUTED_FLAG", SENTINEL)]))
         .await
         .expect_err("a slot never overrides the contributor's variable");
-    assert_refusal(&refused, "secret_env_not_declared");
+    assert_eq!(refused.code, "invalid_profile", "{refused:?}");
+    assert!(
+        refused.msg.contains("CONTRIBUTED_FLAG") && !refused.msg.contains(SENTINEL),
+        "the refusal names the slot, never a value: {refused:?}"
+    );
+    assert!(registry.list().await.is_empty(), "no session was created");
+    assert!(
+        fs::read_to_string(&slots.store_path)
+            .unwrap_or_default()
+            .is_empty(),
+        "no record was written before the refusal"
+    );
     assert!(slots.recorded().is_empty(), "no agent was launched");
 }

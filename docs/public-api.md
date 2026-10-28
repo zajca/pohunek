@@ -1062,8 +1062,10 @@ resume, a fork) reads them from the definition that serves it. A launch applies
 them first, then the session's private `TMPDIR`, then the host profile's
 `[env]`, the runtime contributor's pairs, the reserved `POHUNEK_*` values, then
 the request's `secret_env` values. A launch whose slot names a variable any of
-those layers already set fails with `secret_env_not_declared`, and the worker
-re-asserts `POHUNEK_*` last (a slot can never name one). The version probe applies the descriptor pairs after clearing its
+those layers already set (a runtime contributor's variable, say) fails with
+`invalid_profile` naming the slot, before the worker socket, the record or any
+worktree exists, and the worker re-asserts `POHUNEK_*` last (a slot can never
+name one). The version probe applies the descriptor pairs after clearing its
 environment; a profile entry reaches the launch only. A program the user starts
 by hand inside a shell session gets no descriptor environment. A built-in
 descriptor digest covers the table only while it holds a pair.

@@ -3241,6 +3241,23 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
+        // Refused before the worker socket, the record or any worktree exists.
+        if !secret_env.is_empty() {
+            let contributed = self.contributed_env_names(
+                &resolved.definition,
+                profile_env,
+                RuntimeRef::from(resolved.base.clone()),
+                &id,
+                LaunchKind::Create,
+                &resolved.snapshot_args(),
+            )?;
+            if let Some((slot, _)) = secret_env
+                .iter()
+                .find(|(slot, _)| contributed.contains(slot))
+            {
+                return Err(secret_slot_collision(&resolved.name, slot));
+            }
+        }
         self.ensure_worker_socket(&id)?;
         // The durable intent, target binding, registration, initial input, and
         // every compensation run as one detached task, so a client dropped
@@ -4159,11 +4176,11 @@ impl SessionRegistry {
         )?;
         // A slot never replaces a variable an earlier layer (descriptor,
         // `TMPDIR`, profile, contributor, handshake) already set.
-        if secret_env
+        if let Some((slot, _)) = secret_env
             .iter()
-            .any(|(name, _)| inputs.env.iter().any(|(set, _)| set == name))
+            .find(|(slot, _)| inputs.env.iter().any(|(set, _)| set == slot))
         {
-            return Err(ProtocolError::secret_env_not_declared());
+            return Err(secret_slot_collision(&resolved.name, slot));
         }
         let mut env_extra = inputs.env;
         env_extra.append(secret_env);
@@ -9507,3 +9524,14 @@ fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig
 
 #[cfg(test)]
 mod tests;
+
+/// The refusal of a launch whose secret slot names a variable the launch itself
+/// sets. The slot is the owner's own profile key, so it is named; no value is.
+fn secret_slot_collision(profile: &str, slot: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "invalid_profile",
+        format!("invalid agent profile '{profile}': secret_env name '{slot}' is set by the runtime's launch itself"),
+        None,
+    )
+}

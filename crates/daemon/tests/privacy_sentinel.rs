@@ -38,6 +38,7 @@ use protocol::{
     Response, SessionAttachParams, SessionAttachResult, SessionInfo, SessionNewParams,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState, SessionStopResult,
 };
+use sha2::Digest as _;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -1132,7 +1133,10 @@ impl SecretEnvHost {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s' \"${SECRET_SLOT}\" > '{}'\nexec /bin/cat\n",
+                "#!/bin/sh\n\
+                 if [ -x /usr/bin/sha256sum ]; then h=$(printf '%s' \"${SECRET_SLOT}\" | /usr/bin/sha256sum)\n\
+                 else h=$(printf '%s' \"${SECRET_SLOT}\" | /usr/bin/shasum -a 256); fi\n\
+                 printf '%s\\n' \"${{h%% *}}\" > '{}'\nexec /bin/cat\n",
                 seen_path.display()
             ),
         )
@@ -1310,6 +1314,34 @@ async fn session_secret_env_reaches_only_the_agent_process() {
         "no refused request created a session"
     );
 
+    // A subscriber sees every lifecycle event of the session.
+    let mut events = connect(&socket).await;
+    events
+        .send(
+            serde_json::to_string(&Request::make(
+                "secret-env-subscribe",
+                method::SUBSCRIBE,
+                serde_json::Value::Null,
+            ))
+            .expect("serialize subscribe"),
+        )
+        .await
+        .expect("send subscribe");
+    let ack = events
+        .next()
+        .await
+        .expect("subscribe ack")
+        .expect("ack framing");
+    let streamed = Arc::new(std::sync::Mutex::new(ack));
+    let collector = {
+        let streamed = Arc::clone(&streamed);
+        tokio::spawn(async move {
+            while let Some(Ok(line)) = events.next().await {
+                streamed.lock().expect("streamed events").push_str(&line);
+            }
+        })
+    };
+
     // The accepted request: the agent process holds the value.
     let create = Request::make(
         "secret-env-create",
@@ -1325,9 +1357,18 @@ async fn session_secret_env_reaches_only_the_agent_process() {
             .filter(|text| !text.is_empty())
     })
     .await;
+    let expected = sha2::Sha256::digest(SECRET_VALUE.as_bytes()).iter().fold(
+        String::new(),
+        |mut hex, byte| {
+            use std::fmt::Write as _;
+            write!(hex, "{byte:02x}").expect("write to a string");
+            hex
+        },
+    );
     assert_eq!(
-        seen, SECRET_VALUE,
-        "the agent process holds the exact value"
+        seen.trim(),
+        expected,
+        "the agent process holds the exact value (its sha256 matches)"
     );
 
     // Observation paths.
@@ -1371,18 +1412,36 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     let journal_bytes = wait_for_dir_containing(&worker_state_root, created.id.0.as_bytes()).await;
     let event_log_bytes = wait_for_dir_containing(&host.events_dir, created.id.0.as_bytes()).await;
     let worker_log_bytes = collect_dir_bytes(&worker_log_dir);
+    pohunek_test_support::wait::wait_until("the subscriber to see the session", || async {
+        streamed
+            .lock()
+            .expect("streamed events")
+            .contains(&created.id.0)
+            .then_some(())
+    })
+    .await;
+    collector.abort();
+    let streamed_events = streamed.lock().expect("streamed events").clone();
     let _ = shutdown.send(());
     let _ = handle.await;
     drop(log_guard);
+    // Everything the test host wrote, wherever it landed: the data and host
+    // state, the agents directory, the daemon logs and the worker's whole home
+    // (state, runtime and the session's private directories).
+    let root_bytes = collect_dir_bytes(host.root.path());
+    let worker_home_bytes = collect_dir_bytes(worker_home.path());
     let store_bytes = std::fs::read(&host.store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&host.daemon_log_dir);
 
-    let artifacts: [(&str, &[u8]); 5] = [
+    let artifacts: [(&str, &[u8]); 8] = [
         ("logical store", &store_bytes),
         ("worker journal", &journal_bytes),
         ("event log", &event_log_bytes),
         ("worker structured log", &worker_log_bytes),
         ("daemon structured log", &daemon_log_bytes),
+        ("subscribe stream", streamed_events.as_bytes()),
+        ("test host root", &root_bytes),
+        ("worker home", &worker_home_bytes),
     ];
     for (artifact_name, bytes) in artifacts {
         let text = String::from_utf8_lossy(bytes);
