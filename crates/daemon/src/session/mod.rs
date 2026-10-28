@@ -116,13 +116,13 @@ mod turn_wait;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
 pub use background::ShutdownReport;
-pub use idle_stop::{SessionIdleStopTask, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
+pub use idle_stop::{spawn_idle_stop, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
 pub use package_lifecycle::ensure::{
     detect_official_runtimes, ensure_official_runtimes, plan_official_runtimes, EnsureError,
     EnsureInputs, OfficialPlan, PlannedProfile,
 };
 pub use package_lifecycle::HostTrustAnchor;
-pub use retention::{SessionRetentionTask, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
+pub use retention::{spawn_session_retention, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
 
@@ -190,14 +190,6 @@ const SESSION_RECORD_SCHEMA_VERSION: u32 = crate::store::STORE_SCHEMA_VERSION;
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
 /// its backlog, so a wedged log write can never hang shutdown.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Default bound on how long daemon shutdown waits for in-flight create
-/// transactions ([`SessionRegistryConfig::create_drain_timeout`]).
-///
-/// It stays well inside the daemon's native stop timeout (30 s by default),
-/// so the remaining shutdown steps still fit. A create still running at the
-/// deadline is recovered by startup reconciliation from its durable record.
-const DEFAULT_CREATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default per-session raw-output history cap (10 MB), replayed on attach.
 ///
@@ -589,7 +581,10 @@ pub struct SessionRegistryConfig {
     pub supervision_retry_initial: Duration,
     /// Bound on how long [`SessionRegistry::drain_creates`] waits for the
     /// create transactions still running when daemon shutdown starts.
-    /// Defaults to [`DEFAULT_CREATE_DRAIN_TIMEOUT`].
+    /// The daemon reads it from `deadlines.create_drain_ms` of `service.toml`;
+    /// it defaults to [`pohunek_service_config::DEFAULT_CREATE_DRAIN`]. A create
+    /// still running at the deadline is recovered by startup reconciliation from
+    /// its durable record.
     pub create_drain_timeout: Duration,
     /// Bound on how long [`SessionRegistry::shutdown`] waits for background
     /// tasks and in-flight store writes after cancelling them.
@@ -688,7 +683,7 @@ impl Default for SessionRegistryConfig {
             hook_admission_wait: pohunek_service_config::DEFAULT_HOOK_ADMISSION_WAIT,
             supervision: None,
             supervision_retry_initial: supervision::SUPERVISION_RETRY_INITIAL,
-            create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
+            create_drain_timeout: pohunek_service_config::DEFAULT_CREATE_DRAIN,
             shutdown_timeout: pohunek_service_config::DEFAULT_REGISTRY_SHUTDOWN,
         }
     }
@@ -950,6 +945,9 @@ struct SessionRegistryInner {
 struct CreateTasks {
     tracker: TaskTracker,
     admission: std::sync::Mutex<()>,
+    /// Where the first drain stops waiting; later drains share it, so the
+    /// create drain costs its bound once however often it is called.
+    drain_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 #[cfg(test)]
@@ -2690,7 +2688,17 @@ impl SessionRegistry {
         self.close_creates();
         let creates = &self.inner.creates.tracker;
         let timeout = self.inner.config.create_drain_timeout;
-        if tokio::time::timeout(timeout, creates.wait()).await.is_ok() {
+        let deadline = *self
+            .inner
+            .creates
+            .drain_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| tokio::time::Instant::now() + timeout);
+        if tokio::time::timeout_at(deadline, creates.wait())
+            .await
+            .is_ok()
+        {
             return true;
         }
         warn!(
@@ -2850,17 +2858,21 @@ impl SessionRegistry {
     /// Stops every background task of the registry and waits until none is
     /// left, bounded by [`SessionRegistryConfig::shutdown_timeout`].
     ///
-    /// Shutdown refuses new tasks, cancels the per-session tokens, aborts the
+    /// Creates in flight are drained first (see [`Self::drain_creates`],
+    /// bounded by [`SessionRegistryConfig::create_drain_timeout`]), so each
+    /// commits or compensates before the registry stops writing. Shutdown
+    /// refuses new tasks, cancels the per-session tokens, aborts the
     /// tasks that do not watch one, and awaits them together with the blocking
     /// store writes still in flight. When it returns the registry writes
     /// nothing more: a store write through it is refused with
     /// `registry_shut_down` (and aborts the process in test builds, where it is
     /// always a defect). A task that outlived the deadline is named in the
-    /// report and logged. Daemon shutdown calls it after [`Self::drain_creates`]
-    /// and after the tasks that drive the registry from outside have stopped; a
-    /// test calls it before it opens the next registry over the same store.
+    /// report and logged. Daemon shutdown calls it after the tasks that drive
+    /// the registry from outside have stopped; a test calls it before it opens
+    /// the next registry over the same store.
     pub async fn shutdown(&self) -> ShutdownReport {
         self.begin_daemon_shutdown();
+        self.drain_creates().await;
         let timeout = self.inner.config.shutdown_timeout;
         let report = self.inner.background.shutdown(timeout).await;
         if report.is_quiescent() {
@@ -2874,6 +2886,26 @@ impl SessionRegistry {
             );
         }
         report
+    }
+
+    /// Starts a transaction that runs until the returned sender is dropped or
+    /// used, standing for a store write that does not return.
+    #[cfg(test)]
+    pub(crate) fn hold_transaction_for_test(
+        &self,
+        name: &'static str,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let (release, held) = tokio::sync::oneshot::channel();
+        drop(self.spawn_transaction(name, async move {
+            let _ = held.await;
+        }));
+        release
+    }
+
+    /// Whether [`Self::shutdown`] has waited for the registry's tracked work.
+    #[cfg(test)]
+    pub(crate) fn is_quiescent_for_test(&self) -> bool {
+        self.inner.background.is_quiescent()
     }
 
     /// Aborts the process in test builds; a late write there is always a defect.

@@ -22,11 +22,12 @@ use protocol::{
     SessionRetentionResult,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::SessionRegistry;
+use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 use crate::worktree::WorktreeWork;
 
 /// File name of the durable session policy below the daemon data directory.
@@ -76,12 +77,6 @@ const MAX_REPORTED_CANDIDATES: usize = 200;
 /// default per-sweep removal cap, and a candidate past it is held as unknown
 /// rather than removed, so the bound only delays cleanup to the next sweep.
 pub(super) const MAX_WORKTREE_PROBES_PER_SWEEP: usize = 64;
-
-/// Maximum time to wait for a running sweep during daemon shutdown.
-///
-/// A sweep performs bounded local filesystem work per session. Five seconds
-/// matches the notification retention shutdown budget while bounding exit.
-const RETENTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Mutable retention state owned by one [`SessionRegistry`].
 #[derive(Debug)]
@@ -320,25 +315,26 @@ impl SessionRegistry {
     }
 }
 
-/// Background task that applies the current session retention policy.
-#[derive(Debug)]
-pub struct SessionRetentionTask {
-    shutdown: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-impl SessionRetentionTask {
-    /// Spawns automatic session retention for `sessions`.
-    ///
-    /// The first sweep runs immediately so an upgraded daemon cleans stale
-    /// records without waiting a full interval. Both the enable flag and the
-    /// interval are re-read from the current policy every cycle, so a policy
-    /// change takes effect on the next sweep without a restart.
-    #[must_use]
-    pub fn spawn(sessions: SessionRegistry) -> Self {
-        let shutdown = CancellationToken::new();
-        let task_shutdown = shutdown.clone();
-        let handle = tokio::spawn(async move {
+/// Spawns the task that applies the current session retention policy.
+///
+/// The first sweep runs immediately so an upgraded daemon cleans stale
+/// records without waiting a full interval. Both the enable flag and the
+/// interval are re-read from the current policy every cycle, so a policy
+/// change takes effect on the next sweep without a restart. The task is a
+/// driver of `tasks`: daemon shutdown cancels it and waits for an in-flight
+/// sweep.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "the handle only stops the task before daemon shutdown does"
+)]
+pub fn spawn_session_retention(tasks: &DaemonShutdown, sessions: SessionRegistry) -> DriverHandle {
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    tasks.spawn(
+        "session_retention",
+        Stage::Driver,
+        move || shutdown.cancel(),
+        async move {
             loop {
                 if sessions.retention_policy().enabled {
                     // The sweep runs in its own task so a panic anywhere in the
@@ -363,23 +359,8 @@ impl SessionRetentionTask {
                     () = tokio::time::sleep(interval) => {}
                 }
             }
-        });
-        Self { shutdown, handle }
-    }
-
-    /// Stops the task and waits for any in-flight sweep to finish.
-    pub async fn shutdown(self) {
-        self.shutdown.cancel();
-        match tokio::time::timeout(RETENTION_SHUTDOWN_TIMEOUT, self.handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                warn!(error = %err, "session retention task failed during shutdown");
-            }
-            Err(_) => {
-                warn!("session retention task did not finish within the shutdown timeout");
-            }
-        }
-    }
+        },
+    )
 }
 
 /// Logs the outcome of one automatic sweep, including a panicked one.

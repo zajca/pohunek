@@ -13,11 +13,11 @@ use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, InputTiming, InventoryProbe, KeepaliveTiming, RequiredHook,
-    ServiceConfig, WaitTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES,
-    DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE, DEFAULT_KEEPALIVE_TIMING,
-    DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING, DEFAULT_WORKER_JOURNAL_MAX_AGE,
-    MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES,
-    MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    ServiceConfig, WaitTiming, DEFAULT_CREATE_DRAIN, DEFAULT_EVENT_RETENTION,
+    DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE,
+    DEFAULT_KEEPALIVE_TIMING, DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING,
+    DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE,
+    MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
@@ -172,6 +172,9 @@ fn spec() -> ConfigSpec {
             daemon_exit_timeout: Duration::from_secs(30),
             daemon_restart_throttle: Duration::from_secs(5),
             registry_shutdown: DEFAULT_REGISTRY_SHUTDOWN,
+            create_drain: pohunek_service_config::DEFAULT_CREATE_DRAIN,
+            driver_shutdown: pohunek_service_config::DEFAULT_DRIVER_SHUTDOWN,
+            event_log_flush: pohunek_service_config::DEFAULT_EVENT_LOG_FLUSH,
         },
         environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
         search_path: SearchPath::empty(),
@@ -2934,6 +2937,99 @@ fn non_default_registry_shutdown_round_trips_and_is_not_unknown() {
         DEFAULT_REGISTRY_SHUTDOWN
     );
     assert!(!default.to_toml().contains("registry_shutdown"));
+}
+
+/// The shutdown phase keys are bounded like the other deadlines, optional, and
+/// omitted by the writer while they equal their defaults.
+#[test]
+fn shutdown_phase_keys_round_trip_and_reject_out_of_range() {
+    let fixture = Fixture::new();
+    for key in [
+        "deadlines.create_drain_ms",
+        "deadlines.driver_shutdown_ms",
+        "deadlines.event_log_flush_ms",
+    ] {
+        let line = key.trim_start_matches("deadlines.");
+        for value in [0_u64, 600_001] {
+            match fixture.load(&with_registry_shutdown(&format!("{line} = {value}"))) {
+                Err(ConfigError::OutOfRange {
+                    key: rejected,
+                    value: rejected_value,
+                    min,
+                    max,
+                }) => assert_eq!(
+                    (rejected, rejected_value, min, max),
+                    (key, value, 1, 600_000)
+                ),
+                other => panic!("{key} = {value}: {other:?}"),
+            }
+        }
+    }
+    let loaded = fixture
+        .load(&with_registry_shutdown(
+            "create_drain_ms = 3000\ndriver_shutdown_ms = 2000\nevent_log_flush_ms = 1000",
+        ))
+        .expect("load custom phase bounds");
+    let deadlines = loaded.deadlines();
+    assert_eq!(deadlines.create_drain, Duration::from_secs(3));
+    assert_eq!(deadlines.driver_shutdown, Duration::from_secs(2));
+    assert_eq!(deadlines.event_log_flush, Duration::from_secs(1));
+    assert!(loaded.unknown_keys().is_empty());
+    let rendered = loaded.to_toml();
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+
+    let default = fixture.load(GOLDEN).expect("load the golden file");
+    let rendered = default.to_toml();
+    for key in ["create_drain", "driver_shutdown", "event_log_flush"] {
+        assert!(!rendered.contains(key), "{key} written at its default");
+    }
+    assert_eq!(default.deadlines().create_drain, DEFAULT_CREATE_DRAIN);
+}
+
+/// Phase bounds that do not fit inside `daemon_exit_timeout_ms` are refused,
+/// and the defaults fit the default exit timeout.
+#[test]
+fn phase_bounds_that_exceed_exit_timeout_are_refused() {
+    let fixture = Fixture::new();
+    let default = fixture.load(GOLDEN).expect("load the golden file");
+    default
+        .deadlines()
+        .validate_shutdown_budget()
+        .expect("defaults fit the default exit timeout");
+    for line in [
+        "registry_shutdown_ms = 30000",
+        "create_drain_ms = 20000",
+        "event_log_flush_ms = 600000",
+    ] {
+        let loaded = fixture
+            .load(&with_registry_shutdown(line))
+            .expect("each key is in range on its own");
+        match loaded.deadlines().validate_shutdown_budget() {
+            Err(error @ ConfigError::ShutdownBudget { .. }) => {
+                let message = error.to_string();
+                for key in [
+                    "deadlines.create_drain_ms",
+                    "deadlines.driver_shutdown_ms",
+                    "deadlines.registry_shutdown_ms",
+                    "deadlines.event_log_flush_ms",
+                    "deadlines.daemon_exit_timeout_ms",
+                ] {
+                    assert!(message.contains(key), "{line}: {message}");
+                }
+            }
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+    let lowered = replace(
+        GOLDEN,
+        "daemon_exit_timeout_ms = 30000",
+        "daemon_exit_timeout_ms = 20000",
+    );
+    let loaded = fixture.load(&lowered).expect("load a lowered exit timeout");
+    assert!(matches!(
+        loaded.deadlines().validate_shutdown_budget(),
+        Err(ConfigError::ShutdownBudget { .. })
+    ));
 }
 
 /// Appends a `[worker_journals]` table with `lines` to the golden file, before `[limits]`.

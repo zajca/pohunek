@@ -7,11 +7,7 @@ crates/daemon/src/events/mod.rs 1
 crates/daemon/src/external/mod.rs 1
 crates/daemon/src/external/watch.rs 1
 crates/daemon/src/main.rs 2
-crates/daemon/src/notifications/coordinator.rs 1
-crates/daemon/src/notifications/projector.rs 1
-crates/daemon/src/notifications/retention.rs 1
 crates/daemon/src/runtime/client.rs 1
 crates/daemon/src/runtime/launcher.rs 1
-crates/daemon/src/session/idle_stop.rs 1
-crates/daemon/src/session/retention.rs 2
+crates/daemon/src/session/retention.rs 1
 crates/session-worker/src/input.rs 1

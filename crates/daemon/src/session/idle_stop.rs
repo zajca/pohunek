@@ -27,7 +27,6 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -37,6 +36,7 @@ use super::retention::{
 };
 use super::{RuntimeHandle, SessionEntry, SessionRegistry};
 use crate::notifications::{NotificationError, NotificationService};
+use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 
 /// File name of the durable idle-stop default below the daemon data directory.
 pub const IDLE_STOP_FILE_NAME: &str = "session-idle-stop.json";
@@ -602,27 +602,27 @@ fn write_record(path: &Path, record: IdleStopRecord) -> Result<(), ProtocolError
     }
 }
 
-/// Background task that stops opted-in sessions after their idle limit.
-#[derive(Debug)]
-pub struct SessionIdleStopTask {
-    shutdown: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-/// Maximum time to wait for the task during daemon shutdown.
+/// Spawns the task that stops opted-in sessions after their idle limit.
 ///
-/// One pass performs at most one stop transaction per due session, each bounded
-/// by the worker stop bound; five seconds matches the other background tasks and
-/// bounds the exit when a stop is stuck.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-impl SessionIdleStopTask {
-    /// Spawns idle stop for `sessions`, recording each stop in `notifications`.
-    #[must_use]
-    pub fn spawn(sessions: SessionRegistry, notifications: NotificationService) -> Self {
-        let shutdown = CancellationToken::new();
-        let task_shutdown = shutdown.clone();
-        let handle = tokio::spawn(async move {
+/// The task is a driver of `tasks`: daemon shutdown cancels it and waits for an
+/// in-flight stop, which is one transaction per due session bounded by the
+/// worker stop bound.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "the handle only stops the task before daemon shutdown does"
+)]
+pub fn spawn_idle_stop(
+    tasks: &DaemonShutdown,
+    sessions: SessionRegistry,
+    notifications: NotificationService,
+) -> DriverHandle {
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    tasks.spawn(
+        "session_idle_stop",
+        Stage::Driver,
+        move || shutdown.cancel(),
+        async move {
             let recheck = sessions.inner.config.idle_stop_recheck;
             let mut reported = HashSet::new();
             loop {
@@ -676,21 +676,8 @@ impl SessionIdleStopTask {
                     () = sleep => {}
                 }
             }
-        });
-        Self { shutdown, handle }
-    }
-
-    /// Stops the task and waits for an in-flight stop to finish.
-    pub async fn shutdown(self) {
-        self.shutdown.cancel();
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!(error = %error, "session idle-stop task failed during shutdown");
-            }
-            Err(_) => warn!("session idle-stop task did not finish within the shutdown timeout"),
-        }
-    }
+        },
+    )
 }
 
 /// Stops one due session unless something holds it back; returns `false` when

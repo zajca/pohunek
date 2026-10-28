@@ -5866,6 +5866,7 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
         .set_policy(policy)
         .expect("enable system notifications");
     let (attention, _attention_task) = crate::notifications::AttentionCoordinator::spawn(
+        &crate::shutdown::DaemonShutdown::default(),
         notifications.clone(),
         &released.restarted.registry,
     );

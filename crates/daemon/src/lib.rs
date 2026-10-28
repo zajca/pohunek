@@ -35,6 +35,7 @@ pub mod doctor;
 
 pub mod runtime;
 pub mod session;
+pub mod shutdown;
 
 pub mod agent;
 pub mod detect;

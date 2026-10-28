@@ -23,7 +23,8 @@ use tokio::sync::broadcast;
 use super::turn_wait_tests::{err, every_provider, ok, pause_clock, settle, Fixture, AGENT};
 use crate::agent::host::fixture::official_host;
 use crate::notifications::default_policy;
-use crate::session::{SessionIdleStopTask, SessionRegistryConfig};
+use crate::session::{spawn_idle_stop, SessionRegistryConfig};
+use crate::shutdown::{DaemonShutdown, DriverHandle};
 
 /// The shortest idle time the scenarios' daemon accepts.
 const MIN_SECS: u32 = 5;
@@ -72,7 +73,7 @@ fn system_enabled() -> protocol::NotificationPolicy {
 /// A daemon with live sessions, a paused clock and a running idle-stop task.
 struct World {
     fixture: Fixture,
-    task: Option<SessionIdleStopTask>,
+    task: Option<DriverHandle>,
     events: broadcast::Receiver<protocol::Event>,
     inhibitor: Option<AutoAdvanceInhibitor>,
     clock_paused: bool,
@@ -101,8 +102,12 @@ impl World {
     async fn adopt(fixture: Fixture, sessions: Vec<String>) -> Self {
         let events = fixture.sessions.subscribe();
         let inhibitor = pause_clock().await;
-        let task =
-            SessionIdleStopTask::spawn(fixture.sessions.clone(), fixture.notifications().clone());
+        let tasks = DaemonShutdown::default();
+        let task = spawn_idle_stop(
+            &tasks,
+            fixture.sessions.clone(),
+            fixture.notifications().clone(),
+        );
         settle().await;
         Self {
             fixture,
@@ -276,7 +281,7 @@ impl World {
     /// sessions' working directories in place.
     async fn release_clock(&mut self) {
         if let Some(task) = self.task.take() {
-            task.shutdown().await;
+            task.stop().await;
         }
         if let Some(inhibitor) = self.inhibitor.take() {
             inhibitor.release().await;

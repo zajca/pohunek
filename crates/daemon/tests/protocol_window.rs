@@ -22,6 +22,7 @@ use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::{AttentionCoordinator, NotificationService};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::shutdown::DaemonShutdown;
 use pohunek_test_support::wait::{self, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{method, Request, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
@@ -225,7 +226,7 @@ async fn spawn_server(
         .expect("enable every notification kind");
     // Session-scoped notifications (approval, turn) are debounced by the coordinator.
     let (attention, _attention_task) =
-        AttentionCoordinator::spawn(notifications.clone(), &registry);
+        AttentionCoordinator::spawn(&DaemonShutdown::default(), notifications.clone(), &registry);
     let state = DaemonState::new(
         HealthInfo::new("0.0.0"),
         registry,

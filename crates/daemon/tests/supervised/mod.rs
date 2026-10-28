@@ -1176,7 +1176,11 @@ fn service_config(
             worker_exit_timeout: settings.worker_exit,
             daemon_exit_timeout: settings.daemon_exit,
             daemon_restart_throttle: settings.restart_throttle,
-            registry_shutdown: settings.daemon_exit,
+            // Four phases of an eighth each plus the margin fit the exit timeout.
+            registry_shutdown: settings.daemon_exit / 8,
+            create_drain: settings.daemon_exit / 8,
+            driver_shutdown: settings.daemon_exit / 8,
+            event_log_flush: settings.daemon_exit / 8,
         },
         environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
             .iter()

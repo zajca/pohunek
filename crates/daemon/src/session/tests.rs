@@ -22643,6 +22643,36 @@ async fn daemon_shutdown_drains_an_in_flight_create() {
     assert_eq!(daemon.bindings().len(), 1, "its worktree stays owned");
 }
 
+#[tokio::test]
+async fn registry_shutdown_drains_an_in_flight_create_without_drain_creates() {
+    let daemon = RestartableDaemon::new("wt-shutdown-drain");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/shutdown-drained");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, _worktree) = daemon.intent_and_worktree();
+
+    let mut shutdown = Box::pin(registry.shutdown());
+    assert!(
+        futures::poll!(shutdown.as_mut()).is_pending(),
+        "shutdown waits for the in-flight create"
+    );
+    gate.release.notify_one();
+
+    let report = shutdown.await;
+    assert!(report.is_quiescent(), "{report:?}");
+    creating
+        .await
+        .expect("create task joins")
+        .expect("the drained create commits");
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the create committed");
+}
+
 /// Connect deadline and drain timeout an already-exited worker must never
 /// wait for.
 const NEVER: Duration = Duration::from_secs(600);
@@ -22822,6 +22852,44 @@ async fn create_drain_gives_up_at_its_deadline() {
     );
     daemon.intent_and_worktree();
 
+    gate.release.notify_one();
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the create commits after the drain gave up");
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+#[tokio::test]
+async fn repeated_create_drains_share_one_deadline() {
+    let daemon = RestartableDaemon::new("wt-drain-shared-deadline");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        // timing-allowed: #1625 the drain bound is the policy under test, on a paused clock
+        create_drain_timeout: Duration::from_secs(10),
+        ..daemon.config.clone()
+    });
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/drain-twice");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    registry.begin_daemon_shutdown();
+    tokio::time::pause();
+
+    let started = tokio::time::Instant::now();
+    assert!(!registry.drain_creates().await);
+    let first = started.elapsed();
+    assert!(first >= Duration::from_secs(10), "{first:?}");
+    assert!(!registry.drain_creates().await);
+    assert_eq!(
+        started.elapsed(),
+        first,
+        "a second drain does not wait the bound again"
+    );
+
+    tokio::time::resume();
     gate.release.notify_one();
     let created = creating
         .await

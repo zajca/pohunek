@@ -27,20 +27,20 @@ use tokio::sync::broadcast;
 
 use crate::session::{rfc3339_from_nanos, TurnId, TurnSnapshot};
 
-pub(crate) use coordinator::ResolveAsOf;
 #[doc(inline)]
-pub use coordinator::{AttentionCoordinator, AttentionCoordinatorTask};
+pub use coordinator::AttentionCoordinator;
+pub(crate) use coordinator::ResolveAsOf;
 #[doc(inline)]
 pub use policy::{
     default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEBOUNCE_SECS,
     DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
 };
 #[doc(inline)]
-pub use projector::{attention_dedupe_key, turn_dedupe_key, NotificationProjector};
+pub use projector::{attention_dedupe_key, spawn_projector, turn_dedupe_key};
 #[cfg(test)]
 pub(crate) use projector::{resync_with_fresh_state, SEED_RETRY_DELAY};
 #[doc(inline)]
-pub use retention::NotificationRetentionTask;
+pub use retention::spawn_notification_retention;
 #[doc(inline)]
 pub use store::NOTIFICATIONS_SUBDIR;
 
