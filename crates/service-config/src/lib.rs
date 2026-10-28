@@ -699,22 +699,86 @@ impl Deadlines {
             .saturating_add(self.event_log_flush)
     }
 
-    /// Checks that the shutdown phases and [`SHUTDOWN_MARGIN`] fit inside
-    /// `daemon_exit_timeout`.
+    /// The shutdown phase bounds sized to fit inside `daemon_exit_timeout`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigError::ShutdownBudget`] naming the keys when they do not.
-    pub fn validate_shutdown_budget(&self) -> Result<(), ConfigError> {
-        let phases = self.shutdown_phases_total();
-        if phases.saturating_add(SHUTDOWN_MARGIN) > self.daemon_exit_timeout {
-            return Err(ConfigError::ShutdownBudget {
-                phases_ms: millis(phases),
-                margin_ms: millis(SHUTDOWN_MARGIN),
-                exit_timeout_ms: millis(self.daemon_exit_timeout),
-            });
+    /// Bounds whose sum plus [`SHUTDOWN_MARGIN`] fits are returned as
+    /// configured. Otherwise each is shortened in proportion so that the sum
+    /// fits (at least 1 ms each), and the result carries the shortfall for the
+    /// caller to report. A file stays valid either way.
+    #[must_use]
+    pub fn fitted_shutdown(&self) -> FittedShutdown {
+        let total = self.shutdown_phases_total();
+        let required = total.saturating_add(SHUTDOWN_MARGIN);
+        if required <= self.daemon_exit_timeout {
+            return FittedShutdown {
+                create_drain: self.create_drain,
+                driver_shutdown: self.driver_shutdown,
+                registry_shutdown: self.registry_shutdown,
+                event_log_flush: self.event_log_flush,
+                shortfall: None,
+            };
         }
-        Ok(())
+        let available = self
+            .daemon_exit_timeout
+            .checked_sub(SHUTDOWN_MARGIN)
+            .unwrap_or(self.daemon_exit_timeout / 2);
+        let scale = |phase: Duration| {
+            let scaled = u128::from(millis(phase)) * u128::from(millis(available))
+                / u128::from(millis(total).max(1));
+            Duration::from_millis(u64::try_from(scaled).unwrap_or(u64::MAX).max(1))
+        };
+        FittedShutdown {
+            create_drain: scale(self.create_drain),
+            driver_shutdown: scale(self.driver_shutdown),
+            registry_shutdown: scale(self.registry_shutdown),
+            event_log_flush: scale(self.event_log_flush),
+            shortfall: Some(ShutdownShortfall {
+                required,
+                exit_timeout: self.daemon_exit_timeout,
+            }),
+        }
+    }
+}
+
+/// Shutdown phase bounds after fitting them to the exit timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FittedShutdown {
+    /// Bound of the create drain.
+    pub create_drain: Duration,
+    /// Bound of the driver phase.
+    pub driver_shutdown: Duration,
+    /// Bound of the registry phase.
+    pub registry_shutdown: Duration,
+    /// Bound of the event-log flush.
+    pub event_log_flush: Duration,
+    /// Set when the configured bounds did not fit and were shortened.
+    pub shortfall: Option<ShutdownShortfall>,
+}
+
+/// The configured shutdown bounds need more time than the exit timeout allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownShortfall {
+    /// Sum of the configured phase bounds plus [`SHUTDOWN_MARGIN`]; the least
+    /// `daemon_exit_timeout_ms` that runs them unshortened.
+    pub required: Duration,
+    /// The configured `deadlines.daemon_exit_timeout_ms`.
+    pub exit_timeout: Duration,
+}
+
+impl std::fmt::Display for ShutdownShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "deadlines.daemon_exit_timeout_ms = {} is below the {} ms the configured shutdown \
+             phases need (create_drain_ms, driver_shutdown_ms, registry_shutdown_ms and \
+             event_log_flush_ms plus a {} ms margin); the phase bounds are shortened in \
+             proportion to fit. Raise daemon_exit_timeout_ms to at least {} or lower the phase \
+             bounds",
+            millis(self.exit_timeout),
+            millis(self.required),
+            millis(SHUTDOWN_MARGIN),
+            millis(self.required),
+        )
     }
 }
 

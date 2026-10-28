@@ -46,6 +46,9 @@ const JOB_FAILED: &str = "failed";
 /// Name of the check that reports `service.toml` keys this version does not know.
 const SERVICE_CONFIG_UNKNOWN_KEYS_CHECK: &str = "service_config_unknown_keys";
 
+/// Name of the check that reports shutdown bounds that do not fit the exit timeout.
+const SHUTDOWN_BUDGET_CHECK: &str = "service_config_shutdown_budget";
+
 /// Name of the check that reports `overlays.toml` and compares it with the daemon.
 const OVERLAY_CONFIG_CHECK: &str = "overlay_config";
 
@@ -115,6 +118,7 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
     let platform = hostcheck::current_platform();
     checks.extend(working_directory_check(platform, &working_dir));
     checks.extend(service_config_unknown_keys_check(&paths.config_dir));
+    checks.extend(shutdown_budget_check(&paths.config_dir));
     let job_status = if platform == Platform::MacOs {
         Some(crate::service::status().await)
     } else {
@@ -306,6 +310,29 @@ fn service_config_unknown_keys_check(config_dir: &Path) -> Option<DoctorCheck> {
             ),
         },
     )
+}
+
+/// Reports shutdown phase bounds that do not fit `daemon_exit_timeout_ms`.
+///
+/// The check is `warn` and names the configured exit timeout and the least one
+/// that runs the phases unshortened; the daemon shortens them to fit and keeps
+/// starting. Nothing is reported without an installed file or when it cannot be
+/// loaded; `pohunek service status` reports that.
+fn shutdown_budget_check(config_dir: &Path) -> Option<DoctorCheck> {
+    let config = pohunek_service_config::ServiceConfig::load(
+        &config_dir.join(pohunek_service_config::FILE_NAME),
+    )
+    .ok()?;
+    Some(match config.deadlines().fitted_shutdown().shortfall {
+        Some(shortfall) => {
+            DoctorCheck::new(SHUTDOWN_BUDGET_CHECK, Status::Warn, shortfall.to_string())
+        }
+        None => DoctorCheck::new(
+            SHUTDOWN_BUDGET_CHECK,
+            Status::Ok,
+            "the daemon shutdown phases fit inside daemon_exit_timeout_ms",
+        ),
+    })
 }
 
 /// The supervision mode this process can infer for the daemon.
@@ -922,6 +949,30 @@ open_files = 8192
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
             .expect("chmod service.toml");
         (guard, base)
+    }
+
+    #[test]
+    fn doctor_warns_when_shutdown_bounds_exceed_the_exit_timeout() {
+        let (_guard, fits) = config_dir_with(&service_toml(""));
+        let check = shutdown_budget_check(&fits).expect("a check for a fitting file");
+        assert_eq!(check.name, "service_config_shutdown_budget");
+        assert_eq!(check.status, Status::Ok);
+
+        let (_low_guard, low) = config_dir_with(&service_toml("").replace(
+            "daemon_exit_timeout_ms = 30000",
+            "daemon_exit_timeout_ms = 20000",
+        ));
+        let check = shutdown_budget_check(&low).expect("a check for a low exit timeout");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("daemon_exit_timeout_ms = 20000"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("27000"), "{}", check.detail);
+
+        let (_missing_guard, missing) = unique_temp_dir();
+        assert!(shutdown_budget_check(&missing).is_none());
     }
 
     #[test]

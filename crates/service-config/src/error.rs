@@ -148,23 +148,6 @@ pub enum ConfigError {
         /// The recorded ceiling in milliseconds.
         max_ms: u64,
     },
-    /// The daemon's shutdown phase bounds do not fit inside its exit timeout.
-    #[error(
-        "service config keys deadlines.create_drain_ms, deadlines.driver_shutdown_ms, \
-         deadlines.registry_shutdown_ms and deadlines.event_log_flush_ms add up to \
-         {phases_ms} ms plus a {margin_ms} ms margin, which exceeds \
-         deadlines.daemon_exit_timeout_ms = {exit_timeout_ms}; the service manager would \
-         kill the daemon before its shutdown finished. Lower the phase bounds or raise \
-         deadlines.daemon_exit_timeout_ms"
-    )]
-    ShutdownBudget {
-        /// Sum of the four phase bounds in milliseconds.
-        phases_ms: u64,
-        /// Margin kept free of phase bounds in milliseconds.
-        margin_ms: u64,
-        /// The recorded `deadlines.daemon_exit_timeout_ms`.
-        exit_timeout_ms: u64,
-    },
     /// A duration cannot be recorded as whole milliseconds.
     #[error("service config key {key} must be a whole number of milliseconds")]
     Precision {

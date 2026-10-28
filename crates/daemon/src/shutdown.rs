@@ -7,7 +7,7 @@
 //! phases: in-flight creates, the drivers, the registry, the event logs. Each
 //! phase has its own bound from `service.toml`, and the bounds together fit
 //! inside the service manager's exit timeout (see
-//! `Deadlines::validate_shutdown_budget`), so a slow phase cannot push the
+//! `Deadlines::fitted_shutdown`), so a slow phase cannot push the
 //! event-log flush past the kill.
 //!
 //! Drivers are cooperative: shutdown asks them to stop and waits. A driver
@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use pohunek_service_config::{
-    Deadlines, DEFAULT_CREATE_DRAIN, DEFAULT_DRIVER_SHUTDOWN, DEFAULT_EVENT_LOG_FLUSH,
-    DEFAULT_REGISTRY_SHUTDOWN,
+    Deadlines, ShutdownShortfall, DEFAULT_CREATE_DRAIN, DEFAULT_DRIVER_SHUTDOWN,
+    DEFAULT_EVENT_LOG_FLUSH, DEFAULT_REGISTRY_SHUTDOWN,
 };
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
@@ -84,17 +84,22 @@ pub struct ShutdownPlan {
     pub registry_shutdown: Duration,
     /// Bound of [`ShutdownPhase::EventLogs`].
     pub event_log_flush: Duration,
+    /// Set when the bounds `service.toml` records did not fit the exit timeout
+    /// and were shortened.
+    pub shortfall: Option<ShutdownShortfall>,
 }
 
 impl ShutdownPlan {
-    /// The bounds `service.toml` records.
+    /// The bounds `service.toml` records, fitted to its exit timeout.
     #[must_use]
     pub fn from_deadlines(deadlines: &Deadlines) -> Self {
+        let fitted = deadlines.fitted_shutdown();
         Self {
-            create_drain: deadlines.create_drain,
-            driver_shutdown: deadlines.driver_shutdown,
-            registry_shutdown: deadlines.registry_shutdown,
-            event_log_flush: deadlines.event_log_flush,
+            create_drain: fitted.create_drain,
+            driver_shutdown: fitted.driver_shutdown,
+            registry_shutdown: fitted.registry_shutdown,
+            event_log_flush: fitted.event_log_flush,
+            shortfall: fitted.shortfall,
         }
     }
 }
@@ -107,6 +112,7 @@ impl Default for ShutdownPlan {
             driver_shutdown: DEFAULT_DRIVER_SHUTDOWN,
             registry_shutdown: DEFAULT_REGISTRY_SHUTDOWN,
             event_log_flush: DEFAULT_EVENT_LOG_FLUSH,
+            shortfall: None,
         }
     }
 }
@@ -126,6 +132,8 @@ pub struct PhaseReport {
 pub struct DaemonShutdownReport {
     /// One entry per phase, in the order the phases ran.
     pub phases: Vec<PhaseReport>,
+    /// Set when the phase bounds were shortened to fit the exit timeout.
+    pub shortened: Option<ShutdownShortfall>,
 }
 
 impl DaemonShutdownReport {
@@ -397,7 +405,13 @@ impl DaemonShutdown {
             still_running: stop_stage(&slots, Stage::EventLog, deadline).await,
         });
 
-        let report = DaemonShutdownReport { phases };
+        let report = DaemonShutdownReport {
+            phases,
+            shortened: plan.shortfall,
+        };
+        if let Some(shortfall) = &report.shortened {
+            warn!(%shortfall, "daemon shutdown ran with shortened phase bounds");
+        }
         for phase in &report.phases {
             if phase.still_running.is_empty() {
                 debug!(
@@ -632,6 +646,39 @@ mod tests {
             plan.create_drain + started.elapsed() + SHUTDOWN_MARGIN <= SERVICE_EXIT_TIMEOUT,
             "every phase at its bound still ends before the service manager's kill"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shortened_plan_finishes_inside_the_short_exit_timeout_and_says_so() {
+        let shortfall = ShutdownShortfall {
+            required: Duration::from_secs(27),
+            exit_timeout: Duration::from_secs(12),
+        };
+        let plan = ShutdownPlan {
+            create_drain: Duration::from_secs(3),
+            driver_shutdown: Duration::from_secs(2),
+            registry_shutdown: Duration::from_secs(2),
+            event_log_flush: Duration::from_secs(2),
+            shortfall: Some(shortfall),
+        };
+        let tasks = DaemonShutdown::new(plan);
+        let sessions = registry(plan);
+        tasks.spawn(
+            "wedged_driver",
+            Stage::Driver,
+            || {},
+            std::future::pending(),
+        );
+        let _wedged_write = sessions.hold_transaction_for_test("wedged_store_write");
+        let wedged_log = tokio::spawn(std::future::pending());
+        tasks.adopt("wedged_event_log", Stage::EventLog, || {}, wedged_log);
+        let started = Instant::now();
+
+        let report = tasks.run(&sessions).await;
+
+        assert_eq!(report.shortened, Some(shortfall));
+        assert_eq!(report.still_running().len(), 3, "{report:?}");
+        assert!(started.elapsed() + SHUTDOWN_MARGIN <= shortfall.exit_timeout);
     }
 
     #[tokio::test(start_paused = true)]

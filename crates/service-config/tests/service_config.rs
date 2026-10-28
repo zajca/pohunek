@@ -2986,50 +2986,54 @@ fn shutdown_phase_keys_round_trip_and_reject_out_of_range() {
     assert_eq!(default.deadlines().create_drain, DEFAULT_CREATE_DRAIN);
 }
 
-/// Phase bounds that do not fit inside `daemon_exit_timeout_ms` are refused,
-/// and the defaults fit the default exit timeout.
+/// Phase bounds that do not fit inside `daemon_exit_timeout_ms` load, are
+/// shortened to fit, and report the shortfall; the defaults fit untouched.
 #[test]
-fn phase_bounds_that_exceed_exit_timeout_are_refused() {
+fn phase_bounds_that_exceed_exit_timeout_are_fitted_and_reported() {
     let fixture = Fixture::new();
     let default = fixture.load(GOLDEN).expect("load the golden file");
-    default
-        .deadlines()
-        .validate_shutdown_budget()
-        .expect("defaults fit the default exit timeout");
-    for line in [
-        "registry_shutdown_ms = 30000",
-        "create_drain_ms = 20000",
-        "event_log_flush_ms = 600000",
-    ] {
-        let loaded = fixture
-            .load(&with_registry_shutdown(line))
-            .expect("each key is in range on its own");
-        match loaded.deadlines().validate_shutdown_budget() {
-            Err(error @ ConfigError::ShutdownBudget { .. }) => {
-                let message = error.to_string();
-                for key in [
-                    "deadlines.create_drain_ms",
-                    "deadlines.driver_shutdown_ms",
-                    "deadlines.registry_shutdown_ms",
-                    "deadlines.event_log_flush_ms",
-                    "deadlines.daemon_exit_timeout_ms",
-                ] {
-                    assert!(message.contains(key), "{line}: {message}");
-                }
-            }
-            other => panic!("{line}: {other:?}"),
-        }
-    }
+    let fitted = default.deadlines().fitted_shutdown();
+    assert_eq!(fitted.shortfall, None);
+    assert_eq!(fitted.create_drain, DEFAULT_CREATE_DRAIN);
+    assert_eq!(fitted.registry_shutdown, DEFAULT_REGISTRY_SHUTDOWN);
+
     let lowered = replace(
         GOLDEN,
         "daemon_exit_timeout_ms = 30000",
         "daemon_exit_timeout_ms = 20000",
     );
-    let loaded = fixture.load(&lowered).expect("load a lowered exit timeout");
-    assert!(matches!(
-        loaded.deadlines().validate_shutdown_budget(),
-        Err(ConfigError::ShutdownBudget { .. })
-    ));
+    let loaded = fixture
+        .load(&lowered)
+        .expect("a lowered exit timeout loads");
+    let fitted = loaded.deadlines().fitted_shutdown();
+    let shortfall = fitted.shortfall.expect("the defaults need 27000 ms");
+    assert_eq!(shortfall.required, Duration::from_secs(27));
+    assert_eq!(shortfall.exit_timeout, Duration::from_secs(20));
+    let total = fitted.create_drain
+        + fitted.driver_shutdown
+        + fitted.registry_shutdown
+        + fitted.event_log_flush;
+    assert!(
+        total + Duration::from_secs(2) <= Duration::from_secs(20),
+        "{total:?}"
+    );
+    assert!(
+        fitted.create_drain > fitted.registry_shutdown,
+        "proportions are kept"
+    );
+    let message = shortfall.to_string();
+    assert!(
+        message.contains("daemon_exit_timeout_ms = 20000"),
+        "{message}"
+    );
+    assert!(message.contains("27000"), "{message}");
+
+    let huge = fixture
+        .load(&with_registry_shutdown("registry_shutdown_ms = 600000"))
+        .expect("an oversized phase bound loads");
+    let fitted = huge.deadlines().fitted_shutdown();
+    assert!(fitted.shortfall.is_some());
+    assert!(fitted.registry_shutdown < Duration::from_secs(28));
 }
 
 /// Appends a `[worker_journals]` table with `lines` to the golden file, before `[limits]`.

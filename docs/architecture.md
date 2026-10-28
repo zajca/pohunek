@@ -511,9 +511,12 @@ phases, each inside its own bound from `[deadlines]` in `service.toml`:
 defers and resolves they hand over are accepted), `registry_shutdown_ms` and
 `event_log_flush_ms` (the drains flush last, so a slow phase before them cannot
 lose buffered audit events). All four are optional (10 s, 5 s, 5 s and 5 s by
-default). Their sum plus a 2 s margin must fit inside `daemon_exit_timeout_ms`,
-the service manager's stop timeout; the daemon refuses to start on a file that
-does not fit, with an error naming the keys. A driver is stopped, not aborted,
+default). Their sum plus a 2 s margin should fit inside `daemon_exit_timeout_ms`,
+the service manager's stop timeout. A file that does not fit still starts the
+daemon: it logs a warning, shortens the phase bounds in proportion so they do
+fit, says so in the shutdown report, and `pohunek doctor` reports
+`service_config_shutdown_budget` as `warn` with the configured exit timeout and
+the least one that runs the phases unshortened. A driver is stopped, not aborted,
 and a driver still running at its phase bound is named in the log and left to
 finish, so a store transaction it holds is not cut in half. The registry phase
 calls `SessionRegistry::shutdown`, which drains creates itself, refuses
