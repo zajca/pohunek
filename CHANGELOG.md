@@ -2,6 +2,12 @@
 
 User-facing changes of pohunek.
 
+## 0.38.0 - 2026-10-28
+
+### Changed
+
+- The daemon now stops its session registry's background work before it exits, bounded by the optional `deadlines.registry_shutdown_ms` key of `service.toml` (1 to 600000 ms, 5000 ms when absent), and refuses store writes made after that, and a worker no longer rewrites its journal after the terminal outcome is committed except to record the terminal acknowledgement. ([#1592](https://github.com/zajca/pohunek/issues/1592))
+
 ## 0.37.1 - 2026-10-27
 
 ### Fixed

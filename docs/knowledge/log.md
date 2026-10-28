@@ -5,6 +5,63 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.38.0
+
+### 2026-10-28, package commands descriptor, #1690
+
+- A package descriptor can export named commands (`[commands.<name>]` with `program`, `args` and `expose = "local" | "peers"`) next to a runtime or on its own. The export is gated by the `package-commands-v1` runtime feature, so `requires = ["package-commands-v1"]` is mandatory and an older core refuses the archive with `runtime_feature_unsupported`. A package that exports commands only serves no runtime: `package.install` and `package.link` report `runtime` absent and the new `commands` list, the install review prints every command's program, arguments and exposure (a `peers` command is shown as callable by every overlay peer the overlay policy admits), and nothing runs yet. See [Declaring package commands](guides/runtime-packages.md#declaring-package-commands). A request must opt in with `accept_commands` (advertised as the `package_install_commands_supported` host capability) for a descriptor that declares commands; otherwise it is refused with `package_commands_client_unsupported` before any write, a dry run included. A command-only package under catalog trust is refused with `package_untrusted`.
+
+### 2026-10-28, session.new secret_env, #1691
+
+- `session.new` accepts `secret_env`, a map of variable name to value for the agent process. The host profile declares the names (`secret_env = ["NAME"]`), the request supplies only the values, and every declared name is required on every launch. The values are never persisted, listed or logged, so resume, fork and relay launches of such a profile fail with `secret_env_missing`. Clients check `HostCapabilities.session_new_secret_env_supported` first. See [Agent profiles](concepts/agent-profiles.md) and [secrets](safety/secrets.md).
+
+### 2026-10-27, runtime features for out-of-tree runtimes, #1645
+
+- A runtime descriptor can read a numeric `1.4.13-R2` release (`semver-revision-line-v1`, feature `version-probe-revision-v1`), set literal launch and probe environment variables (`[launch_env]`, feature `launch-env-v1`) and name its config home below a variable's value (`[config_home] subdir`, feature `config-home-subdir-v1`). Each is listed in the descriptor's `requires`; core refuses a descriptor that uses one without it with `runtime_feature_unsupported`. See [Runtime features](guides/runtime-packages.md#runtime-features), [Launch environment](guides/runtime-packages.md#launch-environment) and [Declaring a version probe](guides/runtime-packages.md#declaring-a-version-probe).
+
+### 2026-10-27, per-launch input seam, #1648
+
+- An integration handler can contribute per-launch input (environment pairs, root-position arguments, private files) that core validates, places in the session's worker state directory as `launch-input.<name>`, and applies to every create, resume and fork without storing it in the resume snapshot. A refused contribution fails the launch with `runtime/launch_input_invalid` or `runtime/launch_input_unavailable`. No handler contributes yet. See [Per-launch input](guides/runtime-packages.md#per-launch-input).
+
+### 2026-10-27, Muse Code hook handler, #1648
+
+- The `integration-muse-hook-v1` runtime feature adds the `muse-hook-v1` handler: every Muse launch gets a session-private managed hooks overlay and the `-c managed_hooks_env_vars` argument as per-launch input, `integration install`, `status` and `uninstall` write nothing into the Muse config home, and a stateless reporter reports the root session and provider subagents to the worker. New refusals: `runtime/integration_overlay_unavailable` (an unreadable, oversized or unparsable managed hooks file) and `runtime/integration_launch_arg_conflict`. The payload fixtures are derived from the Muse documentation and the MIT SDK and are marked unverified. See [Hook schemas and integration handlers](guides/runtime-packages.md#hook-schemas-and-integration-handlers).
+
+### 2026-10-27, transcripts below a data root, #1649
+
+- A runtime descriptor can keep its session logs outside the config home (`[transcripts] root_env`, `root_home`, `max_depth`), read dated session logs with the `muse-session-v1` parser, and verify a hook reference through a directory named after it (`[native_reference.existence] dir_name`). All three are feature `transcripts-data-root-v1`; core refuses a descriptor that uses one without it in `requires` with `runtime_feature_unsupported`. See [Transcripts outside the config home](guides/runtime-packages.md#transcripts-outside-the-config-home).
+
+### 2026-10-27, launch_env key policy, #1667
+
+- `[launch_env]` values are a closed set of flag literals (`0`, `1`, `true`, `false`); widening the set needs a new feature id. Names inside the runtime's namespace are refused when any `_`-separated word is secret-, location-, identity- or code-shaped (a second layer behind the value rule), and the refused runtime namespaces cover the C library, toolchains, TLS, container, cloud and version-manager families; a runtime such as `goose` keeps a usable table because only `GO_` and the exact Go variable names are refused. See [Launch environment](guides/runtime-packages.md#launch-environment).
+
+### 2026-10-26, Linux cgroup containment of the lost-runtime sweep, #186
+
+- On Linux the worker journals its unified cgroup path as the optional `worker_control_group` (no schema bump). The sweep of a lost runtime ignores an unreadable-marker process whose cgroup lies outside the `user@<uid>.service` subtree of that path (Docker scopes, logind session scopes), so such bystanders no longer make `session rm` refuse with `runtime_supervision_ambiguous`. Processes inside the user manager still keep the cleanup unconfirmed, as does a journal without the field. The evidence only excludes; it adds no kill path. See [sessions](concepts/sessions.md) and [architecture](concepts/architecture.md).
+
+### 2026-10-26, contributor path, #1587
+
+- `scripts/dev-bootstrap` reads the Hermes test interpreter pins from the `hermes-test-python` composite action that `ci.yml` calls. Unreadable pins fail only the `hermes-test-python` row (`config-error`) and never abort the other rows or paths. A new `docs` path covers a documentation-only change (`cargo xtask docs check`).
+- The contributor docs list the required CI checks. The review gate is an `opus-pr-review:v1` marker comment authored by `zajca` at the exact head; an outside contribution also needs the maintainer's explicit approval.
+
+### 2026-10-26, plugins live outside core, #1611
+
+- New plugins (runtime packages and workflow plugins) are never added to this repository: an official plugin lives in `pohunekd/plugin-<name>`, a third-party plugin in its author's account, and a plugin becomes installable by id through a pull request to `pohunekd/pohunek-plugin-index`. The rule, naming, required CI, compatibility declaration, index admission, release snapshot and documentation split are in the [plugin repositories guide](guides/plugin-repositories.md). The kit, template and index are available from a later release.
+- `cargo xtask docs check` fails a new top-level directory under `runtime-packages/` or `compat/` (`plugin-directories`); the four official runtimes pass until they move.
+
+### 2026-10-26, runtime feature registry, #1612
+
+- A runtime descriptor can list core capabilities in a top-level `requires` array. An id the core does not implement, or a gated key or compiled id used without its feature, is refused with `runtime_feature_unsupported`. The core keeps an append-only table of features; the table starts empty and each Muse core change adds its own row. See [Runtime features](guides/runtime-packages.md#runtime-features).
+
+### 2026-10-26, 0.38 boundary rulings, #1626
+
+- The architecture records that plugins live outside core, that herd orchestration stays outside the daemon (core keeps only the `spawned_by` attribution and durable session metadata, neither shipped yet), and the full list of crates a Rust client links (`netbird`, `overlay` and `overlay-tailscale` included).
+- The unknown-enum policy gains the same-release rule: a release adds values only to enums the previous release already decodes tolerantly in both the Rust client and the TypeScript SDK; the other enums need a protocol bump and an N-1 adapter, and the bump-only enums get no new value. The rule is in "Unknown enum values from a newer daemon" of `docs/architecture.md`.
+
+### 2026-10-25, changelog, #1588
+
+- `scripts/release` folds the `changelog.d/` fragments into the committed `CHANGELOG.md` in the release commit, next to the knowledge-log fold. It refuses a candidate that still holds fragments or has no folded section for its version, and `--dry-run` prints the section the release body will carry.
+
 ## 0.37.1
 
 ### 2026-10-27, 0.37.1 upgrade and rollback notes, #1642, #1388

@@ -1,3 +1,0 @@
-## Unreleased (2026-10-27, launch_env key policy, #1667)
-
-- `[launch_env]` values are a closed set of flag literals (`0`, `1`, `true`, `false`); widening the set needs a new feature id. Names inside the runtime's namespace are refused when any `_`-separated word is secret-, location-, identity- or code-shaped (a second layer behind the value rule), and the refused runtime namespaces cover the C library, toolchains, TLS, container, cloud and version-manager families; a runtime such as `goose` keeps a usable table because only `GO_` and the exact Go variable names are refused. See [Launch environment](guides/runtime-packages.md#launch-environment).

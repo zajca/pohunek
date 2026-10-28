@@ -1,3 +1,0 @@
-## Unreleased (2026-10-26, Linux cgroup containment of the lost-runtime sweep, #186)
-
-- On Linux the worker journals its unified cgroup path as the optional `worker_control_group` (no schema bump). The sweep of a lost runtime ignores an unreadable-marker process whose cgroup lies outside the `user@<uid>.service` subtree of that path (Docker scopes, logind session scopes), so such bystanders no longer make `session rm` refuse with `runtime_supervision_ambiguous`. Processes inside the user manager still keep the cleanup unconfirmed, as does a journal without the field. The evidence only excludes; it adds no kill path. See [sessions](concepts/sessions.md) and [architecture](concepts/architecture.md).
