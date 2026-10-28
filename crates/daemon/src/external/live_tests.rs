@@ -18,7 +18,9 @@ use protocol::RuntimeRef;
 
 use crate::agent::host::TranscriptParser;
 
-use super::watch::{TranscriptWatch, WatcherDegraded, RECONCILE_INTERVAL};
+use tokio_util::sync::CancellationToken;
+
+use super::watch::{RootScan, TranscriptWatch, WatcherDegraded, RECONCILE_INTERVAL};
 use super::{
     start_transcript_index, ExternalSessions, TranscriptIndex, TranscriptRoot, WatcherHandle,
 };
@@ -643,6 +645,30 @@ fn write_session_log(tree: &Path, day: &str, name: &str) -> PathBuf {
     path
 }
 
+/// Creates the session directories of every day in `days` below `tree`.
+fn create_dated_session_dirs(tree: &Path, days: &[&str]) {
+    for day in days {
+        for number in 0..SESSIONS_PER_DAY {
+            fs::create_dir_all(tree.join(day).join(session_name(number))).expect("session dir");
+        }
+    }
+}
+
+/// Creates subagent directories below the newest sessions of `day`: registered
+/// under the session watches they would exhaust the backend-wide budget, and
+/// the parser reads nothing there.
+fn create_subagent_dirs(tree: &Path, day: &str) {
+    for number in SESSIONS_PER_DAY - NEWEST_WITH_SUBAGENTS..SESSIONS_PER_DAY {
+        for subagent in 0..SUBAGENTS_PER_SESSION {
+            let dir = tree
+                .join(day)
+                .join(session_name(number))
+                .join(format!("subagents/s{subagent}"));
+            fs::create_dir_all(dir).expect("subagent dir");
+        }
+    }
+}
+
 /// A dated tree whose descriptor declares a `max_depth` that would reach the
 /// subagent directories: the walk and the share of session watches follow the
 /// parser, never the larger bound.
@@ -657,6 +683,28 @@ fn dated_root(path: &Path) -> TranscriptRoot {
 }
 
 #[tokio::test]
+async fn a_pass_over_a_dated_tree_larger_than_its_bound_leaves_the_older_day() {
+    let base = pohunek_test_support::tempdir().expect("base");
+    let dated = base.path().join("muse/sessions");
+    let (old_day, new_day) = ("2026/09/01", "2026/10/09");
+    create_dated_session_dirs(&dated, &[new_day, old_day]);
+    create_subagent_dirs(&dated, new_day);
+    // The lowest session of each day has a log. The pass visits the highest
+    // names first and stops at its directory bound inside the older day, so
+    // only the newest day's is indexed.
+    let new_day_log = write_session_log(&dated, new_day, &session_name(0));
+    let old_day_log = write_session_log(&dated, old_day, &session_name(0));
+    let index = TranscriptIndex::default();
+    let scans = index
+        .scan_roots(vec![dated_root(&dated)], CancellationToken::new())
+        .await;
+    assert_eq!(scans, [RootScan::Incomplete]);
+    let indexed = |path: &Path| index.inner.lock().expect("index").contains_key(path);
+    assert!(indexed(&new_day_log), "the newest day is visited first");
+    assert!(!indexed(&old_day_log), "the older day is left at the bound");
+}
+
+#[tokio::test]
 async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live() {
     let base = pohunek_test_support::tempdir().expect("base");
     let dated = base.path().join("muse/sessions");
@@ -666,28 +714,13 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
     // watches. The newest day is created first, so a walk in creation order or
     // in reverse creation order would not meet it first by luck.
     let (old_day, new_day) = ("2026/09/01", "2026/10/09");
-    for day in [new_day, old_day] {
-        for number in 0..SESSIONS_PER_DAY {
-            fs::create_dir_all(dated.join(day).join(session_name(number))).expect("session dir");
-        }
-    }
-    // Subagent directories below the newest sessions: registered under the
-    // session watches they would exhaust the backend-wide budget, and the
-    // parser reads nothing there.
-    for number in SESSIONS_PER_DAY - NEWEST_WITH_SUBAGENTS..SESSIONS_PER_DAY {
-        for subagent in 0..SUBAGENTS_PER_SESSION {
-            let dir = dated
-                .join(new_day)
-                .join(session_name(number))
-                .join(format!("subagents/s{subagent}"));
-            fs::create_dir_all(dir).expect("subagent dir");
-        }
-    }
-    // The lowest session of each day has a log from the start. The pass visits
-    // the highest names first and stops at its directory bound inside the older
-    // day, so only the newest day's is indexed.
+    create_dated_session_dirs(&dated, &[new_day, old_day]);
+    create_subagent_dirs(&dated, new_day);
+    // The lowest session of the newest day has a log from the start. A log
+    // written into the older day before the watcher starts could be reported
+    // as a live event, which indexes it regardless of the pass's bound, so the
+    // bound of the older day is asserted on the pass alone, without a backend.
     let new_day_log = write_session_log(&dated, new_day, &session_name(0));
-    let old_day_log = write_session_log(&dated, old_day, &session_name(0));
     let probe = prepare_arming_probe(&other);
     let sessions = ExternalSessions::new();
     let roots = vec![
@@ -728,7 +761,6 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
     .unwrap_or_else(|_elapsed| panic!("the pass is not reported incomplete: {:?}", handle.state()))
     .expect("watcher state");
     assert!(indexed(&new_day_log), "the newest day is visited first");
-    assert!(!indexed(&old_day_log), "the older day is left at the bound");
 
     // A log in the newest day's last session directory, one in a session
     // directory of a day that appears later, and one under another root are
