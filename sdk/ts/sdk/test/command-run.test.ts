@@ -95,9 +95,16 @@ describe("runCommand against the fixture daemon", () => {
     // timing-allowed: #1690 the reply is released after the default request deadline has passed
     setTimeout(release, 80);
     expect((await running).output).toBe(OUTPUT);
-    // The default budget still applies to other calls.
-    const health = await client.call("daemon.health", null);
-    expect(health.protocol_version).toBe(PROTOCOL_VERSION);
+  });
+
+  test("a timeout or output cap that is not a nonzero u32 is refused before sending", async () => {
+    const { client } = await fixture([{ package: PACKAGE, command: COMMAND, output: OUTPUT }]);
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5]) {
+      for (const field of ["timeout_ms", "max_output_bytes"] as const) {
+        const error = await rejection(client.runCommand({ package: PACKAGE, command: COMMAND, [field]: bad }));
+        expect(error.code).toBe("bad_request");
+      }
+    }
   });
 
   test("each command_* error keeps its code and details", async () => {

@@ -219,11 +219,24 @@ export class Client {
    * Runs one package command on a dedicated connection whose deadline is the
    * wire timeout plus response headroom, so the budget of other calls is
    * unchanged. An omitted `timeout_ms` is bounded by `MAX_COMMAND_TIMEOUT_MS`,
-   * the ceiling the daemon applies. A daemon that answers `method_not_found`, or
+   * the ceiling the daemon applies; a `timeout_ms` or `max_output_bytes` that is
+   * not a nonzero `u32` is refused before sending. A daemon that answers `method_not_found`, or
    * whose protocol version never defined the method, fails with
    * `command_unsupported`.
    */
   public async runCommand(params: CommandRunParams): Promise<CommandRunResult> {
+    // JSON turns `NaN` and `Infinity` into `null`, which the daemon reads as
+    // "use the ceiling", so a value that is not a nonzero `u32` is refused before sending.
+    for (const field of ["timeout_ms", "max_output_bytes"] as const) {
+      const value = params[field];
+      if (value !== undefined && !isNonzeroU32(value)) {
+        throw ClientError.protocol({
+          class: "daemon",
+          code: "bad_request",
+          msg: `${field} must be a nonzero u32`,
+        });
+      }
+    }
     const wire = {
       package: params.package,
       command: params.command,

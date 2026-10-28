@@ -5414,7 +5414,11 @@ SDK error mapping:
   - The call uses a dedicated connection whose deadline is the wire timeout
     (`MAX_COMMAND_TIMEOUT_MS` when omitted) plus response headroom, so the
     budget of other calls is unchanged.
-  - A `command_*` daemon error keeps its `class`, `code` and `msg`.
+  - A `timeout_ms` or `max_output_bytes` that is not a nonzero `u32` fails with
+    `daemon/bad_request` before anything is sent.
+  - A `command_*` daemon error keeps its `class`, `code` and `msg` (a remote
+    host prefixes the `msg` with `host '<route>':` and the kind is
+    `remoteProtocol`).
     `ClientError.details` returns a copy of the structured detail the daemon
     attached, for example `{ process_exit: { exit_code } }` or
     `{ process_exit: { signal } }` for `command_failed`; it is `undefined`
