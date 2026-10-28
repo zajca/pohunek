@@ -2,6 +2,8 @@ import { Buffer } from "node:buffer";
 import { unlink } from "node:fs/promises";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import {
+  type CommandRunParams,
+  type CommandRunResult,
   EVENT_AGENT_STATE,
   EVENT_ATTACH_CLOSED,
   EVENT_ATTACH_OPENED,
@@ -160,6 +162,23 @@ export interface StartFixtureDaemonOptions {
   readonly initialProjects?: readonly FixtureProject[];
   readonly pty?: FixturePtyOptions;
   readonly turnWait?: FixtureTurnWaitOptions;
+  /** Commands served by `command.run`; without this option the method is unknown, like an older daemon. */
+  readonly commands?: readonly FixtureCommand[];
+}
+
+/**
+ * One package command the fixture serves for `command.run`. The fixture runs
+ * no process: it answers with `output`, or with `error` when set, after `hold`
+ * settles.
+ */
+export interface FixtureCommand {
+  readonly package: string;
+  readonly command: string;
+  readonly version?: string;
+  readonly output?: string;
+  readonly error?: ProtocolError;
+  /** Settles when the fixture may answer; lets a test hold the reply past a client deadline. */
+  readonly hold?: Promise<void>;
 }
 
 export interface FixtureProject {
@@ -274,6 +293,8 @@ const MAX_U32 = 4_294_967_295;
 const DEFAULT_CWD = "/tmp/pohunek-testkit";
 const FIRST_FIXTURE_PID = 42_000;
 const SESSION_ID_PREFIX = "s-testkit-";
+const COMMAND_RUN_FIELDS: ReadonlySet<string> = new Set(["package", "command", "timeout_ms", "max_output_bytes"]);
+const FIXTURE_COMMAND_DIGEST = `sha256:${"0".repeat(64)}`;
 const NOTIFICATION_ID_PREFIX = "n-testkit-";
 const PROJECT_ID_PREFIX = "p-testkit-";
 const MAX_SESSION_METADATA_KEY_BYTES = 64;
@@ -311,6 +332,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly daemonVersion: string;
   private readonly protocolVersion: ProtocolVersion;
   private readonly hostCapabilities: HostCapabilities;
+  private readonly commands: readonly FixtureCommand[] | undefined;
   private readonly pty: FixturePtyRegistry;
   private readonly servers: Server[] = [];
   private readonly sockets = new Set<Socket>();
@@ -356,6 +378,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.turnWaitMaxMs = options.turnWait?.maxTimeoutMs ?? DEFAULT_TURN_WAIT_MAX_MS;
     this.turnJournalCapacity = options.turnWait?.journalCapacity ?? DEFAULT_TURN_JOURNAL_CAPACITY;
     assertTurnWaitOptions(this.turnWaitDefaultMs, this.turnWaitMaxMs, this.turnJournalCapacity);
+    this.commands = options.commands === undefined ? undefined : [...options.commands];
     this.hostCapabilities = cloneValue(options.host?.capabilities ?? defaultHostCapabilities(this.daemonVersion));
     this.discoveredHosts = cloneValue([...(options.host?.discoveredHosts ?? [])]);
     this.notificationPolicy = cloneValue(options.notificationPolicy ?? defaultNotificationPolicy());
@@ -789,6 +812,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
           daemon_version: this.daemonVersion,
           protocol_version: this.protocolVersion,
         } satisfies Methods["daemon.health"]["output"]);
+      case "command.run":
+        return this.handleCommandRun(request);
       case "host.inspect":
         return this.handleHostInspect(request);
       case "host.discover":
@@ -857,6 +882,41 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       default:
         return errResponse(request.id, methodNotFound(request.method));
     }
+  }
+
+  private async handleCommandRun(request: ControlRequest): Promise<ControlResponse> {
+    if (this.commands === undefined) {
+      return errResponse(request.id, methodNotFound(request.method));
+    }
+    const params = readObjectParams<CommandRunParams & JsonRecord>(request);
+    if (
+      params === undefined ||
+      typeof params.package !== "string" ||
+      typeof params.command !== "string" ||
+      Object.keys(params).some((key) => !COMMAND_RUN_FIELDS.has(key)) ||
+      (params.timeout_ms !== undefined && !isPositiveInteger(params.timeout_ms)) ||
+      (params.max_output_bytes !== undefined && !isPositiveInteger(params.max_output_bytes))
+    ) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const declared = this.commands.find(
+      (candidate) => candidate.package === params.package && candidate.command === params.command,
+    );
+    if (declared === undefined) {
+      return errResponse(request.id, protocolError("runtime", "command_not_declared", "the package declares no such command"));
+    }
+    await declared.hold;
+    if (declared.error !== undefined) {
+      return errResponse(request.id, cloneValue(declared.error));
+    }
+    const result: CommandRunResult = {
+      package: { id: declared.package, version: declared.version ?? "1.0.0" },
+      command: declared.command,
+      digest: FIXTURE_COMMAND_DIGEST,
+      output: declared.output ?? "",
+      duration_ms: 0,
+    };
+    return okResponse(request.id, result);
   }
 
   private handleHostInspect(request: ControlRequest): ControlResponse {

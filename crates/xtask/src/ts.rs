@@ -30,10 +30,11 @@ use protocol::{
     SessionScreenResult, SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult,
     SessionWarning, SessionWarningKind, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TerminalCursor, TerminalDimensions, TerminalWatermark,
-    CLIENT_PROTOCOL_VERSIONS, MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS,
-    MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    CLIENT_PROTOCOL_VERSIONS, MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS,
+    MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS,
+    MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -293,6 +294,20 @@ fn emit_previous_version_tables(body: &mut String) {
     body.push_str("] as const;\n");
 }
 
+/// Ceilings a `command.run` caller applies before it sends the request.
+fn emit_command_limits(body: &mut String) {
+    writeln!(
+        body,
+        "export const MAX_COMMAND_OUTPUT_BYTES = {MAX_COMMAND_OUTPUT_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_COMMAND_TIMEOUT_MS = {MAX_COMMAND_TIMEOUT_MS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+}
+
 fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     let mut event_specs = event::EVENT_SPECS.to_vec();
     event_specs.sort_by_key(|spec| spec.name);
@@ -357,6 +372,7 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
         "export const MAX_SESSION_WAIT_MS = {MAX_SESSION_WAIT_MS} as const;"
     )
     .expect("writing to a String cannot fail");
+    emit_command_limits(&mut body);
     writeln!(
         body,
         "export const MAX_SESSION_WAIT_TURN_MS = {MAX_SESSION_WAIT_TURN_MS} as const;"

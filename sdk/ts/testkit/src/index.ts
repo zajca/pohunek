@@ -5,6 +5,7 @@ export type {
   FixtureDaemonHandle,
   FixtureDaemonListenOptions,
   FixtureHostOptions,
+  FixtureCommand,
   FixtureProject,
   FixtureTurnWaitOptions,
   StartFixtureDaemonOptions,
