@@ -21742,6 +21742,28 @@ generation "$1"
             )
         }
 
+        /// Stops a session whose worker the scenario killed in transit, once the
+        /// exit watcher has classified the loss.
+        ///
+        /// The watcher ends the session as failed on its own schedule, so a stop
+        /// racing it either reaches the dead worker or finds the session ended.
+        /// The loss is awaited first so the stop meets the one settled state: the
+        /// session already ended, and the stop reports that it stopped nothing.
+        async fn stop_after_the_killed_worker_is_lost(fixture: &Fixture, id: &SessionId) {
+            wait_until("the killed worker's session to end as lost", || async {
+                let info = fixture.registry.inspect(id).await.expect("the session");
+                (info.state == protocol::SessionState::Failed).then_some(())
+            })
+            .await;
+            fixture.registry.settled(id).await;
+            let stop = fixture
+                .registry
+                .stop(id)
+                .await
+                .expect("the stop of an ended session is answered");
+            assert!(!stop.stopped, "a session that ended is not stopped");
+        }
+
         async fn pending_state_of(
             fixture: &Fixture,
             id: &SessionId,
@@ -21876,12 +21898,7 @@ generation "$1"
                 "the report the worker may hold stays pending"
             );
             drop(stopped);
-            let refused = fixture
-                .registry
-                .stop(&created.id)
-                .await
-                .expect_err("the stop of this session is refused");
-            assert_eq!(refused.code, "worker_operation_failed", "{refused:?}");
+            stop_after_the_killed_worker_is_lost(&fixture, &created.id).await;
         }
 
         /// X001: the same for a release.
@@ -21920,12 +21937,7 @@ generation "$1"
                 "the release the worker may hold stays pending"
             );
             drop(stopped);
-            let refused = fixture
-                .registry
-                .stop(&created.id)
-                .await
-                .expect_err("the stop of this session is refused");
-            assert_eq!(refused.code, "worker_operation_failed", "{refused:?}");
+            stop_after_the_killed_worker_is_lost(&fixture, &created.id).await;
         }
 
         /// The `session.active_identity.forward_failed` events logged on the
@@ -22067,13 +22079,14 @@ generation "$1"
             // once every forward and acknowledgement in flight is done.
             fixture.registry.settle_transactions().await;
             let events = (released, logs.messages(), logs.trace());
-            let stop = fixture.registry.stop(&created.id).await;
             if answer == Answer::Lost {
-                // The worker was killed in transit, so the stop cannot succeed.
-                let refused = stop.expect_err("the stop of this session is refused");
-                assert_eq!(refused.code, "worker_operation_failed", "{refused:?}");
+                stop_after_the_killed_worker_is_lost(&fixture, &created.id).await;
             } else {
-                stop.expect("stop the session");
+                fixture
+                    .registry
+                    .stop(&created.id)
+                    .await
+                    .expect("stop the session");
             }
             events
         }
