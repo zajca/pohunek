@@ -164,13 +164,15 @@ impl PackageCommandService {
             .search_path
             .clone()
             .map_err(|_error| ProtocolError::from(CommandErrorKind::Unavailable))?;
-        let started = Instant::now();
+        let note = RunNote::of(&resolved, transport);
         let work = {
             let cancel = Arc::clone(&cancel);
             let args = resolved.command.args.clone();
             let program = resolved.program.clone();
+            let note = note.clone();
             self.inner.tracker.spawn_blocking(move || {
                 let _admission = admission;
+                let started = Instant::now();
                 let spec = RunSpec {
                     program: &program,
                     args: &args,
@@ -180,36 +182,49 @@ impl PackageCommandService {
                     limits: RunLimits::new(Duration::from_millis(u64::from(timeout)), cap as usize),
                     stderr: StderrPolicy::Discard,
                 };
-                bounded_run::run(&spec, &Instant::now, Some(&cancel))
+                let outcome = bounded_run::run(&spec, &Instant::now, Some(&cancel));
+                let elapsed = started.elapsed();
+                let (result, exit, bytes) = classify(outcome);
+                // Logged here, not by the waiting call, so a run is logged once
+                // even when the caller hung up or the daemon is shutting down.
+                note.log(elapsed, &result, exit, bytes);
+                Finished {
+                    result,
+                    exit,
+                    elapsed,
+                }
             })
         };
-        let outcome = tokio::select! {
+        let finished = tokio::select! {
             joined = work => joined,
             () = self.inner.host.shutdown.cancelled() => {
+                // The flag ends the run within one poll; the run logs itself.
                 cancel.store(true, Ordering::Relaxed);
-                // The flag ends the run within one poll; the reply reports it.
-                return Err(Self::finish(&resolved, transport, started, CommandErrorKind::Unavailable, None, 0));
+                return Err(CommandErrorKind::Unavailable.into());
             }
         };
-        let elapsed = started.elapsed();
-        let (result, exit, bytes) = match outcome {
-            Ok(outcome) => classify(outcome),
-            Err(_join) => (Err(CommandErrorKind::Unavailable), None, 0),
-        };
-        match result {
-            Ok(output) => {
-                Self::log(&resolved, transport, elapsed, "ok", None, bytes);
-                Ok(CommandRunResult {
-                    package: resolved.identity,
-                    command: resolved.command.name,
-                    digest: resolved.digest,
-                    output,
-                    duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                })
-            }
-            Err(kind) => Err(Self::finish(
-                &resolved, transport, started, kind, exit, bytes,
+        let finished = finished.unwrap_or_else(|_join| {
+            let finished = Finished {
+                result: Err(CommandErrorKind::Unavailable),
+                exit: None,
+                elapsed: Duration::ZERO,
+            };
+            note.log(finished.elapsed, &finished.result, None, 0);
+            finished
+        });
+        match finished.result {
+            Ok(output) => Ok(CommandRunResult {
+                package: resolved.identity,
+                command: resolved.command.name,
+                digest: resolved.digest,
+                output,
+                duration_ms: millis(finished.elapsed),
+            }),
+            Err(CommandErrorKind::Failed) => Err(finished.exit.map_or_else(
+                || ProtocolError::from(CommandErrorKind::Failed),
+                ProtocolError::command_failed,
             )),
+            Err(kind) => Err(kind.into()),
         }
     }
 
@@ -269,47 +284,53 @@ impl PackageCommandService {
             _slot: slot,
         })
     }
+}
 
-    /// Logs a failed run and returns its wire error.
-    fn finish(
-        resolved: &Resolved,
-        transport: ControlTransport,
-        started: Instant,
-        kind: CommandErrorKind,
-        exit: Option<ProcessExit>,
-        bytes: usize,
-    ) -> ProtocolError {
-        Self::log(
-            resolved,
+/// What a finished run reports to its waiting call.
+struct Finished {
+    result: Result<String, CommandErrorKind>,
+    exit: Option<ProcessExit>,
+    elapsed: Duration,
+}
+
+/// The identity of one run, for its single log line.
+#[derive(Clone)]
+struct RunNote {
+    package: PackageId,
+    version: String,
+    digest: protocol::PackageDigest,
+    command: CommandName,
+    transport: ControlTransport,
+}
+
+impl RunNote {
+    fn of(resolved: &Resolved, transport: ControlTransport) -> Self {
+        Self {
+            package: resolved.identity.id.clone(),
+            version: resolved.identity.version.to_string(),
+            digest: resolved.digest.clone(),
+            command: resolved.command.name.clone(),
             transport,
-            started.elapsed(),
-            kind.code(),
-            exit,
-            bytes,
-        );
-        match (kind, exit) {
-            (CommandErrorKind::Failed, Some(exit)) => ProtocolError::command_failed(exit),
-            _ => ProtocolError::from(kind),
         }
     }
 
     /// One INFO line per run; it names the package and the outcome, never the
     /// program's output.
     fn log(
-        resolved: &Resolved,
-        transport: ControlTransport,
+        &self,
         elapsed: Duration,
-        outcome: &str,
+        result: &Result<String, CommandErrorKind>,
         exit: Option<ProcessExit>,
         output_bytes: usize,
     ) {
+        let outcome = result.as_ref().map_or_else(|kind| kind.code(), |_| "ok");
         info!(
-            package = %resolved.identity.id,
-            version = %resolved.identity.version,
-            digest = %resolved.digest,
-            command = %resolved.command.name,
-            transport = ?transport,
-            duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            package = %self.package,
+            version = %self.version,
+            digest = %self.digest,
+            command = %self.command,
+            transport = ?self.transport,
+            duration_ms = millis(elapsed),
             outcome,
             exit_code = exit.and_then(|exit| exit.exit_code),
             signal = exit.and_then(|exit| exit.signal),
@@ -317,6 +338,10 @@ impl PackageCommandService {
             "package command run"
         );
     }
+}
+
+fn millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// `value` lowered to `ceiling`; absent means the ceiling and zero is refused.

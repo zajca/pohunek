@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use futures::{SinkExt, StreamExt};
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
 use protocol::{
-    method, CommandRunResult, PackageChangeResult, PackageInstallResult, ProtocolError,
-    Request as ProtocolRequest, Response, MAX_COMMAND_OUTPUT_BYTES,
+    method, CommandRunResult, PackageChangeResult, PackageInspectResult, PackageInstallResult,
+    ProtocolError, Request as ProtocolRequest, Response, MAX_COMMAND_OUTPUT_BYTES,
 };
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -882,6 +882,20 @@ async fn a_package_file_modified_after_install_is_not_run() {
         .await
         .expect("an intact package runs");
     std::fs::remove_file(servers.work.join("ok.ran")).expect("reset the marker");
+    let intact: PackageInspectResult = call(
+        &mut local,
+        method::PACKAGE_INSPECT,
+        json!({ "digest": digest }),
+    )
+    .await;
+    assert!(
+        !intact.commands.is_empty(),
+        "an intact package lists its commands"
+    );
+    assert!(
+        intact.commands_only,
+        "an intact commands-only package carries the marker"
+    );
 
     let root = package::registry::files_path(&servers.plugins, &digest);
     let script = root.join("bin/run.sh");
@@ -896,6 +910,16 @@ async fn a_package_file_modified_after_install_is_not_run() {
     assert!(
         !servers.work.join("ok.ran").exists(),
         "the program did not start"
+    );
+    let inspected: PackageInspectResult = call(
+        &mut local,
+        method::PACKAGE_INSPECT,
+        json!({ "digest": digest }),
+    )
+    .await;
+    assert!(
+        inspected.commands.is_empty() && !inspected.commands_only,
+        "a package that fails verification lists no commands and no marker"
     );
 
     drop(local);
@@ -1033,9 +1057,10 @@ async fn the_first_remote_calls_after_install_are_gated_from_a_cold_cache() {
 
 #[tokio::test]
 async fn a_caller_that_hangs_up_stops_the_run_and_frees_its_slot() {
+    let captured = captured_log();
     let servers = spawn_servers("cmd-hangup").await;
     let mut local = connect_unix(&servers.socket).await;
-    install_fixture(&mut local, &servers).await;
+    let digest = install_fixture(&mut local, &servers).await;
     make_fifos(&servers.work, "hold");
 
     let socket = servers.socket.clone();
@@ -1076,6 +1101,20 @@ async fn a_caller_that_hangs_up_stops_the_run_and_frees_its_slot() {
     started(&servers.work, "hold").await;
     release(&servers.work, "hold").await;
     again.await.expect("run task").expect("the slot was free");
+
+    // Each spawned run is logged once, the abandoned one included.
+    let log = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("package command run") && line.contains(&digest.to_string()))
+        .collect();
+    assert_eq!(lines.len(), 2, "one line per spawned run: {log}");
+    assert!(
+        lines[0].contains("outcome=\"command_unavailable\""),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[1].contains("outcome=\"ok\""), "{}", lines[1]);
 
     drop(local);
     servers.stop().await;
