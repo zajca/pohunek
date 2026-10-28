@@ -3813,3 +3813,51 @@ async fn the_preflight_repair_resolves_against_the_planned_profile_text() {
         report.stopped_sessions
     );
 }
+
+/// A served-runtime session whose agent is the host profile `name`, a profile
+/// over [`SERVED_RUNTIME`] pinned to its official package that declares
+/// `secret_env`, plus the profile directory holding it.
+///
+/// The profile is written as the owner keeps it; the session record is the
+/// served one rebound to the profile's name, which resumes and forks natively.
+fn slot_profile_session(host: &Host, session: &str, worker: &str, name: &str) -> (Value, PathBuf) {
+    let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+    let path = profiles.join(format!("{name}.toml"));
+    fs::write(
+        &path,
+        format!(
+            "base = \"{SERVED_RUNTIME}\"\n{}secret_env = [\"METER_TOKEN\"]\n",
+            official_runtimes::profile_pin(SERVED_RUNTIME)
+        ),
+    )
+    .expect("write the slot profile");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    let mut line = served_session_line(session, worker);
+    line["info"]["agent"] = json!(name);
+    line["recovery"]["agent"] = json!(name);
+    (line, profiles)
+}
+
+/// A live session of a profile that declares secret slots cannot be relaunched
+/// by `session.resume` or `session.fork` on the running release either
+/// (`secret_env_missing`), so the upgrade loses no recovery: the verdict is
+/// `already_not_resumable`, not the `would_lose_recovery` of a profile that no
+/// longer resolves.
+#[tokio::test]
+async fn a_session_of_a_slot_profile_is_already_not_resumable_not_a_recovery_loss() {
+    let host = Host::serving().await;
+    let (line, profiles) = slot_profile_session(&host, "s-1", "w-fixture", "metered");
+    host.write_store(&[line]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+    let mut options = host.options();
+    options.profiles_dir = Some(profiles);
+
+    let report = run_with(&host.inputs(), &options, &HostInspector::new());
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::AlreadyNotResumable, "secret_env_missing"),
+        "{:?}",
+        report.sessions
+    );
+}
