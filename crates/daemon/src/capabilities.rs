@@ -10,9 +10,7 @@
 //! per configured lifetime.
 
 use std::ffi::OsStr;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +24,7 @@ use crate::agent::host::{
     RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
+use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 use crate::integration::Home;
 use crate::runtime::environment::effective_variable;
 use pohunek_worker_protocol::BaseEnv;
@@ -38,10 +37,6 @@ pub(crate) use probe_cache::{ProbeCache, ProbeRequest};
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum stdout the version probe may write or retain.
 const VERSION_OUTPUT_LIMIT: usize = 4 * 1024;
-/// Poll cadence balances bounded shutdown with negligible idle CPU use.
-const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// A deterministic locale keeps provider version output stable.
-const PROBE_LOCALE: &str = "C";
 
 /// Version-probe parsers the daemon compiles in, selected by the parser id a
 /// runtime definition names under `version_probe.parser`.
@@ -651,8 +646,7 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
         timeout,
         &[],
         &Instant::now,
-    )
-    .unwrap_or(ProbeOutcome::Unavailable);
+    );
     match outcome {
         ProbeOutcome::Output(output) => policy
             .check_output(&output)
@@ -697,7 +691,7 @@ fn run_request(request: &ProbeRequest) -> Option<String> {
         VERSION_PROBE_TIMEOUT,
         &[],
         &Instant::now,
-    )? {
+    ) {
         ProbeOutcome::Output(output) => Some(output),
         ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
     }
@@ -714,7 +708,7 @@ fn spawn_and_collect_probe(
     timeout: Duration,
     seeded_env: &[(&str, &str)],
     now: &impl Fn() -> Instant,
-) -> Option<ProbeOutcome> {
+) -> ProbeOutcome {
     collect_probe(
         path,
         policy.args(),
@@ -726,13 +720,11 @@ fn spawn_and_collect_probe(
     )
 }
 
-/// Spawns `path` with `args` and collects at most [`VERSION_OUTPUT_LIMIT`]
-/// bytes of its stdout.
+/// Runs `path` with `args` through the bounded runner and collects at most
+/// [`VERSION_OUTPUT_LIMIT`] bytes of its stdout.
 ///
-/// The child is spawned without `pre_exec` so std can use `posix_spawn`, whose
-/// cost does not grow with the daemon's address space. Its stdout is a pipe the
-/// daemon drains while it waits; output past the limit ends the probe's process
-/// group and counts as a failed probe.
+/// Output past the limit ends the probe's process group and counts as a failed
+/// probe; stderr is discarded.
 fn collect_probe(
     path: &std::path::Path,
     args: &[String],
@@ -741,345 +733,28 @@ fn collect_probe(
     timeout: Duration,
     seeded_env: &[(&str, &str)],
     now: &impl Fn() -> Instant,
-) -> Option<ProbeOutcome> {
-    let sandbox = VersionProbeSandbox::create()?;
-    let mut command = Command::new(path);
-    command.envs(seeded_env.iter().copied());
-    // The runtime's `[launch_env]` pairs go in right after the clear: they
-    // never name a variable the sandbox below sets, and a program that
-    // self-updates unless one is set needs it during the probe too.
-    command.env_clear().envs(launch_env.iter().cloned());
-    command
-        .current_dir(&sandbox.cwd_path)
-        .env("LANG", PROBE_LOCALE)
-        .env("LC_ALL", PROBE_LOCALE)
-        .env("HOME", &sandbox.home_path)
-        .env("XDG_CONFIG_HOME", &sandbox.xdg_config_path)
-        .env("XDG_CACHE_HOME", &sandbox.xdg_cache_path)
-        .env("XDG_DATA_HOME", &sandbox.xdg_data_path)
-        .env("XDG_STATE_HOME", &sandbox.xdg_state_path)
-        .env("XDG_RUNTIME_DIR", &sandbox.xdg_runtime_path)
-        .env("TMPDIR", &sandbox.tmp_path);
-    // The probed program may be an interpreter script (`#!/usr/bin/env
-    // node`); the effective launch `PATH` (daemon base plus profile
-    // overrides) finds the interpreter the launch will use. Every other
-    // variable stays isolated.
-    command.args(args);
-    if let Some(search_path) = launch_path {
-        command.env(SEARCH_PATH_VAR, search_path);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_probe_process_group(&mut command);
-
-    let mut child = command.spawn().ok()?;
-    let Some(mut stdout) = child.stdout.take().and_then(ProbeStdout::new) else {
-        terminate_probe_process(&mut child);
-        return Some(ProbeOutcome::Unavailable);
+) -> ProbeOutcome {
+    // The runtime's `[launch_env]` pairs are the runner's fixed environment: a
+    // program that self-updates unless one is set needs it during the probe
+    // too. The launch `PATH` finds the interpreter of a script probe
+    // (`#!/usr/bin/env node`); every other variable stays isolated.
+    let spec = RunSpec {
+        program: path,
+        args,
+        search_path: launch_path,
+        env: launch_env,
+        seeded_env,
+        limits: RunLimits::new(timeout, VERSION_OUTPUT_LIMIT),
+        stderr: StderrPolicy::Discard,
     };
-    let deadline = now() + timeout;
-    let status = loop {
-        if stdout.drain_available() == Drain::Overflow {
-            terminate_probe_process(&mut child);
-            return Some(ProbeOutcome::Failed);
+    match bounded_run::run(&spec, now, None) {
+        RunOutcome::Exited(output) if output.status().success() => {
+            ProbeOutcome::Output(output.stdout_lossy())
         }
-        match probe_exited(&mut child) {
-            Ok(true) => {
-                // The exited child is not reaped yet, so its pid still holds
-                // the process group id and the signal reaches only the probe's
-                // own group.
-                terminate_probe_process_group(child.id());
-                match child.wait() {
-                    Ok(status) => break status,
-                    Err(_) => return Some(ProbeOutcome::Unavailable),
-                }
-            }
-            Ok(false) if now() < deadline => {
-                std::thread::sleep(VERSION_PROBE_POLL_INTERVAL);
-            }
-            Ok(false) => {
-                terminate_probe_process(&mut child);
-                return Some(ProbeOutcome::TimedOut);
-            }
-            Err(error) if probe_child_gone(&error) => {
-                // The child is no longer waitable, so its pid and group id may
-                // already belong to an unrelated process and must not be
-                // signalled.
-                debug!(%error, "version probe child is no longer waitable");
-                return Some(ProbeOutcome::Unavailable);
-            }
-            Err(error) => {
-                debug!(%error, "version probe exit check failed");
-                terminate_probe_process(&mut child);
-                return Some(ProbeOutcome::Unavailable);
-            }
-        }
-    };
-    let Some(output) = stdout.finish() else {
-        return Some(ProbeOutcome::Failed);
-    };
-    Some(if status.success() {
-        ProbeOutcome::Output(String::from_utf8_lossy(&output).into_owned())
-    } else {
-        ProbeOutcome::Failed
-    })
-}
-
-/// Whether the probe's stdout pipe may hold more output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Drain {
-    /// The pipe is empty for now or at end of file, and the cap is not reached.
-    Within,
-    /// More than [`VERSION_OUTPUT_LIMIT`] bytes were written.
-    Overflow,
-}
-
-/// The read end of a probe's stdout, bounded to [`VERSION_OUTPUT_LIMIT`] bytes.
-///
-/// The pipe is read without blocking while the probe runs, so a probe that
-/// floods its output is noticed within one poll interval and a descendant that
-/// keeps the pipe open past the probe's exit cannot stall the daemon.
-struct ProbeStdout {
-    pipe: ChildStdout,
-    bytes: Vec<u8>,
-    nonblocking: bool,
-}
-
-impl ProbeStdout {
-    /// Wraps `pipe`, or `None` when it cannot be read without blocking.
-    fn new(pipe: ChildStdout) -> Option<Self> {
-        let nonblocking = set_nonblocking(&pipe).ok()?;
-        Some(Self {
-            pipe,
-            bytes: Vec::with_capacity(VERSION_OUTPUT_LIMIT),
-            nonblocking,
-        })
+        RunOutcome::Exited(_) | RunOutcome::Overflow => ProbeOutcome::Failed,
+        RunOutcome::TimedOut => ProbeOutcome::TimedOut,
+        RunOutcome::Cancelled | RunOutcome::Unavailable => ProbeOutcome::Unavailable,
     }
-
-    /// Moves what the pipe holds right now into the retained output.
-    ///
-    /// A platform without non-blocking pipe reads leaves the read to
-    /// [`Self::finish`], after the probe has exited.
-    fn drain_available(&mut self) -> Drain {
-        if !self.nonblocking {
-            return Drain::Within;
-        }
-        let mut chunk = [0_u8; VERSION_OUTPUT_LIMIT];
-        loop {
-            match self.pipe.read(&mut chunk) {
-                // End of file, or nothing more to read yet.
-                Ok(0) => return Drain::Within,
-                Ok(read) => {
-                    self.bytes.extend_from_slice(&chunk[..read]);
-                    if self.bytes.len() > VERSION_OUTPUT_LIMIT {
-                        return Drain::Overflow;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Drain::Within;
-                }
-                Err(error) => {
-                    debug!(%error, "version probe output read failed");
-                    return Drain::Within;
-                }
-            }
-        }
-    }
-
-    /// The retained output once the probe has exited, or `None` when it
-    /// exceeded the cap or could not be read.
-    fn finish(mut self) -> Option<Vec<u8>> {
-        if self.nonblocking {
-            return (self.drain_available() == Drain::Within).then_some(self.bytes);
-        }
-        // A blocking pipe is read only now: the probe's process group is gone,
-        // so end of file arrives once the pipe's writers have closed.
-        let limit = u64::try_from(VERSION_OUTPUT_LIMIT + 1).ok()?;
-        (&mut self.pipe)
-            .take(limit)
-            .read_to_end(&mut self.bytes)
-            .ok()?;
-        (self.bytes.len() <= VERSION_OUTPUT_LIMIT).then_some(self.bytes)
-    }
-}
-
-/// Switches `pipe` to non-blocking reads; `Ok(false)` where the platform
-/// has none.
-#[cfg(unix)]
-fn set_nonblocking(pipe: &ChildStdout) -> std::io::Result<bool> {
-    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
-
-    let flags = fcntl_getfl(pipe)?;
-    fcntl_setfl(pipe, flags | OFlags::NONBLOCK)?;
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-fn set_nonblocking(_pipe: &ChildStdout) -> std::io::Result<bool> {
-    Ok(false)
-}
-
-/// Owner-private state paths for one version probe.
-#[derive(Debug)]
-struct VersionProbeSandbox {
-    dir: PathBuf,
-    home_path: PathBuf,
-    xdg_config_path: PathBuf,
-    xdg_cache_path: PathBuf,
-    xdg_data_path: PathBuf,
-    xdg_state_path: PathBuf,
-    xdg_runtime_path: PathBuf,
-    tmp_path: PathBuf,
-    cwd_path: PathBuf,
-}
-
-impl VersionProbeSandbox {
-    fn create() -> Option<Self> {
-        for _ in 0..4 {
-            let dir =
-                std::env::temp_dir().join(format!("pohunek-version-probe-{}", ulid::Ulid::new()));
-            match create_owner_only_dir(&dir) {
-                Ok(()) => {
-                    let sandbox = Self {
-                        home_path: dir.join("home"),
-                        xdg_config_path: dir.join("xdg-config"),
-                        xdg_cache_path: dir.join("xdg-cache"),
-                        xdg_data_path: dir.join("xdg-data"),
-                        xdg_state_path: dir.join("xdg-state"),
-                        xdg_runtime_path: dir.join("xdg-runtime"),
-                        tmp_path: dir.join("tmp"),
-                        cwd_path: dir.join("cwd"),
-                        dir,
-                    };
-                    if sandbox
-                        .private_dirs()
-                        .iter()
-                        .try_for_each(|path| create_owner_only_dir(path))
-                        .is_err()
-                    {
-                        drop(sandbox);
-                        return None;
-                    }
-                    return Some(sandbox);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-
-    fn private_dirs(&self) -> [&Path; 8] {
-        [
-            &self.home_path,
-            &self.xdg_config_path,
-            &self.xdg_cache_path,
-            &self.xdg_data_path,
-            &self.xdg_state_path,
-            &self.xdg_runtime_path,
-            &self.tmp_path,
-            &self.cwd_path,
-        ]
-    }
-}
-
-impl Drop for VersionProbeSandbox {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-#[cfg(unix)]
-fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    std::fs::DirBuilder::new().mode(0o700).create(path)
-}
-
-#[cfg(not(unix))]
-fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(path)
-}
-
-#[cfg(unix)]
-fn configure_probe_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_probe_process_group(_command: &mut Command) {}
-
-/// Whether the probe child has exited, observed without reaping it, so its pid
-/// and process group id stay reserved until `child` is waited.
-///
-/// An interrupted check reports the child as still running, so the caller's
-/// deadline decides when to check again.
-#[cfg(unix)]
-fn probe_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
-    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
-
-    let pid = i32::try_from(child.id())
-        .ok()
-        .and_then(Pid::from_raw)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid probe PID")
-        })?;
-    match waitid(
-        WaitId::Pid(pid),
-        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-    ) {
-        Ok(status) => Ok(status.is_some()),
-        Err(rustix::io::Errno::INTR) => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Whether the probe child has exited.
-#[cfg(not(unix))]
-fn probe_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
-    child.try_wait().map(|status| status.is_some())
-}
-
-/// Whether a failed exit check means the probe child is no longer waitable.
-#[cfg(unix)]
-fn probe_child_gone(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ECHILD)
-}
-
-/// Whether a failed exit check means the probe child is no longer waitable.
-#[cfg(not(unix))]
-fn probe_child_gone(_error: &std::io::Error) -> bool {
-    false
-}
-
-fn terminate_probe_process(child: &mut std::process::Child) {
-    terminate_probe_process_group(child.id());
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn terminate_probe_process_group(child_id: u32) {
-    #[cfg(unix)]
-    {
-        let Ok(pid) = i32::try_from(child_id) else {
-            return;
-        };
-        #[expect(
-            unsafe_code,
-            reason = "libc::kill is required to terminate a timed-out probe subtree"
-        )]
-        // SAFETY: the child starts in a process group whose id is its positive
-        // pid; negating it targets only that group.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child_id;
 }
 
 /// Resolve a binary name against the `PATH` environment variable.
@@ -1101,12 +776,14 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
     use crate::agent::host::fixture::{official_host, official_profile_pin, OfficialFixtureSource};
     use crate::agent::host::{BuiltinSource, DefinitionOrigin};
+    use crate::bounded_run::RunSandbox;
     use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 
     /// How long fixture processes block; well beyond `HANG_GUARD` so a fixture
@@ -1517,7 +1194,6 @@ strategy = "none"
             seeded_env,
             now,
         )
-        .unwrap_or(ProbeOutcome::Unavailable)
     }
 
     #[test]
@@ -1584,15 +1260,15 @@ strategy = "none"
 
     #[test]
     fn version_probe_directories_are_owner_private() {
-        let sandbox = VersionProbeSandbox::create().expect("create probe sandbox");
-        for path in std::iter::once(sandbox.dir.as_path()).chain(sandbox.private_dirs()) {
+        let sandbox = RunSandbox::create().expect("create probe sandbox");
+        for path in std::iter::once(sandbox.root()).chain(sandbox.private_dirs()) {
             let mode = std::fs::metadata(path)
                 .expect("private directory metadata")
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o700);
         }
-        let root = sandbox.dir.clone();
+        let root = sandbox.root().to_path_buf();
         drop(sandbox);
         assert!(!root.exists(), "probe sandbox must be removed on drop");
     }
@@ -2100,8 +1776,7 @@ strategy = "none"
             HANG_GUARD,
             &seeded_env,
             &Instant::now,
-        )
-        .expect("the probe runs");
+        );
         assert!(
             matches!(&outcome, ProbeOutcome::Output(output) if output.trim() == "1.0.2"),
             "{outcome:?}"
