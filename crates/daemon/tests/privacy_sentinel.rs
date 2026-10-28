@@ -819,10 +819,11 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     )
     .expect("write sentinel agent profile");
 
-    // Install the daemon's real JSON logging sink so this test scans the
-    // exact structured-log path production uses (RFC §22/§23), not a stand-in.
+    // Install the daemon's JSON logging sink for this test thread, so the scan
+    // covers the structured log the daemon writes from the test's own thread
+    // (RFC §22/§23); events from other threads are not captured.
     let log_guard =
-        pohunek_daemon::logging::init(&daemon_log_dir).expect("daemon logging initializes");
+        pohunek_daemon::logging::scoped(&daemon_log_dir).expect("daemon logging initializes");
 
     let socket_dir = temp_dir("privacy-sentinel-sock");
     let socket = socket_dir.path().join("daemon.sock");
@@ -1006,6 +1007,10 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
 
     let store_bytes = std::fs::read(&store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&daemon_log_dir);
+    assert!(
+        String::from_utf8_lossy(&daemon_log_bytes).contains(&socket.display().to_string()),
+        "the scoped sink did not capture this test's server start, so the scan would pass vacuously"
+    );
 
     let artifacts: [(&str, &[u8]); 5] = [
         ("logical store", &store_bytes),
@@ -1225,7 +1230,7 @@ fn assert_error_free_of_secret(response: Response, code: &str) {
 async fn session_secret_env_reaches_only_the_agent_process() {
     let host = SecretEnvHost::new("secret-env-sentinel");
     let log_guard =
-        pohunek_daemon::logging::init(&host.daemon_log_dir).expect("daemon logging initializes");
+        pohunek_daemon::logging::scoped(&host.daemon_log_dir).expect("daemon logging initializes");
     let socket = host.socket();
     let (shutdown, handle, worker_home) =
         spawn_worker_backed_server(&socket, "0.0.0", host.config()).await;
@@ -1429,6 +1434,10 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     let worker_home_bytes = collect_dir_bytes(worker_home.path());
     let store_bytes = std::fs::read(&host.store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&host.daemon_log_dir);
+    assert!(
+        String::from_utf8_lossy(&daemon_log_bytes).contains(&host.socket().display().to_string()),
+        "the scoped sink did not capture this test's server start, so the scan would pass vacuously"
+    );
 
     let artifacts: [(&str, &[u8]); 8] = [
         ("logical store", &store_bytes),
