@@ -102,6 +102,21 @@ function isSet(value: unknown): boolean {
   return value !== undefined && value !== null;
 }
 
+/**
+ * Whether `params` holds a non-empty `secret_env`, or a value the daemon must
+ * judge. An empty object counts as absent.
+ */
+export function carriesSecretEnv(params: unknown): boolean {
+  if (!isObject(params) || !("secret_env" in params)) {
+    return false;
+  }
+  const value = params["secret_env"];
+  if (value === undefined) {
+    return false;
+  }
+  return !(isObject(value) && !Array.isArray(value) && Object.keys(value).length === 0);
+}
+
 function adapted(version: number): "current" | "v3" {
   if (version === PROTOCOL_VERSION) {
     return "current";
@@ -179,7 +194,8 @@ export function downgradeRequestParams(version: number, method: string, params: 
     isObject(params) &&
     (isSet(params["branch_source"]) ||
       isSet(params["on_diverged"]) ||
-      isSet(params["input_ack_timeout_ms"]))
+      isSet(params["input_ack_timeout_ms"]) ||
+      carriesSecretEnv(params))
   ) {
     throw new CompatError({ kind: "methodNotDefined", method });
   }

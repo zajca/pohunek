@@ -4,6 +4,7 @@ import type { ConnectOptions, ControlChannel, RawDuplex, ResolvedConnectOptions,
 import { resolveConnectOptions } from "./transport";
 
 export class WsTransport implements Transport {
+  public readonly relayed = true;
   private readonly baseUrl: string;
   private readonly host: string;
   private readonly options: ResolvedConnectOptions;

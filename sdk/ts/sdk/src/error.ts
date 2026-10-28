@@ -42,6 +42,8 @@ export const ClientErrorCode = {
   VersionMismatch: "version_mismatch",
   DaemonProtocolTooOld: "daemon_protocol_too_old",
   VersionTranslationFailed: "version_translation_failed",
+  SessionNewSecretEnvUnsupported: "session_new_secret_env_unsupported",
+  SessionNewSecretEnvRelayRefused: "session_new_secret_env_relay_refused",
 } as const;
 
 export type ClientErrorKind =
@@ -61,7 +63,9 @@ export type ClientErrorKind =
   | "inputWaitContract"
   | "versionMismatch"
   | "daemonProtocolTooOld"
-  | "versionTranslation";
+  | "versionTranslation"
+  | "sessionNewSecretEnvUnsupported"
+  | "sessionNewSecretEnvRelayRefused";
 
 /** Facts of a method that a daemon's older protocol version never defined. */
 export interface DaemonProtocolTooOldDetail {
@@ -298,6 +302,41 @@ export class ClientError extends Error {
         `upgrade pohunek on ${target} so both sides speak the same protocol version`,
       ),
       source,
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_new_secret_env_supported`, so it
+   * would drop `secret_env` silently. The message names no variable and no value.
+   */
+  public static sessionNewSecretEnvUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates secret_env and would drop it silently; nothing was sent`;
+    return new ClientError(
+      "sessionNewSecretEnvUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionNewSecretEnvUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /** `secret_env` must not pass through the relay, which must never see raw secrets. */
+  public static sessionNewSecretEnvRelayRefused(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `secret_env is not sent through the relay to ${target}`;
+    return new ClientError(
+      "sessionNewSecretEnvRelayRefused",
+      msg,
+      protocolError(
+        ClientErrorClass.Configuration,
+        ClientErrorCode.SessionNewSecretEnvRelayRefused,
+        msg,
+        "connect to the host directly over a local socket or an overlay TCP connection",
+      ),
     );
   }
 

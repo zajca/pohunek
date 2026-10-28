@@ -22,7 +22,7 @@ import {
   type SessionWaitTurnParams,
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
-import { CompatError, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
+import { CompatError, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
 import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -84,6 +84,8 @@ interface Connection {
   readonly replies: AsyncIterator<string>;
   selectedVersion: ProtocolVersion | undefined;
   poisoned: Poison | undefined;
+  /** Whether the daemon on this connection advertised `session_new_secret_env_supported`. */
+  secretEnvVerified: boolean;
 }
 
 function openConnection(channel: ControlChannel): Connection {
@@ -92,6 +94,7 @@ function openConnection(channel: ControlChannel): Connection {
     replies: channel.lines[Symbol.asyncIterator](),
     selectedVersion: undefined,
     poisoned: undefined,
+    secretEnvVerified: false,
   };
 }
 
@@ -136,6 +139,7 @@ export class Client {
   ): Promise<Methods[K]["output"]> {
     if (method === "session.new") {
       const creation = params as SessionNewParams;
+      this.refuseSecretEnvOverRelay(creation);
       return this.callDedicated(
         "session.new",
         hasInitialInput(creation) ? { ...creation, extended_input_ready_wait: true } : creation,
@@ -279,8 +283,59 @@ export class Client {
     // The request is copied before the first await: the caller keeps ownership
     // of its parameters and may change them once this call has returned a promise.
     const request = snapshotRequest(applyRequestOrigin(req, this.options.origin));
+    this.refuseSessionNewSecretEnvOverRelay(request);
     const connection = await this.usableConnection();
     return this.negotiateAndExchange(connection, request);
+  }
+
+  /** Applies the relay refusal to a prepared `session.new` request. */
+  private refuseSessionNewSecretEnvOverRelay(request: Request): void {
+    if (request.method === "session.new") {
+      this.refuseSecretEnvOverRelay(request.params);
+    }
+  }
+
+  /**
+   * Refuses `secret_env` before a connection opens unless the transport states
+   * it is not a relay; a transport that does not say is treated as one.
+   */
+  private refuseSecretEnvOverRelay(params: unknown): void {
+    if (this.transport.relayed !== false && carriesSecretEnv(params)) {
+      throw ClientError.sessionNewSecretEnvRelayRefused(this.remoteHost);
+    }
+  }
+
+  /**
+   * Lets `secret_env` reach the wire only on a connection whose daemon
+   * advertised `session_new_secret_env_supported`; an older daemon would drop
+   * the field silently. The check runs on the connection that carries the
+   * request and is remembered for that connection only.
+   */
+  private async requireSecretEnvSupport(connection: Connection): Promise<void> {
+    if (connection.secretEnvVerified) {
+      return;
+    }
+    const inspect = applyRequestOrigin(
+      {
+        v: CLIENT_PROTOCOL_VERSIONS,
+        id: nextRequestId("host.inspect"),
+        method: "host.inspect",
+        params: { skip_runtime_probes: true },
+      },
+      this.options.origin,
+    );
+    const capabilities = await withTimeout(
+      this.exchange(connection, inspect, stringifyRequest(inspect)),
+      this.options.requestTimeoutMs,
+      () => {
+        this.poison(connection, REQUEST_TIMED_OUT, true);
+        return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs);
+      },
+    );
+    if ((capabilities as { session_new_secret_env_supported?: unknown }).session_new_secret_env_supported !== true) {
+      throw ClientError.sessionNewSecretEnvUnsupported(this.remoteHost);
+    }
+    connection.secretEnvVerified = true;
   }
 
   /**
@@ -289,6 +344,12 @@ export class Client {
    * does not take its probe out of the caller's budget.
    */
   private async negotiateAndExchange(connection: Connection, request: Request): Promise<unknown> {
+    if (request.method === "session.new" && carriesSecretEnv(request.params)) {
+      if (this.transport.relayed !== false) {
+        throw ClientError.sessionNewSecretEnvRelayRefused(this.remoteHost);
+      }
+      await this.requireSecretEnvSupport(connection);
+    }
     const prepared = await this.negotiatedRequest(connection, request);
     // The caller may have given up (timeout) or closed the client while the
     // version probe was in flight. A request must never be written after that.
@@ -468,6 +529,7 @@ export class Client {
   public async subscribe(request: Request): Promise<Subscription> {
     this.ensureOpen();
     const prepared = snapshotRequest(applyRequestOrigin(request, this.options.origin));
+    this.refuseSessionNewSecretEnvOverRelay(prepared);
     const connection = await this.usableConnection();
     try {
       await this.negotiateAndExchange(connection, prepared);

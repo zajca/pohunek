@@ -286,6 +286,7 @@ function createRuntime(steps: ScriptStep[]): Runtime {
 }
 
 class MemoryTransport implements Transport {
+  public readonly relayed = false;
   private readonly runtime: Runtime;
 
   public constructor(runtime: Runtime) {
