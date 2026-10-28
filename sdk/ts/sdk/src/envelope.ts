@@ -127,11 +127,13 @@ function isRawProtocolError(value: unknown): value is Record<string, unknown> {
     return false;
   }
   const recover = value["recover"];
+  const details = value["details"];
   return (
     typeof value["class"] === "string" &&
     typeof value["code"] === "string" &&
     typeof value["msg"] === "string" &&
-    (recover === undefined || typeof recover === "string")
+    (recover === undefined || typeof recover === "string") &&
+    (details === undefined || isRecord(details))
   );
 }
 

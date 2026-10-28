@@ -1,5 +1,6 @@
 import type {
   ErrorClass,
+  ErrorDetails,
   ProtocolError,
   ProtocolVersion,
   ProtocolVersionRange,
@@ -44,6 +45,8 @@ export const ClientErrorCode = {
   VersionTranslationFailed: "version_translation_failed",
   SessionNewSecretEnvUnsupported: "session_new_secret_env_unsupported",
   SessionNewSecretEnvRelayRefused: "session_new_secret_env_relay_refused",
+  CommandUnsupported: "command_unsupported",
+  PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
 
 export type ClientErrorKind =
@@ -65,7 +68,9 @@ export type ClientErrorKind =
   | "daemonProtocolTooOld"
   | "versionTranslation"
   | "sessionNewSecretEnvUnsupported"
-  | "sessionNewSecretEnvRelayRefused";
+  | "sessionNewSecretEnvRelayRefused"
+  | "commandUnsupported"
+  | "packageInstallCommandsUnsupported";
 
 /** Facts of a method that a daemon's older protocol version never defined. */
 export interface DaemonProtocolTooOldDetail {
@@ -324,6 +329,44 @@ export class ClientError extends Error {
     );
   }
 
+  /**
+   * The daemon does not serve `command.run`: it answered `method_not_found`, or
+   * its negotiated protocol version never defined the method.
+   */
+  public static commandUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} does not support command.run`;
+    return new ClientError(
+      "commandUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.CommandUnsupported,
+        msg,
+        `upgrade pohunek on ${target} to a release that supports package commands`,
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `package_install_commands_supported`, so it
+   * would reject `accept_commands`; nothing was sent.
+   */
+  public static packageInstallCommandsUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates package commands and rejects accept_commands; nothing was sent`;
+    return new ClientError(
+      "packageInstallCommandsUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.PackageInstallCommandsUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
   /** `secret_env` must not pass through the relay, which must never see raw secrets. */
   public static sessionNewSecretEnvRelayRefused(host: string | undefined): ClientError {
     const target = daemonTarget(host);
@@ -338,6 +381,11 @@ export class ClientError extends Error {
         "connect to the host directly over a local socket or an overlay TCP connection",
       ),
     );
+  }
+
+  /** Structured detail the daemon attached to the error, for example the exit status of a failed command. */
+  public get details(): ErrorDetails | undefined {
+    return this.structured.details === undefined ? undefined : structuredClone(this.structured.details);
   }
 
   public toProtocolError(): ObservedProtocolError {
@@ -391,15 +439,20 @@ function protocolError(
   code: string,
   msg: string,
   recover?: string,
+  details?: ErrorDetails,
 ): ObservedProtocolError {
-  if (recover === undefined) {
-    return { class: errorClass, code, msg };
+  const error: ObservedProtocolError = { class: errorClass, code, msg };
+  if (recover !== undefined) {
+    error.recover = recover;
   }
-  return { class: errorClass, code, msg, recover };
+  if (details !== undefined) {
+    error.details = structuredClone(details);
+  }
+  return error;
 }
 
 function cloneProtocolError(error: ObservedProtocolError): ObservedProtocolError {
-  return protocolError(error.class, error.code, error.msg, error.recover);
+  return protocolError(error.class, error.code, error.msg, error.recover, error.details);
 }
 
 function messageFromUnknown(source: unknown): string {

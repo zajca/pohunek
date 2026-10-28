@@ -4008,7 +4008,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `overlay_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner`, `session_new_secret_env_relay_refused` |
-| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported`, `command_unsupported` |
+| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported`, `command_unsupported`, `package_install_commands_unsupported` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `secret_env_not_declared`, `secret_env_missing`, `secret_env_invalid`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible`, `launch_input_invalid`, `launch_input_unavailable`, `integration_overlay_unavailable`, `integration_launch_arg_conflict`, `command_package_not_installed`, `command_not_selected`, `command_not_declared`, `command_not_exposed`, `command_package_disabled`, `command_busy`, `command_failed`, `command_timed_out`, `command_output_too_large`, `command_output_not_utf8`, `command_unavailable` |
 
@@ -5174,7 +5174,13 @@ Public exports:
 - `WsTransport`: transparent WebSocket relay transport using the
   WHATWG `WebSocket` global.
 - `Transport`: pluggable transport interface with `control()` for framed
-  control channels and `raw()` for unframed attach channels.
+  control channels and `raw()` for unframed attach channels, and the optional
+  `relayed` member. `relayed` must be `false` on a transport whose frames do not
+  pass through a relay service (`SocketTransport` sets it); `WsTransport` sets it
+  to `true`. A transport that omits it is treated as a relay, so a custom or
+  wrapping transport must pass the wrapped transport's value through: otherwise
+  every `session.new` with `secret_env` fails with
+  `session_new_secret_env_relay_refused`.
 - `ControlChannel`: `send(line)`, async `lines`, and `close()` for one framed
   control connection.
 - `RawDuplex`: `ReadableStream<Uint8Array>`, `WritableStream<Uint8Array>`, and
@@ -5271,7 +5277,8 @@ Connection APIs:
   `http`, `https`, `ws`, or `wss`; the SDK connects to
   `/daemon/<host>/control` under that base URL.
 - `Client.connectTransport(transport, opts?, remoteHost?)`: injection point for
-  tests and custom transports that implement `Transport`.
+  tests and custom transports that implement `Transport`. The transport's
+  `relayed` member decides whether `secret_env` may be sent (see `Transport`).
 - `connectLocal(socketPath, opts?)` and `connectTcp(host, {host, port}, opts?)`:
   root-entry Bun/Node helpers for a direct Unix socket or daemon TCP address.
 - `SocketTransport.unix(socketPath, opts?)` and `SocketTransport.tcp(host,
@@ -5372,8 +5379,9 @@ SDK error mapping:
   `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,
   `json_error`, `session_input_wait_contract_mismatch`, `version_mismatch`,
   `daemon_protocol_too_old`, `version_translation_failed`,
-  `session_new_secret_env_unsupported` and
-  `session_new_secret_env_relay_refused`. `daemon_protocol_too_old` and
+  `session_new_secret_env_unsupported`,
+  `session_new_secret_env_relay_refused`, `command_unsupported` and
+  `package_install_commands_unsupported`. `daemon_protocol_too_old` and
   `version_translation_failed` are the window errors: `ClientError.kind` `daemonProtocolTooOld` carries
   `tooOld.{host, method, daemonVersion, requiredVersion}` and is raised before a
   method new in the current protocol is sent to a daemon that negotiated the
@@ -5399,6 +5407,34 @@ SDK error mapping:
   - Both errors use fixed text that names no variable and no value, and no
     `ClientError` field, message or stack carries the `secret_env` contents. An
     empty `secret_env` is treated as absent and skips the check.
+- `Client.runCommand({ package, command, timeout_ms?, max_output_bytes? })`
+  (also `Client.call("command.run", ...)`) runs one package-declared command
+  and returns `CommandRunResult`. Only those four fields reach the wire; the
+  SDK never forwards arguments, environment, working directory or stdin.
+  - The call uses a dedicated connection whose deadline is the wire timeout
+    (`MAX_COMMAND_TIMEOUT_MS` when omitted) plus response headroom, so the
+    budget of other calls is unchanged.
+  - A `timeout_ms` or `max_output_bytes` that is not a nonzero `u32` fails with
+    `daemon/bad_request` before anything is sent.
+  - A `command_*` daemon error keeps its `class`, `code` and `msg` (a remote
+    host prefixes the `msg` with `host '<route>':` and the kind is
+    `remoteProtocol`).
+    `ClientError.details` returns a copy of the structured detail the daemon
+    attached, for example `{ process_exit: { exit_code } }` or
+    `{ process_exit: { signal } }` for `command_failed`; it is `undefined`
+    otherwise, and `toProtocolError()` carries it too.
+  - A daemon that answers `method_not_found`, or whose negotiated protocol
+    version never defined `command.run`, fails with
+    `daemon/command_unsupported` (`ClientError.kind` `commandUnsupported`).
+- `package.install` and `package.link` with `accept_commands` set are gated by
+  the SDK like `secret_env`: the SDK sends `host.inspect
+  {skip_runtime_probes: true}` on the connection that carries the request and
+  sends `accept_commands` only when the daemon reports
+  `package_install_commands_supported`. Otherwise the call fails with
+  `daemon/package_install_commands_unsupported` (`ClientError.kind`
+  `packageInstallCommandsUnsupported`) and nothing is sent, because an older
+  daemon rejects the key. `accept_commands: false` is the default and is left
+  off the wire without a capability check.
 - `ClientError.toProtocolError()` returns the structured error
   (`ObservedProtocolError`, a `ProtocolError` whose `class` may be `"unknown"`)
   for CLI/API rendering, and `recoverHint()` returns the optional recovery text.

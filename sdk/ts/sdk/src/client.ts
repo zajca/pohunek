@@ -5,6 +5,9 @@ import {
   PROTOCOL_VERSION,
   CLIENT_PROTOCOL_VERSIONS,
   RANGE_FORWARDING_METHODS,
+  MAX_COMMAND_TIMEOUT_MS,
+  type CommandRunParams,
+  type CommandRunResult,
   type Methods,
   type ProtocolVersion,
   type ProtocolVersionRange,
@@ -84,8 +87,8 @@ interface Connection {
   readonly replies: AsyncIterator<string>;
   selectedVersion: ProtocolVersion | undefined;
   poisoned: Poison | undefined;
-  /** Whether the daemon on this connection advertised `session_new_secret_env_supported`. */
-  secretEnvVerified: boolean;
+  /** `HostCapabilities` flags this connection's daemon advertised, learned by `host.inspect`. */
+  verifiedCapabilities: Set<string>;
 }
 
 function openConnection(channel: ControlChannel): Connection {
@@ -94,7 +97,7 @@ function openConnection(channel: ControlChannel): Connection {
     replies: channel.lines[Symbol.asyncIterator](),
     selectedVersion: undefined,
     poisoned: undefined,
-    secretEnvVerified: false,
+    verifiedCapabilities: new Set(),
   };
 }
 
@@ -148,6 +151,9 @@ export class Client {
             ? 0
             : creation.input_ack_timeout_ms + MAX_SESSION_WAIT_MS),
       );
+    }
+    if (method === "command.run") {
+      return this.runCommand(params as CommandRunParams);
     }
     if (method === "session.resume") {
       return this.callDedicated(
@@ -207,6 +213,49 @@ export class Client {
       return decodeHostGovernanceInspect(value);
     }
     return value as Methods[K]["output"];
+  }
+
+  /**
+   * Runs one package command on a dedicated connection whose deadline is the
+   * wire timeout plus response headroom, so the budget of other calls is
+   * unchanged. An omitted `timeout_ms` is bounded by `MAX_COMMAND_TIMEOUT_MS`,
+   * the ceiling the daemon applies; a `timeout_ms` or `max_output_bytes` that is
+   * not a nonzero `u32` is refused before sending. A daemon that answers `method_not_found`, or
+   * whose protocol version never defined the method, fails with
+   * `command_unsupported`.
+   */
+  public async runCommand(params: CommandRunParams): Promise<CommandRunResult> {
+    // JSON turns `NaN` and `Infinity` into `null`, which the daemon reads as
+    // "use the ceiling", so a value that is not a nonzero `u32` is refused before sending.
+    for (const field of ["timeout_ms", "max_output_bytes"] as const) {
+      const value = params[field];
+      if (value !== undefined && !isNonzeroU32(value)) {
+        throw ClientError.protocol({
+          class: "daemon",
+          code: "bad_request",
+          msg: `${field} must be a nonzero u32`,
+        });
+      }
+    }
+    const wire = {
+      package: params.package,
+      command: params.command,
+      ...(params.timeout_ms === undefined ? {} : { timeout_ms: params.timeout_ms }),
+      ...(params.max_output_bytes === undefined ? {} : { max_output_bytes: params.max_output_bytes }),
+    };
+    const timeoutMs = Math.min(params.timeout_ms ?? MAX_COMMAND_TIMEOUT_MS, MAX_COMMAND_TIMEOUT_MS);
+    try {
+      return await this.callDedicated("command.run", wire, timeoutMs);
+    } catch (error: unknown) {
+      if (
+        error instanceof ClientError
+        && (error.kind === "daemonProtocolTooOld"
+          || ((error.kind === "protocol" || error.kind === "remoteProtocol") && error.code === "method_not_found"))
+      ) {
+        throw ClientError.commandUnsupported(this.remoteHost);
+      }
+      throw error;
+    }
   }
 
   public async sessionScreen(params: SessionScreenParams): Promise<SessionScreenResult> {
@@ -283,6 +332,7 @@ export class Client {
     // The request is copied before the first await: the caller keeps ownership
     // of its parameters and may change them once this call has returned a promise.
     const request = snapshotRequest(applyRequestOrigin(req, this.options.origin));
+    omitDeclinedCommandsConsent(request);
     this.refuseSessionNewSecretEnvOverRelay(request);
     const connection = await this.usableConnection();
     return this.negotiateAndExchange(connection, request);
@@ -306,13 +356,14 @@ export class Client {
   }
 
   /**
-   * Lets `secret_env` reach the wire only on a connection whose daemon
-   * advertised `session_new_secret_env_supported`; an older daemon would drop
-   * the field silently. The check runs on the connection that carries the
-   * request and is remembered for that connection only.
+   * Lets a request that depends on a newer-daemon field reach the wire only on
+   * a connection whose daemon advertised the capability flag; an older daemon
+   * would drop the field silently or reject it. The check runs on the
+   * connection that carries the request and is remembered for that connection
+   * only.
    */
-  private async requireSecretEnvSupport(connection: Connection): Promise<void> {
-    if (connection.secretEnvVerified) {
+  private async requireCapability(connection: Connection, requirement: CapabilityRequirement): Promise<void> {
+    if (connection.verifiedCapabilities.has(requirement.flag)) {
       return;
     }
     const inspect = applyRequestOrigin(
@@ -332,10 +383,10 @@ export class Client {
         return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs);
       },
     );
-    if ((capabilities as { session_new_secret_env_supported?: unknown }).session_new_secret_env_supported !== true) {
-      throw ClientError.sessionNewSecretEnvUnsupported(this.remoteHost);
+    if ((capabilities as Record<string, unknown>)[requirement.flag] !== true) {
+      throw requirement.unsupported(this.remoteHost);
     }
-    connection.secretEnvVerified = true;
+    connection.verifiedCapabilities.add(requirement.flag);
   }
 
   /**
@@ -348,7 +399,16 @@ export class Client {
       if (this.transport.relayed !== false) {
         throw ClientError.sessionNewSecretEnvRelayRefused(this.remoteHost);
       }
-      await this.requireSecretEnvSupport(connection);
+      await this.requireCapability(connection, {
+        flag: "session_new_secret_env_supported",
+        unsupported: (host) => ClientError.sessionNewSecretEnvUnsupported(host),
+      });
+    }
+    if (isPackageCommandsRequest(request)) {
+      await this.requireCapability(connection, {
+        flag: "package_install_commands_supported",
+        unsupported: (host) => ClientError.packageInstallCommandsUnsupported(host),
+      });
     }
     const prepared = await this.negotiatedRequest(connection, request);
     // The caller may have given up (timeout) or closed the client while the
@@ -631,6 +691,7 @@ export class Client {
   private async callDedicated<
     K extends
       | "session.new"
+      | "command.run"
       | "session.resume"
       | "session.fork"
       | "session.stop"
@@ -758,6 +819,39 @@ function narrowToWindow(allowed: ProtocolVersionRange): ProtocolVersionRange | u
   const minimum = Math.max(allowed.minimum, CLIENT_PROTOCOL_VERSIONS.minimum);
   const maximum = Math.min(allowed.maximum, CLIENT_PROTOCOL_VERSIONS.maximum);
   return minimum > maximum ? undefined : { minimum, maximum };
+}
+
+/**
+ * `accept_commands: false` is the default, and a daemon without package
+ * commands rejects the key, so the client omits it from the wire.
+ */
+function omitDeclinedCommandsConsent(request: Request): void {
+  if (!PACKAGE_COMMANDS_METHODS.has(request.method)) {
+    return;
+  }
+  const params = request.params;
+  if (typeof params === "object" && params !== null && !Array.isArray(params)
+    && (params as { accept_commands?: unknown }).accept_commands === false) {
+    delete (params as { accept_commands?: unknown }).accept_commands;
+  }
+}
+
+/** A host capability a request depends on, and the error raised when the host lacks it. */
+interface CapabilityRequirement {
+  readonly flag: string;
+  readonly unsupported: (host: string | undefined) => ClientError;
+}
+
+const PACKAGE_COMMANDS_METHODS: ReadonlySet<string> = new Set(["package.install", "package.link"]);
+
+/** Whether `request` sets `accept_commands`, which only a daemon with package commands accepts. */
+function isPackageCommandsRequest(request: Request): boolean {
+  if (!PACKAGE_COMMANDS_METHODS.has(request.method)) {
+    return false;
+  }
+  const params = request.params;
+  return typeof params === "object" && params !== null && !Array.isArray(params)
+    && (params as { accept_commands?: unknown }).accept_commands !== undefined;
 }
 
 function hasInitialInput(value: unknown): value is SessionNewParams & { input: string } {
