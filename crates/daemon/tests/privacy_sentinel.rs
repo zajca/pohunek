@@ -819,8 +819,9 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     )
     .expect("write sentinel agent profile");
 
-    // Install the daemon's real JSON logging sink so this test scans the
-    // exact structured-log path production uses (RFC §22/§23), not a stand-in.
+    // Install the daemon's JSON logging sink for this test thread, so the scan
+    // covers the structured log the daemon writes from the test's own thread
+    // (RFC §22/§23); events from other threads are not captured.
     let log_guard =
         pohunek_daemon::logging::scoped(&daemon_log_dir).expect("daemon logging initializes");
 
@@ -1007,8 +1008,8 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     let store_bytes = std::fs::read(&store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&daemon_log_dir);
     assert!(
-        !daemon_log_bytes.is_empty(),
-        "the scoped sink captured no daemon log, so the scan would pass vacuously"
+        String::from_utf8_lossy(&daemon_log_bytes).contains(&socket.display().to_string()),
+        "the scoped sink did not capture this test's server start, so the scan would pass vacuously"
     );
 
     let artifacts: [(&str, &[u8]); 5] = [
@@ -1434,8 +1435,8 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     let store_bytes = std::fs::read(&host.store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&host.daemon_log_dir);
     assert!(
-        !daemon_log_bytes.is_empty(),
-        "the scoped sink captured no daemon log, so the scan would pass vacuously"
+        String::from_utf8_lossy(&daemon_log_bytes).contains(&host.socket().display().to_string()),
+        "the scoped sink did not capture this test's server start, so the scan would pass vacuously"
     );
 
     let artifacts: [(&str, &[u8]); 8] = [
