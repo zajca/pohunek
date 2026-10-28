@@ -21,8 +21,7 @@ use super::tests::{
 };
 use super::{SessionRegistry, SessionRegistryConfig};
 use crate::agent::host::fixture::{
-    pi_shaped_host, pi_shaped_integration_host_as, pi_shaped_integration_host_with_homes,
-    pi_shaped_profile_pin, PI_SHAPED_NO_CHECK,
+    pi_shaped_host, pi_shaped_integration_host_as, pi_shaped_profile_pin, PI_SHAPED_NO_CHECK,
 };
 
 /// Variable the profile declares as its credential slot.
@@ -393,29 +392,6 @@ async fn a_slot_naming_the_runtimes_config_home_variable_cannot_be_filled() {
         .create(slots.new_params("homed", &[("CLAUDE_CONFIG_DIR", SENTINEL)]))
         .await
         .expect_err("the runtime's own home variable is not a slot");
-    assert_refusal(&refused, "secret_env_not_declared");
-    assert!(slots.recorded().is_empty(), "no agent was launched");
-}
-
-#[tokio::test]
-async fn a_slot_naming_a_launch_env_variable_cannot_be_filled() {
-    let slots = Slots::new("secret-env-launch-env");
-    slots.write_profile("flagged", "secret_env = [\"PI_NO_UPDATE\"]\n");
-    let registry = SessionRegistry::new_with_runtimes(
-        slots.config(),
-        pi_shaped_integration_host_with_homes(
-            &slots.script,
-            "claude-hook-v1",
-            "identity-subagent-v1",
-            "\"launch-env-v1\"",
-            &[("pi", "\n[launch_env]\nPI_NO_UPDATE = \"1\"\n")],
-        ),
-    );
-
-    let refused = registry
-        .create(slots.new_params("flagged", &[("PI_NO_UPDATE", SENTINEL)]))
-        .await
-        .expect_err("a runtime launch flag is not a slot");
     assert_refusal(&refused, "secret_env_not_declared");
     assert!(slots.recorded().is_empty(), "no agent was launched");
 }

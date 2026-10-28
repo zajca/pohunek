@@ -1061,11 +1061,15 @@ name or a value. The pairs are not persisted: each launch (a new session, a
 resume, a fork) reads them from the definition that serves it. A launch applies
 them first, then the session's private `TMPDIR`, then the host profile's
 `[env]`, the runtime contributor's pairs, the reserved `POHUNEK_*` values, then
-the request's `secret_env` values. A launch whose slot names a variable any of
-those layers already set (a runtime contributor's variable, say) fails with
-`invalid_profile` naming the slot, before the worker socket, the record or any
-worktree exists, and the worker re-asserts `POHUNEK_*` last (a slot can never
-name one). The version probe applies the descriptor pairs after clearing its
+the request's `secret_env` values. A slot that collides with an earlier layer
+is refused before the worker socket, the record or any worktree exists, and the
+outcome depends on the layer: a slot naming a variable of the profile's `[env]`,
+the session's `TMPDIR` or a reserved `POHUNEK_*` name fails when the profile
+loads (`invalid_profile`, naming the slot); a slot naming a runtime
+contributor's variable fails the launch with `invalid_profile` naming the slot;
+a slot naming a descriptor `[launch_env]` variable or the runtime's
+config-home variable fails at match with `secret_env_not_declared`. The worker
+re-asserts `POHUNEK_*` last (a slot can never name one). The version probe applies the descriptor pairs after clearing its
 environment; a profile entry reaches the launch only. A program the user starts
 by hand inside a shell session gets no descriptor environment. A built-in
 descriptor digest covers the table only while it holds a pair.

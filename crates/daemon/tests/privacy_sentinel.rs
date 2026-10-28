@@ -1412,12 +1412,9 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     let journal_bytes = wait_for_dir_containing(&worker_state_root, created.id.0.as_bytes()).await;
     let event_log_bytes = wait_for_dir_containing(&host.events_dir, created.id.0.as_bytes()).await;
     let worker_log_bytes = collect_dir_bytes(&worker_log_dir);
-    pohunek_test_support::wait::wait_until("the subscriber to see the session", || async {
-        streamed
-            .lock()
-            .expect("streamed events")
-            .contains(&created.id.0)
-            .then_some(())
+    pohunek_test_support::wait::wait_until("the subscriber to see the session stop", || async {
+        let events = streamed.lock().expect("streamed events");
+        (events.contains(&created.id.0) && events.contains("session_stopped")).then_some(())
     })
     .await;
     collector.abort();
