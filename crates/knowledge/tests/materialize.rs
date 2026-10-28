@@ -10,9 +10,25 @@ const UMASK_CHILD_VAR: &str = "KNOWLEDGE_MATERIALIZE_UMASK_CHILD";
 /// Umask of a default login session, under which a plain `mkdir` is 0755.
 const PERMISSIVE_UMASK: &str = "022";
 
+/// Serializes child-process spawns against the directory lock held by
+/// `gc_collects_orphaned_owned_temps_but_never_a_locked_temp`.
+///
+/// A spawn forks first, and until the child execs it holds a copy of every open
+/// file descriptor, `O_CLOEXEC` or not. A copy of the held directory descriptor
+/// keeps its `flock` alive after the test closes it, so a spawn on a sibling
+/// thread would make the lock look contended to the second `gc`.
+static SPAWN_AND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize_spawn_and_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_AND_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn materializing_into_a_fresh_cache_creates_its_directories_owner_private() {
     // The umask is process-wide, so a child owns it and this binary keeps its own.
+    let spawn_guard = serialize_spawn_and_lock();
     let output = std::process::Command::new("/bin/sh")
         .args([
             "-c",
@@ -27,6 +43,7 @@ fn materializing_into_a_fresh_cache_creates_its_directories_owner_private() {
         .env(UMASK_CHILD_VAR, "1")
         .output()
         .expect("run the child under the permissive umask");
+    drop(spawn_guard);
     assert!(
         output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
         "child failed: {}{}",
@@ -138,6 +155,7 @@ fn gc_collects_old_legacy_temps_but_keeps_recent_temps_and_external_targets() {
     knowledge::materialize(&cache, "kept-version").expect("initial materialization");
     let knowledge_root = cache.join("knowledge");
     let environment = pohunek_test_support::env::TestEnv::new().expect("isolated process fixture");
+    let spawn_guard = serialize_spawn_and_lock();
     let mut child = environment
         .command(std::env::current_exe().expect("test executable"))
         .arg("--list")
@@ -146,6 +164,7 @@ fn gc_collects_old_legacy_temps_but_keeps_recent_temps_and_external_targets() {
         .expect("short-lived owner");
     let owner_pid = child.id();
     assert!(child.wait().expect("reap the old owner").success());
+    drop(spawn_guard);
     let old = knowledge_root.join(format!(".tmp-interrupted-{owner_pid}-0-0"));
     let recent = knowledge_root.join(format!(".tmp-interrupted-{owner_pid}-0-1"));
     let live = knowledge_root.join(format!(".tmp-live-{}-0-0", std::process::id()));
@@ -210,6 +229,7 @@ fn gc_collects_orphaned_owned_temps_but_never_a_locked_temp() {
         .expect("private owner marker");
         std::fs::write(directory.join("partial"), b"interrupted extraction").expect("partial file");
     }
+    let spawn_guard = serialize_spawn_and_lock();
     let owner = std::fs::File::open(&held).expect("open the active temporary directory");
     owner
         .lock()
@@ -231,6 +251,7 @@ fn gc_collects_orphaned_owned_temps_but_never_a_locked_temp() {
         !held.exists(),
         "the extraction is collectable after its owner releases the lock"
     );
+    drop(spawn_guard);
 }
 
 #[test]
