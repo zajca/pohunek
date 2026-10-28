@@ -648,6 +648,46 @@ async fn branch_source_options_fail_before_the_previous_daemon_receives_them() {
     .await;
 }
 
+/// The previous daemon would drop `secret_env` and start the agent without its
+/// credential, so the adapter refuses the request before it is written and the
+/// refusal names no secret.
+#[tokio::test]
+async fn secret_env_fails_before_the_previous_daemon_receives_it() {
+    const SECRET: &str = "SENTINEL_V3_SECRET_0a1b2c";
+    guard("the current-only secret_env option", async {
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let params = json!({
+            "agent": "shell",
+            "cols": 80,
+            "rows": 24,
+            "secret_env": { "METER_TOKEN": SECRET }
+        });
+        let error = client
+            .request(&request_for(method::SESSION_NEW, params))
+            .await
+            .expect_err("the previous daemon would start the agent without its credential");
+        assert!(matches!(
+            error,
+            ClientError::DaemonProtocolTooOld {
+                method: ref name,
+                daemon_version,
+                required_version,
+                ..
+            } if name == method::SESSION_NEW
+                && daemon_version == previous()
+                && required_version == PROTOCOL_VERSION
+        ));
+        assert!(
+            !format!("{error:?} {error}").contains(SECRET),
+            "the refusal echoed the secret"
+        );
+        assert_eq!(daemon.methods(), [method::DAEMON_HEALTH]);
+        assert_eq!(daemon.violations(), Vec::<String>::new());
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_version_dependent_request_learns_the_version_before_it_is_sent() {
     guard("the dependent request", async {

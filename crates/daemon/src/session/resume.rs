@@ -1699,6 +1699,12 @@ pub(super) fn recovery_profile_memo(
             None => Ok(RecoveryProfile::none()),
         };
     };
+    // The daemon keeps no secret value, so a relaunch can never fill the
+    // profile's slots; refusing keeps it from falling back to the host's own
+    // credentials.
+    if !profile.secret_env.is_empty() {
+        return Err(ProtocolError::secret_env_missing());
+    }
     let keys = profiles.revision_keys();
     let current = keys.revision(&profile.inputs)?;
     let unchanged = match frozen {

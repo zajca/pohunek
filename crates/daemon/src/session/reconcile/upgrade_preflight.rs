@@ -2123,6 +2123,17 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
             Ok(profile) => {
                 profile_env.get_or_insert(profile.env);
             }
+            Err(error) if error.code == protocol::SECRET_ENV_MISSING_CODE => {
+                // The profile's secret slots refuse every relaunch on the running
+                // release too, so the upgrade loses no recovery.
+                return Some((
+                    Verdict::AlreadyNotResumable,
+                    error.code.clone(),
+                    "resume refuses the session's host profile because it declares secret \
+                     variables a relaunch cannot fill, on the running release too"
+                        .to_owned(),
+                ));
+            }
             Err(error) => {
                 return Some((
                     Verdict::WouldLoseRecovery,

@@ -873,6 +873,7 @@ fn build_menu_new_session_request(
             on_diverged: None,
             input_ack_timeout_ms: None,
             metadata: std::collections::BTreeMap::new(),
+            secret_env: protocol::SessionSecretEnv::default(),
         },
     )
 }

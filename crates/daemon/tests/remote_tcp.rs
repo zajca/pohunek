@@ -299,6 +299,7 @@ fn session_params(socket: &Path) -> SessionNewParams {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     }
 }
 
@@ -510,6 +511,129 @@ async fn session_lifecycle_over_tcp() {
         serde_json::from_value(ok_payload(exchange(&mut client, &stop_second_req).await))
             .expect("stop second result");
 
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A session started with `secret_env` over a peer connection is listed and
+/// inspected over both transports without its value, and a refusal over the
+/// peer connection quotes none of it.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario drives the refusal, the creation and every observation over both transports"
+)]
+async fn session_secret_env_is_never_listed_or_echoed_over_tcp() {
+    const SLOT: &str = "METER_TOKEN";
+    const SECRET: &str = "SENTINEL_TCP_SECRET_8f14e45f";
+    let fixture = pohunek_test_support::tempdir_with_prefix("ph-tcp-secret-")
+        .expect("create the profile directory");
+    let agents = fixture.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents dir");
+    let seen = fixture.path().join("seen.txt");
+    let script = fixture.path().join("metered-agent");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"${SLOT}\" > '{}'\nexec /bin/cat\n",
+            seen.display()
+        ),
+    )
+    .expect("write the metered agent");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("make the agent executable");
+    std::fs::write(
+        agents.join("metered.toml"),
+        format!(
+            "base = \"shell\"\nprogram = \"{}\"\nsecret_env = [\"{SLOT}\"]\n",
+            script.display()
+        ),
+    )
+    .expect("write the metered profile");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        host_state_dir: Some(fixture.path().join("host-state")),
+        ..shell_config()
+    };
+    let (addr, socket, shutdown, handle) =
+        spawn_dual_servers("remote-secret-env", "0.0.0", config).await;
+    let mut peer = connect_tcp(addr).await;
+    let mut local = connect_unix(&socket).await;
+
+    let mut refused = serde_json::to_value(SessionNewParams {
+        agent: "metered".to_owned(),
+        ..session_params(&socket)
+    })
+    .expect("serialize params");
+    refused["secret_env"] = serde_json::json!({SLOT: SECRET, "UNDECLARED": SECRET});
+    let refusal = exchange(
+        &mut peer,
+        &Request::make("secret-env-refused", method::SESSION_NEW, refused),
+    )
+    .await
+    .into_result()
+    .expect_err("an undeclared variable is refused");
+    assert_eq!(refusal.code, "secret_env_not_declared", "{refusal:?}");
+    assert!(
+        !format!("{refusal:?}").contains(SECRET),
+        "the refusal quotes the secret: {refusal:?}"
+    );
+
+    let mut params = serde_json::to_value(SessionNewParams {
+        agent: "metered".to_owned(),
+        ..session_params(&socket)
+    })
+    .expect("serialize params");
+    params["secret_env"] = serde_json::json!({SLOT: SECRET});
+    let created_payload = ok_payload(
+        exchange(
+            &mut peer,
+            &Request::make("secret-env-created", method::SESSION_NEW, params),
+        )
+        .await,
+    );
+    let created: SessionInfo =
+        serde_json::from_value(created_payload.clone()).expect("session info");
+    let recorded =
+        pohunek_test_support::wait::wait_until("the agent to record its slot", || async {
+            std::fs::read_to_string(&seen)
+                .ok()
+                .filter(|text| !text.is_empty())
+        })
+        .await;
+    assert_eq!(recorded, SECRET, "the agent process holds the exact value");
+
+    let mut observed = vec![created_payload.to_string()];
+    for (name, framed_is_peer) in [("peer", true), ("local", false)] {
+        let list = Request::make("secret-env-list", method::SESSION_LIST, Value::Null);
+        let inspect = Request::make(
+            "secret-env-inspect",
+            method::SESSION_INSPECT,
+            serde_json::to_value(&created.id).expect("serialize id"),
+        );
+        for request in [list, inspect] {
+            let response = if framed_is_peer {
+                exchange(&mut peer, &request).await
+            } else {
+                exchange(&mut local, &request).await
+            };
+            observed.push(format!("{name}: {}", ok_payload(response)));
+        }
+    }
+    for text in &observed {
+        assert!(
+            !text.contains(SECRET) && !text.contains(SLOT),
+            "an observation carries the secret: {text}"
+        );
+    }
+
+    let stop = Request::make(
+        "secret-env-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut peer, &stop).await)).expect("stop result");
     let _ = shutdown.send(());
     let _ = handle.await;
 }

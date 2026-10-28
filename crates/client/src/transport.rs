@@ -796,6 +796,21 @@ impl Client {
         let mut client = self
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;
+        // A daemon that predates `secret_env` drops the field and would start the
+        // agent without its credential, so the flag is checked on the same
+        // connection before the secret leaves the process.
+        if !params.secret_env.is_empty() {
+            let capabilities = client
+                .host_inspect_with(protocol::HostInspectParams {
+                    skip_runtime_probes: Some(true),
+                })
+                .await?;
+            if !capabilities.session_new_secret_env_supported {
+                return Err(ClientError::Protocol(
+                    ProtocolError::session_new_secret_env_unsupported(self.remote_host()),
+                ));
+            }
+        }
         client
             .call_direct::<protocol::method::SessionNew>(params)
             .await

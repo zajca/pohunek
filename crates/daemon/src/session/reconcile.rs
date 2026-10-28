@@ -10030,6 +10030,7 @@ while os.getppid() == parent:
                 on_diverged: None,
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
             })
             .await
             .expect("create after daemon replacement");
@@ -13303,6 +13304,7 @@ handler = "codex-hook-v1"
             on_diverged: None,
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
+            secret_env: protocol::SessionSecretEnv::default(),
         }
     }
 
@@ -20470,6 +20472,7 @@ generation "$1"
                         on_diverged: None,
                         input_ack_timeout_ms: None,
                         metadata: std::collections::BTreeMap::new(),
+                        secret_env: protocol::SessionSecretEnv::default(),
                     })
                     .await
                     .expect("create a supervised session");

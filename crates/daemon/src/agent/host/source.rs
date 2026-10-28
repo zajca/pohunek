@@ -385,6 +385,15 @@ impl LaunchSource {
                 let Some(inputs) = agent.profile_inputs() else {
                     return Err(agent_profile_not_found(profile));
                 };
+                // A relay never carries secret values, so a profile with secret
+                // slots cannot launch from it.
+                if agent
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| !profile.secret_env.is_empty())
+                {
+                    return Err(ProtocolError::secret_env_missing());
+                }
                 if profiles.revision_keys().matches(inputs, revision)? {
                     Ok(agent)
                 } else {

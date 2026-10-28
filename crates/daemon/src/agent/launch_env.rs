@@ -23,6 +23,12 @@ impl LaunchEnv {
         Self(entries)
     }
 
+    /// Moves the entries of `other` behind this carrier's, so they win for a
+    /// shared name.
+    pub fn append(&mut self, mut other: Self) {
+        self.0.append(&mut other.0);
+    }
+
     /// The entries in launch order.
     #[must_use]
     pub fn as_slice(&self) -> &[(String, String)] {

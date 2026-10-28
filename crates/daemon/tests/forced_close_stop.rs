@@ -320,6 +320,7 @@ impl Scenario {
                     on_diverged: None,
                     input_ack_timeout_ms: None,
                     metadata: BTreeMap::new(),
+                    secret_env: protocol::SessionSecretEnv::default(),
                 })
                 .await
                 .expect("create the session")

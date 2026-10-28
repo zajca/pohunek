@@ -33,15 +33,16 @@ use protocol::{
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
     SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark,
-    TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId, TransferProposal,
-    UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
-    MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    SessionSecretEnv, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
+    SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
+    TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
+    TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES,
+    MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_SECRET_ENV_ENTRIES,
+    MAX_SESSION_SECRET_ENV_VALUE_BYTES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
+    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
 };
 use serde_json::{json, Value};
@@ -864,6 +865,7 @@ fn session_new_params_json_shape_roundtrips() {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -899,6 +901,7 @@ fn session_new_params_roundtrips_with_metadata() {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
+        secret_env: protocol::SessionSecretEnv::default(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -938,6 +941,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -975,6 +979,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -3468,6 +3473,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_wait_turn_supported: true,
         session_new_cwd_supported: true,
         session_new_input_ack_supported: true,
+        session_new_secret_env_supported: true,
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
@@ -3502,6 +3508,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_cwd_supported": true,
             "session_new_branch_source_supported": true,
             "session_new_input_ack_supported": true,
+            "session_new_secret_env_supported": true,
             "session_idle_stop_supported": true,
             "package_install_commands_supported": true
         })
@@ -3542,6 +3549,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.session_new_input_ack_supported,
         "a host that omits the ack flag drops input_ack_timeout_ms"
+    );
+    assert!(
+        !caps.session_new_secret_env_supported,
+        "a host that omits the secret_env flag drops secret_env"
     );
     assert!(
         !caps.session_idle_stop_supported,
@@ -5342,4 +5353,88 @@ fn session_new_input_ack_json_shape_roundtrips() {
             .expect("decode parameters without the window");
     let value = serde_json::to_value(&legacy).expect("serialize parameters");
     assert!(value.get("input_ack_timeout_ms").is_none(), "{value}");
+}
+
+/// Secret value the `secret_env` scenarios must never see in a rendering.
+const SECRET_ENV_SENTINEL: &str = "SENTINEL_PROTOCOL_SECRET_91d2";
+
+#[test]
+fn session_new_secret_env_round_trips_but_never_renders_a_name_or_value() {
+    let wire = json!({
+        "agent": "shell", "cols": 80, "rows": 24,
+        "secret_env": {"METER_TOKEN": SECRET_ENV_SENTINEL}
+    });
+    let params: SessionNewParams = serde_json::from_value(wire.clone()).expect("typed params");
+    assert_eq!(serde_json::to_value(&params).expect("serialize"), wire);
+
+    for rendering in [
+        format!("{params:?}"),
+        format!("{params:#?}"),
+        format!("{:?}", params.secret_env),
+        format!(
+            "{:?}",
+            Request::new("secret-env-debug", "session.new", wire).expect("request")
+        ),
+    ] {
+        assert!(
+            !rendering.contains(SECRET_ENV_SENTINEL) && !rendering.contains("METER_TOKEN"),
+            "a Debug rendering shows the secret: {rendering}"
+        );
+    }
+    assert!(format!("{:?}", params.secret_env).contains("1 entries"));
+
+    let without = SessionNewParams {
+        secret_env: SessionSecretEnv::default(),
+        ..params
+    };
+    assert!(
+        serde_json::to_value(&without)
+            .expect("serialize")
+            .get("secret_env")
+            .is_none(),
+        "an empty map is omitted"
+    );
+}
+
+#[test]
+fn malformed_secret_env_is_refused_with_text_that_quotes_nothing() {
+    let too_many: serde_json::Map<String, Value> = (0..=MAX_SESSION_SECRET_ENV_ENTRIES)
+        .map(|index| (format!("SLOT_{index}"), json!(SECRET_ENV_SENTINEL)))
+        .collect();
+    let cases = [
+        json!({"METER_TOKEN": 1234, "OTHER": SECRET_ENV_SENTINEL}),
+        json!({"METER_TOKEN": [SECRET_ENV_SENTINEL]}),
+        json!({"METER_TOKEN": null}),
+        json!({"METER_TOKEN": ""}),
+        json!({"METER_TOKEN": format!("{SECRET_ENV_SENTINEL}\u{0}")}),
+        json!({"METER_TOKEN": "x".repeat(MAX_SESSION_SECRET_ENV_VALUE_BYTES + 1)}),
+        json!({"": SECRET_ENV_SENTINEL}),
+        Value::Object(too_many),
+        json!([SECRET_ENV_SENTINEL]),
+        json!(SECRET_ENV_SENTINEL),
+    ];
+    for secret_env in cases {
+        let error = serde_json::from_value::<SessionNewParams>(json!({
+            "agent": "shell", "cols": 80, "rows": 24, "secret_env": secret_env
+        }))
+        .expect_err("a malformed map is refused");
+        let text = error.to_string();
+        assert!(
+            !text.contains(SECRET_ENV_SENTINEL) && !text.contains("METER_TOKEN"),
+            "the parse error quotes the secret: {text}"
+        );
+    }
+    let at_the_bounds: serde_json::Map<String, Value> = (0..MAX_SESSION_SECRET_ENV_ENTRIES)
+        .map(|index| {
+            (
+                format!("SLOT_{index}"),
+                json!("x".repeat(MAX_SESSION_SECRET_ENV_VALUE_BYTES)),
+            )
+        })
+        .collect();
+    let accepted: SessionNewParams = serde_json::from_value(json!({
+        "agent": "shell", "cols": 80, "rows": 24, "secret_env": Value::Object(at_the_bounds)
+    }))
+    .expect("a map at the bounds is accepted");
+    assert_eq!(accepted.secret_env.len(), MAX_SESSION_SECRET_ENV_ENTRIES);
 }

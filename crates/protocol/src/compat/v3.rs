@@ -166,8 +166,9 @@ fn translate_request(
         });
     }
     // A protocol 3 daemon would drop these options silently: the branch options
-    // would check out the local branch as it is, and the acknowledgement window
-    // would leave `prompt_delivered` unreported.
+    // would check out the local branch as it is, the acknowledgement window
+    // would leave `prompt_delivered` unreported, and `secret_env` would start the
+    // agent without its credential.
     if method == method::SESSION_NEW
         && matches!(direction, Direction::ToLegacy)
         && has_session_new_option(&params)
@@ -197,9 +198,14 @@ fn translate_request(
 }
 
 fn has_session_new_option(params: &Value) -> bool {
-    ["branch_source", "on_diverged", "input_ack_timeout_ms"]
-        .iter()
-        .any(|key| params.get(key).is_some_and(|value| !value.is_null()))
+    [
+        "branch_source",
+        "on_diverged",
+        "input_ack_timeout_ms",
+        "secret_env",
+    ]
+    .iter()
+    .any(|key| params.get(key).is_some_and(|value| !value.is_null()))
 }
 
 fn has_metadata_list_filter(params: &Value) -> bool {

@@ -2048,6 +2048,17 @@ that remain are cheap, free-by-default, or inherited:
   / Claude Code. It is mitigated by those agents' own approval gates, not by a
   new authorization layer in `pohunek`. Dangerous operations (e.g. starting
   sessions on other hosts) stay behind explicit, per-action confirmation.
+- **Per-session secret environment (`session.new` `secret_env`).** A host
+  profile declares the variable names (`secret_env = [...]`) and the request
+  supplies only the values, so the A.5 boundary holds: program, args and the set
+  of environment names come from the owner's profile, never from the wire or a
+  peer. The values live in a redacting protocol type, leave the request before
+  any record or hook is built, and reach the agent once through the worker's
+  private `Initialize` message. They are never persisted, listed, journaled or
+  logged; every declared slot is required on every launch, so a resume, a fork or
+  a relay-origin launch fails with `secret_env_missing` instead of running with
+  the host's own credentials. The residual exposure is the agent's own
+  environment, as for profile `[env]`.
 - **Secrets in terminal output are accepted, not guaranteed-redacted.** Agents
   may print tokens to the PTY; scrollback on your own disk may therefore contain
   secrets. The "no secrets" guarantee applies to *structured* metadata

@@ -862,6 +862,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             on_diverged: None,
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
+            secret_env: protocol::SessionSecretEnv::default(),
         })
         .expect("serialize session.new params"),
     );
@@ -1091,6 +1092,314 @@ fn assert_allowed_only_in(
             allowed,
             "{artifact_name} {} contain {what} ({sentinel}): {text}",
             if allowed { "must" } else { "must never" }
+        );
+    }
+}
+
+/// Secret variable a `session.new` fills into the `metered` profile's slot.
+const SECRET_SLOT: &str = "METER_TOKEN";
+
+/// A secret value no artifact or response may carry.
+const SECRET_VALUE: &str = "SENTINEL_SECRET_ENV_5d41402a";
+
+/// Owner-only fixture for the secret-env scenarios: a worker-backed daemon over
+/// a profile whose slot a request fills, and the files the agent writes into.
+struct SecretEnvHost {
+    root: tempfile::TempDir,
+    socket_dir: tempfile::TempDir,
+    store_path: PathBuf,
+    events_dir: PathBuf,
+    daemon_log_dir: PathBuf,
+    seen_path: PathBuf,
+}
+
+impl SecretEnvHost {
+    /// Lays out the directories and the `metered` profile: a shell that writes
+    /// the value of its slot into `seen_path`, then waits on its input.
+    fn new(tag: &str) -> Self {
+        let root = temp_dir(tag);
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("make data directory private");
+        let agents_dir = root.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        std::fs::create_dir(root.path().join("work")).expect("create the working directory");
+        let seen_path = root.path().join("seen.txt");
+        // The slot name lives in the script, not in the profile's argv, which the
+        // store legitimately freezes.
+        let script = root.path().join("metered-agent");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${SECRET_SLOT}\" > '{}'\nexec /bin/cat\n",
+                seen_path.display()
+            ),
+        )
+        .expect("write the metered agent");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make the agent executable");
+        std::fs::write(
+            agents_dir.join("metered.toml"),
+            format!(
+                "base = \"shell\"\nprogram = \"{}\"\nsecret_env = [\"{SECRET_SLOT}\"]\n",
+                script.display()
+            ),
+        )
+        .expect("write the metered profile");
+        std::fs::write(
+            agents_dir.join("plain.toml"),
+            "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"exec /bin/cat\"]\n",
+        )
+        .expect("write the slot-less profile");
+        Self {
+            store_path: data_dir.join("metadata.jsonl"),
+            events_dir: data_dir.join("events"),
+            daemon_log_dir: root.path().join("daemon-logs"),
+            socket_dir: temp_dir(&format!("{tag}-sock")),
+            seen_path,
+            root,
+        }
+    }
+
+    fn config(&self) -> SessionRegistryConfig {
+        SessionRegistryConfig {
+            shell_command: support::hermetic_shell(),
+            store_path: Some(self.store_path.clone()),
+            event_log_dir: Some(self.events_dir.clone()),
+            agents_dir: Some(self.root.path().join("agents")),
+            host_state_dir: Some(self.root.path().join("host-state")),
+            ..SessionRegistryConfig::default()
+        }
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.socket_dir.path().join("daemon.sock")
+    }
+
+    fn new_params(&self, agent: &str, secret_env: serde_json::Value) -> serde_json::Value {
+        let mut params = serde_json::to_value(SessionNewParams {
+            name: None,
+            agent: agent.to_owned(),
+            cwd: Some(self.root.path().join("work")),
+            cols: 80,
+            rows: 24,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
+            input_ack_timeout_ms: None,
+            metadata: BTreeMap::new(),
+            secret_env: protocol::SessionSecretEnv::default(),
+        })
+        .expect("serialize session.new params");
+        params["secret_env"] = secret_env;
+        params
+    }
+}
+
+/// Every error response of a request line must be free of the secret.
+fn assert_error_free_of_secret(response: Response, code: &str) {
+    let error = response.into_result().expect_err("the request is refused");
+    assert_eq!(error.code, code, "{error:?}");
+    let rendered = format!("{error:?} {} {:?}", error.msg, error.recover);
+    assert!(
+        !rendered.contains(SECRET_VALUE) && !rendered.contains("SENTINEL_"),
+        "the refusal leaked a secret: {rendered}"
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end scan drives creation, observation and every refusal path"
+)]
+async fn session_secret_env_reaches_only_the_agent_process() {
+    let host = SecretEnvHost::new("secret-env-sentinel");
+    let log_guard =
+        pohunek_daemon::logging::init(&host.daemon_log_dir).expect("daemon logging initializes");
+    let socket = host.socket();
+    let (shutdown, handle, worker_home) =
+        spawn_worker_backed_server(&socket, "0.0.0", host.config()).await;
+    let worker_state_root = worker_home.path().join("state/pohunek/workers");
+    let worker_log_dir = worker_home.path().join("state/pohunek/logs");
+    let mut control = connect(&socket).await;
+
+    // The capability flag is the client's gate.
+    let inspect = Request::make(
+        "secret-env-host-inspect",
+        method::HOST_INSPECT,
+        serde_json::json!({"skip_runtime_probes": true}),
+    );
+    let capabilities = ok_payload(exchange(&mut control, &inspect).await);
+    assert_eq!(capabilities["session_new_secret_env_supported"], true);
+
+    // Refusals first: a refused request launches nothing and quotes nothing.
+    let refusals = [
+        (
+            "metered",
+            serde_json::json!({SECRET_SLOT: SECRET_VALUE, "UNDECLARED": SECRET_VALUE}),
+            "secret_env_not_declared",
+        ),
+        ("metered", serde_json::json!({}), "secret_env_missing"),
+        (
+            "plain",
+            serde_json::json!({SECRET_SLOT: SECRET_VALUE}),
+            "secret_env_not_declared",
+        ),
+        (
+            "shell",
+            serde_json::json!({SECRET_SLOT: SECRET_VALUE}),
+            "secret_env_not_declared",
+        ),
+        (
+            "metered",
+            serde_json::json!({SECRET_SLOT: 1234, "OTHER": SECRET_VALUE}),
+            "secret_env_invalid",
+        ),
+        (
+            "metered",
+            serde_json::json!({SECRET_SLOT: ""}),
+            "secret_env_invalid",
+        ),
+        (
+            "metered",
+            serde_json::json!({SECRET_SLOT: format!("{SECRET_VALUE}\u{0}")}),
+            "secret_env_invalid",
+        ),
+        (
+            "metered",
+            serde_json::json!({SECRET_SLOT: "x".repeat(protocol::MAX_SESSION_SECRET_ENV_VALUE_BYTES + 1)}),
+            "secret_env_invalid",
+        ),
+        (
+            "metered",
+            serde_json::Value::Object(
+                (0..=protocol::MAX_SESSION_SECRET_ENV_ENTRIES)
+                    .map(|index| (format!("SLOT_{index}"), serde_json::json!(SECRET_VALUE)))
+                    .collect(),
+            ),
+            "secret_env_invalid",
+        ),
+        (
+            "metered",
+            serde_json::json!([SECRET_VALUE]),
+            "secret_env_invalid",
+        ),
+    ];
+    for (index, (agent, secret_env, code)) in refusals.into_iter().enumerate() {
+        let request = Request::make(
+            &format!("secret-env-refusal-{index}"),
+            method::SESSION_NEW,
+            host.new_params(agent, secret_env),
+        );
+        assert_error_free_of_secret(exchange(&mut control, &request).await, code);
+    }
+    let listed = Request::make(
+        "secret-env-list-empty",
+        method::SESSION_LIST,
+        serde_json::Value::Null,
+    );
+    assert_eq!(
+        ok_payload(exchange(&mut control, &listed).await),
+        serde_json::json!([]),
+        "no refused request created a session"
+    );
+
+    // The accepted request: the agent process holds the value.
+    let create = Request::make(
+        "secret-env-create",
+        method::SESSION_NEW,
+        host.new_params("metered", serde_json::json!({SECRET_SLOT: SECRET_VALUE})),
+    );
+    let created_payload = ok_payload(exchange(&mut control, &create).await);
+    let created: SessionInfo =
+        serde_json::from_value(created_payload.clone()).expect("session info");
+    let seen = pohunek_test_support::wait::wait_until("the agent to record its slot", || async {
+        std::fs::read_to_string(&host.seen_path)
+            .ok()
+            .filter(|text| !text.is_empty())
+    })
+    .await;
+    assert_eq!(
+        seen, SECRET_VALUE,
+        "the agent process holds the exact value"
+    );
+
+    // Observation paths.
+    let list = Request::make(
+        "secret-env-list",
+        method::SESSION_LIST,
+        serde_json::Value::Null,
+    );
+    let inspect_session = Request::make(
+        "secret-env-inspect",
+        method::SESSION_INSPECT,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let observed = [
+        ("session.new result", created_payload.to_string()),
+        (
+            "session.list",
+            ok_payload(exchange(&mut control, &list).await).to_string(),
+        ),
+        (
+            "session.inspect",
+            ok_payload(exchange(&mut control, &inspect_session).await).to_string(),
+        ),
+    ];
+    for (what, text) in &observed {
+        assert!(
+            !text.contains(SECRET_VALUE) && !text.contains(SECRET_SLOT),
+            "{what} carries the secret: {text}"
+        );
+    }
+
+    let stop = Request::make(
+        "secret-env-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop).await))
+            .expect("stop result");
+
+    let journal_bytes = wait_for_dir_containing(&worker_state_root, created.id.0.as_bytes()).await;
+    let event_log_bytes = wait_for_dir_containing(&host.events_dir, created.id.0.as_bytes()).await;
+    let worker_log_bytes = collect_dir_bytes(&worker_log_dir);
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    drop(log_guard);
+    let store_bytes = std::fs::read(&host.store_path).expect("read logical store");
+    let daemon_log_bytes = collect_dir_bytes(&host.daemon_log_dir);
+
+    let artifacts: [(&str, &[u8]); 5] = [
+        ("logical store", &store_bytes),
+        ("worker journal", &journal_bytes),
+        ("event log", &event_log_bytes),
+        ("worker structured log", &worker_log_bytes),
+        ("daemon structured log", &daemon_log_bytes),
+    ];
+    for (artifact_name, bytes) in artifacts {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains(SECRET_VALUE) && !text.contains("SENTINEL_"),
+            "{artifact_name} carries a secret value: {text}"
+        );
+    }
+    // The slot name is configuration, not a secret, but the structured stores
+    // never need it either.
+    for (artifact_name, bytes) in [
+        ("logical store", store_bytes.as_slice()),
+        ("event log", event_log_bytes.as_slice()),
+    ] {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(SECRET_SLOT),
+            "{artifact_name} names the secret slot"
         );
     }
 }

@@ -401,6 +401,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
                 on_diverged: None,
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
             })
             .await
             .expect("create shell session")
@@ -489,6 +490,7 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
                 on_diverged: None,
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
             })
             .await
             .expect("create shell session")
@@ -533,6 +535,10 @@ async fn procwatch_leaves_a_foreground_claude_unattributed_without_the_official_
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario drives the worker-backed session across a daemon restart"
+)]
 async fn procwatch_keeps_worker_agent_after_daemon_restart() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
@@ -590,6 +596,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                                 on_diverged: None,
                                 input_ack_timeout_ms: None,
                                 metadata: BTreeMap::new(),
+                                secret_env: protocol::SessionSecretEnv::default(),
                             })
                             .await
                             .expect("create shell session")
@@ -746,6 +753,7 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
                 on_diverged: None,
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
             })
             .await
             .expect("create shell session")
@@ -830,6 +838,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             on_diverged: None,
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
+            secret_env: protocol::SessionSecretEnv::default(),
         })
         .await
         .expect("create shell session");

@@ -322,6 +322,7 @@ pub async fn prepare_with_options(
         on_diverged: params.on_diverged,
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     };
 
     Ok(PreparedLaunch {
