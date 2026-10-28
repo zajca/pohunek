@@ -27,10 +27,12 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::host::{
-    is_reserved, InputReadiness, LaunchProgram, ProfileInputs, ProfileRevision, RevisionKeys,
-    RuntimeDefinition, RuntimeHost, ServedBy, Spawn,
+    is_reserved, ConfigHome, InputReadiness, LaunchProgram, ProfileInputs, ProfileRevision,
+    RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy, Spawn,
 };
-use super::{InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind};
+use super::{
+    env_name_problem, InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind,
+};
 use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
 use crate::project::config::validate_name;
 
@@ -58,6 +60,10 @@ struct RawProfile {
     /// Extra PTY env (every `POHUNEK_`-prefixed key is stripped on load — reserved).
     #[serde(default)]
     env: HashMap<String, EnvValue>,
+    /// Names of the secret variables a `session.new` fills. Only the names live
+    /// in the profile; the values arrive with the request and are never stored.
+    #[serde(default)]
+    secret_env: Vec<String>,
     /// Input-framing override; absent ⇒ the base kind's defaults.
     #[serde(default)]
     input_rules: Option<RawInputRules>,
@@ -180,6 +186,9 @@ pub(crate) struct ResolvedProfile {
     /// key already stripped. Secret-bearing: its `Debug` form is redacted and
     /// it never reaches the store.
     pub env: LaunchEnv,
+    /// Names of the secret variables every launch of this profile must fill,
+    /// sorted. Empty ⇒ the profile takes no secret variables.
+    pub secret_env: Vec<String>,
     /// Input-rules override; `None` ⇒ inherit the base kind's rules.
     pub input_rules: Option<InputRules>,
     /// Resolved native-session launch spec; `None` ⇒ not resumable and not
@@ -216,6 +225,52 @@ impl ResolvedAgent {
             || self.definition.native().cloned(),
             |profile| profile.native.clone(),
         )
+    }
+
+    /// Matches the secret variables of a launch against the slots of the
+    /// profile this agent resolved from, and returns the pairs to add to the
+    /// launch environment in slot order.
+    ///
+    /// Only a declared slot may be filled and every declared slot must be:
+    /// a launch that cannot supply the profile's credential must not fall back
+    /// to whatever the agent finds on the host. A slot the runtime's own
+    /// `config_home` variable or `[launch_env]` already names cannot be filled,
+    /// because a caller would redirect the agent's home or flip its behaviour
+    /// flags. Errors name neither a variable nor a value.
+    ///
+    /// # Errors
+    ///
+    /// `secret_env_not_declared` for a request that fills an undeclared or
+    /// unfillable name (a bare runtime and a slot-less profile declare none),
+    /// `secret_env_missing` for a declared slot the launch leaves unfilled.
+    pub(crate) fn bind_secret_env(
+        &self,
+        provided: protocol::SessionSecretEnv,
+    ) -> Result<Vec<(String, String)>, ProtocolError> {
+        let slots = self
+            .profile
+            .as_ref()
+            .map_or(&[][..], |profile| profile.secret_env.as_slice());
+        let config_home = self.definition.config_home().map(ConfigHome::env);
+        let launch_env = self.definition.launch_env();
+        let fillable = |name: &str| {
+            slots.iter().any(|slot| slot == name)
+                && config_home != Some(name)
+                && !launch_env.iter().any(|(key, _)| key == name)
+        };
+        if provided.names().any(|name| !fillable(name)) {
+            return Err(ProtocolError::secret_env_not_declared());
+        }
+        let mut entries: std::collections::BTreeMap<String, String> =
+            provided.into_entries().into_iter().collect();
+        let mut bound = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match entries.remove(slot) {
+                Some(value) => bound.push((slot.clone(), value)),
+                None => return Err(ProtocolError::secret_env_missing()),
+            }
+        }
+        Ok(bound)
     }
 
     /// The launch inputs of the host profile this agent resolved from; `None`
@@ -1347,6 +1402,7 @@ fn resolve_profile_text(
         .program
         .unwrap_or_else(|| definition.program().as_str().to_owned());
     let args = raw.args.unwrap_or_default();
+    let env_keys: HashSet<String> = raw.env.keys().cloned().collect();
     // Every `POHUNEK_`-prefixed key is reserved for the daemon handshake; strip the
     // whole prefix so a profile can never shadow `POHUNEK_ENV`/`_PROTOCOL_VERSION`/…
     // (the launch path also re-asserts this by appending the handshake env last).
@@ -1357,6 +1413,7 @@ fn resolve_profile_text(
         .map(|(key, value)| (key, value.0))
         .collect::<Vec<_>>()
         .into();
+    let secret_env = validate_secret_env(name, raw.secret_env, &env_keys)?;
     let input_rules = raw.input_rules.map(|rules| {
         definition.input_rules().with_framing(
             rules.bracketed_paste.unwrap_or(false),
@@ -1382,6 +1439,7 @@ fn resolve_profile_text(
             program,
             args,
             env,
+            secret_env,
             input_rules,
             native,
             manifest: manifest_source.map(|source| source.manifest),
@@ -1389,6 +1447,71 @@ fn resolve_profile_text(
             inputs,
         }),
     })
+}
+
+/// Variables the launch composes itself; a profile slot on one of them would
+/// let a caller overwrite the agent's terminal, paths or identity.
+const LAUNCH_OWNED_ENV_NAMES: [&str; 8] = [
+    "TERM", "TMPDIR", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG",
+];
+
+/// Prefixes of the dynamic-loader variables, which execute caller-chosen code
+/// in the agent process.
+const LOADER_ENV_PREFIXES: [&str; 2] = ["LD_", "DYLD_"];
+
+/// Validate the `secret_env` slot names of profile `name`.
+///
+/// A slot is a portable upper-case variable name outside every set the launch
+/// owns: `POHUNEK_*`, the service-manager denylist, the loader prefixes, the
+/// launch-owned names and the profile's own `[env]` keys. At most
+/// [`protocol::MAX_SESSION_SECRET_ENV_ENTRIES`] distinct names. The error names
+/// the offending slot (a name, never a value) and returns the slots sorted.
+fn validate_secret_env(
+    name: &str,
+    slots: Vec<String>,
+    env_keys: &HashSet<String>,
+) -> Result<Vec<String>, ProtocolError> {
+    if slots.len() > protocol::MAX_SESSION_SECRET_ENV_ENTRIES {
+        return Err(invalid_profile(
+            name,
+            &format!(
+                "secret_env holds {} names; at most {} are allowed",
+                slots.len(),
+                protocol::MAX_SESSION_SECRET_ENV_ENTRIES
+            ),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for slot in &slots {
+        let shown = slot.chars().take(64).collect::<String>();
+        let problem = if let Some(reason) = env_name_problem(slot) {
+            Some(reason)
+        } else if pohunek_worker_protocol::is_denylisted(slot) {
+            Some("is a service-manager variable")
+        } else if LOADER_ENV_PREFIXES
+            .iter()
+            .any(|prefix| slot.starts_with(prefix))
+        {
+            Some("is a dynamic-loader variable")
+        } else if LAUNCH_OWNED_ENV_NAMES.contains(&slot.as_str()) {
+            Some("is set by the launch itself")
+        } else if env_keys.contains(slot) {
+            Some("is also a key of [env]")
+        } else if !seen.insert(slot.as_str()) {
+            Some("is listed twice")
+        } else {
+            None
+        };
+        if let Some(reason) = problem {
+            return Err(invalid_profile(
+                name,
+                &format!("secret_env name '{shown}' {reason}"),
+            ));
+        }
+    }
+    let mut sorted = slots;
+    sorted.sort();
+    Ok(sorted)
 }
 
 /// The package binding of a profile: the package id and archive digest its

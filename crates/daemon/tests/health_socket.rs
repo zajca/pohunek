@@ -866,6 +866,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     }
 }
 
@@ -886,6 +887,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     }
 }
 
@@ -911,6 +913,7 @@ fn session_params_for_worktree(
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     }
 }
 

@@ -75,8 +75,14 @@ where
     T: serde::de::DeserializeOwned,
 {
     serde_json::from_value::<T>(request.params().clone()).map_err(|err| {
+        let text = err.to_string();
+        // A malformed `secret_env` is answered with its own fixed text: the
+        // serde message of a neighbouring field could otherwise quote a value.
+        if text.contains(protocol::SECRET_ENV_INVALID_MESSAGE) {
+            return protocol::ProtocolError::secret_env_invalid();
+        }
         protocol::ProtocolError::bad_request(format!(
-            "invalid params for {}: {err}",
+            "invalid params for {}: {text}",
             request.method()
         ))
     })

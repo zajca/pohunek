@@ -87,6 +87,14 @@ export type HostCapabilities = {
    */
   session_new_input_ack_supported?: boolean;
   /**
+   * Whether `session.new` honors `secret_env`.
+   *
+   * A daemon that predates the field omits the flag, which decodes as
+   * `false`; it would drop `secret_env` silently. `false` is likewise
+   * omitted on the wire.
+   */
+  session_new_secret_env_supported?: boolean;
+  /**
    * Whether the daemon serves `session.idle_stop.get` and
    * `session.idle_stop.set` and stops sessions opted in to idle stop.
    *

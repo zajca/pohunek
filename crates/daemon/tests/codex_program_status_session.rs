@@ -255,6 +255,7 @@ impl Fixture {
                 on_diverged: None,
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
             })
             .await
             .expect("create the stand-in agent session")
@@ -520,6 +521,7 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
                 on_diverged: None,
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
             })
             .await
             .expect("create the shell session")

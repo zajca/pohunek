@@ -100,6 +100,16 @@ export type SessionNewParams = {
    */
   input_ack_timeout_ms?: number;
   /**
+   * Secret environment variables for the agent process: variable name to
+   * value. The profile's `secret_env` key declares the names a caller may
+   * fill and every declared name is required; values are never listed,
+   * persisted or logged. A daemon that does not advertise
+   * `HostCapabilities::session_new_secret_env_supported` would drop the field
+   * silently, so a client checks the flag before sending it (the protocol 3
+   * client adapter refuses it).
+   */
+  secret_env?: Record<string, string>;
+  /**
    * Owner-controlled metadata for the session. Must not contain secrets.
    */
   metadata?: { [key in string]: string };

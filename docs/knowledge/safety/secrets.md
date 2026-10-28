@@ -24,6 +24,14 @@ cannot print a name or a value. The store keeps only the keyed revision (a MAC)
 of the profile a session launched under, never its env, and error messages of
 the profile-change refusals name the agent and session, never a profile value.
 
+A `session.new` `secret_env` map is a second secret-bearing carrier. The
+protocol type prints only an entry count and reports a malformed entry with
+fixed text; the daemon takes the values out of the request before any record,
+hook or event is built, and sends them once to the worker in `Initialize`
+alongside the profile environment. They are not persisted, so a resume or fork of
+a profile that declares `secret_env` slots is refused with `secret_env_missing`.
+The slot names come from the host profile, never from the wire.
+
 The assistant snapshot is allowlist-built. It may include filenames, existence
 status, parse status, selected action names, structured command output, and
 warnings. It must not collect process environment variables, profile env values,

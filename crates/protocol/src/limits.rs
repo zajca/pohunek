@@ -55,6 +55,23 @@ pub const ED25519_SIGNATURE_BYTES: usize = 64;
 /// A 64-byte payload encodes to 86 base64url characters without padding.
 pub const ED25519_SIGNATURE_PAYLOAD_BYTES: usize = 86;
 
+/// Maximum variables one `session.new` `secret_env` map may carry.
+///
+/// A metering credential is a handful of variables; 16 bounds the per-launch
+/// secret surface and the profile `secret_env` list alike.
+pub const MAX_SESSION_SECRET_ENV_ENTRIES: usize = 16;
+
+/// Maximum UTF-8 bytes in one `secret_env` value.
+///
+/// Large enough for a signed token or a PEM-sized credential, small enough that
+/// sixteen of them fit one control line.
+pub const MAX_SESSION_SECRET_ENV_VALUE_BYTES: usize = 16 * 1024;
+
+/// Maximum UTF-8 bytes in one `secret_env` variable name.
+///
+/// Matches the portable environment-name bound used for launch environments.
+pub const MAX_SESSION_SECRET_ENV_NAME_BYTES: usize = 128;
+
 /// Maximum bounded `session.wait` duration accepted on the public wire.
 ///
 /// Eight seconds releases abandoned daemon waiter slots promptly while still

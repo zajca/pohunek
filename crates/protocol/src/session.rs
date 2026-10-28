@@ -14,8 +14,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     envelope::StateSource, ActivityRevision, BackgroundRevision, OutputOffset,
     ProcessStartIdentity, ProtocolError, ReportSequence, RuntimeGeneration, RuntimeRef,
-    SubagentRevision, TerminalWatermark, MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
+    SessionSecretEnv, SubagentRevision, TerminalWatermark, MAX_SESSION_ID_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
+    MAX_WORKER_INSTANCE_ID_BYTES,
 };
 
 /// Current detected agent activity within a running session.
@@ -411,6 +412,16 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub input_ack_timeout_ms: Option<u32>,
+    /// Secret environment variables for the agent process: variable name to
+    /// value. The profile's `secret_env` key declares the names a caller may
+    /// fill and every declared name is required; values are never listed,
+    /// persisted or logged. A daemon that does not advertise
+    /// `HostCapabilities::session_new_secret_env_supported` would drop the field
+    /// silently, so a client checks the flag before sending it (the protocol 3
+    /// client adapter refuses it).
+    #[serde(default, skip_serializing_if = "SessionSecretEnv::is_unset")]
+    #[cfg_attr(feature = "ts", ts(optional, type = "Record<string, string>"))]
+    pub secret_env: SessionSecretEnv,
     /// Owner-controlled metadata for the session. Must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,

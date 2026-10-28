@@ -30,6 +30,15 @@ prefers a user-defined `pohunek-assistant` profile when available, then `codex`,
 then `claude`, then `hermes`, then other profiles based on those runtimes. The selected agent
 must be reported to the user and remain overrideable.
 
+A profile can also declare `secret_env = ["NAME", ...]`: variables whose values
+come from the `session.new` request (`secret_env` map) instead of the file. The
+profile owns the names, every declared name is required on every launch, and
+the values reach only the agent process; they are never stored, listed or
+logged, and `session.resume`, `session.fork` and relay launches of such a
+profile fail with `secret_env_missing`. A client checks
+`HostCapabilities.session_new_secret_env_supported` before sending the map. The API contract is the "Secret session environment" section of the public API
+reference.
+
 Profile environment values are secret-bearing. They must not be copied into the
 knowledge bundle, prompt, snapshot, logs, or documentation. See
 [secrets](../safety/secrets.md).

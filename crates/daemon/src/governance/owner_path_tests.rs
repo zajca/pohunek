@@ -546,6 +546,7 @@ where
             on_diverged: None,
             input_ack_timeout_ms: None,
             metadata: BTreeMap::default(),
+            secret_env: protocol::SessionSecretEnv::default(),
         })
         .expect("serialize real session parameters"),
     )

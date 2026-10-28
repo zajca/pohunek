@@ -208,6 +208,7 @@ pub(super) fn params() -> SessionNewParams {
         on_diverged: None,
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
     }
 }
 
@@ -1814,7 +1815,7 @@ std::thread_local! {
 ///
 /// Roots the config does not name are fresh directories that live until the
 /// calling test thread ends, because the fixture outlives any one registry.
-fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
+pub(super) fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
     let (runtime_root, state_root, owned) = super::owned_test_worker_roots(config);
     WORKER_ROOT_DIRS.with(|dirs| dirs.borrow_mut().extend(owned));
     (runtime_root, state_root)

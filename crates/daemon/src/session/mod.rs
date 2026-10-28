@@ -39,7 +39,7 @@ use ulid::Ulid;
 use crate::agent::host::{self, InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
     agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
-    resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts,
+    resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchEnv, LaunchOpts,
     NativeReferenceProvenance, NativeSessionLaunch, ProfileRegistry, ResolvedAgent, SessionRef,
     SessionRefKind, ValidatedLaunchProgram,
 };
@@ -95,6 +95,8 @@ mod procwatch;
 mod profile_freeze_tests;
 #[cfg(test)]
 mod profile_pin_tests;
+#[cfg(test)]
+mod profile_secret_env_tests;
 mod read;
 mod reconcile;
 use claim::{ClaimKey, ClaimOrigin, PendingActivity, PendingRelease};
@@ -3194,9 +3196,12 @@ impl SessionRegistry {
     /// As [`Self::create`].
     pub async fn create_outcome(
         &self,
-        params: SessionNewParams,
+        mut params: SessionNewParams,
     ) -> Result<CreateOutcome, ProtocolError> {
         self.ensure_migration_settled()?;
+        // Taken before anything clones the params, so the secret values live
+        // only in the launch carrier and never reach a record, hook or event.
+        let secret_env = std::mem::take(&mut params.secret_env);
         validate_new_params(&params)?;
         idle_stop::validate_opt_in(&params.metadata, self.inner.config.idle_stop_min_secs)?;
         // Resolve and validate the runtime before allocating a logical id or
@@ -3209,6 +3214,7 @@ impl SessionRegistry {
         // profile still is the one the session launched under. A host that
         // cannot key revisions launches no profile-backed session.
         let profile_revision = self.inner.profiles.revision_of(&resolved)?;
+        let secret_env = LaunchEnv::new(resolved.bind_secret_env(secret_env)?);
         let profile_env = resolved
             .profile
             .as_ref()
@@ -3235,6 +3241,23 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
+        // Refused before the worker socket, the record or any worktree exists.
+        if !secret_env.is_empty() {
+            let contributed = self.contributed_env_names(
+                &resolved.definition,
+                profile_env,
+                RuntimeRef::from(resolved.base.clone()),
+                &id,
+                LaunchKind::Create,
+                &resolved.snapshot_args(),
+            )?;
+            if let Some((slot, _)) = secret_env
+                .iter()
+                .find(|(slot, _)| contributed.contains(slot))
+            {
+                return Err(secret_slot_collision(&resolved.name, slot));
+            }
+        }
         self.ensure_worker_socket(&id)?;
         // The durable intent, target binding, registration, initial input, and
         // every compensation run as one detached task, so a client dropped
@@ -3253,6 +3276,7 @@ impl SessionRegistry {
                 profile_revision,
                 validated_program,
                 fallback_cwd,
+                secret_env,
             ))
             .await?;
             let (session, prompt_delivered) = registry
@@ -3647,6 +3671,10 @@ impl SessionRegistry {
     /// the record for startup reconciliation.
     ///
     /// Returns the committed session and the initial input still to deliver.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the create transaction receives the resolved agent, its frozen revision, the validated program and the launch-only secrets as separate owned values"
+    )]
     async fn create_transaction(
         &self,
         id: SessionId,
@@ -3655,6 +3683,7 @@ impl SessionRegistry {
         profile_revision: Option<host::ProfileRevision>,
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         fallback_cwd: PathBuf,
+        secret_env: LaunchEnv,
     ) -> Result<
         (
             SessionInfo,
@@ -3697,6 +3726,7 @@ impl SessionRegistry {
                         &resolved,
                         profile_revision,
                         validated_program,
+                        secret_env,
                         target,
                     )
                 }
@@ -4068,6 +4098,10 @@ impl SessionRegistry {
         clippy::too_many_lines,
         reason = "the create registration freezes the snapshot, composes the launch and builds the spec in one ordered pass"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the registration takes the resolved agent, its frozen revision, the validated program and the launch-only secrets as separate values"
+    )]
     fn create_spec(
         &self,
         id: &SessionId,
@@ -4075,6 +4109,7 @@ impl SessionRegistry {
         resolved: &ResolvedAgent,
         profile_revision: Option<host::ProfileRevision>,
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
+        secret_env: LaunchEnv,
         target: TargetResolution,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
         let reference_launch = target.reference_launch();
@@ -4139,11 +4174,21 @@ impl SessionRegistry {
             LaunchKind::Create,
             &snapshot.args,
         )?;
+        // A slot never replaces a variable an earlier layer (descriptor,
+        // `TMPDIR`, profile, contributor, handshake) already set.
+        if let Some((slot, _)) = secret_env
+            .iter()
+            .find(|(slot, _)| inputs.env.iter().any(|(set, _)| set == slot))
+        {
+            return Err(secret_slot_collision(&resolved.name, slot));
+        }
+        let mut env_extra = inputs.env;
+        env_extra.append(secret_env);
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),
             cols: params.cols,
             rows: params.rows,
-            env_extra: inputs.env,
+            env_extra,
             validated_program,
         };
         let plan = build_launch_command(
@@ -9479,3 +9524,14 @@ fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig
 
 #[cfg(test)]
 mod tests;
+
+/// The refusal of a launch whose secret slot names a variable the launch itself
+/// sets. The slot is the owner's own profile key, so it is named; no value is.
+fn secret_slot_collision(profile: &str, slot: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "invalid_profile",
+        format!("invalid agent profile '{profile}': secret_env name '{slot}' is set by the runtime's launch itself"),
+        None,
+    )
+}

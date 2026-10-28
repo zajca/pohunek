@@ -34,7 +34,7 @@ use crate::{MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES};
 ///
 /// `params` is method-specific; it is carried as an opaque JSON value at the
 /// envelope layer and parsed into a typed struct by the method handler.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Request {
     /// Inclusive public protocol range supported by the sender.
     ///
@@ -55,6 +55,33 @@ pub struct Request {
     /// Daemon instance paired with `origin_session_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin_daemon_id: Option<String>,
+}
+
+/// Parameter key whose value is secret and must never appear in `Debug` output.
+const SECRET_ENV_PARAM: &str = "secret_env";
+
+impl std::fmt::Debug for Request {
+    /// Renders the request with the `secret_env` parameter replaced by a marker,
+    /// so a panic message or a debug log never carries a secret value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut params = self.params.clone();
+        if let Some(object) = params.as_object_mut() {
+            if object.contains_key(SECRET_ENV_PARAM) {
+                object.insert(
+                    SECRET_ENV_PARAM.to_owned(),
+                    Value::String("<redacted>".to_owned()),
+                );
+            }
+        }
+        f.debug_struct("Request")
+            .field("v", &self.v)
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &params)
+            .field("origin_session_id", &self.origin_session_id)
+            .field("origin_daemon_id", &self.origin_daemon_id)
+            .finish()
+    }
 }
 
 impl Request {

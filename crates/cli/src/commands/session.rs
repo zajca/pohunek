@@ -2099,6 +2099,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
             .then_some(protocol::OnDiverged::BackupReset),
         input_ack_timeout_ms: args.input_ack_timeout_ms,
         metadata: parse_meta_pairs(&args.meta)?,
+        secret_env: protocol::SessionSecretEnv::default(),
     })
 }
 
