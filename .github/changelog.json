@@ -1,4 +1,11 @@
 {
   "repository": "zajca/pohunek",
-  "changelog": "CHANGELOG.md"
+  "changelog": "CHANGELOG.md",
+  "guard": {
+    "label": "no-changelog",
+    "triggers": [
+      "docs/knowledge/log.d/*.md",
+      "docs/cli.md"
+    ]
+  }
 }

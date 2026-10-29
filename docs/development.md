@@ -560,6 +560,15 @@ User-facing changes are recorded as fragments, not in the knowledge log. A pull
 request with a user-visible effect adds one `changelog.d/<issue>-<slug>.md` per
 change; a pull request with none carries the `no-changelog` label.
 
+The `Changelog guard` workflow (`.github/workflows/changelog-guard.yml`)
+enforces this for the changes that document a behavior: a pull request that adds
+or edits a knowledge-log fragment (`docs/knowledge/log.d/*.md`) or `docs/cli.md`
+fails unless it adds a `changelog.d/` fragment, edits `CHANGELOG.md`, or carries
+the `no-changelog` label. Adding or removing the label re-runs only that
+workflow. The trigger paths and the label name are the `guard` key of
+`.github/changelog.json`; `scripts/changelog guard --base REV [--head REV]
+[--labels-json JSON]` runs the same check locally.
+
 A fragment starts with a header and then one paragraph written for users:
 
 ```

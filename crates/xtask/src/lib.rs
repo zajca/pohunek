@@ -921,14 +921,33 @@ fn repo_root() -> PathBuf {
     pohunek_test_support::workspace_root()
 }
 
-/// Root of the checkout the tool runs in.
+/// Root of the checkout the tool runs in: the nearest ancestor of the working
+/// directory that holds the xtask manifest.
+///
+/// The root is resolved at run time. A binary built in one checkout and reused
+/// from another through a shared `CARGO_TARGET_DIR` would otherwise act on the
+/// checkout that compiled it. Outside any checkout, which only a command that
+/// takes every path as an argument does, the checkout that compiled the binary
+/// stands in.
 #[cfg(not(test))]
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("xtask crate lives under crates/xtask")
-        .to_path_buf()
+    /// Manifest whose presence marks the root of a checkout this tool belongs to.
+    const XTASK_MANIFEST: &str = "crates/xtask/Cargo.toml";
+
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            cwd.ancestors()
+                .find(|directory| directory.join(XTASK_MANIFEST).is_file())
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("xtask crate lives under crates/xtask")
+                .to_path_buf()
+        })
 }
 
 fn collect_files(root: &Path) -> Result<Vec<FileEntry>, XtaskError> {
