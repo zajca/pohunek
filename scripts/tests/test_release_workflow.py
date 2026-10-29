@@ -1491,6 +1491,76 @@ class OfflineDependencySourcesTests(unittest.TestCase):
                     self.assertLess(fetch.start(), test_run.start(), f"{name} fetches after running cargo test")
 
 
+class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
+    """The gate runs the nextest set CI runs, not a one-process `cargo test`."""
+
+    PARTITIONS = ROOT / "scripts" / "test-partitions"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.gate = cls.release_jobs["gate"]
+
+    def partition_shards(self) -> list[str]:
+        match = re.search(r"^SHARDS = \(([^)]*)\)", self.PARTITIONS.read_text(), re.M)
+        self.assertIsNotNone(match, "SHARDS not found in scripts/test-partitions")
+        return re.findall(r'"([^"]+)"', match.group(1))
+
+    def test_the_gate_archives_the_workspace_with_the_ci_profile(self):
+        archive = re.search(r"(?m)^\s+run: cargo nextest archive (.*)$", self.gate)
+        self.assertIsNotNone(archive, "the gate builds no nextest archive")
+        for flag in ("--profile ci", "--workspace", "--all-features"):
+            self.assertIn(flag, archive.group(1))
+        self.assertIn("cargo nextest archive --profile ci --workspace --all-features", self.ci)
+
+    def test_the_gate_runs_no_one_process_workspace_test(self):
+        self.assertIsNone(re.search(r"cargo test --workspace\b", self.gate))
+        self.assertIsNone(re.search(r"cargo test\b(?![^\n]*--doc)", self.gate))
+
+    def test_the_gate_proves_the_shards_exhaustive_before_running_them(self):
+        self.assertIn(" check\n", self.gate)
+        self.assertLess(self.gate.index(" check\n"), self.gate.index(' run "$shard"'))
+
+    def test_the_gate_runs_every_shard_of_the_partition_script(self):
+        loop = re.search(r"for shard in ([^;]+); do", self.gate)
+        self.assertIsNotNone(loop, "the gate has no shard loop")
+        self.assertEqual(loop.group(1).split(), self.partition_shards())
+
+    def test_only_the_relay_db_shard_sees_the_database(self):
+        uses = [m.start() for m in re.finditer(r"POHUNEK_RELAY_TEST_DATABASE_URL", self.gate)]
+        self.assertEqual(len(uses), 1)
+        self.assertIn('[ "$shard" = relay-db ]', self.gate[uses[0] - 120 : uses[0]])
+
+    def test_a_failed_shard_does_not_hide_the_others(self):
+        self.assertIn('failed+=("$shard")', self.gate)
+        self.assertRegex(self.gate, r'if \[ "\$\{#failed\[@\]\}" -ne 0 \]; then\n(?:.*\n)*?\s+exit 1\n')
+        self.assertNotRegex(self.gate, r"continue-on-error")
+        self.assertNotRegex(self.gate, r"(?m)^\s+if: (?:false|\$\{\{ *false)")
+
+    def test_every_shard_runs_from_the_archive_after_the_check(self):
+        runs = re.findall(r"scripts/test-partitions (.*?) (?:run|check)\b", self.gate)
+        self.assertEqual(len(runs), 3, "the check and the two shard runs")
+        for arguments in runs:
+            self.assertRegex(arguments, r'--archive-file "\$(?:archive|RUNNER_TEMP/nextest-archive\.tar\.zst)"')
+        self.assertLess(self.gate.index("Verify exhaustive disjoint"), self.gate.index("      - name: Test\n"))
+        self.assertLess(self.gate.index("cargo nextest archive"), self.gate.index("Verify exhaustive disjoint"))
+
+    def test_the_flaky_summary_reads_the_report_of_each_profile(self):
+        for report in ("heavy/junit.xml", "relay-db/junit.xml", "ci/junit.xml"):
+            self.assertIn(f"target/nextest/{report}", self.gate)
+        junit = (ROOT / ".config" / "nextest.toml").read_text()
+        self.assertIn("[profile.relay-db.junit]", junit)
+
+    def test_the_gate_leaves_no_ambient_test_thread_limit(self):
+        self.assertNotIn("RUST_TEST_THREADS", self.gate)
+
+    def test_the_gate_runs_the_doctests_nextest_skips(self):
+        self.assertIn("run: cargo test --doc --workspace --all-features", self.gate)
+
+    def test_the_gate_installs_nextest_before_using_it(self):
+        self.assertLess(self.gate.index("tool: cargo-nextest"), self.gate.index("cargo nextest archive"))
+
+
 class SccacheSetupTests(unittest.TestCase):
     """The Rust jobs reach sccache only through .github/actions/setup-sccache."""
 
