@@ -387,7 +387,13 @@ impl DaemonShutdown {
 
         let deadline = tokio::time::Instant::now() + plan.driver_shutdown;
         let mut stragglers = stop_stage(&slots, Stage::Driver, deadline).await;
-        stragglers.extend(stop_stage(&slots, Stage::Sink, deadline).await);
+        let sinks = stop_stage(&slots, Stage::Sink, deadline).await;
+        // A sink only waits for the drivers' last handoff, so when a driver
+        // outlived the bound the sink's own stop is cut short by that same
+        // expired deadline and naming it would blame a healthy task.
+        if stragglers.is_empty() {
+            stragglers = sinks;
+        }
         phases.push(PhaseReport {
             phase: ShutdownPhase::Drivers,
             still_running: stragglers,
@@ -576,6 +582,8 @@ mod tests {
             || {},
             std::future::pending(),
         );
+        let log: Log = Arc::default();
+        cancellable(&tasks, "healthy_sink", Stage::Sink, &log, "sink stopped");
         let flushed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&flushed);
         tasks.add_step("event_log", Stage::EventLog, move || async move {

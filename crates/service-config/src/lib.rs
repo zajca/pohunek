@@ -517,8 +517,8 @@ pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
 ///
 /// The tasks are cancelled or aborted first, so the wait covers a blocking
 /// store write that cannot be interrupted. The four shutdown phase bounds and
-/// [`SHUTDOWN_MARGIN`] must fit inside [`Deadlines::daemon_exit_timeout`]
-/// ([`Deadlines::validate_shutdown_budget`]). The key is
+/// [`SHUTDOWN_MARGIN`] are fitted to [`Deadlines::daemon_exit_timeout`] by
+/// [`Deadlines::fitted_shutdown`]. The key is
 /// optional and the writer omits it while it equals this value.
 pub const DEFAULT_REGISTRY_SHUTDOWN: Duration = Duration::from_secs(5);
 
@@ -703,8 +703,9 @@ impl Deadlines {
     ///
     /// Bounds whose sum plus [`SHUTDOWN_MARGIN`] fits are returned as
     /// configured. Otherwise each is shortened in proportion so that the sum
-    /// fits (at least 1 ms each), and the result carries the shortfall for the
-    /// caller to report. A file stays valid either way.
+    /// fits, and the result carries the shortfall for the caller to report. A file
+    /// stays valid either way. Every bound keeps at least 1 ms, so an exit
+    /// timeout of a few milliseconds is not honoured.
     #[must_use]
     pub fn fitted_shutdown(&self) -> FittedShutdown {
         let total = self.shutdown_phases_total();
