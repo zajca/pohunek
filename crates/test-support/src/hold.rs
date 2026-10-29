@@ -127,18 +127,32 @@ pub fn link_as(path: &Path) -> io::Result<()> {
 ///
 /// The file is a copy of the test binary with its mode, never a hard link: a
 /// fixture may change the mode of the installed file, which must not reach the
-/// test binary.
+/// test binary. A child process makes the copy, so this process never holds a
+/// write descriptor on a file it is about to run (`ETXTBSY`, see [`crate::fs`]).
 ///
 /// # Errors
 ///
-/// Returns the failure of the copy.
+/// Returns the failure of starting `cp` or its unsuccessful exit.
 ///
 /// # Panics
 ///
 /// Panics when the operating system cannot report the path of the running
 /// executable.
 pub fn install_at(path: &Path) -> io::Result<()> {
-    std::fs::copy(image(), path).map(drop)
+    let status = Command::new("cp")
+        .arg(image())
+        .arg(path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "cp of the holding image to {} failed: {status}",
+            path.display()
+        )))
+    }
 }
 
 /// Shell words that run the holding image, with the path single-quoted.

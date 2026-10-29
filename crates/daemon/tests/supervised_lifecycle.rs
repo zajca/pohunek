@@ -1834,7 +1834,7 @@ const SUPERVISION_AMBIGUOUS: &str = "runtime_supervision_ambiguous";
 #[cfg(target_os = "linux")]
 const PRIVILEGED_VARIABLE: &str = "POHUNEK_PRIVILEGED_E2E";
 
-/// Name of the copy of `sleep` that only its owner may execute.
+/// Name of the copy of the holding image that only its owner may execute.
 #[cfg(target_os = "linux")]
 const UNREADABLE_SLEEP: &str = "unreadable-sleep";
 
@@ -1854,7 +1854,7 @@ enum Placement {
 /// environment the kernel withholds, so neither its markers nor its start time
 /// attribute it.
 ///
-/// It is the copy of `sleep` that only its owner may execute: the kernel marks
+/// It is the copy of the holding image that only its owner may execute: the kernel marks
 /// the image of an unreadable executable non-dumpable, which hides its
 /// environment from procfs, as for the field cases of #186 (`op`, `frankenphp`).
 #[cfg(target_os = "linux")]

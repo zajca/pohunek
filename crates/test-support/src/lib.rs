@@ -604,25 +604,52 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_linked_holding_image_runs_under_the_name_of_its_link() {
+    fn a_linked_holding_image_holds_under_the_name_of_its_link() {
         use std::os::unix::process::ExitStatusExt as _;
+
+        /// Name of the thread libtest runs the holding test on, cut to the 15
+        /// bytes of a thread name.
+        const HOLD_THREAD: &str = "hold_image::hol";
+
+        /// Ends the holder when the scenario fails before it kills it.
+        struct Holder(std::process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
 
         let dir = tempdir().expect("fixture directory");
         let link = dir.path().join("codex");
         crate::hold::link_as(&link).expect("name the holding image");
-        let mut child = crate::hold::command_for(&link)
-            .spawn()
-            .expect("start the holder");
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id()))
-            .expect("read the process name");
-        child.kill().expect("kill the holder");
-        let status = child.wait().expect("reap the holder");
+        let mut holder = Holder(
+            crate::hold::command_for(&link)
+                .spawn()
+                .expect("start the holder"),
+        );
+        let pid = holder.0.id();
+        let comm =
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).expect("read the process name");
+        // The holding test runs on its own thread once the image has started
+        // libtest; an image that exited instead (a multicall binary rejecting
+        // the name, a binary without the declaration) never gets one.
+        crate::wait::poll_until("the holder runs the holding test", || {
+            let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+            tasks
+                .filter_map(Result::ok)
+                .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+                .any(|name| name.trim() == HOLD_THREAD)
+                .then_some(())
+        });
+        holder.0.kill().expect("kill the holder");
+        let status = holder.0.wait().expect("reap the holder");
 
         assert_eq!(comm.trim(), "codex");
         assert_eq!(
             status.signal(),
             Some(9),
-            "the holder ended by itself instead of holding: {status}"
+            "the holder ended by itself: {status}"
         );
     }
 }

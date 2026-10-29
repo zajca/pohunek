@@ -636,11 +636,11 @@ async fn a_starting_unit_not_running_exec_start_is_observed_without_a_process() 
         .start(&id, &fixture(installation.root.path(), "exec-other"))
         .await
         .expect("start transient worker");
-    // The unit's process runs the fixture until it replaces itself with
-    // another program; only then is "another image is never bound" decided,
-    // because an inspection of the fixture still running its own image binds it.
-    let fixture_image = std::fs::canonicalize(std::env::current_exe().expect("test executable"))
-        .expect("canonical test executable");
+    // The unit's process passes through the manager's executor and the fixture
+    // before it replaces itself with the program the fixture execs; only once
+    // it runs that program is "another image is never bound" decided, because
+    // an inspection of the fixture running its own image binds it.
+    let other_image = std::fs::canonicalize("/usr/bin/sleep").expect("canonical sleep");
     wait_for(&supervisor, &id, |observation| {
         observation.state == ServiceState::Starting
             && observation.process.is_none()
@@ -649,7 +649,7 @@ async fn a_starting_unit_not_running_exec_start_is_observed_without_a_process() 
                 .is_some_and(|pid| {
                     pid != "0"
                         && std::fs::read_link(format!("/proc/{pid}/exe"))
-                            .is_ok_and(|image| image != fixture_image)
+                            .is_ok_and(|image| image == other_image)
                 })
     })
     .await;
