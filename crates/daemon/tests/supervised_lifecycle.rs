@@ -1870,13 +1870,16 @@ impl Bystander {
     async fn start(fixture: &Installation, placement: Placement) -> Self {
         let binary = fixture.probe.join(UNREADABLE_SLEEP);
         if !binary.exists() {
-            std::fs::copy("/bin/sleep", &binary).expect("copy sleep");
+            pohunek_test_support::hold::install_at(&binary).expect("install the holding image");
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111))
                 .expect("make the copy execute-only");
         }
         // `systemd-run` collapses `$$` in its arguments, so the shell cannot
         // record its own PID; the process is found by the image it executes.
-        let script = "exec \"$1\" infinity";
+        let script = format!(
+            "exec \"$1\" {}",
+            pohunek_test_support::hold::shell_arguments()
+        );
         let mut command = match placement {
             Placement::SystemScope => {
                 assert_eq!(
@@ -1896,7 +1899,7 @@ impl Bystander {
             }
         };
         let launcher = command
-            .args(["--", "sh", "-c", script, "sh"])
+            .args(["--", "sh", "-c", script.as_str(), "sh"])
             .arg(&binary)
             .current_dir(&fixture.probe)
             .stdin(std::process::Stdio::null())
@@ -2177,14 +2180,15 @@ async fn a_non_dumpable_descendant_in_the_worker_unit_does_not_survive_retiremen
     );
     let fixture = Installation::new(Settings::default()).await;
     let binary = fixture.probe.join(UNREADABLE_SLEEP);
-    std::fs::copy("/bin/sleep", &binary).expect("copy sleep");
+    pohunek_test_support::hold::install_at(&binary).expect("install the holding image");
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o111))
         .expect("make the copy execute-only");
     let script = format!(
         "p='{}'; s=\"$POHUNEK_SESSION_ID\"; \
-         \"$p/{UNREADABLE_SLEEP}\" infinity & echo $! > \"$p/$s.unreadable\"; \
+         \"$p/{UNREADABLE_SLEEP}\" {holder} & echo $! > \"$p/$s.unreadable\"; \
          while IFS= read -r line; do :; done",
-        supervised::path_string(&fixture.probe)
+        supervised::path_string(&fixture.probe),
+        holder = pohunek_test_support::hold::shell_arguments()
     );
     let profile = format!(
         "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {}]\n",

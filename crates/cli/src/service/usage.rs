@@ -833,9 +833,10 @@ pub(crate) mod tests {
         let dir = layout.version_dir("1.0.0").expect("dir");
         std::fs::create_dir_all(&dir).expect("version dir");
         let sleeper = dir.join("pohunek-sessiond");
-        std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
-        let mut child = spawn_when_exec_free(std::process::Command::new(&sleeper).arg("30"))
-            .expect("spawn live worker stand-in");
+        pohunek_test_support::hold::install_at(&sleeper).expect("install the holding image");
+        let mut child =
+            spawn_when_exec_free(&mut pohunek_test_support::hold::command_for(&sleeper))
+                .expect("spawn live worker stand-in");
         let inspector = HostInspector::new();
         await_executable(&inspector, child.id(), &sleeper);
 

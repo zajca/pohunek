@@ -9,6 +9,9 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(test)]
+pohunek_test_support::hold_image!();
+
 mod client;
 mod commands;
 mod completion;

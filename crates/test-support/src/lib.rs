@@ -403,6 +403,9 @@ pub fn worker_binary() -> PathBuf {
 }
 
 #[cfg(test)]
+crate::hold_image!();
+
+#[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
@@ -597,5 +600,29 @@ mod tests {
     fn fixture_is_private_under_an_owner_masking_umask() {
         let lines = run_probe_under_masking_umask("tests::umask_probe_tempdir");
         assert_eq!(lines, [format!("{:o}", super::PRIVATE_DIR_MODE)]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linked_holding_image_runs_under_the_name_of_its_link() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let dir = tempdir().expect("fixture directory");
+        let link = dir.path().join("codex");
+        crate::hold::link_as(&link).expect("name the holding image");
+        let mut child = crate::hold::command_for(&link)
+            .spawn()
+            .expect("start the holder");
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id()))
+            .expect("read the process name");
+        child.kill().expect("kill the holder");
+        let status = child.wait().expect("reap the holder");
+
+        assert_eq!(comm.trim(), "codex");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the holder ended by itself instead of holding: {status}"
+        );
     }
 }
