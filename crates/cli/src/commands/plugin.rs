@@ -884,6 +884,12 @@ async fn ingest_package(
     Ok(())
 }
 
+/// Whether the downgrade guard treats a package of `origin` as official: an
+/// origin this client does not know keeps the guard engaged.
+const fn guarded_as_official(origin: PackageOrigin) -> bool {
+    matches!(origin, PackageOrigin::Official | PackageOrigin::Unknown)
+}
+
 /// Refuses an official update whose version is older than the selected
 /// official version of the same package, or whose order cannot be proven.
 ///
@@ -900,14 +906,12 @@ fn ensure_not_official_downgrade(
     let recorded_official = installed
         .packages
         .iter()
-        .any(|info| info.digest == preview.digest && info.origin == PackageOrigin::Official);
-    if preview.origin != PackageOrigin::Official && !recorded_official {
+        .any(|info| info.digest == preview.digest && guarded_as_official(info.origin));
+    if !guarded_as_official(preview.origin) && !recorded_official {
         return Ok(());
     }
     let Some(selected) = installed.packages.iter().find(|info| {
-        info.selected
-            && info.origin == PackageOrigin::Official
-            && info.package.id == preview.package.id
+        info.selected && guarded_as_official(info.origin) && info.package.id == preview.package.id
     }) else {
         return Ok(());
     };
@@ -1079,6 +1083,7 @@ fn origin_label(origin: PackageOrigin) -> &'static str {
         PackageOrigin::Official => "official (signed catalog)",
         PackageOrigin::ExplicitDigest => "explicit digest (third party, pinned by the owner)",
         PackageOrigin::Link => "link (developer directory copy)",
+        PackageOrigin::Unknown => "unknown (an origin this client does not know)",
     }
 }
 
@@ -1087,6 +1092,7 @@ fn origin_column(origin: PackageOrigin) -> &'static str {
         PackageOrigin::Official => "official",
         PackageOrigin::ExplicitDigest => "digest",
         PackageOrigin::Link => "link",
+        PackageOrigin::Unknown => "unknown",
     }
 }
 
@@ -1101,6 +1107,7 @@ fn fault_label(fault: PackageFault) -> &'static str {
         PackageFault::IdentityMismatch => "identity mismatch",
         PackageFault::RuntimeNotClaimable => "runtime not claimable",
         PackageFault::RuntimeConflict => "runtime conflict",
+        PackageFault::Unknown => "unknown",
     }
 }
 
@@ -1125,6 +1132,10 @@ fn selection_note(info: &PackageInfo) -> Option<String> {
     Some(match block.reason {
         PackageSelectionBlockReason::IncompatibleWithRetained => format!(
             "its integration handler or hook schema differs from version {} of the same package, which a session or profile still uses; the package stays installed and unselected until that reference is gone, then select it with `pohunek plugin select`",
+            short_digest(&block.retained)
+        ),
+        PackageSelectionBlockReason::Unknown => format!(
+            "the daemon holds it back for a reason this client does not know (version {} of the same package is involved); it stays unselected until the reference is gone",
             short_digest(&block.retained)
         ),
     })
@@ -1392,6 +1403,9 @@ fn render_install_result(result: &PackageInstallResult, ingest: Ingest) -> Strin
         PackageInstallStatus::RootRestored => {
             format!("{what} was already recorded; its missing root was restored.\n")
         }
+        PackageInstallStatus::Unknown => {
+            format!("{what}: the daemon reported an install status this client does not know.\n")
+        }
     };
     let _ = writeln!(output, "State: {}", state_label(info));
     if !info.enabled {
@@ -1482,6 +1496,7 @@ fn render_doctor(result: &PackageDoctorResult) -> String {
         .map(|finding| {
             let kind = match finding.kind {
                 PackageFindingKind::Fault => finding.fault.map_or("fault", fault_label).to_owned(),
+                PackageFindingKind::Unknown => "unknown".to_owned(),
                 PackageFindingKind::UnregisteredRoot => "unregistered root".to_owned(),
                 PackageFindingKind::PinnedNotInstalled => "pinned but not installed".to_owned(),
                 PackageFindingKind::SelectionBlocked => finding.blocked_by.as_ref().map_or_else(

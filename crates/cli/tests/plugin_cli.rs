@@ -1131,3 +1131,169 @@ fn profile_list_refuses_an_unsafe_agents_directory() {
     )
     .expect("restore directory");
 }
+
+const NEWER: &str = "a_value_from_a_newer_daemon";
+
+/// A package a newer daemon reports with an origin, a fault and a selection
+/// block this build does not know.
+fn newer_daemon_package(digest: &str, version: &str, selected: bool) -> Value {
+    let mut value = package("acme.pi", version, digest, selected);
+    value["origin"] = json!(NEWER);
+    value["fault"] = json!(NEWER);
+    value["selection_blocked"] = json!({ "reason": NEWER, "retained": DIGEST_OLD });
+    value
+}
+
+fn daemon_with_newer_values(method: &str, params: &Value) -> Value {
+    match method {
+        "package.list" => json!({
+            "generation": 3,
+            "packages": [newer_daemon_package(DIGEST_NEW, "2.0.0", true)]
+        }),
+        "package.inspect" => json!({
+            "package": newer_daemon_package(DIGEST_NEW, "2.0.0", true),
+            "runtime": runtime(),
+        }),
+        "package.doctor" => json!({
+            "generation": 3,
+            "findings": [{
+                "kind": NEWER,
+                "digest": DIGEST_NEW,
+                "referenced": false
+            }]
+        }),
+        "package.bind_profile" => json!({
+            "status": NEWER,
+            "profile": "work",
+            "base": "acme-pi",
+            "package": newer_daemon_package(DIGEST_NEW, "2.0.0", true),
+            "runtime": runtime(),
+            "reloaded": false,
+        }),
+        _ => empty_daemon(method, params),
+    }
+}
+
+#[test]
+fn package_values_from_a_newer_daemon_show_unknown_in_list_and_inspect() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_with_newer_values);
+
+    let list = fixture.run(&["plugin", "list", "--json"]);
+    assert!(list.status.success(), "{}", stderr_text(&list));
+    let document = stdout_json(&list);
+    let listed = &document["ok"]["packages"][0];
+    assert_eq!(listed["origin"], "unknown", "{document}");
+    assert_eq!(listed["fault"], "unknown", "{document}");
+    assert_eq!(
+        listed["selection_blocked"]["reason"], "unknown",
+        "{document}"
+    );
+
+    let human = fixture.run(&["plugin", "list"]);
+    assert!(human.status.success(), "{}", stderr_text(&human));
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("unknown"), "{text}");
+    assert!(
+        text.contains("selection blocked"),
+        "a package with an unknown block reason stays marked blocked: {text}"
+    );
+
+    let inspect = fixture.run(&["plugin", "inspect", "acme.pi", "--json"]);
+    assert!(inspect.status.success(), "{}", stderr_text(&inspect));
+    let document = stdout_json(&inspect);
+    assert_eq!(document["ok"]["package"]["origin"], "unknown", "{document}");
+    drop(daemon.finish());
+}
+
+#[test]
+fn a_doctor_finding_of_an_unknown_kind_still_fails_the_command() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_with_newer_values);
+
+    let output = fixture.run(&["plugin", "doctor"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_text(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unknown"));
+    drop(daemon.finish());
+}
+
+#[test]
+fn a_profile_bind_with_an_unknown_status_still_asks_for_consent() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_with_newer_values);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--json"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_text(&output));
+    let document = stdout_json(&output);
+    assert_eq!(document["err"]["code"], "consent_required", "{document}");
+    let recorded = daemon.finish();
+    assert!(
+        recorded
+            .iter()
+            .all(|(_, params)| params["dry_run"] != false),
+        "no committing bind request is sent without consent: {recorded:?}"
+    );
+}
+
+#[test]
+fn an_update_over_a_selected_package_of_unknown_origin_keeps_the_downgrade_guard() {
+    let fixture = Fixture::new();
+    let archive = fixture.file("pi-old.tar");
+    let daemon = fixture.serve(|method, params| match method {
+        "package.list" => json!({
+            "generation": 2,
+            "packages": [{
+                "digest": DIGEST_OLD,
+                "package": { "id": "acme.pi", "version": "2.0.0" },
+                "origin": NEWER,
+                "enabled": true,
+                "selected": true,
+                "installed_at_unix_seconds": 1,
+                "runtime_id": "acme-pi",
+                "referenced": false
+            }]
+        }),
+        "package.install" => json!({
+            "status": "preview",
+            "package": {
+                "digest": DIGEST_NEW,
+                "package": { "id": "acme.pi", "version": "1.0.0" },
+                "origin": NEWER,
+                "enabled": true,
+                "selected": false,
+                "installed_at_unix_seconds": 1,
+                "runtime_id": "acme-pi",
+                "referenced": false
+            },
+            "runtime": runtime(),
+            "reloaded": false
+        }),
+        _ => empty_daemon(method, params),
+    });
+
+    let output = fixture.run(&[
+        "plugin",
+        "update",
+        "acme.pi",
+        archive.to_str().expect("utf-8 path"),
+        "--sha256",
+        DIGEST_NEW,
+        "--yes",
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_text(&output));
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "plugin_update_downgrade"
+    );
+    let recorded = daemon.finish();
+    assert!(
+        recorded
+            .iter()
+            .all(|(_, params)| params["dry_run"] != false),
+        "the downgrade is refused before any committing install: {recorded:?}"
+    );
+}
