@@ -64,10 +64,16 @@ impl ShutdownPhase {
 /// Where a task stops within the daemon shutdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// An external driver of the registry; stops with the other drivers.
+    /// An external driver of the registry (a producer of registry events);
+    /// stops with the other drivers.
     Driver,
-    /// A consumer of what the drivers produce; stops after every driver, under
-    /// the drivers' bound, so the last items they hand over are still accepted.
+    /// A consumer of the registry's events (projector, hook flush); stops
+    /// after every driver, under the drivers' bound, so the events the
+    /// drivers emit while stopping are still consumed.
+    Consumer,
+    /// A consumer of what the consumers produce; stops after every consumer,
+    /// under the drivers' bound, so the last items they hand over are still
+    /// accepted.
     Sink,
     /// An event-log drain; stops in the event-log phase, after the registry.
     EventLog,
@@ -124,6 +130,10 @@ pub struct PhaseReport {
     pub phase: ShutdownPhase,
     /// Names of the tasks still running when the phase bound passed.
     pub still_running: Vec<&'static str>,
+    /// Names of the tasks asked to stop after the phase bound had already
+    /// passed (behind a task that outlived it); they were not waited for, so
+    /// they may still be running when the next phase starts.
+    pub not_awaited: Vec<&'static str>,
 }
 
 /// What [`DaemonShutdown::run`] found, phase by phase.
@@ -142,7 +152,17 @@ impl DaemonShutdownReport {
     pub fn is_quiescent(&self) -> bool {
         self.phases
             .iter()
-            .all(|phase| phase.still_running.is_empty())
+            .all(|phase| phase.still_running.is_empty() && phase.not_awaited.is_empty())
+    }
+
+    /// Names of the tasks asked to stop after their phase bound had passed,
+    /// with their phase.
+    #[must_use]
+    pub fn not_awaited(&self) -> Vec<(ShutdownPhase, &'static str)> {
+        self.phases
+            .iter()
+            .flat_map(|phase| phase.not_awaited.iter().map(|name| (phase.phase, *name)))
+            .collect()
     }
 
     /// Names of the tasks that outlived their phase bound, with their phase.
@@ -383,32 +403,42 @@ impl DaemonShutdown {
             } else {
                 vec!["session_creates"]
             },
+            not_awaited: Vec::new(),
         });
 
         let deadline = tokio::time::Instant::now() + plan.driver_shutdown;
-        let mut stragglers = stop_stage(&slots, Stage::Driver, deadline).await;
-        let sinks = stop_stage(&slots, Stage::Sink, deadline).await;
-        // A sink only waits for the drivers' last handoff, so when a driver
-        // outlived the bound the sink's own stop is cut short by that same
-        // expired deadline and naming it would blame a healthy task.
-        if stragglers.is_empty() {
-            stragglers = sinks;
+        let mut stragglers = Vec::new();
+        let mut not_awaited = Vec::new();
+        for stage in [Stage::Driver, Stage::Consumer, Stage::Sink] {
+            // A stage that starts after the shared bound has passed is asked
+            // to stop but not waited for; naming it as running at the bound
+            // would blame a task that never had time to stop.
+            let awaited = tokio::time::Instant::now() < deadline;
+            let left = stop_stage(&slots, stage, deadline).await;
+            if awaited {
+                stragglers.extend(left);
+            } else {
+                not_awaited.extend(left);
+            }
         }
         phases.push(PhaseReport {
             phase: ShutdownPhase::Drivers,
             still_running: stragglers,
+            not_awaited,
         });
 
         let registry = sessions.shutdown().await;
         phases.push(PhaseReport {
             phase: ShutdownPhase::Registry,
             still_running: registry.still_running,
+            not_awaited: Vec::new(),
         });
 
         let deadline = tokio::time::Instant::now() + plan.event_log_flush;
         phases.push(PhaseReport {
             phase: ShutdownPhase::EventLogs,
             still_running: stop_stage(&slots, Stage::EventLog, deadline).await,
+            not_awaited: Vec::new(),
         });
 
         let report = DaemonShutdownReport {
@@ -419,6 +449,13 @@ impl DaemonShutdown {
             warn!(%shortfall, "daemon shutdown ran with shortened phase bounds");
         }
         for phase in &report.phases {
+            if !phase.not_awaited.is_empty() {
+                warn!(
+                    phase = phase.phase.as_str(),
+                    tasks = ?phase.not_awaited,
+                    "daemon shutdown asked tasks to stop after the phase bound and did not wait for them"
+                );
+            }
             if phase.still_running.is_empty() {
                 debug!(
                     phase = phase.phase.as_str(),
@@ -597,12 +634,65 @@ mod tests {
             report.still_running(),
             [(ShutdownPhase::Drivers, "wedged_driver")]
         );
+        assert_eq!(
+            report.not_awaited(),
+            [(ShutdownPhase::Drivers, "healthy_sink")],
+            "a sink behind the wedged driver is reported, not blamed"
+        );
         assert_eq!(started.elapsed(), plan.driver_shutdown);
         assert!(
             flushed.load(Ordering::SeqCst),
             "the event log still flushed"
         );
         assert!(sessions.is_quiescent_for_test());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_event_a_producer_emits_while_stopping_is_still_consumed() {
+        let plan = ShutdownPlan::default();
+        let tasks = DaemonShutdown::new(plan);
+        let sessions = registry(plan);
+        let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let projected: Log = Arc::default();
+
+        // The producer commits one more event after its stop request.
+        let stop_producer = CancellationToken::new();
+        let stop = stop_producer.clone();
+        tasks.spawn(
+            "producer",
+            Stage::Driver,
+            move || stop.cancel(),
+            async move {
+                stop_producer.cancelled().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = events.send("session.stopped");
+            },
+        );
+
+        // The consumer drains what is buffered once it is asked to stop.
+        let stop_consumer = CancellationToken::new();
+        let stop = stop_consumer.clone();
+        let sink = Arc::clone(&projected);
+        tasks.spawn(
+            "consumer",
+            Stage::Consumer,
+            move || stop.cancel(),
+            async move {
+                stop_consumer.cancelled().await;
+                while let Ok(event) = inbox.try_recv() {
+                    record(&sink, event);
+                }
+            },
+        );
+
+        let report = tasks.run(&sessions).await;
+
+        assert!(report.is_quiescent(), "{report:?}");
+        assert_eq!(
+            *projected.lock().unwrap_or_else(PoisonError::into_inner),
+            ["session.stopped"],
+            "the consumer stops only after the producer's last event"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -507,8 +507,12 @@ notification projector, the attention coordinator, the agent-state hook flush an
 the event-log drains) belong to `DaemonShutdown`, which stops them in four ordered
 phases, each inside its own bound from `[deadlines]` in `service.toml`:
 `create_drain_ms` (creates still running commit or compensate), `driver_shutdown_ms`
-(the drivers stop together and the attention coordinator after them, so the last
-defers and resolves they hand over are accepted), `registry_shutdown_ms` and
+(the producers, idle stop and retention, stop together; then the consumers of
+the registry's events, the notification projector and the agent-state hook flush,
+so the events the producers emit while stopping are still consumed; then the
+attention coordinator, so the last defers and resolves they hand over are
+accepted; a stage that starts after the shared bound has passed is asked to stop
+and reported as not awaited), `registry_shutdown_ms` and
 `event_log_flush_ms` (the drains flush last, so a slow phase before them cannot
 lose buffered audit events). All four are optional (10 s, 5 s, 5 s and 5 s by
 default). Their sum plus a 2 s margin should fit inside `daemon_exit_timeout_ms`,

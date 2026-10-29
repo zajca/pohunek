@@ -6862,6 +6862,61 @@ async fn agent_state_hook_dispatcher_flushes_buffered_event_on_shutdown() {
 }
 
 #[tokio::test]
+async fn daemon_shutdown_flushes_pending_agent_state_hooks_before_the_registry_phase() {
+    let config_dir = temp_dir("agent-state-tree-config");
+    let cwd = temp_dir("agent-state-tree-cwd");
+    let marker = config_dir.join("agent-state-tree.marker");
+    write_host_hook(
+        &config_dir,
+        "agent-state",
+        &format!(
+            "#!/bin/sh\nsleep 0.15\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+            marker.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        config_dir: Some(config_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let tasks = crate::shutdown::DaemonShutdown::default();
+    registry.spawn_agent_state_hooks_in(&tasks);
+    let created = registry
+        .create(SessionNewParams {
+            cwd: Some(cwd),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+
+    // Runs after the consumers and before the registry phase.
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let probe = Arc::clone(&seen);
+    let probe_marker = marker.clone();
+    tasks.add_step(
+        "before_registry_probe",
+        crate::shutdown::Stage::Sink,
+        move || async move {
+            *probe.lock().expect("probe lock") =
+                fs::read_to_string(&probe_marker).unwrap_or_default();
+        },
+    );
+
+    let report = tasks.run(&registry).await;
+
+    assert!(report.is_quiescent(), "{report:?}");
+    let seen = seen.lock().expect("probe lock").clone();
+    assert!(
+        seen.contains("working"),
+        "the pending activity was flushed before the registry phase: {seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn agent_state_hook_coalesces_flaps_while_hook_is_in_flight() {
     let config_dir = temp_dir("agent-state-coalesce-config");
     let cwd = temp_dir("agent-state-coalesce-cwd");

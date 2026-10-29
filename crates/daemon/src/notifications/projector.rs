@@ -87,7 +87,7 @@ fn spawn_projector_task(
     shutdown: CancellationToken,
     stop: impl FnOnce() + Send + 'static,
 ) -> DriverHandle {
-    tasks.spawn("notification_projector", Stage::Driver, stop, async move {
+    tasks.spawn("notification_projector", Stage::Consumer, stop, async move {
         let mut state = ProjectorState::default();
         let mut turn_edges = sessions.turn_events().take_edge_receiver();
         loop {

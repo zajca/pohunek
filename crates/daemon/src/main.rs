@@ -589,11 +589,7 @@ async fn run() -> Result<(), DaemonError> {
         notifications.clone(),
         attention_coordinator.clone(),
     );
-    sessions.spawn_agent_state_hooks();
-    let hook_sessions = sessions.clone();
-    tasks.add_step("agent_state_hooks", Stage::Driver, move || async move {
-        hook_sessions.shutdown_agent_state_hooks().await;
-    });
+    sessions.spawn_agent_state_hooks_in(&tasks);
 
     // 7. Adopt exact surviving worker runtimes before exposing the public API.
     //    Reconciliation never invokes provider-native resume.

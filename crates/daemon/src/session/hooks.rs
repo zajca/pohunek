@@ -61,11 +61,25 @@ impl SessionRegistry {
         *slot = Some(handle);
     }
 
+    /// Starts the agent-state hook dispatcher and registers its flush with the
+    /// daemon shutdown as a consumer of the registry's events.
+    pub fn spawn_agent_state_hooks_in(&self, tasks: &crate::shutdown::DaemonShutdown) {
+        self.spawn_agent_state_hooks();
+        let sessions = self.clone();
+        tasks.add_step(
+            "agent_state_hooks",
+            crate::shutdown::Stage::Consumer,
+            move || async move {
+                sessions.shutdown_agent_state_hooks().await;
+            },
+        );
+    }
+
     /// Stop the agent-state hook dispatcher and flush any pending debounced
     /// activity values before returning.
     ///
-    /// The wait has no bound of its own; daemon shutdown runs it as a step of
-    /// the driver phase, which bounds it.
+    /// The wait has no bound of its own; daemon shutdown runs it as a consumer
+    /// step of the driver phase, which bounds it.
     pub async fn shutdown_agent_state_hooks(&self) {
         self.inner.agent_state_hook_shutdown.cancel();
         let handle = self
