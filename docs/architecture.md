@@ -2226,9 +2226,9 @@ never `unreachable!()`.
 | `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | [#1338](https://github.com/zajca/pohunek/issues/1338) |
 | `CommandExposure` | safe | read as the widest exposure (`peers`) wherever it is shown for consent | [#1690](https://github.com/zajca/pohunek/issues/1690) |
 | `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | [#1338](https://github.com/zajca/pohunek/issues/1338) |
-| `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | | [#1339](https://github.com/zajca/pohunek/issues/1339) |
-| `NotificationStatus` | safe | never matches `--unread` or `--status` filters | [#1339](https://github.com/zajca/pohunek/issues/1339) |
-| `ConceptIntent` | drop | | [#1339](https://github.com/zajca/pohunek/issues/1339) |
+| `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | `ProviderKind::Unknown` is never the `none` kind; an unknown `ConceptType` reaches the typed `assistant_bundle_mismatch` error | done |
+| `NotificationStatus` | safe | never matches `--unread` or `--status` filters | done |
+| `ConceptIntent` | drop | an unknown element is dropped from `intents` | done |
 | `SessionWarningKind` | drop | own mechanism | done |
 | `SessionState` | bump-only | drives live and terminal decisions; no safe default | |
 | `SessionTurnEventKind` | bump-only | the daemon emits only the kinds the client asked for | |

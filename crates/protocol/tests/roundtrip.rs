@@ -4887,7 +4887,7 @@ struct TolerantEnum<T> {
 
 impl<T> TolerantEnum<T>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug + Copy,
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
 {
     fn check(&self, name: &str) {
         let newer = json!("a_value_from_a_newer_daemon");
@@ -4927,7 +4927,7 @@ where
         protocol::tolerant::from_value::<T>(json!(7))
             .expect_err("tolerance covers unknown strings only");
 
-        let token = serde_json::to_value(self.unknown).expect("serialize the fallback");
+        let token = serde_json::to_value(&self.unknown).expect("serialize the fallback");
         assert_eq!(
             token,
             json!(self.unknown_wire),
@@ -5508,4 +5508,210 @@ fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
             })
         }))
     );
+}
+
+#[test]
+fn notification_project_and_quarantine_enums_are_tolerant_only_on_the_client() {
+    use protocol::{
+        NotificationSeverity, NotificationStatus, ProjectSource, PromptLayer, ProviderKind,
+        QuarantineReason,
+    };
+
+    TolerantEnum {
+        known: vec![
+            ("info", NotificationSeverity::Info),
+            ("success", NotificationSeverity::Success),
+            ("warning", NotificationSeverity::Warning),
+            ("error", NotificationSeverity::Error),
+            ("action_required", NotificationSeverity::ActionRequired),
+        ],
+        unknown: NotificationSeverity::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("NotificationSeverity");
+    TolerantEnum {
+        known: vec![
+            ("unread", NotificationStatus::Unread),
+            ("read", NotificationStatus::Read),
+            ("acknowledged", NotificationStatus::Acknowledged),
+            ("archived", NotificationStatus::Archived),
+            ("deleted", NotificationStatus::Deleted),
+        ],
+        unknown: NotificationStatus::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("NotificationStatus");
+    TolerantEnum {
+        known: vec![
+            ("auto", ProjectSource::Auto),
+            ("manual", ProjectSource::Manual),
+        ],
+        unknown: ProjectSource::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("ProjectSource");
+    TolerantEnum {
+        known: vec![
+            ("linear_issue", ProviderKind::LinearIssue),
+            ("github_pr", ProviderKind::GithubPr),
+            ("none", ProviderKind::None),
+        ],
+        unknown: ProviderKind::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("ProviderKind");
+    TolerantEnum {
+        known: vec![
+            ("in_repo", PromptLayer::InRepo),
+            ("host", PromptLayer::Host),
+        ],
+        unknown: PromptLayer::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PromptLayer");
+    TolerantEnum {
+        known: vec![
+            ("host_identity_clone", QuarantineReason::HostIdentityClone),
+            ("projection_conflict", QuarantineReason::ProjectionConflict),
+            ("enrollment_conflict", QuarantineReason::EnrollmentConflict),
+        ],
+        unknown: QuarantineReason::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("QuarantineReason");
+    assert_ne!(
+        ProviderKind::Unknown,
+        ProviderKind::None,
+        "an unknown provider is never the provider-less kind"
+    );
+}
+
+#[test]
+fn assistant_concept_enums_are_tolerant_only_on_the_client() {
+    use protocol::{ConceptIntent, ConceptType};
+
+    TolerantEnum {
+        known: vec![
+            ("Concept", ConceptType::Concept),
+            ("Guide", ConceptType::Guide),
+            ("Runbook", ConceptType::Runbook),
+            ("Troubleshooting", ConceptType::Troubleshooting),
+            ("SafetyPolicy", ConceptType::SafetyPolicy),
+            ("CliCommand", ConceptType::CliCommand),
+            ("ConfigReference", ConceptType::ConfigReference),
+            ("ProtocolMethod", ConceptType::ProtocolMethod),
+            ("ProtocolEvent", ConceptType::ProtocolEvent),
+            ("SetupAsset", ConceptType::SetupAsset),
+            ("PromptTemplate", ConceptType::PromptTemplate),
+            ("SourceMap", ConceptType::SourceMap),
+            ("SnapshotTemplate", ConceptType::SnapshotTemplate),
+            ("ReleaseNote", ConceptType::ReleaseNote),
+        ],
+        unknown: ConceptType::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("ConceptType");
+    TolerantEnum {
+        known: vec![
+            ("setup", ConceptIntent::Setup),
+            ("project", ConceptIntent::Project),
+            ("update", ConceptIntent::Update),
+            ("debug", ConceptIntent::Debug),
+            ("help", ConceptIntent::Help),
+        ],
+        unknown: ConceptIntent::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("ConceptIntent");
+}
+
+#[test]
+fn a_concept_from_a_newer_daemon_keeps_its_known_intents_and_decodes_an_unknown_type() {
+    use protocol::{ConceptIntent, ConceptMeta, ConceptType};
+
+    let concept = |intents: Value| {
+        json!({
+            "type": "AType_from_a_newer_daemon",
+            "id": "concept-1",
+            "title": "Concept",
+            "description": "A concept",
+            "intents": intents,
+        })
+    };
+
+    serde_json::from_value::<ConceptMeta>(concept(json!(["setup"])))
+        .expect_err("plain decoding rejects the unknown type");
+    let mut known_type = concept(json!(["setup", "an_intent_from_a_newer_daemon"]));
+    known_type["type"] = json!("Guide");
+    serde_json::from_value::<ConceptMeta>(known_type.clone())
+        .expect_err("plain decoding rejects the unknown intent");
+
+    let decoded: ConceptMeta =
+        protocol::tolerant::from_value(concept(json!(["setup", "an_intent_from_a_newer_daemon"])))
+            .expect("tolerant decode");
+    assert_eq!(decoded.r#type, ConceptType::Unknown);
+    assert_eq!(decoded.intents, Some(vec![ConceptIntent::Setup]));
+
+    let decoded: ConceptMeta = protocol::tolerant::from_value(known_type).expect("tolerant decode");
+    assert_eq!(decoded.r#type, ConceptType::Guide);
+    assert_eq!(decoded.intents, Some(vec![ConceptIntent::Setup]));
+
+    let only_unknown: ConceptMeta =
+        protocol::tolerant::from_value(concept(json!(["an_intent_from_a_newer_daemon"])))
+            .expect("tolerant decode");
+    assert_eq!(
+        only_unknown.intents,
+        Some(Vec::new()),
+        "a concept whose intents are all unknown has intents, none of them known"
+    );
+
+    let mut without_intents = concept(json!(null));
+    without_intents
+        .as_object_mut()
+        .expect("object")
+        .remove("intents");
+    let absent: ConceptMeta =
+        protocol::tolerant::from_value(without_intents).expect("tolerant decode");
+    assert_eq!(absent.intents, None);
+}
+
+#[test]
+fn a_quarantined_status_with_a_reason_from_a_newer_daemon_still_passes_the_status_cross_check() {
+    use protocol::{HostGovernanceStatus, QuarantineReason};
+
+    let identifier = |prefix: &str| format!("{prefix}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let quarantined = |status: protocol::EnrollmentStatus| {
+        let enrollment = protocol::EnrollmentInfo::new(
+            protocol::RelayId::parse(&identifier("relay_")).expect("relay id"),
+            status,
+            protocol::EnrollmentRevision::new(2).expect("revision"),
+        );
+        let mut document = serde_json::to_value(
+            HostGovernanceStatus::new(
+                protocol::HostId::parse(&identifier("host_")).expect("host id"),
+                Some(enrollment),
+                Some(protocol::HostOwner::Principal(
+                    protocol::PrincipalId::parse(&identifier("principal_")).expect("principal"),
+                )),
+                Some(protocol::OwnerRevision::new(3).expect("owner revision")),
+                (status == protocol::EnrollmentStatus::Quarantined)
+                    .then_some(QuarantineReason::ProjectionConflict),
+                protocol::ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+            )
+            .expect("valid status"),
+        )
+        .expect("status JSON");
+        document["quarantine"] = json!("a_reason_from_a_newer_daemon");
+        document
+    };
+
+    let status: HostGovernanceStatus =
+        protocol::tolerant::from_value(quarantined(protocol::EnrollmentStatus::Quarantined))
+            .expect("a quarantined enrollment with an unknown reason decodes");
+    assert_eq!(status.quarantine(), Some(QuarantineReason::Unknown));
+
+    protocol::tolerant::from_value::<HostGovernanceStatus>(quarantined(
+        protocol::EnrollmentStatus::Active,
+    ))
+    .expect_err("a quarantine reason on an active enrollment is still inconsistent");
 }

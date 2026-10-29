@@ -182,7 +182,8 @@ fn auto_retention_deadline(
             };
             (record.created_at.as_str(), ttl)
         }
-        NotificationStatus::Deleted => return Ok(None),
+        // The daemon never holds an unknown status; a record it cannot classify is kept.
+        NotificationStatus::Deleted | NotificationStatus::Unknown => return Ok(None),
     };
     Ok(Some(
         parse_timestamp(timestamp)? + Duration::seconds(i64::from(ttl_secs)),

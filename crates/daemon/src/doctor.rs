@@ -801,6 +801,18 @@ fn quarantine_checks(reason: Option<QuarantineReason>) -> (DoctorCheck, DoctorCh
         Some(QuarantineReason::EnrollmentConflict) => quarantine_warning(
             "Enrollment coordinates conflict; reconcile the registered relay before use.",
         ),
+        Some(QuarantineReason::Unknown) => (
+            check(
+                "host_governance_consistency",
+                DoctorStatus::Fail,
+                "Host governance is quarantined for a reason this build does not know; upgrade this daemon or reconcile the registered relay before use.",
+            ),
+            check(
+                "host_governance_quarantine",
+                DoctorStatus::Fail,
+                "Host governance is quarantined for a reason this build does not know.",
+            ),
+        ),
         Some(QuarantineReason::HostIdentityClone) => (
             check(
                 "host_governance_consistency",

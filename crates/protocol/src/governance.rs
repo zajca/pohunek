@@ -688,7 +688,7 @@ pub enum EnrollmentStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "QuarantineReason.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum QuarantineReason {
     /// More than one process claimed the stable host identity.
     HostIdentityClone,
@@ -696,7 +696,16 @@ pub enum QuarantineReason {
     ProjectionConflict,
     /// A conflicting enrollment state was detected locally.
     EnrollmentConflict,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(QuarantineReason);
 
 /// One known relay enrollment's safe public state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

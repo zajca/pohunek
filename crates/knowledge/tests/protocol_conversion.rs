@@ -88,5 +88,6 @@ fn protocol_type_name(value: ConceptType) -> &'static str {
         ConceptType::SourceMap => "SourceMap",
         ConceptType::SnapshotTemplate => "SnapshotTemplate",
         ConceptType::ReleaseNote => "ReleaseNote",
+        ConceptType::Unknown => "unknown",
     }
 }

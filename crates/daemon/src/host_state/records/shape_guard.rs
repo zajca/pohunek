@@ -219,7 +219,7 @@ fn governance_enums() -> Vec<EnumEntry> {
         EnumEntry {
             paths: paths(&["governance.quarantine"]),
             values: unit_values!(
-                QuarantineReason: HostIdentityClone, ProjectionConflict, EnrollmentConflict
+                QuarantineReason: HostIdentityClone, ProjectionConflict, EnrollmentConflict; skip Unknown
             ),
         },
         EnumEntry {
