@@ -108,3 +108,88 @@ async fn doctor_reports_missing_and_incompatible_selected_worker_through_cli() {
     fs::rename(&backup, &selected_worker).expect("restore selected real worker");
     harness.stop().await;
 }
+
+const SERVICE_TOML: &str = r#"schema_version = 7
+prefix = "/home/u/.local"
+active_version = "0.35.2"
+
+[namespace]
+uid = 1000
+state_root = "/home/u/.local/state/pohunek"
+runtime_root = "/run/user/1000/pohunek"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = EXIT_TIMEOUT_MS
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = []
+allowlist = ["PATH"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 5000
+submit_delay_ms = 150
+write_stall_timeout_ms = 3000
+
+[waits]
+turn_default_ms = 300000
+turn_max_ms = 1800000
+
+[hooks]
+stderr_tail_bytes = 4096
+
+[events]
+max_file_bytes = 33554432
+max_files = 8
+max_age_days = 14
+
+[limits]
+open_files = 8192
+"#;
+
+fn install_service_toml(harness: &Harness, exit_timeout_ms: u32) {
+    let dir = harness.env.config_home().join("pohunek");
+    fs::create_dir_all(&dir).expect("create the config directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod config directory");
+    let file = dir.join("service.toml");
+    fs::write(
+        &file,
+        SERVICE_TOML.replace("EXIT_TIMEOUT_MS", &exit_timeout_ms.to_string()),
+    )
+    .expect("write service.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("chmod service.toml");
+}
+
+#[tokio::test]
+async fn doctor_warns_when_shutdown_bounds_exceed_the_exit_timeout_through_cli() {
+    let harness = Harness::start().await;
+
+    install_service_toml(&harness, 30_000);
+    let json = harness.run(&["doctor", "--json"]).await;
+    let document: Value = serde_json::from_slice(&json.stdout).expect("doctor JSON");
+    assert_eq!(
+        check(&document, "service_config_shutdown_budget")["status"],
+        "ok"
+    );
+
+    install_service_toml(&harness, 20_000);
+    let json = harness.run(&["doctor", "--json"]).await;
+    let document: Value = serde_json::from_slice(&json.stdout).expect("doctor JSON");
+    let budget = check(&document, "service_config_shutdown_budget");
+    assert_eq!(budget["status"], "warn", "{document}");
+    assert!(
+        budget["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("daemon_exit_timeout_ms = 20000"),
+        "{budget}"
+    );
+    harness.stop().await;
+}

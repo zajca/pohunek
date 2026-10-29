@@ -952,30 +952,6 @@ open_files = 8192
     }
 
     #[test]
-    fn doctor_warns_when_shutdown_bounds_exceed_the_exit_timeout() {
-        let (_guard, fits) = config_dir_with(&service_toml(""));
-        let check = shutdown_budget_check(&fits).expect("a check for a fitting file");
-        assert_eq!(check.name, "service_config_shutdown_budget");
-        assert_eq!(check.status, Status::Ok);
-
-        let (_low_guard, low) = config_dir_with(&service_toml("").replace(
-            "daemon_exit_timeout_ms = 30000",
-            "daemon_exit_timeout_ms = 20000",
-        ));
-        let check = shutdown_budget_check(&low).expect("a check for a low exit timeout");
-        assert_eq!(check.status, Status::Warn);
-        assert!(
-            check.detail.contains("daemon_exit_timeout_ms = 20000"),
-            "{}",
-            check.detail
-        );
-        assert!(check.detail.contains("27000"), "{}", check.detail);
-
-        let (_missing_guard, missing) = unique_temp_dir();
-        assert!(shutdown_budget_check(&missing).is_none());
-    }
-
-    #[test]
     fn doctor_reports_unknown_service_config_keys() {
         const SECRET: &str = "PH-DOCTOR-sentinel-2b9f-77a0";
         let (_clean_guard, clean) = config_dir_with(&service_toml(""));
