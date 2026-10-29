@@ -6876,7 +6876,6 @@ async fn daemon_shutdown_flushes_pending_agent_state_hooks_before_the_registry_p
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         config_dir: Some(config_dir),
         ..SessionRegistryConfig::default()
     });

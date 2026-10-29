@@ -502,12 +502,12 @@ leftover processes swept by ownership marker before the session is reported
 The daemon stops its own background work through one tree (`crates/daemon/src/shutdown.rs`).
 The session registry spawns every watcher, exit committer, forwarder and retry
 through a tracker it owns, and runs its blocking store writes through the same
-tracker. The tasks around it (idle stop, session and notification retention, the
-notification projector, the attention coordinator, the agent-state hook flush and
+tracker. The tasks around it (idle stop, session and notification retention,
+package command runs, the notification projector, the attention coordinator, the agent-state hook flush and
 the event-log drains) belong to `DaemonShutdown`, which stops them in four ordered
 phases, each inside its own bound from `[deadlines]` in `service.toml`:
 `create_drain_ms` (creates still running commit or compensate), `driver_shutdown_ms`
-(the producers, idle stop and retention, stop together; then the consumers of
+(the producers, idle stop, retention and package command runs, stop together; then the consumers of
 the registry's events, the notification projector and the agent-state hook flush,
 so the events the producers emit while stopping are still consumed; then the
 attention coordinator, so the last defers and resolves they hand over are
