@@ -614,3 +614,74 @@ fn a_governance_quarantine_reason_from_a_newer_daemon_prints_unknown_for_humans(
         "{stdout}"
     );
 }
+
+/// A terminal session whose runtime a newer daemon reports in a state this
+/// build does not know.
+fn newer_daemon_runtime_session() -> Value {
+    let mut session = newer_daemon_session();
+    session["state"] = json!("done");
+    session["runtime"] = json!({
+        "state": "a_state_from_a_newer_daemon",
+        "runtime_generation": "1",
+    });
+    session
+}
+
+#[test]
+fn a_runtime_state_from_a_newer_daemon_shows_unknown_in_list_and_inspect() {
+    let list = run_against_scripted_daemon(
+        &["session", "list"],
+        session_snapshot_daemon(newer_daemon_runtime_session()),
+    );
+    assert_eq!(list.status.code(), Some(0), "{list:?}");
+
+    let inspect = run_against_scripted_daemon(
+        &["session", "inspect", "s-1", "--json"],
+        session_snapshot_daemon(newer_daemon_runtime_session()),
+    );
+    assert_eq!(inspect.status.code(), Some(0), "{inspect:?}");
+    let document: Value = serde_json::from_slice(&inspect.stdout).expect("one JSON document");
+    assert_eq!(document["ok"]["runtime"]["state"], "unknown", "{document}");
+}
+
+#[test]
+fn stop_and_remove_refuse_a_session_with_an_unknown_runtime_state_without_a_request() {
+    for (arguments, operation) in [
+        (vec!["session", "stop", "s-1", "--json"], "stop"),
+        (vec!["session", "rm", "s-1", "--json"], "remove"),
+    ] {
+        let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = std::sync::Arc::clone(&methods);
+        let session = newer_daemon_runtime_session();
+        let output = run_against_scripted_daemon(&arguments, move |request| {
+            recorded
+                .lock()
+                .expect("method log")
+                .push(request.method().to_owned());
+            match request.method() {
+                protocol::method::SESSION_LIST => Some(Ok(json!([session.clone()]))),
+                _ => None,
+            }
+        });
+
+        assert_ne!(output.status.code(), Some(0), "{operation}: {output:?}");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("session_runtime_state_unknown"),
+            "{operation}: {text}"
+        );
+        let methods = methods.lock().expect("method log");
+        assert!(
+            !methods.iter().any(|method| {
+                method == protocol::method::SESSION_STOP
+                    || method == protocol::method::SESSION_REMOVE
+                    || method == protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+            }),
+            "{operation}: no lifecycle request is sent: {methods:?}"
+        );
+    }
+}

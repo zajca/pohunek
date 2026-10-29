@@ -6929,7 +6929,8 @@ impl SessionRegistry {
                 RuntimeState::Starting
                 | RuntimeState::Live
                 | RuntimeState::Reconnecting
-                | RuntimeState::Terminal => event::SESSION_UPDATED,
+                | RuntimeState::Terminal
+                | RuntimeState::Unknown => event::SESSION_UPDATED,
             };
             self.emit(event_name, info.as_ref());
             if base.info.background.is_some() {
@@ -9119,7 +9120,7 @@ fn unavailable_runtime_code(state: RuntimeState) -> &'static str {
         RuntimeState::Incompatible => "worker_protocol_incompatible",
         RuntimeState::Starting | RuntimeState::Reconnecting => "session_runtime_reconnecting",
         RuntimeState::Terminal => "session_not_running",
-        RuntimeState::Live => "worker_operation_failed",
+        RuntimeState::Live | RuntimeState::Unknown => "worker_operation_failed",
     }
 }
 
@@ -9181,6 +9182,7 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
         RuntimeState::Lost => "lost",
         RuntimeState::Conflict => "conflict",
         RuntimeState::Incompatible => "incompatible",
+        RuntimeState::Unknown => "unknown",
     }
 }
 

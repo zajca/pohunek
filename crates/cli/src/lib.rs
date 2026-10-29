@@ -2126,6 +2126,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let host = client::PinnedHost::resolve(&host).await?;
                     let target =
                         commands::session::resolve_target_pinned(&host, &paths, &target).await?;
+                    commands::session::ensure_lifecycle_allowed(&host, &paths, &target, "stop")
+                        .await?;
                     commands::session::run_stop(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Fork {
@@ -2157,6 +2159,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let host = client::PinnedHost::resolve(&host).await?;
                     let target =
                         commands::session::resolve_target_pinned(&host, &paths, &target).await?;
+                    commands::session::ensure_lifecycle_allowed(&host, &paths, &target, "remove")
+                        .await?;
                     commands::session::run_remove(
                         &host,
                         &paths,

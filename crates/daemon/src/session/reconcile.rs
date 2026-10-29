@@ -4334,7 +4334,8 @@ impl SessionRegistry {
             RuntimeState::Starting
             | RuntimeState::Live
             | RuntimeState::Reconnecting
-            | RuntimeState::Terminal => event::SESSION_UPDATED,
+            | RuntimeState::Terminal
+            | RuntimeState::Unknown => event::SESSION_UPDATED,
         };
         self.emit(event_name, &info);
         if had_background {
@@ -5483,7 +5484,9 @@ fn runtime_currency(
     }
     match state {
         RuntimeState::Live => WorkerMetadataCurrency::Current,
-        RuntimeState::Starting | RuntimeState::Reconnecting => WorkerMetadataCurrency::NotYet,
+        RuntimeState::Starting | RuntimeState::Reconnecting | RuntimeState::Unknown => {
+            WorkerMetadataCurrency::NotYet
+        }
         RuntimeState::Terminal
         | RuntimeState::Lost
         | RuntimeState::Conflict

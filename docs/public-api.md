@@ -1811,7 +1811,12 @@ Important fields:
   sessions and peers predating worker-backed sessions. `runtime_generation` is
   a canonical unsigned decimal JSON string, not a JSON number. `runtime.state` is
   `starting`, `live`, `reconnecting`, `terminal`, `lost`, `conflict`, or
-  `incompatible`; `worker_id` identifies the PTY owner and `worker_instance_id`
+  `incompatible`. A state a newer daemon defines reads as `unknown` on the Rust
+  client and the CLI: the session may still own a live PTY, so it blocks an
+  upgrade and `session stop` and `session rm` refuse it locally with
+  `session_runtime_state_unknown` before sending a request. The daemon never
+  emits `unknown`, and its session store stays strict. `worker_id` identifies the
+  PTY owner and `worker_instance_id`
   identifies the PTY generation. `started_at`, `last_connected_at`, `loss_reason`
   and `exit` are optional. `exit` (`RuntimeExit`) says how the service manager
   saw the worker end and is present only on a `lost` runtime whose failed

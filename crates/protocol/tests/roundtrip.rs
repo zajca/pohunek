@@ -23,23 +23,24 @@ use protocol::{
     ObservationParamsError, OutputOffset, OwnerRevision, PrincipalId, ProcessStartIdentity,
     ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError, ProtocolVersion,
     ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence, Request,
-    Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeRef, SessionAttachResult,
-    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
-    SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionForkResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
-    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSecretEnv, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
-    SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
-    SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
-    TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
-    TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES,
-    MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeRef, RuntimeState,
+    SessionAttachResult, SessionBackground, SessionCapabilities, SessionDetachParams,
+    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
+    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeParams, SessionRuntime, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark,
+    TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId, TransferProposal,
+    UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
     MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_SECRET_ENV_ENTRIES,
     MAX_SESSION_SECRET_ENV_VALUE_BYTES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
     OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
@@ -5714,4 +5715,47 @@ fn a_quarantined_status_with_a_reason_from_a_newer_daemon_still_passes_the_statu
         protocol::EnrollmentStatus::Active,
     ))
     .expect_err("a quarantine reason on an active enrollment is still inconsistent");
+}
+
+#[test]
+fn a_runtime_state_from_a_newer_daemon_is_possibly_live_and_never_stoppable_or_removable() {
+    TolerantEnum {
+        known: vec![
+            ("starting", RuntimeState::Starting),
+            ("live", RuntimeState::Live),
+            ("reconnecting", RuntimeState::Reconnecting),
+            ("terminal", RuntimeState::Terminal),
+            ("lost", RuntimeState::Lost),
+            ("conflict", RuntimeState::Conflict),
+            ("incompatible", RuntimeState::Incompatible),
+        ],
+        unknown: RuntimeState::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("RuntimeState");
+
+    // A terminal session is the case where only the runtime keeps it live.
+    let mut value = serde_json::to_value(SessionInfo {
+        state: SessionState::Done,
+        ..running_shell_session(None)
+    })
+    .expect("serialize session info");
+    value["runtime"] = json!({
+        "state": "a_state_from_a_newer_daemon",
+        "runtime_generation": "1"
+    });
+    serde_json::from_value::<SessionInfo>(value.clone())
+        .expect_err("plain decoding rejects the unknown runtime state");
+
+    let session: SessionInfo = protocol::tolerant::from_value(value).expect("tolerant decode");
+    assert_eq!(
+        session.runtime.as_ref().map(|runtime| runtime.state),
+        Some(RuntimeState::Unknown)
+    );
+    assert!(
+        session.may_own_runtime(),
+        "an unknown runtime may still be live"
+    );
+    assert!(!session.can_stop());
+    assert!(!session.can_remove());
 }

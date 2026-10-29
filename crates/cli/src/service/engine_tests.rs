@@ -5378,8 +5378,21 @@ async fn a_daemon_that_never_answers_rolls_the_upgrade_back_to_the_previous_vers
 async fn uninstall_refuses_live_sessions_and_changes_nothing() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
+    // A finished session whose runtime state a newer daemon defines may still
+    // own a live PTY.
+    let mut unknown_runtime = session("s-8", None);
+    unknown_runtime.state = SessionState::Done;
+    unknown_runtime
+        .runtime
+        .as_mut()
+        .expect("the helper session has a runtime")
+        .state = RuntimeState::Unknown;
     harness.fake.seed(
-        vec![session(SESSION, Some("review")), session("s-7", None)],
+        vec![
+            session(SESSION, Some("review")),
+            session("s-7", None),
+            unknown_runtime,
+        ],
         vec![
             worker(worker_id(SESSION), ServiceState::Running),
             worker(worker_id("s-9"), ServiceState::Running),
@@ -5395,7 +5408,11 @@ async fn uninstall_refuses_live_sessions_and_changes_nothing() {
     };
     assert_eq!(
         sessions.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        [format!("{SESSION} (review)"), "s-7".to_owned()]
+        [
+            format!("{SESSION} (review)"),
+            "s-7".to_owned(),
+            "s-8".to_owned()
+        ]
     );
     assert_eq!(workers, &[worker_id("s-9").to_string()]);
     harness.assert_installed(V1);
