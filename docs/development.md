@@ -563,13 +563,25 @@ change; a pull request with none carries the `no-changelog` label.
 
 The `Changelog guard` workflow (`.github/workflows/changelog-guard.yml`)
 enforces this for the changes that document a behavior: a pull request that adds
-or edits a knowledge-log fragment (`docs/knowledge/log.d/*.md`) or `docs/cli.md`
-fails unless it adds a new `changelog.d/` fragment (a fragment only edited or
-renamed does not count), edits `CHANGELOG.md`, or carries the `no-changelog`
-label. Adding or removing the label re-runs only that
-workflow. The trigger paths and the label name are the `guard` key of
-`.github/changelog.json`; `scripts/changelog guard --base REV [--head REV]
-[--labels-json JSON]` runs the same check locally.
+or edits a knowledge-log fragment (`docs/knowledge/log.d/*.md`), `docs/cli.md`,
+`docs/public-api.md` or `docs/development.md` fails unless it adds a new
+`changelog.d/` fragment (a fragment only edited or renamed does not count),
+edits `CHANGELOG.md`, or carries the `no-changelog` label. Adding or removing the
+label re-runs only that workflow. The trigger paths and the label name are the
+`guard` key of `.github/changelog.json`; `scripts/changelog guard --base REV
+[--head REV] [--labels-json JSON]` runs the same check locally.
+
+The guard is advisory. It runs on `pull_request` with the scripts and the
+`guard` configuration of the pull request head (never `pull_request_target`, so a
+pull request from a fork gets no write token or secret), which means a pull
+request can change its own guard configuration, and anyone who can label a pull
+request can bypass it. It catches a forgotten fragment; review decides whether
+the change needs one.
+
+A pull request that is opened with a label, or labeled right after opening,
+starts one run per event. The concurrency group of the workflow cancels the
+earlier run, so the pull request shows one cancelled run next to the run that
+decides; the run of the last event is always the one that survives.
 
 A fragment starts with a header and then one paragraph written for users:
 

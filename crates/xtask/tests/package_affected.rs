@@ -68,6 +68,8 @@ impl Repo {
         repo.git(&["init", "--quiet", "--initial-branch=main"]);
         repo.git(&["config", "user.email", "test@example.invalid"]);
         repo.git(&["config", "user.name", "test"]);
+        // Marks the fixture as a checkout, which the xtask binary requires.
+        repo.write("crates/xtask/Cargo.toml", "");
         for (path, content) in BASE_FILES {
             repo.write(path, content);
         }

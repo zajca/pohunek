@@ -19,7 +19,7 @@ LABEL = "no-changelog"
 LAYOUT = {
     "repository": "example/app",
     "changelog": "CHANGELOG.md",
-    "guard": {"label": LABEL, "triggers": ["docs/knowledge/log.d/*.md", "docs/cli.md"]},
+    "guard": {"label": LABEL, "triggers": ["docs/knowledge/log.d/*.md", "docs/cli.md", "docs/public-api.md", "docs/development.md"]},
 }
 CHANGELOG = "# Changelog\n\nUser-facing changes of example/app.\n"
 FRAGMENT = "---\nkind: added\n---\nText.\n"
@@ -48,6 +48,8 @@ class GuardScenarios(unittest.TestCase):
         self.write(".github/changelog.json", json.dumps(LAYOUT))
         self.write("CHANGELOG.md", CHANGELOG)
         self.write("docs/cli.md", "cli\n")
+        self.write("docs/public-api.md", "api\n")
+        self.write("docs/development.md", "dev\n")
         self.write("src/lib.rs", "// code\n")
         self.write("changelog.d/.gitkeep", "")
         self.git("init", "-q", "-b", "main")
@@ -69,7 +71,7 @@ class GuardScenarios(unittest.TestCase):
     def guard(self, *labels: str, base: str = "main") -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, str(TOOL), "--root", str(self.repo), "guard", "--base", base, "--labels-json", json.dumps(list(labels))],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, env=self.env,
         )
 
     def assert_passes(self, result: subprocess.CompletedProcess) -> None:
@@ -98,6 +100,16 @@ class DocumentedBehaviorChange(GuardScenarios):
         result = self.guard()
         self.assertEqual(result.returncode, 1)
         self.assertIn("docs/cli.md", result.stderr)
+
+    def test_an_edit_of_the_public_api_or_development_reference_without_a_fragment_fails(self):
+        for path in ("docs/public-api.md", "docs/development.md"):
+            with self.subTest(path=path):
+                self.git("checkout", "-q", "-B", "work", "main")
+                self.write(path, "changed\n")
+                self.commit("docs change")
+                result = self.guard()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(path, result.stderr)
 
     def test_an_added_changelog_fragment_satisfies_the_guard(self):
         self.write("docs/knowledge/log.d/7-thing.md", LOG_FRAGMENT)
@@ -215,7 +227,7 @@ class RefusedInput(GuardScenarios):
     def test_labels_that_are_not_a_json_array_of_names_are_refused(self):
         result = subprocess.run(
             [sys.executable, str(TOOL), "--root", str(self.repo), "guard", "--base", "main", "--labels-json", '{"a": 1}'],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, env=self.env,
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("--labels-json", result.stderr)

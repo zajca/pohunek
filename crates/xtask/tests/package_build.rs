@@ -139,6 +139,8 @@ impl Repo {
         ]);
         repo.git(&["config", "user.email", "test@example.invalid"]);
         repo.git(&["config", "user.name", "test"]);
+        // Marks the fixture as a checkout, which the xtask binary requires.
+        repo.write("crates/xtask/Cargo.toml", "");
         repo.write("runtime-packages/pi/runtime.toml", PI_DESCRIPTOR);
         repo.write("runtime-packages/pi/detect.toml", PI_DETECT);
         repo.write("runtime-packages/pi/bin/probe.sh", PI_PROBE);
@@ -463,6 +465,9 @@ fn a_package_outside_a_git_work_tree_is_refused_in_the_command_context() {
     let package = env.cwd().join("runtime-packages/pi");
     std::fs::create_dir_all(&package).expect("mkdir");
     std::fs::write(package.join("runtime.toml"), PI_DESCRIPTOR).expect("write");
+    // Marks the directory as a checkout, which the xtask binary requires.
+    std::fs::create_dir_all(env.cwd().join("crates/xtask")).expect("mkdir xtask");
+    std::fs::write(env.cwd().join("crates/xtask/Cargo.toml"), "").expect("write marker");
     let archive = env.root().join(ARCHIVE);
     let evidence = env.root().join("evidence");
     let output = env
