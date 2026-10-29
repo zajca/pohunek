@@ -975,9 +975,9 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertIn("trap 'cleanup_base' EXIT INT TERM", run_smoke_text)
         self.assertIn("/usr/bin/sudo -n /usr/sbin/chown", run_smoke_text)
         self.assertNotIn("chmod -R go+rX", run_smoke_text)
-        # Smoke is a matrix job with ubuntu-latest and macos-15
+        # Smoke is a matrix job with ubuntu-24.04 and macos-15
         self.assertIn("    strategy:\n      fail-fast: false\n      matrix:\n        include:", smoke)
-        self.assertIn("          - os: ubuntu-latest\n            smoke_target: \"\"", smoke)
+        self.assertIn("          - os: ubuntu-24.04\n            smoke_target: \"\"", smoke)
         self.assertIn("          - os: macos-15\n            smoke_target: aarch64-apple-darwin", smoke)
         self.assertIn("SMOKE_TARGET: ${{ matrix.smoke_target }}", smoke)
 
@@ -1341,7 +1341,7 @@ jobs:
 
     def test_a_flow_style_job_is_rejected(self):
         base = self.TEXT.format(action=DOWNLOAD, script=self.SCRIPT)
-        hidden = "  hidden: {runs-on: ubuntu-latest, permissions: write-all, steps: [{run: ./x}]}\n"
+        hidden = "  hidden: {runs-on: ubuntu-24.04, permissions: write-all, steps: [{run: ./x}]}\n"
         for text in (base.replace("jobs:\n", "jobs:\n" + hidden), base + hidden):
             with self.subTest(text=text):
                 self.assertTrue(workflow_violations(text, writer="publish", oidc=set(), publish_scripts=self.ALLOWED))

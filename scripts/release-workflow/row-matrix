@@ -40,7 +40,7 @@ targets=$*
 jq -ec --arg targets "$targets" --argjson limit "$ROW_LIMIT_MINUTES" --argjson setup "$SETUP_MINUTES" '
     def word: type == "string" and test("^[a-z0-9][a-z0-9_-]*$");
     def runner:
-        if test("^x86_64-unknown-linux-(gnu|musl)$") then "ubuntu-latest"
+        if test("^x86_64-unknown-linux-(gnu|musl)$") then "ubuntu-24.04"
         elif test("^aarch64-apple-darwin$") then "macos-15"
         else error("no runner for target " + .) end;
     def os_of: if . == "macos-15" then "macos" else "linux" end;
@@ -52,7 +52,7 @@ jq -ec --arg targets "$targets" --argjson limit "$ROW_LIMIT_MINUTES" --argjson s
         | select(($wanted | length) == 0 or ((.target) as $t | $wanted | index($t)))]
     | if length == 0 then error("no rows selected") else . end
     | . as $rows
-    | {include: [("ubuntu-latest", "macos-15") as $runner
+    | {include: [("ubuntu-24.04", "macos-15") as $runner
         | [$rows[] | select(.runner == $runner) | "\(.runtime):\(.target)"] as $words
         | {runner: $runner,
            os: ($runner | os_of),

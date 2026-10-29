@@ -499,12 +499,12 @@ class CiEvidenceCliTests(unittest.TestCase):
         smoke = "release rehearsal (evidence, assembly, archive smoke) / Archive smoke"
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated)", workflow))
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, macos-13)", workflow))
-        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, ubuntu-latest) extra", workflow))
+        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, ubuntu-24.04) extra", workflow))
         self.assertFalse(names_a_workflow_job("tests (gpu, fast)", workflow))
         # The release rehearsal is nightly-tier evidence: both legs of its
         # archive smoke gate a release through the nightly run, and the main
         # tier, which never starts the rehearsal, requires none of its jobs.
-        for leg in ("ubuntu-latest", "macos-15"):
+        for leg in ("ubuntu-24.04", "macos-15"):
             self.assertIn(f"{smoke} (network-isolated, {leg})", config["required_jobs"]["nightly"])
         self.assertIn(
             "release rehearsal (archive smoke scenarios) / Archive smoke scenarios (network-isolated, macos-15)",

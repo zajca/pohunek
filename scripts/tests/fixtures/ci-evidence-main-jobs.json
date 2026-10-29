@@ -231,7 +231,7 @@
       "conclusion": "success"
     },
     {
-      "name": "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable (ubuntu-latest)",
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable (ubuntu-24.04)",
       "status": "completed",
       "conclusion": "success"
     },
@@ -326,7 +326,7 @@
       "conclusion": "skipped"
     },
     {
-      "name": "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-24.04)",
       "status": "completed",
       "conclusion": "success"
     },

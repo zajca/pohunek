@@ -32,6 +32,7 @@ name: Release
 # its caller lacks. They run no repository or downloaded code. The signing key
 # (the secret CATALOG_SIGNING_KEY_CI of the environment `release`) is passed by
 # name to the reusable workflow and read only by its `assemble` signing step.
+# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
 on:
   push:
     tags:
@@ -59,7 +60,7 @@ env:
 jobs:
   tier-evidence:
     name: Verify exact-commit main and nightly CI evidence
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
@@ -80,7 +81,7 @@ jobs:
 
   gate:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [tier-evidence]
     permissions:
       contents: read
@@ -168,7 +169,7 @@ jobs:
   docs-gate:
     name: docs check (deterministic build + secret scan)
     needs: [tier-evidence]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:
@@ -205,7 +206,7 @@ jobs:
   sdk-gate:
     name: SDK typecheck + lint + test + pack contract + e2e
     needs: [tier-evidence]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:
@@ -636,7 +637,7 @@ jobs:
   publish:
     name: Publish the release
     needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test, build, stage-macos, package-macos, verify-macos, evidence]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: write
