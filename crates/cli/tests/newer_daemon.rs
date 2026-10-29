@@ -596,3 +596,21 @@ fn a_governance_quarantine_reason_from_a_newer_daemon_shows_unknown() {
         "{document}"
     );
 }
+
+#[test]
+fn a_governance_quarantine_reason_from_a_newer_daemon_prints_unknown_for_humans() {
+    let output = run_against_scripted_daemon(
+        &["host", "governance", "inspect", "local"],
+        single_result_daemon(
+            protocol::method::HOST_GOVERNANCE_INSPECT,
+            newer_daemon_quarantined_status(),
+        ),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("quarantine:             unknown"),
+        "{stdout}"
+    );
+}

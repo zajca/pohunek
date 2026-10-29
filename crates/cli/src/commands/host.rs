@@ -18,7 +18,7 @@ use std::process::ExitCode;
 
 use protocol::{
     method, CommandRunParams, HostCapabilities, HostClass, HostGovernanceStatus, HostOwner,
-    HostRecord,
+    HostRecord, QuarantineReason,
 };
 
 use crate::client::Client;
@@ -324,6 +324,7 @@ fn render_governance_human(host: &str, status: &HostGovernanceStatus) -> String 
         let _ = writeln!(output, "  owner_revision:         {revision}");
     }
     match status.quarantine() {
+        Some(QuarantineReason::Unknown) => output.push_str("  quarantine:             unknown\n"),
         Some(reason) => {
             let _ = writeln!(output, "  quarantine:             {reason:?}");
         }
@@ -336,8 +337,7 @@ fn render_governance_human(host: &str, status: &HostGovernanceStatus) -> String 
 mod tests {
     use protocol::{
         AgentRuntime, ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,
-        HostId, OwnerRevision, PrincipalId, ProtocolVersion, QuarantineReason, RelayId, RuntimeRef,
-        TeamId,
+        HostId, OwnerRevision, PrincipalId, ProtocolVersion, RelayId, RuntimeRef, TeamId,
     };
 
     use super::*;

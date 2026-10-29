@@ -5510,7 +5510,6 @@ fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
     );
 }
 
-
 #[test]
 fn notification_project_and_quarantine_enums_are_tolerant_only_on_the_client() {
     use protocol::{

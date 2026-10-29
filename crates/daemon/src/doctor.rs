@@ -801,8 +801,17 @@ fn quarantine_checks(reason: Option<QuarantineReason>) -> (DoctorCheck, DoctorCh
         Some(QuarantineReason::EnrollmentConflict) => quarantine_warning(
             "Enrollment coordinates conflict; reconcile the registered relay before use.",
         ),
-        Some(QuarantineReason::Unknown) => quarantine_warning(
-            "Host governance is quarantined for a reason this build does not know; reconcile the registered relay before use.",
+        Some(QuarantineReason::Unknown) => (
+            check(
+                "host_governance_consistency",
+                DoctorStatus::Fail,
+                "Host governance is quarantined for a reason this build does not know; upgrade this daemon or reconcile the registered relay before use.",
+            ),
+            check(
+                "host_governance_quarantine",
+                DoctorStatus::Fail,
+                "Host governance is quarantined for a reason this build does not know.",
+            ),
         ),
         Some(QuarantineReason::HostIdentityClone) => (
             check(
@@ -857,6 +866,13 @@ mod tests {
         // does not exist yet.
         crate::test_support::thread_scoped_dir(&format!("pohunek-daemon-doctor-{tag}-"))
             .join("root")
+    }
+
+    #[test]
+    fn an_unknown_quarantine_reason_fails_both_governance_checks() {
+        let (consistency, quarantine) = quarantine_checks(Some(QuarantineReason::Unknown));
+        assert_eq!(consistency.status, DoctorStatus::Fail);
+        assert_eq!(quarantine.status, DoctorStatus::Fail);
     }
 
     #[test]
