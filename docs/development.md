@@ -616,12 +616,14 @@ assembles and publishes the release in one fixed flow.
 The `gate` job tests the way CI does: it builds the `cargo nextest archive
 --profile ci --workspace --all-features` archive, proves the shards of
 `scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy` and
-`relay-db` under their bounded profiles, the PostgreSQL service visible to
+`relay-db` under their bounded profiles, the PostgreSQL URL set for
 `relay-db` only), and runs the doctests with `cargo test --doc --workspace
 --all-features`, because nextest runs none. Every shard runs before the step
 fails, so one red shard does not hide another. It differs from a PR run in
-three ways: it runs the full set (no selection, no sparse tree), it runs in the
-checkout that built the archive, and it does not run the script regressions or
+these ways: it runs the full set (no selection, no sparse tree), it runs in the
+checkout that built the archive, it builds with the job's `-C
+link-arg=-fuse-ld=mold` and sccache, it keeps the shard JUnit reports in the step
+summary only (no artifact upload), and it does not run the script regressions or
 the toolchain-pin check, which the `core` shard job runs and the main and nightly
 evidence of the release commit already covers.
 

@@ -86,8 +86,6 @@ jobs:
     permissions:
       contents: read
     env:
-      # Bound concurrent isolated PostgreSQL fixture pools.
-      RUST_TEST_THREADS: 4
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
       postgres:
