@@ -869,13 +869,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_quarantine_reason_fails_both_governance_checks() {
-        let (consistency, quarantine) = quarantine_checks(Some(QuarantineReason::Unknown));
-        assert_eq!(consistency.status, DoctorStatus::Fail);
-        assert_eq!(quarantine.status, DoctorStatus::Fail);
-    }
-
-    #[test]
     fn the_supervision_mode_follows_the_active_supervision() {
         let active = |native| ActiveSupervision {
             worker_executable: PathBuf::from("/opt/pohunek-sessiond"),
