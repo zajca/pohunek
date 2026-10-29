@@ -253,11 +253,6 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "the guard run over every crate's test code, and the toolchain pin the fixtures copy",
     ),
     (
-        "crates/xtask/tests/checkout_root.rs",
-        &["docs/knowledge/log.d", "docs/knowledge/log.md"],
-        "the fold dry run from the checkout that built the binary, which reads the knowledge log and its fragments",
-    ),
-    (
         "crates/xtask/tests/dependency_policy.rs",
         &["Cargo.toml", "Cargo.lock", ".clippy.toml", ".cargo", "crates"],
         "workspace resolution and member manifests",

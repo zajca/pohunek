@@ -84,16 +84,17 @@ fn log_fold_run_from_a_subdirectory_acts_on_the_enclosing_checkout() {
 }
 
 #[test]
-fn outside_any_checkout_the_checkout_that_built_the_binary_stands_in() {
-    let outside = pohunek_test_support::tempdir_with_prefix("pxd-none-").expect("fixture dir");
-    let args = ["docs", "log", "fold", "--version", "9.9.9", "--dry-run"];
-    let from_outside = xtask(outside.path(), &args);
-    let from_the_built_checkout = xtask(&pohunek_test_support::workspace_root(), &args);
+fn a_directory_without_the_xtask_crate_is_not_taken_for_a_checkout() {
+    let decoy = fixture_checkout();
+    fs::remove_file(decoy.path().join("crates/xtask/Cargo.toml")).expect("remove the xtask marker");
+    let output = xtask(
+        decoy.path(),
+        &["docs", "log", "fold", "--version", "9.9.9", "--dry-run"],
+    );
 
     assert!(
-        from_outside.status.success(),
-        "{}",
-        String::from_utf8_lossy(&from_outside.stderr)
+        !stdout(&output).contains(MARKER_FRAGMENT),
+        "the fold acted on a directory that holds no xtask crate: {}",
+        stdout(&output)
     );
-    assert_eq!(stdout(&from_outside), stdout(&from_the_built_checkout));
 }
