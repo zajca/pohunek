@@ -301,6 +301,9 @@ fn a_missing_base_fails_without_a_selection() {
 #[test]
 fn a_directory_outside_a_repository_fails_without_a_selection() {
     let env = TestEnv::new().expect("hermetic test environment");
+    // Marks the directory as a checkout, which the xtask binary requires.
+    std::fs::create_dir_all(env.cwd().join("crates/xtask")).expect("mkdir xtask");
+    std::fs::write(env.cwd().join("crates/xtask/Cargo.toml"), "").expect("write marker");
     let output = env
         .command(pohunek_test_support::bin_exe("xtask"))
         .args(["package", "affected", "--base", "main", "--json"])
@@ -309,6 +312,11 @@ fn a_directory_outside_a_repository_fails_without_a_selection() {
         .expect("run xtask");
     assert!(!output.status.success(), "a non-repository must fail");
     assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("git") && !stderr.contains("not inside a pohunek checkout"),
+        "the run did not reach the non-repository path: {stderr}"
+    );
 }
 
 #[test]

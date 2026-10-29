@@ -19,7 +19,7 @@ LABEL = "no-changelog"
 LAYOUT = {
     "repository": "example/app",
     "changelog": "CHANGELOG.md",
-    "guard": {"label": LABEL, "triggers": ["docs/knowledge/log.d/*.md", "docs/cli.md", "docs/public-api.md", "docs/development.md"]},
+    "guard": {"label": LABEL, "triggers": ["docs/knowledge/log.d/*.md", "docs/cli.md", "docs/public-api.md"]},
 }
 CHANGELOG = "# Changelog\n\nUser-facing changes of example/app.\n"
 FRAGMENT = "---\nkind: added\n---\nText.\n"
@@ -32,7 +32,7 @@ class GuardScenarios(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name)
         self.env = dict(
-            os.environ,
+            {key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
             GIT_CONFIG_GLOBAL=os.devnull,
             GIT_CONFIG_SYSTEM=os.devnull,
             GIT_AUTHOR_NAME="test",
@@ -49,7 +49,6 @@ class GuardScenarios(unittest.TestCase):
         self.write("CHANGELOG.md", CHANGELOG)
         self.write("docs/cli.md", "cli\n")
         self.write("docs/public-api.md", "api\n")
-        self.write("docs/development.md", "dev\n")
         self.write("src/lib.rs", "// code\n")
         self.write("changelog.d/.gitkeep", "")
         self.git("init", "-q", "-b", "main")
@@ -101,15 +100,12 @@ class DocumentedBehaviorChange(GuardScenarios):
         self.assertEqual(result.returncode, 1)
         self.assertIn("docs/cli.md", result.stderr)
 
-    def test_an_edit_of_the_public_api_or_development_reference_without_a_fragment_fails(self):
-        for path in ("docs/public-api.md", "docs/development.md"):
-            with self.subTest(path=path):
-                self.git("checkout", "-q", "-B", "work", "main")
-                self.write(path, "changed\n")
-                self.commit("docs change")
-                result = self.guard()
-                self.assertEqual(result.returncode, 1)
-                self.assertIn(path, result.stderr)
+    def test_an_edit_of_the_public_api_reference_without_a_fragment_fails(self):
+        self.write("docs/public-api.md", "api, changed\n")
+        self.commit("api change")
+        result = self.guard()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("docs/public-api.md", result.stderr)
 
     def test_an_added_changelog_fragment_satisfies_the_guard(self):
         self.write("docs/knowledge/log.d/7-thing.md", LOG_FRAGMENT)

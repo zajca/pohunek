@@ -564,7 +564,7 @@ change; a pull request with none carries the `no-changelog` label.
 The `Changelog guard` workflow (`.github/workflows/changelog-guard.yml`)
 enforces this for the changes that document a behavior: a pull request that adds
 or edits a knowledge-log fragment (`docs/knowledge/log.d/*.md`), `docs/cli.md`,
-`docs/public-api.md` or `docs/development.md` fails unless it adds a new
+or `docs/public-api.md` fails unless it adds a new
 `changelog.d/` fragment (a fragment only edited or renamed does not count),
 edits `CHANGELOG.md`, or carries the `no-changelog` label. Adding or removing the
 label re-runs only that workflow. The trigger paths and the label name are the

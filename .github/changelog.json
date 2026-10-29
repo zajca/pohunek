@@ -6,8 +6,7 @@
     "triggers": [
       "docs/knowledge/log.d/*.md",
       "docs/cli.md",
-      "docs/public-api.md",
-      "docs/development.md"
+      "docs/public-api.md"
     ]
   }
 }

@@ -345,6 +345,7 @@ pub fn check_docs(
     source_dir: impl AsRef<Path>,
     output_root: impl AsRef<Path>,
 ) -> Result<bool, XtaskError> {
+    ensure_checkout()?;
     checks::check_docs(source_dir, output_root)
 }
 
