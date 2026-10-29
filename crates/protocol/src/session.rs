@@ -2426,7 +2426,7 @@ pub enum SessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeState.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum RuntimeState {
     /// A worker unit is being initialized.
     Starting,
@@ -2442,7 +2442,17 @@ pub enum RuntimeState {
     Conflict,
     /// The live worker has no compatible private protocol version.
     Incompatible,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one. It is treated
+    /// as a runtime that may still be live and is never stoppable or removable.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(RuntimeState);
 
 /// Discovery classification for one independently surviving worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2576,6 +2586,7 @@ impl RuntimeState {
             Self::Lost => "lost",
             Self::Conflict => "conflict",
             Self::Incompatible => "incompatible",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -2923,8 +2934,9 @@ impl SessionInfo {
     /// Whether the session may still own a live PTY runtime.
     ///
     /// An external observe-only entry owns none. Otherwise the session may own
-    /// one while its runtime is starting, live, reconnecting, in conflict or
-    /// incompatible, or while the session itself is starting or running.
+    /// one while its runtime is starting, live, reconnecting, in conflict,
+    /// incompatible or of a state this build does not know, or while the session
+    /// itself is starting or running.
     #[must_use]
     pub fn may_own_runtime(&self) -> bool {
         if self.external == Some(true) {
@@ -2938,6 +2950,7 @@ impl SessionInfo {
                     | RuntimeState::Reconnecting
                     | RuntimeState::Conflict
                     | RuntimeState::Incompatible
+                    | RuntimeState::Unknown
             )
         });
         runtime_live || matches!(self.state, SessionState::Starting | SessionState::Running)
@@ -2947,8 +2960,9 @@ impl SessionInfo {
     ///
     /// An external observe-only entry has no PTY to stop, a terminal session has
     /// already stopped, and a runtime that is neither connected nor on its way
-    /// back cannot be asked to shut one down. A session with no runtime at all
-    /// predates worker-backed runtimes and is treated as stoppable.
+    /// back cannot be asked to shut one down; neither can a runtime in a state
+    /// this build does not know. A session with no runtime at all predates
+    /// worker-backed runtimes and is treated as stoppable.
     #[must_use]
     pub fn can_stop(&self) -> bool {
         if self.external == Some(true) || self.state.is_terminal() {
@@ -2965,9 +2979,10 @@ impl SessionInfo {
     /// Whether `session.remove` can evict this session.
     ///
     /// Removal is refused for an external entry the daemon does not own, and for
-    /// a [`RuntimeState::Conflict`] or [`RuntimeState::Incompatible`] runtime,
-    /// where the identity backing the session is unresolved and evicting the
-    /// record would strand a live PTY. Everything else is removable once it is
+    /// a [`RuntimeState::Conflict`], [`RuntimeState::Incompatible`] or
+    /// [`RuntimeState::Unknown`] runtime, where the identity backing the session
+    /// is unresolved or unknown and evicting the record could strand a live
+    /// PTY. Everything else is removable once it is
     /// terminal, still stoppable, or lost. This is the single eligibility rule
     /// shared by client remove affordances and the daemon's retention sweep.
     #[must_use]
@@ -2978,7 +2993,7 @@ impl SessionInfo {
         if self.runtime.as_ref().is_some_and(|runtime| {
             matches!(
                 runtime.state,
-                RuntimeState::Conflict | RuntimeState::Incompatible
+                RuntimeState::Conflict | RuntimeState::Incompatible | RuntimeState::Unknown
             )
         }) {
             return false;

@@ -2216,7 +2216,7 @@ never `unreachable!()`.
 | `AgentActivity` | display, safe | an input-wait miss is the existing typed error | done |
 | `StateSource`, `CwdSource`, `SubagentLifecycle` | display | a lifecycle `unknown` is not counted as running | done |
 | `BackgroundKind`, `BackgroundStatus` | display | maps to the existing `Other` | done |
-| `RuntimeState` | safe | may own a runtime, cannot be stopped or removed, blocks upgrade | [#1336](https://github.com/zajca/pohunek/issues/1336) |
+| `RuntimeState` | safe | may own a runtime, cannot be stopped or removed, blocks upgrade; `session stop` and `session rm` refuse locally | done |
 | `RuntimeInventoryStatus`, `SessionRetentionReason`, `SessionWaitTurnReason`, `SessionReadSource` | display | | [#1337](https://github.com/zajca/pohunek/issues/1337) |
 | `SessionRetentionHold` | safe | never `None` (free to remove) | [#1337](https://github.com/zajca/pohunek/issues/1337) |
 | `SessionWaitReason` | safe | reported like a timeout, non-zero exit | [#1337](https://github.com/zajca/pohunek/issues/1337) |

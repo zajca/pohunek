@@ -777,7 +777,7 @@ fn persisted_enums() -> Vec<EnumEntry> {
     );
     let runtime_state = || {
         unit_values!(
-            RuntimeState: Starting, Live, Reconnecting, Terminal, Lost, Conflict, Incompatible
+            RuntimeState: Starting, Live, Reconnecting, Terminal, Lost, Conflict, Incompatible; skip Unknown
         )
     };
     add(

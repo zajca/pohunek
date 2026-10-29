@@ -876,6 +876,44 @@ pub(crate) async fn run_inspect(
     Ok(())
 }
 
+/// Refuses a lifecycle `operation` locally when the daemon reports a runtime
+/// state this client does not know for the session.
+///
+/// Such a runtime may still be live, so [`SessionInfo::can_stop`] and
+/// [`SessionInfo::can_remove`] are false for it and no request is sent.
+///
+/// # Errors
+///
+/// Returns [`CliError::UnknownRuntimeState`] for the refused session, or a
+/// [`CliError`] if the daemon cannot be reached or answers with a bad payload.
+pub(crate) async fn ensure_lifecycle_allowed(
+    host: &PinnedHost,
+    paths: &Paths,
+    target: &Target,
+    operation: &'static str,
+) -> Result<(), CliError> {
+    let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
+    let sessions = sdk
+        .call::<protocol::method::SessionList>(SessionListParams {
+            filters: vec![SessionListFilter::Id(target.session_id.clone())],
+        })
+        .await?;
+    let unknown = sessions.iter().any(|session| {
+        session.id.0 == target.session_id
+            && session
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.state == protocol::RuntimeState::Unknown)
+    });
+    if unknown {
+        return Err(CliError::UnknownRuntimeState {
+            operation,
+            session_id: target.session_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Run `session stop` against the daemon for `host`.
 ///
 /// # Errors

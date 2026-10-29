@@ -108,6 +108,18 @@ pub(crate) enum CliError {
         candidates: String,
     },
 
+    /// The daemon reports a runtime state this client does not know, so the
+    /// session may still own a live PTY and the lifecycle request is not sent.
+    #[error(
+        "cannot {operation} session {session_id}: the daemon reports a runtime state this client does not know"
+    )]
+    UnknownRuntimeState {
+        /// The refused lifecycle operation, `stop` or `remove`.
+        operation: &'static str,
+        /// Stable id of the session.
+        session_id: String,
+    },
+
     /// A long-running observation was cancelled by a local process signal.
     #[error("operation cancelled by process signal")]
     Cancelled,
@@ -401,6 +413,17 @@ impl CliError {
                 "ambiguous_session_name",
                 format!("session name is ambiguous; matching session ids: {candidates}"),
                 Some("retry with one of the listed full session ids".to_owned()),
+            ),
+            CliError::UnknownRuntimeState {
+                operation,
+                session_id,
+            } => ProtocolError::new(
+                ErrorClass::Runtime,
+                "session_runtime_state_unknown",
+                format!(
+                    "cannot {operation} session {session_id}: the daemon reports a runtime state this client does not know"
+                ),
+                Some("upgrade this client to the daemon's version, then retry".to_owned()),
             ),
             CliError::Cancelled => ProtocolError::new(
                 ErrorClass::Runtime,
