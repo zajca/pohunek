@@ -611,7 +611,19 @@ for that evidence and pushes the tag after verification. `--no-push` checks
 already-existing evidence and leaves the commit and tag local; it does not
 dispatch CI or push either ref. The Release workflow
 (`.github/workflows/release.yml`) re-runs the gates on the tag and then builds,
-assembles and publishes the release in one fixed flow:
+assembles and publishes the release in one fixed flow.
+
+The `gate` job tests the way CI does: it builds the `cargo nextest archive
+--profile ci --workspace --all-features` archive, proves the shards of
+`scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy` and
+`relay-db` under their bounded profiles, the PostgreSQL service visible to
+`relay-db` only), and runs the doctests with `cargo test --doc --workspace
+--all-features`, because nextest runs none. Every shard runs before the step
+fails, so one red shard does not hide another. It differs from a PR run in
+three ways: it runs the full set (no selection, no sparse tree), it runs in the
+checkout that built the archive, and it does not run the script regressions or
+the toolchain-pin check, which the `core` shard job runs and the main and nightly
+evidence of the release commit already covers.
 
 1. **Producers** upload workflow artifacts only: `release-build.yml` (reusable)
    builds the glibc and MUSL x86_64 CLI and daemon archives and the glibc relay

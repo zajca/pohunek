@@ -20,8 +20,9 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
 - Working tree is clean. Commit or stash first; the script aborts on a dirty
   tree.
 - The gates pass on the commit being released. The Release workflow re-runs
-  fmt/clippy/test + `docs check` on the tag, so a red commit publishes nothing —
-  run the `gates` skill before tagging to fail fast locally.
+  fmt/clippy/test (the nextest shards CI runs, plus doctests) + `docs check` on
+  the tag, so a red commit publishes nothing — run the `gates` skill before
+  tagging to fail fast locally.
 - The target tag does not already exist.
 
 ## Steps
