@@ -983,7 +983,7 @@ impl SessionScreenParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "DetectionRegionKind.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum DetectionRegionKind {
     /// Latest OSC terminal title.
     OscTitle,
@@ -1008,7 +1008,16 @@ pub enum DetectionRegionKind {
     /// Canonical form of the held OSC 7501 program-status record. The daemon
     /// returns no preview of it while this enum is strict for older clients.
     ProgramStatus,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(DetectionRegionKind);
 
 impl DetectionRegionKind {
     /// All region kinds accepted by this protocol implementation.
@@ -1039,6 +1048,19 @@ pub struct DetectionRegionPreview {
     pub region: String,
     /// Current rendered text supplied to matchers.
     pub text: String,
+}
+
+/// Decodes `supported_regions`, dropping every region a newer daemon sent that
+/// this build does not know.
+fn deserialize_known_regions<'de, D>(deserializer: D) -> Result<Vec<DetectionRegionKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let regions = Vec::<DetectionRegionKind>::deserialize(deserializer)?;
+    Ok(regions
+        .into_iter()
+        .filter(|region| *region != DetectionRegionKind::Unknown)
+        .collect())
 }
 
 /// Parameters for `session.detection`.
@@ -1073,7 +1095,9 @@ impl SessionDetectionParams {
 pub struct SessionDetectionResult {
     /// Logical session whose detector supplied the previews.
     pub session_id: SessionId,
-    /// Complete region set supported by this detector engine.
+    /// Complete region set supported by this detector engine. A region a newer
+    /// daemon defines is dropped on decode.
+    #[serde(deserialize_with = "deserialize_known_regions")]
     pub supported_regions: Vec<DetectionRegionKind>,
     /// Regions required by the active manifest, in manifest order.
     pub previews: Vec<DetectionRegionPreview>,
@@ -1083,7 +1107,7 @@ pub struct SessionDetectionResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadSource.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SessionReadSource {
     /// Current visible terminal rows.
     Visible,
@@ -1093,7 +1117,16 @@ pub enum SessionReadSource {
     RecentUnwrapped,
     /// Detection-oriented recent text, when available.
     Detection,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SessionReadSource);
 
 impl SessionReadSource {
     /// Returns the stable wire string.
@@ -1104,6 +1137,7 @@ impl SessionReadSource {
             Self::Recent => "recent",
             Self::RecentUnwrapped => "recent_unwrapped",
             Self::Detection => "detection",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1967,7 +2001,7 @@ impl<'de> Deserialize<'de> for SessionWaitParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitReason.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SessionWaitReason {
     /// A requested lifecycle state is current.
     StateMatched,
@@ -1983,7 +2017,16 @@ pub enum SessionWaitReason {
     RuntimeChanged,
     /// The requested bounded wait elapsed.
     Timeout,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SessionWaitReason);
 
 /// Result returned by the bounded long-poll `session.wait` method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2458,7 +2501,7 @@ crate::tolerant_enum!(RuntimeState);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeInventoryStatus.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum RuntimeInventoryStatus {
     /// The worker is the unique authenticated runtime for its logical session.
     Managed,
@@ -2470,7 +2513,16 @@ pub enum RuntimeInventoryStatus {
     Incompatible,
     /// The runtime-directory, logical-record, and worker identities disagree.
     IdentityMismatch,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(RuntimeInventoryStatus);
 
 /// Public, read-only inventory entry for one discovered worker endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3324,13 +3376,22 @@ impl Default for SessionRetentionPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionReason.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SessionRetentionReason {
     /// The session reached a terminal lifecycle state.
     Terminal,
     /// The session's PTY runtime was lost and never recovered.
     Lost,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SessionRetentionReason);
 
 impl SessionRetentionReason {
     /// Returns the stable wire string.
@@ -3339,6 +3400,7 @@ impl SessionRetentionReason {
         match self {
             Self::Terminal => "terminal",
             Self::Lost => "lost",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -3348,6 +3410,8 @@ impl SessionRetentionReason {
         match self {
             Self::Terminal => policy.terminal_ttl_secs,
             Self::Lost => policy.lost_ttl_secs,
+            // A reason this build does not know is never aged out.
+            Self::Unknown => u32::MAX,
         }
     }
 }
@@ -3361,7 +3425,7 @@ impl SessionRetentionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionHold.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SessionRetentionHold {
     /// The owned worktree has uncommitted changes to tracked files.
     WorktreeUncommitted,
@@ -3373,7 +3437,16 @@ pub enum SessionRetentionHold {
     /// The owned worktree's state could not be determined, so the sweep fails
     /// closed and keeps it.
     WorktreeUnknown,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SessionRetentionHold);
 
 impl SessionRetentionHold {
     /// Returns the stable wire string.
@@ -3384,6 +3457,7 @@ impl SessionRetentionHold {
             Self::WorktreeUntracked => "worktree_untracked",
             Self::WorktreeUnpushed => "worktree_unpushed",
             Self::WorktreeUnknown => "worktree_unknown",
+            Self::Unknown => "unknown",
         }
     }
 }

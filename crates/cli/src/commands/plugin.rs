@@ -897,8 +897,9 @@ const fn guarded_as_official(origin: PackageOrigin) -> bool {
 /// so an older official version stays installable; only the update flow
 /// reads the semantic order. An archive counts as official when the catalog
 /// listed it or its digest is already recorded as official, because an
-/// explicit digest carries no catalog origin. Build metadata does not order
-/// versions. Rolling back on purpose is `pohunek plugin select`.
+/// explicit digest carries no catalog origin. A package whose origin this
+/// client does not know counts as official, so the guard stays engaged. Build
+/// metadata does not order versions. Rolling back on purpose is `pohunek plugin select`.
 fn ensure_not_official_downgrade(
     installed: &PackageListResult,
     preview: &PackageInfo,

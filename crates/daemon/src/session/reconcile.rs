@@ -3522,7 +3522,8 @@ impl SessionRegistry {
                 }
                 RuntimeInventoryStatus::Conflict
                 | RuntimeInventoryStatus::IdentityMismatch
-                | RuntimeInventoryStatus::Orphaned => (RuntimeState::Conflict, IDENTITY_MISMATCH),
+                | RuntimeInventoryStatus::Orphaned
+                | RuntimeInventoryStatus::Unknown => (RuntimeState::Conflict, IDENTITY_MISMATCH),
                 RuntimeInventoryStatus::Managed => {
                     (RuntimeState::Reconnecting, "worker_unavailable")
                 }
@@ -3792,7 +3793,7 @@ impl SessionRegistry {
                 RuntimeInventoryStatus::Incompatible => {
                     Some("worker_protocol_incompatible".to_owned())
                 }
-                RuntimeInventoryStatus::IdentityMismatch => {
+                RuntimeInventoryStatus::IdentityMismatch | RuntimeInventoryStatus::Unknown => {
                     Some("runtime_identity_mismatch".to_owned())
                 }
             };

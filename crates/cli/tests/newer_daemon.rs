@@ -43,7 +43,7 @@ fn newer_daemon_line(id: &str, error: ProtocolError, class: &str) -> String {
 /// script, which gets a health result.
 fn run_against_scripted_daemon(
     arguments: &[&str],
-    answer: impl Fn(&Request) -> Option<Result<Value, String>> + Send + 'static,
+    answer: impl Fn(&Request) -> Option<Result<Value, String>> + Send + Sync + 'static,
 ) -> Output {
     run_against_streaming_daemon(arguments, answer, Vec::new())
 }
@@ -53,7 +53,7 @@ fn run_against_scripted_daemon(
 /// that connection.
 fn run_against_streaming_daemon(
     arguments: &[&str],
-    answer: impl Fn(&Request) -> Option<Result<Value, String>> + Send + 'static,
+    answer: impl Fn(&Request) -> Option<Result<Value, String>> + Send + Sync + 'static,
     events: Vec<String>,
 ) -> Output {
     let env = TestEnv::new().expect("private CLI environment");
@@ -64,63 +64,85 @@ fn run_against_streaming_daemon(
     let socket = runtime.join("daemon.sock");
     let listener = UnixListener::bind(&socket).expect("bind daemon socket");
 
-    let server = std::thread::spawn(move || {
-        loop {
-            let (connection, _) = listener.accept().expect("accept a CLI connection");
-            let mut writer = connection.try_clone().expect("clone the connection");
-            let mut served = false;
-            for line in BufReader::new(connection).lines() {
-                let Ok(line) = line else { break };
-                served = true;
-                let request: Request = serde_json::from_str(&line).expect("one request line");
-                if request.method() == protocol::method::SUBSCRIBE {
-                    let ack = serde_json::to_string(
-                        &Response::ok(PROTOCOL_VERSION, request.id(), json!({"subscribed": true}))
-                            .expect("response"),
-                    )
-                    .expect("response line");
-                    writeln!(writer, "{ack}").expect("write the subscription ack");
-                    for event in &events {
-                        writeln!(writer, "{event}").expect("write an event");
-                    }
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answer = std::sync::Arc::new(answer);
+    let events = std::sync::Arc::new(events);
+    let server = {
+        let finished = std::sync::Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            loop {
+                let (connection, _) = listener.accept().expect("accept a CLI connection");
+                if finished.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                let reply = match answer(&request) {
-                    Some(Ok(result)) => serde_json::to_string(
-                        &Response::ok(PROTOCOL_VERSION, request.id(), result).expect("response"),
-                    )
-                    .expect("response line"),
-                    Some(Err(line)) => line,
-                    None => {
-                        let health = json!({
-                            "status": "ok",
-                            "daemon_version": "0.34.2",
-                            "protocol_version": PROTOCOL_VERSION.get(),
-                        });
-                        serde_json::to_string(
-                            &Response::ok(PROTOCOL_VERSION, request.id(), health)
-                                .expect("response"),
-                        )
-                        .expect("response line")
-                    }
-                };
-                writeln!(writer, "{reply}").expect("write the response");
+                let answer = std::sync::Arc::clone(&answer);
+                let events = std::sync::Arc::clone(&events);
+                connections.push(std::thread::spawn(move || {
+                    serve_connection(connection, &*answer, &events);
+                }));
             }
-            // A connection without a request ends the fixture daemon.
-            if !served {
-                break;
+            for connection in connections {
+                connection.join().expect("a fixture connection ends");
             }
-        }
-    });
+        })
+    };
 
     let output = env
         .command(pohunek_test_support::bin_exe("pohunek"))
         .args(arguments)
         .output()
         .expect("run CLI");
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(std::os::unix::net::UnixStream::connect(&socket).expect("end the fixture daemon"));
     server.join().expect("the fixture daemon ends");
     output
+}
+
+/// Serves the requests of one CLI connection until it closes.
+fn serve_connection(
+    connection: std::os::unix::net::UnixStream,
+    answer: &(impl Fn(&Request) -> Option<Result<Value, String>> + ?Sized),
+    events: &[String],
+) {
+    let mut writer = connection.try_clone().expect("clone the connection");
+    for line in BufReader::new(connection).lines() {
+        let Ok(line) = line else { break };
+        let request: Request = serde_json::from_str(&line).expect("one request line");
+        if request.method() == protocol::method::SUBSCRIBE {
+            let ack = serde_json::to_string(
+                &Response::ok(PROTOCOL_VERSION, request.id(), json!({"subscribed": true}))
+                    .expect("response"),
+            )
+            .expect("response line");
+            writeln!(writer, "{ack}").expect("write the subscription ack");
+            for event in events {
+                writeln!(writer, "{event}").expect("write an event");
+            }
+            break;
+        }
+        let reply = match answer(&request) {
+            Some(Ok(result)) => serde_json::to_string(
+                &Response::ok(PROTOCOL_VERSION, request.id(), result).expect("response"),
+            )
+            .expect("response line"),
+            Some(Err(line)) => line,
+            None => {
+                let health = json!({
+                    "status": "ok",
+                    "daemon_version": "0.34.2",
+                    "protocol_version": PROTOCOL_VERSION.get(),
+                });
+                serde_json::to_string(
+                    &Response::ok(PROTOCOL_VERSION, request.id(), health).expect("response"),
+                )
+                .expect("response line")
+            }
+        };
+        if writeln!(writer, "{reply}").is_err() {
+            break;
+        }
+    }
 }
 
 /// Runs `pohunek notifications list` with `extra` arguments against a scripted
@@ -684,4 +706,229 @@ fn stop_and_remove_refuse_a_session_with_an_unknown_runtime_state_without_a_requ
             "{operation}: no lifecycle request is sent: {methods:?}"
         );
     }
+}
+
+/// Answers each `(method, result)` pair; every other method gets a health result.
+fn results_daemon(
+    results: Vec<(&'static str, Value)>,
+) -> impl Fn(&Request) -> Option<Result<Value, String>> {
+    move |request| {
+        results
+            .iter()
+            .find(|(method, _)| *method == request.method())
+            .map(|(_, result)| Ok(result.clone()))
+    }
+}
+
+fn plain_session() -> Value {
+    json!({
+        "id": "s-1",
+        "agent": "shell",
+        "agent_base": "shell",
+        "cwd": "/workspace/project",
+        "pid": 4242,
+        "cols": 120,
+        "rows": 40,
+        "state": "running",
+        "state_source": "process",
+        "created_at": "2026-06-17T10:00:00Z",
+        "updated_at": "2026-06-17T10:01:00Z",
+    })
+}
+
+#[test]
+fn a_session_wait_reason_from_a_newer_daemon_exits_non_zero_with_a_defined_error() {
+    let output = run_against_scripted_daemon(
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "--state",
+            "running",
+            "--timeout-ms",
+            "1000",
+            "--json",
+        ],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_WAIT,
+                json!({"reason": "a_reason_from_a_newer_daemon", "session": plain_session()}),
+            ),
+        ]),
+    );
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(
+        document["err"]["code"], "session_wait_reason_unknown",
+        "{document}"
+    );
+    assert!(document.get("ok").is_none(), "{document}");
+}
+
+#[test]
+fn a_turn_wait_reason_from_a_newer_daemon_shows_unknown_and_keeps_the_cursor() {
+    let output = run_against_scripted_daemon(
+        &["session", "wait", "s-1", "--json"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_WAIT_TURN,
+                json!({
+                    "reason": "a_reason_from_a_newer_daemon",
+                    "cursor": "cursor-after-newer-reason",
+                    "progress": [],
+                }),
+            ),
+        ]),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(document["ok"]["reason"], "unknown", "{document}");
+    assert_eq!(
+        document["ok"]["cursor"], "cursor-after-newer-reason",
+        "{document}"
+    );
+}
+
+#[test]
+fn a_retention_hold_and_reason_from_a_newer_daemon_show_unknown_and_never_free_to_remove() {
+    let result = json!({
+        "dry_run": true,
+        "examined": 1,
+        "eligible": 0,
+        "held": 1,
+        "removed": 0,
+        "worktrees_cleaned": 0,
+        "worktrees_failed": 0,
+        "failed": 0,
+        "sessions": [{
+            "session_id": "s-1",
+            "reason": "a_reason_from_a_newer_daemon",
+            "age_secs": 90,
+            "hold": "a_hold_from_a_newer_daemon",
+            "removed": false,
+        }],
+    });
+    let human = run_against_scripted_daemon(
+        &["session", "retention", "sweep", "--dry-run"],
+        single_result_daemon(protocol::method::SESSION_RETENTION_SWEEP, result.clone()),
+    );
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.contains("reason=unknown"), "{stdout}");
+    assert!(
+        stdout.contains("hold=unknown"),
+        "an unknown hold is never shown as free to remove (`-`): {stdout}"
+    );
+
+    let json_output = run_against_scripted_daemon(
+        &["session", "retention", "sweep", "--dry-run", "--json"],
+        single_result_daemon(protocol::method::SESSION_RETENTION_SWEEP, result),
+    );
+    let document: Value = serde_json::from_slice(&json_output.stdout).expect("one JSON document");
+    assert_eq!(
+        document["ok"]["sessions"][0]["hold"], "unknown",
+        "{document}"
+    );
+}
+
+#[test]
+fn detection_regions_and_inventory_status_from_a_newer_daemon_are_dropped_or_shown_unknown() {
+    let detection = run_against_scripted_daemon(
+        &["session", "detection", "s-1", "--json"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_DETECTION,
+                json!({
+                    "session_id": "s-1",
+                    "supported_regions": ["osc_title", "a_region_from_a_newer_daemon"],
+                    "previews": [{
+                        "kind": "a_region_from_a_newer_daemon",
+                        "region": "future_region",
+                        "text": "preview",
+                    }],
+                }),
+            ),
+        ]),
+    );
+    assert_eq!(detection.status.code(), Some(0), "{detection:?}");
+    let document: Value = serde_json::from_slice(&detection.stdout).expect("one JSON document");
+    assert_eq!(
+        document["ok"]["supported_regions"],
+        json!(["osc_title"]),
+        "{document}"
+    );
+    assert_eq!(
+        document["ok"]["previews"][0]["kind"], "unknown",
+        "{document}"
+    );
+
+    let inventory = run_against_scripted_daemon(
+        &["session", "runtime-inventory", "--json"],
+        single_result_daemon(
+            protocol::method::SESSION_RUNTIME_INVENTORY,
+            json!({"entries": [{
+                "runtime_slot": "slot-1",
+                "status": "a_status_from_a_newer_daemon",
+            }]}),
+        ),
+    );
+    assert_eq!(inventory.status.code(), Some(0), "{inventory:?}");
+    let document: Value = serde_json::from_slice(&inventory.stdout).expect("one JSON document");
+    assert_eq!(
+        document["ok"]["entries"][0]["status"], "unknown",
+        "{document}"
+    );
+}
+
+#[test]
+fn a_read_source_from_a_newer_daemon_shows_unknown() {
+    let output = run_against_scripted_daemon(
+        &["session", "read", "s-1", "--json"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_READ,
+                json!({
+                    "text": "hello",
+                    "source_used": "a_source_from_a_newer_daemon",
+                    "worker_instance_id": "runtime-1",
+                    "runtime_generation": "1",
+                    "revision": "1",
+                    "alternate_screen": false,
+                    "lines_requested": 10,
+                    "truncated": false,
+                }),
+            ),
+        ]),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(document["ok"]["source_used"], "unknown", "{document}");
+
+    let human = run_against_scripted_daemon(
+        &["session", "read", "s-1"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_READ,
+                json!({
+                    "text": "hello",
+                    "source_used": "a_source_from_a_newer_daemon",
+                    "worker_instance_id": "runtime-1",
+                    "runtime_generation": "1",
+                    "revision": "1",
+                    "alternate_screen": false,
+                    "lines_requested": 10,
+                    "truncated": false,
+                }),
+            ),
+        ]),
+    );
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
 }

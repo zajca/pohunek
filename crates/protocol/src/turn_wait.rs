@@ -263,7 +263,7 @@ fn has_duplicate<T: PartialEq>(values: &[T]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitTurnReason.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SessionWaitTurnReason {
     /// A selected turn event newer than the cursor was recorded.
     Event,
@@ -274,7 +274,16 @@ pub enum SessionWaitTurnReason {
     CursorReset,
     /// Every target is in a terminal state and none has a newer selected event.
     TargetsEnded,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SessionWaitTurnReason);
 
 /// One recorded turn event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
