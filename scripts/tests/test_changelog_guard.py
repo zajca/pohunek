@@ -105,22 +105,56 @@ class DocumentedBehaviorChange(GuardScenarios):
         self.commit("behavior change with its fragment")
         self.assert_passes(self.guard())
 
-    def test_a_renamed_changelog_fragment_counts_as_present(self):
-        self.write("changelog.d/7-old-name.md", FRAGMENT)
-        self.commit("fragment on main")
+    def merge_to_main(self):
         self.git("checkout", "-q", "main")
         self.git("merge", "-q", "--ff-only", "pr")
+
+    def test_a_renamed_changelog_fragment_does_not_count_as_a_new_entry(self):
+        self.write("changelog.d/7-old-name.md", FRAGMENT)
+        self.commit("fragment on main")
+        self.merge_to_main()
         self.git("checkout", "-q", "-b", "pr2")
         self.git("mv", "changelog.d/7-old-name.md", "changelog.d/7-new-name.md")
         self.write("docs/cli.md", "cli, changed\n")
         self.commit("rename and change")
+        self.assertEqual(self.guard().returncode, 1)
+
+    def test_an_edited_existing_changelog_fragment_does_not_count_as_a_new_entry(self):
+        self.write("changelog.d/7-old.md", FRAGMENT)
+        self.commit("fragment on main")
+        self.merge_to_main()
+        self.git("checkout", "-q", "-b", "pr2")
+        self.write("changelog.d/7-old.md", FRAGMENT + "More text.\n")
+        self.write("docs/cli.md", "cli, changed\n")
+        self.commit("edit the fragment and the docs")
+        self.assertEqual(self.guard().returncode, 1)
+
+    def test_a_file_renamed_into_a_trigger_path_is_a_trigger(self):
+        self.write("notes/thing.md", "A longer note so that git detects the rename. " * 20)
+        self.commit("note on main")
+        self.merge_to_main()
+        self.git("checkout", "-q", "-b", "pr2")
+        (self.repo / "docs/knowledge/log.d").mkdir(parents=True)
+        self.git("mv", "notes/thing.md", "docs/knowledge/log.d/7-thing.md")
+        self.commit("move the note into the knowledge log")
+        result = self.guard()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("docs/knowledge/log.d/7-thing.md", result.stderr)
+
+    def test_a_file_renamed_into_changelog_d_counts_as_a_new_entry(self):
+        self.write("notes/thing.md", FRAGMENT * 5)
+        self.commit("note on main")
+        self.merge_to_main()
+        self.git("checkout", "-q", "-b", "pr2")
+        self.git("mv", "notes/thing.md", "changelog.d/7-thing.md")
+        self.write("docs/cli.md", "cli, changed\n")
+        self.commit("move the note in as a fragment")
         self.assert_passes(self.guard())
 
     def test_a_deleted_fragment_does_not_satisfy_the_guard(self):
         self.write("changelog.d/7-old.md", FRAGMENT)
         self.commit("fragment on main")
-        self.git("checkout", "-q", "main")
-        self.git("merge", "-q", "--ff-only", "pr")
+        self.merge_to_main()
         self.git("checkout", "-q", "-b", "pr2")
         self.git("rm", "-q", "changelog.d/7-old.md")
         self.write("docs/cli.md", "cli, changed\n")
@@ -146,8 +180,7 @@ class DocumentedBehaviorChange(GuardScenarios):
     def test_a_release_commit_that_removes_log_fragments_is_not_a_trigger(self):
         self.write("docs/knowledge/log.d/7-thing.md", LOG_FRAGMENT)
         self.commit("fragment on main")
-        self.git("checkout", "-q", "main")
-        self.git("merge", "-q", "--ff-only", "pr")
+        self.merge_to_main()
         self.git("checkout", "-q", "-b", "release")
         self.git("rm", "-q", "docs/knowledge/log.d/7-thing.md")
         self.commit("Release v1.0.0")

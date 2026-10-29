@@ -129,7 +129,8 @@ passed, and a failing, cancelled or still pending check does not.
   `pinned Hermes compatibility (macOS arm64, model-free)`.
 - These jobs decide the pull request by their own result, outside the
   verdict: `docs check (schema + drift + source-map + runbooks + secrets +
-  release)`, `package version bump`, `runtime package selection` with
+  release)`, `changelog fragment or no-changelog label` (workflow
+  `Changelog guard`), `package version bump`, `runtime package selection` with
   `pinned Hermes compatibility (model-free)` and the Pi, Codex and Claude Code
   runtime package jobs, `real systemd supervision`, and the paths-filtered
   `TS binding drift (xs check)`, `upgrade from the previous release`,
@@ -563,8 +564,9 @@ change; a pull request with none carries the `no-changelog` label.
 The `Changelog guard` workflow (`.github/workflows/changelog-guard.yml`)
 enforces this for the changes that document a behavior: a pull request that adds
 or edits a knowledge-log fragment (`docs/knowledge/log.d/*.md`) or `docs/cli.md`
-fails unless it adds a `changelog.d/` fragment, edits `CHANGELOG.md`, or carries
-the `no-changelog` label. Adding or removing the label re-runs only that
+fails unless it adds a new `changelog.d/` fragment (a fragment only edited or
+renamed does not count), edits `CHANGELOG.md`, or carries the `no-changelog`
+label. Adding or removing the label re-runs only that
 workflow. The trigger paths and the label name are the `guard` key of
 `.github/changelog.json`; `scripts/changelog guard --base REV [--head REV]
 [--labels-json JSON]` runs the same check locally.

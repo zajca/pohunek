@@ -368,8 +368,8 @@ def check(root: Path, layout: Layout) -> int:
     return 0
 
 
-def changed_paths(root: Path, base: str, head: str) -> list[tuple[str, str]]:
-    """The (status letter, path) pairs a pull request changes since its merge base."""
+def changed_paths(root: Path, base: str, head: str) -> list[tuple[str, str, str | None]]:
+    """The (status letter, path, source path of a rename or copy) triples a pull request changes since its merge base."""
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "diff", "--name-status", "--find-renames", "-z", f"{base}...{head}"],
@@ -381,32 +381,39 @@ def changed_paths(root: Path, base: str, head: str) -> list[tuple[str, str]]:
     fields = result.stdout.decode("utf-8").split("\0")
     if fields and fields[-1] == "":
         fields.pop()
-    changes: list[tuple[str, str]] = []
+    changes: list[tuple[str, str, str | None]] = []
     index = 0
     while index < len(fields):
         status = fields[index][0]
         if status in ("R", "C"):
-            changes.append((status, fields[index + 2]))
+            changes.append((status, fields[index + 2], fields[index + 1]))
             index += 3
         else:
-            changes.append((status, fields[index + 1]))
+            changes.append((status, fields[index + 1], None))
             index += 2
     return changes
 
 
-def guard_changes(layout: Layout, changes: list[tuple[str, str]], labels: list[str]) -> list[str]:
+def is_fragment_path(path: str) -> bool:
+    directory, _, name = path.rpartition("/")
+    return directory == FRAGMENT_DIR and FRAGMENT_NAME.fullmatch(name) is not None
+
+
+def guard_changes(layout: Layout, changes: list[tuple[str, str, str | None]], labels: list[str]) -> list[str]:
     """Problems with a pull request that changes a documented behavior unrecorded; empty when fine."""
     guard = layout.guard
     if guard is None:
         raise ChangelogError(f"{CONFIG_IN_TREE}: declare guard (label and triggers) to use the guard")
-    present = [path for status, path in changes if status != "D"]
+    present = [path for status, path, _ in changes if status != "D"]
     triggered = [path for path in present if any(fnmatch.fnmatchcase(path, pattern) for pattern in guard.triggers)]
     if not triggered or guard.label in labels:
         return []
     changelog_files = {layout.changelog} if layout.changelog is not None else set(layout.surfaces.values())
-    for path in present:
-        directory, _, name = path.rpartition("/")
-        if (directory == FRAGMENT_DIR and FRAGMENT_NAME.fullmatch(name)) or path in changelog_files:
+    for status, path, source in changes:
+        # A fragment counts when the pull request creates it; an edit of an
+        # existing fragment, or a rename of one, records nothing new.
+        created = status == "A" or (status in ("R", "C") and not (source and is_fragment_path(source)))
+        if (created and is_fragment_path(path)) or (status != "D" and path in changelog_files):
             return []
     listed = "\n".join(f"  {path}" for path in triggered)
     return [
