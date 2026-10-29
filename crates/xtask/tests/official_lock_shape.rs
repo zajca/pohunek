@@ -70,6 +70,8 @@ impl Repo {
         let repo = Self {
             env: TestEnv::new().expect("hermetic test environment"),
         };
+        // Marks the fixture as a checkout, which the xtask binary requires.
+        repo.write("crates/xtask/Cargo.toml", b"");
         let workspace = pohunek_test_support::workspace_root();
         let mut rows = Vec::new();
         for runtime in runtimes {

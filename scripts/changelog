@@ -12,6 +12,7 @@ Usage:
   scripts/changelog check
   scripts/changelog fold VERSION [--surface SURFACE] [--date YYYY-MM-DD]
   scripts/changelog notes VERSION [--surface SURFACE]
+  scripts/changelog guard --base REV [--head REV] [--labels-json JSON]
 
 `--root` names another repository tree and defaults to the one holding this script.
 """
@@ -20,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fnmatch
 import json
+import subprocess
 import re
 import sys
 from dataclasses import dataclass
@@ -49,12 +52,26 @@ class ChangelogError(Exception):
 
 
 @dataclass(frozen=True)
+class Guard:
+    """What a pull request must carry when it changes a documented behavior.
+
+    `triggers` are path patterns (`*` also matches `/`); a pull request that adds
+    or edits a matching file needs a changelog fragment, or `label` to say that
+    the change has no user-visible effect.
+    """
+
+    label: str
+    triggers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Layout:
     """The changelog files of a repository, from `.github/changelog.json`."""
 
     repository: str
     changelog: str | None
     surfaces: dict[str, str]
+    guard: Guard | None = None
 
     def surface_for(self, surface: str | None) -> str | None:
         """Checks the --surface argument against the layout and returns it."""
@@ -102,25 +119,42 @@ def load_layout(root: Path) -> Layout:
         data = json.loads(read_text(root / CONFIG_IN_TREE, label))
     except json.JSONDecodeError as error:
         raise ChangelogError(f"{label}: not valid JSON: {error.msg}") from error
-    if not isinstance(data, dict) or not set(data) <= {"repository", "changelog", "surfaces"}:
-        raise ChangelogError(f"{label}: expected an object with repository, changelog and surfaces only")
+    if not isinstance(data, dict) or not set(data) <= {"repository", "changelog", "surfaces", "guard"}:
+        raise ChangelogError(f"{label}: expected an object with repository, changelog, surfaces and guard only")
     repository = data.get("repository")
     if not isinstance(repository, str) or REPOSITORY.fullmatch(repository) is None:
         raise ChangelogError(f"{label}: repository must be OWNER/REPO")
     changelog = data.get("changelog")
     surfaces = data.get("surfaces")
+    guard = load_guard(data["guard"], label) if "guard" in data else None
     if (changelog is None) == (surfaces is None):
         raise ChangelogError(f"{label}: declare exactly one of changelog and surfaces")
     if changelog is not None:
         if not isinstance(changelog, str):
             raise ChangelogError(f"{label}: changelog must be a path")
-        return Layout(repository, changelog, {})
+        return Layout(repository, changelog, {}, guard)
     if not isinstance(surfaces, dict) or not surfaces:
         raise ChangelogError(f"{label}: surfaces must map at least one name to a changelog path")
     for name, path in surfaces.items():
         if SURFACE_NAME.fullmatch(name) is None or not isinstance(path, str):
             raise ChangelogError(f"{label}: surface {name!r} needs a lowercase name and a changelog path")
-    return Layout(repository, None, dict(surfaces))
+    return Layout(repository, None, dict(surfaces), guard)
+
+
+def load_guard(data: object, label: str) -> Guard:
+    if not isinstance(data, dict) or set(data) != {"label", "triggers"}:
+        raise ChangelogError(f"{label}: guard must be an object with label and triggers")
+    guard_label = data["label"]
+    triggers = data["triggers"]
+    if not isinstance(guard_label, str) or not guard_label:
+        raise ChangelogError(f"{label}: guard.label must be a non-empty label name")
+    if (
+        not isinstance(triggers, list)
+        or not triggers
+        or not all(isinstance(pattern, str) and pattern for pattern in triggers)
+    ):
+        raise ChangelogError(f"{label}: guard.triggers must list at least one path pattern")
+    return Guard(guard_label, tuple(triggers))
 
 
 def parse_fragment(path: Path, surfaces: frozenset[str] | None) -> Fragment:
@@ -334,6 +368,76 @@ def check(root: Path, layout: Layout) -> int:
     return 0
 
 
+def changed_paths(root: Path, base: str, head: str) -> list[tuple[str, str, str | None]]:
+    """The (status letter, path, source path of a rename or copy) triples a pull request changes since its merge base."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "diff", "--name-status", "--find-renames", "-z", f"{base}...{head}"],
+            check=True, capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = error.stderr.decode("utf-8", "replace").strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        raise ChangelogError(f"cannot diff {base}...{head} (is the history complete?): {detail}") from error
+    fields = result.stdout.decode("utf-8").split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    changes: list[tuple[str, str, str | None]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index][0]
+        if status in ("R", "C"):
+            changes.append((status, fields[index + 2], fields[index + 1]))
+            index += 3
+        else:
+            changes.append((status, fields[index + 1], None))
+            index += 2
+    return changes
+
+
+def is_fragment_path(path: str) -> bool:
+    directory, _, name = path.rpartition("/")
+    return directory == FRAGMENT_DIR and FRAGMENT_NAME.fullmatch(name) is not None
+
+
+def guard_changes(layout: Layout, changes: list[tuple[str, str, str | None]], labels: list[str]) -> list[str]:
+    """Problems with a pull request that changes a documented behavior unrecorded; empty when fine."""
+    guard = layout.guard
+    if guard is None:
+        raise ChangelogError(f"{CONFIG_IN_TREE}: declare guard (label and triggers) to use the guard")
+    present = [path for status, path, _ in changes if status != "D"]
+    triggered = [path for path in present if any(fnmatch.fnmatchcase(path, pattern) for pattern in guard.triggers)]
+    if not triggered or guard.label in labels:
+        return []
+    changelog_files = {layout.changelog} if layout.changelog is not None else set(layout.surfaces.values())
+    for status, path, source in changes:
+        # A fragment counts when the pull request creates it; an edit of an
+        # existing fragment, or a rename of one, records nothing new.
+        created = status == "A" or (status in ("R", "C") and not (source and is_fragment_path(source)))
+        if (created and is_fragment_path(path)) or (status != "D" and path in changelog_files):
+            return []
+    listed = "\n".join(f"  {path}" for path in triggered)
+    return [
+        "this change edits documented behavior but records no changelog entry:\n"
+        f"{listed}\n"
+        f"Add {FRAGMENT_DIR}/<issue>-<slug>.md (see docs/development.md, \"Changelog\"), "
+        f"or, when the change has no user-visible effect, add the {guard.label!r} label to the pull request."
+    ]
+
+
+def guard(root: Path, layout: Layout, base: str, head: str, labels_json: str) -> int:
+    try:
+        labels = json.loads(labels_json)
+    except json.JSONDecodeError as error:
+        raise ChangelogError(f"--labels-json: not valid JSON: {error.msg}") from error
+    if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+        raise ChangelogError("--labels-json: expected a JSON array of label names")
+    problems = guard_changes(layout, changed_paths(root, base, head), labels)
+    if problems:
+        return fail(problems)
+    print("changelog guard: ok")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -346,6 +450,10 @@ def build_parser() -> argparse.ArgumentParser:
     notes_parser = commands.add_parser("notes", help="print the release notes block of a version")
     notes_parser.add_argument("version")
     notes_parser.add_argument("--surface")
+    guard_parser = commands.add_parser("guard", help="require a fragment or the exemption label for a documented behavior change")
+    guard_parser.add_argument("--base", required=True, help="the pull request's base revision")
+    guard_parser.add_argument("--head", default="HEAD", help="the pull request's head revision")
+    guard_parser.add_argument("--labels-json", default="[]", help="JSON array of the pull request's label names")
     return parser
 
 
@@ -356,6 +464,8 @@ def main(argv: list[str]) -> int:
         layout = load_layout(root)
         if args.command == "check":
             return check(root, layout)
+        if args.command == "guard":
+            return guard(root, layout, args.base, args.head, args.labels_json)
         version = getattr(args, "version", None)
         if version is not None and VERSION.fullmatch(version) is None:
             raise ChangelogError(f"not a version: {version!r}")

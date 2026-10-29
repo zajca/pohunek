@@ -202,6 +202,8 @@ impl Fixture {
         fixture.git(&["init", "--quiet", "--initial-branch=main"]);
         fixture.git(&["config", "user.email", "test@example.invalid"]);
         fixture.git(&["config", "user.name", "test"]);
+        // Marks the fixture as a checkout, which the xtask binary requires.
+        fixture.write("crates/xtask/Cargo.toml", "");
         fixture.write("README.md", "# fixture\n");
         fixture.write("compat/matrix.json", &matrix(&PACKAGES, SUITE_VERSION));
         for name in PACKAGES {

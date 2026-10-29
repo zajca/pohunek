@@ -345,6 +345,7 @@ pub fn check_docs(
     source_dir: impl AsRef<Path>,
     output_root: impl AsRef<Path>,
 ) -> Result<bool, XtaskError> {
+    ensure_checkout()?;
     checks::check_docs(source_dir, output_root)
 }
 
@@ -374,6 +375,7 @@ where
     let command = XtaskCommand::try_parse_from(parsed_args)
         .map_err(|error| XtaskError::Usage(error.to_string()))?;
 
+    ensure_checkout()?;
     let root = repo_root();
     match command.command {
         TopCommand::Eval => {
@@ -921,14 +923,54 @@ fn repo_root() -> PathBuf {
     pohunek_test_support::workspace_root()
 }
 
-/// Root of the checkout the tool runs in.
+/// Under test the checkout is the workspace of the test run.
+#[cfg(test)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches the run-time variant, which can refuse the working directory"
+)]
+fn ensure_checkout() -> Result<(), XtaskError> {
+    Ok(())
+}
+
+/// Manifest whose presence marks the root of a checkout this tool belongs to.
+#[cfg(not(test))]
+const XTASK_MANIFEST: &str = "crates/xtask/Cargo.toml";
+
+/// The nearest ancestor of the working directory that holds the xtask manifest.
+#[cfg(not(test))]
+fn find_checkout() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cwd.ancestors()
+        .find(|directory| directory.join(XTASK_MANIFEST).is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Refuses a working directory outside every checkout.
+///
+/// The root is resolved at run time. A binary built in one checkout and reused
+/// from another through a shared `CARGO_TARGET_DIR` would otherwise act on the
+/// checkout that compiled it.
+#[cfg(not(test))]
+fn ensure_checkout() -> Result<(), XtaskError> {
+    if find_checkout().is_some() {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().map_err(|source| XtaskError::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    Err(XtaskError::Usage(format!(
+        "the working directory {} is not inside a pohunek checkout (no ancestor holds {XTASK_MANIFEST})",
+        cwd.display()
+    )))
+}
+
+/// Root of the checkout the tool runs in; `ensure_checkout` has accepted the
+/// working directory by the time a command asks.
 #[cfg(not(test))]
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("xtask crate lives under crates/xtask")
-        .to_path_buf()
+    find_checkout().expect("ensure_checkout accepted the working directory")
 }
 
 fn collect_files(root: &Path) -> Result<Vec<FileEntry>, XtaskError> {

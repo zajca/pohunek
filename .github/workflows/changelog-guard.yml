@@ -1,0 +1,45 @@
+# A pull request that edits documented behavior records a changelog fragment, or
+# carries the exemption label named by `guard` in .github/changelog.json. A small
+# workflow of its own, so adding or removing the label re-runs only this check
+# and not the full CI.
+name: Changelog guard
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: changelog-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # A Python script never imports from its own directory or the working
+  # directory, so a file a pull request adds there cannot shadow a module.
+  PYTHONSAFEPATH: "1"
+
+jobs:
+  guard:
+    name: changelog fragment or no-changelog label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The merge base of the pull request and its base commit needs history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the fragments
+        run: python3 scripts/changelog check
+
+      # The base commit and the labels come through the environment, never
+      # interpolated into the script.
+      - name: Require a fragment or the exemption label
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: python3 scripts/changelog guard --base "$BASE_SHA" --head "$HEAD_SHA" --labels-json "$LABELS"

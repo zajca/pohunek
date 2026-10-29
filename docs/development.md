@@ -129,7 +129,8 @@ passed, and a failing, cancelled or still pending check does not.
   `pinned Hermes compatibility (macOS arm64, model-free)`.
 - These jobs decide the pull request by their own result, outside the
   verdict: `docs check (schema + drift + source-map + runbooks + secrets +
-  release)`, `package version bump`, `runtime package selection` with
+  release)`, `changelog fragment or no-changelog label` (workflow
+  `Changelog guard`), `package version bump`, `runtime package selection` with
   `pinned Hermes compatibility (model-free)` and the Pi, Codex and Claude Code
   runtime package jobs, `real systemd supervision`, and the paths-filtered
   `TS binding drift (xs check)`, `upgrade from the previous release`,
@@ -559,6 +560,28 @@ so it never waits for the bundle) runs them with
 User-facing changes are recorded as fragments, not in the knowledge log. A pull
 request with a user-visible effect adds one `changelog.d/<issue>-<slug>.md` per
 change; a pull request with none carries the `no-changelog` label.
+
+The `Changelog guard` workflow (`.github/workflows/changelog-guard.yml`)
+enforces this for the changes that document a behavior: a pull request that adds
+or edits a knowledge-log fragment (`docs/knowledge/log.d/*.md`), `docs/cli.md`,
+or `docs/public-api.md` fails unless it adds a new
+`changelog.d/` fragment (a fragment only edited or renamed does not count),
+edits `CHANGELOG.md`, or carries the `no-changelog` label. Adding or removing the
+label re-runs only that workflow. The trigger paths and the label name are the
+`guard` key of `.github/changelog.json`; `scripts/changelog guard --base REV
+[--head REV] [--labels-json JSON]` runs the same check locally.
+
+The guard is advisory. It runs on `pull_request` with the scripts and the
+`guard` configuration of the pull request head (never `pull_request_target`, so a
+pull request from a fork gets no write token or secret), which means a pull
+request can change its own guard configuration, and anyone who can label a pull
+request can bypass it. It catches a forgotten fragment; review decides whether
+the change needs one.
+
+A pull request that is opened with a label, or labeled right after opening,
+starts one run per event. The concurrency group of the workflow cancels the
+earlier run, so the pull request shows one cancelled run next to the run that
+decides; the run of the last event is always the one that survives.
 
 A fragment starts with a header and then one paragraph written for users:
 
