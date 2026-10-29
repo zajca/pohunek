@@ -106,7 +106,7 @@ class RowMatrixTests(unittest.TestCase):
             {
                 "include": [
                     {
-                        "runner": "ubuntu-latest",
+                        "runner": "ubuntu-24.04",
                         "os": "linux",
                         "daemon_pattern": "build-daemon-*",
                         "rows": "alpha:x86_64-unknown-linux-gnu alpha:x86_64-unknown-linux-musl beta:x86_64-unknown-linux-gnu",
@@ -134,7 +134,7 @@ class RowMatrixTests(unittest.TestCase):
         result = run("row-matrix", self.matrix(rows), "x86_64-unknown-linux-musl")
         self.assertEqual(result.returncode, 0, result.stderr)
         entries = {entry["runner"]: entry for entry in json.loads(result.stdout)["include"]}
-        self.assertEqual(entries["ubuntu-latest"]["rows"], "alpha:x86_64-unknown-linux-musl")
+        self.assertEqual(entries["ubuntu-24.04"]["rows"], "alpha:x86_64-unknown-linux-musl")
         # The macOS job still builds the consumer that the macOS smoke runs.
         self.assertEqual(entries["macos-15"]["rows"], "")
         self.assertNotEqual(run("row-matrix", self.matrix(rows), "riscv64gc-unknown-linux-gnu").returncode, 0)

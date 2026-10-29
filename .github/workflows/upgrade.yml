@@ -26,6 +26,7 @@ name: Upgrade test
 #   `head_ref` is a branch, tag or commit of this repository, never a fork
 #   head (`refs/pull/<N>/head` or a fork commit).
 
+# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
 on:
   workflow_dispatch:
     inputs:
@@ -62,7 +63,7 @@ env:
 jobs:
   upgrade:
     name: upgrade from the previous release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       GH_TOKEN: ${{ github.token }}

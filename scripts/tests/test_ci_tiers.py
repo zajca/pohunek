@@ -1530,7 +1530,7 @@ exit 0
 
 
 def resolve_runner_tool(name: str) -> str:
-    """Resolve a tool that the workflow step runs on ubuntu-latest (GNU coreutils).
+    """Resolve a tool that the workflow step runs on ubuntu-24.04 (GNU coreutils).
 
     Symlinks the tool into a test bin directory so it's available in the
     restricted PATH. On Linux this finds the real tool; on macOS the test
@@ -1539,7 +1539,7 @@ def resolve_runner_tool(name: str) -> str:
     tool_path = shutil.which(name)
     if tool_path is None:
         raise AssertionError(
-            f"{name} is required: the workflow step runs it on ubuntu-latest (GNU coreutils)"
+            f"{name} is required: the workflow step runs it on ubuntu-24.04 (GNU coreutils)"
         )
     return tool_path
 

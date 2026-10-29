@@ -20,6 +20,7 @@ name: Release build
 # packaging/runtime-catalog-anchor.json in the job's own ephemeral checkout, so
 # the archives and the rehearsal's throwaway signing key agree. The production
 # anchor is never changed, and a rehearsal bundle is never published.
+# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
 on:
   workflow_call:
     inputs:
@@ -51,7 +52,7 @@ env:
 jobs:
   meta:
     name: Resolve the release version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -83,7 +84,7 @@ jobs:
   binaries:
     name: Build ${{ matrix.target }} (${{ matrix.components }})
     needs: [meta]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     permissions:
@@ -297,7 +298,7 @@ jobs:
   packages:
     name: Build the runtime package archives and the SDK tarballs
     needs: [meta]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read

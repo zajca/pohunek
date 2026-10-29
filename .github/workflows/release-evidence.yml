@@ -47,6 +47,7 @@ name: Release evidence
 #
 # The calling job must grant `id-token: write` and `attestations: write` even
 # for a rehearsal: a called workflow cannot hold a scope its caller lacks.
+# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
 on:
   workflow_call:
     inputs:
@@ -87,7 +88,7 @@ env:
 jobs:
   plan:
     name: Plan the compatibility rows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -276,7 +277,7 @@ jobs:
     name: Attest the producer artifacts
     if: ${{ inputs.mode == 'release' }}
     needs: [rows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -346,7 +347,7 @@ jobs:
     name: Assemble and sign the release bundle
     if: ${{ inputs.mode == 'release' }}
     needs: [rows, attest]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
     permissions:
@@ -435,7 +436,7 @@ jobs:
     name: Assemble the rehearsal bundle
     if: ${{ inputs.mode == 'rehearsal' }}
     needs: [rows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -519,7 +520,7 @@ jobs:
     name: Attest the release bundle
     if: ${{ inputs.mode == 'release' }}
     needs: [assemble]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -578,7 +579,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             smoke_target: ""
           - os: macos-15
             smoke_target: aarch64-apple-darwin
@@ -664,7 +665,7 @@ jobs:
     name: Evidence verdict
     if: ${{ always() }}
     needs: [plan, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke, smoke-scenarios]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:

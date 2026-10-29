@@ -626,7 +626,7 @@ assembles and publishes the release in one fixed flow:
    both macOS components in one job. No macOS job uses secrets or a protected
    environment.
 2. **Evidence** (`release-evidence.yml`, reusable): one job per runner
-   (`Rows on ubuntu-latest`, `Rows on macos-15`) builds the release consumer
+   (`Rows on ubuntu-24.04`, `Rows on macos-15`) builds the release consumer
    executable once, uploads it for the smoke, then runs the runner's
    (runtime x target) rows of `compat/matrix.json` in sequence through
    `scripts/release-workflow/run-rows`. Each row extracts the binaries from the

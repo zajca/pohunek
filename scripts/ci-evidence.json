@@ -81,11 +81,11 @@
       "release rehearsal (build) / Build x86_64-unknown-linux-musl (cli daemon)",
       "release rehearsal (build) / Build and sign cli and daemon for aarch64-apple-darwin (rehearsal)",
       "release rehearsal (evidence, assembly, archive smoke) / Plan the compatibility rows",
-      "release rehearsal (evidence, assembly, archive smoke) / Rows on ubuntu-latest",
+      "release rehearsal (evidence, assembly, archive smoke) / Rows on ubuntu-24.04",
       "release rehearsal (evidence, assembly, archive smoke) / Rows on macos-15",
       "release rehearsal (evidence, assembly, archive smoke) / Assemble the rehearsal bundle",
       "release rehearsal (archive smoke scenarios) / Archive smoke scenarios (network-isolated, macos-15)",
-      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
+      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-24.04)",
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",
       "tests (relay DB, PostgreSQL)"

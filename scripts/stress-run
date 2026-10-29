@@ -63,7 +63,7 @@ import subprocess
 import sys
 import time
 
-# CI's Linux test jobs run on `ubuntu-latest`, 4 vCPUs for a public
+# CI's Linux test jobs run on `ubuntu-24.04`, 4 vCPUs for a public
 # repository, with 4 test threads; pinning to the same count reproduces that
 # contention without loading the rest of the host.
 DEFAULT_CPUS = 4

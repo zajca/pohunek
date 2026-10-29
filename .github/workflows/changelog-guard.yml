@@ -4,6 +4,7 @@
 # and not the full CI.
 name: Changelog guard
 
+# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
 on:
   pull_request:
     types: [opened, reopened, synchronize, labeled, unlabeled]
@@ -22,7 +23,7 @@ env:
 jobs:
   guard:
     name: changelog fragment or no-changelog label
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
