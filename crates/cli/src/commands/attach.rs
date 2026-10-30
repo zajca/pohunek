@@ -48,6 +48,9 @@ const SHORTCUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 /// close can be read before the reply. The wait only bridges that ordering gap;
 /// when it elapses the close is handled as an ordinary stream loss.
 const MENU_TASK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for the terminal to take queued output before the terminal
+/// leaves raw mode; a stuck terminal must not hold back a detach or stop.
+const OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Selective terminal reset emitted whenever raw attach passthrough ends.
 ///
 /// Agent TUIs may enable these DEC modes through ordinary PTY output. Termios
@@ -1047,6 +1050,16 @@ async fn prepare_attach_terminal(
     Ok((terminal, output, winch))
 }
 
+/// Whether a dialog frame may be queued: an open dialog adds a frame per key or
+/// status event, so it waits while the terminal holds a full queue. Terminal
+/// input without a dialog is never held back.
+fn menu_may_paint<O>(modal: Option<&ModalState>, stdout: &BufferedOutput<O>) -> bool
+where
+    O: AsyncWrite + Unpin,
+{
+    stdout.queued() < OUTPUT_QUEUE_BYTES || !modal.is_some_and(|modal| modal.active)
+}
+
 /// Writes the queued output before the terminal leaves raw mode, so it is not
 /// processed by the restored line discipline. A write error surfaces on the
 /// next write.
@@ -1054,7 +1067,7 @@ async fn flush_output_before_restore<W>(stdout: &mut W)
 where
     W: AsyncWrite + Unpin,
 {
-    let _ = stdout.flush().await;
+    let _ = time::timeout(OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT, stdout.flush()).await;
 }
 
 /// Renders the active modal dialog with its session header.
@@ -1885,7 +1898,7 @@ where
                     &mut stdin,
                     &mut stdin_buf,
                     shortcut_deadline,
-                ), if stream_input.accepts_stdin() => {
+                ), if stream_input.accepts_stdin() && menu_may_paint(modal.as_ref(), &stdout) => {
                     let ctx = StdinInputContext {
                         stream_input: &mut stream_input,
                         stdout: &mut stdout,
@@ -1915,7 +1928,7 @@ where
                         &mut stdout,
                     ).await?;
                 }
-                update = recv_status_update(&mut status_updates), if status_updates.is_some() => {
+                update = recv_status_update(&mut status_updates), if status_updates.is_some() && menu_may_paint(modal.as_ref(), &stdout) => {
                     if let Some(update) = update {
                         if handle_status_update(update, &mut modal) {
                             paint_modal(
