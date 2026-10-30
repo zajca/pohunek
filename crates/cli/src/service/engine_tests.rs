@@ -1395,6 +1395,55 @@ async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_hangs_o
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
+    let mut harness = Harness::new();
+    let recorded = harness.root.join("recorded-bin");
+    let fallback = harness.root.join("fallback-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+    harness.install(V1).await.expect("install");
+    let started = harness.root.join("shell-started");
+    let body = format!("touch '{}'; exec sleep 3600", started.display());
+    harness.context = scripted_discovery(
+        &harness.context,
+        &harness.root,
+        &body,
+        std::time::Duration::from_secs(8),
+        &fallback,
+    );
+    let context = harness.context.clone();
+    let refresher = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(crate::service::refresh::refresh_search_path(
+                &context, None, false,
+            ))
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the login shell never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let store = Store::new(harness.context.paths().state_dir.clone());
+    let lock = store
+        .lock()
+        .await
+        .expect("the lock is free while the login shell hangs");
+    drop(lock);
+
+    let error = refresher
+        .join()
+        .expect("refresh thread")
+        .expect_err("the shell hangs");
+    assert_eq!(error.code(), "service_search_path_refresh_failed");
+}
+
 #[tokio::test]
 async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pending_transaction() {
     let mut harness = Harness::new();

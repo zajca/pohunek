@@ -5,7 +5,7 @@
 //! (nix generations), leaves the record behind. This command runs the same
 //! bounded discovery, shows the difference and rewrites only the recorded
 //! path, atomically. Nothing is stopped or restarted, and the service manager
-//! is not contacted.
+//! is not contacted. The discovery runs before the transaction lock is taken.
 
 // Rust guideline compliant 2026-06-26
 
@@ -38,25 +38,15 @@ pub(crate) async fn refresh_search_path(
     inherited: Option<&TransactionLock>,
     dry_run: bool,
 ) -> Result<RefreshPathReport, Error> {
-    let store = Store::new(context.paths().state_dir.clone());
-    let _transaction = match inherited {
-        Some(_) => None,
-        None => Some(store.lock().await?),
-    };
-    super::engine::upgrade_preflight(context)?;
+    // A host without an installation never runs the login shell; the check is
+    // repeated under the lock.
     let config_path = context.config_path();
     if !super::engine::file_exists(&config_path)? {
         return Err(Error::NotInstalled { path: config_path });
     }
-    if store.load()?.is_some() {
-        return Err(Error::RefreshBlockedByTransaction);
-    }
-    let config = ServiceConfig::load(&config_path)?;
-    config.verify_installation(
-        context.uid(),
-        &context.paths().state_dir,
-        &context.paths().runtime_dir,
-    )?;
+    // The login shell runs before this command takes the transaction lock, so a
+    // slow shell never keeps another service command waiting. Everything that
+    // depends on the recorded state is decided under the lock below.
     let (fresh, found) = context.install_search_path().map_err(|error| match error {
         Error::SearchPath(reason) => Error::SearchPathRefreshFailed {
             detail: reason.to_string(),
@@ -73,6 +63,24 @@ pub(crate) async fn refresh_search_path(
                 .unwrap_or_else(|| "no login shell was asked".to_owned()),
         });
     }
+    let store = Store::new(context.paths().state_dir.clone());
+    let _transaction = match inherited {
+        Some(_) => None,
+        None => Some(store.lock().await?),
+    };
+    super::engine::upgrade_preflight(context)?;
+    if !super::engine::file_exists(&config_path)? {
+        return Err(Error::NotInstalled { path: config_path });
+    }
+    if store.load()?.is_some() {
+        return Err(Error::RefreshBlockedByTransaction);
+    }
+    let config = ServiceConfig::load(&config_path)?;
+    config.verify_installation(
+        context.uid(),
+        &context.paths().state_dir,
+        &context.paths().runtime_dir,
+    )?;
     let recorded = config.search_path().entries().to_vec();
     let discovered = fresh.entries().to_vec();
     let added: Vec<_> = discovered
