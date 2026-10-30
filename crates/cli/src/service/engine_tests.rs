@@ -1531,9 +1531,14 @@ async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_l
     let error = refresh(&harness, false).await.expect_err("newer schema");
     assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
     let hint = error.hint().expect("hint");
-    assert!(
-        hint.contains("newer release") && hint.contains("<prefix>/bin/pohunek"),
-        "{hint}"
+    assert_steps_in_order(
+        hint,
+        &[
+            "written by a newer release",
+            "`pohunek service refresh-path` of the installed release",
+            "`<prefix>/bin/pohunek`",
+            "never rewrites it",
+        ],
     );
     assert_eq!(config_bytes(&harness), newer.into_bytes(), "untouched");
 }
@@ -8048,7 +8053,12 @@ fn an_unmanaged_host_gets_no_recorded_path_warning() {
         .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
     assert!(
-        super::preflight::recorded_path_warning(&context, "/usr/bin:/bin").is_none(),
+        super::preflight::recorded_path_warning(
+            &context,
+            "/usr/bin:/bin",
+            super::preflight::JudgedPath::Installed
+        )
+        .is_none(),
         "the user manager's PATH is not a recorded path"
     );
 }

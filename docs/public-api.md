@@ -2832,7 +2832,13 @@ clears its record after reading and verifying the file, without comparing it wit
 the refresh, and `uninstall` removes the installation without needing the file to
 match the refresh), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
-(`pohunek service refresh-path` resolves it). It fails with `service_search_path_refresh_failed` when the
+(`pohunek service refresh-path` without `--dry-run` resolves it), and what a
+dry run returns over any pending refresh, because a dry run never resolves one.
+A daemon job that vanished after the record exists gives
+`service_daemon_job_missing` from the replacement and its rollback alike, and the
+hint names the uninstall and reinstall way out. The store and preflight refusals
+carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
+`service_upgrade_preflight_failed`) with texts that name the installed release. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
 fallback list never replaces a recorded path), `service_search_path_unmanaged`
 where the host records no path, `service_refresh_blocked_by_transaction` while an

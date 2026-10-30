@@ -694,9 +694,14 @@ async fn a_refresh_that_reached_registering_blocks_upgrade_and_install_and_leave
         ] {
             let error = error.expect_err(name);
             assert_eq!(error.code(), "service_refresh_pending", "{step:?} {name}");
-            assert_eq!(
-                error.hint(),
-                Some("rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it); it resumes or rolls back the pending refresh")
+            assert_steps_in_order(
+                error.hint().expect("hint"),
+                &[
+                    "rerun `pohunek service refresh-path` without --dry-run",
+                    "the same `pohunek`",
+                    "`./pohunek`",
+                    "resumes or rolls back the pending refresh",
+                ],
             );
         }
 
@@ -770,6 +775,15 @@ async fn a_file_edited_during_a_pending_refresh_is_never_overwritten() {
 
         let error = refresh(harness, false).await.expect_err("edited");
         assert_eq!(error.code(), "service_refresh_config_changed", "{step:?}");
+        assert_steps_in_order(
+            error.hint().expect("hint"),
+            &[
+                "Restore it as the refresh wrote it or as it was before the refresh",
+                "then rerun `pohunek service refresh-path`",
+                "or run `pohunek service uninstall`",
+                "session-checked",
+            ],
+        );
         let error = harness
             .upgrade(V1)
             .await
@@ -947,6 +961,7 @@ async fn without_a_daemon_job_nothing_changes_and_a_stopped_job_is_started() {
     for dry_run in [false, true] {
         let error = refresh(harness, dry_run).await.expect_err("no job");
         assert_eq!(error.code(), "service_daemon_job_missing");
+        assert_daemon_job_missing_steps(&error);
     }
     assert_eq!(config_bytes(harness), before);
     assert_eq!(harness.pending(), None);
@@ -1030,6 +1045,15 @@ async fn a_dry_run_over_a_pending_refresh_fails_closed_and_leaves_the_record() {
 
     let error = refresh(harness, true).await.expect_err("dry run");
     assert_eq!(error.code(), "service_refresh_pending");
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "rerun `pohunek service refresh-path` without --dry-run",
+            "a dry run is refused while a refresh is pending",
+            "the same `pohunek`",
+            "resumes or rolls back the pending refresh",
+        ],
+    );
     assert_eq!(harness.pending().expect("kept").step, Step::Config);
 }
 
@@ -1375,6 +1399,39 @@ async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_resto
     assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
     assert_eq!(config_bytes(harness), bytes, "nothing was rolled back");
     assert_eq!(record_bytes(harness), pending);
+    let Error::UpgradeAtRisk { warnings, .. } = &error else {
+        unreachable!("matched above");
+    };
+    let [warning] = warnings.as_slice() else {
+        panic!("one warning names the judged path: {warnings:?}");
+    };
+    assert_steps_in_order(
+        warning,
+        &[
+            super::preflight::STALE_PATH_WARNING,
+            canonical(&r.old).to_str().expect("utf-8"),
+            super::preflight::RESTORED_PATH_NOTE,
+            "do not accept the loss",
+            "the same `pohunek` that started the pending refresh",
+            "`pohunek service refresh-path` to finish it",
+            "a dry run is refused while a refresh is pending",
+            "rerun this upgrade",
+        ],
+    );
+    assert!(
+        !warning.contains("install records it") && !warning.contains("refresh-path --dry-run"),
+        "{warning}"
+    );
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "do not accept the loss",
+            "the same `pohunek` that started the pending search-path refresh",
+            "`pohunek service refresh-path` without --dry-run",
+            "then rerun the upgrade",
+            "otherwise preserve the required runtime",
+        ],
+    );
 
     harness
         .engine()
@@ -1384,4 +1441,225 @@ async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_resto
         .await
         .expect("the flag accepts the risk the upgrade runs with");
     harness.assert_installed(V2);
+}
+
+/// Asserts the way out a missing daemon job names, in the order it is walked.
+fn assert_daemon_job_missing_steps(error: &Error) {
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "stop the live sessions",
+            "`pohunek session list`",
+            "save a copy of service.toml",
+            "`pohunek service uninstall`",
+            "install the version that is installed now from its own archive",
+            "same --prefix",
+            "reapply the non-default settings",
+            "except `search_path` under [environment]",
+            "rerun `pohunek service refresh-path` if the path still differs",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_and_uninstall_takes_it(
+) {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Registering).await;
+    harness.fake.world().registered = None;
+    harness.fake.world().running = false;
+
+    let error = refresh(harness, false).await.expect_err("the job is gone");
+
+    assert_eq!(error.code(), "service_rollback_failed", "{error:?}");
+    assert!(
+        matches!(&error, Error::RollbackFailed { rollback, .. } if matches!(**rollback, Error::DaemonJobMissing)),
+        "{error:?}"
+    );
+    assert_daemon_job_missing_steps(&error);
+    assert!(harness.pending().expect("the record is kept").rolling_back);
+    assert_eq!(
+        recorded(harness),
+        [canonical(&r.old)],
+        "the file was restored before the replacement failed"
+    );
+
+    let again = refresh(harness, false).await.expect_err("every rerun");
+    assert_eq!(again.code(), "service_daemon_job_missing", "{again:?}");
+    assert_daemon_job_missing_steps(&again);
+
+    harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("the way out: the session-checked uninstall takes the pending refresh");
+    assert_eq!(harness.pending(), None);
+}
+
+#[tokio::test]
+async fn the_entry_blocks_on_a_foreign_record_before_judging_the_schema() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Config);
+    let error = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the upgrade is interrupted");
+    assert!(matches!(error, Error::Interrupted(_)), "{error:?}");
+    let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    let record = record_bytes(harness);
+
+    let error = entry_without_connection(&harness.context).await;
+
+    assert_eq!(
+        error.code(),
+        "service_refresh_blocked_by_transaction",
+        "{error}"
+    );
+    assert_eq!(record_bytes(harness), record, "the record is kept");
+    assert_eq!(config_bytes(harness), older.as_bytes(), "the file is kept");
+}
+
+#[tokio::test]
+async fn the_entry_returns_an_unreadable_record_before_judging_the_schema() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    let record = harness.engine().store.path();
+    std::fs::write(&record, b"not a record").expect("junk record");
+    std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("private record");
+
+    let error = entry_without_connection(&harness.context).await;
+
+    assert!(matches!(error, Error::Record { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn the_entry_lets_a_pending_refresh_record_reach_the_schema_judgement() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Config).await;
+    let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    let record = record_bytes(harness);
+
+    let error = entry_without_connection(&harness.context).await;
+
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    assert_eq!(record_bytes(harness), record, "the record is kept");
+}
+
+#[tokio::test]
+async fn a_refresh_refused_for_the_store_or_the_preflight_words_the_refusal_as_a_refresh() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    let before = config_bytes(harness);
+
+    let error = refresh_with(
+        harness,
+        harness
+            .engine()
+            .with_adoption_preflight(Box::new(FailingFrom {
+                inner: InProcessPreflight::default(),
+                fail_from: 0,
+            })),
+        false,
+    )
+    .await
+    .expect_err("the daemon gives no report");
+
+    assert_eq!(
+        error.code(),
+        "service_upgrade_preflight_failed",
+        "{error:?}"
+    );
+    assert!(
+        matches!(error, Error::RefreshPreflightFailed { .. }),
+        "{error:?}"
+    );
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "`<prefix>/libexec/pohunek/<active>/pohunekd upgrade-preflight`",
+            "the daemon of the installed release",
+            "nothing was changed",
+        ],
+    );
+    assert!(!error.hint().expect("hint").contains("<staged>"));
+
+    seed_live_session(harness, SESSION, "w-1");
+    edit_stored_line(harness, SESSION, |line| {
+        line["schema_version"] = 99.into();
+    });
+    let path = store_path(harness);
+    let body = std::fs::read_to_string(&path).expect("read store");
+    std::fs::write(
+        &path,
+        body.replace("\"schema_version\":1", "\"schema_version\":99"),
+    )
+    .expect("write store");
+    let error = refresh(harness, false)
+        .await
+        .expect_err("the store is refused");
+
+    assert_eq!(error.code(), "service_upgrade_store_unusable", "{error:?}");
+    assert!(
+        matches!(error, Error::RefreshStoreUnusable { .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        !message.contains("upgrade") && !message.contains("new daemon"),
+        "{message}"
+    );
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "--accept-runtime-loss does not apply",
+            "the daemon of the installed release cannot read this store",
+            "nothing was changed",
+        ],
+    );
+    assert_eq!(config_bytes(harness), before);
+    assert_eq!(harness.pending(), None);
+}
+
+#[tokio::test]
+async fn a_record_of_another_schema_names_the_pohunek_that_started_the_transaction() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    let record = harness.engine().store.path();
+    std::fs::write(&record, br#"{"schema_version":99}"#).expect("future record");
+    std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("private record");
+
+    let error = refresh(harness, false)
+        .await
+        .expect_err("unsupported record");
+
+    assert_eq!(error.code(), "service_record_invalid", "{error:?}");
+    assert!(
+        error.to_string().contains("is unsupported; expected"),
+        "{error}"
+    );
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "another record schema",
+            "rerun the command with the `pohunek` that started the transaction",
+            "`./pohunek`",
+            "`<prefix>/bin/pohunek`",
+        ],
+    );
 }

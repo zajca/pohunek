@@ -155,8 +155,11 @@ pub async fn refresh_search_path(
 ///
 /// The discovery refusals that need no service manager and no read of
 /// `service.toml` ([`Error::NotInstalled`], [`Error::SearchPathUnmanaged`])
-/// come first; then the schema is judged, and only then is the service manager
-/// contacted. The engine repeats the schema read under the lock.
+/// come first; then the pending record is classified, then the schema is
+/// judged, and only then is the service manager contacted. The record comes
+/// before the schema because a transaction that is still pending can leave a
+/// file of another schema behind, and its own remedy is the one to name. The
+/// engine repeats the record and schema reads under the lock.
 pub(crate) async fn refresh_entry<Connect, Connecting>(
     context: &Context,
     inherited: Option<record::TransactionLock>,
@@ -169,11 +172,27 @@ where
     Connecting: std::future::Future<Output = Result<Backend, Error>>,
 {
     let discovered = discover_for_refresh(context)?;
+    classify_pending_record(context)?;
     refresh::load_installed_config(context)?;
     let backend = connect().await?;
     let engine =
         engine(context, &backend, inherited).with_runtime_loss_accepted(accept_runtime_loss);
     engine.refresh_path(discovered, dry_run).await
+}
+
+/// Refuses a refresh while a record of another operation is pending and
+/// returns the error of a record store that cannot be read; a pending refresh
+/// record or no record passes.
+///
+/// # Errors
+///
+/// Returns [`Error::RefreshBlockedByTransaction`] or the record store's error.
+fn classify_pending_record(context: &Context) -> Result<(), Error> {
+    let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+    if pending.is_some_and(|record| record.operation != record::Operation::RefreshPath) {
+        return Err(Error::RefreshBlockedByTransaction);
+    }
+    Ok(())
 }
 
 /// Runs the login-shell discovery, then [`engine::Engine::refresh_path`].
@@ -384,7 +403,7 @@ async fn finish_check(
             }
             None => ledger::Acceptance::none(),
         };
-        let gated = preflight::gate_upgrade(
+        let gated = preflight::gate_upgrade_over(
             preflight,
             context,
             &release,
@@ -394,6 +413,7 @@ async fn finish_check(
             preflight::ReleasePlan::Included,
             accept_runtime_loss,
             &acceptance,
+            engine::judged_path(checked.pending.as_ref()),
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;

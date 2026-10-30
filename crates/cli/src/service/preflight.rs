@@ -192,6 +192,53 @@ pub async fn gate_upgrade(
     accept_runtime_loss: bool,
     acceptance: &Acceptance,
 ) -> Result<Gated, Error> {
+    gate_upgrade_over(
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        search_path,
+        variables,
+        plan,
+        accept_runtime_loss,
+        acceptance,
+        JudgedPath::Installed,
+    )
+    .await
+}
+
+/// Where the `PATH` an upgrade is judged with comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgedPath {
+    /// The path `service.toml` records for the installed daemon job.
+    Installed,
+    /// The previous path of a pending search-path refresh, which the upgrade
+    /// rolls back first; `service.toml` may already hold the refresh target.
+    RestoredByRefresh,
+}
+
+/// [`gate_upgrade`] for a `judged` path of either origin, which words the
+/// stale-path warning of an at-risk refusal.
+///
+/// # Errors
+///
+/// See [`gate_upgrade`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the judgement inputs are passed one by one, as gate does, and the plan is the eighth"
+)]
+pub async fn gate_upgrade_over(
+    preflight: &dyn AdoptionPreflight,
+    context: &Context,
+    daemon_dir: &VerifiedVersionDir,
+    version: &str,
+    search_path: &str,
+    variables: &BTreeMap<String, String>,
+    plan: ReleasePlan,
+    accept_runtime_loss: bool,
+    acceptance: &Acceptance,
+    judged: JudgedPath,
+) -> Result<Gated, Error> {
     match gate_installed_release(
         preflight,
         context,
@@ -206,7 +253,7 @@ pub async fn gate_upgrade(
     .await
     {
         Err(refusal @ Error::UpgradeAtRisk { .. }) => {
-            let warning = recorded_path_warning(context, search_path);
+            let warning = recorded_path_warning(context, search_path, judged);
             Err(refusal.with_warnings(warning.as_slice()))
         }
         decided => decided,
@@ -260,6 +307,12 @@ pub async fn gate_refresh(
             acceptance,
             warnings,
         },
+        Error::UpgradeStoreUnusable { path, code, detail } => {
+            Error::RefreshStoreUnusable { path, code, detail }
+        }
+        Error::UpgradePreflightFailed { binary, detail } => {
+            Error::RefreshPreflightFailed { binary, detail }
+        }
         other => other,
     })
 }
@@ -302,6 +355,11 @@ async fn gate_installed_release(
 /// [`Error::hint`] and `packaging/install-daemon.sh` key on it.
 pub(super) const STALE_PATH_WARNING: &str = "the search path this upgrade judged with is:";
 
+/// Marks the warning of an upgrade that judges with the previous path of a
+/// pending search-path refresh. [`Error::hint`] keys on it.
+pub(super) const RESTORED_PATH_NOTE: &str =
+    "the path a pending search-path refresh's rollback restores";
+
 /// Names the recorded search path and the command that refreshes it, when the
 /// upgrade refuses sessions as at risk.
 ///
@@ -313,20 +371,38 @@ pub(super) const STALE_PATH_WARNING: &str = "the search path this upgrade judged
 /// never runs the login shell, which `pohunek service refresh-path --dry-run`
 /// does outside any lock. An installation that records no path (the Linux user
 /// manager's `PATH`) gets none.
-pub(super) fn recorded_path_warning(context: &Context, judged: &str) -> Option<String> {
+///
+/// Over a pending refresh the judged path is the one its rollback restores,
+/// not the one `service.toml` holds, and a dry run is refused while the
+/// refresh is pending, so the warning sends the operator to finish it.
+pub(super) fn recorded_path_warning(
+    context: &Context,
+    judged: &str,
+    origin: JudgedPath,
+) -> Option<String> {
     if !context.records_search_path() || judged.is_empty() {
         return None;
     }
-    Some(format!(
-        "{STALE_PATH_WARNING} {judged} (install records it in service.toml); if a runtime \
-         moved since it was recorded, for example after a Nix profile update, do not accept \
-         the loss: with the `pohunek` of the release you are installing (`./pohunek` in its \
-         unpacked archive), compare with `pohunek service refresh-path --dry-run`, record the \
-         current path with `pohunek service refresh-path` (it restarts the daemon with that \
-         path after the same adoption check), and rerun this upgrade. A pending transaction \
-         of another kind blocks refresh-path (`pohunek service status` names it); see the \
-         update runbook"
-    ))
+    Some(match origin {
+        JudgedPath::Installed => format!(
+            "{STALE_PATH_WARNING} {judged} (install records it in service.toml); if a runtime \
+             moved since it was recorded, for example after a Nix profile update, do not accept \
+             the loss: with the `pohunek` of the release you are installing (`./pohunek` in its \
+             unpacked archive), compare with `pohunek service refresh-path --dry-run`, record the \
+             current path with `pohunek service refresh-path` (it restarts the daemon with that \
+             path after the same adoption check), and rerun this upgrade. A pending transaction \
+             of another kind blocks refresh-path (`pohunek service status` names it); see the \
+             update runbook"
+        ),
+        JudgedPath::RestoredByRefresh => format!(
+            "{STALE_PATH_WARNING} {judged} ({RESTORED_PATH_NOTE}); if a runtime moved since it \
+             was recorded, for example after a Nix profile update, do not accept the loss: \
+             with the same `pohunek` that started the pending refresh, run `pohunek service \
+             refresh-path` to finish it (a dry run is refused while a refresh is pending, and \
+             `pohunek service status` names the pending transaction), and rerun this upgrade; \
+             see the update runbook"
+        ),
+    })
 }
 
 /// Checks the staged `daemon` is of `version` and returns its report.

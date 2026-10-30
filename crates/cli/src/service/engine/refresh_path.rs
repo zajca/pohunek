@@ -68,10 +68,11 @@ impl Engine<'_> {
     /// [`Error::RefreshConfigSchema`] for a file of another schema,
     /// [`Error::DaemonJobMissing`] without a daemon job,
     /// [`Error::RefreshConfigChanged`] when `service.toml` was edited during a
-    /// pending refresh that has to act on the file, [`Error::RefreshPending`] for a dry run while one is
-    /// pending, the adoption refusals of an upgrade ([`Error::RefreshAtRisk`],
-    /// [`Error::UpgradeStoreUnusable`]) before any effect, and the failing
-    /// step's error after a rollback.
+    /// pending refresh that has to act on the file, [`Error::RefreshPending`]
+    /// for a dry run over any pending refresh (a dry run never resolves one),
+    /// the adoption refusals ([`Error::RefreshAtRisk`],
+    /// [`Error::RefreshStoreUnusable`], [`Error::RefreshPreflightFailed`])
+    /// before any effect, and the failing step's error after a rollback.
     pub(crate) async fn refresh_path(
         &self,
         discovered: Result<Discovered, Error>,
@@ -468,8 +469,9 @@ impl Engine<'_> {
     ///
     /// Returns [`Error::RefreshConfigChanged`] for a file the journal does not
     /// account for, [`Error::RefreshConfigSchema`] for a file of another
-    /// schema, the rollback gate's refusals, and the service-manager and
-    /// readiness errors of the restoring replacement.
+    /// schema, the rollback gate's refusals, [`Error::DaemonJobMissing`] when the
+    /// job vanished, and the service-manager and readiness errors of the
+    /// restoring replacement.
     pub(super) async fn rollback_refresh(
         &self,
         record: &Record,
@@ -525,11 +527,17 @@ impl Engine<'_> {
                 Err(supervisor::Error::NotFound(_)) => None,
                 Err(source) => return Err(supervisor_error("inspect daemon", source)),
             };
+            // A job that vanished after the record exists cannot be restored by
+            // a replacement, and no rerun can change that; the typed error
+            // carries the way out.
             self.backend
                 .daemon()
                 .replace(&definition)
                 .await
-                .map_err(|source| supervisor_error("restore daemon", source))?;
+                .map_err(|source| match source {
+                    supervisor::Error::NotFound(_) => Error::DaemonJobMissing,
+                    source => supervisor_error("restore daemon", source),
+                })?;
             self.wait_restarted(&record.version, replaced).await?;
         }
         Ok(gated)

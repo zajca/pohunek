@@ -509,6 +509,31 @@ pub enum Error {
         detail: String,
     },
 
+    /// The daemon of the installed release would refuse to start with the
+    /// metadata store, so a search-path refresh is refused.
+    #[error(
+        "refused: the daemon of the installed release cannot start with the metadata store {} ({code}): {detail}",
+        path.display()
+    )]
+    RefreshStoreUnusable {
+        /// The store file.
+        path: PathBuf,
+        /// Machine code of the store refusal.
+        code: String,
+        /// The refusal, as the daemon words it.
+        detail: String,
+    },
+
+    /// The installed release's daemon preflight did not produce a report for
+    /// a search-path refresh.
+    #[error("the adoption preflight of {} failed: {detail}", binary.display())]
+    RefreshPreflightFailed {
+        /// The daemon executable that was asked.
+        binary: PathBuf,
+        /// Why no report came back.
+        detail: String,
+    },
+
     /// The release's official runtime step refused its plan, so nothing was
     /// stopped or changed.
     #[error(
@@ -697,6 +722,10 @@ pub enum Error {
     ///
     /// The refresh records the path and replaces the job together or changes
     /// nothing, so without a job it changes nothing.
+    ///
+    /// Only `refresh-path` returns it, and a refresh never changes the active
+    /// version, so "the version installed now" in its hint names one version
+    /// whether or not a refresh record is pending.
     #[error("no daemon job is registered, so the new search path has nothing to take effect in; the recorded search path is unchanged")]
     DaemonJobMissing,
 
@@ -785,6 +814,12 @@ impl From<crate::workflow::Error> for Error {
     }
 }
 
+/// The way out of a missing daemon job.
+///
+/// `uninstall` is session-checked and keeps durable metadata; the version to
+/// install is the one `service.toml` names, which a refresh never changes.
+const DAEMON_JOB_MISSING_HINT: &str = "refresh-path cannot register a missing daemon job; stop the live sessions (`pohunek session list` shows them), save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata and refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix, reapply the non-default settings from the saved copy except `search_path` under [environment] (restoring it brings the stale path back), and rerun `pohunek service refresh-path` if the path still differs; `pohunek service status` shows whether the daemon job is registered";
+
 impl Error {
     /// Attaches the warnings of a degraded judgement to a refusal that the
     /// judgement produced, so the operator reads them with the refusal.
@@ -801,6 +836,7 @@ impl Error {
                 slot.extend_from_slice(warnings);
             }
             Self::UpgradePreflightFailed { detail, .. }
+            | Self::RefreshPreflightFailed { detail, .. }
             | Self::RollbackPreflightFailed { detail, .. } => {
                 for warning in warnings {
                     detail.push_str("; warning: ");
@@ -854,8 +890,12 @@ impl Error {
             Self::UpgradeAtRisk { .. } | Self::RefreshAtRisk { .. } => {
                 "service_upgrade_sessions_at_risk"
             }
-            Self::UpgradeStoreUnusable { .. } => "service_upgrade_store_unusable",
-            Self::UpgradePreflightFailed { .. } => "service_upgrade_preflight_failed",
+            Self::UpgradeStoreUnusable { .. } | Self::RefreshStoreUnusable { .. } => {
+                "service_upgrade_store_unusable"
+            }
+            Self::UpgradePreflightFailed { .. } | Self::RefreshPreflightFailed { .. } => {
+                "service_upgrade_preflight_failed"
+            }
             Self::UpgradeRuntimesRefused { .. } => "service_upgrade_runtimes_refused",
             Self::UpgradeRuntimesFailed { .. } => "service_upgrade_runtimes_failed",
             Self::UpgradeRuntimesUnconfirmed { .. } => "service_upgrade_runtimes_unconfirmed",
@@ -923,6 +963,11 @@ impl Error {
             }
             Self::UpgradeAtRisk { warnings, .. } => Some(if warnings
                 .iter()
+                .any(|warning| warning.contains(super::preflight::RESTORED_PATH_NOTE))
+            {
+                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the same `pohunek` that started the pending search-path refresh (the release's `./pohunek` if you used it), run `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) to finish it, then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+            } else if warnings
+                .iter()
                 .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING))
             {
                 "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path` (it restarts the daemon with the new path), then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
@@ -937,6 +982,9 @@ impl Error {
             ),
             Self::UpgradeStoreUnusable { .. } => Some(
                 "--accept-runtime-loss does not apply: install a pohunek release that reads this store, or restore the store's .pre-schema-<n> backup",
+            ),
+            Self::RefreshStoreUnusable { .. } => Some(
+                "--accept-runtime-loss does not apply: the daemon of the installed release cannot read this store, so restore the store's .pre-schema-<n> backup or install a pohunek release that reads it; nothing was changed",
             ),
             Self::UpgradeRuntimesRefused { .. } => Some(
                 "the release's official runtime packages cannot be installed or bound as planned; the listed subjects name what to fix, and nothing was changed",
@@ -958,6 +1006,9 @@ impl Error {
             ),
             Self::UpgradePreflightFailed { .. } => Some(
                 "run `<staged>/pohunekd upgrade-preflight` by hand with the same XDG environment to see its error, then retry",
+            ),
+            Self::RefreshPreflightFailed { .. } => Some(
+                "run `<prefix>/libexec/pohunek/<active>/pohunekd upgrade-preflight` (the daemon of the installed release, named in the message) by hand with the same XDG environment to see its error, then retry; nothing was changed",
             ),
             Self::RollbackStoreUnusable { .. } => Some(
                 "--accept-runtime-loss cannot make the previous daemon read this store; restore its .pre-schema-<n> backup or keep the newer release installed",
@@ -1009,6 +1060,9 @@ impl Error {
             Self::SupervisedVersion { .. } => Some(
                 "inspect which daemon the service job now runs (for example through `systemctl cat` or `launchctl print`), and decide through which pohunek installation's commands it should be stopped or replaced before this command continues",
             ),
+            Self::RollbackFailed { rollback, .. } if matches!(**rollback, Self::DaemonJobMissing) => {
+                Some(DAEMON_JOB_MISSING_HINT)
+            }
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")
             }
@@ -1030,19 +1084,18 @@ impl Error {
             Self::RefreshBlockedByTransaction => Some(
                 "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it, and see https://github.com/zajca/pohunek/issues/1763 (recovery design)",
             ),
-            Self::DaemonJobMissing => Some(
-                "`pohunek service status` shows whether the daemon job is registered",
-            ),
+            Self::DaemonJobMissing => Some(DAEMON_JOB_MISSING_HINT),
+
             Self::RefreshConfigChanged => Some(
                 "service.toml was edited while a search-path refresh was pending. Restore it as the refresh wrote it or as it was before the refresh, then rerun `pohunek service refresh-path`; or run `pohunek service uninstall`, which is session-checked and does not need the file to match the refresh",
             ),
             Self::RefreshPending {
                 rolling_back: true, ..
             } => Some(
-                "rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it); it finishes the rollback after judging the live sessions again, and if it refuses with the listed sessions, run `pohunek service refresh-path --accept-runtime-loss` to accept the loss of their runtime or native recovery (it records nothing)",
+                "rerun `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) and with the same `pohunek` (the release's `./pohunek` if you used it); it finishes the rollback after judging the live sessions again, and if it refuses with the listed sessions, run `pohunek service refresh-path --accept-runtime-loss` to accept the loss of their runtime or native recovery (it records nothing)",
             ),
             Self::RefreshPending { .. } => Some(
-                "rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it); it resumes or rolls back the pending refresh",
+                "rerun `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) and with the same `pohunek` (the release's `./pohunek` if you used it); it resumes or rolls back the pending refresh",
             ),
             Self::Record { detail, .. } if detail.contains("is unsupported; expected") => Some(
                 "the record was written by a pohunek release with another record schema: rerun the command with the `pohunek` that started the transaction (the `./pohunek` of the release's unpacked archive if you used it, or `<prefix>/bin/pohunek` of the installed release)",

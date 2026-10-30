@@ -877,7 +877,7 @@ impl<'a> Engine<'a> {
             }
         };
         let acceptance = self.acceptance(&basis)?;
-        let gated = preflight::gate_upgrade(
+        let gated = preflight::gate_upgrade_over(
             &*self.preflight,
             self.context,
             release,
@@ -887,6 +887,7 @@ impl<'a> Engine<'a> {
             preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
             &acceptance,
+            judged_path(plan.record()),
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
@@ -2188,10 +2189,15 @@ impl<'a> Engine<'a> {
             },
             // The job exists and is replaced in place; a missing job is an
             // error, because the refresh promised a restart of that job.
-            (Operation::RefreshPath, _) => daemon
-                .replace(definition)
-                .await
-                .map_err(|source| supervisor_error("replace daemon", source)),
+            (Operation::RefreshPath, _) => {
+                daemon
+                    .replace(definition)
+                    .await
+                    .map_err(|source| match source {
+                        supervisor::Error::NotFound(_) => Error::DaemonJobMissing,
+                        source => supervisor_error("replace daemon", source),
+                    })
+            }
             (Operation::Upgrade, _) => match daemon.replace(definition).await {
                 // A migration stopped the daemon job before it rewrote
                 // `service.toml`, so there is nothing to replace; the new
@@ -3252,6 +3258,18 @@ fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> 
 /// See [`job_path`].
 async fn installed_job_path(context: &Context) -> Result<JobPath, Error> {
     installed_job_path_in(context, None, PathUse::Forward).await
+}
+
+/// Where the path an upgrade judges with comes from, given the record it
+/// resumes or rolls back: a pending refresh's rollback restores the previous
+/// path, anything else judges the installed one.
+pub(crate) fn judged_path(pending: Option<&Record>) -> preflight::JudgedPath {
+    match pending {
+        Some(record) if record.operation == Operation::RefreshPath => {
+            preflight::JudgedPath::RestoredByRefresh
+        }
+        _ => preflight::JudgedPath::Installed,
+    }
 }
 
 /// The `PATH` the adoption preflight of an upgrade that swaps the daemon judges
