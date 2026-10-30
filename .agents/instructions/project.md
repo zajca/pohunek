@@ -37,8 +37,11 @@ rule. The current state of each place is stated separately.
   `boot_session_id` (the boot session UUID on macOS, the kernel boot id on Linux)
   is additive the same way: when the host names another boot than the journal,
   no process of the worker's runtime remains and the loss is proven ended; the
-  journal of an N-1 worker lacks it and keeps the sweep's unconfirmed outcome,
-  and N-1 readers ignore the unknown key. The same holds for the
+  journal of an N-1 worker lacks it. On Linux its `boot_identity`, which is the
+  same kernel boot id, stands in for it when it is a canonical UUID; on macOS
+  `boot_identity` encodes `kern.boottime`, which a clock change shifts, so it
+  never proves a reboot and the sweep keeps its unconfirmed outcome (operator
+  consent only). N-1 readers ignore the unknown key. The same holds for the
   optional field `worker_coalitions`, which lets the sweep dismiss processes
   the kernel places in other coalitions than the worker's. The optional field
   `worker_control_group` (the worker's unified cgroup path on Linux) is additive

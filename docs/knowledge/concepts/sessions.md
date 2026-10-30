@@ -1005,7 +1005,7 @@ decimal, no schema bump, used only in the boot it was recorded in). A hidden
 process whose lineage is open and whose both coalitions differ from the
 worker's is ignored and not reported; equal or unreadable coalitions prove
 nothing and keep it a candidate, and a lineage descendant whose coalitions
-differ is skipped, never selected. On Linux the worker journals the unified cgroup path it runs in as the optional `worker_control_group` (no schema bump, same boot rule). A hidden process whose own `0::` path lies outside the `user@<uid>.service` subtree of that path (a Docker scope, a logind session scope) is ignored and not reported, because an unprivileged process cannot migrate out of the user manager's subtree; a hidden process inside the subtree, such as a `systemd-run --user --scope` unit, stays a candidate. The worker also journals the identifier of its boot as the optional `boot_session_id` (the boot session UUID on macOS, the kernel boot id on Linux; no schema bump). When the host names another boot, nothing of the runtime can still run: the sweep is complete without scanning and the lost session ends with its runtime instead of staying `running`; a journal without the field (a worker of 0.38.x or earlier) keeps the unconfirmed outcome. Those processes are not reported at once: while only such
+differ is skipped, never selected. On Linux the worker journals the unified cgroup path it runs in as the optional `worker_control_group` (no schema bump, same boot rule). A hidden process whose own `0::` path lies outside the `user@<uid>.service` subtree of that path (a Docker scope, a logind session scope) is ignored and not reported, because an unprivileged process cannot migrate out of the user manager's subtree; a hidden process inside the subtree, such as a `systemd-run --user --scope` unit, stays a candidate. The worker also journals the identifier of its boot as the optional `boot_session_id` (the boot session UUID on macOS, the kernel boot id on Linux; no schema bump). When the host names another boot, nothing of the runtime can still run: the sweep is complete without scanning and the lost session ends with its runtime instead of staying `running`; a journal without the field (a worker of 0.38.x or earlier) falls back, on Linux, to its `boot_identity` (the same kernel boot id, if it is a canonical UUID) and, on macOS, keeps the unconfirmed outcome, because `boot_identity` there encodes the clock-shiftable `kern.boottime`; the operator's `--accept-unconfirmed-cleanup` is the way out on macOS. Those processes are not reported at once: while only such
 unreadable processes remain, the sweep re-reads the process table for up to the
 sweep grace (`sweep.grace_ms`), so one that is caught between images or about to
 exit does not leave the cleanup unconfirmed; a candidate that outlives the grace
@@ -1047,8 +1047,11 @@ removal proceeds past the unreadable candidates without signalling them,
 logs each at `warn` once the sweep lets it proceed (before any cleanup), and lists
 every one in the result as `accepted_unconfirmed_processes` (human output prints `pid N (start S, command
 name)` lines after the `removed=` line, with the process-chosen command name
-escaped; `--json` carries the array). A removal with more than 64 candidates is
-refused before anything is deleted, so the result always fits one response. It changes
+escaped; `--json` carries the array). The result lists the
+first 64 accepted processes and, when there are more, counts them in
+`accepted_unconfirmed_total` (human output ends the list with `... and N more`); the
+daemon log names every one. A removal with more than 1024 candidates is refused with
+a count of at least the candidates found before anything is deleted. Accepting never signals a process. It changes
 nothing else: a signalled process that is still running, a sweep error, or a
 missing supervision configuration still refuses. The trade-off is that an
 accepted process that does carry the runtime marker keeps running unsupervised

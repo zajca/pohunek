@@ -474,12 +474,15 @@ impl SessionRegistry {
             cleanup,
         ))
         .await?;
+        let (accepted_unconfirmed_processes, accepted_unconfirmed_total) =
+            super::supervision::bound_accepted_listing(released.accepted_unconfirmed);
         Ok(SessionRemoveResult {
             removed: released.evicted,
             stopped: true,
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
-            accepted_unconfirmed_processes: released.accepted_unconfirmed,
+            accepted_unconfirmed_processes,
+            accepted_unconfirmed_total,
             warnings: released.warnings,
         })
     }
@@ -594,12 +597,15 @@ impl SessionRegistry {
             cleanup,
         ))
         .await?;
+        let (accepted_unconfirmed_processes, accepted_unconfirmed_total) =
+            super::supervision::bound_accepted_listing(released.accepted_unconfirmed);
         Ok(SessionRemoveResult {
             removed: released.evicted,
             stopped: true,
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
-            accepted_unconfirmed_processes: released.accepted_unconfirmed,
+            accepted_unconfirmed_processes,
+            accepted_unconfirmed_total,
             warnings: released.warnings,
         })
     }

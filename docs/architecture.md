@@ -863,7 +863,10 @@ states the contract and then the current state.
   way. A daemon whose host names another boot knows that no process of the
   worker's runtime remains: the sweep is complete without scanning, the loss is
   proven, and the session ends with its runtime. The journal of a worker started
-  by an earlier release lacks the field and keeps the unconfirmed outcome.
+  by an earlier release lacks the field: on Linux its `boot_identity` (the same
+  kernel boot id, when it is a canonical UUID) stands in for it; on macOS
+  `boot_identity` encodes the clock-shiftable `kern.boottime`, never proves a
+  reboot, and the sweep keeps the unconfirmed outcome.
 - **Public-protocol clients.** The contract: a protocol change keeps the
   previous version served through adapters, so the advertised range is
   `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.

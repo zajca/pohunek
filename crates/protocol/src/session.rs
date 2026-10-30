@@ -3287,6 +3287,12 @@ pub struct SessionRemoveResult {
     /// removal needed no consent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_unconfirmed_processes: Vec<UnconfirmedProcess>,
+    /// How many processes the removal accepted when more than the list above
+    /// holds (the daemon log names all of them). Omitted when the list is
+    /// complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub accepted_unconfirmed_total: Option<u32>,
     /// Non-fatal warnings the removal raised, such as a failing `pre-remove`
     /// or `post-remove` worktree hook. The session record is gone once the
     /// result is returned, so this is the only place they are reported.
