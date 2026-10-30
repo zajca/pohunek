@@ -819,11 +819,11 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     )
     .expect("write sentinel agent profile");
 
-    // Install the daemon's JSON logging sink for this test thread, so the scan
-    // covers the structured log the daemon writes from the test's own thread
-    // (RFC §22/§23); events from other threads are not captured.
+    // Capture the daemon's JSON log of every thread of the process, so the scan
+    // covers the structured log the daemon writes from the test's own thread,
+    // the blocking pool and the event-journal writer (RFC §22/§23).
     let log_guard =
-        pohunek_daemon::logging::scoped(&daemon_log_dir).expect("daemon logging initializes");
+        pohunek_daemon::logging::capture(&daemon_log_dir).expect("daemon logging initializes");
 
     let socket_dir = temp_dir("privacy-sentinel-sock");
     let socket = socket_dir.path().join("daemon.sock");
@@ -1001,15 +1001,15 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
 
     let _ = shutdown.send(());
     let _ = handle.await;
-    // The daemon's non-blocking JSON writer flushes synchronously on guard
-    // drop, so the daemon log is read directly rather than polled.
+    // The capture writes each event synchronously, so the daemon log is read
+    // directly rather than polled.
     drop(log_guard);
 
     let store_bytes = std::fs::read(&store_path).expect("read logical store");
     let daemon_log_bytes = collect_dir_bytes(&daemon_log_dir);
     assert!(
         String::from_utf8_lossy(&daemon_log_bytes).contains(&socket.display().to_string()),
-        "the scoped sink did not capture this test's server start, so the scan would pass vacuously"
+        "the capture did not record this test's server start, so the scan would pass vacuously"
     );
 
     let artifacts: [(&str, &[u8]); 5] = [
@@ -1031,15 +1031,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             "the native reference from a rejected identity report",
         ),
     ];
-    for (artifact_name, bytes) in artifacts {
-        let text = String::from_utf8_lossy(bytes);
-        for (sentinel, what) in forbidden_everywhere {
-            assert!(
-                !text.contains(sentinel),
-                "{artifact_name} must never contain {what} ({sentinel}): {text}"
-            );
-        }
-    }
+    assert_artifacts_free_of(&artifacts, &forbidden_everywhere);
 
     // Argv is a structural launch detail: the logical store's launch snapshot
     // legitimately freezes program/args (RFC §10.2), but no other artifact may
@@ -1081,6 +1073,19 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     );
 }
 
+/// Panics when an artifact carries one of the `forbidden` values.
+fn assert_artifacts_free_of(artifacts: &[(&str, &[u8])], forbidden: &[(&str, &str)]) {
+    for (artifact_name, bytes) in artifacts {
+        let text = String::from_utf8_lossy(bytes);
+        for (sentinel, what) in forbidden {
+            assert!(
+                !text.contains(sentinel),
+                "{artifact_name} must never contain {what} ({sentinel}): {text}"
+            );
+        }
+    }
+}
+
 /// Asserts `sentinel` appears in every artifact named in `allowed_in` and in
 /// none of the others — the allow/deny half of the privacy matrix for a
 /// sentinel that is legitimately persisted somewhere.
@@ -1100,6 +1105,146 @@ fn assert_allowed_only_in(
             if allowed { "must" } else { "must never" }
         );
     }
+}
+
+/// Log markers of the capture tests. The capture records every thread of the
+/// process, so a marker must not carry the `SENTINEL_` prefix the scans of
+/// concurrently running sentinel tests forbid.
+const OFF_THREAD_SECRET: &str = "CAPTURE_MARKER_OFFTHREAD_5b2e";
+
+/// Emits `marker` as a structured daemon event on the calling thread.
+fn log_marker(marker: &str) {
+    tracing::info!(marker, "capture marker");
+}
+
+#[tokio::test]
+async fn a_secret_logged_off_the_test_thread_fails_the_daemon_log_scan() {
+    let root = temp_dir("capture-off-thread");
+    let log_dir = root.path().join("daemon-logs");
+    let capture = pohunek_daemon::logging::capture(&log_dir).expect("daemon logging initializes");
+
+    log_marker("CAPTURE_MARKER_ONTHREAD_5b2e");
+    tokio::task::spawn_blocking(|| log_marker(OFF_THREAD_SECRET))
+        .await
+        .expect("blocking closure");
+    std::thread::spawn(|| log_marker("CAPTURE_MARKER_PLAINTHREAD_5b2e"))
+        .join()
+        .expect("plain thread");
+    drop(capture);
+
+    let bytes = collect_dir_bytes(&log_dir);
+    let text = String::from_utf8_lossy(&bytes);
+    for marker in [
+        "CAPTURE_MARKER_ONTHREAD_5b2e",
+        OFF_THREAD_SECRET,
+        "CAPTURE_MARKER_PLAINTHREAD_5b2e",
+    ] {
+        assert!(text.contains(marker), "the capture missed {marker}: {text}");
+    }
+    let scan = catch_unwind(AssertUnwindSafe(|| {
+        assert_artifacts_free_of(
+            &[("daemon structured log", &bytes)],
+            &[(OFF_THREAD_SECRET, "a secret logged from the blocking pool")],
+        );
+    }));
+    assert!(
+        scan.is_err(),
+        "the scan accepted a secret logged off the test thread"
+    );
+}
+
+#[test]
+fn events_outside_a_capture_never_reach_the_next_one() {
+    let root = temp_dir("capture-sequence");
+    let (first, second) = (root.path().join("first"), root.path().join("second"));
+
+    let capture = pohunek_daemon::logging::capture(&first).expect("first capture");
+    log_marker("CAPTURE_MARKER_FIRST_7d10");
+    drop(capture);
+    // No capture is active: the event is discarded, not kept for the next one.
+    std::thread::spawn(|| log_marker("CAPTURE_MARKER_BETWEEN_7d10"))
+        .join()
+        .expect("late thread");
+    let capture = pohunek_daemon::logging::capture(&second).expect("second capture");
+    log_marker("CAPTURE_MARKER_SECOND_7d10");
+    drop(capture);
+
+    let (first, second) = (collect_dir_bytes(&first), collect_dir_bytes(&second));
+    let (first, second) = (
+        String::from_utf8_lossy(&first),
+        String::from_utf8_lossy(&second),
+    );
+    assert!(
+        first.contains("CAPTURE_MARKER_FIRST_7d10")
+            && !first.contains("CAPTURE_MARKER_SECOND_7d10")
+    );
+    assert!(
+        second.contains("CAPTURE_MARKER_SECOND_7d10")
+            && !second.contains("CAPTURE_MARKER_FIRST_7d10")
+    );
+    assert!(
+        !first.contains("CAPTURE_MARKER_BETWEEN_7d10")
+            && !second.contains("CAPTURE_MARKER_BETWEEN_7d10")
+    );
+}
+
+#[test]
+fn concurrent_captures_run_one_after_the_other() {
+    let root = temp_dir("capture-concurrent");
+    let dirs = [root.path().join("a"), root.path().join("b")];
+    let threads: Vec<_> = dirs
+        .iter()
+        .cloned()
+        .zip(["CAPTURE_MARKER_CONC_A_91c4", "CAPTURE_MARKER_CONC_B_91c4"])
+        .map(|(dir, marker)| {
+            std::thread::spawn(move || {
+                let capture = pohunek_daemon::logging::capture(&dir).expect("capture");
+                log_marker(marker);
+                drop(capture);
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("capturing thread");
+    }
+    let text = |dir: &Path| String::from_utf8_lossy(&collect_dir_bytes(dir)).into_owned();
+    let (a, b) = (text(&dirs[0]), text(&dirs[1]));
+    assert!(a.contains("CAPTURE_MARKER_CONC_A_91c4") && !a.contains("CAPTURE_MARKER_CONC_B_91c4"));
+    assert!(b.contains("CAPTURE_MARKER_CONC_B_91c4") && !b.contains("CAPTURE_MARKER_CONC_A_91c4"));
+}
+
+#[test]
+fn a_panic_while_capturing_does_not_block_the_next_capture() {
+    let root = temp_dir("capture-panic");
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _capture =
+            pohunek_daemon::logging::capture(&root.path().join("first")).expect("first capture");
+        panic!("a test failed while capturing");
+    }));
+    assert!(panicked.is_err());
+    let capture = pohunek_daemon::logging::capture(&root.path().join("second"))
+        .expect("capture after a panic");
+    log_marker("CAPTURE_MARKER_AFTER_PANIC_3e08");
+    drop(capture);
+    let bytes = collect_dir_bytes(&root.path().join("second"));
+    assert!(String::from_utf8_lossy(&bytes).contains("CAPTURE_MARKER_AFTER_PANIC_3e08"));
+}
+
+#[test]
+fn the_daemon_initializer_still_refuses_a_second_subscriber() {
+    let root = temp_dir("capture-init");
+    let capture = pohunek_daemon::logging::capture(&root.path().join("capture"))
+        .expect("capture installs the process-wide subscriber");
+    let error = pohunek_daemon::logging::init(&root.path().join("init"))
+        .expect_err("init must fail when a subscriber is already installed");
+    assert!(
+        matches!(
+            error,
+            pohunek_daemon::error::DaemonError::LoggingSubscriber(_)
+        ),
+        "{error:?}"
+    );
+    drop(capture);
 }
 
 /// Secret variable a `session.new` fills into the `metered` profile's slot.
@@ -1230,7 +1375,7 @@ fn assert_error_free_of_secret(response: Response, code: &str) {
 async fn session_secret_env_reaches_only_the_agent_process() {
     let host = SecretEnvHost::new("secret-env-sentinel");
     let log_guard =
-        pohunek_daemon::logging::scoped(&host.daemon_log_dir).expect("daemon logging initializes");
+        pohunek_daemon::logging::capture(&host.daemon_log_dir).expect("daemon logging initializes");
     let socket = host.socket();
     let (shutdown, handle, worker_home) =
         spawn_worker_backed_server(&socket, "0.0.0", host.config()).await;
@@ -1436,7 +1581,7 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     let daemon_log_bytes = collect_dir_bytes(&host.daemon_log_dir);
     assert!(
         String::from_utf8_lossy(&daemon_log_bytes).contains(&host.socket().display().to_string()),
-        "the scoped sink did not capture this test's server start, so the scan would pass vacuously"
+        "the capture did not record this test's server start, so the scan would pass vacuously"
     );
 
     let artifacts: [(&str, &[u8]); 8] = [
@@ -1449,13 +1594,13 @@ async fn session_secret_env_reaches_only_the_agent_process() {
         ("test host root", &root_bytes),
         ("worker home", &worker_home_bytes),
     ];
-    for (artifact_name, bytes) in artifacts {
-        let text = String::from_utf8_lossy(bytes);
-        assert!(
-            !text.contains(SECRET_VALUE) && !text.contains("SENTINEL_"),
-            "{artifact_name} carries a secret value: {text}"
-        );
-    }
+    assert_artifacts_free_of(
+        &artifacts,
+        &[
+            (SECRET_VALUE, "the secret value"),
+            ("SENTINEL_", "a sentinel"),
+        ],
+    );
     // The slot name is configuration, not a secret, but the structured stores
     // never need it either.
     for (artifact_name, bytes) in [

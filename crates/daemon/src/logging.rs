@@ -10,12 +10,13 @@
 
 // Rust guideline compliant 2026-07-28
 
+use std::io;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use pohunek_logging::Writer;
-use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
@@ -46,76 +47,142 @@ pub fn init(log_dir: &Path) -> Result<LogGuard, DaemonError> {
     Ok(guard)
 }
 
-/// Guards that keep a [`scoped`] logging sink installed.
+/// Guard of a [`capture`]: while it lives, the daemon's JSON log of every thread
+/// of the process is written to the capture's directory.
 ///
-/// Dropping it flushes the buffered log lines and restores the previously
-/// installed subscriber of the thread.
+/// Dropping it ends the capture; every event is on disk by then, because the
+/// capture writes synchronously.
 #[derive(Debug)]
-#[must_use = "dropping the guards ends the scoped logging sink"]
-pub struct ScopedLogGuard {
-    // Field order is drop order: the subscriber is uninstalled before the writer
-    // flushes.
-    _default: DefaultGuard,
-    _flush: LogGuard,
+#[must_use = "dropping the guard ends the capture"]
+pub struct CaptureGuard {
+    // Released after the sink is detached: the next capture starts only once
+    // this one has ended.
+    _serial: MutexGuard<'static, ()>,
 }
 
-/// Install the production JSON logging sink for the current thread only.
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        // Detach the sink first so a late event of another thread is discarded.
+        *lock_ignoring_poison(&CAPTURE_SINK) = None;
+    }
+}
+
+/// Capture the production JSON log of the whole process in `log_dir`.
 ///
-/// The sink is built like the one [`init`] installs, but it replaces no
-/// process-wide state, so several callers in one process (tests sharing a
-/// binary) each capture their own log directory. [`init`] stays the only entry
-/// point that installs a process-wide subscriber and still fails when one is
-/// already set.
-///
-/// Only events emitted on the calling thread reach the sink; events from other
-/// threads (blocking-pool closures, the event-journal writer thread) are not
-/// captured. Use it on a current-thread runtime, where every `.await` resumes on
-/// the installing thread.
-///
-/// A process-wide `NoSubscriber` anchor is registered first. With a single
-/// registered dispatcher `tracing` computes a callsite's interest from the
-/// first thread that reaches it, and a thread without a default would cache
-/// "never" for every other thread. With the anchor present, interest is
-/// combined over all dispatchers and each event consults its own thread's
-/// default.
+/// The sink is the bounded daemon log writer [`init`] installs, written to
+/// synchronously, so no event is lost to a full channel or an unflushed buffer.
+/// The events of every thread reach it: blocking-pool closures and the
+/// event-journal writer thread, not only the calling one, and so do the events
+/// of other tests running in the process. The first capture of a process
+/// installs one process-wide subscriber whose file writer forwards to the
+/// capture that is active and discards while none is (the stderr mirror keeps
+/// printing). A capture holds a process-wide lock, so tests of one binary that
+/// run on several threads capture one after the other, each into its own
+/// directory; a second capture on a thread that holds one blocks forever.
+/// [`init`] stays the entry point of the daemon and still fails when a
+/// subscriber is already set, a capture's included.
 ///
 /// # Errors
 ///
-/// Returns a typed [`DaemonError`] when the bounded writer cannot be opened.
-pub fn scoped(log_dir: &Path) -> Result<ScopedLogGuard, DaemonError> {
-    static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
-    let (subscriber, flush) = subscriber(log_dir)?;
-    Ok(ScopedLogGuard {
-        _default: subscriber.set_default(),
-        _flush: flush,
-    })
+/// Returns a typed [`DaemonError`] when the bounded writer cannot be opened or
+/// another process-wide subscriber is already installed.
+pub fn capture(log_dir: &Path) -> Result<CaptureGuard, DaemonError> {
+    let serial = lock_ignoring_poison(&CAPTURE_SERIAL);
+    install_capture_subscriber()?;
+    let writer = open_writer(log_dir)?;
+    *lock_ignoring_poison(&CAPTURE_SINK) = Some(writer);
+    Ok(CaptureGuard { _serial: serial })
+}
+
+/// Serializes captures.
+static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+/// The writer of the active capture.
+static CAPTURE_SINK: Mutex<Option<Writer>> = Mutex::new(None);
+/// Outcome of installing the process-wide capture subscriber.
+static CAPTURE_SUBSCRIBER: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn lock_ignoring_poison<T>(mutex: &'static Mutex<T>) -> MutexGuard<'static, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn install_capture_subscriber() -> Result<(), DaemonError> {
+    CAPTURE_SUBSCRIBER
+        .get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_env_filter(filter())
+                .with_writer(CaptureWriters.and(stderr_mirror()))
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(DaemonError::LoggingSubscriber)
+}
+
+/// Makes the writers of the process-wide capture subscriber.
+struct CaptureWriters;
+
+impl<'a> MakeWriter<'a> for CaptureWriters {
+    type Writer = CaptureWriter;
+
+    fn make_writer(&'a self) -> CaptureWriter {
+        CaptureWriter
+    }
+}
+
+/// Forwards to the writer of the active capture, and discards when none is.
+struct CaptureWriter;
+
+impl io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match lock_ignoring_poison(&CAPTURE_SINK).as_mut() {
+            Some(sink) => sink.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match lock_ignoring_poison(&CAPTURE_SINK).as_mut() {
+            Some(sink) => sink.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Build the JSON subscriber writing to `log_dir`, and the guard that flushes it.
 fn subscriber(
     log_dir: &Path,
 ) -> Result<(impl tracing::Subscriber + Send + Sync + 'static, LogGuard), DaemonError> {
-    let writer = Writer::open(
-        log_dir,
-        pohunek_logging::config::daemon_files()?,
-        pohunek_logging::config::daemon_policy()?,
-    )?;
-    let (non_blocking, guard) = tracing_appender::non_blocking(writer);
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
-
-    // Also mirror to stderr so foreground `daemon start` shows activity; the
-    // file is the durable JSON record for backtesting.
-    let stderr = std::io::stderr.with_max_level(tracing::Level::INFO);
-
+    let (non_blocking, guard) = tracing_appender::non_blocking(open_writer(log_dir)?);
     let subscriber = tracing_subscriber::fmt()
         .json()
         .with_current_span(true)
         .with_span_list(false)
-        .with_env_filter(filter)
-        .with_writer(non_blocking.and(stderr))
+        .with_env_filter(filter())
+        // Also mirror to stderr so foreground `daemon start` shows activity; the
+        // file is the durable JSON record for backtesting.
+        .with_writer(non_blocking.and(stderr_mirror()))
         .finish();
     Ok((subscriber, guard))
+}
+
+/// The bounded daemon log writer on `log_dir`.
+fn open_writer(log_dir: &Path) -> Result<Writer, DaemonError> {
+    Ok(Writer::open(
+        log_dir,
+        pohunek_logging::config::daemon_files()?,
+        pohunek_logging::config::daemon_policy()?,
+    )?)
+}
+
+/// The log filter: `RUST_LOG`, or [`DEFAULT_FILTER`] when it is not set.
+fn filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+}
+
+/// The stderr mirror of the file log, at `info` and above.
+fn stderr_mirror() -> impl for<'a> MakeWriter<'a> + 'static {
+    std::io::stderr.with_max_level(tracing::Level::INFO)
 }
