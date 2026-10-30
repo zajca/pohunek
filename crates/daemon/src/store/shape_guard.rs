@@ -29,8 +29,9 @@
 //! Every sample is destructured field by field (no `..`), so adding a field to a
 //! persisted struct fails to compile here until the sample and snapshot are
 //! revisited. Each enum-valued field is also pinned to its enum type in that
-//! function, so retyping a field, or turning a string field into an enum, fails to
-//! compile. Types with private fields ([`NativeSessionLaunch`] and its
+//! function, so retyping an enum field fails to compile. A free-text string field
+//! turned into an enum compiles and is not caught while its path stays in
+//! [`free_text`]; moving the path to the enum registry is a manual step. Types with private fields ([`NativeSessionLaunch`] and its
 //! components) cannot be destructured; their samples are populated through the
 //! full JSON form instead.
 //!
@@ -686,7 +687,7 @@ pub(crate) use unit_values;
 /// entry names it, and an entry cannot name a variant without supplying its sample.
 /// `$tag` is the internal tag key, or `None` for an externally tagged enum.
 macro_rules! data_values {
-    ($ty:ty, $tag:expr; $($pattern:pat => $sample:expr),+ $(,)?) => {{
+    ($ty:ty, $tag:expr; $($pattern:pat_param => $sample:expr),+ $(,)?) => {{
         let listed: Vec<$ty> = vec![$($sample),+];
         let matchers: Vec<fn(&$ty) -> bool> = vec![$(|value| matches!(value, $pattern)),+];
         for (value, matcher) in listed.iter().zip(&matchers) {

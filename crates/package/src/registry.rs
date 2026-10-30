@@ -949,3 +949,6 @@ pub(crate) fn registry_fs(error: &FsError) -> RegistryError {
         },
     }
 }
+
+#[cfg(test)]
+mod shape_guard;

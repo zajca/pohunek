@@ -169,8 +169,32 @@ The sibling guard `crates/daemon/src/host_state/records/shape_guard.rs` pins the
 key and enum value sets of both records to
 `crates/daemon/src/host_state/fixtures/{governance,identity}-<N>.txt`. A failure
 means: bump the format constant, make the reader accept the previous format, and
-add the new snapshot. `notifications.jsonl`, `policy.json` and the other
-daemon-owned documents are not covered by these guards.
+add the new snapshot.
+
+`registry.json` carries `REGISTRY_SCHEMA` (`crates/package/src/registry.rs`) and
+the reader accepts exactly one. The guard
+`crates/package/src/registry/shape_guard.rs` pins its key set and the
+`PackageSource` value set to
+`crates/package/src/registry/fixtures/registry-<N>.txt`, with the same failure
+resolution: bump `REGISTRY_SCHEMA`, make `parse_state` accept the previous schema,
+add the new snapshot.
+
+These daemon-owned documents persist no enum the daemon reads back, so they have
+no snapshot guard:
+
+- `events.jsonl`: write-only journal, never read back; each line is a protocol
+  `Event` whose enums fall under the protocol enum rule.
+- `session-idle-stop.json`: one optional integer (`default_after_secs`), no enum. The
+  record is unversioned and strict (`deny_unknown_fields`, a parse error stops the
+  daemon), so a new key needs a format version first.
+- assistant `snapshot.json`: regenerated at every launch in the per-launch runtime
+  directory and only handed to the assistant session as prompt input; its `intent`
+  string is not read back by any daemon or CLI code.
+- `metadata.rejected.jsonl`: write-only audit trail (`quarantine_schema`); `kind`
+  and `reason` are free text, and the daemon never interprets the file.
+
+`notifications.jsonl`, `policy.json` and any document not named here are not
+covered by these guards.
 
 Authoritative design lives in `docs/architecture.md` (it wins over `idea.md`).
 Hard constraints, decided on purpose — respect them in every change:
