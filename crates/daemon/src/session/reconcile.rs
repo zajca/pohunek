@@ -24471,7 +24471,8 @@ generation "$1"
                     Some(crate::store::DesiredState::Stopped),
                     "{label}"
                 );
-                worker.server_task.abort();
+                assert!(registry.shutdown().await.is_quiescent(), "{label}");
+                worker.server_task.finish().await;
                 drop(worker.reporter);
             }
         }
@@ -25539,6 +25540,14 @@ generation "$1"
                 )
                 .await;
             }
+            // The registry's exit watch, acknowledgement and retries write
+            // through the fixture directories, so they stop before the worker
+            // and before the case's root drops.
+            assert!(
+                registry.shutdown().await.is_quiescent(),
+                "{} ({form}): registry shutdown",
+                case.name
+            );
             task.finish().await;
 
             let adoptable = verdict == Some(Verdict::Adoptable);
