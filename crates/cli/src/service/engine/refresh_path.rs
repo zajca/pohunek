@@ -133,10 +133,12 @@ impl Engine<'_> {
             }
         };
         match result {
-            Err(error) if error.is_job_missing() => Err(match self.job_missing_effects(&start) {
-                Some(effects) => error.with_job_missing_effects(effects),
-                None => error,
-            }),
+            Err(error) if error.is_job_missing() => {
+                Err(match self.job_missing_effects(&start, dry_run) {
+                    Some(effects) => error.with_job_missing_effects(effects),
+                    None => error,
+                })
+            }
             other => other,
         }
     }
@@ -144,7 +146,19 @@ impl Engine<'_> {
     /// What the run that just ended left in `service.toml` and in the record,
     /// read from the files; `None` when either cannot be read, so the refusal
     /// then claims nothing.
-    fn job_missing_effects(&self, start: &RunStart) -> Option<JobMissingEffects> {
+    ///
+    /// A dry run never writes, so its effects are stated without a re-read.
+    fn job_missing_effects(&self, start: &RunStart, dry_run: bool) -> Option<JobMissingEffects> {
+        if dry_run {
+            return Some(JobMissingEffects {
+                file: FileEffect::Untouched,
+                record: if start.had_record {
+                    RecordEffect::Kept
+                } else {
+                    RecordEffect::Absent
+                },
+            });
+        }
         let record = match self.store.load().ok()? {
             None if start.had_record => RecordEffect::Cleared,
             None => RecordEffect::Absent,
