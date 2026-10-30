@@ -253,9 +253,13 @@ if ! check_json=$("$archive_dir/pohunek" "$@"); then
     echo "\`pohunek service $service_action\` would refuse this host, so the legacy install was not retired;" >&2
     echo "nothing was changed; fix the reported problem and re-run $0" >&2
     if printf '%s\n' "$check_json" | grep -q 'service_upgrade_sessions_at_risk'; then
-        echo "live sessions the upgrade would not carry over are listed above; re-run $0 --accept-runtime-loss to accept losing them" >&2
-        if printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with lists'; then
-            echo "the refusal also warns that the recorded search path may be stale; follow that warning before accepting the loss" >&2
+        echo "live sessions the upgrade would not carry over are listed above" >&2
+        if printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with is:'; then
+            echo "the refusal names the recorded search path; if a runtime moved since it was recorded, do not accept the loss:" >&2
+            echo "run $archive_dir/pohunek service refresh-path --dry-run, then $archive_dir/pohunek service refresh-path, then re-run $0 without --accept-runtime-loss" >&2
+            echo "otherwise re-run $0 --accept-runtime-loss to accept losing the listed sessions" >&2
+        else
+            echo "re-run $0 --accept-runtime-loss to accept losing them" >&2
         fi
     fi
     exit 1

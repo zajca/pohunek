@@ -623,6 +623,37 @@ pub enum Error {
         detail: String,
     },
 
+    /// `service refresh-path` on a host whose daemon job carries no recorded
+    /// `PATH`.
+    #[error("this host's daemon job takes the service manager's own PATH, so there is no search path to refresh")]
+    SearchPathUnmanaged,
+
+    /// `service refresh-path` on a `service.toml` of another schema than this
+    /// release writes.
+    #[error("service.toml has schema {found}, but this release refreshes only schema {current}")]
+    RefreshConfigSchema {
+        /// The `schema_version` the file declares.
+        found: i64,
+        /// The schema this release reads and writes.
+        current: u32,
+    },
+
+    /// `service refresh-path` could not read the path from the login shell.
+    ///
+    /// The fallback list an install would record in that case is never put in
+    /// place of a recorded path.
+    #[error(
+        "the login shell did not supply a PATH ({detail}); the recorded search path is unchanged"
+    )]
+    SearchPathRefreshFailed {
+        /// Why the login shell failed, or that it was not asked.
+        detail: String,
+    },
+
+    /// A transaction is pending, so the recorded path stays as it is.
+    #[error("a `pohunek service` transaction is pending; the recorded search path is unchanged")]
+    RefreshBlockedByTransaction,
+
     /// Another `pohunek service` command holds the transaction lock.
     #[error("another `pohunek service` command is running (lock {})", path.display())]
     TransactionInProgress {
@@ -774,6 +805,10 @@ impl Error {
             Self::AcceptedRisks { .. } => "service_accepted_risks_invalid",
             Self::ConfigBackup { .. } => "service_config_backup_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
+            Self::SearchPathUnmanaged => "service_search_path_unmanaged",
+            Self::RefreshConfigSchema { .. } => "service_refresh_config_schema",
+            Self::SearchPathRefreshFailed { .. } => "service_search_path_refresh_failed",
+            Self::RefreshBlockedByTransaction => "service_refresh_blocked_by_transaction",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
             Self::PrefixMismatch { .. } => "service_prefix_mismatch",
             Self::RollbackFailed { .. } => "service_rollback_failed",
@@ -816,18 +851,14 @@ impl Error {
             Self::StopTimeout { .. } => {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
-            Self::UpgradeAtRisk { warnings, .. }
-                if warnings
-                    .iter()
-                    .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING)) =>
+            Self::UpgradeAtRisk { warnings, .. } => Some(if warnings
+                .iter()
+                .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING))
             {
-                Some(
-                    "the warning names a search path that may be stale: re-record it as the warning describes before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions",
-                )
-            }
-            Self::UpgradeAtRisk { .. } => Some(
-                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed",
-            ),
+                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path`, then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+            } else {
+                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+            }),
             Self::AcceptedRisks { .. } => Some(
                 "remove the ledger file and rerun with --accept-runtime-loss to accept the listed sessions again; the file only records what an earlier upgrade accepted",
             ),
@@ -908,6 +939,21 @@ impl Error {
             Self::TransactionInProgress { .. } => {
                 Some("wait for the other `pohunek service` command to finish, then retry")
             }
+            Self::SearchPathUnmanaged => Some(
+                "nothing to refresh: this installation takes the PATH of the service manager, which a login-shell discovery does not change",
+            ),
+            Self::RefreshConfigSchema { found, current } if *found > i64::from(*current) => Some(
+                "service.toml was written by a newer release: run `pohunek service refresh-path` of the installed release (`<prefix>/bin/pohunek`); this binary never rewrites it",
+            ),
+            Self::RefreshConfigSchema { .. } => Some(
+                "refresh-path never rewrites a service.toml of an older schema. If the installed release has the command (v0.39 and later), run its own `<prefix>/bin/pohunek service refresh-path`. For a release without it: stop the live sessions, save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata and refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix (a fresh install discovers the current path), reapply the non-default settings from the saved copy except `search_path` under [environment] (restoring it brings the stale path back), and rerun the upgrade",
+            ),
+            Self::SearchPathRefreshFailed { .. } => Some(
+                "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
+            ),
+            Self::RefreshBlockedByTransaction => Some(
+                "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it, and see https://github.com/zajca/pohunek/issues/1763 (recovery design)",
+            ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")
             }

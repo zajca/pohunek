@@ -197,10 +197,25 @@ class InstallDaemonWarningTest(unittest.TestCase):
 
     def test_the_wrapper_greps_the_cli_warning_prefix(self):
         source = (ROOT / "crates/cli/src/service/preflight.rs").read_text()
-        match = re.search(r'STALE_PATH_WARNING: &str = "([^"]+)";', source)
+        match = re.search(r'STALE_PATH_WARNING: &str =\s*"([^"]+)";', source)
         self.assertIsNotNone(match, "STALE_PATH_WARNING not found in preflight.rs")
         wrapper = (PACKAGING / "install-daemon.sh").read_text()
         self.assertIn(f"grep -q '{match.group(1)}'", wrapper)
+
+
+    def test_the_wrapper_names_the_refresh_before_the_loss_acceptance(self):
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        order = [
+            "service refresh-path --dry-run",
+            "then $archive_dir/pohunek service refresh-path",
+            "re-run $0 without --accept-runtime-loss",
+            "otherwise re-run $0 --accept-runtime-loss",
+        ]
+        position = -1
+        for step in order:
+            found = wrapper.find(step, position + 1)
+            self.assertGreater(found, position, f"{step!r} missing or out of order")
+            position = found
 
 
 class StageArchiveTest(unittest.TestCase):

@@ -42,6 +42,7 @@ pub mod manager_env;
 pub mod preflight;
 mod process_group;
 pub mod record;
+mod refresh;
 pub mod report;
 mod rollback;
 pub mod runtimes;
@@ -124,6 +125,21 @@ pub async fn upgrade(
         .with_runtime_loss_accepted(accept_runtime_loss)
         .upgrade(&from, VERSION)
         .await
+}
+
+/// Re-records the daemon job's search path from a fresh login-shell discovery.
+///
+/// See [`refresh::refresh_search_path`]; `dry_run` previews the change.
+///
+/// # Errors
+///
+/// Returns the errors of [`refresh::refresh_search_path`], and
+/// [`Error::InheritedLock`] when `POHUNEK_SERVICE_LOCK_TOKEN` proves no live
+/// lock holder.
+pub async fn refresh_search_path(dry_run: bool) -> Result<report::RefreshPathReport, Error> {
+    let context = Context::resolve()?;
+    let inherited = inherited_lock(&context)?;
+    refresh::refresh_search_path(&context, inherited.as_ref(), dry_run).await
 }
 
 /// Uninstalls the service.

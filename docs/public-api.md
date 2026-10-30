@@ -2711,7 +2711,8 @@ resolved (owned by the user or root, not writable by group or others). The path 
 recorded at install and reaches the daemon job only when the installer writes
 the job definition (install, or an upgrade to a different version); upgrades
 reuse the recorded list, so a manual edit takes effect only at the next
-version-changing upgrade, and an in-place refresh is tracked in #319. This key
+version-changing upgrade; `pohunek service refresh-path` re-records the path in
+place (below). This key
 raised the `service.toml` `schema_version` to 2, the `[input]` table added
 for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_ms`
 and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
@@ -2799,7 +2800,23 @@ outcome in an additive `search_path` object: `source` (`login_shell`,
 `shell_defaulted`, `login_shell_failure` (the rendered typed reason when the
 fallback list was used), and `dropped` (`[{path, reason}]`, directories refused
 as untrusted); the human output prints a `warning:` line for a failed login
-shell and for each dropped directory. A set but relative `$SHELL`, or a
+shell and for each dropped directory. `pohunek service refresh-path --json`
+runs the same discovery against an existing installation and reports `dry_run`,
+`changed`, `applied` (`changed` and not `dry_run`), `recorded` and `discovered`
+(the directories in search order), `added`, `removed`, `shell_used`,
+`shell_defaulted`, `dropped` (as above) and `warnings`; it rewrites only
+`environment.search_path` of `service.toml` (atomically, under the transaction
+lock, unknown keys kept) and stops and restarts nothing, so `service check` and
+`service upgrade` read the new path at once and the running daemon job at its
+next replacement. It fails with `service_search_path_refresh_failed` when the
+login shell fails, hangs or prints junk or yields no usable directory (the
+fallback list never replaces a recorded path), `service_search_path_unmanaged`
+where the host records no path, `service_refresh_blocked_by_transaction` while a
+transaction record exists, `service_refresh_config_schema` for a `service.toml` of another
+schema than this release writes (nothing is rewritten; run the installed release's own
+`refresh-path` when it has the command, otherwise stop the live sessions, save a copy of `service.toml`, uninstall, install the
+installed version from its archive with the same `--prefix`, reapply the non-default settings
+except the recorded `search_path`, and rerun the upgrade), and `service_not_installed`. A set but relative `$SHELL`, or a
 non-UTF-8 `HOME`, `USER`, or `LOGNAME`, fails the install
 (`service_environment_invalid`, `service_environment_not_utf8`). When the
 installer cannot resolve the search path, `pohunek service` fails with the CLI

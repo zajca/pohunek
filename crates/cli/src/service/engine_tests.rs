@@ -6,6 +6,7 @@
 //! and lives below a temporary root.
 
 use std::future::Future;
+use std::os::unix::fs::MetadataExt as _;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1227,6 +1228,313 @@ async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
     assert_eq!(recorded, first.display().to_string());
     let registered = harness.fake.world().registered.clone().expect("registered");
     assert_eq!(registered.environment().get("PATH"), Some(&recorded));
+}
+
+/// A context whose login shell runs `body` under the probe deadline `timeout`,
+/// with `fallback` as the fallback list.
+fn scripted_discovery(
+    context: &Context,
+    root: &std::path::Path,
+    body: &str,
+    timeout: std::time::Duration,
+    fallback: &std::path::Path,
+) -> Context {
+    crate::service::context::tests::make_dirs(root, fallback);
+    let shell = root.join("scripted-shell");
+    pohunek_test_support::fs::write_executable(&shell, format!("#!/bin/sh\n{body}\n"))
+        .expect("write shell");
+    let crate::service::context::PathDiscovery::Managed {
+        mut login_shell,
+        shell_defaulted,
+        ..
+    } = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery")
+    else {
+        panic!("managed discovery");
+    };
+    if let Some(spec) = login_shell.as_mut() {
+        spec.timeout = timeout;
+    }
+    context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: vec![fallback.display().to_string()],
+        })
+}
+
+async fn refresh(
+    harness: &Harness,
+    dry_run: bool,
+) -> Result<crate::service::report::RefreshPathReport, Error> {
+    crate::service::refresh::refresh_search_path(&harness.context, None, dry_run).await
+}
+
+fn config_bytes(harness: &Harness) -> Vec<u8> {
+    std::fs::read(harness.context.config_path()).expect("read service.toml")
+}
+
+#[tokio::test]
+async fn refresh_path_records_the_current_login_shell_path_and_a_second_run_changes_nothing() {
+    let mut harness = Harness::new();
+    let (old, new) = (harness.root.join("old-bin"), harness.root.join("new-bin"));
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &old);
+    harness.install(V1).await.expect("install");
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &new);
+    let before = config_bytes(&harness);
+
+    let preview = refresh(&harness, true).await.expect("dry run");
+    assert!(preview.dry_run && preview.changed && !preview.applied);
+    assert_eq!(
+        (preview.added.as_slice(), preview.removed.as_slice()),
+        (&[new.clone()][..], &[old.clone()][..])
+    );
+    assert_eq!(config_bytes(&harness), before, "a dry run writes nothing");
+
+    let applied = refresh(&harness, false).await.expect("refresh");
+    assert!(applied.changed && applied.applied);
+    assert_eq!(applied.recorded, std::slice::from_ref(&old));
+    assert_eq!(applied.discovered, std::slice::from_ref(&new));
+    assert_eq!(
+        harness
+            .config()
+            .expect("config")
+            .search_path()
+            .to_env_value(),
+        new.display().to_string()
+    );
+    assert!(harness.pending().is_none(), "no transaction record is left");
+
+    let inode = || {
+        std::fs::metadata(harness.context.config_path())
+            .expect("metadata")
+            .ino()
+    };
+    let (after, before_inode) = (config_bytes(&harness), inode());
+    let again = refresh(&harness, false).await.expect("second refresh");
+    assert!(!again.changed && !again.applied);
+    assert_eq!(
+        config_bytes(&harness),
+        after,
+        "a no-op refresh keeps the bytes"
+    );
+    assert_eq!(inode(), before_inode, "a no-op refresh replaces no file");
+}
+
+#[tokio::test]
+async fn refresh_path_follows_a_profile_link_that_moved_and_keeps_unknown_keys() {
+    use std::os::unix::fs::symlink;
+
+    let mut harness = Harness::new();
+    let (generation_one, generation_two) = (
+        harness.root.join("generation-1-bin"),
+        harness.root.join("generation-2-bin"),
+    );
+    for generation in [&generation_one, &generation_two] {
+        crate::service::context::tests::make_dirs(&harness.root, generation);
+    }
+    let link = harness.root.join("profile-bin");
+    symlink(&generation_one, &link).expect("profile link");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &link);
+    harness.install(V1).await.expect("install");
+    let canonical_one = std::fs::canonicalize(&generation_one).expect("canonical");
+    let canonical_two = std::fs::canonicalize(&generation_two).expect("canonical");
+    assert_eq!(
+        harness.config().expect("config").search_path().entries(),
+        std::slice::from_ref(&canonical_one),
+        "install records the link's target, not the link"
+    );
+    let mut text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
+    text.push_str("\n[future]\nflag = true\n");
+    std::fs::write(harness.context.config_path(), text).expect("add an unknown table");
+
+    std::fs::remove_file(&link).expect("remove link");
+    symlink(&generation_two, &link).expect("move the link");
+    let report = refresh(&harness, false).await.expect("refresh");
+
+    assert_eq!(report.removed, [canonical_one]);
+    assert_eq!(report.added, [canonical_two]);
+    assert!(
+        String::from_utf8(config_bytes(&harness))
+            .expect("utf-8")
+            .contains("flag = true"),
+        "the unknown table survives the rewrite"
+    );
+}
+
+#[tokio::test]
+async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_or_prints_junk() {
+    let deadline = pohunek_test_support::wait::HANG_GUARD;
+    for (name, body) in [
+        ("fails", "exit 1"),
+        ("prints junk", "echo 'not a path report'; exit 0"),
+    ] {
+        let mut harness = Harness::new();
+        let recorded = harness.root.join("recorded-bin");
+        let fallback = harness.root.join("fallback-bin");
+        harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+        harness.install(V1).await.expect("install");
+        harness.context =
+            scripted_discovery(&harness.context, &harness.root, body, deadline, &fallback);
+        let before = config_bytes(&harness);
+
+        let error = refresh(&harness, false).await.expect_err(name);
+
+        assert_eq!(
+            error.code(),
+            "service_search_path_refresh_failed",
+            "{name}: {error}"
+        );
+        assert_eq!(
+            config_bytes(&harness),
+            before,
+            "{name}: service.toml is unchanged"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
+    let mut harness = Harness::new();
+    let recorded = harness.root.join("recorded-bin");
+    let fallback = harness.root.join("fallback-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+    harness.install(V1).await.expect("install");
+    let started = harness.root.join("shell-started");
+    let release = harness.root.join("shell-release");
+    let body = format!(
+        "touch '{}'; while [ ! -e '{}' ] && [ -d '{}' ]; do sleep 0.01; done; exit 1",
+        started.display(),
+        release.display(),
+        harness.root.display()
+    );
+    harness.context = scripted_discovery(
+        &harness.context,
+        &harness.root,
+        &body,
+        pohunek_test_support::wait::HANG_GUARD,
+        &fallback,
+    );
+    let context = harness.context.clone();
+    let refresher = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(crate::service::refresh::refresh_search_path(
+                &context, None, false,
+            ))
+    });
+    pohunek_test_support::wait::poll_until("the login shell to start", || {
+        started.exists().then_some(())
+    });
+
+    let store = Store::new(harness.context.paths().state_dir.clone());
+    let lock = store
+        .lock()
+        .await
+        .expect("the lock is free while the login shell hangs");
+    drop(lock);
+    std::fs::write(&release, b"").expect("release the login shell");
+
+    let error = refresher
+        .join()
+        .expect("refresh thread")
+        .expect_err("the released shell fails");
+    assert_eq!(error.code(), "service_search_path_refresh_failed");
+}
+
+/// Asserts that `steps` occur in `hint` in the given order.
+fn assert_steps_in_order(hint: &str, steps: &[&str]) {
+    let mut from = 0;
+    for step in steps {
+        let Some(found) = hint[from..].find(step) else {
+            panic!("`{step}` is missing or out of order in: {hint}");
+        };
+        from += found + step.len();
+    }
+}
+
+#[tokio::test]
+async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_leaves_it_alone() {
+    let mut harness = Harness::new();
+    let recorded = harness.root.join("recorded-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+    harness.install(V1).await.expect("install");
+    let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    let before = config_bytes(&harness);
+
+    let error = refresh(&harness, false).await.expect_err("older schema");
+
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    let hint = error.hint().expect("hint");
+    assert_steps_in_order(
+        hint,
+        &[
+            "<prefix>/bin/pohunek service refresh-path",
+            "stop the live sessions",
+            "save a copy of service.toml",
+            "pohunek service uninstall",
+            "from its own archive",
+            "same --prefix",
+            "reapply the non-default settings",
+            "except `search_path`",
+            "rerun the upgrade",
+        ],
+    );
+    assert_eq!(config_bytes(&harness), before, "service.toml is untouched");
+
+    let newer = text.replacen("schema_version = 7", "schema_version = 8", 1);
+    std::fs::write(harness.context.config_path(), &newer).expect("write schema 8");
+    let error = refresh(&harness, false).await.expect_err("newer schema");
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    let hint = error.hint().expect("hint");
+    assert!(
+        hint.contains("newer release") && hint.contains("<prefix>/bin/pohunek"),
+        "{hint}"
+    );
+    assert_eq!(config_bytes(&harness), newer.into_bytes(), "untouched");
+}
+
+#[tokio::test]
+async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pending_transaction() {
+    let mut harness = Harness::new();
+    let error = refresh(&harness, false).await.expect_err("not installed");
+    assert_eq!(error.code(), "service_not_installed");
+
+    let first = harness.root.join("first-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &first);
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let error = refresh(&harness, false).await.expect_err("pending install");
+    assert_eq!(error.code(), "service_refresh_blocked_by_transaction");
+    let hint = error.hint().expect("hint");
+    assert_steps_in_order(
+        hint,
+        &[
+            "rerunning the command it names",
+            "then rerun `pohunek service refresh-path`",
+            "the record keeps blocking refresh-path",
+            "do not accept the runtime loss unless you intend to lose it",
+            "see https://github.com/zajca/pohunek/issues/1763",
+        ],
+    );
+
+    harness.install(V1).await.expect("finish the install");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    let error = refresh(&harness, false).await.expect_err("unmanaged");
+    assert_eq!(error.code(), "service_search_path_unmanaged");
 }
 
 /// A context whose discovery-only variables are unusable.
@@ -7585,33 +7893,6 @@ impl AdoptionPreflight for RuntimeOnPathPreflight {
     }
 }
 
-/// A context whose login shell fails, so discovery falls back to `fallback`.
-fn failing_discovery(
-    context: &Context,
-    root: &std::path::Path,
-    fallback: &std::path::Path,
-) -> Context {
-    crate::service::context::tests::make_dirs(root, fallback);
-    let shell = root.join("failing-shell");
-    pohunek_test_support::fs::write_executable(&shell, "#!/bin/sh\nexit 1\n").expect("write shell");
-    let crate::service::context::PathDiscovery::Managed {
-        login_shell,
-        shell_defaulted,
-        ..
-    } = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
-        .expect("discovery")
-    else {
-        panic!("managed discovery");
-    };
-    context
-        .clone()
-        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
-            login_shell,
-            shell_defaulted,
-            fallback_directories: vec![fallback.display().to_string()],
-        })
-}
-
 /// Installs with a login shell that reports a store-style directory holding
 /// `claude` 2.1.288, then upgrades with a login shell that reports the
 /// profile's directory holding `claude` 2.1.302, under the version-aware
@@ -7635,8 +7916,24 @@ async fn stale_store_path_refusal() -> (Harness, std::path::PathBuf, std::path::
 }
 
 #[tokio::test]
-async fn a_store_path_runtime_below_the_range_is_named_as_a_stale_recorded_path() {
-    let (_harness, stale, profile, error) = stale_store_path_refusal().await;
+async fn a_store_path_runtime_below_the_range_points_at_refresh_path_without_a_login_shell() {
+    let (mut harness, stale, profile, _error) = stale_store_path_refusal().await;
+    // The refusal above ran with a login shell that reports the profile; a
+    // shell that records every run shows the refusal never starts one.
+    let ran = harness.root.join("shell-ran");
+    harness.context = scripted_discovery(
+        &harness.context,
+        &harness.root,
+        &format!("touch '{}'; exit 1", ran.display()),
+        std::time::Duration::from_secs(5),
+        &harness.root.join("fallback-bin"),
+    );
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the recorded runtime is below the range");
 
     let Error::UpgradeAtRisk {
         stopped_sessions,
@@ -7654,106 +7951,67 @@ async fn a_store_path_runtime_below_the_range_is_named_as_a_stale_recorded_path(
     let [warning] = warnings.as_slice() else {
         panic!("one warning names the recorded path: {warnings:?}");
     };
-    for expected in [
-        super::preflight::STALE_PATH_WARNING,
-        stale.to_str().expect("utf-8"),
-        profile.to_str().expect("utf-8"),
-        "pohunek service uninstall",
-        "pohunek service install",
-        "do not accept the loss",
-    ] {
-        assert!(
-            warning.contains(expected),
-            "{expected} missing from {warning}"
-        );
-    }
-    assert!(
-        error.to_string().contains(stale.to_str().expect("utf-8")),
-        "{error}"
+    assert_steps_in_order(
+        warning,
+        &[
+            super::preflight::STALE_PATH_WARNING,
+            stale.to_str().expect("utf-8"),
+            "do not accept the loss",
+            "./pohunek",
+            "refresh-path --dry-run",
+            "`pohunek service refresh-path`",
+            "rerun this upgrade",
+        ],
     );
     assert!(
-        error
-            .hint()
-            .is_some_and(|hint| hint.contains("may be stale")),
-        "{:?}",
-        error.hint()
+        !warning.contains(profile.to_str().expect("utf-8")) && !warning.contains("uninstall"),
+        "{warning}"
+    );
+    assert!(!ran.exists(), "the refusal started the login shell");
+    let hint = error.hint().expect("hint");
+    assert_steps_in_order(
+        hint,
+        &[
+            "do not accept the loss",
+            "./pohunek",
+            "refresh-path --dry-run",
+            "then `pohunek service refresh-path`",
+            "then rerun the upgrade",
+            "otherwise preserve the required runtime",
+        ],
+    );
+    assert!(
+        !hint.contains("before passing --accept-runtime-loss"),
+        "{hint}"
     );
 }
 
 #[tokio::test]
-async fn re_recording_the_path_lets_the_same_upgrade_through_without_the_flag() {
+async fn refreshing_the_path_lets_the_same_upgrade_through_without_the_flag() {
     let (harness, ..) = stale_store_path_refusal().await;
 
-    harness
-        .engine()
-        .uninstall(UninstallOptions::default())
-        .await
-        .expect("uninstall");
-    harness.install(V1).await.expect("install again");
+    let refreshed = refresh(&harness, false).await.expect("refresh-path");
+    assert!(refreshed.applied);
     let report = harness
         .engine()
         .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
         .upgrade(&harness.staged(V2), V2)
         .await
-        .expect("the re-recorded path finds the current runtime");
+        .expect("the refreshed path finds the current runtime");
     assert!(!report.accepted_runtime_loss);
     harness.assert_installed(V2);
 }
 
-#[tokio::test]
-async fn a_recorded_path_that_still_matches_gets_no_stale_path_warning() {
-    let mut harness = Harness::new();
-    let same = harness.root.join("same-bin");
-    harness.context = discovering(&harness.context, &harness.root, "shell-a", &same);
-    std::fs::write(same.join("claude"), "2.1.288\n").expect("claude");
-    harness.install(V1).await.expect("install");
-
-    let error = harness
-        .engine()
-        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
-        .upgrade(&harness.staged(V2), V2)
-        .await
-        .expect_err("the runtime really is below the range");
-
-    let Error::UpgradeAtRisk { warnings, .. } = &error else {
-        panic!("{error:?}");
-    };
+#[test]
+fn an_unmanaged_host_gets_no_recorded_path_warning() {
+    let harness = Harness::new();
+    let context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
     assert!(
-        warnings
-            .iter()
-            .all(|warning| !warning.starts_with(super::preflight::STALE_PATH_WARNING)),
-        "{warnings:?}"
-    );
-    assert!(error
-        .hint()
-        .is_some_and(|hint| !hint.contains("may be stale")));
-}
-
-#[tokio::test]
-async fn a_failed_login_shell_says_nothing_about_the_recorded_path() {
-    let mut harness = Harness::new();
-    let recorded = harness.root.join("recorded-bin");
-    let fallback = harness.root.join("fallback-bin");
-    harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
-    std::fs::write(recorded.join("claude"), "2.1.288\n").expect("claude");
-    harness.install(V1).await.expect("install");
-    harness.context = failing_discovery(&harness.context, &harness.root, &fallback);
-
-    let error = harness
-        .engine()
-        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
-        .upgrade(&harness.staged(V2), V2)
-        .await
-        .expect_err("the runtime really is below the range");
-
-    let Error::UpgradeAtRisk { warnings, .. } = &error else {
-        panic!("{error:?}");
-    };
-    assert!(
-        warnings
-            .iter()
-            .all(|warning| !warning.starts_with(super::preflight::STALE_PATH_WARNING)),
-        "a fallback list is not evidence of a stale path: {warnings:?}"
+        super::preflight::recorded_path_warning(&context, "/usr/bin:/bin").is_none(),
+        "the user manager's PATH is not a recorded path"
     );
 }
 

@@ -42,6 +42,38 @@ pub struct InstallReport {
     pub runtimes: Option<EnsureReport>,
 }
 
+/// Result of `pohunek service refresh-path`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the serialized report exposes independent facts about the run"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefreshPathReport {
+    /// Whether the command only previewed the change (`--dry-run`).
+    pub dry_run: bool,
+    /// Whether the discovered path differs from the recorded one.
+    pub changed: bool,
+    /// Whether `service.toml` was rewritten: `changed` and not `dry_run`.
+    pub applied: bool,
+    /// The directories recorded before, in search order.
+    pub recorded: Vec<PathBuf>,
+    /// The directories the login shell reports now, in search order.
+    pub discovered: Vec<PathBuf>,
+    /// Discovered directories the recorded path lacks.
+    pub added: Vec<PathBuf>,
+    /// Recorded directories the discovered path lacks.
+    pub removed: Vec<PathBuf>,
+    /// The login shell that was tried.
+    pub shell_used: Option<PathBuf>,
+    /// Whether `shell_used` is the built-in default because `$SHELL` was unset.
+    pub shell_defaulted: bool,
+    /// Existing directories refused as untrusted.
+    pub dropped: Vec<DroppedPath>,
+    /// Conditions the operator should know, such as keys of `service.toml`
+    /// this version does not know.
+    pub warnings: Vec<String>,
+}
+
 /// How the daemon job's executable search path was obtained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchPathReport {

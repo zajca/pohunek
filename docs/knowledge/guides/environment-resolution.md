@@ -94,8 +94,8 @@ because another local account could plant an agent executable there. Each kept e
 and recording cover the same directory and nothing can be retargeted after the
 check. The trade-off: a profile symlink that later points elsewhere (nix
 generations, a dotfile manager) keeps the recorded target until the path is
-recorded again; #319 tracks the refresh command. An upgrade refused as at risk names a
-recorded entry that a fresh discovery would not record (see the
+recorded again with `pohunek service refresh-path`. An upgrade refused as at risk
+points to it (see the
 [upgrade runbook](../runbooks/update-after-release.md#a-recorded-search-path-that-no-longer-matches-your-profile)). Empty, relative, `.`-style, duplicate, and
 missing entries are ignored; a `PATH` containing a control character is
 garbage and fails the probe.
@@ -150,8 +150,15 @@ and at an upgrade to a different version, and upgrades reuse the recorded list
 without running a login shell, so an edit of `search_path` in `service.toml`
 takes effect only at the next version-changing upgrade; a same-version upgrade
 returns before it replaces the job. To pick up a newly installed prefix,
-uninstall and install again. A command that refreshes the path in place is
-tracked in #319.
+or a profile link that moved, run `pohunek service refresh-path`: it runs the
+login-shell discovery again, prints the directories it adds and removes, and
+rewrites only the recorded `search_path` in `service.toml`, atomically and under
+the transaction lock, without stopping or restarting anything. `--dry-run`
+previews it. `service check` and `service upgrade` judge with the new path at
+once; the running daemon job carries its `PATH` until its next replacement, a
+version-changing upgrade. A login shell that fails, hangs or prints junk is
+refused (`service_search_path_refresh_failed`): the fallback list an install
+would record then never replaces a recorded path.
 
 ## The NetBird CLI
 
