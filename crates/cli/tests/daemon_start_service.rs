@@ -250,3 +250,11 @@ fn a_linked_version_directory_is_refused() {
 
     host.assert_refused(&host.run(&["daemon", "start"]));
 }
+
+#[test]
+fn a_missing_version_directory_is_refused() {
+    let host = Host::new();
+    fs::remove_dir_all(host.version_dir()).expect("remove the version directory");
+
+    host.assert_refused(&host.run(&["daemon", "start"]));
+}
