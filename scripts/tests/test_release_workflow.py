@@ -1574,12 +1574,13 @@ class SharedGateTests(ReleaseWorkflowFiles):
 
     GATE_CALL = "uses: ./.github/workflows/gate-tests.yml"
     GATE_INPUTS = (
-        ".github/workflows/ci.yml",
         ".github/workflows/release.yml",
         ".github/workflows/gate-tests.yml",
         ".config/nextest.toml",
         "scripts/test-partitions",
         "scripts/junit-flaky-summary",
+        "rust-toolchain.toml",
+        ".github/actions/setup-rust/**",
     )
     CI_IF = (
         "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && "
@@ -1622,8 +1623,7 @@ class SharedGateTests(ReleaseWorkflowFiles):
         filter_block = re.search(r"(?m)^            release_gate:\n((?:              - .*\n)+)", self.ci)
         self.assertIsNotNone(filter_block, "the changes job has no release_gate filter")
         listed = re.findall(r"'([^']+)'", filter_block.group(1))
-        for path in self.GATE_INPUTS:
-            self.assertIn(path, listed)
+        self.assertEqual(sorted(listed), sorted(self.GATE_INPUTS))
         self.assertIn("release_gate: ${{ steps.filter.outputs.release_gate }}", self.ci)
 
     def test_the_nightly_evidence_requires_the_gate_and_the_main_tier_does_not(self):
