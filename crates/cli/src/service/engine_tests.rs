@@ -6548,8 +6548,8 @@ async fn a_prefix_reached_through_a_symlink_is_refused_before_any_version_is_del
     std::fs::rename(harness.prefix(), &moved).expect("move prefix");
     std::os::unix::fs::symlink(&moved, harness.prefix()).expect("symlink prefix");
     let sleeper = moved.join("libexec/pohunek").join(V1).join("sleeper");
-    std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
-    let mut child = spawn_tracked(std::process::Command::new(&sleeper).arg("30"));
+    pohunek_test_support::hold::install_at(&sleeper).expect("install the holding image");
+    let mut child = spawn_tracked(&mut pohunek_test_support::hold::command_for(&sleeper));
 
     let upgrade = harness.upgrade(V2).await;
     let uninstall = harness

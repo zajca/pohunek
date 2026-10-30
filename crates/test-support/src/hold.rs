@@ -10,6 +10,13 @@
 //! script such as `trap '' HUP TERM; exec <holder>` yields a marker-carrying
 //! process that survives a hangup and a termination request.
 //!
+//! A fixture that needs the long-lived process under the name of another
+//! program (an agent that process recognition matches by name) runs the image
+//! through a link ([`link_as`]) or a file of its own ([`install_at`]). A link or
+//! copy of a system binary would not do: a multicall userland such as uutils
+//! coreutils picks the applet from the name it runs under and exits on an
+//! unknown one.
+//!
 //! A test binary that starts holders declares the image once at its crate root
 //! with [`hold_image!`](crate::hold_image) and builds the command through
 //! [`command`] or, inside a shell script, [`shell_words`]. The image ends by
@@ -25,7 +32,8 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -53,6 +61,9 @@ pub const HOLD_MARKER: &str = "hold-image-marker";
 /// is the same in every binary.
 pub const HOLD_TEST: &str = "hold_image::hold";
 
+/// Arguments that make the test binary hold: it runs the holding test alone.
+pub const ARGUMENTS: [&str; 4] = ["--exact", HOLD_TEST, "--ignored", HOLD_MARKER];
+
 /// Path of the running test binary, which is also the holding image.
 ///
 /// # Panics
@@ -73,13 +84,75 @@ pub fn image() -> PathBuf {
 /// [`hold_image!`](crate::hold_image).
 #[must_use]
 pub fn command() -> Command {
-    let mut command = Command::new(image());
+    command_for(&image())
+}
+
+/// A command that runs the holding image under the name `program`.
+///
+/// `program` is a link to the image ([`link_as`]) or a file of its own
+/// ([`install_at`]); the process takes its name and command line from it. The
+/// streams are null as for [`command`].
+#[must_use]
+pub fn command_for(program: &Path) -> Command {
+    let mut command = Command::new(program);
     command
-        .args(["--exact", HOLD_TEST, "--ignored", HOLD_MARKER])
+        .args(ARGUMENTS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command
+}
+
+/// Names the holding image `path`: a symbolic link to the running test binary.
+///
+/// A fixture that needs a long-lived process under the name of an agent runs
+/// the link. Unlike a link to a system binary such as `sleep`, the image does
+/// not choose what it does from the name it runs under: a multicall userland
+/// (uutils coreutils) answers an unknown name with an error and exits.
+///
+/// # Errors
+///
+/// Returns the failure of creating the link.
+///
+/// # Panics
+///
+/// Panics when the operating system cannot report the path of the running
+/// executable.
+pub fn link_as(path: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(image(), path)
+}
+
+/// Installs the holding image at `path` as a file of its own, so that a process
+/// running it reports `path` as its executable.
+///
+/// The file is a copy of the test binary with its mode, never a hard link: a
+/// fixture may change the mode of the installed file, which must not reach the
+/// test binary. A child process makes the copy, so this process never holds a
+/// write descriptor on a file it is about to run (`ETXTBSY`, see [`crate::fs`]).
+///
+/// # Errors
+///
+/// Returns the failure of starting `cp` or its unsuccessful exit.
+///
+/// # Panics
+///
+/// Panics when the operating system cannot report the path of the running
+/// executable.
+pub fn install_at(path: &Path) -> io::Result<()> {
+    let status = Command::new("cp")
+        .arg(image())
+        .arg(path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "cp of the holding image to {} failed: {status}",
+            path.display()
+        )))
+    }
 }
 
 /// Shell words that run the holding image, with the path single-quoted.
@@ -97,12 +170,33 @@ pub fn command() -> Command {
 /// executable, or when the path is not UTF-8.
 #[must_use]
 pub fn shell_words() -> String {
-    let path = image();
-    let path = path.to_str().expect("the test binary path is UTF-8");
-    format!(
-        "'{}' --exact {HOLD_TEST} --ignored {HOLD_MARKER} </dev/null >/dev/null 2>&1",
-        path.replace('\'', r"'\''")
-    )
+    shell_words_for(&image())
+}
+
+/// [`shell_words`] for the image run under the name `program` ([`link_as`],
+/// [`install_at`]).
+///
+/// # Examples
+///
+/// ```
+/// let words = pohunek_test_support::hold::shell_words_for(std::path::Path::new("/agents/codex"));
+/// assert!(words.starts_with("'/agents/codex' --exact"));
+/// ```
+///
+/// # Panics
+///
+/// Panics when the path is not UTF-8.
+#[must_use]
+pub fn shell_words_for(program: &Path) -> String {
+    let path = program.to_str().expect("the program path is UTF-8");
+    format!("'{}' {}", path.replace('\'', r"'\''"), shell_arguments())
+}
+
+/// The arguments of a holder as shell words, ending in the redirections of
+/// [`shell_words`]; a script that names the program itself appends them to it.
+#[must_use]
+pub fn shell_arguments() -> String {
+    format!("--exact {HOLD_TEST} --ignored {HOLD_MARKER} </dev/null >/dev/null 2>&1")
 }
 
 /// Body of the holding test; only [`hold_image!`](crate::hold_image) calls it.

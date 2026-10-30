@@ -270,11 +270,16 @@ resolved_inside() (
   set -- $target
   for component do
     [ -n "$component" ] || continue
+    # A component below a regular file is refused here: readlink -e does not
+    # fail for it on every userland.
+    [ -d "$candidate" ] || exit 1
     candidate=$candidate/$component
     resolved=$(readlink -e "$candidate" && printf x) || exit 1
     case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
   done
-  # Resolve the symlink itself to retain a final slash or dot after a file.
+  case $target in */) [ -d "$candidate" ] || exit 1 ;; esac
+  # The checks above refuse a final slash or dot after a file on every
+  # userland; this resolves the link itself, so it must stay inside the root.
   resolved=$(readlink -e "$path" && printf x) || exit 1
   case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
 )

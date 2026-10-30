@@ -92,7 +92,9 @@ if [ "$mode" = reply ]; then
   printf '\033]7501;?\033\\'
   head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/reply.hex"
   if [ "$source" = fifo ]; then
-    timeout 1 head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/extra.hex"
+    stty min 0 time 10
+    head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/extra.hex"
+    stty min 1 time 0
   fi
 fi
 draw {idle}

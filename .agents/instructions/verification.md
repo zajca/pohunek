@@ -637,6 +637,10 @@ whose ownership markers the product must read runs the test binary as the holdin
 (`pohunek_test_support::hold`, declared with `hold_image!`; it returns at once under a
 plain `--ignored` run) instead of a platform binary, because macOS 27 withholds the
 environment of `/bin/sh`, `/bin/cat` and `/bin/sleep`.
+The same holds for any fixture process that must run under another program's name
+(`hold::link_as`, `hold::install_at`): a copy or link of a coreutils binary under a new name
+breaks on a multicall userland (uutils on ubuntu-26.04), which picks the applet from `argv[0]`
+and exits "unknown program".
 A copy of a shell image used as a fixture interpreter goes through
 `pohunek_test_support::fs::copy_shell_image`, because macOS 27 kills a copy of a platform binary on
 launch; the helper re-signs the copy ad hoc only when the kernel killed it.

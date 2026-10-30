@@ -2,6 +2,8 @@
 
 #![cfg(target_os = "linux")]
 
+pohunek_test_support::hold_image!();
+
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
 
@@ -365,10 +367,10 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     let dir = env.cwd();
     let fake_codex = dir.join("codex");
     let pid_file = dir.join("agent.pid");
-    symlink_sleep_as(&fake_codex);
+    pohunek_test_support::hold::link_as(&fake_codex).expect("name the fake codex");
     let script = format!(
-        "{} 60 & echo $! > {}; wait $!; sleep {SHELL_LINGER_SECS}",
-        fake_codex.display(),
+        "{} & echo $! > {}; wait $!; sleep {SHELL_LINGER_SECS}",
+        pohunek_test_support::hold::shell_words_for(&fake_codex),
         pid_file.display()
     );
     let poll_blind = PollBlindInspector::new();
@@ -453,10 +455,10 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
     let dir = env.cwd();
     let fake_agent = dir.join(agent);
     let pid_file = dir.join("agent.pid");
-    symlink_sleep_as(&fake_agent);
+    pohunek_test_support::hold::link_as(&fake_agent).expect("name the fake agent");
     let script = format!(
-        "{} {SHELL_LINGER_SECS} & echo $! > {}; wait $!",
-        fake_agent.display(),
+        "{} & echo $! > {}; wait $!",
+        pohunek_test_support::hold::shell_words_for(&fake_agent),
         pid_file.display()
     );
     let inspector = PollBlindInspector::new();
@@ -547,10 +549,10 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
     let dir = env.cwd();
     let fake_codex = dir.join("codex");
     let pid_file = dir.join("agent.pid");
-    symlink_sleep_as(&fake_codex);
+    pohunek_test_support::hold::link_as(&fake_codex).expect("name the fake codex");
     let script = format!(
-        "{} {SHELL_LINGER_SECS} & echo $! > {}; wait $!",
-        fake_codex.display(),
+        "{} & echo $! > {}; wait $!",
+        pohunek_test_support::hold::shell_words_for(&fake_codex),
         pid_file.display()
     );
     let config = SessionRegistryConfig {
@@ -711,16 +713,16 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
     let fake_codex = dir.join("codex");
     let pid_file = dir.join("nested-agent.pid");
     let missing_session_pid_file = dir.join("missing-session-agent.pid");
-    symlink_sleep_as(&fake_codex);
+    pohunek_test_support::hold::link_as(&fake_codex).expect("name the fake codex");
     let script = format!(
         "POHUNEK_DAEMON_ID=daemon-nested POHUNEK_WORKER_INSTANCE_ID=runtime-nested \
-         {} {SHELL_LINGER_SECS} & echo $! > {}; \
+         {} & echo $! > {}; \
          (unset POHUNEK_SESSION_ID; \
-         POHUNEK_DAEMON_ID=daemon-nested exec {} {SHELL_LINGER_SECS}) \
+         POHUNEK_DAEMON_ID=daemon-nested exec {}) \
          & echo $! > {}; wait",
-        fake_codex.display(),
+        pohunek_test_support::hold::shell_words_for(&fake_codex),
         pid_file.display(),
-        fake_codex.display(),
+        pohunek_test_support::hold::shell_words_for(&fake_codex),
         missing_session_pid_file.display()
     );
     let inspector = PollBlindInspector::new();
@@ -887,7 +889,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     let bin_dir = env.data_home().join("bin");
     fs::create_dir(&bin_dir).expect("create the fake agent directory");
     let fake_claude = bin_dir.join("claude");
-    symlink_sleep_as(&fake_claude);
+    pohunek_test_support::hold::link_as(&fake_claude).expect("name the fake claude");
     let inspector = PollBlindInspector::new();
     // The packages are installed before the observer starts, so its first pass
     // already watches the Claude transcript root.
@@ -1019,30 +1021,18 @@ fn native_exit_watch_is_available() -> bool {
     }
 }
 
-fn symlink_sleep_as(path: &Path) {
-    let sleep = which_sleep();
-    std::os::unix::fs::symlink(sleep, path).expect("symlink fake codex");
-}
-
 /// Starts a fake agent as a genuinely external process: it runs in the
 /// scrubbed environment of `env`, so it carries none of the pohunek ownership
 /// markers the test runner may itself have (a marked process is treated as
 /// another daemon's agent and would never surface as external).
 fn spawn_fake_agent(env: &TestEnv, program: &Path) -> Child {
     env.command(program)
-        .arg("60")
+        .args(pohunek_test_support::hold::ARGUMENTS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn fake agent")
-}
-
-fn which_sleep() -> PathBuf {
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("sleep"))
-                .find(|candidate| candidate.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from("/bin/sleep"))
 }
 
 async fn wait_for_cwd(registry: &SessionRegistry, id: &SessionId, expected: &Path) -> SessionInfo {
