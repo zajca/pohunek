@@ -392,7 +392,15 @@ For durable notification issues:
 
 The durable store is under the daemon data directory in `notifications/`.
 `notifications.jsonl` is append-only record history, while `policy.json` is the
-current persisted notification policy. Both are host-local; `--all-hosts`
+current persisted notification policy; `format.json` records the format version
+the store was written in. A store this build cannot use (a newer
+`format_version`, an unreadable marker, an action or policy it cannot decode) is
+left untouched and the daemon keeps running with notifications unavailable:
+`notification.*` calls answer `notifications_unavailable`, the daemon log says
+"notifications are unavailable", turn signals for `session.wait_turn` still
+work, and idle stop holds every session. Recover by running a build that reads
+the store, or by moving the `notifications/` directory aside and restarting the
+daemon; nothing is deleted or rewritten automatically. All three are host-local; `--all-hosts`
 commands perform client-side fan-out rather than reading a shared store.
 
 Do not treat installed config files as the daemon source of truth. A missing

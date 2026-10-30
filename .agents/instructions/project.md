@@ -90,6 +90,22 @@ reader treats an unreadable line as proof of absence. A store
 newer than the binary, or older than every kept migration, makes the daemon
 refuse to start and leaves the store untouched.
 
+The notification store (`notifications/notifications.jsonl`, `policy.json`,
+`format.json`) degrades instead. `format.json` holds `NOTIFICATIONS_FORMAT_VERSION`;
+a missing file is format 1. When it names a newer format, cannot be read, when an
+action line cannot be decoded, or when `policy.json` is rejected, the daemon still
+starts, logs a WARN with the remedy, and the notification service is unavailable:
+its RPCs answer `notifications_unavailable`, producers neither write nor compact,
+and every notification file stays byte for byte as it was. The recovery is to
+upgrade to a build that reads the format or to move the `notifications` directory
+aside. A line-level quarantine is not used, because skipping one action of an
+append-only log can resurrect a deleted record. `governance.json` and
+`identity.json` stay fail-closed: they carry identity and authorization, so a
+value or key their reader does not know refuses the start. The notification
+guard in `crates/daemon/src/notifications/store/format_guard.rs` fails when a key
+or enum value of `StoreAction`, `NotificationRecord` or `NotificationPolicy`
+changes without a format bump.
+
 The operator-facing gate of the window is the upgrade preflight: `pohunek
 service check|upgrade` run `pohunekd upgrade-preflight` of the new archive
 before any effect. It judges the dry-run store migration and every live session

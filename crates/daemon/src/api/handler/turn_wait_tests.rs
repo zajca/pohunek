@@ -118,8 +118,28 @@ impl Fixture {
         config: SessionRegistryConfig,
         policy: Option<NotificationPolicy>,
     ) -> Self {
+        Self::build(config, policy, false)
+    }
+
+    /// Builds the daemon components over a notification store written in a
+    /// newer format, which this build leaves unavailable.
+    pub(super) fn with_unavailable_store(config: SessionRegistryConfig) -> Self {
+        Self::build(config, None, true)
+    }
+
+    fn build(
+        config: SessionRegistryConfig,
+        policy: Option<NotificationPolicy>,
+        unavailable_store: bool,
+    ) -> Self {
         let root =
             Arc::new(pohunek_test_support::tempdir_with_prefix("ph-turn-").expect("fixture root"));
+        if unavailable_store {
+            let directory = root.path().join("data").join("notifications");
+            std::fs::create_dir_all(&directory).expect("create the notification directory");
+            std::fs::write(directory.join("format.json"), "{\"format_version\":99}\n")
+                .expect("write a newer format marker");
+        }
         let agents = root.path().join("agents");
         std::fs::create_dir_all(&agents).expect("create the agents dir");
         std::fs::write(
@@ -1088,6 +1108,40 @@ async fn ended_targets_are_reported_only_after_their_exit_is_recorded() {
     gate.release.notify_one();
     let stopped = ok(guard("the stop", stop).await.expect("stop task joins"));
     assert_eq!(stopped["stopped"], true);
+}
+
+#[tokio::test]
+async fn hook_turn_wakes_the_wait_while_the_notification_store_is_unavailable() {
+    let fixture = Fixture::with_unavailable_store(SessionRegistryConfig::default());
+    let session = fixture.session("unavailable").await;
+    fixture.activity(&session, "idle").await;
+    let start = fresh_cursor(&fixture, &session).await;
+    let _inhibitor = pause_clock().await;
+
+    let wait = fixture.spawn_wait(json!({
+        "session_ids": [session], "until": ["turn_completed"],
+        "after": start, "timeout_ms": LONG_WAIT_MS
+    }));
+    parked(&fixture, 1).await;
+    // The report is refused because the store is unavailable, and its turn
+    // signal still completes the wait after the debounce window.
+    let refused = err(fixture.turn_completed(&session, 1).await);
+    assert_eq!(refused.code, "notifications_unavailable");
+    settle().await;
+    tokio::time::advance(debounce().saturating_sub(Duration::from_millis(1))).await;
+    settle().await;
+    assert!(
+        !wait.is_finished(),
+        "the turn waits out the debounce window"
+    );
+    advance_until_finished(&wait, FLUSH_SLACK).await;
+    let first = ok(joined(wait).await);
+    assert_eq!(first["reason"], "event");
+    assert_eq!(first["event"]["session_id"], session);
+    assert_eq!(first["event"]["kind"], "turn_completed");
+    assert!(first["event"].get("notification_id").is_none());
+    let listed = err(fixture.call(method::NOTIFICATION_LIST, json!({})).await);
+    assert_eq!(listed.code, "notifications_unavailable");
 }
 
 #[tokio::test]

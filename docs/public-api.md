@@ -2550,7 +2550,10 @@ these hold at the deadline, re-checked under the lock that marks the session
 as stopping: the session is `running` on a live worker, its activity is
 `idle`, no `agent_blocked` or `approval_required` notification for it is
 `unread` or `read`, and no `session.input`, `session.wait` or
-`session.wait_turn` call waits on it. A held session is looked at again after
+`session.wait_turn` call waits on it. While the notification store is
+unavailable (`notifications_unavailable`) its attention records are unknown, so
+every session counts as holding one and none is stopped until the daemon runs
+over a usable store. A held session is looked at again after
 a short interval. The worktree is kept and the `session-stop` hook fires.
 The idle clock and the reported activity are memory only: after a daemon restart
 a session is armed again when it reports `idle` again, and its limit counts from
@@ -3373,6 +3376,17 @@ Important fields:
   records are acknowledged with `superseded_by` pointing at the newer turn or
   attention record that made them stale.
 
+A notification store this build cannot use safely (`notifications/format.json`
+names a newer format or cannot be read, an action line cannot be decoded, or
+`policy.json` is rejected) does not stop the daemon. Every notification RPC then
+answers the `daemon` error `notifications_unavailable` with a recovery hint (a
+create with an invalid session id or reserved dedupe key reports that validation
+error first), the
+notification files are left byte for byte as they were, and producers neither
+write nor compact until a build that reads the store runs or the `notifications`
+directory is moved aside. A hook or projector turn report is refused the same way, but its turn
+signal still reaches `session.wait_turn`.
+
 `notification.list` sorts by `created_at` descending, then `id`, and omits
 deleted records by default. `NotificationListParams` can filter by status, kind,
 severity, provider, session id, and creation time range, plus `limit` and
@@ -4029,7 +4043,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `overlay_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner`, `session_new_secret_env_relay_refused` |
-| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported`, `command_unsupported`, `package_install_commands_unsupported` |
+| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported`, `command_unsupported`, `package_install_commands_unsupported`, `notifications_unavailable` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `secret_env_not_declared`, `secret_env_missing`, `secret_env_invalid`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible`, `launch_input_invalid`, `launch_input_unavailable`, `integration_overlay_unavailable`, `integration_launch_arg_conflict`, `command_package_not_installed`, `command_not_selected`, `command_not_declared`, `command_not_exposed`, `command_package_disabled`, `command_busy`, `command_failed`, `command_timed_out`, `command_output_too_large`, `command_output_not_utf8`, `command_unavailable` |
 
