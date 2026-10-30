@@ -1154,6 +1154,35 @@ async fn a_secret_logged_off_the_test_thread_fails_the_daemon_log_scan() {
 }
 
 #[test]
+fn a_secret_logged_through_the_log_crate_fails_the_daemon_log_scan() {
+    const LOG_CRATE_SECRET: &str = "CAPTURE_MARKER_LOGCRATE_6a39";
+    let root = temp_dir("capture-log-crate");
+    let log_dir = root.path().join("daemon-logs");
+    let capture = pohunek_daemon::logging::capture(&log_dir).expect("daemon logging initializes");
+    log::warn!("{LOG_CRATE_SECRET}");
+    std::thread::spawn(|| log::warn!("{LOG_CRATE_SECRET}"))
+        .join()
+        .expect("plain thread");
+    drop(capture);
+
+    let bytes = collect_dir_bytes(&log_dir);
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(LOG_CRATE_SECRET),
+        "the capture dropped a log-crate record"
+    );
+    let scan = catch_unwind(AssertUnwindSafe(|| {
+        assert_artifacts_free_of(
+            &[("daemon structured log", &bytes)],
+            &[(LOG_CRATE_SECRET, "a secret logged through the log crate")],
+        );
+    }));
+    assert!(
+        scan.is_err(),
+        "the scan accepted a secret logged through the log crate"
+    );
+}
+
+#[test]
 fn events_outside_a_capture_never_reach_the_next_one() {
     let root = temp_dir("capture-sequence");
     let (first, second) = (root.path().join("first"), root.path().join("second"));

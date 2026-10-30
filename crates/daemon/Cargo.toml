@@ -69,6 +69,8 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 pohunek-test-support = { workspace = true, features = ["catalog"] }
 wait-timeout = "0.2"
+# The privacy sentinel emits a `log`-crate record to prove the capture bridges it.
+log = "0.4"
 # The forced-close scenarios turn their escaped holder non-dumpable (`prctl`).
 nix = { workspace = true, features = ["process"] }
 

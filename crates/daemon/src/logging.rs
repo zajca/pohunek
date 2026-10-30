@@ -115,7 +115,9 @@ fn install_capture_subscriber() -> Result<(), DaemonError> {
                 .with_env_filter(filter())
                 .with_writer(CaptureWriters.and(stderr_mirror()))
                 .finish();
-            tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
+            // `try_init` also installs the `log` bridge, like [`init`], so a
+            // `log`-crate record of a dependency reaches the capture.
+            subscriber.try_init().map_err(|error| error.to_string())
         })
         .clone()
         .map_err(DaemonError::LoggingSubscriber)
