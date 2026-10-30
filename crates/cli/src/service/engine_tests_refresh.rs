@@ -1105,3 +1105,121 @@ async fn the_entry_reads_the_schema_before_it_connects_once_discovery_succeeded(
     assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
     assert!(!connected.get(), "the service manager is not contacted");
 }
+
+/// Runs the entry with a connection that must never be requested.
+async fn entry_without_connection(context: &Context) -> Error {
+    let connected = std::cell::Cell::new(false);
+    let error = crate::service::refresh_entry(context, None, false, false, || {
+        connected.set(true);
+        async { Err(Error::SearchPathUnmanaged) }
+    })
+    .await
+    .expect_err("the entry refuses before connecting");
+    assert!(!connected.get(), "the service manager is not contacted");
+    error
+}
+
+/// A managed context whose login shell exits with a failure.
+fn failing_shell(harness: &Harness) -> Context {
+    scripted_discovery(
+        &harness.context,
+        &harness.root,
+        "exit 1",
+        pohunek_test_support::wait::HANG_GUARD,
+        &harness.root.join("fallback-bin"),
+    )
+}
+
+#[tokio::test]
+async fn the_entry_reports_a_missing_installation_before_the_unmanaged_refusal() {
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    assert!(!harness.context.config_path().exists(), "nothing installed");
+
+    let error = entry_without_connection(&harness.context).await;
+
+    assert_eq!(error.code(), "service_not_installed", "{error}");
+}
+
+#[tokio::test]
+async fn the_entry_returns_a_failed_login_shell_before_the_schema_read() {
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    harness.context = failing_shell(&harness);
+
+    let error = entry_without_connection(&harness.context).await;
+
+    assert_eq!(
+        error.code(),
+        "service_search_path_refresh_failed",
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn the_entry_returns_a_failed_login_shell_before_reading_the_record_store() {
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.context = failing_shell(&harness);
+    std::fs::write(harness.engine().store.path(), b"not a record").expect("junk record");
+
+    let error = entry_without_connection(&harness.context).await;
+
+    assert_eq!(
+        error.code(),
+        "service_search_path_refresh_failed",
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_rollback_over_a_hand_formatted_original_is_finished_by_a_rerun_after_the_restore() {
+    let r = refreshable().await;
+    // A comment survives neither the typed rewrite of the refresh nor of the
+    // rollback, so the restored file is not byte-equal to the original.
+    let original = config_bytes(&r.harness);
+    let mut annotated = b"# hand-written note\n".to_vec();
+    annotated.extend_from_slice(&original);
+    std::fs::write(r.harness.context.config_path(), &annotated).expect("annotate service.toml");
+    let harness = &r.harness;
+    let (old_env, new_env) = (
+        canonical(&r.old).display().to_string(),
+        canonical(&r.new).display().to_string(),
+    );
+    harness.fake.world().kept_process_path = Some(new_env);
+    harness.fake.world().refused_replace_path = Some(old_env.clone());
+
+    let error = refresh(harness, false)
+        .await
+        .expect_err("readiness fails and the restore fails");
+
+    assert_eq!(error.code(), "service_rollback_failed", "{error:?}");
+    assert!(harness.pending().expect("kept").rolling_back);
+    assert_eq!(recorded(harness), [canonical(&r.old)], "restored");
+    assert_ne!(
+        config_bytes(harness),
+        annotated,
+        "the restored file is the typed rendering, not the original bytes"
+    );
+    harness.fake.world().refused_replace_path = None;
+
+    let report = refresh(harness, false)
+        .await
+        .expect("the rerun finishes the rollback");
+
+    assert!(!report.applied);
+    assert_eq!(
+        report.rolled_back.map(|pending| pending.operation),
+        Some("refresh_path")
+    );
+    assert_eq!(job_path_env(harness), old_env);
+    assert_eq!(recorded(harness), [canonical(&r.old)]);
+    assert_eq!(harness.pending(), None);
+}

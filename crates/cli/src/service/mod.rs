@@ -203,17 +203,20 @@ pub(crate) async fn refresh_discovering(
 /// too, unless a refresh record is pending: resuming or rolling that back
 /// never needs the fresh path, so the engine gets the failure and carries it
 /// as a warning. The pending record is looked at without the lock; the engine
-/// decides again under it.
+/// decides again under it. A record store that cannot be read counts as no
+/// pending record: the shell failure is returned, and the engine reports the
+/// store problem under the lock once the shell works.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`refresh::discover`] that are not deferred, and the
-/// record store's error when a failed discovery has to look for a pending
-/// record.
+/// Returns the errors of [`refresh::discover`] that are not deferred.
 fn discover_for_refresh(context: &Context) -> Result<Result<refresh::Discovered, Error>, Error> {
     match refresh::discover(context) {
         Err(error @ Error::SearchPathRefreshFailed { .. }) => {
-            let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+            let pending = record::Store::new(context.paths().state_dir.clone())
+                .load()
+                .ok()
+                .flatten();
             if pending.is_some_and(|record| record.operation == record::Operation::RefreshPath) {
                 Ok(Err(error))
             } else {
