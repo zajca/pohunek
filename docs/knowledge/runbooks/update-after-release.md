@@ -998,22 +998,20 @@ current. `refresh-path` refuses while a transaction record is pending
 (`service_refresh_blocked_by_transaction`), and an interrupted upgrade leaves
 one. First rerun the command `pohunek service status` names (it resumes or
 rolls the record back), then run `pohunek service refresh-path` and the
-upgrade. Only when the resumed upgrade is refused again with the same warning
-the record cannot be refreshed around: stop the live sessions, save a
-copy of `service.toml`, remove the record with `pohunek service uninstall` (it
-checks live sessions first), then install the version that is installed now from
-its own archive with the same `--prefix`: a fresh install discovers the current
-path, so no `refresh-path` is needed. Reapply the non-default settings from the
-saved copy, but not `search_path` under `[environment]`: it is the stale value
-and the upgrade would refuse again. Then rerun the upgrade.
+upgrade. If the resumed upgrade is refused again with the same warning, the
+record keeps blocking `refresh-path`: do not accept the runtime loss unless you
+intend to lose it, and see
+https://github.com/zajca/pohunek/issues/1763 (recovery design).
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without
 touching the file. A file written by a newer release is refreshed by that
 release's own `<prefix>/bin/pohunek service refresh-path`. A file of an older
 schema is refreshed the same way when the installed release has the command
-(v0.39 and later); for a release without it, use the uninstall and fresh
-install above, with the same save, stop and reapply steps.
+(v0.39 and later); for a release without it, stop the live sessions, save a
+copy of `service.toml`, run `pohunek service uninstall`, install the version that is installed
+now from its own archive with the same `--prefix`, reapply the non-default
+settings except `search_path` under `[environment]`, and rerun the upgrade.
 
 ### Stopped sessions on an older official package version
 

@@ -952,7 +952,7 @@ impl Error {
                 "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
             ),
             Self::RefreshBlockedByTransaction => Some(
-                "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If an upgrade is refused as at risk again and again, the record cannot be resumed around: stop the live sessions, save a copy of service.toml, run `pohunek service uninstall` (it refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix (a fresh install discovers the current path), reapply the non-default settings from the copy except `search_path` under [environment], and rerun the upgrade",
+                "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it, and see https://github.com/zajca/pohunek/issues/1763 (recovery design)",
             ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")

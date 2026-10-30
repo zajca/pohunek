@@ -1522,14 +1522,9 @@ async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pen
         &[
             "rerunning the command it names",
             "then rerun `pohunek service refresh-path`",
-            "stop the live sessions",
-            "save a copy of service.toml",
-            "pohunek service uninstall",
-            "from its own archive",
-            "same --prefix",
-            "reapply the non-default settings",
-            "except `search_path`",
-            "rerun the upgrade",
+            "the record keeps blocking refresh-path",
+            "do not accept the runtime loss unless you intend to lose it",
+            "see https://github.com/zajca/pohunek/issues/1763",
         ],
     );
 
