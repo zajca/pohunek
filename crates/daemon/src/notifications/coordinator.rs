@@ -337,6 +337,7 @@ fn defer(
         signal,
         turn,
         minted,
+        ..
     } = deferred;
     let Some(dedupe_key) = record.dedupe_key.clone() else {
         // Debounced creates always carry a dedupe key; without one the record

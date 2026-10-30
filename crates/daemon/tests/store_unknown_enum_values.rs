@@ -1,7 +1,8 @@
 //! Records a newer daemon wrote with an enum value this build does not know,
 //! read after a rollback through the public daemon boundaries: the notification
 //! store, the metadata store and the host governance record. Each decode stays
-//! strict, so the value is refused and the file is left as it was.
+//! strict, so the value is refused and the file is left as it was; the
+//! notification store then reports itself unavailable instead of failing to open.
 
 // Rust guideline compliant 2026-10-28
 
@@ -65,9 +66,16 @@ fn a_notification_store_line_with_an_unknown_severity_stops_replay_and_stays_on_
         &format!("\"severity\":\"{NEWER_VALUE}\""),
     );
 
-    let error = NotificationService::open(root.path())
-        .expect_err("replay stops at a line this build cannot decode");
-    assert!(error.to_string().contains(":1"), "{error}");
+    let reopened = NotificationService::open(root.path())
+        .expect("a store this build cannot decode opens as unavailable");
+    let error = reopened
+        .list(protocol::NotificationListParams::default())
+        .expect_err("an unavailable store refuses to list");
+    assert_eq!(
+        error.to_protocol_error().code,
+        "notifications_unavailable",
+        "{error}"
+    );
     assert_eq!(
         std::fs::read_to_string(&store_path).expect("read the store again"),
         rewritten,

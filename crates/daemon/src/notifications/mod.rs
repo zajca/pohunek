@@ -57,8 +57,11 @@ pub(crate) use store::NotificationStore;
 pub(crate) struct DeferredNotification {
     /// Validated record with its id minted.
     pub(crate) record: NotificationRecord,
-    /// Whether the policy keeps the record in the inbox.
+    /// Whether the policy keeps the record in the inbox. An unavailable store
+    /// keeps nothing.
     pub(crate) inbox: bool,
+    /// Why the store cannot take the record; the turn signal is still delivered.
+    pub(crate) unavailable: Option<String>,
     /// Whether the record comes from a producer trusted to report turn events.
     pub(crate) signal: bool,
     /// The turn the record reports, when it reports one the daemon runs.
@@ -88,9 +91,12 @@ impl DeferredNotification {
         record.session_metadata = turn.metadata.clone();
     }
 
-    /// The error an immediate create of this record reports, when the policy
-    /// drops it.
+    /// The error an immediate create of this record reports, when the store
+    /// cannot take it or the policy drops it.
     pub(crate) fn policy_refusal(&self) -> Option<NotificationError> {
+        if let Some(reason) = &self.unavailable {
+            return Some(NotificationError::unavailable(reason.clone()));
+        }
         (!self.inbox).then(|| NotificationError::KindDisabled {
             provider: self.record.source.provider.clone(),
             kind: self.record.kind,
@@ -234,6 +240,14 @@ pub enum NotificationError {
         source: serde_json::Error,
     },
 
+    /// This build does not use the notification store, so notifications are
+    /// unavailable until the store is readable again.
+    #[error("notifications are unavailable: {reason}")]
+    Unavailable {
+        /// Why the store is not used.
+        reason: String,
+    },
+
     /// A requested notification does not exist.
     #[error("notification not found: {}", id.0)]
     NotFound {
@@ -336,6 +350,15 @@ impl NotificationError {
                 self.to_string(),
                 None,
             ),
+            Self::Unavailable { .. } => ProtocolError::new(
+                ErrorClass::Daemon,
+                "notifications_unavailable",
+                self.to_string(),
+                Some(
+                    "upgrade pohunek to a build that reads this notification store, or move the notifications directory aside to start a new one; the existing files were not changed"
+                        .to_owned(),
+                ),
+            ),
             Self::NotFound { .. } => ProtocolError::new(
                 ErrorClass::Runtime,
                 "notification_not_found",
@@ -436,6 +459,12 @@ impl NotificationError {
             path: path.into(),
             line,
             source,
+        }
+    }
+
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
         }
     }
 
@@ -758,7 +787,10 @@ impl NotificationService {
     /// count.
     #[must_use]
     pub fn has_active_attention(&self, session_id: &protocol::SessionId) -> bool {
-        self.inner.store.has_active_attention(session_id)
+        // Without the store the attention records are unknown, so a session is
+        // treated as awaiting the owner rather than stopped as idle.
+        self.inner.store.ensure_available().is_err()
+            || self.inner.store.has_active_attention(session_id)
     }
 
     /// Update a notification lifecycle status.
@@ -837,6 +869,16 @@ impl NotificationService {
         Ok(resolved)
     }
 
+    /// Fails with the typed unavailable error while this build does not use
+    /// the notification store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError::Unavailable`] when the store is not used.
+    pub fn ensure_available(&self) -> Result<(), NotificationError> {
+        self.inner.store.ensure_available()
+    }
+
     /// Return the current notification policy.
     #[must_use]
     pub fn policy(&self) -> NotificationPolicy {
@@ -898,6 +940,7 @@ impl NotificationService {
         &self,
         params: &NotificationRetentionParams,
     ) -> Result<NotificationRetentionResult, NotificationError> {
+        self.inner.store.ensure_available()?;
         let records = self.inner.store.all();
         let ids = policy::records_matching_retention(&records, params)?;
         if params.dry_run {
@@ -1036,6 +1079,11 @@ impl NotificationService {
         params: NotificationCreateParams,
         created_at: String,
     ) -> Result<DeferredNotification, NotificationError> {
+        let unavailable = match self.inner.store.ensure_available() {
+            Ok(()) => None,
+            Err(NotificationError::Unavailable { reason }) => Some(reason),
+            Err(other) => return Err(other),
+        };
         let mut params = normalize_params(params);
         validate_session_id(params.session_id.as_ref())?;
         validate_reserved_dedupe_key(
@@ -1044,7 +1092,8 @@ impl NotificationService {
             params.dedupe_key.as_deref(),
         )?;
         let policy = self.policy();
-        let inbox = policy_enables_kind(&policy, &params.source.provider, params.kind);
+        let inbox = unavailable.is_none()
+            && policy_enables_kind(&policy, &params.source.provider, params.kind);
         params.metadata = if inbox {
             validate_metadata(&params.metadata)?
         } else {
@@ -1078,6 +1127,7 @@ impl NotificationService {
         Ok(DeferredNotification {
             record,
             inbox,
+            unavailable,
             signal: false,
             turn: None,
             minted: Instant::now(),

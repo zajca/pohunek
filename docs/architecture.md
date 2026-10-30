@@ -1915,6 +1915,7 @@ Runtime state under the user data directory:
   notifications/
     notifications.jsonl    # durable notification action log (0600)
     policy.json             # notification, retention, and compaction policy (0600)
+    format.json             # notification store format marker (0600)
   events/                  # local bounded event journal (audit/debug, not replicated)
   worktrees/               # managed git worktrees
 ```

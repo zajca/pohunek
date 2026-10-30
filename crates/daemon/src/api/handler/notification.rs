@@ -334,6 +334,9 @@ pub(super) fn handle_notification_policy_get(
         Ok(notifications) => notifications,
         Err(resp) => return resp,
     };
+    if let Err(error) = notifications.ensure_available() {
+        return error_value(request, error.to_protocol_error());
+    }
     ok_value(
         request,
         &NotificationPolicyResult {

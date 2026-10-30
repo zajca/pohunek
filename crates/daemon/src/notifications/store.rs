@@ -29,6 +29,18 @@ const NOTIFICATIONS_LOG_NAME: &str = "notifications.jsonl";
 /// Temporary log name used for atomic notification-store compaction.
 const NOTIFICATIONS_COMPACTION_NAME: &str = "notifications.jsonl.tmp";
 
+/// File name of the notification format marker.
+///
+/// A sidecar rather than a field of the action log: builds that predate it
+/// ignore the file, and a build that meets a newer value stops using the store.
+const FORMAT_FILE_NAME: &str = "format.json";
+
+/// Format of the notification action log and policy this build reads and writes.
+///
+/// Raise it, together with a snapshot in `format_guard`, when a key or enum
+/// value of `StoreAction`, `NotificationRecord` or `NotificationPolicy` changes.
+pub(crate) const NOTIFICATIONS_FORMAT_VERSION: u32 = 1;
+
 /// File name of the durable notification policy.
 ///
 /// Policy is singleton configuration state, not notification audit history, so
@@ -63,11 +75,15 @@ pub(crate) struct NotificationStore {
     path: PathBuf,
     sources: crate::store::Store,
     state: Mutex<StoreState>,
+    /// Why this build does not use the store. The files stay as they are, no
+    /// append handle is open and every operation that needs the store fails.
+    unavailable: Option<String>,
 }
 
 #[derive(Debug)]
 struct StoreState {
-    file: File,
+    /// The append handle; `None` while the store is unavailable.
+    file: Option<File>,
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
     source_warning_logged: bool,
@@ -82,6 +98,9 @@ struct ReplayState {
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
 }
+
+#[cfg(test)]
+mod format_guard;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -131,23 +150,79 @@ impl NotificationStore {
         let dir = data_dir.join(NOTIFICATIONS_SUBDIR);
         create_private_dir(&dir)?;
         let path = dir.join(NOTIFICATIONS_LOG_NAME);
+        let sources = crate::store::Store::new(data_dir.join(pohunek_paths::METADATA_STORE_NAME));
+        if let Some(reason) = unsupported_format(&dir)? {
+            return Ok(Self::unavailable(dir, path, sources, reason));
+        }
+        if let Some(reason) = unreadable_policy(&dir)? {
+            return Ok(Self::unavailable(dir, path, sources, reason));
+        }
         let file = owner_private_append_options()
             .open(&path)
             .map_err(|source| NotificationError::io(&path, source))?;
         set_owner_private_file_permissions(&path)?;
-        let replayed = replay(&path)?;
+        let replayed = match replay(&path) {
+            Ok(replayed) => replayed,
+            Err(
+                error @ (NotificationError::StoreParse { .. }
+                | NotificationError::Unavailable { .. }),
+            ) => {
+                drop(file);
+                return Ok(Self::unavailable(dir, path, sources, error.to_string()));
+            }
+            Err(error) => return Err(error),
+        };
+        write_format_marker(&dir)?;
         Ok(Self {
             dir,
             path,
-            sources: crate::store::Store::new(data_dir.join(pohunek_paths::METADATA_STORE_NAME)),
+            sources,
             state: Mutex::new(StoreState {
-                file,
+                file: Some(file),
                 records: replayed.records,
                 action_count: replayed.action_count,
                 source_warning_logged: false,
                 contributions: HashMap::new(),
             }),
+            unavailable: None,
         })
+    }
+
+    fn unavailable(
+        dir: PathBuf,
+        path: PathBuf,
+        sources: crate::store::Store,
+        reason: String,
+    ) -> Self {
+        warn!(
+            file.path = %path.display(),
+            reason = %reason,
+            "the notification store is not used: notifications are unavailable and the \
+             store files are left untouched; upgrade pohunek to a build that reads this \
+             format, or move the notification directory aside to start a new store"
+        );
+        Self {
+            dir,
+            path,
+            sources,
+            state: Mutex::new(StoreState {
+                file: None,
+                records: BTreeMap::new(),
+                action_count: 0,
+                source_warning_logged: false,
+                contributions: HashMap::new(),
+            }),
+            unavailable: Some(reason),
+        }
+    }
+
+    /// Fails with [`NotificationError::Unavailable`] while this build does not
+    /// use the store.
+    pub(crate) fn ensure_available(&self) -> Result<(), NotificationError> {
+        match &self.unavailable {
+            Some(reason) => Err(NotificationError::unavailable(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     /// The backing JSONL file path.
@@ -280,7 +355,7 @@ impl NotificationStore {
         fs::rename(&temp_path, &self.path)
             .map_err(|source| NotificationError::io(&self.path, source))?;
 
-        state.file = replacement;
+        state.file = Some(replacement);
         state.action_count = retained_records.len();
         state.records = retained_records
             .into_iter()
@@ -353,6 +428,7 @@ impl NotificationStore {
         attention_window_secs: u64,
         minted: Instant,
     ) -> Result<CreateOutcome, NotificationError> {
+        self.ensure_available()?;
         let mut state = self
             .state
             .lock()
@@ -520,6 +596,9 @@ impl NotificationStore {
         &self,
         fallback: NotificationPolicy,
     ) -> Result<NotificationPolicy, NotificationError> {
+        if self.unavailable.is_some() {
+            return Ok(fallback);
+        }
         let path = self.policy_path();
         match fs::read_to_string(&path) {
             Ok(content) => serde_json::from_str(&content)
@@ -538,6 +617,7 @@ impl NotificationStore {
         &self,
         policy: &NotificationPolicy,
     ) -> Result<(), NotificationError> {
+        self.ensure_available()?;
         let path = self.policy_path();
         let temp_path = self.dir.join("policy.json.tmp");
         let mut file = owner_private_write_options()
@@ -605,6 +685,7 @@ impl NotificationStore {
         status: NotificationStatus,
         now: &str,
     ) -> Result<UpdateOutcome, NotificationError> {
+        self.ensure_available()?;
         let mut state = self
             .state
             .lock()
@@ -652,6 +733,7 @@ impl NotificationStore {
         id: &NotificationId,
         now: &str,
     ) -> Result<Option<NotificationRecord>, NotificationError> {
+        self.ensure_available()?;
         let mut state = self
             .state
             .lock()
@@ -753,6 +835,7 @@ impl NotificationStore {
         &self,
         params: NotificationListParams,
     ) -> Result<NotificationListResult, NotificationError> {
+        self.ensure_available()?;
         let NotificationListParams {
             status,
             kind,
@@ -832,13 +915,13 @@ fn append_action_locked(
 ) -> Result<(), NotificationError> {
     let mut line = serde_json::to_string(&action).map_err(NotificationError::serialize)?;
     line.push('\n');
-    state
+    let file = state
         .file
-        .write_all(line.as_bytes())
+        .as_mut()
+        .ok_or_else(|| NotificationError::unavailable("the notification store is not open"))?;
+    file.write_all(line.as_bytes())
         .map_err(|source| NotificationError::io(path, source))?;
-    state
-        .file
-        .flush()
+    file.flush()
         .map_err(|source| NotificationError::io(path, source))?;
     apply_action(&mut state.records, action);
     state.action_count += 1;
@@ -962,8 +1045,113 @@ fn upgrade_projector(
     existing
 }
 
+/// Why the marker in `dir` names a format this build does not read, if it does.
+///
+/// A missing marker is format 1.
+fn unsupported_format(dir: &Path) -> Result<Option<String>, NotificationError> {
+    let path = dir.join(FORMAT_FILE_NAME);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::InvalidData => {
+            return Ok(Some(format!(
+                "the notification format marker {} is not text",
+                path.display()
+            )))
+        }
+        Err(source) => return Err(NotificationError::io(&path, source)),
+    };
+    let marker = match serde_json::from_str::<FormatMarker>(&content) {
+        Ok(marker) => marker,
+        Err(error) => {
+            return Ok(Some(format!(
+                "the notification format marker {} cannot be read: {error}",
+                path.display()
+            )))
+        }
+    };
+    if marker.format_version > NOTIFICATIONS_FORMAT_VERSION {
+        return Ok(Some(format!(
+            "the notification store uses format {}, newer than the format {} this build reads",
+            marker.format_version, NOTIFICATIONS_FORMAT_VERSION
+        )));
+    }
+    Ok(None)
+}
+
+/// Why `policy.json` in `dir` cannot be read by this build, if it cannot.
+fn unreadable_policy(dir: &Path) -> Result<Option<String>, NotificationError> {
+    let path = dir.join(POLICY_FILE_NAME);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::InvalidData => {
+            return Ok(Some(format!(
+                "the notification policy {} is not text",
+                path.display()
+            )))
+        }
+        Err(source) => return Err(NotificationError::io(&path, source)),
+    };
+    let policy = match serde_json::from_str::<NotificationPolicy>(&content) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return Ok(Some(
+                NotificationError::policy_parse(&path, error).to_string(),
+            ))
+        }
+    };
+    Ok(super::validate_policy(&policy)
+        .err()
+        .map(|error| error.to_string()))
+}
+
+/// Writes the format marker atomically when it is missing.
+fn write_format_marker(dir: &Path) -> Result<(), NotificationError> {
+    let path = dir.join(FORMAT_FILE_NAME);
+    if path.exists() {
+        return Ok(());
+    }
+    let temp_path = dir.join("format.json.tmp");
+    let mut file = owner_private_write_options()
+        .open(&temp_path)
+        .map_err(|source| NotificationError::io(&temp_path, source))?;
+    serde_json::to_writer(
+        &mut file,
+        &FormatMarker {
+            format_version: NOTIFICATIONS_FORMAT_VERSION,
+        },
+    )
+    .map_err(NotificationError::serialize)?;
+    file.write_all(b"\n")
+        .map_err(|source| NotificationError::io(&temp_path, source))?;
+    file.sync_all()
+        .map_err(|source| NotificationError::io(&temp_path, source))?;
+    set_owner_private_file_permissions(&temp_path)?;
+    fs::rename(&temp_path, &path).map_err(|source| NotificationError::io(&path, source))?;
+    File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| NotificationError::io(dir, source))
+}
+
+/// The `format.json` document.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormatMarker {
+    format_version: u32,
+}
+
 fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
-    let content = fs::read_to_string(path).map_err(|source| NotificationError::io(path, source))?;
+    let content = fs::read_to_string(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::InvalidData {
+            NotificationError::unavailable(format!(
+                "the notification log {} is not text",
+                path.display()
+            ))
+        } else {
+            NotificationError::io(path, source)
+        }
+    })?;
     let mut records = BTreeMap::new();
     let mut action_count = 0;
     for (index, raw_line) in content.split_inclusive('\n').enumerate() {
@@ -1460,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_corrupt_mid_file_action() {
+    fn a_corrupt_mid_file_action_makes_the_store_unavailable_and_leaves_the_log() {
         let data_dir = temp_data_dir("mid-file-corrupt");
         let store = NotificationStore::open(&data_dir).expect("open store");
         let first = record("n-1", "2026-07-03T10:00:00Z");
@@ -1483,14 +1671,18 @@ mod tests {
         )
         .expect("write corrupt mid-file log");
 
-        let err = NotificationStore::open(&data_dir)
-            .expect_err("mid-file corrupt action must fail store open");
+        let corrupt = std::fs::read(&path).expect("read corrupt log");
 
-        assert_eq!(err.to_protocol_error().code, "notification_store_error");
-        match err {
-            super::super::NotificationError::StoreParse { line, .. } => assert_eq!(line, 2),
-            other => panic!("expected StoreParse error, got {other:?}"),
-        }
+        let store = NotificationStore::open(&data_dir)
+            .expect("a mid-file corrupt action leaves the daemon able to start");
+
+        let err = store.ensure_available().expect_err("the store is not used");
+        assert_eq!(err.to_protocol_error().code, "notifications_unavailable");
+        assert_eq!(
+            std::fs::read(&path).expect("read log again"),
+            corrupt,
+            "the log is left as it was"
+        );
     }
 
     #[test]

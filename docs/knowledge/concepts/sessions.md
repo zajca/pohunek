@@ -1169,8 +1169,10 @@ The clock starts when the agent's activity becomes `idle` and restarts on every
 activity change; a daemon restart starts it again when the session is adopted. A
 session is never stopped while it is `working` or `blocked`, while an
 `agent_blocked` or `approval_required` notification for it is still unread or
-read (acknowledge it first), or while a `session.input`, `session.wait` or
-`session.wait_turn` call waits on it. The stop is an ordinary `session stop`: the
+read (acknowledge it first), while a `session.input`, `session.wait` or
+`session.wait_turn` call waits on it, or while the notification store is
+unavailable (its attention records are then unknown, so no session is stopped
+until the daemon runs over a usable store). The stop is an ordinary `session stop`: the
 worktree is kept, the `session-stop` hook fires, and the session can be resumed.
 The idle clock and the reported activity are memory only, so after a daemon
 restart a session is armed again when it reports `idle` again.
