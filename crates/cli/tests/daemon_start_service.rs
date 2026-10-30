@@ -165,17 +165,11 @@ impl Host {
         );
         assert!(
             stderr.contains(
-                "hint: make sure nothing runs from that version directory and remove it, then"
+                "hint: the active version directory is untrusted or missing: make sure nothing runs from it"
             ),
-            "the refusal names the way to replace the active version: {stderr}"
+            "the refusal carries the daemon start hint: {stderr}"
         );
-        for step in [
-            "pohunek service upgrade",
-            "--stop-sessions",
-            "save a copy of service.toml",
-        ] {
-            assert!(stderr.contains(step), "the hint names `{step}`: {stderr}");
-        }
+        assert!(stderr.contains("issues/1763"), "{stderr}");
         assert!(!self.marker().exists(), "the daemon must not run");
     }
 }
