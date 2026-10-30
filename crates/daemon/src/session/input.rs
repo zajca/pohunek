@@ -322,16 +322,31 @@ impl SessionRegistry {
                     .take();
                 // A transaction finishes both plans even when the caller goes
                 // away, so a typed body is never left without its Enter.
+                let registry = self.clone();
                 self.spawn_transaction("delayed_input", async move {
                     let _input_guard = input_guard;
-                    write_delayed_input(
+                    let outcome = write_delayed_input(
                         &worker,
                         writes,
                         || turns.note_input(&session_id),
                         #[cfg(test)]
                         delay_boundary,
                     )
-                    .await
+                    .await;
+                    match outcome {
+                        Err(DelayedInputFailure::Enter(error))
+                            if !registry.input_runtime_running(&session_id).await =>
+                        {
+                            // The process ended after the text arrived, so
+                            // Enter has nothing left to reach.
+                            debug!(error = %error, "Enter skipped: the runtime ended after the text was delivered");
+                            Ok(())
+                        }
+                        Err(
+                            DelayedInputFailure::Text(error) | DelayedInputFailure::Enter(error),
+                        ) => Err(error),
+                        Ok(()) => Ok(()),
+                    }
                 })
                 .await
                 .map_err(|error| worker_input_task_error(&error))?
@@ -1249,6 +1264,14 @@ fn worker_input_task_error(_error: &tokio::task::JoinError) -> ProtocolError {
     )
 }
 
+/// Which plan of a delayed input failed.
+enum DelayedInputFailure {
+    /// The text plan failed, so nothing was delivered.
+    Text(WorkerError),
+    /// The text arrived and Enter could not be delivered.
+    Enter(WorkerError),
+}
+
 /// Writes the body, waits the submit delay and writes Enter as a second plan.
 ///
 /// Neither plan holds the worker's control connection while the delay runs, so
@@ -1259,21 +1282,25 @@ async fn write_delayed_input(
     writes: InputWritePlan,
     note_input: impl FnOnce(),
     #[cfg(test)] delay_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
-) -> Result<(), WorkerError> {
+) -> Result<(), DelayedInputFailure> {
     let delay = writes.submit_delay;
     if writes.body.is_empty() {
         worker
             .reserve_write(vec![enter_fragment(Duration::ZERO)])
-            .await?
+            .await
+            .map_err(DelayedInputFailure::Text)?
             .commit(note_input)
-            .await?;
+            .await
+            .map_err(DelayedInputFailure::Text)?;
         return Ok(());
     }
     worker
         .reserve_write(vec![body_fragment(writes.body)])
-        .await?
+        .await
+        .map_err(DelayedInputFailure::Text)?
         .commit(note_input)
-        .await?;
+        .await
+        .map_err(DelayedInputFailure::Text)?;
     #[cfg(test)]
     if let Some(delay_boundary) = delay_boundary {
         delay_boundary.wait().await;
@@ -1282,9 +1309,11 @@ async fn write_delayed_input(
     tokio::time::sleep(delay).await;
     worker
         .reserve_write(vec![enter_fragment(Duration::ZERO)])
-        .await?
+        .await
+        .map_err(DelayedInputFailure::Enter)?
         .commit(|| {})
-        .await?;
+        .await
+        .map_err(DelayedInputFailure::Enter)?;
     Ok(())
 }
 
@@ -1295,6 +1324,14 @@ fn worker_write_task_result(
 }
 
 impl SessionRegistry {
+    /// Whether `session_id` still has a live runtime that input can reach.
+    async fn input_runtime_running(&self, session_id: &SessionId) -> bool {
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .is_some_and(|entry| input_runtime_identity(entry, session_id).is_ok())
+    }
+
     /// Consumes the acknowledgement of a worker input whose caller stopped waiting.
     fn shield_worker_ack(
         &self,

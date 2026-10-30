@@ -7834,7 +7834,12 @@ const DELAYED_SUBMIT_TUI: &str = "while IFS= read -r line; do echo got:$line; do
 /// TUI answers `got:<line>` only once it receives Enter, so the screen shows
 /// whether Enter was written.
 fn delayed_submit_registry(tag: &str) -> SessionRegistry {
-    let body = format!("program = \"/bin/sh\"\nargs = [\"-c\", '{DELAYED_SUBMIT_TUI}']\n");
+    delayed_submit_registry_running(tag, DELAYED_SUBMIT_TUI)
+}
+
+/// [`delayed_submit_registry`] whose fake TUI runs the shell script `tui`.
+fn delayed_submit_registry_running(tag: &str, tui: &str) -> SessionRegistry {
+    let body = format!("program = \"/bin/sh\"\nargs = [\"-c\", '{tui}']\n");
     let agents_dir =
         temp_agents_dir_with(tag, "delayed-codex", &format!("base = \"codex\"\n{body}"));
     std::fs::write(
@@ -8062,7 +8067,7 @@ async fn stop_between_body_and_enter(
     id: &SessionId,
     delay_boundary: &tokio::sync::Barrier,
     request: tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>,
-) -> protocol::ProtocolError {
+) -> Result<protocol::SessionInputResult, protocol::ProtocolError> {
     reach_boundary(delay_boundary).await;
     pohunek_test_support::wait::guard(
         "the stop to be served while the submit delay is pending",
@@ -8071,10 +8076,7 @@ async fn stop_between_body_and_enter(
     .await
     .expect("stop between the body and Enter");
     reach_boundary(delay_boundary).await;
-    request
-        .await
-        .expect("input task joins")
-        .expect_err("Enter must not reach a stopped session")
+    request.await.expect("input task joins")
 }
 
 #[tokio::test]
@@ -8091,7 +8093,9 @@ async fn delayed_wait_input_serves_a_stop_while_the_submit_delay_runs() {
         5_000,
     );
 
-    let error = stop_between_body_and_enter(&registry, &id, &delay_boundary, request).await;
+    let error = stop_between_body_and_enter(&registry, &id, &delay_boundary, request)
+        .await
+        .expect_err("Enter must not reach a stopped session");
     assert_eq!(error.code, "session_not_running", "{error:?}");
 }
 
@@ -8115,9 +8119,48 @@ async fn delayed_plain_input_serves_a_stop_while_the_submit_delay_runs() {
         }
     });
 
-    let error = stop_between_body_and_enter(&registry, &id, &delay_boundary, request).await;
-    // The plain path has no session re-check: Enter meets the stopped worker.
-    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
+    // Plain input is fire-and-forget: the text was delivered and the stopped
+    // process leaves Enter nothing to reach.
+    stop_between_body_and_enter(&registry, &id, &delay_boundary, request)
+        .await
+        .expect("the text was delivered before the stop");
+}
+
+#[tokio::test]
+async fn delayed_plain_input_succeeds_when_the_agent_exits_before_enter() {
+    // The text ends with a newline, so the fake TUI reads its line and exits
+    // while the submit delay is still pending.
+    let registry =
+        delayed_submit_registry_running("delayed-plain-exit", "IFS= read -r line; echo got:$line");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "exit-marker\n".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    reach_boundary(&delay_boundary).await;
+    wait_until("the session to leave running", || async {
+        let info = registry.inspect(&id).await.ok()?;
+        (info.state != protocol::SessionState::Running).then_some(())
+    })
+    .await;
+    reach_boundary(&delay_boundary).await;
+
+    request
+        .await
+        .expect("input task joins")
+        .expect("the text was delivered; Enter has no process left to reach");
 }
 
 #[tokio::test]

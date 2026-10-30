@@ -138,7 +138,8 @@ delay, re-checks activity and the runtime under the session lock, and only then
 writes Enter, holding the input gate across both writes. The worker
 connection is released once the body is acknowledged, so resize, stop and
 observation requests are served during the delay. Plain (fire-and-forget)
-delayed input uses the same two plans and always writes Enter. For waited input,
+delayed input uses the same two plans and writes Enter, unless the process
+ended after the text was delivered, which still succeeds. For waited input,
 if the agent turned `blocked` meanwhile, or the deadline or a shutdown
 arrives before Enter, Enter is not written and the call fails with
 `session_input_not_submitted`; the typed text may remain in the input box
