@@ -613,19 +613,30 @@ dispatch CI or push either ref. The Release workflow
 (`.github/workflows/release.yml`) re-runs the gates on the tag and then builds,
 assembles and publishes the release in one fixed flow.
 
-The `gate` job tests the way CI does: it builds the `cargo nextest archive
+The `gate` job calls the reusable workflow `.github/workflows/gate-tests.yml`
+and tests the way CI does: it builds the `cargo nextest archive
 --profile ci --workspace --all-features` archive, proves the shards of
 `scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy` and
 `relay-db` under their bounded profiles, the PostgreSQL URL set for
 `relay-db` only), and runs the doctests with `cargo test --doc --workspace
 --all-features`, because nextest runs none. Every shard runs before the step
-fails, so one red shard does not hide another. It differs from a PR run in
-these ways: it runs the full set (no selection, no sparse tree), it runs in the
+fails, so one red shard does not hide another. The same workflow runs in CI as
+the job `release gate (full test set)`: in the nightly tier (schedule or a
+`tier=nightly` dispatch) and on a pull request that changes one of its inputs
+(`release.yml`, `gate-tests.yml`, `.config/nextest.toml`,
+`scripts/test-partitions`, `scripts/junit-flaky-summary`, the toolchain and
+cache actions), so a break in the gate shows between releases, and the nightly
+evidence the tag requires includes it. The workflow takes no input, holds only
+`contents: read`, and runs on ubuntu-24.04. It differs from a PR run in these
+ways: it runs the full set (no selection, no sparse tree), it runs in the
 checkout that built the archive, it builds with the job's `-C
-link-arg=-fuse-ld=mold` and sccache, it keeps the shard JUnit reports in the step
-summary only (no artifact upload), and it does not run the script regressions or
-the toolchain-pin check, which the `core` shard job runs and the main and nightly
-evidence of the release commit already covers.
+link-arg=-fuse-ld=mold` and sccache, and it uploads no artifact: the step
+summary holds only the flaky and failed tests of each shard (`target/nextest` is
+removed before each shard). It does not run the script regressions or the
+toolchain-pin check, which the `core` shard job runs, nor CI's ignored-test
+jobs (real systemd supervision, the four `*-package` jobs with
+`--run-ignored all`, the macOS lane and tier, the test selection audit); the
+main and nightly evidence of the release commit covers those.
 
 1. **Producers** upload workflow artifacts only: `release-build.yml` (reusable)
    builds the glibc and MUSL x86_64 CLI and daemon archives and the glibc relay

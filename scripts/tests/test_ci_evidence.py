@@ -520,8 +520,12 @@ class CiEvidenceCliTests(unittest.TestCase):
             [],
         )
         # Apart from the rehearsal, the nightly tier differs from main only by
-        # its nightly-only relay database suite and the G3 test selection audit.
-        nightly_only = {"tests (relay DB, PostgreSQL)", "test selection audit (G3)"}
+        # its nightly-only relay database suite, the G3 test selection audit and the release gate's test steps.
+        nightly_only = {
+            "tests (relay DB, PostgreSQL)",
+            "test selection audit (G3)",
+            "release gate (full test set) / fmt + clippy + test",
+        }
         self.assertEqual(
             set(config["required_jobs"]["main"]),
             set(config["required_jobs"]["nightly"]) - set(rehearsal) - nightly_only,

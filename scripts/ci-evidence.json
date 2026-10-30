@@ -88,7 +88,8 @@
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-24.04)",
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",
-      "tests (relay DB, PostgreSQL)"
+      "tests (relay DB, PostgreSQL)",
+      "release gate (full test set) / fmt + clippy + test"
     ]
   },
   "required_steps": {

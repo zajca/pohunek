@@ -2924,7 +2924,10 @@ class RunnerImageTests(unittest.TestCase):
     """
 
     GLIBC_FLOOR = {"release-build", "build-bins", "sdk"}
-    FLOOR_WORKFLOWS = ("release.yml", "release-build.yml", "release-evidence.yml", "upgrade.yml")
+    IMAGE_EXPRESSION = re.compile(r"\$\{\{[^}]*\b(?:matrix\.(?:os|runner|image)|runner\.(?:image|name))\b")
+    FLOOR_WORKFLOWS = (
+        "release.yml", "release-build.yml", "release-evidence.yml", "gate-tests.yml", "upgrade.yml",
+    )
 
     @staticmethod
     def runner(job: str) -> str:
@@ -2962,7 +2965,7 @@ class RunnerImageTests(unittest.TestCase):
         for image, text in entries:
             for step in text.split("uses: Swatinem/rust-cache")[1:]:
                 step = re.split(r"(?m)^\s*- ", step, maxsplit=1)[0]
-                key = re.search(r"(?m)^\s+shared-key: (\S+)\s*$", step)
+                key = re.search(r"(?m)^\s+shared-key: (.+?)\s*$", step)
                 save = re.search(r"(?m)^\s+save-if: (.+)$", step)
                 if key:
                     uses.append((key.group(1), image, save is None or save.group(1) != "false"))
@@ -2974,14 +2977,20 @@ class RunnerImageTests(unittest.TestCase):
         the one that saves them."""
         savers = collections.defaultdict(set)
         images = collections.defaultdict(set)
+        unresolvable = set()
         for key, image, saves in cls.cache_uses(entries):
+            # A key with an expression is compared as its template. An
+            # expression that picks the image cannot be compared, so it is
+            # refused.
+            if cls.IMAGE_EXPRESSION.search(key):
+                unresolvable.add(key)
             images[key].add(image)
             if saves:
                 savers[key].add(image)
-        return sorted(
+        return sorted(unresolvable | {
             key for key, saving in savers.items()
             if len(saving) != 1 or min(images[key]) < max(saving)
-        )
+        })
 
     def test_a_cache_is_never_restored_on_an_older_image_than_the_one_that_saved_it(self):
         workflows = ROOT / ".github" / "workflows"
@@ -2998,6 +3007,22 @@ class RunnerImageTests(unittest.TestCase):
             return (f"      - uses: Swatinem/rust-cache@abc\n        with:\n"
                     f"          shared-key: {key}\n{save_if}")
         restore = "          save-if: false\n"
+        # A key with an expression is kept whole and compared as its template.
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-26.04", step("bins-${{ matrix.part }}")),
+            ("ubuntu-24.04", step("bins-${{ matrix.part }}", restore)),
+        ]), ["bins-${{ matrix.part }}"])
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-24.04", step("bins-${{ matrix.part }}")),
+            ("ubuntu-26.04", step("bins-${{ matrix.part }}", restore)),
+        ]), [])
+        # An expression that selects the image cannot be compared: refused.
+        for key in ("bins-${{ matrix.os }}", "bins-${{ runner.image }}"):
+            with self.subTest(key=key):
+                self.assertEqual(self.cache_direction_violations([
+                    ("ubuntu-24.04", step(key)),
+                ]), [key])
+
         self.assertEqual(self.cache_direction_violations([
             ("ubuntu-26.04", step("bins")),
             ("ubuntu-24.04", step("bins", restore)),

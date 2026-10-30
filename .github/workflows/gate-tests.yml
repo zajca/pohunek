@@ -1,0 +1,148 @@
+name: Gate tests
+
+# The release gate's test steps: format, clippy, the nextest archive, the
+# partition proof, every shard, the doctests and the dependency audit, on the
+# full workspace (the workflow takes no input, so no selection or sparse tree
+# can narrow it). One definition serves both callers:
+# - release.yml `gate` runs it on a release tag, after the exact-commit
+#   evidence check;
+# - ci.yml `release-gate` runs it in the nightly tier and on a pull request
+#   that changes one of its inputs, so a break shows before the next tag.
+# The called workflow holds only `contents: read` and receives no secret. The
+# PostgreSQL service lives in the job because a called workflow cannot use its
+# caller's services.
+
+# The gate stays on ubuntu-24.04 (#1731), never ubuntu-latest, like the release
+# jobs it guards.
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Disable incremental compilation: rust-cache strips incremental artifacts
+  # before persisting anyway (issue #124).
+  CARGO_INCREMENTAL: "0"
+  # Each Rust job's .github/actions/setup-sccache step exports RUSTC_WRAPPER
+  # once the pinned sccache is verified in place. Bump SCCACHE_VERSION together
+  # with release-build.yml and release.yml.
+  SCCACHE_VERSION: "0.18.0"
+  SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+
+jobs:
+  tests:
+    name: fmt + clippy + test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: pohunek_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pohunek_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt, clippy
+
+      - name: Enable sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
+          sha256: ${{ env.SCCACHE_SHA256 }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-
+
+      # xtask::dependency_policy resolves the locked graph with `--offline`, so
+      # every locked package source must already be in the cargo registry.
+      - name: Fetch locked dependency sources
+        run: cargo fetch --locked
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
+      # The gate runs the tests the way CI does: one archive of the workspace
+      # test binaries, shards proven exhaustive and disjoint, one nextest
+      # process per test. The archive holds `pohunek-sessiond`, which the daemon
+      # tests spawn by path (`archive.include` in .config/nextest.toml makes
+      # its absence a build error).
+      - name: Archive workspace test binaries
+        run: cargo nextest archive --profile ci --workspace --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+
+      - name: Verify exhaustive disjoint test partitions
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" check
+
+      # Every shard runs before the step fails, so one red shard does not hide
+      # another. Only the relay-db shard sees the PostgreSQL service, as in CI.
+      - name: Test
+        shell: bash
+        env:
+          # Resolved at step level: the `job` context is not available in
+          # job-level `env`, where it makes the whole workflow invalid.
+          RELAY_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
+        run: |
+          set -uo pipefail
+          archive="$RUNNER_TEMP/nextest-archive.tar.zst"
+          failed=()
+          for shard in core daemon relay cli relay-db heavy; do
+            rm -rf target/nextest
+            echo "::group::shard $shard"
+            if [ "$shard" = relay-db ]; then
+              POHUNEK_RELAY_TEST_DATABASE_URL="$RELAY_DATABASE_URL" python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
+            else
+              python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
+            fi
+            echo "::endgroup::"
+            if [ "$shard" = heavy ]; then
+              python3 scripts/junit-flaky-summary --label "$shard" target/nextest/heavy/junit.xml
+            elif [ "$shard" = relay-db ]; then
+              python3 scripts/junit-flaky-summary --label "$shard" target/nextest/relay-db/junit.xml
+            else
+              python3 scripts/junit-flaky-summary --label "$shard" target/nextest/ci/junit.xml
+            fi
+          done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "::error::failed test shards: ${failed[*]}"
+            exit 1
+          fi
+
+      # nextest runs no doctests.
+      - name: Documentation tests
+        run: cargo test --doc --workspace --all-features
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-audit
+
+      - name: Audit release dependencies
+        run: cargo audit
