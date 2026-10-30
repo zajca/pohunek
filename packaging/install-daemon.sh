@@ -254,8 +254,8 @@ if ! check_json=$("$archive_dir/pohunek" "$@"); then
     echo "nothing was changed; fix the reported problem and re-run $0" >&2
     if printf '%s\n' "$check_json" | grep -q 'service_upgrade_sessions_at_risk'; then
         echo "live sessions the upgrade would not carry over are listed above; re-run $0 --accept-runtime-loss to accept losing them" >&2
-        if printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with lists'; then
-            echo "the refusal also warns that the recorded search path may be stale; follow that warning before accepting the loss" >&2
+        if printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with is recorded in service.toml:'; then
+            echo "the refusal also names the recorded search path; if a runtime moved, follow that warning (pohunek service refresh-path) before accepting the loss" >&2
         fi
     fi
     exit 1

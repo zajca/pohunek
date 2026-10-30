@@ -208,76 +208,38 @@ pub async fn gate_upgrade(
     }
     match decide(report, accept_runtime_loss, acceptance) {
         Err(refusal @ Error::UpgradeAtRisk { .. }) => {
-            let warning = stale_recorded_path_warning(context, search_path);
+            let warning = recorded_path_warning(context, search_path);
             Err(refusal.with_warnings(warning.as_slice()))
         }
         decided => decided,
     }
 }
 
-/// Start of the warning an at-risk refusal carries when the search path the
-/// upgrade judged with differs from the one a new install would record.
-/// [`Error::hint`] keys on it.
-pub(super) const STALE_PATH_WARNING: &str = "the search path this upgrade judged with lists";
+/// Start of the warning an at-risk refusal of a managed installation carries.
+/// [`Error::hint`] and `packaging/install-daemon.sh` key on it.
+pub(super) const STALE_PATH_WARNING: &str =
+    "the search path this upgrade judged with is recorded in service.toml:";
 
-/// Names the `PATH` entries a new install would not record, when the upgrade
-/// refuses sessions as at risk.
+/// Names the recorded search path and the command that refreshes it, when the
+/// upgrade refuses sessions as at risk.
 ///
 /// The upgrade judges runtimes with the `PATH` the daemon job carries, which
 /// `service.toml` records at install. A Nix profile update leaves that entry
 /// pointing at the store path of an older generation: the runtime found there
 /// can be older than the one the login shell resolves now, and the sessions
-/// look at risk although the runtime is current. The comparison needs a
-/// successful login-shell discovery (macOS); a fallback list, a failed shell
-/// or an unmanaged `PATH` says nothing. The order of entries is not compared.
-/// Running the discovery runs the user's login shell once, as `service check`
-/// does for an install, and only on the refusal path.
-fn stale_recorded_path_warning(context: &Context, judged: &str) -> Option<String> {
-    let (fresh, report) = context.install_search_path().ok()?;
-    if report.source != "login_shell" || report.login_shell_failure.is_some() {
+/// look at risk although the runtime is current. The warning is static: it
+/// never runs the login shell, which `pohunek service refresh-path --dry-run`
+/// does outside any lock. An installation that records no path (the Linux user
+/// manager's `PATH`) gets none.
+fn recorded_path_warning(context: &Context, judged: &str) -> Option<String> {
+    if !context.records_search_path() || judged.is_empty() {
         return None;
     }
-    let fresh: Vec<String> = fresh
-        .entries()
-        .iter()
-        .map(|entry| entry.display().to_string())
-        .collect();
-    if fresh.is_empty() {
-        return None;
-    }
-    let judged: Vec<&str> = judged
-        .split(':')
-        .filter(|entry| !entry.is_empty())
-        .collect();
-    let stale: Vec<&str> = judged
-        .iter()
-        .copied()
-        .filter(|entry| !fresh.iter().any(|current| current == entry))
-        .collect();
-    if stale.is_empty() {
-        return None;
-    }
-    let current: Vec<&str> = fresh
-        .iter()
-        .map(String::as_str)
-        .filter(|entry| !judged.contains(entry))
-        .collect();
     Some(format!(
-        "{STALE_PATH_WARNING} {} which a new install would not record (it would record {}); \
-         a runtime found there may be older than the one your login shell resolves now, for \
-         example after a Nix profile update. If that is the cause, do not accept the loss: \
-         save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata \
-         and refuses while sessions are live), reinstall the version that is installed now from its own archive with the \
-         same --prefix (`pohunek service install`), reapply the non-default settings from the \
-         saved copy except `search_path` under [environment] (restoring it brings the stale \
-         path back and the upgrade refuses again), and rerun this upgrade. Installing the new \
-         release directly after the uninstall skips this check",
-        stale.join(", "),
-        if current.is_empty() {
-            "no replacement".to_owned()
-        } else {
-            current.join(", ")
-        }
+        "{STALE_PATH_WARNING} {judged}; if a runtime moved since it was recorded, for example \
+         after a Nix profile update, do not accept the loss: compare with \
+         `pohunek service refresh-path --dry-run`, record the current path with \
+         `pohunek service refresh-path`, and rerun this upgrade"
     ))
 }
 

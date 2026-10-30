@@ -335,6 +335,17 @@ impl Context {
         Ok(Namespace::derive(self.uid, &state, &runtime))
     }
 
+    /// Whether an install of this host records a search path in `service.toml`
+    /// (macOS login-shell discovery) instead of leaving it to the service
+    /// manager. Reads no environment and runs no shell.
+    #[must_use]
+    pub fn records_search_path(&self) -> bool {
+        match &self.path_discovery {
+            DiscoverySource::Fixed(discovery) => *discovery != PathDiscovery::Unmanaged,
+            DiscoverySource::Environment { managed, .. } => *managed,
+        }
+    }
+
     /// Resolves the executable search path a fresh install records.
     ///
     /// Empty for [`PathDiscovery::Unmanaged`]. Otherwise the tier order of

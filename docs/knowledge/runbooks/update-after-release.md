@@ -979,19 +979,20 @@ The refusal is `service_upgrade_sessions_at_risk` and offers
 sessions.
 
 On macOS, where the install discovers the path through your login shell, the
-refusal also carries a warning when a fresh discovery succeeds and would record
-a different path: it names the entries that discovery would not record and the
-entries it would record instead. (A failed login shell, the fallback list and a
-Linux install, which records the user manager's `PATH`, give no such warning.)
-If the warning matches your situation, do not accept the loss. Re-record the
-path: save a copy of `service.toml`, run `pohunek service uninstall` (it keeps
-durable metadata and refuses while sessions are live; stop them first),
-reinstall the version that is installed now from its own archive with the same
-`--prefix`, reapply the non-default settings from the saved copy, and rerun the
-upgrade. Do not restore `search_path` under `[environment]` from the saved copy:
-it is the stale value, and the upgrade would refuse again. Installing the new release directly after the uninstall skips this
-check, so sessions that were at risk are not reported. A command that refreshes
-the path in place is tracked in #319.
+refusal also carries a warning that names the recorded path the upgrade judged
+with. It runs no login shell. (A Linux install records no path, because the
+user manager's `PATH` applies, and gets no such warning.) If a runtime moved
+since the path was recorded, do not accept the loss. Compare with
+`pohunek service refresh-path --dry-run`, which runs the login-shell discovery
+as install does and prints the directories it would add and remove, record the
+current path with `pohunek service refresh-path`, and rerun the upgrade. The
+command changes only the recorded path in `service.toml`, takes the transaction
+lock only after the discovery, and refuses while an install or upgrade record
+is pending. Nothing is stopped or restarted: `service check` and `service
+upgrade` judge with the new path at once, and the running daemon job gets it at
+its next replacement. Do not use `--accept-runtime-loss` for this cause, since
+it would drop resume and fork for the listed sessions although the runtime is
+current.
 
 ### Stopped sessions on an older official package version
 

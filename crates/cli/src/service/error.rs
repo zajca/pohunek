@@ -846,7 +846,7 @@ impl Error {
                     .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING)) =>
             {
                 Some(
-                    "the warning names a search path that may be stale: re-record it as the warning describes before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions",
+                    "the warning names the recorded search path, which may be stale: refresh it with `pohunek service refresh-path` as the warning describes before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions",
                 )
             }
             Self::UpgradeAtRisk { .. } => Some(

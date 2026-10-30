@@ -197,7 +197,7 @@ class InstallDaemonWarningTest(unittest.TestCase):
 
     def test_the_wrapper_greps_the_cli_warning_prefix(self):
         source = (ROOT / "crates/cli/src/service/preflight.rs").read_text()
-        match = re.search(r'STALE_PATH_WARNING: &str = "([^"]+)";', source)
+        match = re.search(r'STALE_PATH_WARNING: &str =\s*"([^"]+)";', source)
         self.assertIsNotNone(match, "STALE_PATH_WARNING not found in preflight.rs")
         wrapper = (PACKAGING / "install-daemon.sh").read_text()
         self.assertIn(f"grep -q '{match.group(1)}'", wrapper)
