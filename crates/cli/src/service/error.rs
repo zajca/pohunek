@@ -946,13 +946,13 @@ impl Error {
                 "service.toml was written by a newer release: run `pohunek service refresh-path` of the installed release (`<prefix>/bin/pohunek`); this binary never rewrites it",
             ),
             Self::RefreshConfigSchema { .. } => Some(
-                "refresh-path never rewrites a service.toml of an older schema; run `pohunek service uninstall` (it keeps durable metadata and refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix (a fresh install discovers the current path), and rerun the upgrade",
+                "refresh-path never rewrites a service.toml of an older schema. If the installed release has the command (v0.39 and later), run its own `<prefix>/bin/pohunek service refresh-path`. For a release without it: stop the live sessions, save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata and refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix (a fresh install discovers the current path), reapply the non-default settings from the saved copy except `search_path` under [environment] (restoring it brings the stale path back), and rerun the upgrade",
             ),
             Self::SearchPathRefreshFailed { .. } => Some(
                 "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
             ),
             Self::RefreshBlockedByTransaction => Some(
-                "finish the pending transaction first (`pohunek service status` names it; rerunning the command it names resumes or rolls it back, `pohunek service uninstall` removes it after its session check), then rerun `pohunek service refresh-path`",
+                "finish the pending transaction first (`pohunek service status` names it; rerunning the command it names resumes or rolls it back, `pohunek service uninstall` removes it after its session check; before that, stop the live sessions and save a copy of service.toml, and install the version that is installed now from its own archive with the same --prefix, which discovers the current path by itself, and reapply the non-default settings from the copy except `search_path` under [environment]), then rerun the upgrade",
             ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")

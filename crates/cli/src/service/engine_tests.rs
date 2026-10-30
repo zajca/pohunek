@@ -1462,7 +1462,16 @@ async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_l
     assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
     let hint = error.hint().expect("hint");
     assert!(
-        hint.contains("pohunek service uninstall") && hint.contains("from its own archive"),
+        hint.contains("<prefix>/bin/pohunek service refresh-path")
+            && hint.contains("pohunek service uninstall")
+            && hint.contains("from its own archive")
+            && hint.contains("save a copy of service.toml")
+            && hint.contains("stop the live sessions")
+            && hint.contains("reapply the non-default settings")
+            && hint.contains("from its own archive")
+            && hint.contains("same --prefix")
+            && hint.contains("rerun the upgrade")
+            && hint.contains("except `search_path`"),
         "{hint}"
     );
     assert_eq!(config_bytes(&harness), before, "service.toml is untouched");
@@ -1495,6 +1504,13 @@ async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pen
         .expect_err("interrupted");
     let error = refresh(&harness, false).await.expect_err("pending install");
     assert_eq!(error.code(), "service_refresh_blocked_by_transaction");
+    let hint = error.hint().expect("hint");
+    assert!(
+        hint.contains("save a copy of service.toml")
+            && hint.contains("stop the live sessions")
+            && hint.contains("except `search_path`"),
+        "{hint}"
+    );
 
     harness.install(V1).await.expect("finish the install");
     harness.context = harness

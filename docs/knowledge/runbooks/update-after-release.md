@@ -997,14 +997,21 @@ it would drop resume and fork for the listed sessions although the runtime is
 current. `refresh-path` refuses while a transaction record is pending
 (`service_refresh_blocked_by_transaction`), and an interrupted upgrade leaves
 one: `pohunek service status` names it, and an upgrade that is refused again
-with the same warning cannot be refreshed around. Remove the record with
-`pohunek service uninstall` (it checks live sessions first), then install the
-version that is installed now from its own archive: a fresh install discovers
-the current path, so no `refresh-path` is needed.
-The same way out applies when `refresh-path` reports `service_refresh_config_schema`:
-it rewrites only a `service.toml` of the schema its own release writes, so an
-installation recorded by an older release (schema 6 or below) is left
-untouched and needs the uninstall and fresh install instead.
+with the same warning cannot be refreshed around. Stop the live sessions, save a
+copy of `service.toml`, remove the record with `pohunek service uninstall` (it
+checks live sessions first), then install the version that is installed now from
+its own archive with the same `--prefix`: a fresh install discovers the current
+path, so no `refresh-path` is needed. Reapply the non-default settings from the
+saved copy, but not `search_path` under `[environment]`: it is the stale value
+and the upgrade would refuse again. Then rerun the upgrade.
+
+`refresh-path` rewrites only a `service.toml` of the schema its own release
+writes, and reports `service_refresh_config_schema` for another one without
+touching the file. A file written by a newer release is refreshed by that
+release's own `<prefix>/bin/pohunek service refresh-path`. A file of an older
+schema is refreshed the same way when the installed release has the command
+(v0.39 and later); for a release without it, use the uninstall and fresh
+install above, with the same save, stop and reapply steps.
 
 ### Stopped sessions on an older official package version
 
