@@ -73,6 +73,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ci-
+          # Only main saves; pull requests and tags restore its entry.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # xtask::dependency_policy resolves the locked graph with `--offline`, so
       # every locked package source must already be in the cargo registry.

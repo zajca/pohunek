@@ -2965,7 +2965,7 @@ class RunnerImageTests(unittest.TestCase):
         for image, text in entries:
             for step in text.split("uses: Swatinem/rust-cache")[1:]:
                 step = re.split(r"(?m)^\s*- ", step, maxsplit=1)[0]
-                key = re.search(r"(?m)^\s+shared-key: (.+?)\s*$", step)
+                key = re.search(r"(?m)^\s+shared-key: (.+?)\s*(?:#.*)?$", step)
                 save = re.search(r"(?m)^\s+save-if: (.+)$", step)
                 if key:
                     uses.append((key.group(1), image, save is None or save.group(1) != "false"))
@@ -2991,6 +2991,34 @@ class RunnerImageTests(unittest.TestCase):
             key for key, saving in savers.items()
             if len(saving) != 1 or min(images[key]) < max(saving)
         })
+
+    @classmethod
+    def cached_jobs_on_an_expression_runner(cls, job_texts):
+        """Jobs with a rust-cache step whose `runs-on` is an expression: the
+        image is not known, so the cache direction cannot be compared."""
+        found = []
+        for name, job in job_texts.items():
+            runner = re.search(r"(?m)^    runs-on: (.+?)\s*(?:#.*)?$", job)
+            if runner and "${{" in runner.group(1) and "Swatinem/rust-cache" in job:
+                found.append(name)
+        return sorted(found)
+
+    def test_a_job_with_an_expression_runner_may_not_use_the_rust_cache(self):
+        self.assertEqual(self.cached_jobs_on_an_expression_runner(workflow_jobs()), [])
+        cached = "    runs-on: ${{ matrix.os }}\n    steps:\n      - uses: Swatinem/rust-cache@abc\n"
+        self.assertEqual(
+            self.cached_jobs_on_an_expression_runner({
+                "bad": cached,
+                "literal": cached.replace("${{ matrix.os }}", "ubuntu-24.04"),
+                "nocache": "    runs-on: ${{ matrix.os }}\n    steps: []\n",
+            }),
+            ["bad"],
+        )
+        key = "bins # the saver"
+        self.assertEqual(
+            self.cache_uses([("ubuntu-24.04", f"uses: Swatinem/rust-cache@abc\n        with:\n          shared-key: {key}\n")]),
+            [("bins", "ubuntu-24.04", True)],
+        )
 
     def test_a_cache_is_never_restored_on_an_older_image_than_the_one_that_saved_it(self):
         workflows = ROOT / ".github" / "workflows"

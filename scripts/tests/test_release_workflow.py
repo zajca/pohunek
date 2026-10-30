@@ -647,6 +647,7 @@ class OidcTests(ReleaseWorkflowFiles):
         )
         self.assertEqual(workflow_violations(self.build, writer=None, oidc=set()), [])
         self.assertEqual(workflow_violations(self.scenarios, writer=None, oidc=set()), [])
+        self.assertEqual(workflow_violations(self.gate_tests, writer=None, oidc=set()), [])
 
     def test_the_ci_caller_runs_in_rehearsal_mode_and_never_for_forks(self):
         ci_jobs = jobs(self.ci)
@@ -1700,7 +1701,7 @@ class SccacheSetupTests(unittest.TestCase):
 
     def test_the_pinned_release_agrees_between_the_two_workflows(self):
         pins = {}
-        for name in ("release.yml", "release-build.yml"):
+        for name in ("release.yml", "release-build.yml", "gate-tests.yml"):
             header = self.texts[name].partition("\njobs:\n")[0]
             version = re.search(r'(?m)^  SCCACHE_VERSION: "([0-9.]+)"$', header)
             digest = re.search(r"(?m)^  SCCACHE_SHA256: ([0-9a-f]{64})$", header)
@@ -1708,6 +1709,7 @@ class SccacheSetupTests(unittest.TestCase):
             self.assertIsNotNone(digest, name)
             pins[name] = (version.group(1), digest.group(1))
         self.assertEqual(pins["release.yml"], pins["release-build.yml"])
+        self.assertEqual(pins["release.yml"], pins["gate-tests.yml"])
 
 
 if __name__ == "__main__":

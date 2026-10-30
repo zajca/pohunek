@@ -1,7 +1,7 @@
 {
   "workflow_path": ".github/workflows/ci.yml",
   "workflow_file": "ci.yml",
-  "wait_timeout_seconds": 1800,
+  "wait_timeout_seconds": 3600,
   "poll_interval_seconds": 15,
   "tree_match_max_age_days": 14,
   "required_jobs": {

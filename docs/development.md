@@ -623,7 +623,7 @@ and tests the way CI does: it builds the `cargo nextest archive
 fails, so one red shard does not hide another. The same workflow runs in CI as
 the job `release gate (full test set)`: in the nightly tier (schedule or a
 `tier=nightly` dispatch) and on a pull request that changes one of its inputs
-(`release.yml`, `gate-tests.yml`, `.config/nextest.toml`,
+(`ci.yml`, `release.yml`, `gate-tests.yml`, `.config/nextest.toml`,
 `scripts/test-partitions`, `scripts/junit-flaky-summary`, the toolchain and
 cache actions), so a break in the gate shows between releases, and the nightly
 evidence the tag requires includes it. The workflow takes no input, holds only

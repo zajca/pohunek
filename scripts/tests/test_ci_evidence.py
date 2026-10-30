@@ -487,6 +487,15 @@ class CiEvidenceCliTests(unittest.TestCase):
         macos_job = workflow.split("  macos-package:\n", 1)[1].split("\n  test:\n", 1)[0]
         self.assertNotIn("continue-on-error", macos_job)
 
+    def test_the_wait_outlasts_a_nightly_that_runs_the_release_gate(self):
+        # The nightly tier runs the whole release gate in one job (about 35
+        # minutes); the release script waits this long for its evidence.
+        config = json.loads(DEFAULT_CONFIG.read_text())
+        self.assertIn(
+            "release gate (full test set) / fmt + clippy + test", config["required_jobs"]["nightly"]
+        )
+        self.assertGreaterEqual(config["wait_timeout_seconds"], 3600)
+
     def test_every_required_job_names_a_job_of_the_workflow_or_its_reusable_workflows(self):
         config = json.loads(DEFAULT_CONFIG.read_text())
         workflow = config["workflow_path"]
