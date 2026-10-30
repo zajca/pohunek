@@ -101,9 +101,11 @@ impl CommandErrorKind {
     /// Every kind this build knows, in declaration order.
     ///
     /// [`Self::ordinal`] matches every variant without a wildcard, so adding a
-    /// variant fails to compile until it has the next ordinal; list it here at
-    /// that position and grow the array. A compile-time assertion keeps the
-    /// listed kinds in ordinal order.
+    /// variant fails to compile until it has an ordinal. Give it the next one,
+    /// list it here at that position and grow the array: a compile-time
+    /// assertion keeps the listed kinds in ordinal order, but that the new kind
+    /// is listed at all is checked by review and by the exit-status scenario
+    /// of the CLI, which iterates this array.
     pub const ALL: [Self; 12] = [
         Self::Unsupported,
         Self::PackageNotInstalled,

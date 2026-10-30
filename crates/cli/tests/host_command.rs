@@ -519,7 +519,7 @@ async fn a_local_only_command_is_not_exposed_over_a_peer() {
 }
 
 /// Runs `host command run local` against a scripted daemon that answers every
-/// request with `error`, passing `run` a closure that invokes the CLI.
+/// request with `error`, passing `check` a closure that invokes the CLI.
 fn against_scripted_daemon<T>(
     error: &protocol::ProtocolError,
     check: impl FnOnce(&dyn Fn(&[&str]) -> std::process::Output) -> T,
