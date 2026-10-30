@@ -1428,7 +1428,8 @@ enum SessionAction {
     /// or `--timeout-ms`: waits up to 8000 ms for one target to match the
     /// predicates. It takes exactly one target and requires `--timeout-ms`.
     ///
-    /// Both modes exit 0 for every completion reason, including a timeout.
+    /// Both modes exit 0 for every completion reason, including a timeout, except a
+    /// legacy wait the daemon ended for a reason this client does not know.
     #[command(group(
         clap::ArgGroup::new("legacy_wait")
             .multiple(true)

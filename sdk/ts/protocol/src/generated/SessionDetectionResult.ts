@@ -13,7 +13,8 @@ export type SessionDetectionResult = {
    */
   session_id: SessionId;
   /**
-   * Complete region set supported by this detector engine.
+   * Complete region set supported by this detector engine. A region a newer
+   * daemon defines is dropped on decode.
    */
   supported_regions: Array<DetectionRegionKind>;
   /**

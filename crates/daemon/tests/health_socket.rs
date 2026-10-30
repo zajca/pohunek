@@ -362,6 +362,32 @@ async fn integration_status_accepts_null_at_daemon_boundary() {
 }
 
 #[tokio::test]
+async fn session_read_refuses_an_unknown_source_in_params() {
+    let socket = temp_socket("session-read-unknown-source");
+    let (shutdown, server) = spawn_server(&socket, "test").await;
+    let mut framed = connect(&socket).await;
+
+    for (id, source) in [
+        ("read-unknown-token", "unknown"),
+        ("read-newer-source", "a_source_from_a_newer_client"),
+    ] {
+        let request = Request::make(
+            id,
+            method::SESSION_READ,
+            serde_json::json!({ "session_id": "s-1", "source": source }),
+        );
+
+        let response = exchange(&mut framed, &request).await;
+
+        assert_eq!(response.id(), id);
+        assert_eq!(err_payload(response).code, "bad_request", "{source}");
+    }
+    framed.get_mut().shutdown().await.expect("close client");
+    shutdown.send(()).expect("send session read shutdown");
+    server.await.expect("server task");
+}
+
+#[tokio::test]
 async fn integration_status_rejects_unknown_params_at_daemon_boundary() {
     let socket = temp_socket("integration-status-unknown-params");
     let (shutdown, server) = spawn_server(&socket, "test").await;

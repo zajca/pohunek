@@ -85,7 +85,8 @@ const fn available_source(requested: SessionReadSource) -> SessionReadSource {
         SessionReadSource::Visible
         | SessionReadSource::Recent
         | SessionReadSource::RecentUnwrapped
-        | SessionReadSource::Detection => SessionReadSource::Visible,
+        | SessionReadSource::Detection
+        | SessionReadSource::Unknown => SessionReadSource::Visible,
     }
 }
 

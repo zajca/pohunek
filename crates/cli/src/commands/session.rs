@@ -1359,6 +1359,11 @@ pub(crate) async fn run_wait(
     .expect("only the already-validated session id changed");
     let client = Client::connect_pinned(host, paths).await?;
     let result = cancellable(client.into_sdk().session_wait(params)).await?;
+    // Under `--json` the error document is the only output, so a caller parses
+    // one document either way.
+    if json && result.reason == protocol::SessionWaitReason::Unknown {
+        return Err(CliError::UnknownWaitReason);
+    }
     if json {
         print!(
             "{}",
@@ -1375,6 +1380,9 @@ pub(crate) async fn run_wait(
                 .activity
                 .map_or("unknown", AgentActivity::as_str)
         );
+    }
+    if result.reason == protocol::SessionWaitReason::Unknown {
+        return Err(CliError::UnknownWaitReason);
     }
     Ok(())
 }
@@ -1472,6 +1480,7 @@ fn turn_wait_reason(reason: SessionWaitTurnReason) -> &'static str {
         SessionWaitTurnReason::Timeout => "timeout",
         SessionWaitTurnReason::CursorReset => "cursor_reset",
         SessionWaitTurnReason::TargetsEnded => "targets_ended",
+        SessionWaitTurnReason::Unknown => "unknown",
     }
 }
 

@@ -120,6 +120,11 @@ pub(crate) enum CliError {
         session_id: String,
     },
 
+    /// The daemon ended `session.wait` for a reason this client does not know,
+    /// so it cannot say whether the awaited condition matched.
+    #[error("the daemon ended the wait for a reason this client does not know")]
+    UnknownWaitReason,
+
     /// A long-running observation was cancelled by a local process signal.
     #[error("operation cancelled by process signal")]
     Cancelled,
@@ -423,6 +428,12 @@ impl CliError {
                 format!(
                     "cannot {operation} session {session_id}: the daemon reports a runtime state this client does not know"
                 ),
+                Some("upgrade this client to the daemon's version, then retry".to_owned()),
+            ),
+            CliError::UnknownWaitReason => ProtocolError::new(
+                ErrorClass::Runtime,
+                "session_wait_reason_unknown",
+                "the daemon ended the wait for a reason this client does not know".to_owned(),
                 Some("upgrade this client to the daemon's version, then retry".to_owned()),
             ),
             CliError::Cancelled => ProtocolError::new(

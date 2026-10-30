@@ -25,23 +25,24 @@ use protocol::{
     PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce,
     ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId,
     ReportSequence, Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry,
-    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRuntime,
+    RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground,
+    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
     SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark,
-    TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId, TransferProposal,
-    UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
+    SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
+    TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
+    TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES,
+    MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
     MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_SECRET_ENV_ENTRIES,
     MAX_SESSION_SECRET_ENV_VALUE_BYTES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
     OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
@@ -5833,4 +5834,130 @@ fn package_enums_are_tolerant_only_on_the_client() {
         unknown_wire: "unknown",
     }
     .check("PackageFindingKind");
+}
+
+#[test]
+fn session_result_enums_are_tolerant_only_on_the_client() {
+    TolerantEnum {
+        known: vec![
+            ("managed", RuntimeInventoryStatus::Managed),
+            ("orphaned", RuntimeInventoryStatus::Orphaned),
+            ("conflict", RuntimeInventoryStatus::Conflict),
+            ("incompatible", RuntimeInventoryStatus::Incompatible),
+            (
+                "identity_mismatch",
+                RuntimeInventoryStatus::IdentityMismatch,
+            ),
+        ],
+        unknown: RuntimeInventoryStatus::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("RuntimeInventoryStatus");
+    TolerantEnum {
+        known: vec![
+            ("terminal", SessionRetentionReason::Terminal),
+            ("lost", SessionRetentionReason::Lost),
+        ],
+        unknown: SessionRetentionReason::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("SessionRetentionReason");
+    TolerantEnum {
+        known: vec![
+            (
+                "worktree_uncommitted",
+                SessionRetentionHold::WorktreeUncommitted,
+            ),
+            (
+                "worktree_untracked",
+                SessionRetentionHold::WorktreeUntracked,
+            ),
+            ("worktree_unpushed", SessionRetentionHold::WorktreeUnpushed),
+            ("worktree_unknown", SessionRetentionHold::WorktreeUnknown),
+        ],
+        unknown: SessionRetentionHold::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("SessionRetentionHold");
+    TolerantEnum {
+        known: vec![
+            ("state_matched", SessionWaitReason::StateMatched),
+            ("activity_matched", SessionWaitReason::ActivityMatched),
+            ("session_updated", SessionWaitReason::SessionUpdated),
+            ("terminal_changed", SessionWaitReason::TerminalChanged),
+            ("output_advanced", SessionWaitReason::OutputAdvanced),
+            ("runtime_changed", SessionWaitReason::RuntimeChanged),
+            ("timeout", SessionWaitReason::Timeout),
+        ],
+        unknown: SessionWaitReason::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("SessionWaitReason");
+    TolerantEnum {
+        known: vec![
+            ("event", SessionWaitTurnReason::Event),
+            ("timeout", SessionWaitTurnReason::Timeout),
+            ("cursor_reset", SessionWaitTurnReason::CursorReset),
+            ("targets_ended", SessionWaitTurnReason::TargetsEnded),
+        ],
+        unknown: SessionWaitTurnReason::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("SessionWaitTurnReason");
+    TolerantEnum {
+        known: vec![
+            ("visible", SessionReadSource::Visible),
+            ("recent", SessionReadSource::Recent),
+            ("recent_unwrapped", SessionReadSource::RecentUnwrapped),
+            ("detection", SessionReadSource::Detection),
+        ],
+        unknown: SessionReadSource::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("SessionReadSource");
+    TolerantEnum {
+        known: DetectionRegionKind::ALL
+            .iter()
+            .map(|kind| {
+                let wire = serde_json::to_value(kind).expect("serialize region");
+                (
+                    Box::leak(
+                        wire.as_str()
+                            .expect("region wire string")
+                            .to_owned()
+                            .into_boxed_str(),
+                    ) as &'static str,
+                    *kind,
+                )
+            })
+            .collect(),
+        unknown: DetectionRegionKind::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("DetectionRegionKind");
+}
+
+#[test]
+fn unknown_regions_are_dropped_and_an_unknown_hold_stays_a_hold() {
+    let regions = json!({
+        "session_id": "s-1",
+        "supported_regions": ["osc_title", "a_region_from_a_newer_daemon"],
+        "previews": [],
+    });
+    serde_json::from_value::<SessionDetectionResult>(regions.clone())
+        .expect_err("plain decoding rejects a region this build does not know");
+    let result: SessionDetectionResult =
+        protocol::tolerant::from_value(regions).expect("tolerant decode");
+    assert_eq!(result.supported_regions, [DetectionRegionKind::OscTitle]);
+
+    // An unknown hold stays a hold: `None` means the sweep is free to remove.
+    let candidate: SessionRetentionCandidate = protocol::tolerant::from_value(json!({
+        "session_id": "s-1",
+        "reason": "lost",
+        "age_secs": 1,
+        "hold": "a_hold_from_a_newer_daemon",
+        "removed": false,
+    }))
+    .expect("tolerant decode");
+    assert_eq!(candidate.hold, Some(SessionRetentionHold::Unknown));
 }

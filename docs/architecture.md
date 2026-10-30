@@ -2216,11 +2216,11 @@ never `unreachable!()`.
 | `AgentActivity` | display, safe | an input-wait miss is the existing typed error | done |
 | `StateSource`, `CwdSource`, `SubagentLifecycle` | display | a lifecycle `unknown` is not counted as running | done |
 | `BackgroundKind`, `BackgroundStatus` | display | maps to the existing `Other` | done |
-| `RuntimeState` | safe | may own a runtime, cannot be stopped or removed, blocks upgrade; `session stop` and `session rm` refuse locally | done |
-| `RuntimeInventoryStatus`, `SessionRetentionReason`, `SessionWaitTurnReason`, `SessionReadSource` | display | | [#1337](https://github.com/zajca/pohunek/issues/1337) |
-| `SessionRetentionHold` | safe | never `None` (free to remove) | [#1337](https://github.com/zajca/pohunek/issues/1337) |
-| `SessionWaitReason` | safe | reported like a timeout, non-zero exit | [#1337](https://github.com/zajca/pohunek/issues/1337) |
-| `DetectionRegionKind` | drop, display | dropped from `supported_regions` | [#1337](https://github.com/zajca/pohunek/issues/1337) |
+| `RuntimeState` | safe | may own a runtime, cannot be stopped or removed, blocks `service uninstall`; `session stop` and `session rm` refuse locally | done |
+| `RuntimeInventoryStatus`, `SessionRetentionReason`, `SessionWaitTurnReason`, `SessionReadSource` | display | | done |
+| `SessionRetentionHold` | safe | never `None` (free to remove) | done |
+| `SessionWaitReason` | safe | `session wait` exits non-zero with `session_wait_reason_unknown` | done |
+| `DetectionRegionKind` | drop, display | dropped from `supported_regions` | done |
 | `PackageOrigin` | safe | the downgrade guard stays engaged | done |
 | `PackageBindStatus` | safe | never `Unchanged`; consent is still asked | done |
 | `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | done |
