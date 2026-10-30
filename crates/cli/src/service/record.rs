@@ -1,11 +1,16 @@
 //! The journaled install transaction record, `<state>/pohunek/service-install.json`.
 //!
-//! The record exists only while an install or upgrade is in flight. It is
+//! The record exists only while an install, upgrade, or search-path refresh is in flight. It is
 //! written owner-private (`0600`) with an atomic replace before each step's
 //! effects become visible and after they complete, so a later run knows how
 //! far the interrupted transaction got and can resume or roll it back. A
 //! rollback is journaled the same way: once it begins, the record is never
 //! resumed forward again.
+//!
+//! A refresh-path transaction ([`Operation::RefreshPath`]) journals its
+//! [`RefreshJournal`] in a schema-6 record. A release that writes schema 5
+//! refuses a record of schema 6 by name, so an older CLI never resumes,
+//! rolls back, or clears a refresh it cannot interpret.
 
 // Rust guideline compliant 2026-09-29
 
@@ -34,6 +39,8 @@ const MAX_CONFIG_BACKUP_BYTES: usize = pohunek_service_config::MAX_CONFIG_BYTES;
 
 /// Version of the record schema; any other version is rejected.
 ///
+/// Version 6 carries the refresh-path transaction, [`Operation::RefreshPath`]
+/// and [`Record::refresh`]; a release that writes schema 5 refuses it.
 /// Version 5 carries the gate's accepted set, [`Record::accepted_risks`].
 /// Version 4 carries the runtime step's journal, [`Record::runtime_stop`] and
 /// [`Record::runtime_backup`], and [`Step::Runtimes`]. Version 3 carries
@@ -41,14 +48,15 @@ const MAX_CONFIG_BACKUP_BYTES: usize = pohunek_service_config::MAX_CONFIG_BYTES;
 /// A record of an earlier version cannot say whether its `service.toml` was
 /// rewritten from the previous release's schema, so it is refused rather than
 /// guessed at. Version 2 carried [`Record::rolling_back`], which stays.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// The record schemas before [`SCHEMA_VERSION`] that still load.
 ///
-/// A record of version 4 has no accepted set and one of version 3 has no
-/// runtime journal either, so they load with those empty; their steps keep
-/// their meaning under the new step order.
-const PREVIOUS_SCHEMA_VERSIONS: [u32; 2] = [4, 3];
+/// A record of version 5 has no refresh journal, one of version 4 has no
+/// accepted set either, and one of version 3 has no runtime journal, so they
+/// load with those empty; their steps keep their meaning under the new step
+/// order. None of them can describe a refresh-path transaction.
+const PREVIOUS_SCHEMA_VERSIONS: [u32; 3] = [5, 4, 3];
 
 /// Directory of the runtime backup inside the application state directory.
 ///
@@ -122,6 +130,9 @@ pub enum Operation {
     Install,
     /// Switching an installation to a new version.
     Upgrade,
+    /// Re-recording the daemon job's search path and replacing the job, at
+    /// the version that is already active.
+    RefreshPath,
 }
 
 impl Operation {
@@ -131,6 +142,7 @@ impl Operation {
         match self {
             Self::Install => "install",
             Self::Upgrade => "upgrade",
+            Self::RefreshPath => "refresh_path",
         }
     }
 }
@@ -244,13 +256,71 @@ pub struct RuntimeBackup {
     pub entries: Vec<RuntimeBackupEntry>,
 }
 
-/// One in-flight install or upgrade.
+/// The identity of a process, journaled as its two integers.
+///
+/// A start identity keeps a reused PID from passing for the process that ran
+/// before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournaledProcess {
+    /// Process ID.
+    pub pid: u32,
+    /// Start identity within one boot.
+    pub start_identity: u64,
+}
+
+impl From<ProcessIdentity> for JournaledProcess {
+    fn from(identity: ProcessIdentity) -> Self {
+        Self {
+            pid: identity.pid,
+            start_identity: identity.start_identity.get(),
+        }
+    }
+}
+
+impl From<JournaledProcess> for ProcessIdentity {
+    fn from(process: JournaledProcess) -> Self {
+        Self {
+            pid: process.pid,
+            start_identity: StartIdentity::new(process.start_identity),
+        }
+    }
+}
+
+/// The journal of a refresh-path transaction.
+///
+/// `service.toml` must equal one of the two digests whenever the transaction
+/// resumes or rolls back; any other content means the file was edited while
+/// the refresh was pending, and nothing is written over it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshJournal {
+    /// The recorded search path before the refresh; a rollback restores it.
+    pub previous: Vec<PathBuf>,
+    /// The validated search path being recorded; a resume uses it and never a
+    /// fresh discovery.
+    pub target: Vec<PathBuf>,
+    /// SHA-256 of the exact `service.toml` bytes before the write, hexadecimal.
+    pub digest_before: String,
+    /// SHA-256 of the exact `service.toml` bytes the refresh writes, hexadecimal.
+    pub digest_after: String,
+    /// The daemon job's main process right before the job is replaced; `None`
+    /// when the job had no running process.
+    ///
+    /// Written once, while the step is before `Registering`: afterwards the
+    /// replacement may already have happened, and the process observed then
+    /// would be the new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_before: Option<JournaledProcess>,
+}
+
+/// One in-flight install, upgrade, or search-path refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
     /// Always [`SCHEMA_VERSION`].
     pub schema_version: u32,
-    /// Install or upgrade.
+    /// Install, upgrade, or search-path refresh.
     pub operation: Operation,
     /// The version being installed.
     pub version: String,
@@ -315,6 +385,14 @@ pub struct Record {
     /// from it when the transaction completes; a rollback discards it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_risks: Option<AcceptedSet>,
+    /// The refresh-path transaction's journal; present exactly for
+    /// [`Operation::RefreshPath`].
+    ///
+    /// The refresh keeps `version` and `previous_version` at the active
+    /// version and never enters the `Binaries`, `BackedUp`, `StopDaemon`,
+    /// `Runtimes`, or `Cli` steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshJournal>,
 }
 
 /// Exclusive ownership of the install transaction, released on drop.
@@ -611,6 +689,15 @@ impl Store {
             });
         }
         let mut record: Record = serde_json::from_value(value).map_err(malformed)?;
+        // A refresh exists from schema 6 on, and its operation and journal
+        // come together; anything else is a record this release did not write.
+        let refreshing = record.operation == Operation::RefreshPath;
+        if refreshing != record.refresh.is_some() || (refreshing && record.schema_version < 6) {
+            return Err(Error::Record {
+                path: self.path(),
+                detail: "a refresh-path record needs schema_version 6 and its refresh journal, and no other record carries one".to_owned(),
+            });
+        }
         // The next save writes the current schema, which is what a
         // previous release refuses by name instead of misreading.
         record.schema_version = SCHEMA_VERSION;
@@ -1104,6 +1191,7 @@ mod tests {
             launchd_default_path: None,
             launchd_boot_identity: None,
             accepted_risks: None,
+            refresh: None,
         }
     }
 
@@ -1342,6 +1430,92 @@ mod tests {
             ..record(Step::Runtimes)
         };
         assert!(store.save(&over).is_err());
+    }
+
+    fn refresh_record(step: Step) -> Record {
+        Record {
+            operation: Operation::RefreshPath,
+            version: "1.2.3".to_owned(),
+            previous_version: Some("1.2.3".to_owned()),
+            version_dir_preexisted: true,
+            refresh: Some(RefreshJournal {
+                previous: vec![PathBuf::from("/old/bin")],
+                target: vec![PathBuf::from("/new/bin")],
+                digest_before: "ab".repeat(32),
+                digest_after: "cd".repeat(32),
+                daemon_before: Some(JournaledProcess {
+                    pid: 4242,
+                    start_identity: 7,
+                }),
+            }),
+            ..record(step)
+        }
+    }
+
+    #[test]
+    fn a_refresh_record_round_trips_as_schema_6_which_a_schema_5_release_refuses() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        let saved = refresh_record(Step::Registering);
+        store.save(&saved).expect("save");
+        assert_eq!(store.load().expect("load"), Some(saved));
+
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.join(FILE_NAME)).expect("read"))
+                .expect("json");
+        assert_eq!(written["operation"], "refresh_path");
+        let schema = written["schema_version"].as_u64().expect("schema");
+        // The set of schemas the previous release loads: its own and its two
+        // predecessors. A refresh record is outside it.
+        let previous_release_loads = [5, 4, 3];
+        assert!(
+            !previous_release_loads.contains(&schema),
+            "schema {schema} would load in a release that does not know the refresh"
+        );
+    }
+
+    #[test]
+    fn a_record_that_claims_an_earlier_schema_but_carries_a_refresh_is_refused() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        store
+            .save(&refresh_record(Step::Config))
+            .expect("create directory");
+        let mut value = serde_json::to_value(refresh_record(Step::Config)).expect("value");
+        value["schema_version"] = 5.into();
+        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
+        assert!(matches!(store.load(), Err(Error::Record { .. })));
+
+        // The operation and the journal come together.
+        let mut value = serde_json::to_value(refresh_record(Step::Config)).expect("value");
+        value.as_object_mut().expect("object").remove("refresh");
+        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
+        assert!(matches!(store.load(), Err(Error::Record { .. })));
+
+        let mut value = serde_json::to_value(record(Step::Config)).expect("value");
+        value["refresh"] =
+            serde_json::to_value(refresh_record(Step::Config).refresh).expect("journal");
+        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
+        assert!(matches!(store.load(), Err(Error::Record { .. })));
+    }
+
+    #[test]
+    fn a_schema_5_record_loads_without_a_refresh_and_is_saved_as_schema_6() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        store
+            .save(&record(Step::Definition))
+            .expect("create directory");
+        let mut value = serde_json::to_value(record(Step::Definition)).expect("value");
+        value["schema_version"] = 5.into();
+        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
+
+        let loaded = store.load().expect("load").expect("record");
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(loaded.refresh, None);
     }
 
     #[test]

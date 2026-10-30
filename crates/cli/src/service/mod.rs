@@ -127,19 +127,123 @@ pub async fn upgrade(
         .await
 }
 
-/// Re-records the daemon job's search path from a fresh login-shell discovery.
+/// Re-records the daemon job's search path from a fresh login-shell discovery
+/// and replaces the daemon job with it.
 ///
-/// See [`refresh::refresh_search_path`]; `dry_run` previews the change.
+/// See [`refresh_entry`]; `dry_run` previews the change and the
+/// adoption verdict, and `accept_runtime_loss` accepts the sessions that
+/// verdict lists as at risk. The login shell runs before any lock is taken.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`refresh::refresh_search_path`], and
-/// [`Error::InheritedLock`] when `POHUNEK_SERVICE_LOCK_TOKEN` proves no live
-/// lock holder.
-pub async fn refresh_search_path(dry_run: bool) -> Result<report::RefreshPathReport, Error> {
+/// Returns the errors of [`refresh_entry`] and [`Error::InheritedLock`]
+/// when `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
+pub async fn refresh_search_path(
+    dry_run: bool,
+    accept_runtime_loss: bool,
+) -> Result<report::RefreshPathReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
-    refresh::refresh_search_path(&context, inherited.as_ref(), dry_run).await
+    refresh_entry(&context, inherited, dry_run, accept_runtime_loss, || {
+        connect_installed(&context)
+    })
+    .await
+}
+
+/// The order of [`refresh_search_path`] with the service-manager connection
+/// supplied by `connect`.
+///
+/// The discovery refusals that need no service manager and no read of
+/// `service.toml` ([`Error::NotInstalled`], [`Error::SearchPathUnmanaged`])
+/// come first; then the pending record is classified, then the schema is
+/// judged, and only then is the service manager contacted. The record comes
+/// before the schema because a transaction that is still pending can leave a
+/// file of another schema behind, and its own remedy is the one to name. The
+/// engine repeats the record and schema reads under the lock.
+pub(crate) async fn refresh_entry<Connect, Connecting>(
+    context: &Context,
+    inherited: Option<record::TransactionLock>,
+    dry_run: bool,
+    accept_runtime_loss: bool,
+    connect: Connect,
+) -> Result<report::RefreshPathReport, Error>
+where
+    Connect: FnOnce() -> Connecting,
+    Connecting: std::future::Future<Output = Result<Backend, Error>>,
+{
+    let discovered = discover_for_refresh(context)?;
+    classify_pending_record(context)?;
+    refresh::load_installed_config(context)?;
+    let backend = connect().await?;
+    let engine =
+        engine(context, &backend, inherited).with_runtime_loss_accepted(accept_runtime_loss);
+    engine.refresh_path(discovered, dry_run).await
+}
+
+/// Refuses a refresh while a record of another operation is pending and
+/// returns the error of a record store that cannot be read; a pending refresh
+/// record or no record passes.
+///
+/// # Errors
+///
+/// Returns [`Error::RefreshBlockedByTransaction`] or the record store's error.
+fn classify_pending_record(context: &Context) -> Result<(), Error> {
+    let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+    if pending.is_some_and(|record| record.operation != record::Operation::RefreshPath) {
+        return Err(Error::RefreshBlockedByTransaction);
+    }
+    Ok(())
+}
+
+/// Runs the login-shell discovery, then [`engine::Engine::refresh_path`].
+///
+/// See [`discover_for_refresh`] for how a failed discovery is treated.
+///
+/// # Errors
+///
+/// Returns the errors of [`engine::Engine::refresh_path`] and
+/// [`refresh::discover`].
+#[cfg(test)]
+pub(crate) async fn refresh_discovering(
+    context: &Context,
+    engine: &engine::Engine<'_>,
+    dry_run: bool,
+) -> Result<report::RefreshPathReport, Error> {
+    let discovered = discover_for_refresh(context)?;
+    engine.refresh_path(discovered, dry_run).await
+}
+
+/// Runs the login-shell discovery of a refresh.
+///
+/// The shell runs before the engine takes the transaction lock, so a slow
+/// shell never keeps another service command waiting. [`Error::NotInstalled`]
+/// and [`Error::SearchPathUnmanaged`] are always returned. A failed, hung or
+/// junk login shell ([`Error::SearchPathRefreshFailed`]) is returned at once
+/// too, unless a refresh record is pending: resuming or rolling that back
+/// never needs the fresh path, so the engine gets the failure and carries it
+/// as a warning. The pending record is looked at without the lock; the engine
+/// decides again under it. A record store that cannot be read counts as no
+/// pending record: the shell failure is returned, and the engine reports the
+/// store problem under the lock once the shell works.
+///
+/// # Errors
+///
+/// Returns the errors of [`refresh::discover`] that are not deferred.
+fn discover_for_refresh(context: &Context) -> Result<Result<refresh::Discovered, Error>, Error> {
+    match refresh::discover(context) {
+        Err(error @ Error::SearchPathRefreshFailed { .. }) => {
+            let pending = record::Store::new(context.paths().state_dir.clone())
+                .load()
+                .ok()
+                .flatten();
+            if pending.is_some_and(|record| record.operation == record::Operation::RefreshPath) {
+                Ok(Err(error))
+            } else {
+                Err(error)
+            }
+        }
+        other => other.map(Ok),
+    }
 }
 
 /// Uninstalls the service.
@@ -299,7 +403,7 @@ async fn finish_check(
             }
             None => ledger::Acceptance::none(),
         };
-        let gated = preflight::gate_upgrade(
+        let gated = preflight::gate_upgrade_over(
             preflight,
             context,
             &release,
@@ -309,6 +413,7 @@ async fn finish_check(
             preflight::ReleasePlan::Included,
             accept_runtime_loss,
             &acceptance,
+            engine::judged_path(checked.pending.as_ref()),
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
@@ -1558,6 +1663,7 @@ mod tests {
             launchd_default_path: None,
             launchd_boot_identity: None,
             accepted_risks: None,
+            refresh: None,
         };
         assert_eq!(
             checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),

@@ -120,6 +120,10 @@ fn flag_completion_follows_the_active_cli_tree() {
             &["--stop-sessions"],
         ),
         (&["pohunek", "service", "uninstall", "--pu"], &["--purge"]),
+        (
+            &["pohunek", "service", "refresh-path", "--accept-"],
+            &["--accept-runtime-loss"],
+        ),
         (&["pohunek", "plugin", "install", "--cat"], &["--catalog"]),
         (&["pohunek", "plugin", "install", "--no"], &["--no-enable"]),
         (&["pohunek", "plugin", "install", "--sha"], &["--sha256"]),

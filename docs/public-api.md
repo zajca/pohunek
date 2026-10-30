@@ -2709,10 +2709,11 @@ directories the installer resolved and hands to the daemon job as its `PATH`
 bounded). Each directory is recorded as its canonical path and was trusted when
 resolved (owned by the user or root, not writable by group or others). The path is
 recorded at install and reaches the daemon job only when the installer writes
-the job definition (install, or an upgrade to a different version); upgrades
-reuse the recorded list, so a manual edit takes effect only at the next
-version-changing upgrade; `pohunek service refresh-path` re-records the path in
-place (below). This key
+the job definition (install, an upgrade to a different version, or
+`pohunek service refresh-path`); upgrades reuse the recorded list, so a manual
+edit takes effect only at the next version-changing upgrade;
+`pohunek service refresh-path` re-records the path and replaces the daemon job
+with it (below). This key
 raised the `service.toml` `schema_version` to 2, the `[input]` table added
 for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_ms`
 and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
@@ -2802,17 +2803,54 @@ fallback list was used), and `dropped` (`[{path, reason}]`, directories refused
 as untrusted); the human output prints a `warning:` line for a failed login
 shell and for each dropped directory. `pohunek service refresh-path --json`
 runs the same discovery against an existing installation and reports `dry_run`,
-`changed`, `applied` (`changed` and not `dry_run`), `recorded` and `discovered`
-(the directories in search order), `added`, `removed`, `shell_used`,
-`shell_defaulted`, `dropped` (as above) and `warnings`; it rewrites only
-`environment.search_path` of `service.toml` (atomically, under the transaction
-lock, unknown keys kept) and stops and restarts nothing, so `service check` and
-`service upgrade` read the new path at once and the running daemon job at its
-next replacement. It fails with `service_search_path_refresh_failed` when the
+`changed`, `applied` (the refresh took effect: `service.toml` records the path
+and the daemon job runs with it), `recorded` and `discovered` (the directories
+in search order; for a resumed refresh, the ones the interrupted run
+journaled), `added`, `removed`, `shell_used`, `shell_defaulted`, `dropped` (as
+above), `daemon_restart` (`restarted`, `would_restart` for a dry run of a
+change, or `none`), `daemon_started` (the job was registered but not running),
+`workers_kept` (worker jobs left running, `null` when they could not be
+listed), `resumed` (an interrupted refresh was resumed), `rolled_back` (an
+interrupted refresh that was rolled back instead; the run then stops), `preflight`
+(the new daemon's adoption verdict, as `service upgrade --json` reports it),
+`accepted_runtime_loss` and `warnings`. It rewrites `environment.search_path`
+of `service.toml` (atomically, under the transaction lock, unknown keys kept)
+and replaces the daemon job in one journaled transaction (record operation
+`refresh_path`, record schema 6, which a release that writes schema 5 refuses):
+the adoption verdict is taken before any effect and again before the
+replacement, readiness requires a new daemon process, and a failure restores
+the previous path and job. Worker jobs are never touched and the accepted-risk
+ledger is never written. `status`, `check` and the reports of the other service
+commands show a pending refresh as `pending_transaction` with `operation`
+`refresh_path`, and `rolling_back: true` (omitted otherwise) once its rollback
+has begun. It fails with `service_upgrade_sessions_at_risk` or
+`service_upgrade_store_unusable` as an upgrade does, with
+`service_daemon_job_missing` when a rerun, or the first run before any record
+exists, finds no registered daemon job (the latter changes nothing), with `service_refresh_config_changed` when `service.toml` was edited
+during a pending refresh that has to act on it (a refresh at `ready` only
+clears its record after reading and verifying the file, without comparing it with
+the refresh, and `uninstall` removes the installation without needing the file to
+match the refresh), and `service_refresh_pending` is what `install` and
+`upgrade` return while a refresh that reached the job replacement is pending
+(`pohunek service refresh-path` without `--dry-run` resolves it), and what a
+dry run returns over any pending refresh, because a dry run never resolves one.
+A daemon job that vanished after the record exists makes the run roll back:
+before `registering` the file is restored and the record cleared and the run
+returns `service_daemon_job_missing`; from `registering` on the first run returns
+`service_rollback_failed` with the missing job among its causes (the record stays
+`rolling_back`), and every rerun returns `service_daemon_job_missing`. Each such
+message states the effects the run had, read from the files after it ended:
+`service.toml` unchanged, put back on the previous search path, or recording the
+new search path, and the record absent, cleared, `rolling_back` or kept; it
+states none when a file cannot be read. The hint names `pohunek service uninstall` (it removes the
+installation, its daemon job and `service.toml`, and keeps durable metadata) as
+the documented way out (#1763). The store and preflight refusals
+carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
+`service_upgrade_preflight_failed`) with texts that name the installed release. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
 fallback list never replaces a recorded path), `service_search_path_unmanaged`
-where the host records no path, `service_refresh_blocked_by_transaction` while a
-transaction record exists, `service_refresh_config_schema` for a `service.toml` of another
+where the host records no path, `service_refresh_blocked_by_transaction` while an
+install or upgrade record is pending, `service_refresh_config_schema` for a `service.toml` of another
 schema than this release writes (nothing is rewritten; run the installed release's own
 `refresh-path` when it has the command, otherwise stop the live sessions, save a copy of `service.toml`, uninstall, install the
 installed version from its archive with the same `--prefix`, reapply the non-default settings

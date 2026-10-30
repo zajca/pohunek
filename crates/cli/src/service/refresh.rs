@@ -1,54 +1,56 @@
-//! `pohunek service refresh-path`: re-records the executable search path.
+//! `pohunek service refresh-path`: re-records the executable search path and
+//! replaces the daemon job, so the running daemon gets it.
 //!
 //! Install records the path a login shell reports in `service.toml`, and
 //! upgrades reuse it. A prefix installed later, or a profile link that moved
-//! (nix generations), leaves the record behind. This command runs the same
-//! bounded discovery, shows the difference and rewrites only the recorded
-//! path, atomically. Nothing is stopped or restarted, and the service manager
-//! is not contacted. The discovery runs before the transaction lock is taken.
+//! (nix generations), leaves the record behind, and the daemon keeps running
+//! with the `PATH` its job was registered with. The command runs the same
+//! bounded discovery, shows the difference, rewrites only the recorded path
+//! (atomically) and replaces the daemon job in one journaled transaction
+//! ([`super::engine::Engine::refresh_path`]); it either does both or changes
+//! nothing. Worker jobs are never touched.
+//!
+//! The login shell runs here, before any transaction lock is taken, so a slow
+//! shell never keeps another service command waiting. Everything that depends
+//! on the recorded state is decided later, under the lock, against the freshly
+//! loaded file.
 
 // Rust guideline compliant 2026-06-26
 
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_service_config::{ConfigError, ServiceConfig, SCHEMA_VERSION};
 
 use super::context::Context;
 use super::error::Error;
-use super::record::{Store, TransactionLock};
-use super::report::RefreshPathReport;
+use super::report::SearchPathReport;
 
-/// Re-records the search path of the installation `context` locates.
+/// The search path a fresh login-shell discovery reports.
+#[derive(Debug, Clone)]
+pub(crate) struct Discovered {
+    /// The validated directories, in search order.
+    pub(crate) search_path: SearchPath,
+    /// How they were obtained: the shell tried and the directories dropped.
+    pub(crate) found: SearchPathReport,
+}
+
+/// Runs the bounded login-shell discovery of the installation `context` locates.
 ///
-/// The recorded path is what `service check` and `service upgrade` judge
-/// runtimes with, and what the daemon job gets at its next replacement (a
-/// version-changing upgrade); the running daemon keeps its `PATH` until then.
-/// With `dry_run` the file is left alone. A path that is already current is a
-/// no-op. `inherited` is the transaction lock of a `pohunek service lock`
-/// ancestor; without one the command takes the lock itself.
+/// Takes no lock and contacts no service manager.
 ///
 /// # Errors
 ///
 /// Returns [`Error::NotInstalled`] without an installation,
-/// [`Error::RefreshBlockedByTransaction`] while a transaction record exists,
-/// [`Error::SearchPathUnmanaged`] when the host records no path,
-/// [`Error::RefreshConfigSchema`] for a `service.toml` of another schema,
+/// [`Error::SearchPathUnmanaged`] when the host records no path, and
 /// [`Error::SearchPathRefreshFailed`] when the login shell supplies none (the
-/// fallback list never replaces a recorded path), and the configuration and
-/// write errors of `service.toml`.
-pub(crate) async fn refresh_search_path(
-    context: &Context,
-    inherited: Option<&TransactionLock>,
-    dry_run: bool,
-) -> Result<RefreshPathReport, Error> {
+/// fallback list never replaces a recorded path).
+pub(crate) fn discover(context: &Context) -> Result<Discovered, Error> {
     // A host without an installation never runs the login shell; the check is
     // repeated under the lock.
     let config_path = context.config_path();
     if !super::engine::file_exists(&config_path)? {
         return Err(Error::NotInstalled { path: config_path });
     }
-    // The login shell runs before this command takes the transaction lock, so a
-    // slow shell never keeps another service command waiting. Everything that
-    // depends on the recorded state is decided under the lock below.
-    let (fresh, found) = context.install_search_path().map_err(|error| match error {
+    let (search_path, found) = context.install_search_path().map_err(|error| match error {
         Error::SearchPath(reason) => Error::SearchPathRefreshFailed {
             detail: reason.to_string(),
         },
@@ -64,62 +66,54 @@ pub(crate) async fn refresh_search_path(
                 .unwrap_or_else(|| "no login shell was asked".to_owned()),
         });
     }
-    let store = Store::new(context.paths().state_dir.clone());
-    let _transaction = match inherited {
-        Some(_) => None,
-        None => Some(store.lock().await?),
-    };
-    super::engine::upgrade_preflight(context)?;
+    Ok(Discovered { search_path, found })
+}
+
+/// Loads the installed `service.toml` of the current schema, with its exact
+/// bytes, after proving it describes this installation.
+///
+/// # Errors
+///
+/// Returns [`Error::NotInstalled`] without an installation,
+/// [`Error::RefreshConfigSchema`] for a file of another schema, and the
+/// configuration errors of the read and of the namespace verification.
+pub(crate) fn load_installed_config(context: &Context) -> Result<(ServiceConfig, Vec<u8>), Error> {
+    let config_path = context.config_path();
     if !super::engine::file_exists(&config_path)? {
         return Err(Error::NotInstalled { path: config_path });
     }
-    if store.load()?.is_some() {
-        return Err(Error::RefreshBlockedByTransaction);
-    }
-    let config = match ServiceConfig::load(&config_path) {
+    // One trusted read supplies the typed values and the exact bytes. A file of
+    // another schema may not parse as the older one the upgrade reader accepts,
+    // so a failure is classified by the strict reader, which names the schema.
+    let source = match ServiceConfig::load_upgrade_source(&config_path) {
+        Ok(source) => source,
         Err(ConfigError::UnsupportedSchema { found }) => {
             return Err(Error::RefreshConfigSchema {
                 found,
                 current: SCHEMA_VERSION,
             });
         }
-        loaded => loaded?,
+        Err(error) => {
+            return Err(match ServiceConfig::load(&config_path) {
+                Err(ConfigError::UnsupportedSchema { found }) => Error::RefreshConfigSchema {
+                    found,
+                    current: SCHEMA_VERSION,
+                },
+                _ => error.into(),
+            });
+        }
     };
-    config.verify_installation(
+    if source.source_schema_version != SCHEMA_VERSION {
+        return Err(Error::RefreshConfigSchema {
+            found: i64::from(source.source_schema_version),
+            current: SCHEMA_VERSION,
+        });
+    }
+    let bytes = source.original_bytes().to_vec();
+    source.config.verify_installation(
         context.uid(),
         &context.paths().state_dir,
         &context.paths().runtime_dir,
     )?;
-    let recorded = config.search_path().entries().to_vec();
-    let discovered = fresh.entries().to_vec();
-    let added: Vec<_> = discovered
-        .iter()
-        .filter(|entry| !recorded.contains(entry))
-        .cloned()
-        .collect();
-    let removed: Vec<_> = recorded
-        .iter()
-        .filter(|entry| !discovered.contains(entry))
-        .cloned()
-        .collect();
-    let changed = recorded != discovered;
-    let applied = changed && !dry_run;
-    if applied {
-        config.with_search_path(fresh)?.write(&config_path)?;
-    }
-    Ok(RefreshPathReport {
-        dry_run,
-        changed,
-        applied,
-        recorded,
-        discovered,
-        added,
-        removed,
-        shell_used: found.shell_used,
-        shell_defaulted: found.shell_defaulted,
-        dropped: found.dropped,
-        warnings: super::definition::unknown_keys_warning(&config)
-            .into_iter()
-            .collect(),
-    })
+    Ok((source.config, bytes))
 }

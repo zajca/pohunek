@@ -218,6 +218,70 @@ class InstallDaemonWarningTest(unittest.TestCase):
             position = found
 
 
+class InstallDaemonRefreshEchoTest(unittest.TestCase):
+    """The echo lines of the stale-path refusal walk the operator in the order the commands run."""
+
+    def echo_lines(self):
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        return [line.strip() for line in wrapper.splitlines() if line.strip().startswith("echo ")]
+
+    def test_the_refresh_echo_lines_come_in_the_order_the_operator_runs_them(self):
+        lines = self.echo_lines()
+        steps = [
+            "the refusal names the recorded search path",
+            "service refresh-path --dry-run",
+            "otherwise re-run $0 --accept-runtime-loss",
+        ]
+        positions = []
+        for step in steps:
+            matching = [index for index, line in enumerate(lines) if step in line]
+            self.assertEqual(len(matching), 1, f"{step!r} is not on exactly one echo line")
+            positions.append(matching[0])
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(positions[1] - positions[0], 1)
+        self.assertEqual(positions[2] - positions[1], 1)
+
+    def test_one_echo_line_orders_dry_run_then_refresh_then_rerun_without_the_flag(self):
+        (line,) = [line for line in self.echo_lines() if "service refresh-path --dry-run" in line]
+        order = [
+            "service refresh-path --dry-run",
+            "then $archive_dir/pohunek service refresh-path",
+            "then re-run $0 without --accept-runtime-loss",
+        ]
+        position = -1
+        for step in order:
+            found = line.find(step, position + 1)
+            self.assertGreater(found, position, f"{step!r} missing or out of order in {line!r}")
+            position = found
+
+
+    def test_a_pending_refresh_is_finished_without_a_dry_run_before_the_rerun(self):
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        restored = wrapper.index("grep -q 'the path a pending search-path refresh'")
+        installed = wrapper.index("grep -q 'the search path this upgrade judged with is:'")
+        self.assertLess(restored, installed)
+        lines = [
+            line
+            for line in self.echo_lines()
+            if "a search-path refresh is pending" in line or "service refresh-path (without a dry run)" in line
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("pending", lines[0])
+        order = [
+            "run the same pohunek that started the refresh",
+            "service refresh-path (without a dry run) to finish it",
+            "then re-run $0 without --accept-runtime-loss",
+        ]
+        position = -1
+        for step in order:
+            found = lines[1].find(step, position + 1)
+            self.assertGreater(found, position, f"{step!r} missing or out of order in {lines[1]!r}")
+            position = found
+        for line in lines:
+            self.assertNotIn("--dry-run", line)
+            self.assertNotIn("recorded search path", line)
+
+
 class StageArchiveTest(unittest.TestCase):
     def test_daemon_archive_holds_the_binaries_installer_completions_and_docs(self):
         ws = Workspace(self)

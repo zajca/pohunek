@@ -22,7 +22,7 @@ use pohunek_daemon::store::{
 };
 use pohunek_paths::BasePaths;
 use pohunek_platform::process::{
-    Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
+    Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_service_config::preflight::{SessionVerdict, StoreState, Verdict};
@@ -59,6 +59,9 @@ use pohunek_platform::supervisor::UnitEnvironment;
 #[cfg(target_os = "linux")]
 #[path = "engine_tests_unit_environment.rs"]
 mod unit_environment;
+
+#[path = "engine_tests_refresh.rs"]
+mod refresh_path;
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
@@ -471,6 +474,16 @@ fn engine_over<'a>(context: &'a Context, backend: &'a Backend) -> Engine<'a> {
     engine
 }
 
+/// A test action run when `replace` succeeds.
+#[derive(Clone)]
+struct ReplaceHook(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for ReplaceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplaceHook(..)")
+    }
+}
+
 #[derive(Debug, Default)]
 struct World {
     registered: Option<JobDefinition>,
@@ -491,6 +504,16 @@ struct World {
     refused_replace: Option<String>,
     /// Version whose daemon installation is refused during rollback.
     refused_install: Option<String>,
+    /// Daemon starts so far; each one gives the main process a new start identity.
+    restarts: u64,
+    /// `PATH` whose definition `replace` refuses without effect.
+    refused_replace_path: Option<String>,
+    /// `PATH` whose definition `replace` accepts without restarting the
+    /// daemon process: the old process keeps running and answering.
+    kept_process_path: Option<String>,
+    /// Runs once, when the next `replace` succeeds: the old daemon having
+    /// accepted work meanwhile.
+    replace_hook: Option<ReplaceHook>,
     /// A daemon store write made when the replacement starts.
     store_on_replace: Option<PathBuf>,
     /// A final store write made while the replacement stops.
@@ -568,6 +591,7 @@ impl DaemonSupervisor for Fake {
             }
             world.registered = Some(definition.clone());
             world.running = true;
+            world.restarts += 1;
             if world.registration == Registration::FailsAfterRegistering {
                 return Err(supervisor::Error::Operation {
                     operation: "install",
@@ -591,8 +615,21 @@ impl DaemonSupervisor for Fake {
                     source: "injected failure".into(),
                 });
             }
+            let path = definition.environment().get("PATH").cloned();
+            if path.is_some() && world.refused_replace_path == path {
+                return Err(supervisor::Error::Operation {
+                    operation: "replace",
+                    source: "injected failure for this PATH".into(),
+                });
+            }
             world.registered = Some(definition.clone());
             world.running = true;
+            if path.is_none() || world.kept_process_path != path {
+                world.restarts += 1;
+            }
+            if let Some(hook) = world.replace_hook.take() {
+                (hook.0)();
+            }
             if let Some(path) = world.store_on_replace.take() {
                 write_new_store(&path);
             }
@@ -616,7 +653,7 @@ impl DaemonSupervisor for Fake {
                 },
                 process: (world.running && !world.processless).then_some(ProcessIdentity {
                     pid: DAEMON_PID,
-                    start_identity: StartIdentity::new(1),
+                    start_identity: StartIdentity::new(1 + world.restarts),
                 }),
                 definition: Some(definition.facts()),
             })
@@ -1268,7 +1305,7 @@ async fn refresh(
     harness: &Harness,
     dry_run: bool,
 ) -> Result<crate::service::report::RefreshPathReport, Error> {
-    crate::service::refresh::refresh_search_path(&harness.context, None, dry_run).await
+    crate::service::refresh_discovering(&harness.context, &harness.engine(), dry_run).await
 }
 
 fn config_bytes(harness: &Harness) -> Vec<u8> {
@@ -1394,13 +1431,22 @@ async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_or_prin
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
+/// Drives the command's entry in a thread while the login shell hangs, and
+/// takes the transaction lock from this one.
+#[test]
+fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
+    let test_runtime = runtime();
     let mut harness = Harness::new();
     let recorded = harness.root.join("recorded-bin");
     let fallback = harness.root.join("fallback-bin");
     harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
-    harness.install(V1).await.expect("install");
+    test_runtime.block_on(harness.install(V1)).expect("install");
     let started = harness.root.join("shell-started");
     let release = harness.root.join("shell-release");
     let body = format!(
@@ -1416,32 +1462,24 @@ async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
         pohunek_test_support::wait::HANG_GUARD,
         &fallback,
     );
-    let context = harness.context.clone();
-    let refresher = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(crate::service::refresh::refresh_search_path(
-                &context, None, false,
-            ))
-    });
-    pohunek_test_support::wait::poll_until("the login shell to start", || {
-        started.exists().then_some(())
+
+    // The entry the command runs: the shell and the engine's lock in one call.
+    let error = std::thread::scope(|scope| {
+        let refresher = scope.spawn(|| runtime().block_on(refresh(&harness, false)));
+        pohunek_test_support::wait::poll_until("the login shell to start", || {
+            started.exists().then_some(())
+        });
+
+        let store = Store::new(harness.context.paths().state_dir.clone());
+        let lock = test_runtime.block_on(store.lock());
+        let held = lock.is_ok();
+        drop(lock);
+        std::fs::write(&release, b"").expect("release the login shell");
+        let outcome = refresher.join().expect("refresh thread");
+        assert!(held, "the lock is free while the login shell hangs");
+        outcome.expect_err("the released shell fails")
     });
 
-    let store = Store::new(harness.context.paths().state_dir.clone());
-    let lock = store
-        .lock()
-        .await
-        .expect("the lock is free while the login shell hangs");
-    drop(lock);
-    std::fs::write(&release, b"").expect("release the login shell");
-
-    let error = refresher
-        .join()
-        .expect("refresh thread")
-        .expect_err("the released shell fails");
     assert_eq!(error.code(), "service_search_path_refresh_failed");
 }
 
@@ -1493,9 +1531,14 @@ async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_l
     let error = refresh(&harness, false).await.expect_err("newer schema");
     assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
     let hint = error.hint().expect("hint");
-    assert!(
-        hint.contains("newer release") && hint.contains("<prefix>/bin/pohunek"),
-        "{hint}"
+    assert_steps_in_order(
+        hint,
+        &[
+            "written by a newer release",
+            "`pohunek service refresh-path` of the installed release",
+            "`<prefix>/bin/pohunek`",
+            "never rewrites it",
+        ],
     );
     assert_eq!(config_bytes(&harness), newer.into_bytes(), "untouched");
 }
@@ -8010,7 +8053,12 @@ fn an_unmanaged_host_gets_no_recorded_path_warning() {
         .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
     assert!(
-        super::preflight::recorded_path_warning(&context, "/usr/bin:/bin").is_none(),
+        super::preflight::recorded_path_warning(
+            &context,
+            "/usr/bin:/bin",
+            super::preflight::JudgedPath::Installed
+        )
+        .is_none(),
         "the user manager's PATH is not a recorded path"
     );
 }

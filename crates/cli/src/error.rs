@@ -705,12 +705,17 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::VerifierMissing
         | Error::UnitVerification { .. }
         | Error::UpgradeAtRisk { .. }
+        | Error::RefreshAtRisk { .. }
         | Error::UpgradeStoreUnusable { .. }
+        | Error::RefreshStoreUnusable { .. }
         | Error::UpgradeRuntimesRefused { .. }
         | Error::SearchPathUnmanaged
         | Error::RefreshConfigSchema { .. }
         | Error::SearchPathRefreshFailed { .. }
         | Error::RefreshBlockedByTransaction
+        | Error::DaemonJobMissing { .. }
+        | Error::RefreshConfigChanged
+        | Error::RefreshPending { .. }
         | Error::LiveSessions { .. } => ErrorClass::Configuration,
         Error::Workflow { class, .. } => *class,
         Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,

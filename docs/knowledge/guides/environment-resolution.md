@@ -94,7 +94,8 @@ because another local account could plant an agent executable there. Each kept e
 and recording cover the same directory and nothing can be retargeted after the
 check. The trade-off: a profile symlink that later points elsewhere (nix
 generations, a dotfile manager) keeps the recorded target until the path is
-recorded again with `pohunek service refresh-path`. An upgrade refused as at risk
+recorded again with `pohunek service refresh-path`, which also restarts the
+daemon with it. An upgrade refused as at risk
 points to it (see the
 [upgrade runbook](../runbooks/update-after-release.md#a-recorded-search-path-that-no-longer-matches-your-profile)). Empty, relative, `.`-style, duplicate, and
 missing entries are ignored; a `PATH` containing a control character is
@@ -145,20 +146,23 @@ directories refused as untrusted with a reason. The human output prints a
 `warning:` line for a failed login shell and for each refused directory. This
 is the only place the outcome is visible, so read it after installing.
 
-The path is recorded at install. The job definition is written only at install
-and at an upgrade to a different version, and upgrades reuse the recorded list
-without running a login shell, so an edit of `search_path` in `service.toml`
-takes effect only at the next version-changing upgrade; a same-version upgrade
-returns before it replaces the job. To pick up a newly installed prefix,
-or a profile link that moved, run `pohunek service refresh-path`: it runs the
-login-shell discovery again, prints the directories it adds and removes, and
-rewrites only the recorded `search_path` in `service.toml`, atomically and under
-the transaction lock, without stopping or restarting anything. `--dry-run`
-previews it. `service check` and `service upgrade` judge with the new path at
-once; the running daemon job carries its `PATH` until its next replacement, a
-version-changing upgrade. A login shell that fails, hangs or prints junk is
-refused (`service_search_path_refresh_failed`): the fallback list an install
-would record then never replaces a recorded path.
+The path is recorded at install. The job definition is written at install, at
+an upgrade to a different version, and by `pohunek service refresh-path`;
+upgrades reuse the recorded list without running a login shell, so an edit of
+`search_path` in `service.toml` reaches the daemon job only at the next
+version-changing upgrade; a same-version upgrade returns before it replaces the
+job. To pick up a newly installed prefix, or a profile link that moved, run
+`pohunek service refresh-path`: it runs the login-shell discovery again (before
+it takes the transaction lock), prints the directories it adds and removes,
+rewrites the recorded `search_path` in `service.toml` (atomically, under the
+lock) and replaces the daemon job with the new definition in one transaction,
+so the running daemon gets the new `PATH`. Only the daemon restarts; worker
+jobs keep running. The new daemon's adoption verdict is taken first, as for an
+upgrade, and `--accept-runtime-loss` accepts what it lists. `--dry-run` previews
+the change and the verdict without a lock. `service check` and `service
+upgrade` judge with the new path at once. A login shell that fails, hangs or
+prints junk is refused (`service_search_path_refresh_failed`): the fallback list
+an install would record then never replaces a recorded path.
 
 ## The NetBird CLI
 
