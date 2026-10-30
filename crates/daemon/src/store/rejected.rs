@@ -145,7 +145,7 @@ impl Store {
             .into_iter()
             .map(|(line, rejected)| StoreRejectedLine {
                 line,
-                may_pin: rejected.may_pin(),
+                may_pin: rejected.pin_unreadable(),
                 content_hash: content_hash(&rejected.text),
                 reason: bounded(&rejected.reason).to_owned(),
                 kind: rejected
@@ -167,8 +167,8 @@ impl Store {
     /// The quarantine records are written and made durable before the store is
     /// rewritten, so a failure at any point leaves the text in at least one of
     /// the two files; a repeat after a crash between the two steps appends a
-    /// second record. The store's other lines are rewritten unchanged and in
-    /// order. A line that may own a live runtime is refused unless
+    /// second record. The store's other records are rewritten as a rewrite
+    /// does, and the lines that stay rejected are kept as stored. A line that may own a live runtime is refused unless
     /// `accept_pin_loss` is set, because dropping it drops the package pin that
     /// keeps the root a live worker runs from.
     ///
@@ -215,7 +215,7 @@ impl Store {
                 content_hash: content_hash_hex,
                 kind: line.kind.as_deref().map(bounded),
                 reason: bounded(&line.reason),
-                may_pin: line.may_pin(),
+                may_pin: line.pin_unreadable(),
                 may_own_runtime: may_be_live(line),
                 accepted_pin_loss: accept_pin_loss && may_be_live(line),
                 text: &line.text,

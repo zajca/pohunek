@@ -740,13 +740,22 @@ fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
             DoctorStatus::Ok,
             "The metadata store holds no line this build cannot load.",
         ),
-        RejectedLinesState::Counted { total, may_pin } => check(
-            METADATA_STORE_REJECTED_LINES_CHECK,
-            DoctorStatus::Warn,
-            &format!(
-                "The metadata store keeps {total} line(s) this build cannot load, {may_pin} of them may pin a runtime package, so package removal and selection fail closed while they stay. Run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`."
-            ),
-        ),
+        RejectedLinesState::Counted { total, may_pin } => {
+            let effect = if may_pin > 0 {
+                format!(
+                    "{may_pin} of them may pin a runtime package whose pin cannot be read, so package removal and selection fail closed while they stay"
+                )
+            } else {
+                "none of them can pin a runtime package".to_owned()
+            };
+            check(
+                METADATA_STORE_REJECTED_LINES_CHECK,
+                DoctorStatus::Warn,
+                &format!(
+                    "The metadata store keeps {total} line(s) this build cannot load; {effect}. Run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`."
+                ),
+            )
+        }
         RejectedLinesState::Unreadable => check(
             METADATA_STORE_REJECTED_LINES_CHECK,
             DoctorStatus::Fail,

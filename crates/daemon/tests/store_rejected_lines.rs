@@ -485,3 +485,37 @@ async fn the_daemon_doctor_reports_rejected_lines_and_names_the_command() {
     daemon.kill().await.expect("stop daemon");
     let _ = daemon.wait().await;
 }
+
+#[test]
+fn a_line_that_decodes_but_names_a_future_agent_kind_is_listed_without_making_the_pins_unreadable()
+{
+    let root = pohunek_test_support::tempdir().expect("private fixture root");
+    let (store, path) = fixture_store(root.path());
+    // The fixture's session record, naming an agent kind that is not a runtime id.
+    let stored = std::fs::read_to_string(&path).expect("read current store");
+    let mut line: serde_json::Value =
+        serde_json::from_str(stored.trim_end()).expect("one stored JSON line");
+    line["session_id"] = "s-future".into();
+    line["info"]["agent_base"] = "Future Agent".into();
+    let future = serde_json::to_string(&line).expect("serialize the future-kind line");
+    let mut content = stored;
+    content.push_str(&future);
+    content.push('\n');
+    std::fs::write(&path, content).expect("append the future-kind line");
+
+    let listed = store.rejected_lines().expect("list rejected lines");
+    assert_eq!(listed.len(), 1, "the record is not loaded");
+    assert_eq!(listed[0].kind.as_deref(), Some("session"));
+    assert!(
+        !listed[0].may_pin,
+        "the line decodes, so what it pins is read like a loaded record's"
+    );
+    assert_eq!(
+        store
+            .pinned_package_digests()
+            .expect("scan")
+            .unreadable_lines,
+        0,
+        "the daemon's gate counts the same lines as the list"
+    );
+}

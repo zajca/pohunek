@@ -55,8 +55,9 @@ pub struct StoreRejectedLine {
     /// Why no loader accepts the line, cut to
     /// [`STORE_REJECTED_TEXT_MAX_BYTES`].
     pub reason: String,
-    /// Whether the line may pin a runtime package: its readable `kind` is not
-    /// `worktree` or `project`. Package gates fail closed while one exists.
+    /// Whether the line may pin a runtime package whose pin cannot be read:
+    /// its readable `kind` is not `worktree` or `project`, and it does not
+    /// decode as a record. Package gates fail closed while one exists.
     pub may_pin: bool,
     /// Whether the session the line holds may own a live runtime. A line whose
     /// state cannot be read counts as live.

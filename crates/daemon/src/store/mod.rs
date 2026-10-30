@@ -1469,13 +1469,6 @@ impl Store {
             return Ok(PinnedDigests::default());
         };
         let mut pinned = PinnedDigests::default();
-        let pin = |pin: &LaunchPin, digests: &mut Vec<protocol::PackageDigest>| {
-            if let Some(protocol::BindingProvenance::Package { package_digest, .. }) =
-                pin.binding().map(|binding| &binding.provenance)
-            {
-                digests.push(package_digest.clone());
-            }
-        };
         for line in self.checked_lines(&content)? {
             let schema::ParsedLine::Record { value, .. } = line else {
                 pinned.unreadable_lines += 1;
@@ -1484,13 +1477,7 @@ impl Store {
             let carries_no_pin =
                 !kind_may_pin(value.get("kind").and_then(serde_json::Value::as_str));
             match serde_json::from_value::<Record>(value) {
-                Ok(Record::Session(record)) => {
-                    if let Some(recovery) = &record.recovery {
-                        pin(&recovery.launch_binding, &mut pinned.digests);
-                    }
-                }
-                Ok(Record::Resume(binding)) => pin(&binding.launch_binding, &mut pinned.digests),
-                Ok(Record::Worktree(_) | Record::Project(_)) => {}
+                Ok(record) => pinned.digests.extend(record_pin(&record)),
                 Err(_error) if carries_no_pin => {}
                 Err(_error) => pinned.unreadable_lines += 1,
             }
@@ -1945,12 +1932,20 @@ pub(crate) struct RejectedLine {
     pub(crate) reason: String,
     /// The line as stored, without its terminator.
     pub(crate) text: String,
+    /// The package digest a line that still decodes as a record pins. Such a
+    /// line is rejected only because its agent kind is not a runtime id, so
+    /// its pin is as readable as that of a loaded record.
+    pub(crate) decoded_pin: Option<protocol::PackageDigest>,
+    /// Whether the line decodes as a record at all.
+    pub(crate) decodable: bool,
 }
 
 impl RejectedLine {
-    /// Whether the line may pin a runtime package; see [`kind_may_pin`].
-    pub(crate) fn may_pin(&self) -> bool {
-        kind_may_pin(self.kind.as_deref())
+    /// Whether the line may pin a runtime package and the pin cannot be read:
+    /// its kind may pin (see [`kind_may_pin`]) and it does not decode. This is
+    /// the line count [`Store::pinned_package_digests`] reports as unreadable.
+    pub(crate) fn pin_unreadable(&self) -> bool {
+        kind_may_pin(self.kind.as_deref()) && !self.decodable
     }
 }
 
@@ -1981,6 +1976,8 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 (text, (None, None, false, false), Err(error))
             }
         };
+        let mut decoded_pin = None;
+        let mut decodable = false;
         let reason = match parsed {
             Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
                 mirror_worker_instance_id(&mut record);
@@ -1991,7 +1988,9 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 resume.push(binding);
                 continue;
             }
-            Ok(Record::Session(_) | Record::Resume(_)) => {
+            Ok(record @ (Record::Session(_) | Record::Resume(_))) => {
+                decodable = true;
+                decoded_pin = record_pin(&record);
                 "the agent kind is not a runtime id".to_owned()
             }
             Ok(Record::Worktree(binding)) => {
@@ -2012,6 +2011,8 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
             removal_intent,
             reason,
             text: text.to_owned(),
+            decoded_pin,
+            decodable,
         });
     }
     ((resume, worktrees, projects, sessions), rejected)
@@ -2056,6 +2057,25 @@ pub(crate) fn may_hold_session(kind: Option<&str>) -> bool {
 /// missing or unreadable discriminator may.
 pub(crate) fn kind_may_pin(kind: Option<&str>) -> bool {
     !matches!(kind, Some("worktree" | "project"))
+}
+
+/// The package digest `record` pins: its recovery's launch binding for a
+/// session, its launch binding for a resume binding.
+fn record_pin(record: &Record) -> Option<protocol::PackageDigest> {
+    let pin = |pin: &LaunchPin| match pin.binding().map(|binding| &binding.provenance) {
+        Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
+            Some(package_digest.clone())
+        }
+        _ => None,
+    };
+    match record {
+        Record::Session(record) => record
+            .recovery
+            .as_ref()
+            .and_then(|recovery| pin(&recovery.launch_binding)),
+        Record::Resume(binding) => pin(&binding.launch_binding),
+        Record::Worktree(_) | Record::Project(_) => None,
+    }
 }
 
 /// The kind, session id, liveness and removal intent a rejected line still names.

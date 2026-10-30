@@ -1015,6 +1015,14 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
         .filter_map(|session| session.recovery.as_ref())
         .chain(dry.resume.iter())
         .collect();
+    // A rejected line that still decodes pins what the daemon's gate reads from
+    // it, though no runtime of it is known.
+    let rejected_pins = dry.rejected.iter().filter_map(|line| {
+        line.decoded_pin.clone().map(|digest| SessionRecord {
+            runtime: None,
+            pin: Some(digest),
+        })
+    });
     let records = bindings
         .iter()
         .map(|binding| SessionRecord {
@@ -1030,8 +1038,13 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
                 Some(protocol::BindingProvenance::Builtin { .. }) | None => None,
             },
         })
+        .chain(rejected_pins)
         .collect();
-    let unreadable_lines = dry.rejected.iter().filter(|line| line.may_pin()).count();
+    let unreadable_lines = dry
+        .rejected
+        .iter()
+        .filter(|line| line.pin_unreadable())
+        .count();
     Ok(StoreView {
         records,
         unreadable_lines,

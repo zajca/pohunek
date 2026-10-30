@@ -45,7 +45,10 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    repeat with `--accept-pin-loss` once nothing depends on its package root.
    The quarantine file is owner-private and never deleted by the daemon; to put
    a line back, stop the daemon, append the record's `text` to `metadata.jsonl`
-   and start it. `pohunek service uninstall --purge` keeps and reports it. A
+   and start it. `pohunek service uninstall --purge` keeps and reports it. If
+   `set-aside` fails with `store_quarantine_failed` because the quarantine file
+   reached the store size limit or is not owner-private, stop the daemon, move
+   the file aside as a backup and start it; the next set-aside creates a new one. A
    daemon that predates these commands has the manual remedy: stop it, move the
    line out of `metadata.jsonl` into a backup file and start it, because a hand
    edit while the daemon runs risks a short read and data loss at the next

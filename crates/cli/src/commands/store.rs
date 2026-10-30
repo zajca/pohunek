@@ -17,7 +17,7 @@ use protocol::{
 };
 
 use crate::client::Client;
-use crate::commands::plugin::print_output;
+use crate::commands::plugin::{print_output, sanitize};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{is_local_host, LOCAL_HOST};
@@ -184,12 +184,12 @@ fn render_line(out: &mut String, line: &StoreRejectedLine) {
         out,
         "line {}: kind={} may_pin={} may_own_runtime={}",
         line.line,
-        line.kind.as_deref().unwrap_or("-"),
+        sanitize(line.kind.as_deref().unwrap_or("-")),
         yes_no(line.may_pin),
         yes_no(line.may_own_runtime),
     );
     let _ = writeln!(out, "  hash:   {}", line.content_hash);
-    let _ = writeln!(out, "  reason: {}", line.reason);
+    let _ = writeln!(out, "  reason: {}", sanitize(&line.reason));
 }
 
 fn render_set_aside(result: &StoreRejectedSetAsideResult) -> String {

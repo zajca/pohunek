@@ -24,8 +24,9 @@ export type StoreRejectedLine = {
    */
   reason: string;
   /**
-   * Whether the line may pin a runtime package: its readable `kind` is not
-   * `worktree` or `project`. Package gates fail closed while one exists.
+   * Whether the line may pin a runtime package whose pin cannot be read:
+   * its readable `kind` is not `worktree` or `project`, and it does not
+   * decode as a record. Package gates fail closed while one exists.
    */
   may_pin: boolean;
   /**
