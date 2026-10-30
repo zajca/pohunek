@@ -548,7 +548,7 @@ mod tests {
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
-    use pohunek_service_config::{RUNTIME_DROP_BOUND, SHUTDOWN_MARGIN};
+    use pohunek_service_config::{LOG_FLUSH_BOUND, RUNTIME_DROP_BOUND, SHUTDOWN_MARGIN};
     use pohunek_test_support::wait::HANG_GUARD;
 
     use super::*;
@@ -780,6 +780,11 @@ mod tests {
             plan.create_drain + started.elapsed() + SHUTDOWN_MARGIN <= SERVICE_EXIT_TIMEOUT,
             "every phase at its bound still ends before the service manager's kill"
         );
+        assert!(
+            plan.create_drain + started.elapsed() + RUNTIME_DROP_BOUND + LOG_FLUSH_BOUND
+                <= SERVICE_EXIT_TIMEOUT,
+            "the runtime drop and the log flush after the last phase fit as well"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -813,6 +818,10 @@ mod tests {
         assert_eq!(report.shortened, Some(shortfall));
         assert_eq!(report.still_running().len(), 3, "{report:?}");
         assert!(started.elapsed() + SHUTDOWN_MARGIN <= shortfall.exit_timeout);
+        assert!(
+            started.elapsed() + RUNTIME_DROP_BOUND + LOG_FLUSH_BOUND <= shortfall.exit_timeout,
+            "the runtime drop and the log flush fit the shortened plan as well"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -921,31 +930,16 @@ mod tests {
     fn a_blocking_write_that_finishes_inside_the_drop_bound_completes() {
         let finished = Arc::new(AtomicBool::new(false));
         let (runtime, release) = runtime_with_blocking_task(Arc::clone(&finished));
-        let (done, report) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            done.send(drop_runtime(runtime, HANG_GUARD))
-                .expect("test waits");
-        });
+        // The runtime drop drops this task first, which releases the write:
+        // the write can only end once the drop has started waiting for it.
+        drop(runtime.spawn(async move {
+            let _release = release;
+            std::future::pending::<()>().await;
+        }));
 
-        // The drop cannot return before the task does: its bound is the hang
-        // guard, far above the time the release takes.
-        release.send(()).expect("the task is waiting");
-        let report = report
-            .recv_timeout(HANG_GUARD)
-            .expect("the runtime drop returned");
-        thread.join().expect("drop thread");
+        let report = drop_on_thread(runtime, HANG_GUARD);
 
         assert!(finished.load(Ordering::SeqCst), "the write ran to its end");
         assert!(!report.timed_out);
-    }
-
-    #[test]
-    fn runtime_drop_bound_fits_inside_the_shutdown_margin() {
-        // timing-allowed: #1725 tracing-appender's worker guard waits up to 100 ms + 1 s on drop
-        let log_flush = Duration::from_millis(1100);
-        assert!(
-            RUNTIME_DROP_BOUND + log_flush <= SHUTDOWN_MARGIN,
-            "the margin covers the runtime drop and the log writer's final flush"
-        );
     }
 }

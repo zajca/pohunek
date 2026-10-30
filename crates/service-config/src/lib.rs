@@ -542,12 +542,17 @@ pub const DEFAULT_EVENT_LOG_FLUSH: Duration = Duration::from_secs(5);
 /// the service manager's kill.
 pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(2);
 
+/// Longest the log writer's final flush takes when `pohunekd` drops its log
+/// guard: `tracing-appender` 0.2.5 waits up to 100 ms for the worker to
+/// acknowledge shutdown, then 1 s for it to join.
+pub const LOG_FLUSH_BOUND: Duration = Duration::from_millis(1100);
+
 /// How long the daemon waits for its blocking threads when it drops the async
 /// runtime after the last shutdown phase.
 ///
 /// Part of [`SHUTDOWN_MARGIN`]: a blocking store write that never returns is
 /// named by the registry phase and left behind here. The rest of the margin
-/// covers the log writer's final flush (up to 1.1 s) that follows the drop.
+/// covers the log writer's final flush ([`LOG_FLUSH_BOUND`]) that follows the drop.
 pub const RUNTIME_DROP_BOUND: Duration = Duration::from_millis(500);
 
 /// Longest a stop waits behind an input write that holds the worker's control

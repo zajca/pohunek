@@ -284,13 +284,12 @@ impl BackgroundTasks {
 mod tests {
     use super::*;
 
-    // The registry bound is the behavior under test: tokio does not advance
-    // paused time while a blocking task is in flight, and the write only
-    // returns after the bound expired.
+    // The registry bound is the behavior under test; it elapses on the paused
+    // clock, which `advance` moves even while a blocking task is in flight.
     // timing-allowed: #1725 the registry bound is the policy under test
-    const BOUND: Duration = Duration::from_millis(50);
+    const BOUND: Duration = Duration::from_secs(5);
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wedged_blocking_write_is_named_in_the_registry_report() {
         let tasks = BackgroundTasks::default();
         let (release, held) = std::sync::mpsc::channel::<()>();
@@ -303,7 +302,14 @@ mod tests {
             .recv_timeout(pohunek_test_support::wait::HANG_GUARD)
             .expect("the write started");
 
-        let report = tasks.shutdown(BOUND).await;
+        let shutdown = tasks.shutdown(BOUND);
+        tokio::pin!(shutdown);
+        tokio::select! {
+            _ = &mut shutdown => panic!("the shutdown ended while the write is wedged"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(BOUND).await;
+        let report = shutdown.await;
 
         assert_eq!(report.still_running, ["record_session"]);
         assert_eq!(report.outstanding, 1);
