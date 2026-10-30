@@ -526,6 +526,9 @@ Daemon, sessions, integrations, and project state:
 - `crates/package/src/registry/shape_guard.rs` — `registry.json` guard (keys and
   `PackageSource` values) and its `registry/fixtures/registry-<N>.txt` snapshots,
   tied to `REGISTRY_SCHEMA`.
+- `crates/shape-guard/src/lib.rs` — dev-only helpers shared by the guards:
+  key and string-leaf collection, enum registry classification, snapshot
+  comparison, and the `unit_values!`/`data_values!` macros.
 - `crates/protocol/src/version.rs`
 - `crates/worker-protocol/src/version.rs`
 - `scripts/release` — compatibility-constant check against the previous tag.

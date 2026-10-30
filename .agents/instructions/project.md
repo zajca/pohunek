@@ -179,6 +179,17 @@ the reader accepts exactly one. The guard
 resolution: bump `REGISTRY_SCHEMA`, make `parse_state` accept the previous schema,
 add the new snapshot.
 
+The guards share one dev-only crate, `crates/shape-guard`
+(`pohunek-shape-guard`, library `persisted_shape`): key and string-leaf
+collection, the enum registry classification, the snapshot comparison, and the
+`unit_values!`/`data_values!` macros that derive an enum's listed values and an
+exhaustive `match` from one variant list. It is a dev-dependency of the daemon
+and the package crate only and must never become a normal dependency of a
+shipped binary (`cargo tree -e normal` for `pohunek`, `pohunekd`,
+`pohunek-sessiond` and `pohunek-relayd` does not list it). A `data_values!`
+entry names exactly one variant, `Type::Variant` with an optional `(..)` or
+`{ .. }` tail; an or-pattern or `_` does not compile.
+
 These daemon-owned documents persist no enum the daemon reads back, so they have
 no snapshot guard:
 

@@ -998,7 +998,7 @@ a schema bump, and when an older schema has no migration step. The sibling guard
 `crates/daemon/src/host_state/records/shape_guard.rs` does the same for
 `governance.json` and `identity.json` against their format versions, and
 `crates/package/src/registry/shape_guard.rs` does it for `registry.json` against
-`REGISTRY_SCHEMA`.
+`REGISTRY_SCHEMA`. The guards share the dev-only crate `crates/shape-guard`.
 
 ## Attach Streaming
 
