@@ -7834,7 +7834,12 @@ const DELAYED_SUBMIT_TUI: &str = "while IFS= read -r line; do echo got:$line; do
 /// TUI answers `got:<line>` only once it receives Enter, so the screen shows
 /// whether Enter was written.
 fn delayed_submit_registry(tag: &str) -> SessionRegistry {
-    let body = format!("program = \"/bin/sh\"\nargs = [\"-c\", '{DELAYED_SUBMIT_TUI}']\n");
+    delayed_submit_registry_running(tag, DELAYED_SUBMIT_TUI)
+}
+
+/// [`delayed_submit_registry`] whose fake TUI runs the shell script `tui`.
+fn delayed_submit_registry_running(tag: &str, tui: &str) -> SessionRegistry {
+    let body = format!("program = \"/bin/sh\"\nargs = [\"-c\", '{tui}']\n");
     let agents_dir =
         temp_agents_dir_with(tag, "delayed-codex", &format!("base = \"codex\"\n{body}"));
     std::fs::write(
@@ -7953,6 +7958,274 @@ async fn delayed_wait_input_times_out_after_enter_when_the_agent_never_works() {
     assert!(error.msg.contains("Enter was written"), "msg={}", error.msg);
     let output = wait_for_session_output(&registry, &id, &["got:"]).await;
     assert!(output.contains("idle-marker"), "output={output:?}");
+    registry.stop(&id).await.expect("stop the session");
+}
+
+/// Parks a delayed submit between its body and its Enter, resizes the session
+/// meanwhile and checks the resize is served while the agent has seen only the
+/// body; Enter then follows once the submit continues. `acknowledge` reports
+/// the working activity a waited input needs. Returns the input's own result.
+async fn resize_between_body_and_enter(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    delay_boundary: &tokio::sync::Barrier,
+    request: tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>,
+    marker: &str,
+    acknowledge: bool,
+) -> Result<protocol::SessionInputResult, protocol::ProtocolError> {
+    reach_boundary(delay_boundary).await;
+    pohunek_test_support::wait::guard(
+        "the resize to be served while the submit delay is pending",
+        registry.resize(id, 100, 30),
+    )
+    .await
+    .expect("resize between the body and Enter");
+    let before_enter = read_session_output_after_rejection(registry, id).await;
+    assert!(
+        !before_enter.contains("got:"),
+        "Enter reached the agent before the delay ended: {before_enter:?}"
+    );
+    reach_boundary(delay_boundary).await;
+
+    let output = wait_for_session_output(registry, id, &[&format!("got:{marker}")]).await;
+    assert!(output.contains(marker), "output={output:?}");
+    if acknowledge {
+        assert!(
+            report_input_activity(registry, id, AgentActivity::Working, 1)
+                .await
+                .recorded
+        );
+    }
+    let result = request.await.expect("input task joins");
+    registry.stop(id).await.expect("stop the session");
+    result
+}
+
+#[tokio::test]
+async fn delayed_wait_input_serves_a_resize_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-wait-resize");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "resize-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+
+    let result = resize_between_body_and_enter(
+        &registry,
+        &id,
+        &delay_boundary,
+        request,
+        "resize-marker",
+        true,
+    )
+    .await
+    .expect("waited input is acknowledged");
+    assert_eq!(result.submitted, Some(true));
+}
+
+#[tokio::test]
+async fn delayed_plain_input_serves_a_resize_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-plain-resize");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "plain-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    resize_between_body_and_enter(
+        &registry,
+        &id,
+        &delay_boundary,
+        request,
+        "plain-marker",
+        false,
+    )
+    .await
+    .expect("plain input is delivered");
+}
+
+/// Stops the session while a delayed submit waits between body and Enter and
+/// returns the submit's own result once it continues.
+async fn stop_between_body_and_enter(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    delay_boundary: &tokio::sync::Barrier,
+    request: tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>,
+) -> Result<protocol::SessionInputResult, protocol::ProtocolError> {
+    reach_boundary(delay_boundary).await;
+    pohunek_test_support::wait::guard(
+        "the stop to be served while the submit delay is pending",
+        Box::pin(registry.stop(id)),
+    )
+    .await
+    .expect("stop between the body and Enter");
+    reach_boundary(delay_boundary).await;
+    request.await.expect("input task joins")
+}
+
+#[tokio::test]
+async fn delayed_wait_input_serves_a_stop_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-wait-stop");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "stop-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+
+    let error = stop_between_body_and_enter(&registry, &id, &delay_boundary, request)
+        .await
+        .expect_err("Enter must not reach a stopped session");
+    assert_eq!(error.code, "session_not_running", "{error:?}");
+}
+
+#[tokio::test]
+async fn delayed_plain_input_serves_a_stop_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-plain-stop");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "stop-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    // Plain input is fire-and-forget: the text was delivered and the stopped
+    // process leaves Enter nothing to reach.
+    stop_between_body_and_enter(&registry, &id, &delay_boundary, request)
+        .await
+        .expect("the text was delivered before the stop");
+}
+
+#[tokio::test]
+async fn delayed_plain_input_succeeds_when_the_agent_exits_before_enter() {
+    // The text ends with a newline, so the fake TUI reads its line and exits
+    // while the submit delay is still pending.
+    let registry =
+        delayed_submit_registry_running("delayed-plain-exit", "IFS= read -r line; echo got:$line");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "exit-marker\n".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    reach_boundary(&delay_boundary).await;
+    wait_until("the session to leave running", || async {
+        let info = registry.inspect(&id).await.ok()?;
+        (info.state != protocol::SessionState::Running).then_some(())
+    })
+    .await;
+    reach_boundary(&delay_boundary).await;
+
+    let result = request
+        .await
+        .expect("input task joins")
+        .expect("the text was delivered; Enter has no process left to reach");
+    // Plain input reports only that the daemon accepted it: no submit mark,
+    // activity boundary, `submitted` or `prompt_accepted`, none of which would
+    // be true without Enter.
+    assert_eq!(
+        result,
+        protocol::SessionInputResult {
+            accepted: true,
+            activity: None,
+            activity_source: None,
+            runtime: None,
+            activity_epoch: None,
+            activity_revision: None,
+            submitted: None,
+            prompt_accepted: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn delayed_plain_input_reports_a_lost_control_connection_to_a_surviving_worker() {
+    let registry = delayed_submit_registry("delayed-plain-severed");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let failure_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_enter_failure(Arc::clone(&failure_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "severed-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    reach_boundary(&delay_boundary).await;
+    // The worker survives the lost connection, so Enter fails while the
+    // process lives.
+    let (worker, expected) = live_worker_and_identity(&registry, &id).await;
+    worker.sever_connection();
+    reach_boundary(&delay_boundary).await;
+    // The daemon is reconnecting to the surviving worker when the failed
+    // Enter reads the session state.
+    reach_boundary(&failure_boundary).await;
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &id,
+                &expected,
+                &WorkerError::Protocol("test disconnect".to_owned()),
+            )
+            .await
+    );
+    reach_boundary(&failure_boundary).await;
+
+    let error = request
+        .await
+        .expect("input task joins")
+        .expect_err("Enter cannot reach a worker whose connection was lost");
+    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
     registry.stop(&id).await.expect("stop the session");
 }
 

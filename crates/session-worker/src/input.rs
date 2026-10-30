@@ -133,11 +133,21 @@ pub trait InputWriter: Send {
     fn flush(&mut self) -> std::io::Result<()>;
 }
 
+/// Locks that order the writers of one PTY.
+#[derive(Debug, Default)]
+struct WriteLocks {
+    /// Held while one fragment is written; released across a fragment's delay.
+    execution: AsyncMutex<()>,
+    /// Held for the whole run of a control plan, so control plans never
+    /// interleave with each other while `execution` is free during a delay.
+    plans: AsyncMutex<()>,
+}
+
 /// Cloneable ordered input coordinator.
 #[derive(Clone)]
 pub struct WriteCoordinator {
     writer: Arc<Mutex<Box<dyn InputWriter>>>,
-    execution: Arc<AsyncMutex<()>>,
+    locks: Arc<WriteLocks>,
     state: Arc<Mutex<DedupState>>,
     /// Stall bound for control plans, reported in [`InputError::Stalled`].
     ///
@@ -177,7 +187,7 @@ impl WriteCoordinator {
         }
         Ok(Self {
             writer: Arc::new(Mutex::new(Box::new(writer))),
-            execution: Arc::new(AsyncMutex::new(())),
+            locks: Arc::new(WriteLocks::default()),
             stall,
             state: Arc::new(Mutex::new(DedupState {
                 entries: HashMap::new(),
@@ -193,17 +203,21 @@ impl WriteCoordinator {
 
     /// Executes or joins an idempotent control write plan.
     ///
-    /// Completion is published only after all fragments are flushed. Plans are
-    /// globally serialized so their delayed fragments cannot interleave. The
+    /// Completion is published only after all fragments are flushed. Control
+    /// plans are serialized as a whole, so their fragments never interleave
+    /// with another control plan. Attach writes and worker replies may land
+    /// between fragments, while a fragment's delay runs, but never inside a
+    /// fragment. The
     /// lease sequence must increase in request order. A changed lease starts a
     /// fresh namespace because the previous lease is rejected before input
     /// handling.
     ///
     /// The plan is bounded by the coordinator's stall: waiting for the
-    /// execution lock held by an attach write and every PTY write count as no
+    /// plan lock, the execution lock held by an attach write and every PTY write count as no
     /// progress. A control caller must never wedge its connection behind a
-    /// human's input, so a plan that cannot start within the stall fails with
-    /// [`InputError::Stalled`] and writes nothing.
+    /// human's input, so a plan that cannot take a lock within the stall fails
+    /// with [`InputError::Stalled`] and stops after the fragments already
+    /// written.
     ///
     /// # Errors
     ///
@@ -248,7 +262,7 @@ impl WriteCoordinator {
         match action {
             Action::Join(receiver) => wait_result(receiver).await,
             Action::Execute(sender) => {
-                let result = self.execute_once(&plan.fragments, self.stall).await;
+                let result = self.execute_plan(&plan.fragments).await;
                 let stored = result.as_ref().copied().map_err(StoredError::from_input);
                 self.complete(&plan.write_id);
                 let _ = sender.send(Some(stored));
@@ -305,7 +319,7 @@ impl WriteCoordinator {
         match action {
             Action::Join(receiver) => wait_result(receiver).await,
             Action::Execute(sender) => {
-                let result = self.execute_once(&plan.fragments, self.stall).await;
+                let result = self.execute_plan(&plan.fragments).await;
                 let stored = result.as_ref().copied().map_err(StoredError::from_input);
                 self.complete(&plan.write_id);
                 let _ = sender.send(Some(stored));
@@ -363,9 +377,19 @@ impl WriteCoordinator {
             .map(|_receipt| ())
     }
 
-    /// Writes the fragments in order while holding the execution lock.
+    /// Runs a control plan as one unit: no other control plan runs between its
+    /// fragments, while attach writes and replies may land at fragment
+    /// boundaries.
+    async fn execute_plan(&self, fragments: &[InputFragment]) -> Result<WriteReceipt, InputError> {
+        let total = fragments.iter().map(|fragment| fragment.bytes.len()).sum();
+        let _plan = lock_within(&self.locks.plans, self.stall, 0, total).await?;
+        self.execute_once(fragments, self.stall).await
+    }
+
+    /// Writes the fragments in order, holding the execution lock for each
+    /// write and releasing it across the fragment's delay.
     ///
-    /// `stall` bounds the lock wait and every write. `None` leaves both
+    /// `stall` bounds every lock wait and every write. `None` leaves both
     /// unbounded.
     async fn execute_once(
         &self,
@@ -375,7 +399,8 @@ impl WriteCoordinator {
         self.execute_locked(fragments, stall, || {}).await
     }
 
-    /// [`Self::execute_once`] that calls `on_locked` after taking the lock.
+    /// [`Self::execute_once`] that calls `on_locked` after the first
+    /// fragment's lock is taken.
     async fn execute_locked(
         &self,
         fragments: &[InputFragment],
@@ -383,23 +408,14 @@ impl WriteCoordinator {
         on_locked: impl FnOnce(),
     ) -> Result<WriteReceipt, InputError> {
         let total = fragments.iter().map(|fragment| fragment.bytes.len()).sum();
-        let _execution = match stall {
-            Some(stall) => match tokio::time::timeout(stall, self.execution.lock()).await {
-                Ok(guard) => guard,
-                Err(_elapsed) => {
-                    return Err(InputError::Stalled {
-                        written: 0,
-                        total,
-                        stall,
-                    });
-                }
-            },
-            None => self.execution.lock().await,
-        };
-        on_locked();
+        let mut on_locked = Some(on_locked);
         let mut written = 0;
         let mut submit_mark_ns = None;
         for (index, fragment) in fragments.iter().enumerate() {
+            let execution = lock_within(&self.locks.execution, stall, written, total).await?;
+            if let Some(on_locked) = on_locked.take() {
+                on_locked();
+            }
             let bytes = fragment.bytes.clone();
             let writer = Arc::clone(&self.writer);
             let is_last = index + 1 == fragments.len();
@@ -429,6 +445,8 @@ impl WriteCoordinator {
                 }
                 Err(error) => return Err(InputError::Io(error)),
             }
+            // Other writers may take the PTY while the delay runs.
+            drop(execution);
             if !fragment.delay_after.is_zero() {
                 tokio::time::sleep(fragment.delay_after).await;
             }
@@ -448,6 +466,26 @@ impl WriteCoordinator {
                 state.legacy_evicted.insert(&evicted_id);
             }
         }
+    }
+}
+
+/// Takes `mutex`, failing with [`InputError::Stalled`] when `stall` expires
+/// first. `written` and `total` report the plan's progress at that point.
+async fn lock_within(
+    mutex: &AsyncMutex<()>,
+    stall: Option<Duration>,
+    written: usize,
+    total: usize,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, InputError> {
+    match stall {
+        Some(stall) => tokio::time::timeout(stall, mutex.lock())
+            .await
+            .map_err(|_elapsed| InputError::Stalled {
+                written,
+                total,
+                stall,
+            }),
+        None => Ok(mutex.lock().await),
     }
 }
 
@@ -656,7 +694,9 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     /// Adapts a plain writer whose writes never stall, such as a file.
     struct Unbounded<W>(W);
@@ -669,6 +709,169 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             self.0.flush()
         }
+    }
+
+    /// Records every write and parks the writes whose bytes are listed in
+    /// `parked` until the scenario releases one token per gated write.
+    struct Gated {
+        log: Arc<Mutex<Vec<u8>>>,
+        parked: Vec<&'static [u8]>,
+        entered: Arc<Notify>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl InputWriter for Gated {
+        fn write_within(&mut self, buf: &[u8], _stall: Option<Duration>) -> std::io::Result<usize> {
+            if self.parked.contains(&buf) {
+                self.entered.notify_one();
+                self.release
+                    .recv()
+                    .expect("the scenario releases the write");
+            }
+            self.log.lock().expect("write log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Rig {
+        coordinator: WriteCoordinator,
+        log: Arc<Mutex<Vec<u8>>>,
+        entered: Arc<Notify>,
+        release: mpsc::Sender<()>,
+    }
+
+    fn gated_coordinator(parked: Vec<&'static [u8]>, stall: Option<Duration>) -> Rig {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let (release, receiver) = mpsc::channel();
+        let writer = Gated {
+            log: Arc::clone(&log),
+            parked,
+            entered: Arc::clone(&entered),
+            release: receiver,
+        };
+        let coordinator = WriteCoordinator::new(writer, 8, stall).expect("coordinator");
+        Rig {
+            coordinator,
+            log,
+            entered,
+            release,
+        }
+    }
+
+    fn two_fragment_plan(write_id: &str, first: &[u8], second: &[u8]) -> InputPlan {
+        InputPlan {
+            write_id: write_id.to_owned(),
+            fragments: vec![
+                InputFragment {
+                    bytes: first.to_vec(),
+                    delay_after: Duration::ZERO,
+                },
+                InputFragment {
+                    bytes: second.to_vec(),
+                    delay_after: Duration::ZERO,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn control_plans_never_interleave_with_each_other() {
+        let Rig {
+            coordinator,
+            log,
+            entered,
+            release,
+        } = gated_coordinator(vec![b"a0"], None);
+        let first = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_control(PRODUCER, 1, two_fragment_plan("plan-a", b"a0", b"a1"))
+                    .await
+            }
+        });
+        // The first plan is parked inside its first fragment; the second plan
+        // queues behind it.
+        entered.notified().await;
+        let second = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_control(PRODUCER, 2, plan("plan-b", b"b0"))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        release.send(()).expect("release the first fragment");
+
+        first.await.expect("first joins").expect("first plan");
+        second.await.expect("second joins").expect("second plan");
+        assert_eq!(&*log.lock().expect("write log"), b"a0a1b0");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_that_cannot_retake_the_pty_stops_after_its_written_fragments() {
+        const STALL: Duration = Duration::from_millis(50);
+
+        let Rig {
+            coordinator,
+            log,
+            entered,
+            release,
+        } = gated_coordinator(vec![b"body", b"held"], Some(STALL));
+        let control = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_control(PRODUCER, 1, two_fragment_plan("plan-a", b"body", b"enter"))
+                    .await
+            }
+        });
+        entered.notified().await;
+        // The attach write queues for the PTY while the plan writes its body,
+        // takes it at the fragment boundary and parks there.
+        let attach = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_stream(vec![InputFragment {
+                        bytes: b"held".to_vec(),
+                        delay_after: Duration::ZERO,
+                    }])
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        release.send(()).expect("release the body");
+        // The attach write holds the PTY once it is parked; the plan's retake
+        // then waits on the stall, which the test elapses by hand because a
+        // running blocking write stops the clock from advancing by itself.
+        entered.notified().await;
+        tokio::time::advance(STALL).await;
+
+        let error = control
+            .await
+            .expect("control joins")
+            .expect_err("the plan cannot retake the PTY");
+        assert!(
+            matches!(
+                error,
+                InputError::Stalled {
+                    written: 4,
+                    total: 9,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        release.send(()).expect("release the attach write");
+        attach.await.expect("attach joins").expect("attach write");
+        assert_eq!(&*log.lock().expect("write log"), b"bodyheld");
     }
 
     const PRODUCER: &str = "daemon-a";

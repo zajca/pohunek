@@ -4,7 +4,8 @@
 //! after the terminal echoes `ESC ] 7501 ; ? ESC \`. The output hub queues one
 //! token per answerable probe; a dedicated task writes the reply through the
 //! [`WriteCoordinator`], so the reader thread never writes and a reply never
-//! lands inside a paced input plan.
+//! lands inside a fragment. A reply may land between the fragments of a paced
+//! input plan while the plan's delay runs.
 
 // Rust guideline compliant 2026-06-26
 
