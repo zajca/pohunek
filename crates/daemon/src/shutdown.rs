@@ -941,9 +941,11 @@ mod tests {
 
     #[test]
     fn runtime_drop_bound_fits_inside_the_shutdown_margin() {
+        // timing-allowed: #1725 tracing-appender's worker guard waits up to 100 ms + 1 s on drop
+        let log_flush = Duration::from_millis(1100);
         assert!(
-            RUNTIME_DROP_BOUND < SHUTDOWN_MARGIN,
-            "the margin keeps room for process teardown after the drop"
+            RUNTIME_DROP_BOUND + log_flush <= SHUTDOWN_MARGIN,
+            "the margin covers the runtime drop and the log writer's final flush"
         );
     }
 }

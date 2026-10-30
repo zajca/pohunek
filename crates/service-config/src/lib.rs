@@ -546,9 +546,9 @@ pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(2);
 /// runtime after the last shutdown phase.
 ///
 /// Part of [`SHUTDOWN_MARGIN`]: a blocking store write that never returns is
-/// named by the registry phase and left behind here, and the process exits
-/// with the rest of the margin still unspent for teardown.
-pub const RUNTIME_DROP_BOUND: Duration = Duration::from_secs(1);
+/// named by the registry phase and left behind here. The rest of the margin
+/// covers the log writer's final flush (up to 1.1 s) that follows the drop.
+pub const RUNTIME_DROP_BOUND: Duration = Duration::from_millis(500);
 
 /// Longest a stop waits behind an input write that holds the worker's control
 /// connection.

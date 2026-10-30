@@ -538,7 +538,7 @@ turning true). Any other write is refused and logged as
 `worker.journal.sealed_write_refused`, because it would change an outcome the
 daemon may already have read.
 After the last phase the daemon drops its async runtime, waiting at most
-`RUNTIME_DROP_BOUND` (1 s, part of the 2 s margin) for blocking threads; tokio
+`RUNTIME_DROP_BOUND` (500 ms, part of the 2 s margin; the log writer's final flush follows it) for blocking threads; tokio
 itself waits for them without a bound, so a blocking store write that never
 returns would otherwise keep the process alive past `daemon_exit_timeout_ms`.
 A blocking write the registry tracks is named in the registry phase log

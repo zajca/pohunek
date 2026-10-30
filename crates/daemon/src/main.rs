@@ -31,7 +31,7 @@ use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -180,8 +180,18 @@ fn main() -> ExitCode {
     };
     let code = runtime.block_on(daemon_main());
     drop_runtime(runtime, RUNTIME_DROP_BOUND);
+    // The log writer outlives the runtime drop, so its warning reaches the file.
+    drop(
+        LOG_GUARD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(),
+    );
     code
 }
+
+/// Keeps the log writer's worker alive until `main` has dropped the runtime.
+static LOG_GUARD: Mutex<Option<logging::LogGuard>> = Mutex::new(None);
 
 async fn daemon_main() -> ExitCode {
     // The probe deadline of `upgrade-preflight` counts from here.
@@ -498,7 +508,8 @@ async fn run() -> Result<(), DaemonError> {
 
     // 5. Initialize structured logging and durable worker state below B1's
     // owner-private application state directory.
-    let _log_guard = logging::init(&paths.log_dir)?;
+    *LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some(logging::init(&paths.log_dir)?);
     ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
     info!(
         daemon_version = DAEMON_VERSION,
