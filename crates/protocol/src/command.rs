@@ -62,12 +62,27 @@ pub struct CommandRunResult {
     pub duration_ms: u64,
 }
 
-/// Why a `command.run` request failed.
-///
-/// Each kind is one stable wire error code with fixed text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CommandErrorKind {
+/// Declares [`CommandErrorKind`] and [`CommandErrorKind::ALL`] from one list,
+/// so a kind cannot be declared without being listed.
+macro_rules! command_error_kinds {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// Why a `command.run` request failed.
+        ///
+        /// Each kind is one stable wire error code with fixed text.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub enum CommandErrorKind {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl CommandErrorKind {
+            /// Every kind this build knows, in declaration order.
+            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+        }
+    };
+}
+
+command_error_kinds! {
     /// The daemon does not implement `command.run`. Produced by a client from
     /// the daemon's `method_not_found`, never by a daemon.
     Unsupported,

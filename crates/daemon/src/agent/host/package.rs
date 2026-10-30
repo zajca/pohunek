@@ -644,10 +644,9 @@ fn definition_of_root(
 ///
 /// # Errors
 ///
-/// Returns [`PackageRejection::DescriptorMissing`] without a `runtime.toml`,
-/// [`PackageRejection::ReservedRuntimeId`] for a descriptor that claims the
-/// shell, and [`PackageRejection::Descriptor`] for every other invalid
-/// descriptor.
+/// Returns [`PackageRejection::DescriptorMissing`] without a `runtime.toml`
+/// and [`PackageRejection::Descriptor`] for every invalid descriptor. A
+/// reserved runtime id is refused where the package is served, not here.
 pub fn descriptor_from_archive(
     entries: &[ArchiveEntry],
     digest: &PackageDigest,
@@ -666,10 +665,8 @@ pub fn descriptor_from_archive(
 ///
 /// # Errors
 ///
-/// Returns [`PackageRejection::DescriptorMissing`] without a `runtime.toml`,
-/// [`PackageRejection::ReservedRuntimeId`] for a descriptor that claims the
-/// shell, and [`PackageRejection::Descriptor`] for every other invalid
-/// descriptor.
+/// Returns [`PackageRejection::RuntimeMissing`] for a descriptor that exports
+/// commands only, and the errors of [`descriptor_from_archive`] otherwise.
 pub fn definition_from_archive(
     entries: &[ArchiveEntry],
     digest: &PackageDigest,
@@ -798,9 +795,10 @@ fn parse_descriptor(
     let document: toml::Table = toml::from_str(text).map_err(|error| malformed_at(text, &error))?;
     let executable = |path: &str| files.executable(path);
     match classify(&document, &FeatureTables::PRODUCTION)? {
-        Exports::CommandsOnly => parse_commands_only(text, &document, executable),
+        Exports::CommandsOnly => {
+            parse_commands_only(text, &document, &FeatureTables::PRODUCTION, executable)
+        }
         Exports::Runtime => {
-            let commands = commands_of(&document, executable)?;
             let definition = RuntimeDefinition::from_toml(
                 text,
                 |package| DefinitionOrigin::Package {
@@ -809,6 +807,7 @@ fn parse_descriptor(
                 },
                 |name| detection_manifest(files, name),
             )?;
+            let commands = commands_of(&document, executable)?;
             let BindingProvenance::Package { package, .. } = &definition.binding().provenance
             else {
                 return Err(DefinitionError::Malformed { line: None });
