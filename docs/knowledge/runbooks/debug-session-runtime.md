@@ -526,7 +526,11 @@ and the daemon log has the panic.
   On Linux a hidden process outside the `user@<uid>.service` cgroup subtree of the
   worker's journaled `worker_control_group` (a Docker scope, a logind session scope)
   is ignored; one inside it (another user unit, `systemd-run --user --scope`) is still
-  listed, and so is every hidden process when the journal lacks the field. When
+  listed, and so is every hidden process when the journal lacks the field.
+  A worker that journaled `boot_session_id` (a canonical UUID) and a host that has
+  rebooted since need none of this: no process of the runtime remains, the sweep
+  is complete without scanning, and the session leaves `running` with the lost
+  runtime. When
   unreadable same-user
   processes are the only obstacle, the error message names each as
   `pid N (start S, command `name`)` (at most eight, then `and N more`) and

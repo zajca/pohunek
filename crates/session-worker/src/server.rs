@@ -443,6 +443,12 @@ impl Server {
         record.worker_spawn_id = own_spawn_id();
         record.worker_coalitions = own_coalitions();
         record.worker_control_group = own_control_group();
+        record.boot_session_id = HostInspector::new()
+            .boot_session_id()
+            .inspect_err(|error| {
+                tracing::warn!(error = %error, "the boot session id is unavailable; it is not journaled");
+            })
+            .ok();
         journal.write(&record)?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (initialized_tx, _) = watch::channel(false);

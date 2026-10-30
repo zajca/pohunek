@@ -33,7 +33,12 @@ rule. The current state of each place is stated separately.
   only the current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is readable. Any other
   schema gets a typed reason and a WARN. The optional field `worker_spawn_id`
   is additive (no schema bump): the journal of an N-1 worker lacks it, and its
-  lost runtime is swept without the fork-lineage proof. The same holds for the
+  lost runtime is swept without the fork-lineage proof. The optional field
+  `boot_session_id` (the boot session UUID on macOS, the kernel boot id on Linux)
+  is additive the same way: when the host names another boot than the journal,
+  no process of the worker's runtime remains and the loss is proven ended; the
+  journal of an N-1 worker lacks it and keeps the sweep's unconfirmed outcome,
+  and N-1 readers ignore the unknown key. The same holds for the
   optional field `worker_coalitions`, which lets the sweep dismiss processes
   the kernel places in other coalitions than the worker's. The optional field
   `worker_control_group` (the worker's unified cgroup path on Linux) is additive

@@ -1178,8 +1178,9 @@ The daemon reconciles before advertising readiness:
    worker's kernel creation number as a decimal string, and the optional
    `worker_coalitions`, its kernel resource and jetsam coalitions as
    `<resource>:<jetsam>` decimals, and the optional `worker_control_group`, the
-   worker's unified cgroup path on Linux, all absent from journals of workers
-   started by the previous release) and runtime sockets, and join the
+   worker's unified cgroup path on Linux, and the optional `boot_session_id`,
+   the boot session UUID on macOS or the kernel boot id on Linux, all absent from
+   journals of workers started by the previous release) and runtime sockets, and join the
    three sources on each record's current generation (`runtime.generation`,
    `runtime.service_id`). A socket counts only when the connected worker's
    journal names that generation; terminal journals of other generations are

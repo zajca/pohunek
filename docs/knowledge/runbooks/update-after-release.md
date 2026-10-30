@@ -861,7 +861,9 @@ and does not roll the upgrade back. A marked Hermes home is updated with the
 `hermes` executable on the daemon job's `PATH`, the one the runtime plan ran
 with, not the `PATH` of the shell that runs the upgrade. A Hermes home without
 the pohunek marker is reported as a gap with the command that installs it;
-nothing is written into it.
+nothing is written into it. A host without a `~/.hermes` directory reports
+`integration hermes  gap: Hermes is not installed (no <path>), skipped`; a Hermes home that
+exists but is unsafe (for example a dangling symlink) is still a failure.
 
 The manual migration below remains the fallback for a host that cannot run the
 upgrade's runtime step, for example to move its sessions before an upgrade.

@@ -87,6 +87,16 @@ impl LinuxInspector {
         BootIdentity::parse(value.trim())
     }
 
+    /// Returns the identifier that changes at every reboot and at no other
+    /// time: the kernel boot id, which is also the boot identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed boot-identity inspection failures.
+    pub fn boot_session_id(&self) -> Result<String, Error> {
+        self.boot_identity().map(|boot| boot.as_str().to_owned())
+    }
+
     /// Returns whether a process belongs to a cgroup or one of its subgroups.
     ///
     /// The check reads only `/proc/<pid>/cgroup`. Callers that require a stable

@@ -132,9 +132,10 @@ pub struct IntegrationReinstall {
     /// The integration: a runtime id, or `hermes` with its profile.
     pub integration: String,
     /// `installed`, `failed`, or `gap`. A gap is a Hermes home without the
-    /// pohunek marker, which the upgrade does not write into.
+    /// pohunek marker, which the upgrade does not write into, or a host
+    /// without a Hermes home, which is skipped.
     pub status: &'static str,
-    /// The failure, the gap's command, or `null` when installed.
+    /// The failure, the gap's command or skip note, or `null` when installed.
     pub detail: Option<String>,
 }
 
