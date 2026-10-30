@@ -1,0 +1,17 @@
+registry
+registry.generation
+registry.packages
+registry.packages[].digest
+registry.packages[].enabled
+registry.packages[].identity
+registry.packages[].identity.id
+registry.packages[].identity.version
+registry.packages[].installed_at_unix_seconds
+registry.packages[].manifest
+registry.packages[].source
+registry.packages[].source=explicit_digest
+registry.packages[].source=link
+registry.packages[].source=official
+registry.schema
+registry.selected
+registry.selected.*
