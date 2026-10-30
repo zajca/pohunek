@@ -680,6 +680,10 @@ fn render_migration(result: &PackageBindProfileResult) -> String {
             "Pinned profile {} to {what}.\nThe daemon reads the profile at the next launch.\n",
             result.profile
         ),
+        PackageBindStatus::Unknown => format!(
+            "Profile {}: the daemon reported a status this client does not know for {what}; check `pohunek plugin profile list` before relying on the pin.\n",
+            result.profile
+        ),
     }
 }
 

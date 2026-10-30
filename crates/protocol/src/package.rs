@@ -26,7 +26,7 @@ use crate::{
 /// and `link` are local third-party trust; only `official` came through the
 /// signed catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageOrigin.ts"))]
 pub enum PackageOrigin {
@@ -36,14 +36,23 @@ pub enum PackageOrigin {
     ExplicitDigest,
     /// Copied from a developer directory with `package.link`.
     Link,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PackageOrigin);
 
 /// Why an installed package cannot serve its runtime.
 ///
 /// Typed and text-free so it is safe to log and to show; the daemon log keeps
 /// the precise verification cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageFault.ts"))]
 pub enum PackageFault {
@@ -66,11 +75,20 @@ pub enum PackageFault {
     RuntimeNotClaimable,
     /// Another package claims the same runtime id.
     RuntimeConflict,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PackageFault);
 
 /// Why a package that is not selected cannot become the selected one now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts",
@@ -84,7 +102,16 @@ pub enum PackageSelectionBlockReason {
     /// Selecting the package would make the runtime's integration serve two
     /// incompatible handler or schema declarations at once.
     IncompatibleWithRetained,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PackageSelectionBlockReason);
 
 /// A package that stays installed but not selected, and what holds it back.
 ///
@@ -323,7 +350,7 @@ pub struct PackageLinkParams {
 
 /// What an install did to the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageInstallStatus.ts"))]
 pub enum PackageInstallStatus {
@@ -336,7 +363,16 @@ pub enum PackageInstallStatus {
     /// The package was recorded but its root was missing and was extracted
     /// again.
     RootRestored,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PackageInstallStatus);
 
 /// Result of `package.install` and `package.link`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,7 +475,7 @@ pub struct PackageBindProfileParams {
 
 /// What a profile bind did to the profile file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageBindStatus.ts"))]
 pub enum PackageBindStatus {
@@ -449,7 +485,16 @@ pub enum PackageBindStatus {
     Bound,
     /// The profile already pinned the package; nothing was written.
     Unchanged,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PackageBindStatus);
 
 /// Result of `package.bind_profile`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -538,7 +583,7 @@ pub struct PackageDoctorParams {
 
 /// What a doctor finding is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageFindingKind.ts"))]
 pub enum PackageFindingKind {
@@ -553,7 +598,16 @@ pub enum PackageFindingKind {
     /// reference uses an incompatible version of the same package; see
     /// `blocked_by`.
     SelectionBlocked,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(PackageFindingKind);
 
 /// One doctor finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

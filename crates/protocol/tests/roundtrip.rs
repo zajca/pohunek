@@ -20,22 +20,23 @@ use protocol::{
     NotificationListParams, NotificationPolicy, NotificationPolicyParams, NotificationRecord,
     NotificationRetentionParams, NotificationRetentionPolicy, NotificationSeverity,
     NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdatedEvent,
-    ObservationParamsError, OutputOffset, OwnerRevision, PrincipalId, ProcessStartIdentity,
-    ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError, ProtocolVersion,
-    ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence, Request,
-    Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeRef, RuntimeState,
-    SessionAttachResult, SessionBackground, SessionCapabilities, SessionDetachParams,
-    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
-    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeParams, SessionRuntime, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    ObservationParamsError, OutputOffset, OwnerRevision, PackageBindStatus, PackageFault,
+    PackageFindingKind, PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason,
+    PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce,
+    ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId,
+    ReportSequence, Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry,
+    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
+    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
     ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark,
     TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId, TransferProposal,
@@ -5758,4 +5759,78 @@ fn a_runtime_state_from_a_newer_daemon_is_possibly_live_and_never_stoppable_or_r
     );
     assert!(!session.can_stop());
     assert!(!session.can_remove());
+}
+
+#[test]
+fn package_enums_are_tolerant_only_on_the_client() {
+    TolerantEnum {
+        known: vec![
+            ("official", PackageOrigin::Official),
+            ("explicit_digest", PackageOrigin::ExplicitDigest),
+            ("link", PackageOrigin::Link),
+        ],
+        unknown: PackageOrigin::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PackageOrigin");
+    TolerantEnum {
+        known: vec![
+            ("root_missing", PackageFault::RootMissing),
+            ("root_modified", PackageFault::RootModified),
+            ("root_unsafe", PackageFault::RootUnsafe),
+            ("root_unreadable", PackageFault::RootUnreadable),
+            ("descriptor_missing", PackageFault::DescriptorMissing),
+            ("descriptor_invalid", PackageFault::DescriptorInvalid),
+            ("identity_mismatch", PackageFault::IdentityMismatch),
+            ("runtime_not_claimable", PackageFault::RuntimeNotClaimable),
+            ("runtime_conflict", PackageFault::RuntimeConflict),
+        ],
+        unknown: PackageFault::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PackageFault");
+    TolerantEnum {
+        known: vec![(
+            "incompatible_with_retained",
+            PackageSelectionBlockReason::IncompatibleWithRetained,
+        )],
+        unknown: PackageSelectionBlockReason::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PackageSelectionBlockReason");
+    TolerantEnum {
+        known: vec![
+            ("preview", PackageInstallStatus::Preview),
+            ("installed", PackageInstallStatus::Installed),
+            ("already_installed", PackageInstallStatus::AlreadyInstalled),
+            ("root_restored", PackageInstallStatus::RootRestored),
+        ],
+        unknown: PackageInstallStatus::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PackageInstallStatus");
+    TolerantEnum {
+        known: vec![
+            ("preview", PackageBindStatus::Preview),
+            ("bound", PackageBindStatus::Bound),
+            ("unchanged", PackageBindStatus::Unchanged),
+        ],
+        unknown: PackageBindStatus::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PackageBindStatus");
+    TolerantEnum {
+        known: vec![
+            ("fault", PackageFindingKind::Fault),
+            ("unregistered_root", PackageFindingKind::UnregisteredRoot),
+            (
+                "pinned_not_installed",
+                PackageFindingKind::PinnedNotInstalled,
+            ),
+            ("selection_blocked", PackageFindingKind::SelectionBlocked),
+        ],
+        unknown: PackageFindingKind::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("PackageFindingKind");
 }
