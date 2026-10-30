@@ -1732,3 +1732,68 @@ async fn a_record_of_another_schema_names_the_pohunek_that_started_the_transacti
         ],
     );
 }
+
+fn put_agent(dir: &Path, name: &str) {
+    pohunek_test_support::fs::write_executable(dir.join(name), "#!/bin/sh\nexit 0\n")
+        .expect("write agent");
+}
+
+fn behind(context: &Context) -> Option<Vec<(&'static str, PathBuf)>> {
+    crate::service::refresh::agents_behind_recorded_path(context).map(|agents| {
+        agents
+            .into_iter()
+            .map(|agent| (agent.name, agent.found))
+            .collect()
+    })
+}
+
+#[tokio::test]
+async fn an_agent_only_the_login_shell_path_resolves_is_reported() {
+    let r = refreshable().await;
+    put_agent(&r.old, "claude");
+    put_agent(&r.new, "claude");
+    put_agent(&r.new, "codex");
+
+    assert_eq!(
+        behind(&r.harness.context),
+        Some(vec![("codex", canonical(&r.new).join("codex"))]),
+        "claude resolves through the recorded path too"
+    );
+    assert_eq!(r.harness.pending(), None, "the probe writes no record");
+}
+
+#[tokio::test]
+async fn an_agent_both_paths_resolve_is_not_reported() {
+    let r = refreshable().await;
+    for dir in [&r.old, &r.new] {
+        put_agent(dir, "claude");
+        put_agent(dir, "codex");
+    }
+
+    assert_eq!(behind(&r.harness.context), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn the_probe_is_silent_without_a_verdict() {
+    let r = refreshable().await;
+    put_agent(&r.new, "claude");
+    let harness = &r.harness;
+
+    let failing = scripted_discovery(
+        &harness.context,
+        &harness.root,
+        "exit 1",
+        pohunek_test_support::wait::HANG_GUARD,
+        &r.old,
+    );
+    assert_eq!(behind(&failing), None, "a failed login shell");
+
+    let unmanaged = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    assert_eq!(behind(&unmanaged), None, "a host that records no path");
+
+    let fresh = Harness::new();
+    assert_eq!(behind(&fresh.context), None, "no installation");
+}
