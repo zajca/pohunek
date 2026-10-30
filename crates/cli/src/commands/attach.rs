@@ -6,6 +6,7 @@
 //! Press Ctrl-] (0x1d) while attached to detach from the session without
 //! stopping the PTY process.
 
+mod buffered_output;
 mod shortcut;
 
 use std::os::fd::RawFd;
@@ -26,6 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
+use self::buffered_output::{BufferedOutput, OUTPUT_QUEUE_BYTES};
 use self::shortcut::{MenuInputMode, Shortcut, ShortcutDecoder};
 use crate::client::{Client, PinnedHost, RawStream};
 use crate::commands::{request_id, request_with_params};
@@ -1469,17 +1471,14 @@ where
                     *state = MenuState::Closed;
                 }
                 stdout.write_all(input).await?;
-                stdout.flush().await?;
             } else {
                 modal.pending_output.extend_from_slice(input);
             }
         } else {
             stdout.write_all(input).await?;
-            stdout.flush().await?;
         }
     } else {
         stdout.write_all(input).await?;
-        stdout.flush().await?;
     }
     Ok(None)
 }
@@ -1804,7 +1803,7 @@ where
     let (mut terminal, mut terminal_output, mut winch) =
         prepare_attach_terminal(&mut status_updates).await?;
     let (mut socket_read, mut socket_write) = tokio::io::split(io.stream);
-    let (mut stdin, mut stdout) = (io.stdin, io.stdout);
+    let (mut stdin, mut stdout) = (io.stdin, BufferedOutput::new(io.stdout));
     let (mut stdin_buf, mut socket_buf) = ([0_u8; IO_BUFFER_BYTES], [0_u8; IO_BUFFER_BYTES]);
     let mut menu = MenuRuntime::new(modal.is_some());
     let mut shortcuts = ShortcutDecoder::new();
@@ -1844,7 +1843,10 @@ where
                         return Err(error);
                     }
                 }
-                read = socket_read.read(&mut socket_buf) => {
+                drained = stdout.drain(), if stdout.queued() > 0 => {
+                    drained?;
+                }
+                read = socket_read.read(&mut socket_buf), if stdout.queued() < OUTPUT_QUEUE_BYTES => {
                     let input = &socket_buf[..read?];
                     let args = (&control.target, &mut terminal);
                     if let Some(end) =
@@ -1927,6 +1929,7 @@ where
     // write error.
     let _ = close_modal(&mut stdout, modal.as_mut()).await;
     let _ = terminal_output.restore(&mut stdout).await;
+    let _ = stdout.flush().await;
     shutdown_status_updates(&mut status_updates).await;
     finish_attach_outcome(&mut client, &stream_id, outcome).await
 }
@@ -2941,6 +2944,108 @@ mod tests {
             .await
             .expect("stream test daemon");
         assert_eq!(input, typed_input_and_detach().0);
+    }
+
+    /// A terminal that takes a few bytes and then never accepts another,
+    /// recording that a write found it full.
+    struct StalledTerminal {
+        room: usize,
+        full: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsyncWrite for StalledTerminal {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.room == 0 {
+                self.full.store(true, std::sync::atomic::Ordering::SeqCst);
+                return std::task::Poll::Pending;
+            }
+            let taken = self.room.min(buf.len());
+            self.room -= taken;
+            std::task::Poll::Ready(Ok(taken))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Line typed while the terminal takes no output.
+    const STALLED_KEYSTROKE: &[u8] = b"typed-while-the-terminal-is-stalled\n";
+
+    #[tokio::test]
+    async fn a_terminal_that_takes_no_output_does_not_keep_keystrokes_from_the_stream() {
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
+        let (mut daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (client, _server, paths, _socket) = connect_stdin_test_client().await;
+        let (mut terminal, stdin) = tokio::io::duplex(STALLED_KEYSTROKE.len());
+        let full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attach = forward_attached_stream(
+            AttachIo {
+                stream,
+                stdin,
+                stdout: StalledTerminal {
+                    room: 0,
+                    full: Arc::clone(&full),
+                },
+            },
+            client,
+            "stream-test".to_owned(),
+            AttachControlContext {
+                host: PinnedHost::local(),
+                paths,
+                target: "local/s-42".parse().expect("test target"),
+            },
+            None,
+            None,
+            None,
+        );
+        tokio::pin!(attach);
+        // The daemon end writes more output than the stream and the stalled
+        // terminal hold, and reads input independently of it.
+        let output = tokio::spawn(async move {
+            let _ = daemon_output
+                .write_all(&vec![b'y'; STREAM_OUTPUT_BYTES])
+                .await;
+            daemon_output
+        });
+        let typing = async {
+            pohunek_test_support::wait::wait_until("the terminal to be full", || async {
+                full.load(std::sync::atomic::Ordering::SeqCst).then_some(())
+            })
+            .await;
+            terminal
+                .write_all(STALLED_KEYSTROKE)
+                .await
+                .expect("type the keystroke");
+            let mut received = vec![0_u8; STALLED_KEYSTROKE.len()];
+            daemon_input
+                .read_exact(&mut received)
+                .await
+                .expect("read the forwarded keystroke");
+            received
+        };
+
+        let received = tokio::select! {
+            end = &mut attach => panic!("the attach loop ended: {end:?}"),
+            received = guard("the stream receives the keystroke", typing) => received,
+        };
+
+        assert_eq!(received, STALLED_KEYSTROKE);
+        output.abort();
     }
 
     #[tokio::test]

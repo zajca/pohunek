@@ -3202,7 +3202,8 @@ where
 
 /// Pulls live output into the stream's writer queue and, on an attach stream,
 /// accepts framed input. No arm awaits a socket write, so a client that stops
-/// reading output never stalls input.
+/// reading output does not stall input until `attach_ack_backlog`
+/// acknowledgements are held back.
 ///
 /// One input read stays pending across every `select!` iteration (see
 /// [`read_owned_frame`]), so output that becomes ready while an input frame
@@ -3210,8 +3211,9 @@ where
 ///
 /// An accepted input frame's write stays pending across iterations as well,
 /// so output keeps flowing while the PTY waits for the program to read that
-/// input, as on a real terminal. The next input frame is read only once the
-/// write is acknowledged, which keeps the stream's writes in order.
+/// input, as on a real terminal. The next input frame is read once the PTY
+/// accepted the previous one and an acknowledgement slot is free, which keeps
+/// the stream's writes in order.
 #[expect(
     clippy::too_many_arguments,
     reason = "stream framing keeps authenticated stream identity and lease explicit"
