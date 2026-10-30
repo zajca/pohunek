@@ -74,6 +74,18 @@ fn any_file_contains(dir: &Path, needle: &str) -> bool {
     })
 }
 
+/// Kills the git processes the scenario blocked, on every exit of the test;
+/// a git blocked opening a FIFO nobody writes would otherwise outlive it.
+struct ReapGit(String);
+
+impl Drop for ReapGit {
+    fn drop(&mut self) {
+        for pid in processes_running(&["rev-parse", &self.0]) {
+            let _ = kill(pid, Signal::SIGKILL);
+        }
+    }
+}
+
 fn private_dir(path: &Path) {
     fs::create_dir_all(path).expect("create directory");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("make directory private");
@@ -142,7 +154,8 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
 
     // The request is in flight on a blocking thread once git is blocked on the FIFO.
     let repo_text = repo.display().to_string();
-    let wedged_git = wait_until("git blocked on the configuration FIFO", || async {
+    let _reap = ReapGit(repo_text.clone());
+    wait_until("git blocked on the configuration FIFO", || async {
         processes_running(&["rev-parse", &repo_text])
             .first()
             .copied()
@@ -154,8 +167,9 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
         .await
         .expect("wait for the daemon");
 
-    let still_blocked = processes_running(&["rev-parse", &repo_text]).contains(&wedged_git);
-    let _ = kill(wedged_git, Signal::SIGKILL);
+    // Any blocked git counts: the daemon's own detection retries with another
+    // git after its timeout kills the first, so the first pid may be gone.
+    let still_blocked = !processes_running(&["rev-parse", &repo_text]).is_empty();
     assert!(status.success(), "the daemon exits cleanly: {status:?}");
     assert!(
         still_blocked,

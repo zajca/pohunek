@@ -942,4 +942,12 @@ mod tests {
         assert!(finished.load(Ordering::SeqCst), "the write ran to its end");
         assert!(!report.timed_out);
     }
+
+    #[test]
+    fn runtime_drop_and_log_flush_fit_inside_the_shutdown_margin() {
+        assert!(
+            RUNTIME_DROP_BOUND + LOG_FLUSH_BOUND <= SHUTDOWN_MARGIN,
+            "the margin every fitted plan leaves must cover what follows the last phase"
+        );
+    }
 }

@@ -309,7 +309,10 @@ mod tests {
             () = tokio::task::yield_now() => {}
         }
         tokio::time::advance(BOUND).await;
-        let report = shutdown.await;
+        let report = tokio::select! {
+            report = &mut shutdown => report,
+            () = tokio::task::yield_now() => panic!("the shutdown ignored its bound"),
+        };
 
         assert_eq!(report.still_running, ["record_session"]);
         assert_eq!(report.outstanding, 1);
