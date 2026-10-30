@@ -1047,6 +1047,16 @@ async fn prepare_attach_terminal(
     Ok((terminal, output, winch))
 }
 
+/// Writes the queued output before the terminal leaves raw mode, so it is not
+/// processed by the restored line discipline. A write error surfaces on the
+/// next write.
+async fn flush_output_before_restore<W>(stdout: &mut W)
+where
+    W: AsyncWrite + Unpin,
+{
+    let _ = stdout.flush().await;
+}
+
 /// Renders the active modal dialog with its session header.
 async fn paint_modal<W>(writer: &mut W, modal: &mut ModalState) -> Result<(), CliError>
 where
@@ -1060,7 +1070,6 @@ where
         .set_overlay_header(render_dialog_header(&modal.snapshot));
     let frame = modal.compositor.render();
     writer.write_all(&frame).await?;
-    writer.flush().await?;
     Ok(())
 }
 
@@ -1074,7 +1083,6 @@ where
     };
     writer.write_all(&modal.compositor.restore()).await?;
     writer.write_all(&modal.pending_output).await?;
-    writer.flush().await?;
     modal.pending_output.clear();
     modal.active = false;
     Ok(())
@@ -1160,6 +1168,7 @@ where
         time::timeout(MENU_TASK_SETTLE_TIMEOUT, wait_for_menu_task(&mut menu.task)).await
     else {
         menu.task = None;
+        flush_output_before_restore(stdout).await;
         terminal.take();
         let message = format!(
             "no reply within {}s; check the session state with `pohunek session list`",
@@ -1177,6 +1186,7 @@ where
     }) = &result
     {
         menu.task = None;
+        flush_output_before_restore(stdout).await;
         terminal.take();
         return Err(termination_failed(*action, message));
     }
@@ -1704,6 +1714,13 @@ where
         if outcome.changed {
             sync_menu_view(state, ctx.modal, ctx.stdout).await?;
         }
+        if outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, MenuEffect::RunDetach))
+        {
+            flush_output_before_restore(ctx.stdout).await;
+        }
         return handle_menu_effects(
             outcome.effects,
             MenuEffectContext {
@@ -1822,6 +1839,7 @@ where
         loop {
             if stream_input.detaching && stream_input.bytes.is_empty() {
                 socket_write.flush().await?;
+                flush_output_before_restore(&mut stdout).await;
                 return Ok(detach_stream(&mut client, &stream_id, &mut terminal).await);
             }
             if stream_input.closing && stream_input.bytes.is_empty() {
@@ -1838,6 +1856,7 @@ where
                         // ahead of the detach shortcut ends detached unless
                         // the daemon reports a stream failure.
                         if stream_input.detaching {
+                            flush_output_before_restore(&mut stdout).await;
                             return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
                         }
                         return Err(error);
@@ -1856,6 +1875,7 @@ where
                         // the detach shortcut is written ends detached unless
                         // the daemon reports a stream failure.
                         if end == AttachStreamEnd::StreamClosed && stream_input.detaching {
+                            flush_output_before_restore(&mut stdout).await;
                             return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
                         }
                         return Ok(end);
@@ -2154,6 +2174,7 @@ where
     if let Ok(outcome) = &result.outcome {
         match (result.action, outcome) {
             (MenuTaskAction::Kill, _) => {
+                flush_output_before_restore(stdout).await;
                 terminal.take();
                 return Ok(Some(AttachStreamEnd::SessionStopped));
             }
@@ -2163,6 +2184,7 @@ where
                     worktrees_failed, ..
                 },
             ) => {
+                flush_output_before_restore(stdout).await;
                 terminal.take();
                 return Ok(Some(AttachStreamEnd::SessionRemoved {
                     worktrees_failed: *worktrees_failed,

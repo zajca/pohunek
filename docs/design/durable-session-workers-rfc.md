@@ -997,8 +997,9 @@ rather than consuming unbounded worker memory.
 
 Each data stream writes to its client from a concurrent writer fed by a short
 bounded queue that sits in front of the subscriber queue, so a client that
-reads no output does not delay input forwarding until `attach_ack_backlog` acknowledgements are held back; events in that queue count as
-delivered when a gap range is computed. Input acknowledgements are written
+reads no output does not delay input forwarding until `attach_ack_backlog`
+acknowledgements are held back; events in that queue count as delivered when a
+gap range is computed. Input acknowledgements are written
 ahead of queued output but wait behind an output write that is blocked, and
 the worker stops reading attach input at `attach_ack_backlog` unacknowledged
 frames until the client reads again.

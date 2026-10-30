@@ -2,10 +2,12 @@
 //!
 //! Every writer of the attach loop (stream output, dialog paints, shortcut
 //! flushes, terminal restore) appends to one byte queue, and only a dedicated
-//! loop arm, `flush` or `shutdown` moves the queue to the terminal. A slow
-//! terminal therefore never keeps the loop from reading terminal input, and a
-//! partially written chunk is only ever the head of the queue, so dialog escape
-//! sequences cannot land inside it.
+//! loop arm, `flush` or `shutdown` moves the queue to the terminal. A write
+//! never waits for the terminal, so a slow terminal does not keep the loop from
+//! reading terminal input, and a partially written chunk is only ever the head
+//! of the queue, so dialog escape sequences cannot land inside it. The caller
+//! bounds the queue by not reading more stream output while it holds
+//! [`OUTPUT_QUEUE_BYTES`].
 
 use std::io;
 use std::pin::Pin;
@@ -13,7 +15,7 @@ use std::task::{ready, Context, Poll};
 
 use tokio::io::AsyncWrite;
 
-/// Bytes the queue accepts before a writer waits for the terminal.
+/// Queued bytes at which the caller stops reading stream output.
 pub(super) const OUTPUT_QUEUE_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
@@ -52,6 +54,10 @@ impl<O: AsyncWrite + Unpin> BufferedOutput<O> {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
             self.written += taken;
+            if self.written >= OUTPUT_QUEUE_BYTES {
+                self.queue.drain(..self.written);
+                self.written = 0;
+            }
         }
         self.queue.clear();
         self.written = 0;
@@ -62,19 +68,14 @@ impl<O: AsyncWrite + Unpin> BufferedOutput<O> {
 impl<O: AsyncWrite + Unpin> AsyncWrite for BufferedOutput<O> {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if self.queued() >= OUTPUT_QUEUE_BYTES {
-            ready!(self.poll_drain(cx))?;
-        }
-        let room = OUTPUT_QUEUE_BYTES - self.queued();
-        let accepted = room.min(buf.len());
-        self.queue.extend_from_slice(&buf[..accepted]);
-        Poll::Ready(Ok(accepted))
+        self.queue.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
