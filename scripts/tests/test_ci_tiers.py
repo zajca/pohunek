@@ -1,6 +1,7 @@
 """Contract checks for the PR, main, and nightly CI tiers."""
 
 from pathlib import Path
+import collections
 import fnmatch
 import hashlib
 import importlib.machinery
@@ -2922,20 +2923,22 @@ class RunnerImageTests(unittest.TestCase):
     and the jobs that build the shipped binaries stay on the glibc floor (#1731).
     """
 
-    ARCHIVE_GROUP = {"build-tests", "fast-tests", "integration", "integration-relay",
-                     "test-selection-audit", "test-selection-check"}
     GLIBC_FLOOR = {"release-build", "build-bins", "sdk"}
+    FLOOR_WORKFLOWS = ("release.yml", "release-build.yml", "release-evidence.yml", "upgrade.yml")
 
     @staticmethod
     def runner(job: str) -> str:
-        match = re.search(r"(?m)^    runs-on: (ubuntu-[0-9.]+|ubuntu-latest)\b", job)
+        match = re.search(r"(?m)^    runs-on: (\S+)", job)
         if match is None:
-            raise AssertionError("job has no ubuntu runs-on")
+            raise AssertionError("job has no runs-on")
         return match.group(1)
 
     def test_the_archive_producer_and_its_consumers_share_one_image(self):
         jobs = workflow_jobs()
-        runners = {name: self.runner(jobs[name]) for name in self.ARCHIVE_GROUP}
+        group = {name for name, job in jobs.items()
+                 if re.search(r"(?m)^          name: nextest-archive$", job)}
+        self.assertTrue({"build-tests", "fast-tests", "integration"} <= group, group)
+        runners = {name: self.runner(jobs[name]) for name in group}
         self.assertEqual(len(set(runners.values())), 1, runners)
 
     def test_the_jobs_that_build_the_shipped_binaries_stay_on_the_glibc_floor(self):
@@ -2943,9 +2946,35 @@ class RunnerImageTests(unittest.TestCase):
         for name in self.GLIBC_FLOOR:
             with self.subTest(job=name):
                 self.assertEqual(self.runner(jobs[name]), "ubuntu-24.04")
+        for workflow in self.FLOOR_WORKFLOWS:
+            text = (ROOT / ".github" / "workflows" / workflow).read_text()
+            with self.subTest(workflow=workflow):
+                self.assertEqual(
+                    set(re.findall(r"(?m)^\s+(?:runs-on|os): (ubuntu-\S+)", text)),
+                    {"ubuntu-24.04"},
+                )
 
-    def test_no_job_follows_ubuntu_latest(self):
-        self.assertIsNone(re.search(r"(?m)^\s*runs-on: ubuntu-latest", CI))
+    def test_a_cache_is_never_restored_on_an_older_image_than_the_one_that_saved_it(self):
+        savers = collections.defaultdict(set)
+        restorers = collections.defaultdict(set)
+        entries = [(self.runner(job), job) for job in workflow_jobs().values()
+                   if "runs-on: ubuntu" in job]
+        upgrade = (ROOT / ".github" / "workflows" / "upgrade.yml").read_text()
+        entries.append(("ubuntu-24.04", upgrade))
+        for runner, text in entries:
+            for key, save in re.findall(
+                r"(?m)^          shared-key: (\S+)\n          save-if: (.+)$", text
+            ):
+                (restorers if save == "false" else savers)[key].add(runner)
+        for key, runners in savers.items():
+            with self.subTest(key=key):
+                self.assertEqual(len(runners), 1, runners)
+                self.assertGreaterEqual(min(restorers[key] | runners), max(runners))
+
+    def test_no_workflow_follows_ubuntu_latest(self):
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                self.assertIsNone(re.search(r"(?m)^[^#\n]*ubuntu-latest", path.read_text()))
 
 
 AUDIT_JOB = "test-selection-audit"

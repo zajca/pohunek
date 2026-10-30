@@ -86,8 +86,10 @@ env:
   # binaries with default features in-job for the same reason.
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
-  # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
-  # platform-contracts, darwin-check). The full key also hashes the toolchain, the
+  # clippy, test-debug, bins, systemd, release, xtask, docs, hack, nightly-udeps,
+  # platform-contracts, darwin-check). A key that is saved is used by jobs of one
+  # runner image only: the key does not name the image, and a cache built on
+  # ubuntu-26.04 must not feed the ubuntu-24.04 jobs. The full key also hashes the toolchain, the
   # RUST*/CARGO* environment (RUSTFLAGS included), and the Cargo manifests.
   # rust-cache saves only on a key miss and the first finisher wins, so each
   # key has exactly one designated saver, the job that builds the superset
@@ -1318,9 +1320,10 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Designated `bins` saver: the build-bins binaries plus the test
-          # builds of the ignored systemd suites, a superset of build-bins.
-          shared-key: bins
+          # The key is per runner image: this job runs on ubuntu-26.04, and
+          # the `bins` entry belongs to the ubuntu-24.04 jobs that build the
+          # shipped binaries.
+          shared-key: systemd
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Require a running systemd user manager
@@ -3243,9 +3246,10 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore only: systemd-supervision saves `bins`.
+          # Designated `bins` saver; the upgrade workflow restores it. Both
+          # run on ubuntu-24.04, the glibc floor of the shipped binaries.
           shared-key: bins
-          save-if: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries are needed.
