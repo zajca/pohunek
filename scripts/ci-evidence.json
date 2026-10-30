@@ -1,7 +1,7 @@
 {
   "workflow_path": ".github/workflows/ci.yml",
   "workflow_file": "ci.yml",
-  "wait_timeout_seconds": 1800,
+  "wait_timeout_seconds": 3600,
   "poll_interval_seconds": 15,
   "tree_match_max_age_days": 14,
   "required_jobs": {
@@ -88,7 +88,8 @@
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-24.04)",
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",
-      "tests (relay DB, PostgreSQL)"
+      "tests (relay DB, PostgreSQL)",
+      "release gate (full test set) / fmt + clippy + test"
     ]
   },
   "required_steps": {

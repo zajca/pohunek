@@ -38,6 +38,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 RELEASE = WORKFLOWS / "release.yml"
 BUILD = WORKFLOWS / "release-build.yml"
 EVIDENCE = WORKFLOWS / "release-evidence.yml"
+GATE_TESTS = WORKFLOWS / "gate-tests.yml"
 SCENARIOS = WORKFLOWS / "release-smoke-scenarios.yml"
 CI = WORKFLOWS / "ci.yml"
 POLICY = ROOT / "packaging" / "release-policy.json"
@@ -497,16 +498,19 @@ class ReleaseWorkflowFiles(unittest.TestCase):
         cls.release = RELEASE.read_text()
         cls.build = BUILD.read_text()
         cls.evidence = EVIDENCE.read_text()
+        cls.gate_tests = GATE_TESTS.read_text()
         cls.scenarios = SCENARIOS.read_text()
         cls.ci = CI.read_text()
         cls.release_jobs = jobs(cls.release)
         cls.build_jobs = jobs(cls.build)
         cls.evidence_jobs = jobs(cls.evidence)
+        cls.gate_tests_jobs = jobs(cls.gate_tests)
         cls.scenario_jobs = jobs(cls.scenarios)
         cls.texts = {
             "release.yml": cls.release,
             "release-build.yml": cls.build,
             "release-evidence.yml": cls.evidence,
+            "gate-tests.yml": cls.gate_tests,
             "release-smoke-scenarios.yml": cls.scenarios,
         }
 
@@ -643,6 +647,7 @@ class OidcTests(ReleaseWorkflowFiles):
         )
         self.assertEqual(workflow_violations(self.build, writer=None, oidc=set()), [])
         self.assertEqual(workflow_violations(self.scenarios, writer=None, oidc=set()), [])
+        self.assertEqual(workflow_violations(self.gate_tests, writer=None, oidc=set()), [])
 
     def test_the_ci_caller_runs_in_rehearsal_mode_and_never_for_forks(self):
         ci_jobs = jobs(self.ci)
@@ -1461,7 +1466,7 @@ class LinkerSetupTests(unittest.TestCase):
     """A job whose RUSTFLAGS select mold installs mold on every matrix leg."""
 
     def test_mold_jobs_install_mold_unconditionally(self):
-        for path in (RELEASE, BUILD, EVIDENCE):
+        for path in (RELEASE, BUILD, EVIDENCE, GATE_TESTS):
             for name, block in jobs(path.read_text()).items():
                 if not re.search(r"(?m)^      RUSTFLAGS: [^\n]*-fuse-ld=mold", block):
                     continue
@@ -1472,7 +1477,7 @@ class LinkerSetupTests(unittest.TestCase):
 
 
 class OfflineDependencySourcesTests(unittest.TestCase):
-    """A job running `cargo test` fetches the locked sources before the tests.
+    """A job running `cargo test` or the test shards fetches the locked sources first.
 
     The xtask dependency-policy tests resolve the locked graph with
     `--offline`, which fails when a locked package source is missing from the
@@ -1480,9 +1485,12 @@ class OfflineDependencySourcesTests(unittest.TestCase):
     """
 
     def test_cargo_test_jobs_fetch_locked_sources_first(self):
-        for path in (RELEASE, BUILD, EVIDENCE):
+        for path in (RELEASE, BUILD, EVIDENCE, GATE_TESTS):
             for name, block in jobs(path.read_text()).items():
-                test_run = re.search(r"(?m)^\s+(?:- )?run: cargo test\b", block)
+                test_run = re.search(
+                    r'(?m)^\s+(?:- )?run: cargo test\b|python3 scripts/test-partitions --archive-file "\$archive" run',
+                    block,
+                )
                 if test_run is None:
                     continue
                 fetch = re.search(r"(?m)^\s+(?:- )?run: cargo fetch --locked$", block)
@@ -1499,7 +1507,7 @@ class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.gate = cls.release_jobs["gate"]
+        cls.gate = cls.gate_tests_jobs["tests"]
 
     def partition_shards(self) -> list[str]:
         match = re.search(r"^SHARDS = \(([^)]*)\)", self.PARTITIONS.read_text(), re.M)
@@ -1561,6 +1569,94 @@ class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
         self.assertLess(self.gate.index("tool: cargo-nextest"), self.gate.index("cargo nextest archive"))
 
 
+class SharedGateTests(ReleaseWorkflowFiles):
+    """release.yml and ci.yml run one definition of the gate's test steps (#1727)."""
+
+    GATE_CALL = "uses: ./.github/workflows/gate-tests.yml"
+    GATE_INPUTS = (
+        ".github/workflows/release.yml",
+        ".github/workflows/gate-tests.yml",
+        ".config/nextest.toml",
+        "scripts/test-partitions",
+        "scripts/junit-flaky-summary",
+        "rust-toolchain.toml",
+        ".github/actions/setup-rust/**",
+    )
+    CI_IF = (
+        "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && "
+        "inputs.tier == 'nightly') || (github.event_name == 'pull_request' && "
+        "needs.changes.outputs.release_gate == 'true') }}"
+    )
+
+    def callers(self):
+        return {"release.yml gate": self.release_jobs["gate"], "ci.yml release-gate": jobs(self.ci)["release-gate"]}
+
+    def test_both_callers_only_call_the_workflow_with_a_read_token(self):
+        for name, block in self.callers().items():
+            with self.subTest(caller=name):
+                self.assertIn(self.GATE_CALL, block)
+                self.assertNotIn("steps:", block)
+                self.assertNotIn("runs-on:", block)
+                self.assertNotRegex(block, r"(?m)^\s+(secrets|with):")
+                self.assertRegex(block + "\n", READ_BLOCK)
+
+    def test_the_release_gate_still_waits_for_the_exact_commit_evidence(self):
+        self.assertIn("needs: [tier-evidence]", self.release_jobs["gate"])
+        self.assertIn("gate", PUBLISH_NEEDS)
+
+    def test_the_called_workflow_takes_no_input_secret_or_extra_scope(self):
+        header = self.gate_tests.partition("\njobs:\n")[0]
+        self.assertIn("on:\n  workflow_call:\n\npermissions: {}\n", header)
+        self.assertNotRegex(self.gate_tests, r"(?m)^\s+(inputs|secrets):")
+        self.assertEqual(list(self.gate_tests_jobs), ["tests"])
+        job = self.gate_tests_jobs["tests"]
+        self.assertRegex(job + "\n", READ_BLOCK)
+        self.assertIn("runs-on: ubuntu-24.04", job)
+        self.assertIn("postgres:17-alpine", job)
+        self.assertIn("POSTGRES_DB: pohunek_test\n", job)
+        self.assertIn('--health-cmd "pg_isready -U postgres -d pohunek_test"', job)
+        # The URL is resolved at step level: the `job` context is not
+        # available in job-level `env`.
+        step = re.search(r"(?m)^      - name: Test\n(?:        .*\n|\n)*", job)
+        self.assertIsNotNone(step)
+        self.assertIn(
+            "          RELAY_DATABASE_URL: postgresql://postgres@127.0.0.1:"
+            "${{ job.services.postgres.ports['5432'] }}/pohunek_test\n",
+            step.group(0),
+        )
+        self.assertNotRegex(job.partition("    steps:\n")[0], r"RELAY_DATABASE_URL")
+
+    def test_ci_runs_the_gate_in_the_nightly_tier_and_on_a_pull_request_that_changes_it(self):
+        block = jobs(self.ci)["release-gate"]
+        self.assertIn(self.CI_IF, block)
+        self.assertIn("needs: changes", block)
+        verdict = jobs(self.ci)["test-selection-verdict"]
+        self.assertNotIn("release-gate", verdict)
+        filter_block = re.search(r"(?m)^            release_gate:\n((?:              - .*\n)+)", self.ci)
+        self.assertIsNotNone(filter_block, "the changes job has no release_gate filter")
+        listed = re.findall(r"'([^']+)'", filter_block.group(1))
+        self.assertEqual(sorted(listed), sorted(self.GATE_INPUTS))
+        self.assertIn("release_gate: ${{ steps.filter.outputs.release_gate }}", self.ci)
+
+    def test_the_nightly_evidence_requires_the_gate_and_the_main_tier_does_not(self):
+        config = json.loads((ROOT / "scripts" / "ci-evidence.json").read_text())
+        name = "release gate (full test set) / fmt + clippy + test"
+        self.assertIn(name, config["required_jobs"]["nightly"])
+        self.assertNotIn(name, config["required_jobs"]["main"])
+
+    def test_the_shard_loop_is_the_one_of_the_partition_script(self):
+        match = re.search(
+            r"^SHARDS = \(([^)]*)\)", (ROOT / "scripts" / "test-partitions").read_text(), re.M
+        )
+        self.assertIsNotNone(match)
+        shards = re.findall(r'"([^"]+)"', match.group(1))
+        loop = re.search(r"for shard in ([^;]+); do", self.gate_tests)
+        self.assertIsNotNone(loop)
+        self.assertEqual(sorted(loop.group(1).split()), sorted(shards))
+        self.assertNotIn("for shard in", self.release)
+        self.assertNotIn("for shard in", jobs(self.ci)["release-gate"])
+
+
 class SccacheSetupTests(unittest.TestCase):
     """The Rust jobs reach sccache only through .github/actions/setup-sccache."""
 
@@ -1577,7 +1673,7 @@ class SccacheSetupTests(unittest.TestCase):
         cls.action = SCCACHE_ACTION.read_text()
         cls.texts = {
             name: (WORKFLOWS / name).read_text()
-            for name in ("release.yml", "release-build.yml", "release-evidence.yml", "ci.yml")
+            for name in ("release.yml", "release-build.yml", "release-evidence.yml", "gate-tests.yml", "ci.yml")
         }
 
     def test_no_job_sets_the_wrapper_or_the_sccache_flag(self):
@@ -1592,9 +1688,11 @@ class SccacheSetupTests(unittest.TestCase):
         for name, text in self.texts.items():
             with self.subTest(file=name):
                 self.assertNotIn("mozilla-actions/sccache-action", text)
-        self.assertEqual(len(re.findall(self.SETUP_STEP, self.texts["release.yml"])), 3)
+        self.assertEqual(len(re.findall(self.SETUP_STEP, self.texts["release.yml"])), 2)
         self.assertEqual(len(re.findall(self.SETUP_STEP, self.texts["release-build.yml"])), 1)
-        self.assertEqual(self.texts["release.yml"].count("- name: Enable sccache"), 3)
+        self.assertEqual(len(re.findall(self.SETUP_STEP, self.texts["gate-tests.yml"])), 1)
+        self.assertEqual(self.texts["release.yml"].count("- name: Enable sccache"), 2)
+        self.assertEqual(self.texts["gate-tests.yml"].count("- name: Enable sccache"), 1)
         self.assertEqual(self.texts["release-build.yml"].count("- name: Enable sccache"), 1)
 
     def test_the_composite_pins_the_action_and_passes_the_version_explicitly(self):
@@ -1615,7 +1713,7 @@ class SccacheSetupTests(unittest.TestCase):
 
     def test_the_pinned_release_agrees_between_the_two_workflows(self):
         pins = {}
-        for name in ("release.yml", "release-build.yml"):
+        for name in ("release.yml", "release-build.yml", "gate-tests.yml"):
             header = self.texts[name].partition("\njobs:\n")[0]
             version = re.search(r'(?m)^  SCCACHE_VERSION: "([0-9.]+)"$', header)
             digest = re.search(r"(?m)^  SCCACHE_SHA256: ([0-9a-f]{64})$", header)
@@ -1623,6 +1721,7 @@ class SccacheSetupTests(unittest.TestCase):
             self.assertIsNotNone(digest, name)
             pins[name] = (version.group(1), digest.group(1))
         self.assertEqual(pins["release.yml"], pins["release-build.yml"])
+        self.assertEqual(pins["release.yml"], pins["gate-tests.yml"])
 
 
 if __name__ == "__main__":
