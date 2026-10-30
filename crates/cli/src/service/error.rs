@@ -840,18 +840,14 @@ impl Error {
             Self::StopTimeout { .. } => {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
-            Self::UpgradeAtRisk { warnings, .. }
-                if warnings
-                    .iter()
-                    .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING)) =>
+            Self::UpgradeAtRisk { warnings, .. } => Some(if warnings
+                .iter()
+                .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING))
             {
-                Some(
-                    "the warning names the recorded search path, which may be stale: refresh it with `pohunek service refresh-path` as the warning describes before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions",
-                )
-            }
-            Self::UpgradeAtRisk { .. } => Some(
-                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed",
-            ),
+                "if the runtime moved since the search path was recorded, the warning names the recorded path and the `pohunek service refresh-path` remedy: refresh it before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions although the runtime is current; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+            } else {
+                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+            }),
             Self::AcceptedRisks { .. } => Some(
                 "remove the ledger file and rerun with --accept-runtime-loss to accept the listed sessions again; the file only records what an earlier upgrade accepted",
             ),
@@ -939,7 +935,7 @@ impl Error {
                 "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
             ),
             Self::RefreshBlockedByTransaction => Some(
-                "finish the pending transaction first (`pohunek service status` names it), then rerun `pohunek service refresh-path`",
+                "finish the pending transaction first (`pohunek service status` names it; rerunning the command it names resumes or rolls it back, `pohunek service uninstall` removes it after its session check), then rerun `pohunek service refresh-path`",
             ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")

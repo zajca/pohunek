@@ -7898,7 +7898,8 @@ async fn a_store_path_runtime_below_the_range_points_at_refresh_path_without_a_l
     assert!(
         error
             .hint()
-            .is_some_and(|hint| hint.contains("may be stale")),
+            .is_some_and(|hint| hint.contains("pohunek service refresh-path")
+                && hint.contains("otherwise preserve the required runtime")),
         "{:?}",
         error.hint()
     );
@@ -7918,6 +7919,15 @@ async fn refreshing_the_path_lets_the_same_upgrade_through_without_the_flag() {
         .expect("the refreshed path finds the current runtime");
     assert!(!report.accepted_runtime_loss);
     harness.assert_installed(V2);
+}
+
+#[test]
+fn an_unmanaged_host_gets_no_recorded_path_warning() {
+    let harness = Harness::new();
+    assert!(
+        super::preflight::recorded_path_warning(&harness.context, "/usr/bin:/bin").is_none(),
+        "the user manager's PATH is not a recorded path"
+    );
 }
 
 #[tokio::test]

@@ -982,7 +982,9 @@ On macOS, where the install discovers the path through your login shell, the
 refusal also carries a warning that names the recorded path the upgrade judged
 with. It runs no login shell. (A Linux install records no path, because the
 user manager's `PATH` applies, and gets no such warning.) If a runtime moved
-since the path was recorded, do not accept the loss. Compare with
+since the path was recorded, do not accept the loss. Use the
+`pohunek` of the release you are installing (`./pohunek` in its unpacked
+archive), because the installed one may predate the command. Compare with
 `pohunek service refresh-path --dry-run`, which runs the login-shell discovery
 as install does and prints the directories it would add and remove, record the
 current path with `pohunek service refresh-path`, and rerun the upgrade. The
@@ -992,7 +994,13 @@ is pending. Nothing is stopped or restarted: `service check` and `service
 upgrade` judge with the new path at once, and the running daemon job gets it at
 its next replacement. Do not use `--accept-runtime-loss` for this cause, since
 it would drop resume and fork for the listed sessions although the runtime is
-current.
+current. `refresh-path` refuses while a transaction record is pending
+(`service_refresh_blocked_by_transaction`), and an interrupted upgrade leaves
+one: `pohunek service status` names it, and an upgrade that is refused again
+with the same warning cannot be refreshed around. Remove the record with
+`pohunek service uninstall` (it checks live sessions first), then install the
+version that is installed now from its own archive: a fresh install discovers
+the current path, so no `refresh-path` is needed.
 
 ### Stopped sessions on an older official package version
 

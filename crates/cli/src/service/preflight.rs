@@ -217,8 +217,7 @@ pub async fn gate_upgrade(
 
 /// Start of the warning an at-risk refusal of a managed installation carries.
 /// [`Error::hint`] and `packaging/install-daemon.sh` key on it.
-pub(super) const STALE_PATH_WARNING: &str =
-    "the search path this upgrade judged with is recorded in service.toml:";
+pub(super) const STALE_PATH_WARNING: &str = "the search path this upgrade judged with is:";
 
 /// Names the recorded search path and the command that refreshes it, when the
 /// upgrade refuses sessions as at risk.
@@ -231,15 +230,18 @@ pub(super) const STALE_PATH_WARNING: &str =
 /// never runs the login shell, which `pohunek service refresh-path --dry-run`
 /// does outside any lock. An installation that records no path (the Linux user
 /// manager's `PATH`) gets none.
-fn recorded_path_warning(context: &Context, judged: &str) -> Option<String> {
+pub(super) fn recorded_path_warning(context: &Context, judged: &str) -> Option<String> {
     if !context.records_search_path() || judged.is_empty() {
         return None;
     }
     Some(format!(
-        "{STALE_PATH_WARNING} {judged}; if a runtime moved since it was recorded, for example \
-         after a Nix profile update, do not accept the loss: compare with \
-         `pohunek service refresh-path --dry-run`, record the current path with \
-         `pohunek service refresh-path`, and rerun this upgrade"
+        "{STALE_PATH_WARNING} {judged} (install records it in service.toml); if a runtime \
+         moved since it was recorded, for example after a Nix profile update, do not accept \
+         the loss: with the `pohunek` of the release you are installing (`./pohunek` in its \
+         unpacked archive), compare with `pohunek service refresh-path --dry-run`, record the \
+         current path with `pohunek service refresh-path`, and rerun this upgrade. A pending \
+         transaction blocks refresh-path (`pohunek service status` names it); see the update \
+         runbook"
     ))
 }
 
