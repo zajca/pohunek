@@ -16252,6 +16252,68 @@ generation "$1"
             assert!(orphan.is_dir(), "the owners are unknown, so nothing goes");
         }
 
+        /// Makes `path` readable by its group and others, which discovery
+        /// rejects as an unsafe root.
+        fn expose_to_others(path: &Path) {
+            std::fs::create_dir_all(path).expect("create the root");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("expose the root");
+        }
+
+        /// A worker runtime root discovery rejects hides the sockets of every
+        /// worker, so the owners are unknown and neither an aged journal
+        /// directory nor the TMPDIR of a session without journals goes.
+        #[tokio::test]
+        async fn a_failed_socket_discovery_keeps_an_aged_orphan_journal_and_tmpdir() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let orphan = seed_aged_orphan_journals(&fixture.root, "s-9001");
+            let tmp_root = fixture.root.join(FIXTURE_TMP_ROOT);
+            let orphan_data = super::session_tmpdir_with_data(&tmp_root, "s-9002");
+            let runtime_root = fixture.root.join("runtime/workers");
+            expose_to_others(&runtime_root);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert!(orphan.is_dir(), "no collection without the worker sockets");
+            assert!(orphan_data.exists(), "no TMPDIR sweep without them either");
+
+            std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700))
+                .expect("restore the root");
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile again");
+            assert!(!orphan.exists(), "the next start collects the journals");
+            assert!(!orphan_data.exists(), "and sweeps the TMPDIR");
+        }
+
+        /// A worker journal root the scan rejects hides the journals of every
+        /// session, so the owners are unknown and neither an aged journal
+        /// directory nor the TMPDIR of a session without journals goes.
+        #[tokio::test]
+        async fn a_failed_journal_scan_keeps_an_aged_orphan_journal_and_tmpdir() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let orphan = seed_aged_orphan_journals(&fixture.root, "s-9001");
+            let tmp_root = fixture.root.join(FIXTURE_TMP_ROOT);
+            let orphan_data = super::session_tmpdir_with_data(&tmp_root, "s-9002");
+            let journal_root = fixture.root.join("state/workers");
+            expose_to_others(&journal_root);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert!(orphan.is_dir(), "no collection without the journal scan");
+            assert!(orphan_data.exists(), "no TMPDIR sweep without it either");
+
+            std::fs::set_permissions(&journal_root, std::fs::Permissions::from_mode(0o700))
+                .expect("restore the root");
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile again");
+            assert!(!orphan.exists(), "the next start collects the journals");
+            assert!(!orphan_data.exists(), "and sweeps the TMPDIR");
+        }
+
         /// A stale job of a session without a record owns that session's
         /// journals.
         #[tokio::test]
@@ -25633,6 +25695,64 @@ generation "$1"
         // A code the differential does not prove stable carries no scope.
         assert_eq!(unreadable.acceptance_scope, None);
     }
+
+    /// A missing journal and a running worker are not an ended writer:
+    /// `end_worker_runtime` stays pending while the worker serves its running
+    /// phase, and returns only after the worker has left it, when the terminal
+    /// journal exists.
+    #[tokio::test]
+    async fn ending_the_worker_runtime_waits_for_the_worker_not_the_journal() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = "s-1670";
+        let (controller, _instance, child_pid, task) =
+            spawn_initialized_worker(&root, &runtime_root, session_id, "worker-1670").await;
+        let socket = runtime_root
+            .join(session_id)
+            .join(pohunek_paths::WORKER_SOCKET_NAME);
+        let journal_path = root
+            .join("state/workers")
+            .join(session_id)
+            .join("worker-1670.json");
+        let pty_root = crate::procwatch::HostInspector::new()
+            .identity(child_pid)
+            .ok()
+            .flatten();
+        // The worker serves one controller at a time; the release is
+        // acknowledged before the probe connects.
+        controller
+            .release_controller()
+            .await
+            .expect("release the setup controller");
+
+        // The journal a finished removal would have deleted does not exist,
+        // yet the worker still runs: waiting must not treat that as an end.
+        std::fs::remove_file(&journal_path).expect("remove the running journal");
+        let ending = end_worker_runtime(None, &journal_path, &socket, session_id);
+        tokio::pin!(ending);
+        for _ in 0..PENDING_POLLS {
+            assert!(
+                futures::poll!(ending.as_mut()).is_pending(),
+                "a running worker has not ended"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Ending the root makes the worker journal the end and report it.
+        crate::procwatch::scoped_host::kill_if_current(
+            &crate::procwatch::HostInspector::new(),
+            pty_root.expect("the PTY root runs"),
+        );
+        ending.await;
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).expect("terminal journal"))
+                .expect("decode the terminal journal");
+        assert_eq!(journal["phase"], "terminal");
+        task.abort();
+    }
+
+    /// Polls of a wait that must stay pending.
+    const PENDING_POLLS: usize = 64;
 
     /// Ends the PTY root of an in-process worker and waits until the worker has
     /// journaled the end.
