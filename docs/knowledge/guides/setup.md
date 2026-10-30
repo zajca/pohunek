@@ -182,7 +182,11 @@ the `MANIFEST` must describe a daemon archive built for this host (Linux x86_64
 or native macOS arm64, never an Intel Mac or a Rosetta shell), the host must meet
 the archive's minimum macOS version, and every listed member must be present,
 unmodified, and not writable by another account; otherwise it exits before
-running any archive binary, with nothing changed. The install is ready only
+running any archive binary, with nothing changed. The verifier runs `id` from
+`/usr/bin`, `/bin` or, on NixOS, `/run/current-system/sw/bin`, never from `PATH`,
+and trusts a directory only when the directory it resolves to is closed to group
+and others and owned by root or the installing user; a host with none is refused
+with `no trusted id found in <list>`. The install is ready only
 when the daemon job's own main process answers `daemon.health` on the socket;
 an install that fails from the registration step on keeps its record and fails
 with `service_install_incomplete`, and rerunning `pohunek service install` with

@@ -6,6 +6,7 @@ any host: staging, the archive manifest, and the deterministic archive.
 
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -106,6 +107,100 @@ class Workspace:
             cwd=self.root,
         )
         return result.stdout.strip()
+
+
+class VerifyArchiveIdTest(unittest.TestCase):
+    """`verify-archive` finds `id` in a fixed list of system directories, not on PATH (#1682)."""
+
+    LIST_LINE = 'trusted_id_dirs="/usr/bin /bin /run/current-system/sw/bin"'
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="pohunek-verify-id-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.archive = self.root / "archive"
+        self.archive.mkdir()
+        # A MANIFEST that is not a manifest: the verifier reaches the header
+        # check only after it resolved `id` and judged the directories.
+        (self.archive / "MANIFEST").write_text("not a manifest\n")
+        self.archive.chmod(0o755)
+        self.root.chmod(0o755)
+        self.script = (PACKAGING / "verify-archive").read_text()
+
+    def verify(self, trusted, path="/usr/bin:/bin", script=None):
+        """Runs a copy of the script whose trusted list is `trusted`."""
+        text = (script or self.script).replace(self.LIST_LINE, f'trusted_id_dirs="{trusted}"')
+        copy = self.root / "verify-archive"
+        copy.write_text(text)
+        return run(
+            ["sh", copy, self.archive, "daemon", "pohunek"],
+            env={"PATH": path},
+            check=False,
+        )
+
+    def system_id(self):
+        for candidate in ("/usr/bin/id", "/bin/id"):
+            if os.path.exists(candidate):
+                return candidate
+        self.skipTest("no system id to link")
+
+    def test_the_shipped_list_names_the_nixos_system_profile(self):
+        self.assertIn(self.LIST_LINE, self.script)
+        self.assertIn("/run/current-system/sw/bin", self.LIST_LINE)
+
+    def test_id_is_found_in_a_nixos_style_profile_without_usr_bin_id(self):
+        profile = self.root / "run" / "current-system" / "sw" / "bin"
+        profile.mkdir(parents=True)
+        profile.chmod(0o755)
+        (profile / "id").symlink_to(self.system_id())
+        result = self.verify(f"/nonexistent/bin {profile}")
+        self.assertNotIn("no trusted id", result.stderr)
+        self.assertIn("MANIFEST is not a pohunek archive manifest", result.stderr)
+
+    def test_no_trusted_id_is_a_refusal_that_changes_nothing(self):
+        result = self.verify("/nonexistent/bin")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no trusted id found in /nonexistent/bin", result.stderr)
+        self.assertIn("nothing was changed", result.stderr)
+
+    def test_no_trusted_id_names_the_host_requirement_not_the_archive(self):
+        result = self.verify("/nonexistent/bin")
+        self.assertIn("owned by root or by you", result.stderr)
+        self.assertIn("problem of the host, not of the archive", result.stderr)
+        self.assertNotIn("download and extract it again", result.stderr)
+
+    def test_a_directory_writable_by_others_is_not_trusted(self):
+        profile = self.root / "open"
+        profile.mkdir()
+        (profile / "id").symlink_to(self.system_id())
+        profile.chmod(0o777)
+        result = self.verify(str(profile))
+        self.assertIn("no trusted id found", result.stderr)
+
+    def test_an_id_earlier_on_path_is_ignored(self):
+        shadow = self.root / "shadow"
+        shadow.mkdir()
+        (shadow / "id").write_text("#!/bin/sh\necho 4242\n")
+        (shadow / "id").chmod(0o755)
+        profile = self.root / "sys"
+        profile.mkdir()
+        profile.chmod(0o755)
+        (profile / "id").symlink_to(self.system_id())
+        result = self.verify(str(profile), path=f"{shadow}:/usr/bin:/bin")
+        # With the real uid the directories above the archive pass and the run
+        # reaches the manifest header; a shadow uid of 4242 would refuse them.
+        self.assertNotIn("owned by another user", result.stderr)
+        self.assertIn("MANIFEST is not a pohunek archive manifest", result.stderr)
+
+
+class InstallDaemonWarningTest(unittest.TestCase):
+    """The wrapper's stale-path hint matches the text the CLI warning starts with (#1683)."""
+
+    def test_the_wrapper_greps_the_cli_warning_prefix(self):
+        source = (ROOT / "crates/cli/src/service/preflight.rs").read_text()
+        match = re.search(r'STALE_PATH_WARNING: &str = "([^"]+)";', source)
+        self.assertIsNotNone(match, "STALE_PATH_WARNING not found in preflight.rs")
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        self.assertIn(f"grep -q '{match.group(1)}'", wrapper)
 
 
 class StageArchiveTest(unittest.TestCase):

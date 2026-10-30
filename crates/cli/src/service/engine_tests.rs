@@ -7501,6 +7501,227 @@ fn version_dirs(harness: &Harness) -> Vec<String> {
         .collect()
 }
 
+/// Judges the stopped sessions at risk when the first `claude` on the search
+/// path reports a version below the range the release requires: a stand-in for
+/// the runtime check, whose verdict depends on the `PATH` the upgrade carries.
+#[derive(Debug, Default)]
+struct RuntimeOnPathPreflight {
+    inner: InProcessPreflight,
+}
+
+impl RuntimeOnPathPreflight {
+    /// The lowest `claude` version the release accepts, as `[major, minor, patch]`.
+    const REQUIRED: [u64; 3] = [2, 1, 289];
+
+    fn version_on(search_path: &str) -> Option<[u64; 3]> {
+        search_path.split(':').find_map(|dir| {
+            let text = std::fs::read_to_string(std::path::Path::new(dir).join("claude")).ok()?;
+            let parts: Vec<u64> = text
+                .trim()
+                .split('.')
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            <[u64; 3]>::try_from(parts).ok()
+        })
+    }
+}
+
+impl AdoptionPreflight for RuntimeOnPathPreflight {
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        dir: &'a VerifiedVersionDir,
+        search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
+        plan: ReleasePlan,
+    ) -> Judging<'a> {
+        Box::pin(async move {
+            let mut report: PreflightReport = self
+                .inner
+                .judge(context, dir, search_path, variables, probe_budget, plan)
+                .await?;
+            if Self::version_on(search_path).is_some_and(|found| found < Self::REQUIRED) {
+                report.stopped_sessions =
+                    vec![stopped_at_risk(OTHER_SESSION, "runtime_below_range", None)];
+            }
+            Ok(report)
+        })
+    }
+}
+
+/// A context whose login shell fails, so discovery falls back to `fallback`.
+fn failing_discovery(
+    context: &Context,
+    root: &std::path::Path,
+    fallback: &std::path::Path,
+) -> Context {
+    crate::service::context::tests::make_dirs(root, fallback);
+    let shell = root.join("failing-shell");
+    pohunek_test_support::fs::write_executable(&shell, "#!/bin/sh\nexit 1\n").expect("write shell");
+    let crate::service::context::PathDiscovery::Managed {
+        login_shell,
+        shell_defaulted,
+        ..
+    } = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery")
+    else {
+        panic!("managed discovery");
+    };
+    context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: vec![fallback.display().to_string()],
+        })
+}
+
+/// Installs with a login shell that reports a store-style directory holding
+/// `claude` 2.1.288, then upgrades with a login shell that reports the
+/// profile's directory holding `claude` 2.1.302, under the version-aware
+/// preflight. Returns the harness and the refusal of the first upgrade.
+async fn stale_store_path_refusal() -> (Harness, std::path::PathBuf, std::path::PathBuf, Error) {
+    let mut harness = Harness::new();
+    let stale = harness.root.join("nix-store-user-environment-bin");
+    let profile = harness.root.join("profile-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &stale);
+    std::fs::write(stale.join("claude"), "2.1.288\n").expect("stale claude");
+    harness.install(V1).await.expect("install");
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &profile);
+    std::fs::write(profile.join("claude"), "2.1.302\n").expect("profile claude");
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the recorded runtime is below the range");
+    (harness, stale, profile, error)
+}
+
+#[tokio::test]
+async fn a_store_path_runtime_below_the_range_is_named_as_a_stale_recorded_path() {
+    let (_harness, stale, profile, error) = stale_store_path_refusal().await;
+
+    let Error::UpgradeAtRisk {
+        stopped_sessions,
+        warnings,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(
+        stopped_sessions.len(),
+        1,
+        "the stale runtime puts the session at risk"
+    );
+    let [warning] = warnings.as_slice() else {
+        panic!("one warning names the recorded path: {warnings:?}");
+    };
+    for expected in [
+        super::preflight::STALE_PATH_WARNING,
+        stale.to_str().expect("utf-8"),
+        profile.to_str().expect("utf-8"),
+        "pohunek service uninstall",
+        "pohunek service install",
+        "do not accept the loss",
+    ] {
+        assert!(
+            warning.contains(expected),
+            "{expected} missing from {warning}"
+        );
+    }
+    assert!(
+        error.to_string().contains(stale.to_str().expect("utf-8")),
+        "{error}"
+    );
+    assert!(
+        error
+            .hint()
+            .is_some_and(|hint| hint.contains("may be stale")),
+        "{:?}",
+        error.hint()
+    );
+}
+
+#[tokio::test]
+async fn re_recording_the_path_lets_the_same_upgrade_through_without_the_flag() {
+    let (harness, ..) = stale_store_path_refusal().await;
+
+    harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall");
+    harness.install(V1).await.expect("install again");
+    let report = harness
+        .engine()
+        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the re-recorded path finds the current runtime");
+    assert!(!report.accepted_runtime_loss);
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_recorded_path_that_still_matches_gets_no_stale_path_warning() {
+    let mut harness = Harness::new();
+    let same = harness.root.join("same-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &same);
+    std::fs::write(same.join("claude"), "2.1.288\n").expect("claude");
+    harness.install(V1).await.expect("install");
+
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the runtime really is below the range");
+
+    let Error::UpgradeAtRisk { warnings, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.starts_with(super::preflight::STALE_PATH_WARNING)),
+        "{warnings:?}"
+    );
+    assert!(error
+        .hint()
+        .is_some_and(|hint| !hint.contains("may be stale")));
+}
+
+#[tokio::test]
+async fn a_failed_login_shell_says_nothing_about_the_recorded_path() {
+    let mut harness = Harness::new();
+    let recorded = harness.root.join("recorded-bin");
+    let fallback = harness.root.join("fallback-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+    std::fs::write(recorded.join("claude"), "2.1.288\n").expect("claude");
+    harness.install(V1).await.expect("install");
+    harness.context = failing_discovery(&harness.context, &harness.root, &fallback);
+
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the runtime really is below the range");
+
+    let Error::UpgradeAtRisk { warnings, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.starts_with(super::preflight::STALE_PATH_WARNING)),
+        "a fallback list is not evidence of a stale path: {warnings:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_upgrade_refuses_live_sessions_whose_records_cannot_be_migrated_and_the_flag_proceeds() {
     let harness = Harness::new();

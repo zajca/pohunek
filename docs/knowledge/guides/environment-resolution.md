@@ -94,7 +94,9 @@ because another local account could plant an agent executable there. Each kept e
 and recording cover the same directory and nothing can be retargeted after the
 check. The trade-off: a profile symlink that later points elsewhere (nix
 generations, a dotfile manager) keeps the recorded target until the path is
-recorded again; #319 tracks the refresh command. Empty, relative, `.`-style, duplicate, and
+recorded again; #319 tracks the refresh command. An upgrade refused as at risk names a
+recorded entry that a fresh discovery would not record (see the
+[upgrade runbook](../runbooks/update-after-release.md#a-recorded-search-path-that-no-longer-matches-your-profile)). Empty, relative, `.`-style, duplicate, and
 missing entries are ignored; a `PATH` containing a control character is
 garbage and fails the probe.
 

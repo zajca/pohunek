@@ -816,6 +816,15 @@ impl Error {
             Self::StopTimeout { .. } => {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
+            Self::UpgradeAtRisk { warnings, .. }
+                if warnings
+                    .iter()
+                    .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING)) =>
+            {
+                Some(
+                    "the warning names a search path that may be stale: re-record it as the warning describes before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions",
+                )
+            }
             Self::UpgradeAtRisk { .. } => Some(
                 "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed",
             ),

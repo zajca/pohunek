@@ -90,6 +90,14 @@ A completed upgrade to 0.36 cannot be rolled back to 0.35.2 by installing the
 older archive; the ordered procedure is in
 [update after release](knowledge/runbooks/update-after-release.md#roll-back-after-a-completed-036-upgrade).
 
+Before it changes anything, the wrapper verifies the archive with
+`packaging/verify-archive`. The verifier runs `id` from a fixed list of system directories, never from
+`PATH`: `/usr/bin`, `/bin` and, on NixOS, the system profile
+`/run/current-system/sw/bin`. A directory counts only when the directory it
+resolves to is closed to group and others and owned by root or by the installing
+user. A host with no such `id` is refused with `no trusted id found in <list>`
+before anything is changed.
+
 For the daemon component, run the included `packaging/install-daemon.sh`. It
 calls `pohunek service install` (or `pohunek service upgrade` when a service is
 already installed and no interrupted install is pending), which:
