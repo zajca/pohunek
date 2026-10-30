@@ -2698,7 +2698,16 @@ its default. The optional `[deadlines]` key `registry_shutdown_ms` (`1..=600000`
 5000 by default) bounds how long the daemon's session registry waits for its
 background tasks and in-flight store writes at shutdown; it is additive, so it
 leaves `schema_version` at 7 and the writer omits it while it equals its
-default. The optional `[inventory]` table sets the version-probe cache behind
+default. The optional `[deadlines]` keys `create_drain_ms` (10000),
+`driver_shutdown_ms` (5000) and `event_log_flush_ms` (5000), all `1..=600000`,
+bound the other daemon shutdown phases the same way (see the shutdown tree in
+the architecture). The four phase bounds plus a 2000 ms margin should not exceed
+`daemon_exit_timeout_ms`. A file that exceeds it stays valid: `pohunekd` logs a
+warning at start and shortens the phase bounds in proportion so the service
+manager does not kill it before its event log flushed, and the
+`service_config_shutdown_budget` check of `pohunek doctor` is `warn` with the
+configured exit timeout and the least one that fits. The defaults fit the
+default exit timeout of 30000 ms. The optional `[inventory]` table sets the version-probe cache behind
 `host.inspect`: `probe_cache_ttl_ms` and `probe_failure_ttl_ms` (`1..=600000`,
 120000 and 10000 by default), `probe_cache_max_entries` (`1..=4096`, 256) and
 `probe_parallelism` (`1..=256`, 32, the most probes one inventory runs at

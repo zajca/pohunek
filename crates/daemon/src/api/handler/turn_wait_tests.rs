@@ -23,8 +23,8 @@ use tokio::task::JoinHandle;
 use super::{handle_request, DaemonState, HealthInfo};
 use crate::agent::host::fixture::{official_host, official_profile_pin};
 use crate::notifications::{
-    default_policy, AttentionCoordinator, AttentionCoordinatorTask, NotificationProjector,
-    NotificationService, DEFAULT_ATTENTION_DEBOUNCE_SECS,
+    default_policy, spawn_projector, AttentionCoordinator, NotificationService,
+    DEFAULT_ATTENTION_DEBOUNCE_SECS,
 };
 use crate::session::{SessionRegistry, SessionRegistryConfig};
 
@@ -77,8 +77,8 @@ pub(super) struct Fixture {
     state: DaemonState,
     pub(super) sessions: SessionRegistry,
     pub(super) root: Arc<tempfile::TempDir>,
-    projector: std::sync::Mutex<Option<NotificationProjector>>,
-    _coordinator: AttentionCoordinatorTask,
+    projector: std::sync::Mutex<Option<crate::shutdown::DriverHandle>>,
+    _coordinator: crate::shutdown::DriverHandle,
 }
 
 impl Fixture {
@@ -104,7 +104,7 @@ impl Fixture {
             .expect("projector slot is never poisoned")
             .take()
             .expect("the projector runs");
-        projector.shutdown().await;
+        projector.stop().await;
     }
 
     /// Builds the daemon components with the default notification policy.
@@ -160,10 +160,11 @@ impl Fixture {
         if let Some(policy) = policy {
             notifications.set_policy(policy).expect("set the policy");
         }
+        let tasks = crate::shutdown::DaemonShutdown::default();
         let (attention, coordinator) =
-            AttentionCoordinator::spawn(notifications.clone(), &sessions);
+            AttentionCoordinator::spawn(&tasks, notifications.clone(), &sessions);
         let projector =
-            NotificationProjector::spawn(&sessions, notifications.clone(), attention.clone());
+            spawn_projector(&tasks, &sessions, notifications.clone(), attention.clone());
         let state = DaemonState::new(
             HealthInfo::new("test"),
             sessions.clone(),

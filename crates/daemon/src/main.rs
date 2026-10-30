@@ -50,7 +50,7 @@ use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::notifications::{
-    AttentionCoordinator, NotificationProjector, NotificationRetentionTask, NotificationService,
+    spawn_notification_retention, spawn_projector, AttentionCoordinator, NotificationService,
     NOTIFICATIONS_SUBDIR,
 };
 use pohunek_daemon::runtime::lifecycle::{
@@ -65,10 +65,11 @@ use pohunek_daemon::session::upgrade_preflight::{
     self, PreflightInputs, PreflightOptions, ReleaseInputs,
 };
 use pohunek_daemon::session::{
-    detect_official_runtimes, ensure_official_runtimes, EnsureInputs, SessionIdleStopTask,
-    SessionRegistry, SessionRegistryConfig, SessionRetentionTask, IDLE_STOP_POLICY_NAME,
+    detect_official_runtimes, ensure_official_runtimes, spawn_idle_stop, spawn_session_retention,
+    EnsureInputs, SessionRegistry, SessionRegistryConfig, IDLE_STOP_POLICY_NAME,
     RETENTION_POLICY_NAME,
 };
+use pohunek_daemon::shutdown::{DaemonShutdown, ShutdownPlan, Stage};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::preflight::{
@@ -124,14 +125,6 @@ const BOOTSTRAP_VARIABLES: [&str; 6] = [
 ];
 /// Durable worker binary name, expected next to the daemon executable.
 const WORKER_BINARY_NAME: &str = "pohunek-sessiond";
-
-/// Maximum time to let event-log drains flush on daemon shutdown.
-///
-/// Event log writes are local owner-private JSONL appends and should finish
-/// quickly. Bounding shutdown prevents a wedged filesystem from hanging the
-/// daemon indefinitely while still giving buffered audit/debug events a chance
-/// to reach disk.
-const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Initial delay between attempts to enable an optional remote listener.
 ///
@@ -537,7 +530,8 @@ async fn run() -> Result<(), DaemonError> {
         worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),
         ..SessionRegistryConfig::default()
     };
-    let sessions = build_session_registry(config, &paths, mode).await?;
+    let (sessions, shutdown_plan) = build_session_registry(config, &paths, mode).await?;
+    let tasks = DaemonShutdown::new(shutdown_plan);
     // Load the durable retention policy before anything can sweep: a corrupt or
     // unsafely-permissioned document must fail startup rather than silently
     // revert to the shipped default.
@@ -572,28 +566,30 @@ async fn run() -> Result<(), DaemonError> {
     // 7. Start the append-only event log before anything emits, so worker
     //    reconciliation events are captured too. The log drains
     //    both session and notification control-plane events into one file.
-    let event_logs = spawn_event_logs(
+    spawn_event_logs(
+        &tasks,
         &paths.data_dir.join(EVENTS_SUBDIR),
         &sessions,
         &notifications,
     )?;
-    let notification_retention = NotificationRetentionTask::spawn(notifications.clone());
-    let session_retention = SessionRetentionTask::spawn(sessions.clone());
-    let session_idle_stop = SessionIdleStopTask::spawn(sessions.clone(), notifications.clone());
+    spawn_notification_retention(&tasks, notifications.clone());
+    spawn_session_retention(&tasks, sessions.clone());
+    spawn_idle_stop(&tasks, sessions.clone(), notifications.clone());
     // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
     // agent_blocked/approval_required and turn_completed notifications, holding
     // them for the policy debounce window so transient signals never surface,
     // and records the surviving signals as turn events for session.wait_turn.
     // Both producers (the notification.create handler and the projector) route
     // debounced notifications through its clonable command handle.
-    let (attention_coordinator, attention_task) =
-        AttentionCoordinator::spawn(notifications.clone(), &sessions);
-    let notification_projector = NotificationProjector::spawn(
+    let (attention_coordinator, _attention_task) =
+        AttentionCoordinator::spawn(&tasks, notifications.clone(), &sessions);
+    spawn_projector(
+        &tasks,
         &sessions,
         notifications.clone(),
         attention_coordinator.clone(),
     );
-    sessions.spawn_agent_state_hooks();
+    sessions.spawn_agent_state_hooks_in(&tasks);
 
     // 7. Adopt exact surviving worker runtimes before exposing the public API.
     //    Reconciliation never invokes provider-native resume.
@@ -614,6 +610,10 @@ async fn run() -> Result<(), DaemonError> {
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
     let package_commands = state.package_commands.clone();
+    let shutdown_package_commands = package_commands.clone();
+    tasks.add_step("package_commands", Stage::Driver, move || async move {
+        shutdown_package_commands.shutdown().await;
+    });
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
@@ -659,28 +659,20 @@ async fn run() -> Result<(), DaemonError> {
         remote_shutdown_sessions.begin_daemon_shutdown();
     });
     let ((), remote_result) = tokio::join!(unix_serve, remote_serve);
-    // In-flight creates commit or compensate before the runtime stops; shutdown
-    // already refuses new ones.
-    sessions.drain_creates().await;
-    package_commands.shutdown().await;
 
-    // 11. Flush the append-only event log before exit so events buffered at
-    //     shutdown are not lost (bounded so a wedged write cannot hang exit).
-    //     Stop the projector before the coordinator so any last defers/resolves
-    //     it drains are still accepted, then drop the coordinator's pending
-    //     (in-memory, deliberately not persisted).
-    session_idle_stop.shutdown().await;
-    session_retention.shutdown().await;
-    notification_retention.shutdown().await;
-    notification_projector.shutdown().await;
-    attention_task.shutdown().await;
-    sessions.shutdown_agent_state_hooks().await;
-    // The tasks that drive the registry from outside have stopped. It stops its
-    // own background work last and refuses a store write after that; a control
-    // connection still finishing an operation sees `registry_shut_down`, which
-    // is how a daemon that is exiting ends it. The report is logged by shutdown.
-    drop(sessions.shutdown().await);
-    shutdown_event_logs(event_logs).await;
+    // 11. Stop the daemon's tasks in ordered phases, each inside its own bound
+    //     (see `pohunek_daemon::shutdown`): in-flight creates commit or
+    //     compensate (shutdown already refuses new ones), the producers (idle
+    //     stop, retention, package commands) stop first, then the consumers of
+    //     their events (notification projector, hook flush), and the attention
+    //     coordinator last so any last defers/resolves they hand over are
+    //     accepted, the registry stops its own background work and
+    //     refuses a store write after that (a control connection still
+    //     finishing an operation sees `registry_shut_down`, which is how a
+    //     daemon that is exiting ends it), and the append-only event log
+    //     flushes last so events buffered at shutdown are not lost. The report
+    //     is logged by the run.
+    drop(tasks.run(&sessions).await);
 
     remote_result?;
     info!("pohunekd stopped");
@@ -806,7 +798,9 @@ fn apply_input_timing(config: &mut SessionRegistryConfig, timing: InputTiming) {
 /// Applies every registry setting `service.toml` carries to `config`.
 fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceConfig) {
     config.worker_connect_deadline = service.deadlines().worker_connect;
-    config.shutdown_timeout = service.deadlines().registry_shutdown;
+    let shutdown = service.deadlines().fitted_shutdown();
+    config.shutdown_timeout = shutdown.registry_shutdown;
+    config.create_drain_timeout = shutdown.create_drain;
     apply_input_timing(config, service.input_timing());
     apply_wait_timing(config, service.wait_timing());
     config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
@@ -846,9 +840,10 @@ async fn build_session_registry(
     mut config: SessionRegistryConfig,
     paths: &Paths,
     mode: SupervisionMode,
-) -> Result<SessionRegistry, DaemonError> {
+) -> Result<(SessionRegistry, ShutdownPlan), DaemonError> {
     let bootstrap_environment = bootstrap_environment()?;
     let working_directory = worker_working_directory(&bootstrap_environment)?;
+    let mut plan = ShutdownPlan::default();
     let (supervision, supervisor): (SupervisionConfig, Arc<dyn WorkerLauncher>) = match mode {
         SupervisionMode::Native(path) => {
             let service = ServiceConfig::load(&path)?;
@@ -859,6 +854,13 @@ async fn build_session_registry(
                 &paths.runtime_dir,
             )?;
             let deadlines = service.deadlines();
+            // Phase bounds that do not fit the exit timeout are shortened to
+            // fit, so the event-log flush still ends before the service
+            // manager's kill; the file stays valid.
+            plan = ShutdownPlan::from_deadlines(&deadlines);
+            if let Some(shortfall) = &plan.shortfall {
+                warn!(%shortfall, "service.toml shutdown bounds do not fit the exit timeout");
+            }
             apply_service_settings(&mut config, &service);
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             info!(
@@ -920,7 +922,9 @@ async fn build_session_registry(
         }
     };
     config.supervision = Some(supervision);
-    SessionRegistry::new_production(config, supervisor).map_err(DaemonError::Reconcile)
+    let sessions =
+        SessionRegistry::new_production(config, supervisor).map_err(DaemonError::Reconcile)?;
+    Ok((sessions, plan))
 }
 
 /// Validates the bootstrap environment every worker job carries and returns
@@ -1054,17 +1058,14 @@ fn resolve_worker_binary() -> Result<PathBuf, DaemonError> {
     Ok(binary)
 }
 
-#[derive(Debug)]
-struct EventLogDrains {
-    shutdown: CancellationToken,
-    handles: Vec<JoinHandle<()>>,
-}
-
+/// Opens the event log and starts one drain per event source, as event-log
+/// tasks of `tasks`.
 fn spawn_event_logs(
+    tasks: &DaemonShutdown,
     events_dir: &std::path::Path,
     sessions: &SessionRegistry,
     notifications: &NotificationService,
-) -> Result<EventLogDrains, DaemonError> {
+) -> Result<(), DaemonError> {
     let log = Arc::new(
         EventLog::open(events_dir, sessions.event_retention()).map_err(|source| {
             DaemonError::Directory {
@@ -1073,24 +1074,16 @@ fn spawn_event_logs(
             }
         })?,
     );
-    let shutdown = CancellationToken::new();
-    let handles = vec![
-        spawn_drain(Arc::clone(&log), sessions.subscribe(), shutdown.clone()),
-        spawn_drain(log, notifications.subscribe(), shutdown.clone()),
-    ];
-    Ok(EventLogDrains { shutdown, handles })
-}
-
-async fn shutdown_event_logs(drains: EventLogDrains) {
-    drains.shutdown.cancel();
-    for handle in drains.handles {
-        if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
-            .await
-            .is_err()
-        {
-            warn!("event-log drain did not finish flushing within the shutdown timeout");
-        }
+    for (name, events) in [
+        ("session_event_log", sessions.subscribe()),
+        ("notification_event_log", notifications.subscribe()),
+    ] {
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let handle = spawn_drain(Arc::clone(&log), events, shutdown);
+        tasks.adopt(name, Stage::EventLog, move || stop.cancel(), handle);
     }
+    Ok(())
 }
 
 /// Repeatedly bind and serve one optional overlay TCP control listener.

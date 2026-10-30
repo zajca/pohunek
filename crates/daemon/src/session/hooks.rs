@@ -4,7 +4,7 @@ use super::{
     broadcast, event, is_terminal, mpsc, run_hook, warn, AgentActivity, CancellationToken,
     Duration, Event, HashMap, HashSet, HookContext, HookEvent, JoinHandle, PathBuf, RuntimeRef,
     SessionId, SessionRegistry, Value, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION,
-    ENV_SESSION_ID, ENV_SOCKET_PATH, EVENT_LOG_FLUSH_TIMEOUT, PROTOCOL_VERSION,
+    ENV_SESSION_ID, ENV_SOCKET_PATH, PROTOCOL_VERSION,
 };
 use crate::integration::hook_retry_deadline;
 use protocol::{
@@ -61,8 +61,25 @@ impl SessionRegistry {
         *slot = Some(handle);
     }
 
+    /// Starts the agent-state hook dispatcher and registers its flush with the
+    /// daemon shutdown as a consumer of the registry's events.
+    pub fn spawn_agent_state_hooks_in(&self, tasks: &crate::shutdown::DaemonShutdown) {
+        self.spawn_agent_state_hooks();
+        let sessions = self.clone();
+        tasks.add_step(
+            "agent_state_hooks",
+            crate::shutdown::Stage::Consumer,
+            move || async move {
+                sessions.shutdown_agent_state_hooks().await;
+            },
+        );
+    }
+
     /// Stop the agent-state hook dispatcher and flush any pending debounced
     /// activity values before returning.
+    ///
+    /// The wait has no bound of its own; daemon shutdown runs it as a consumer
+    /// step of the driver phase, which bounds it.
     pub async fn shutdown_agent_state_hooks(&self) {
         self.inner.agent_state_hook_shutdown.cancel();
         let handle = self
@@ -72,11 +89,11 @@ impl SessionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(handle) = handle {
-            if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
-                .await
-                .is_err()
-            {
-                warn!("agent-state hook dispatcher did not finish within the shutdown timeout");
+            if let Err(error) = handle.await {
+                // Aborted by the registry shutdown, or panicked.
+                if error.is_panic() {
+                    warn!(error = %error, "agent-state hook dispatcher panicked");
+                }
             }
         }
     }

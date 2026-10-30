@@ -37,7 +37,6 @@ use protocol::{
     NotificationId, NotificationKind, NotificationRecord, NotificationSource, SessionTurnEventKind,
 };
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::time::DelayQueue;
 use tracing::{debug, warn};
@@ -46,14 +45,8 @@ use super::{
     is_turn_dedupe_key, source_priority, DeferredNotification, NotificationService, SourcePriority,
 };
 use crate::session::{SessionRegistry, TurnEvents, TurnId, TurnVerdict};
+use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 use protocol::AgentActivity;
-
-/// Maximum time to wait for the coordinator task to stop on shutdown.
-///
-/// The shutdown path only drops in-memory pending entries and returns; it does no
-/// blocking I/O. Five seconds matches the projector and event-log shutdown
-/// budgets and bounds a wedged runtime.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Command accepted by the session notification debounce coordinator task.
 #[derive(Debug)]
@@ -120,30 +113,43 @@ pub struct AttentionCoordinator {
 }
 
 impl AttentionCoordinator {
-    /// Spawn the coordinator task, returning its command handle and task owner.
+    /// Spawn the coordinator task, returning its command handle and the handle
+    /// of its task.
     ///
-    /// The returned [`AttentionCoordinator`] is the clonable producer handle; the
-    /// [`AttentionCoordinatorTask`] owns the spawned task and drives its graceful
-    /// shutdown. Flushed session signals are recorded as turn events in the
-    /// journal of `sessions`.
+    /// The returned [`AttentionCoordinator`] is the clonable producer handle.
+    /// The task is a sink of `tasks`: daemon shutdown stops it after every
+    /// driver, so the last defers and resolves they hand over are still
+    /// accepted, and pending entries are then dropped without being persisted.
+    /// Flushed session signals are recorded as turn events in the journal of
+    /// `sessions`.
     #[must_use]
     pub fn spawn(
+        tasks: &DaemonShutdown,
         notifications: NotificationService,
         sessions: &SessionRegistry,
-    ) -> (Self, AttentionCoordinatorTask) {
+    ) -> (Self, DriverHandle) {
         // Unbounded: session notification commands are produced at
         // human-interaction rate (an agent blocking, an owner resuming), so
         // growth is not a practical concern, and an unbounded sink lets both the
         // request handler and the projector enqueue without send-side
         // backpressure that could stall them.
         let (commands, receiver) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(run(notifications, sessions.clone(), receiver));
+        let stop = commands.clone();
+        // A closed channel means the task already stopped.
+        let task = tasks.spawn(
+            "attention_coordinator",
+            Stage::Sink,
+            move || {
+                let _ = stop.send(Command::Shutdown);
+            },
+            run(notifications, sessions.clone(), receiver),
+        );
         (
             Self {
-                commands: commands.clone(),
+                commands,
                 as_of: None,
             },
-            AttentionCoordinatorTask { commands, handle },
+            task,
         )
     }
 
@@ -188,34 +194,6 @@ impl AttentionCoordinator {
         Self {
             commands,
             as_of: None,
-        }
-    }
-}
-
-/// Owns the spawned coordinator task and drives its graceful shutdown.
-#[derive(Debug)]
-pub struct AttentionCoordinatorTask {
-    commands: mpsc::UnboundedSender<Command>,
-    handle: JoinHandle<()>,
-}
-
-impl AttentionCoordinatorTask {
-    /// Signal the coordinator to stop and wait for it to drain.
-    ///
-    /// Pending entries are dropped without being persisted. Bounded by
-    /// [`SHUTDOWN_TIMEOUT`] so a wedged runtime cannot hang daemon exit.
-    pub async fn shutdown(self) {
-        // A closed channel means the task already stopped; the timeout below then
-        // resolves immediately on the finished handle.
-        let _ = self.commands.send(Command::Shutdown);
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                warn!(error = %err, "attention coordinator task failed during shutdown");
-            }
-            Err(_) => {
-                warn!("attention coordinator did not finish within the shutdown timeout");
-            }
         }
     }
 }
@@ -728,6 +706,7 @@ mod tests {
     use super::{AttentionCoordinator, ResolveAsOf, StdInstant};
     use crate::notifications::{default_policy, DeferredNotification, NotificationService};
     use crate::session::{SessionRegistry, SessionRegistryConfig};
+    use crate::shutdown::{DaemonShutdown, DriverHandle};
 
     /// Debounce window used by the tests, advanced past to force a flush.
     const TEST_DEBOUNCE_SECS: u64 = 5;
@@ -829,10 +808,9 @@ mod tests {
     }
 
     /// Spawns a coordinator over a registry that holds no session.
-    fn spawn(
-        service: &NotificationService,
-    ) -> (AttentionCoordinator, super::AttentionCoordinatorTask) {
+    fn spawn(service: &NotificationService) -> (AttentionCoordinator, DriverHandle) {
         AttentionCoordinator::spawn(
+            &DaemonShutdown::default(),
             service.clone(),
             &SessionRegistry::new(SessionRegistryConfig::default()),
         )

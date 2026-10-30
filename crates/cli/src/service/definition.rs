@@ -94,6 +94,9 @@ pub(crate) fn config_with_search_path(
             daemon_exit_timeout: settings::DAEMON_EXIT_TIMEOUT,
             daemon_restart_throttle: settings::DAEMON_RESTART_THROTTLE,
             registry_shutdown: pohunek_service_config::DEFAULT_REGISTRY_SHUTDOWN,
+            create_drain: pohunek_service_config::DEFAULT_CREATE_DRAIN,
+            driver_shutdown: pohunek_service_config::DEFAULT_DRIVER_SHUTDOWN,
+            event_log_flush: pohunek_service_config::DEFAULT_EVENT_LOG_FLUSH,
         },
         environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
             .iter()

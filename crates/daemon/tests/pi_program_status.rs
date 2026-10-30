@@ -19,9 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pohunek_daemon::notifications::{
-    AttentionCoordinator, AttentionCoordinatorTask, NotificationProjector, NotificationService,
-};
+use pohunek_daemon::notifications::{spawn_projector, AttentionCoordinator, NotificationService};
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
@@ -29,6 +27,7 @@ use pohunek_daemon::runtime::{
 use pohunek_daemon::session::{
     RedeemedRuntime, SessionRegistry, SessionRegistryConfig, ShellCommand,
 };
+use pohunek_daemon::shutdown::{DaemonShutdown, DriverHandle};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::wait_until;
@@ -185,8 +184,8 @@ struct Fixture {
     env: TestEnv,
     registry: SessionRegistry,
     scratch: PathBuf,
-    projector: NotificationProjector,
-    _attention: AttentionCoordinatorTask,
+    projector: DriverHandle,
+    _attention: DriverHandle,
 }
 
 impl Fixture {
@@ -274,9 +273,10 @@ impl Fixture {
         // `working` to `idle` change of an armed turn into `turn_completed`.
         let notifications = NotificationService::open(&env.root().join("daemon-data"))
             .expect("open the notification inbox");
+        let tasks = DaemonShutdown::default();
         let (coordinator, attention) =
-            AttentionCoordinator::spawn(notifications.clone(), &registry);
-        let projector = NotificationProjector::spawn(&registry, notifications, coordinator);
+            AttentionCoordinator::spawn(&tasks, notifications.clone(), &registry);
+        let projector = spawn_projector(&tasks, &registry, notifications, coordinator);
         registry.spawn_agent_state_hooks();
         Self {
             env,
@@ -369,7 +369,7 @@ impl Fixture {
     }
 
     async fn end(self) {
-        self.projector.shutdown().await;
+        self.projector.stop().await;
     }
 
     fn scratch_file(&self, name: &str) -> PathBuf {

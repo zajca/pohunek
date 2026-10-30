@@ -13,13 +13,13 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::events::ProducedEvent;
 use crate::session::{SessionRegistry, TurnEdge, TurnId};
+use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 
 use super::{
     is_debounced_create, parse_timestamp, policy_enables_kind, AttentionCoordinator,
@@ -32,13 +32,6 @@ const PROJECTOR_PROVIDER: &str = "pohunek";
 
 /// Source-id prefix for daemon-derived notification records.
 const PROJECTOR_SOURCE_ID_PREFIX: &str = "projector";
-
-/// Maximum time to wait for the projector task to flush buffered events.
-///
-/// Projector shutdown only drains local broadcast events and performs
-/// owner-private JSONL appends through [`NotificationService`]. Five seconds
-/// matches the daemon event-log shutdown budget and bounds a wedged filesystem.
-const PROJECTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Delay before the projector retries the epoch seed of sessions whose inputs
 /// wait for it.
@@ -54,59 +47,48 @@ pub(crate) const SEED_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// with a warning then, to bound memory.
 const MAX_DEFERRED_INPUTS_PER_SESSION: usize = 256;
 
-/// Derives durable notifications from session lifecycle events.
-#[derive(Debug)]
-pub struct NotificationProjector {
-    shutdown: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-impl NotificationProjector {
-    /// Spawn a projector task on the session event broadcast.
-    ///
-    /// Derived debounced session notifications are routed through `attention`
-    /// (the debounce coordinator) rather than persisted directly, and the resume
-    /// edge resolves session-scoped notification keys through it too.
-    #[must_use]
-    pub fn spawn(
-        sessions: &SessionRegistry,
-        notifications: NotificationService,
-        attention: AttentionCoordinator,
-    ) -> Self {
-        let shutdown = CancellationToken::new();
-        let handle = spawn_projector_task(
-            sessions.clone(),
-            notifications,
-            attention,
-            sessions.subscribe_produced(),
-            shutdown.clone(),
-        );
-        Self { shutdown, handle }
-    }
-
-    /// Stop the projector and drain buffered session events.
-    pub async fn shutdown(self) {
-        self.shutdown.cancel();
-        match tokio::time::timeout(PROJECTOR_SHUTDOWN_TIMEOUT, self.handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                warn!(error = %err, "notification projector task failed during shutdown");
-            }
-            Err(_) => {
-                warn!("notification projector did not finish within the shutdown timeout");
-            }
-        }
-    }
+/// Spawns the task that derives durable notifications from session lifecycle
+/// events.
+///
+/// Derived debounced session notifications are routed through `attention` (the
+/// debounce coordinator) rather than persisted directly, and the resume edge
+/// resolves session-scoped notification keys through it too. The task is a
+/// consumer of `tasks`: it stops after the producers of session events (idle
+/// stop, retention), so the events they emit while stopping are projected, and
+/// it drains the buffered session events first.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "the handle only stops the task before daemon shutdown does"
+)]
+pub fn spawn_projector(
+    tasks: &DaemonShutdown,
+    sessions: &SessionRegistry,
+    notifications: NotificationService,
+    attention: AttentionCoordinator,
+) -> DriverHandle {
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    spawn_projector_task(
+        tasks,
+        sessions.clone(),
+        notifications,
+        attention,
+        sessions.subscribe_produced(),
+        shutdown,
+        move || stop.cancel(),
+    )
 }
 
 fn spawn_projector_task(
+    tasks: &DaemonShutdown,
     sessions: SessionRegistry,
     notifications: NotificationService,
     attention: AttentionCoordinator,
     mut events: broadcast::Receiver<ProducedEvent>,
     shutdown: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    stop: impl FnOnce() + Send + 'static,
+) -> DriverHandle {
+    tasks.spawn("notification_projector", Stage::Consumer, stop, async move {
         let mut state = ProjectorState::default();
         let mut turn_edges = sessions.turn_events().take_edge_receiver();
         loop {
@@ -1339,11 +1321,9 @@ mod tests {
     /// Spawns a coordinator over a registry that holds no session.
     fn spawn_coordinator(
         service: &NotificationService,
-    ) -> (
-        AttentionCoordinator,
-        crate::notifications::AttentionCoordinatorTask,
-    ) {
+    ) -> (AttentionCoordinator, crate::shutdown::DriverHandle) {
         AttentionCoordinator::spawn(
+            &crate::shutdown::DaemonShutdown::default(),
             service.clone(),
             &crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default()),
         )

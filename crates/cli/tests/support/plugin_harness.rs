@@ -28,13 +28,12 @@ use package::{Limits, PackageDigest};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::governance::HostGovernanceService;
-use pohunek_daemon::notifications::{
-    AttentionCoordinator, AttentionCoordinatorTask, NotificationService,
-};
+use pohunek_daemon::notifications::{AttentionCoordinator, NotificationService};
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher, WorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_daemon::shutdown::{DaemonShutdown, DriverHandle};
 use pohunek_test_support::env::{check_socket_path, TestEnv};
 use pohunek_test_support::wait::guard;
 use pohunek_test_support::worker_binary;
@@ -390,7 +389,7 @@ impl Harness {
             })
             .await;
         if let Some(attention) = attention {
-            attention.shutdown().await;
+            attention.stop().await;
         }
         log_owner.shutdown_event_log().await;
     }
@@ -569,7 +568,7 @@ async fn bind_server(
     socket: &Path,
     registry: SessionRegistry,
     inbox: Inbox,
-) -> (ControlServer, Option<AttentionCoordinatorTask>) {
+) -> (ControlServer, Option<DriverHandle>) {
     let governance = Arc::new(
         HostGovernanceService::open(env.root().join("governance"))
             .await
@@ -581,7 +580,11 @@ async fn bind_server(
     });
     let (coordinator, attention) = match (&notifications, inbox) {
         (Some(notifications), Inbox::Debounced) => {
-            let (coordinator, task) = AttentionCoordinator::spawn(notifications.clone(), &registry);
+            let (coordinator, task) = AttentionCoordinator::spawn(
+                &DaemonShutdown::default(),
+                notifications.clone(),
+                &registry,
+            );
             (Some(coordinator), Some(task))
         }
         _ => (None, None),

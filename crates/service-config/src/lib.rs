@@ -29,6 +29,9 @@
 //! daemon_exit_timeout_ms = 30000
 //! daemon_restart_throttle_ms = 5000
 //! registry_shutdown_ms = 5000                      # optional; 1..=600000
+//! create_drain_ms = 10000                          # optional; 1..=600000
+//! driver_shutdown_ms = 5000                        # optional; 1..=600000
+//! event_log_flush_ms = 5000                        # optional; 1..=600000
 //!
 //! [environment]
 //! search_path = ["/opt/homebrew/bin", "/usr/bin"]  # absolute normalized directories; may be empty
@@ -513,10 +516,31 @@ pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
 /// cancelling them.
 ///
 /// The tasks are cancelled or aborted first, so the wait covers a blocking
-/// store write that cannot be interrupted. Five seconds leaves the rest of the
-/// daemon's shutdown inside [`Deadlines::daemon_exit_timeout`]. The key is
+/// store write that cannot be interrupted. The four shutdown phase bounds and
+/// [`SHUTDOWN_MARGIN`] are fitted to [`Deadlines::daemon_exit_timeout`] by
+/// [`Deadlines::fitted_shutdown`]. The key is
 /// optional and the writer omits it while it equals this value.
 pub const DEFAULT_REGISTRY_SHUTDOWN: Duration = Duration::from_secs(5);
+
+/// Default `deadlines.create_drain_ms`: how long daemon shutdown waits for
+/// session creates in flight to commit or compensate.
+pub const DEFAULT_CREATE_DRAIN: Duration = Duration::from_secs(10);
+
+/// Default `deadlines.driver_shutdown_ms`: how long daemon shutdown waits for
+/// the tasks that drive the registry from outside (idle-stop, retention,
+/// notifications, agent-state hooks) to stop. All of them share this one bound.
+pub const DEFAULT_DRIVER_SHUTDOWN: Duration = Duration::from_secs(5);
+
+/// Default `deadlines.event_log_flush_ms`: how long daemon shutdown waits for
+/// the event-log drains to flush what they buffered.
+pub const DEFAULT_EVENT_LOG_FLUSH: Duration = Duration::from_secs(5);
+
+/// Part of `deadlines.daemon_exit_timeout_ms` that no shutdown phase may use.
+///
+/// It covers process teardown after the last phase and scheduling delay on a
+/// loaded host, so a shutdown that spends every phase bound still ends before
+/// the service manager's kill.
+pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(2);
 
 /// Longest a stop waits behind an input write that holds the worker's control
 /// connection.
@@ -656,6 +680,107 @@ pub struct Deadlines {
     /// How long the daemon's session registry waits for its background tasks
     /// and in-flight store writes once it shuts down.
     pub registry_shutdown: Duration,
+    /// How long daemon shutdown waits for session creates in flight.
+    pub create_drain: Duration,
+    /// How long daemon shutdown waits for the tasks that drive the registry
+    /// from outside.
+    pub driver_shutdown: Duration,
+    /// How long daemon shutdown waits for the event-log drains to flush.
+    pub event_log_flush: Duration,
+}
+
+impl Deadlines {
+    /// Sum of the four shutdown phase bounds.
+    #[must_use]
+    pub fn shutdown_phases_total(&self) -> Duration {
+        self.create_drain
+            .saturating_add(self.driver_shutdown)
+            .saturating_add(self.registry_shutdown)
+            .saturating_add(self.event_log_flush)
+    }
+
+    /// The shutdown phase bounds sized to fit inside `daemon_exit_timeout`.
+    ///
+    /// Bounds whose sum plus [`SHUTDOWN_MARGIN`] fits are returned as
+    /// configured. Otherwise each is shortened in proportion so that the sum
+    /// fits, and the result carries the shortfall for the caller to report. A file
+    /// stays valid either way. Every bound keeps at least 1 ms, so an exit
+    /// timeout of a few milliseconds is not honoured.
+    #[must_use]
+    pub fn fitted_shutdown(&self) -> FittedShutdown {
+        let total = self.shutdown_phases_total();
+        let required = total.saturating_add(SHUTDOWN_MARGIN);
+        if required <= self.daemon_exit_timeout {
+            return FittedShutdown {
+                create_drain: self.create_drain,
+                driver_shutdown: self.driver_shutdown,
+                registry_shutdown: self.registry_shutdown,
+                event_log_flush: self.event_log_flush,
+                shortfall: None,
+            };
+        }
+        let available = self
+            .daemon_exit_timeout
+            .checked_sub(SHUTDOWN_MARGIN)
+            .unwrap_or(self.daemon_exit_timeout / 2);
+        let scale = |phase: Duration| {
+            let scaled = u128::from(millis(phase)) * u128::from(millis(available))
+                / u128::from(millis(total).max(1));
+            Duration::from_millis(u64::try_from(scaled).unwrap_or(u64::MAX).max(1))
+        };
+        FittedShutdown {
+            create_drain: scale(self.create_drain),
+            driver_shutdown: scale(self.driver_shutdown),
+            registry_shutdown: scale(self.registry_shutdown),
+            event_log_flush: scale(self.event_log_flush),
+            shortfall: Some(ShutdownShortfall {
+                required,
+                exit_timeout: self.daemon_exit_timeout,
+            }),
+        }
+    }
+}
+
+/// Shutdown phase bounds after fitting them to the exit timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FittedShutdown {
+    /// Bound of the create drain.
+    pub create_drain: Duration,
+    /// Bound of the driver phase.
+    pub driver_shutdown: Duration,
+    /// Bound of the registry phase.
+    pub registry_shutdown: Duration,
+    /// Bound of the event-log flush.
+    pub event_log_flush: Duration,
+    /// Set when the configured bounds did not fit and were shortened.
+    pub shortfall: Option<ShutdownShortfall>,
+}
+
+/// The configured shutdown bounds need more time than the exit timeout allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownShortfall {
+    /// Sum of the configured phase bounds plus [`SHUTDOWN_MARGIN`]; the least
+    /// `daemon_exit_timeout_ms` that runs them unshortened.
+    pub required: Duration,
+    /// The configured `deadlines.daemon_exit_timeout_ms`.
+    pub exit_timeout: Duration,
+}
+
+impl std::fmt::Display for ShutdownShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "deadlines.daemon_exit_timeout_ms = {} is below the {} ms the configured shutdown \
+             phases need (create_drain_ms, driver_shutdown_ms, registry_shutdown_ms and \
+             event_log_flush_ms plus a {} ms margin); the phase bounds are shortened in \
+             proportion to fit. Raise daemon_exit_timeout_ms to at least {} or lower the phase \
+             bounds",
+            millis(self.exit_timeout),
+            millis(self.required),
+            millis(SHUTDOWN_MARGIN),
+            millis(self.required),
+        )
+    }
 }
 
 /// Host input timings recorded in `[input]`, in whole milliseconds.
@@ -1016,6 +1141,9 @@ impl ServiceConfig {
             "deadlines.registry_shutdown_ms",
             deadlines.registry_shutdown,
         )?;
+        validate_duration("deadlines.create_drain_ms", deadlines.create_drain)?;
+        validate_duration("deadlines.driver_shutdown_ms", deadlines.driver_shutdown)?;
+        validate_duration("deadlines.event_log_flush_ms", deadlines.event_log_flush)?;
         validate_allowlist(&spec.environment_allowlist)?;
         validate_duration("sweep.grace_ms", spec.sweep_grace)?;
         validate_duration(
@@ -1221,6 +1349,9 @@ impl ServiceConfig {
                 daemon_exit_timeout_ms: millis(self.deadlines.daemon_exit_timeout),
                 daemon_restart_throttle_ms: millis(self.deadlines.daemon_restart_throttle),
                 registry_shutdown_ms: millis(self.deadlines.registry_shutdown),
+                create_drain_ms: millis(self.deadlines.create_drain),
+                driver_shutdown_ms: millis(self.deadlines.driver_shutdown),
+                event_log_flush_ms: millis(self.deadlines.event_log_flush),
             },
             environment: RawEnvironment {
                 search_path: self
@@ -1620,7 +1751,8 @@ struct RawNamespace {
 
 /// On-disk `[deadlines]` table in milliseconds.
 ///
-/// `registry_shutdown_ms` is optional: a file that lacks it means its default,
+/// `registry_shutdown_ms`, `create_drain_ms`, `driver_shutdown_ms` and
+/// `event_log_flush_ms` are optional: a file that lacks one means its default,
 /// and the writer omits it while it equals the default, so a file written
 /// without a deliberate setting stays readable by a release that predates the
 /// key.
@@ -1641,6 +1773,21 @@ struct RawDeadlines {
         skip_serializing_if = "is_default_registry_shutdown_ms"
     )]
     registry_shutdown_ms: u64,
+    #[serde(
+        default = "default_create_drain_ms",
+        skip_serializing_if = "is_default_create_drain_ms"
+    )]
+    create_drain_ms: u64,
+    #[serde(
+        default = "default_driver_shutdown_ms",
+        skip_serializing_if = "is_default_driver_shutdown_ms"
+    )]
+    driver_shutdown_ms: u64,
+    #[serde(
+        default = "default_event_log_flush_ms",
+        skip_serializing_if = "is_default_event_log_flush_ms"
+    )]
+    event_log_flush_ms: u64,
 }
 
 fn default_registry_shutdown_ms() -> u64 {
@@ -1653,6 +1800,42 @@ fn default_registry_shutdown_ms() -> u64 {
 )]
 fn is_default_registry_shutdown_ms(value: &u64) -> bool {
     *value == default_registry_shutdown_ms()
+}
+
+fn default_create_drain_ms() -> u64 {
+    millis(DEFAULT_CREATE_DRAIN)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_create_drain_ms(value: &u64) -> bool {
+    *value == default_create_drain_ms()
+}
+
+fn default_driver_shutdown_ms() -> u64 {
+    millis(DEFAULT_DRIVER_SHUTDOWN)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_driver_shutdown_ms(value: &u64) -> bool {
+    *value == default_driver_shutdown_ms()
+}
+
+fn default_event_log_flush_ms() -> u64 {
+    millis(DEFAULT_EVENT_LOG_FLUSH)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_event_log_flush_ms(value: &u64) -> bool {
+    *value == default_event_log_flush_ms()
 }
 
 /// On-disk `[environment]` table.
@@ -2199,6 +2382,9 @@ impl RawConfig {
                 daemon_exit_timeout_ms: 0,
                 daemon_restart_throttle_ms: 0,
                 registry_shutdown_ms: default_registry_shutdown_ms() + 1,
+                create_drain_ms: default_create_drain_ms() + 1,
+                driver_shutdown_ms: default_driver_shutdown_ms() + 1,
+                event_log_flush_ms: default_event_log_flush_ms() + 1,
             },
             environment: RawEnvironment {
                 search_path: Vec::new(),
@@ -2521,6 +2707,9 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
                 raw.deadlines.daemon_restart_throttle_ms,
             ),
             registry_shutdown: Duration::from_millis(raw.deadlines.registry_shutdown_ms),
+            create_drain: Duration::from_millis(raw.deadlines.create_drain_ms),
+            driver_shutdown: Duration::from_millis(raw.deadlines.driver_shutdown_ms),
+            event_log_flush: Duration::from_millis(raw.deadlines.event_log_flush_ms),
         },
         environment_allowlist: raw.environment.allowlist,
         search_path,

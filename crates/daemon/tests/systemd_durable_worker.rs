@@ -664,7 +664,10 @@ impl Fixture {
                 worker_exit_timeout: EXIT_TIMEOUT,
                 daemon_exit_timeout: EXIT_TIMEOUT,
                 daemon_restart_throttle: RESTART_THROTTLE,
-                registry_shutdown: EXIT_TIMEOUT,
+                registry_shutdown: pohunek_service_config::DEFAULT_REGISTRY_SHUTDOWN,
+                create_drain: pohunek_service_config::DEFAULT_CREATE_DRAIN,
+                driver_shutdown: pohunek_service_config::DEFAULT_DRIVER_SHUTDOWN,
+                event_log_flush: pohunek_service_config::DEFAULT_EVENT_LOG_FLUSH,
             },
             environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
                 .iter()

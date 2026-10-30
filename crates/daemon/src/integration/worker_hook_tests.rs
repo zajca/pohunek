@@ -55,8 +55,11 @@ impl DaemonStub {
         notifications.set_policy(policy).expect("enable all kinds");
         let sessions =
             crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default());
-        let (attention, _task) =
-            crate::notifications::AttentionCoordinator::spawn(notifications.clone(), &sessions);
+        let (attention, _task) = crate::notifications::AttentionCoordinator::spawn(
+            &crate::shutdown::DaemonShutdown::default(),
+            notifications.clone(),
+            &sessions,
+        );
         let state = Arc::new(
             DaemonState::new(
                 HealthInfo::new("test"),

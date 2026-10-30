@@ -33,7 +33,7 @@ use protocol::{
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::agent::host::PackageStore;
 use crate::api::ControlTransport;
@@ -46,13 +46,6 @@ use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 /// cost. Raising it raises the number of threads and children a hostile peer
 /// can hold.
 pub const MAX_HOST_COMMAND_RUNS: usize = 4;
-
-/// How long shutdown waits for runs whose cancel flag it set.
-///
-/// A cancelled run kills its group within one runner poll, so the wait only
-/// covers scheduling; it bounds a stuck thread without stalling the daemon's
-/// exit.
-const SHUTDOWN_DRAIN_BOUND: Duration = Duration::from_secs(5);
 
 /// What the service needs from the daemon.
 #[derive(Debug, Clone)]
@@ -228,17 +221,13 @@ impl PackageCommandService {
         }
     }
 
-    /// Stops accepting runs and waits, bounded, for the ones in flight.
+    /// Stops accepting runs and waits for the ones in flight.
     ///
-    /// The daemon's shutdown signal has already set every run's cancel flag.
+    /// The daemon's shutdown signal has already set every run's cancel flag;
+    /// the caller bounds the wait.
     pub async fn shutdown(&self) {
         self.inner.tracker.close();
-        if tokio::time::timeout(SHUTDOWN_DRAIN_BOUND, self.inner.tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!("package command runs did not end within the shutdown bound");
-        }
+        self.inner.tracker.wait().await;
     }
 
     /// Resolves the call to a verified program, in the order: installed,

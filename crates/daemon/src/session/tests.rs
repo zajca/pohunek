@@ -6862,6 +6862,66 @@ async fn agent_state_hook_dispatcher_flushes_buffered_event_on_shutdown() {
 }
 
 #[tokio::test]
+async fn daemon_shutdown_flushes_pending_agent_state_hooks_before_the_registry_phase() {
+    let config_dir = temp_dir("agent-state-tree-config");
+    let cwd = temp_dir("agent-state-tree-cwd");
+    let marker = config_dir.join("agent-state-tree.marker");
+    write_host_hook(
+        &config_dir,
+        "agent-state",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+            marker.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        config_dir: Some(config_dir),
+        shutdown_timeout: HANG_GUARD,
+        ..SessionRegistryConfig::default()
+    });
+    // The bounds only cap a hang; the flush ends when the hook has run.
+    let tasks = crate::shutdown::DaemonShutdown::new(crate::shutdown::ShutdownPlan {
+        driver_shutdown: HANG_GUARD,
+        registry_shutdown: HANG_GUARD,
+        ..crate::shutdown::ShutdownPlan::default()
+    });
+    registry.spawn_agent_state_hooks_in(&tasks);
+    let created = registry
+        .create(SessionNewParams {
+            cwd: Some(cwd),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+
+    // Runs after the consumers and before the registry phase.
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let probe = Arc::clone(&seen);
+    let probe_marker = marker.clone();
+    tasks.add_step(
+        "before_registry_probe",
+        crate::shutdown::Stage::Sink,
+        move || async move {
+            *probe.lock().expect("probe lock") =
+                fs::read_to_string(&probe_marker).unwrap_or_default();
+        },
+    );
+
+    let report = tasks.run(&registry).await;
+
+    assert!(report.is_quiescent(), "{report:?}");
+    let seen = seen.lock().expect("probe lock").clone();
+    assert!(
+        seen.contains("working"),
+        "the pending activity was flushed before the registry phase: {seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn agent_state_hook_coalesces_flaps_while_hook_is_in_flight() {
     let config_dir = temp_dir("agent-state-coalesce-config");
     let cwd = temp_dir("agent-state-coalesce-cwd");
@@ -22643,6 +22703,36 @@ async fn daemon_shutdown_drains_an_in_flight_create() {
     assert_eq!(daemon.bindings().len(), 1, "its worktree stays owned");
 }
 
+#[tokio::test]
+async fn registry_shutdown_drains_an_in_flight_create_without_drain_creates() {
+    let daemon = RestartableDaemon::new("wt-shutdown-drain");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/shutdown-drained");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, _worktree) = daemon.intent_and_worktree();
+
+    let mut shutdown = Box::pin(registry.shutdown());
+    assert!(
+        futures::poll!(shutdown.as_mut()).is_pending(),
+        "shutdown waits for the in-flight create"
+    );
+    gate.release.notify_one();
+
+    let report = shutdown.await;
+    assert!(report.is_quiescent(), "{report:?}");
+    creating
+        .await
+        .expect("create task joins")
+        .expect("the drained create commits");
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the create committed");
+}
+
 /// Connect deadline and drain timeout an already-exited worker must never
 /// wait for.
 const NEVER: Duration = Duration::from_secs(600);
@@ -22822,6 +22912,44 @@ async fn create_drain_gives_up_at_its_deadline() {
     );
     daemon.intent_and_worktree();
 
+    gate.release.notify_one();
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the create commits after the drain gave up");
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+#[tokio::test]
+async fn repeated_create_drains_share_one_deadline() {
+    let daemon = RestartableDaemon::new("wt-drain-shared-deadline");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        // timing-allowed: #1625 the drain bound is the policy under test, on a paused clock
+        create_drain_timeout: Duration::from_secs(10),
+        ..daemon.config.clone()
+    });
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/drain-twice");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    registry.begin_daemon_shutdown();
+    tokio::time::pause();
+
+    let started = tokio::time::Instant::now();
+    assert!(!registry.drain_creates().await);
+    let first = started.elapsed();
+    assert!(first >= Duration::from_secs(10), "{first:?}");
+    assert!(!registry.drain_creates().await);
+    assert_eq!(
+        started.elapsed(),
+        first,
+        "a second drain does not wait the bound again"
+    );
+
+    tokio::time::resume();
     gate.release.notify_one();
     let created = creating
         .await

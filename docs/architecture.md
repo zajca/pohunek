@@ -499,13 +499,33 @@ invoke native resume. A job whose worker is proven dead has its generation's
 leftover processes swept by ownership marker before the session is reported
 `lost`; unavailable or ambiguous supervisor evidence never kills anything.
 
-The daemon stops its own background work in one place. The session registry
-spawns every watcher, exit committer, forwarder and retry through a tracker it
-owns, and runs its blocking store writes through the same tracker. At shutdown
-the daemon first drains the creates still running, stops the tasks that drive the
-registry from outside, and then calls `SessionRegistry::shutdown`. That refuses
+The daemon stops its own background work through one tree (`crates/daemon/src/shutdown.rs`).
+The session registry spawns every watcher, exit committer, forwarder and retry
+through a tracker it owns, and runs its blocking store writes through the same
+tracker. The tasks around it (idle stop, session and notification retention,
+package command runs, the notification projector, the attention coordinator, the agent-state hook flush and
+the event-log drains) belong to `DaemonShutdown`, which stops them in four ordered
+phases, each inside its own bound from `[deadlines]` in `service.toml`:
+`create_drain_ms` (creates still running commit or compensate), `driver_shutdown_ms`
+(the producers, idle stop, retention and package command runs, stop together; then the consumers of
+the registry's events, the notification projector and the agent-state hook flush,
+so the events the producers emit while stopping are still consumed; then the
+attention coordinator, so the last defers and resolves they hand over are
+accepted; a stage that starts after the shared bound has passed is asked to stop
+and reported as not awaited), `registry_shutdown_ms` and
+`event_log_flush_ms` (the drains flush last, so a slow phase before them cannot
+lose buffered audit events). All four are optional (10 s, 5 s, 5 s and 5 s by
+default). Their sum plus a 2 s margin should fit inside `daemon_exit_timeout_ms`,
+the service manager's stop timeout. A file that does not fit still starts the
+daemon: it logs a warning, shortens the phase bounds in proportion so they do
+fit, says so in the shutdown report, and `pohunek doctor` reports
+`service_config_shutdown_budget` as `warn` with the configured exit timeout and
+the least one that runs the phases unshortened. A driver is stopped, not aborted,
+and a driver still running at its phase bound is named in the log and left to
+finish, so a store transaction it holds is not cut in half. The registry phase
+calls `SessionRegistry::shutdown`, which drains creates itself, refuses
 new background tasks, cancels the per-session tokens, aborts the work that has no
-cancellation of its own, and waits, bounded by `shutdown_timeout` (`deadlines.registry_shutdown_ms` in `service.toml`, optional, 5 s by default), until nothing
+cancellation of its own, and waits, bounded by `shutdown_timeout` (`deadlines.registry_shutdown_ms`), until nothing
 tracked is left; tasks still running at the deadline are named in the log. After
 that the registry writes nothing: a store write through it is refused with
 `registry_shut_down` and logged at ERROR with its location. The worker seals its

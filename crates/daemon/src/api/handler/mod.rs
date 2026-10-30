@@ -1267,7 +1267,11 @@ mod tests {
             NotificationService::open(notification_dir.path()).expect("notification service opens");
         enable_all_notification_kinds(&notifications);
         let sessions = SessionRegistry::new(SessionRegistryConfig::default());
-        let (attention, _task) = AttentionCoordinator::spawn(notifications.clone(), &sessions);
+        let (attention, _task) = AttentionCoordinator::spawn(
+            &crate::shutdown::DaemonShutdown::default(),
+            notifications.clone(),
+            &sessions,
+        );
         let state = daemon_state(HealthInfo::new("test"), sessions)
             .with_notifications(notifications)
             .with_attention_coordinator(attention);
