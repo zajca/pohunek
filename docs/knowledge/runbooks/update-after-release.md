@@ -1028,12 +1028,14 @@ verifies the file (schema, user, roots, namespace) but does not compare it with
 the refresh, so an edited file of the current schema does not keep it pending.
 A `--dry-run` over a pending refresh is refused with `service_refresh_pending`;
 rerun the command without `--dry-run`. If the daemon job vanished while the
-refresh was pending, the first run returns `service_rollback_failed` and a rerun
-`service_daemon_job_missing`. The daemon job is missing. The message states what
-the run did, read from the files after it ended: `service.toml` was not changed
-by the run, or the run put it back on the previous search path; and the
-transaction record does not exist, was cleared, or stays `rolling_back`. The
-documented way out is `pohunek service uninstall`, which removes the
+refresh was pending, a run before `registering` rolls the refresh back and
+returns `service_daemon_job_missing`; from `registering` on it returns
+`service_rollback_failed` with the missing job among its causes, and a rerun
+`service_daemon_job_missing`. The message states what the run did, read from the
+files after it ended: `service.toml` was not changed by the run, the run put it
+back on the previous search path, or it records the new search path; and the
+transaction record does not exist, was cleared, stays `rolling_back` or is kept.
+A message that cannot read either file states no effect. The documented way out is `pohunek service uninstall`, which removes the
 installation, its daemon job and `service.toml` and keeps durable metadata; see
 [#1763](https://github.com/zajca/pohunek/issues/1763).
 
