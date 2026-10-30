@@ -568,6 +568,8 @@ bound every new queue:
 | daemon worker-connect deadline | 10 seconds (`service.toml` `worker_connect_ms`) | matches an interactive create operation without hiding a broken job; also bounds each reconciliation probe (connect, controller acquisition, and inspection together) and each reconnect attempt of a running session, so a silent socket cannot stall startup, a held lifecycle lock, or loss classification |
 | raw output history | 10,000,000 bytes | preserves the current per-session history budget |
 | one subscriber queue | 1,000,000 bytes | absorbs repaint bursts without allowing one client to consume the history budget |
+| attach writer queue | 8 events (hard maximum 1,024) | decouples the stream writer from the subscriber so a client that reads no output never blocks input forwarding; overflow is the subscriber's own gap and repaint |
+| attach acknowledgement backlog | 1,024 frames (hard maximum 65,536) | bounds queued input acknowledgements; input reading pauses at the bound until the client reads output |
 | worker data payload | 64 KiB | bounds allocation while efficiently carrying PTY and prompt fragments |
 | worker JSON header/control line | 64 KiB | private control metadata never requires prompt-sized allocation |
 | one-use data token lifetime | 10 seconds | preserves the current attach-token window |
@@ -578,7 +580,7 @@ bound every new queue:
 | active identity claim expiry | 30 seconds | preserves current unverified-claim policy |
 
 Byte, duration, and count values are validated for nonzero safe ranges. Output
-history, subscriber queues, and dedup entries also have documented hard upper
+history, subscriber queues, attach queues, and dedup entries also have documented hard upper
 bounds to prevent a local configuration mistake from exhausting the host.
 Configuration values that affect an initialized runtime are frozen in that
 worker; editing host configuration affects only later runtime generations.
@@ -992,6 +994,13 @@ discards that subscriber's pending output, emits a new `Gap` and current
 `TerminalSnapshot`, and resumes at the new watermark. It never silently skips
 bytes. A repeatedly slow public client is disconnected with a typed reason
 rather than consuming unbounded worker memory.
+
+Each attach stream writes to its client from a writer task fed by a short
+bounded queue that sits in front of the subscriber queue, so a client that
+reads no output never delays input forwarding; events in that queue count as
+delivered when a gap range is computed. Input acknowledgements queue behind
+output, and the worker stops reading attach input at `attach_ack_backlog`
+unacknowledged frames until the client reads again.
 
 ### 12.2 Daemon detector recovery
 

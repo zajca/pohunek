@@ -24,10 +24,10 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
-    is_denylisted, read_frame, write_frame, AttachStart, BaseEnv, ControlCode, DaemonId, DataFrame,
-    Dimensions, FrameHeader, FrameKind, Initialize, InitializeLimits, InputFragment, InputPolicy,
-    LaunchIdentity, RuntimePhase, SecretBytes, SecretEnv, SessionId, StopPolicy, StreamId,
-    TransactionId, Version, WriteId, CURRENT_VERSION, MAX_CONTROL_LINE_BYTES,
+    is_denylisted, read_frame, write_frame, AttachStart, BaseEnv, CloseReason, ControlCode,
+    DaemonId, DataFrame, Dimensions, FrameHeader, FrameKind, Initialize, InitializeLimits,
+    InputFragment, InputPolicy, LaunchIdentity, RuntimePhase, SecretBytes, SecretEnv, SessionId,
+    StopPolicy, StreamId, TransactionId, Version, WriteId, CURRENT_VERSION, MAX_CONTROL_LINE_BYTES,
     MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
 };
 
@@ -917,15 +917,17 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
 /// Line the attach client types while it reads none of the output.
 const UNREAD_KEYSTROKE: &str = "keystroke-while-output-unread";
 
+/// Line typed after the client resumed reading; its echo is live output.
+const RESYNCED_KEYSTROKE: &str = "keystroke-after-resync";
+
 /// Bytes the child prints before the client types: far more than the
 /// subscriber queue and the socket buffers between the child and the client
 /// hold, so the output path is blocked when the client types.
 const UNREAD_FLOOD_BYTES: usize = 16 * 1024 * 1024;
 
-#[tokio::test]
-async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_resyncs_after() {
-    let mut fixture = Fixture::start();
-    let worker = fixture.connect(CURRENT_VERSION).await;
+/// Starts a child that floods its output, then signals through the returned
+/// `flooded` file and copies its input into the returned `typed` file.
+async fn initialize_flooding_child(fixture: &Fixture, worker: &Worker) -> (PathBuf, PathBuf) {
     let sink = fixture.root.join("typed");
     let flooded = fixture.root.join("flooded");
     let mut initialize = fixture.initialize(worker.worker_id().await);
@@ -943,10 +945,36 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
         .initialize(initialize)
         .await
         .expect("initialize the flooding child");
+    (sink, flooded)
+}
 
-    let stream_id = StreamId::new(ATTACH_STREAM_ID).expect("stream id");
+fn attach_input_frame(attach: &DataStream, sequence: u32, text: &str) -> DataFrame {
+    DataFrame::new(
+        FrameHeader {
+            version: attach.version,
+            stream_id: StreamId::new(ATTACH_STREAM_ID).expect("stream id"),
+            worker_instance_id: attach.worker_instance_id.clone(),
+            kind: FrameKind::Input {
+                write_id: WriteId::new(format!("attach-{ATTACH_STREAM_ID}-{sequence}"))
+                    .expect("write id"),
+            },
+        },
+        format!("{text}\n").into_bytes(),
+    )
+    .expect("attach input frame")
+}
+
+#[tokio::test]
+async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_resyncs_after() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    let (sink, flooded) = initialize_flooding_child(&fixture, &worker).await;
+
     let mut attach = worker
-        .open_attach(stream_id.clone(), AttachStart { dimensions: None })
+        .open_attach(
+            StreamId::new(ATTACH_STREAM_ID).expect("stream id"),
+            AttachStart { dimensions: None },
+        )
         .await
         .expect("open attach stream");
 
@@ -956,19 +984,8 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
         flooded.exists().then_some(())
     })
     .await;
-    let input = DataFrame::new(
-        FrameHeader {
-            version: attach.version,
-            stream_id: stream_id.clone(),
-            worker_instance_id: attach.worker_instance_id.clone(),
-            kind: FrameKind::Input {
-                write_id: WriteId::new(format!("attach-{ATTACH_STREAM_ID}-1")).expect("write id"),
-            },
-        },
-        format!("{UNREAD_KEYSTROKE}\n").into_bytes(),
-    )
-    .expect("attach input frame");
-    write_frame(&mut attach.stream, &input)
+    let keystroke = attach_input_frame(&attach, 1, UNREAD_KEYSTROKE);
+    write_frame(&mut attach.stream, &keystroke)
         .await
         .expect("send attach input");
     wait_until("the child to receive the typed line", || async {
@@ -978,10 +995,13 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
     })
     .await;
 
-    // Reading resumes: the lost output is reported as a gap that a complete
-    // repaint follows, never as silently missing bytes.
+    // Reading resumes: the lost output is reported as a gap that a repaint
+    // follows, and live output continues after it. The repaint is over once a
+    // live `Output` frame carrying the echo of a fresh keystroke arrives.
     tokio::time::timeout(DEADLINE, async {
         let mut gap = false;
+        let mut repainted = false;
+        let mut live = Vec::new();
         loop {
             let frame = read_frame(&mut attach.stream)
                 .await
@@ -989,10 +1009,25 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
                 .expect("attach stream stays open");
             match frame.header().kind {
                 FrameKind::Gap { .. } => gap = true,
-                FrameKind::TerminalSnapshot { .. } if gap => return,
+                FrameKind::TerminalSnapshot { .. } if gap && !repainted => {
+                    repainted = true;
+                    let keystroke = attach_input_frame(&attach, 2, RESYNCED_KEYSTROKE);
+                    write_frame(&mut attach.stream, &keystroke)
+                        .await
+                        .expect("send the keystroke typed after the resync");
+                }
+                FrameKind::Output { .. } if repainted => {
+                    live.extend_from_slice(frame.payload());
+                    if live
+                        .windows(RESYNCED_KEYSTROKE.len())
+                        .any(|window| window == RESYNCED_KEYSTROKE.as_bytes())
+                    {
+                        return;
+                    }
+                }
                 FrameKind::Error { .. } | FrameKind::Close { .. } | FrameKind::Exit { .. } => {
                     panic!(
-                        "attach stream ended before the repaint: {:?}",
+                        "attach stream ended before live output resumed: {:?}",
                         frame.header().kind
                     )
                 }
@@ -1001,13 +1036,53 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
         }
     })
     .await
-    .expect("a gap and its repaint reach the client that resumed reading");
+    .expect("a gap, its repaint and live output reach the client that resumed reading");
 
     drop(attach);
     worker
         .stop(TransactionId::new("unread-output-cleanup").expect("transaction id"))
         .await
         .expect("stop the flooding child");
+}
+
+#[tokio::test]
+async fn a_lease_release_closes_an_attach_stream_whose_client_reads_no_output() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    let (_sink, flooded) = initialize_flooding_child(&fixture, &worker).await;
+
+    let mut attach = worker
+        .open_attach(
+            StreamId::new(ATTACH_STREAM_ID).expect("stream id"),
+            AttachStart { dimensions: None },
+        )
+        .await
+        .expect("open attach stream");
+    wait_until("the child to finish its output", || async {
+        flooded.exists().then_some(())
+    })
+    .await;
+    worker
+        .release_controller()
+        .await
+        .expect("release the controller lease");
+
+    // The close frame is queued behind the output the client did not read, so
+    // it arrives once reading resumes.
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let frame = read_frame(&mut attach.stream)
+                .await
+                .expect("read attach frame")
+                .expect("stream stays open until its close frame");
+            if let FrameKind::Close { reason } = frame.header().kind.clone() {
+                assert_eq!(reason, CloseReason::LeaseReleased);
+                return;
+            }
+        }
+    })
+    .await
+    .expect("a close frame follows the queued output");
 }
 
 #[tokio::test]

@@ -10084,6 +10084,10 @@ mod tests {
 
     /// Input reading pauses at `attach_ack_backlog` unacknowledged frames
     /// while a client reads no output, and resumes losslessly once it reads.
+    ///
+    /// This drives `serve_stream_data` directly: the pause is a negative
+    /// observation, and a backlog of one with a one-byte transport is the only
+    /// setup that shows it without a wall-clock wait at the worker socket.
     #[expect(
         clippy::too_many_lines,
         reason = "one attach stream scenario: spawn, flood, hold back acks, drain, verify"
@@ -10192,77 +10196,6 @@ mod tests {
         drop(client_in);
         drop(client_out);
         let _ = stream.await.expect("stream task");
-        pty.stop(
-            "test-cleanup",
-            server_stop_grace(),
-            crate::WorkerConfig::new().kill_reap_deadline,
-        )
-        .await
-        .expect("stop fixture PTY");
-    }
-
-    /// A lease release ends a stream whose client reads no output: the close
-    /// frame follows the queued output instead of being lost.
-    #[tokio::test]
-    async fn lease_release_closes_an_attach_stream_whose_client_reads_no_output() {
-        let owner = crate::LeaseOwner {
-            daemon_id: "daemon-lease-blocked".to_owned(),
-            peer_pid: std::process::id(),
-            peer_start_identity: "7700".to_owned(),
-        };
-        let (server, pty, directory) = launch_claim_fixture_running(UNREAD_OUTPUT_SCRIPT).await;
-        let subscriber = pty.subscribe_output(Some(0)).expect("output subscriber");
-        let stream_id = StreamId::new("a-lease").expect("stream id");
-        let worker_instance_id = WorkerInstanceId::new("runtime-claim").expect("runtime id");
-        let (worker_in, client_in) = tokio::io::duplex(CLIENT_BUFFER);
-        let (mut worker_out, mut client_out) = tokio::io::duplex(CLIENT_BUFFER);
-        let (lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let served_pty = pty.clone();
-        let served_owner = owner.clone();
-        let stream = tokio::spawn(async move {
-            serve_stream_data(
-                &server.shared,
-                &served_pty,
-                worker_in,
-                &mut worker_out,
-                CURRENT_VERSION,
-                &stream_id,
-                &worker_instance_id,
-                StreamMode::Attach,
-                subscriber,
-                0,
-                &mut lease_rx,
-                &owner_peer(&served_owner),
-                &served_owner,
-            )
-            .await
-        });
-
-        let flooded = directory.path().join("flooded");
-        pohunek_test_support::wait::wait_until("the child to finish its output", || async {
-            flooded.exists().then_some(())
-        })
-        .await;
-        lease_tx.send(1).expect("release the lease");
-
-        pohunek_test_support::wait::guard("a close frame after the queued output", async {
-            loop {
-                let frame = protocol::read_frame(&mut client_out)
-                    .await
-                    .expect("read frame")
-                    .expect("stream stays open until its close frame");
-                if let FrameKind::Close { reason } = frame.header().kind.clone() {
-                    assert_eq!(reason, protocol::CloseReason::LeaseReleased);
-                    return;
-                }
-            }
-        })
-        .await;
-        stream
-            .await
-            .expect("stream task")
-            .expect("a lease release ends the stream cleanly");
-        drop(client_in);
         pty.stop(
             "test-cleanup",
             server_stop_grace(),
