@@ -62,12 +62,27 @@ pub struct CommandRunResult {
     pub duration_ms: u64,
 }
 
-/// Why a `command.run` request failed.
-///
-/// Each kind is one stable wire error code with fixed text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CommandErrorKind {
+/// Declares [`CommandErrorKind`] and [`CommandErrorKind::ALL`] from one list,
+/// so a kind cannot be declared without being listed.
+macro_rules! command_error_kinds {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// Why a `command.run` request failed.
+        ///
+        /// Each kind is one stable wire error code with fixed text.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub enum CommandErrorKind {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl CommandErrorKind {
+            /// Every kind this build knows, in declaration order.
+            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+        }
+    };
+}
+
+command_error_kinds! {
     /// The daemon does not implement `command.run`. Produced by a client from
     /// the daemon's `method_not_found`, never by a daemon.
     Unsupported,
@@ -98,47 +113,6 @@ pub enum CommandErrorKind {
 }
 
 impl CommandErrorKind {
-    /// Every kind this build knows, in declaration order.
-    ///
-    /// [`Self::ordinal`] matches every variant without a wildcard, so adding a
-    /// variant fails to compile until it has an ordinal. Give it the next one,
-    /// list it here at that position and grow the array: a compile-time
-    /// assertion keeps the listed kinds in ordinal order, but that the new kind
-    /// is listed at all is checked by review and by the exit-status scenario
-    /// of the CLI, which iterates this array.
-    pub const ALL: [Self; 12] = [
-        Self::Unsupported,
-        Self::PackageNotInstalled,
-        Self::NotSelected,
-        Self::NotDeclared,
-        Self::NotExposed,
-        Self::PackageDisabled,
-        Self::Busy,
-        Self::Failed,
-        Self::TimedOut,
-        Self::OutputTooLarge,
-        Self::OutputNotUtf8,
-        Self::Unavailable,
-    ];
-
-    /// Position of the kind in [`Self::ALL`].
-    const fn ordinal(self) -> usize {
-        match self {
-            Self::Unsupported => 0,
-            Self::PackageNotInstalled => 1,
-            Self::NotSelected => 2,
-            Self::NotDeclared => 3,
-            Self::NotExposed => 4,
-            Self::PackageDisabled => 5,
-            Self::Busy => 6,
-            Self::Failed => 7,
-            Self::TimedOut => 8,
-            Self::OutputTooLarge => 9,
-            Self::OutputNotUtf8 => 10,
-            Self::Unavailable => 11,
-        }
-    }
-
     /// The stable wire error code.
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -205,17 +179,6 @@ impl CommandErrorKind {
         }
     }
 }
-
-const _: () = {
-    let mut index = 0;
-    while index < CommandErrorKind::ALL.len() {
-        assert!(
-            CommandErrorKind::ALL[index].ordinal() == index,
-            "CommandErrorKind::ALL is out of declaration order"
-        );
-        index += 1;
-    }
-};
 
 impl From<CommandErrorKind> for ProtocolError {
     fn from(kind: CommandErrorKind) -> Self {
