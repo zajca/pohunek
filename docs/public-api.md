@@ -2834,15 +2834,17 @@ match the refresh), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
 (`pohunek service refresh-path` without `--dry-run` resolves it), and what a
 dry run returns over any pending refresh, because a dry run never resolves one.
-A daemon job that vanished after the record exists makes the first run return
+A daemon job that vanished after the record exists makes the run roll back:
+before `registering` the file is restored and the record cleared and the run
+returns `service_daemon_job_missing`; from `registering` on the first run returns
 `service_rollback_failed`, whose original and rollback causes are both
-`service_daemon_job_missing` (the file is already restored and the record stays
-`rolling_back`); every rerun returns `service_daemon_job_missing`. The hint
-says the job is missing, what the command left behind (nothing, or after
-`service_rollback_failed` the restored `service.toml` and the `rolling_back`
-record), and that `pohunek service uninstall` (it removes the installation, its
-daemon job and `service.toml`, and keeps durable metadata) is the documented
-way out (#1763). The store and preflight refusals
+`service_daemon_job_missing` (the record stays `rolling_back`), and every rerun
+returns `service_daemon_job_missing`. Each such message states the effects the
+run had, read from the files after it ended: `service.toml` unchanged or put
+back on the previous search path, and the record absent, cleared or
+`rolling_back`. The hint names `pohunek service uninstall` (it removes the
+installation, its daemon job and `service.toml`, and keeps durable metadata) as
+the documented way out (#1763). The store and preflight refusals
 carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
 `service_upgrade_preflight_failed`) with texts that name the installed release. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the

@@ -2194,7 +2194,7 @@ impl<'a> Engine<'a> {
                     .replace(definition)
                     .await
                     .map_err(|source| match source {
-                        supervisor::Error::NotFound(_) => Error::DaemonJobMissing,
+                        supervisor::Error::NotFound(_) => Error::DaemonJobMissing { effects: None },
                         source => supervisor_error("replace daemon", source),
                     })
             }

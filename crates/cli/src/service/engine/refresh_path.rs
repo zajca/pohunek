@@ -28,6 +28,7 @@ use super::{
     JobDefinition, JobPath, LateGate, Operation, PathBuf, PathUse, Plan, Record, ServiceConfig,
     ServiceState, Step,
 };
+use crate::service::error::{FileEffect, JobMissingEffects, RecordEffect};
 use crate::service::record::{JournaledProcess, RefreshJournal};
 use crate::service::refresh::{self, Discovered};
 use crate::service::report::{RefreshPathReport, SearchPathReport};
@@ -46,6 +47,15 @@ enum FileState {
     Restored,
     /// Anything else: the file was edited while the refresh was pending.
     Edited,
+}
+
+/// What a `refresh-path` run found when it started, to tell afterwards what
+/// it changed.
+struct RunStart {
+    digest: String,
+    previous: Vec<PathBuf>,
+    target: Option<Vec<PathBuf>>,
+    had_record: bool,
 }
 
 impl Engine<'_> {
@@ -96,7 +106,23 @@ impl Engine<'_> {
             return Err(Error::RefreshBlockedByTransaction);
         }
         let (config, bytes) = refresh::load_installed_config(self.context)?;
-        match pending {
+        let start = RunStart {
+            digest: config_digest(&bytes),
+            previous: pending.as_ref().map_or_else(
+                || config.search_path().entries().to_vec(),
+                |record| {
+                    record
+                        .refresh
+                        .as_ref()
+                        .map_or_else(Vec::new, |j| j.previous.clone())
+                },
+            ),
+            target: pending
+                .as_ref()
+                .and_then(|record| record.refresh.as_ref().map(|j| j.target.clone())),
+            had_record: pending.is_some(),
+        };
+        let result = match pending {
             Some(record) => {
                 self.refresh_pending(record, &config, &bytes, discovered, dry_run)
                     .await
@@ -105,7 +131,38 @@ impl Engine<'_> {
                 self.refresh_fresh(&config, &bytes, discovered, dry_run)
                     .await
             }
+        };
+        match result {
+            Err(error) if error.is_job_missing() => Err(match self.job_missing_effects(&start) {
+                Some(effects) => error.with_job_missing_effects(effects),
+                None => error,
+            }),
+            other => other,
         }
+    }
+
+    /// What the run that just ended left in `service.toml` and in the record,
+    /// read from the files; `None` when either cannot be read, so the refusal
+    /// then claims nothing.
+    fn job_missing_effects(&self, start: &RunStart) -> Option<JobMissingEffects> {
+        let record = match self.store.load().ok()? {
+            None if start.had_record => RecordEffect::Cleared,
+            None => RecordEffect::Absent,
+            Some(record) if record.rolling_back => RecordEffect::KeptRollingBack,
+            Some(_) => RecordEffect::Kept,
+        };
+        let (config, bytes) = refresh::load_installed_config(self.context).ok()?;
+        let entries = config.search_path().entries();
+        let file = if config_digest(&bytes) == start.digest {
+            FileEffect::Untouched
+        } else if entries == start.previous.as_slice() {
+            FileEffect::RestoredToPrevious
+        } else if start.target.as_deref() == Some(entries) {
+            FileEffect::NewPath
+        } else {
+            return None;
+        };
+        Some(JobMissingEffects { file, record })
     }
 
     /// Starts a refresh, or reports that nothing needs one.
@@ -137,7 +194,9 @@ impl Engine<'_> {
         let definition = daemon_definition(self.context, &target)?;
         let observation = match self.backend.daemon().inspect().await {
             Ok(observation) => observation,
-            Err(supervisor::Error::NotFound(_)) => return Err(Error::DaemonJobMissing),
+            Err(supervisor::Error::NotFound(_)) => {
+                return Err(Error::DaemonJobMissing { effects: None })
+            }
             Err(source) => return Err(supervisor_error("inspect daemon", source)),
         };
         report.daemon_started = observation.state != ServiceState::Running;
@@ -410,7 +469,9 @@ impl Engine<'_> {
     async fn journal_daemon_before(&self, record: &mut Record) -> Result<(), Error> {
         let observation = match self.backend.daemon().inspect().await {
             Ok(observation) => observation,
-            Err(supervisor::Error::NotFound(_)) => return Err(Error::DaemonJobMissing),
+            Err(supervisor::Error::NotFound(_)) => {
+                return Err(Error::DaemonJobMissing { effects: None })
+            }
             Err(source) => return Err(supervisor_error("inspect daemon", source)),
         };
         let journal = record.refresh.as_mut().ok_or_else(|| Error::Record {
@@ -535,7 +596,7 @@ impl Engine<'_> {
                 .replace(&definition)
                 .await
                 .map_err(|source| match source {
-                    supervisor::Error::NotFound(_) => Error::DaemonJobMissing,
+                    supervisor::Error::NotFound(_) => Error::DaemonJobMissing { effects: None },
                     source => supervisor_error("restore daemon", source),
                 })?;
             self.wait_restarted(&record.version, replaced).await?;

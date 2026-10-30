@@ -961,7 +961,7 @@ async fn without_a_daemon_job_nothing_changes_and_a_stopped_job_is_started() {
     for dry_run in [false, true] {
         let error = refresh(harness, dry_run).await.expect_err("no job");
         assert_eq!(error.code(), "service_daemon_job_missing");
-        assert_daemon_job_missing_steps(&error, CHANGED_NOTHING);
+        assert_daemon_job_missing(&error, FILE_UNTOUCHED, RECORD_ABSENT);
     }
     assert_eq!(config_bytes(harness), before);
     assert_eq!(harness.pending(), None);
@@ -1452,14 +1452,22 @@ async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_resto
     harness.assert_installed(V2);
 }
 
-/// Asserts the minimal way out a missing daemon job names: the job is
-/// missing, what the command left behind, `uninstall` by its outcome, #1763.
-fn assert_daemon_job_missing_steps(error: &Error, left_behind: &str) {
+const FILE_UNTOUCHED: &str = "service.toml was not changed by this run";
+const FILE_RESTORED: &str = "this run put service.toml back on the previous search path";
+const RECORD_ABSENT: &str = "no transaction record exists";
+const RECORD_CLEARED: &str = "the transaction record was cleared";
+const RECORD_ROLLING_BACK: &str = "the transaction record stays rolling_back";
+
+/// Asserts the message states the effects the run had, in order, and the hint
+/// names `uninstall` by its outcome and #1763.
+fn assert_daemon_job_missing(error: &Error, file: &str, record: &str) {
+    assert_steps_in_order(
+        &error.to_string(),
+        &["no daemon job is registered", file, record],
+    );
     assert_steps_in_order(
         error.hint().expect("hint"),
         &[
-            "the daemon job is missing",
-            left_behind,
             "`pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata)",
             "documented way out",
             "issues/1763",
@@ -1467,9 +1475,55 @@ fn assert_daemon_job_missing_steps(error: &Error, left_behind: &str) {
     );
 }
 
-const CHANGED_NOTHING: &str = "this command changed nothing";
-const ROLLED_BACK: &str =
-    "service.toml is back on the previous search path and the record stays rolling_back";
+/// A job that vanishes while a refresh record is at `step`: a rerun before
+/// `registering` rolls the refresh back (the file is restored, the record
+/// cleared); at `registering` the replacement and its rollback both find no
+/// job (the file is restored, the record stays `rolling_back`).
+#[tokio::test]
+async fn a_vanished_daemon_job_states_the_effects_of_each_record_step() {
+    for step in [
+        Step::Started,
+        Step::Config,
+        Step::Definition,
+        Step::Registering,
+    ] {
+        let r = refreshable().await;
+        let harness = &r.harness;
+        interrupt_after(harness, step).await;
+        harness.fake.world().registered = None;
+        harness.fake.world().running = false;
+
+        let error = refresh(harness, false).await.expect_err("the job is gone");
+
+        if step < Step::Registering {
+            assert_eq!(
+                error.code(),
+                "service_daemon_job_missing",
+                "{step:?}: {error:?}"
+            );
+            let file = if step == Step::Started {
+                FILE_UNTOUCHED
+            } else {
+                FILE_RESTORED
+            };
+            assert_daemon_job_missing(&error, file, RECORD_CLEARED);
+            assert_eq!(harness.pending(), None, "{step:?}");
+        } else {
+            assert_eq!(
+                error.code(),
+                "service_rollback_failed",
+                "{step:?}: {error:?}"
+            );
+            assert_daemon_job_missing(&error, FILE_RESTORED, RECORD_ROLLING_BACK);
+            assert!(harness.pending().expect("kept").rolling_back);
+        }
+        assert_eq!(
+            recorded(harness),
+            [canonical(&r.old)],
+            "{step:?}: the file records the previous path"
+        );
+    }
+}
 
 #[tokio::test]
 async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_and_uninstall_takes_it(
@@ -1487,12 +1541,12 @@ async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_an
         matches!(
             &error,
             Error::RollbackFailed { original, rollback }
-                if matches!(**original, Error::DaemonJobMissing)
-                    && matches!(**rollback, Error::DaemonJobMissing)
+                if matches!(**original, Error::DaemonJobMissing { .. })
+                    && matches!(**rollback, Error::DaemonJobMissing { .. })
         ),
         "the replacement and the rollback both report the missing job: {error:?}"
     );
-    assert_daemon_job_missing_steps(&error, ROLLED_BACK);
+    assert_daemon_job_missing(&error, FILE_RESTORED, RECORD_ROLLING_BACK);
     assert!(harness.pending().expect("the record is kept").rolling_back);
     assert_eq!(
         recorded(harness),
@@ -1502,7 +1556,7 @@ async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_an
 
     let again = refresh(harness, false).await.expect_err("every rerun");
     assert_eq!(again.code(), "service_daemon_job_missing", "{again:?}");
-    assert_daemon_job_missing_steps(&again, CHANGED_NOTHING);
+    assert_daemon_job_missing(&again, FILE_UNTOUCHED, RECORD_ROLLING_BACK);
 
     harness
         .engine()

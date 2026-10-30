@@ -720,14 +720,16 @@ pub enum Error {
 
     /// `service refresh-path` found no daemon job to replace.
     ///
-    /// The refresh records the path and replaces the job together or changes
-    /// nothing, so without a job it changes nothing.
+    /// `effects` is what the run left behind, computed from the state it ended
+    /// in; `None` claims nothing (a site that did not compute it).
     ///
     /// Only `refresh-path` returns it, and a refresh never changes the active
-    /// version, so "the version installed now" in its hint names one version
-    /// whether or not a refresh record is pending.
-    #[error("no daemon job is registered, so the new search path has nothing to take effect in; the recorded search path is unchanged")]
-    DaemonJobMissing,
+    /// version.
+    #[error("no daemon job is registered, so the new search path has nothing to take effect in{}", job_missing_effects_text(.effects.as_ref()))]
+    DaemonJobMissing {
+        /// What the run did to `service.toml` and to the transaction record.
+        effects: Option<JobMissingEffects>,
+    },
 
     /// `service.toml` changed while a search-path refresh was pending.
     #[error("service.toml is neither the file the pending search-path refresh started from nor the one it wrote, so it was edited meanwhile; nothing was changed")]
@@ -814,15 +816,95 @@ impl From<crate::workflow::Error> for Error {
     }
 }
 
+/// What a `refresh-path` run did to `service.toml`, observed after it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEffect {
+    /// The file is byte-for-byte what the run found.
+    Untouched,
+    /// The run put the previous search path back.
+    RestoredToPrevious,
+    /// The file records the refresh's new search path.
+    NewPath,
+}
+
+/// What is left of the refresh's transaction record, observed after the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordEffect {
+    /// No record existed before the run and none exists now.
+    Absent,
+    /// The run removed the record it found or wrote.
+    Cleared,
+    /// The record stays and the next run continues the rollback.
+    KeptRollingBack,
+    /// The record stays.
+    Kept,
+}
+
+/// The effects a missing-job refusal reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobMissingEffects {
+    /// What happened to `service.toml`.
+    pub file: FileEffect,
+    /// What is left of the transaction record.
+    pub record: RecordEffect,
+}
+
+impl JobMissingEffects {
+    fn sentence(self) -> String {
+        let file = match self.file {
+            FileEffect::Untouched => "service.toml was not changed by this run",
+            FileEffect::RestoredToPrevious => {
+                "this run put service.toml back on the previous search path"
+            }
+            FileEffect::NewPath => "service.toml records the new search path",
+        };
+        let record = match self.record {
+            RecordEffect::Absent => "no transaction record exists",
+            RecordEffect::Cleared => "the transaction record was cleared",
+            RecordEffect::KeptRollingBack => "the transaction record stays rolling_back",
+            RecordEffect::Kept => "the transaction record is kept",
+        };
+        format!("; {file}; {record}")
+    }
+}
+
+fn job_missing_effects_text(effects: Option<&JobMissingEffects>) -> String {
+    effects
+        .copied()
+        .map(JobMissingEffects::sentence)
+        .unwrap_or_default()
+}
+
 /// The way out of a missing daemon job: `uninstall` is the only documented
 /// step; the recovery design for the pending-record cases is #1763.
-const DAEMON_JOB_MISSING_HINT: &str = "the daemon job is missing, so refresh-path cannot replace it, and this command changed nothing; `pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out, see https://github.com/zajca/pohunek/issues/1763";
-
-/// The same way out after a replacement that failed because the job vanished:
-/// the file was restored and the record stays `rolling_back`.
-const DAEMON_JOB_MISSING_ROLLED_BACK_HINT: &str = "the daemon job is missing, so refresh-path cannot replace it; service.toml is back on the previous search path and the record stays rolling_back; `pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out, see https://github.com/zajca/pohunek/issues/1763";
+const DAEMON_JOB_MISSING_HINT: &str = "`pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out of a missing daemon job, see https://github.com/zajca/pohunek/issues/1763";
 
 impl Error {
+    /// Fills the effects of every missing-job refusal inside `self`.
+    pub(crate) fn with_job_missing_effects(self, effects: JobMissingEffects) -> Self {
+        match self {
+            Self::DaemonJobMissing { .. } => Self::DaemonJobMissing {
+                effects: Some(effects),
+            },
+            Self::RollbackFailed { original, rollback } => Self::RollbackFailed {
+                original: Box::new(original.with_job_missing_effects(effects)),
+                rollback: Box::new(rollback.with_job_missing_effects(effects)),
+            },
+            other => other,
+        }
+    }
+
+    /// Whether `self` is, or wraps, a missing-job refusal.
+    pub(crate) fn is_job_missing(&self) -> bool {
+        match self {
+            Self::DaemonJobMissing { .. } => true,
+            Self::RollbackFailed { original, rollback } => {
+                original.is_job_missing() || rollback.is_job_missing()
+            }
+            _ => false,
+        }
+    }
+
     /// Attaches the warnings of a degraded judgement to a refusal that the
     /// judgement produced, so the operator reads them with the refusal.
     ///
@@ -918,7 +1000,7 @@ impl Error {
             Self::RefreshConfigSchema { .. } => "service_refresh_config_schema",
             Self::SearchPathRefreshFailed { .. } => "service_search_path_refresh_failed",
             Self::RefreshBlockedByTransaction => "service_refresh_blocked_by_transaction",
-            Self::DaemonJobMissing => "service_daemon_job_missing",
+            Self::DaemonJobMissing { .. } => "service_daemon_job_missing",
             Self::RefreshConfigChanged => "service_refresh_config_changed",
             Self::RefreshPending { .. } => "service_refresh_pending",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
@@ -1062,8 +1144,10 @@ impl Error {
             Self::SupervisedVersion { .. } => Some(
                 "inspect which daemon the service job now runs (for example through `systemctl cat` or `launchctl print`), and decide through which pohunek installation's commands it should be stopped or replaced before this command continues",
             ),
-            Self::RollbackFailed { rollback, .. } if matches!(**rollback, Self::DaemonJobMissing) => {
-                Some(DAEMON_JOB_MISSING_ROLLED_BACK_HINT)
+            Self::RollbackFailed { rollback, .. }
+                if matches!(**rollback, Self::DaemonJobMissing { .. }) =>
+            {
+                Some(DAEMON_JOB_MISSING_HINT)
             }
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")
@@ -1086,7 +1170,7 @@ impl Error {
             Self::RefreshBlockedByTransaction => Some(
                 "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it, and see https://github.com/zajca/pohunek/issues/1763 (recovery design)",
             ),
-            Self::DaemonJobMissing => Some(DAEMON_JOB_MISSING_HINT),
+            Self::DaemonJobMissing { .. } => Some(DAEMON_JOB_MISSING_HINT),
 
             Self::RefreshConfigChanged => Some(
                 "service.toml was edited while a search-path refresh was pending. Restore it as the refresh wrote it or as it was before the refresh, then rerun `pohunek service refresh-path`; or run `pohunek service uninstall`, which is session-checked and does not need the file to match the refresh",
