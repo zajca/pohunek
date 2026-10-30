@@ -71,7 +71,7 @@ mod legacy_binding;
 mod rejected;
 mod schema;
 #[cfg(test)]
-pub(crate) mod shape_guard;
+mod shape_guard;
 
 #[cfg(test)]
 mod legacy_binding_tests;

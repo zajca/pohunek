@@ -33,6 +33,7 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/relay-protocol` | Typed public API contract of the optional team relay, with redacted secret diagnostics. |
 | `crates/relay` | `pohunek-relayd`: the optional team relay process and service composition. |
 | `crates/relay-client` | HTTPS-only native relay authentication client without a daemon dependency. |
+| `crates/shape-guard` | Dev-dependency-only helpers of the persisted-shape guard tests: key and string-leaf collection, enum registry classification, snapshot comparison, and the `unit_values!`/`data_values!` macros. |
 | `crates/test-support` | Test-only helpers: trusted-filesystem fixture roots, hermetic per-test environment, test binary resolution, and bounded readiness waits. |
 | `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
 

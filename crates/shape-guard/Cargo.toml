@@ -1,0 +1,19 @@
+[package]
+name = "pohunek-shape-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dev-dependency-only helpers of the persisted-shape guard tests: key and string-leaf collection, enum registry classification, snapshot comparison and the unit_values!/data_values! macros."
+publish = false
+
+[lib]
+name = "persisted_shape"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
