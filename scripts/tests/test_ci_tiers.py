@@ -2917,6 +2917,37 @@ class ArchiveToolchainTests(unittest.TestCase):
                          "test-selection-audit"} <= set(checked), checked)
 
 
+class RunnerImageTests(unittest.TestCase):
+    """The nextest archive producer and its consumers share one runner image,
+    and the jobs that build the shipped binaries stay on the glibc floor (#1731).
+    """
+
+    ARCHIVE_GROUP = {"build-tests", "fast-tests", "integration", "integration-relay",
+                     "test-selection-audit", "test-selection-check"}
+    GLIBC_FLOOR = {"release-build", "build-bins", "sdk"}
+
+    @staticmethod
+    def runner(job: str) -> str:
+        match = re.search(r"(?m)^    runs-on: (ubuntu-[0-9.]+|ubuntu-latest)\b", job)
+        if match is None:
+            raise AssertionError("job has no ubuntu runs-on")
+        return match.group(1)
+
+    def test_the_archive_producer_and_its_consumers_share_one_image(self):
+        jobs = workflow_jobs()
+        runners = {name: self.runner(jobs[name]) for name in self.ARCHIVE_GROUP}
+        self.assertEqual(len(set(runners.values())), 1, runners)
+
+    def test_the_jobs_that_build_the_shipped_binaries_stay_on_the_glibc_floor(self):
+        jobs = workflow_jobs()
+        for name in self.GLIBC_FLOOR:
+            with self.subTest(job=name):
+                self.assertEqual(self.runner(jobs[name]), "ubuntu-24.04")
+
+    def test_no_job_follows_ubuntu_latest(self):
+        self.assertIsNone(re.search(r"(?m)^\s*runs-on: ubuntu-latest", CI))
+
+
 AUDIT_JOB = "test-selection-audit"
 
 

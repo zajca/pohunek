@@ -32,7 +32,8 @@ name: Release
 # its caller lacks. They run no repository or downloaded code. The signing key
 # (the secret CATALOG_SIGNING_KEY_CI of the environment `release`) is passed by
 # name to the reusable workflow and read only by its `assemble` signing step.
-# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
+# Linux jobs stay on ubuntu-24.04 (#1731), never ubuntu-latest: they build, assemble or run the shipped binaries, and the
+# acceptance guests carry glibc 2.41, which `glibc-check` enforces; ubuntu-26.04 has glibc 2.43.
 on:
   push:
     tags:

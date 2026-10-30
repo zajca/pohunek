@@ -26,7 +26,8 @@ name: Upgrade test
 #   `head_ref` is a branch, tag or commit of this repository, never a fork
 #   head (`refs/pull/<N>/head` or a fork commit).
 
-# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
+# Linux jobs stay on ubuntu-24.04 (#1731), never ubuntu-latest: they build, assemble or run the shipped binaries, and the
+# acceptance guests carry glibc 2.41, which `glibc-check` enforces; ubuntu-26.04 has glibc 2.43.
 on:
   workflow_dispatch:
     inputs:
