@@ -765,6 +765,34 @@ fn a_session_wait_reason_from_a_newer_daemon_exits_non_zero_with_a_defined_error
         "{document}"
     );
     assert!(document.get("ok").is_none(), "{document}");
+
+    let human = run_against_scripted_daemon(
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "--state",
+            "running",
+            "--timeout-ms",
+            "1000",
+        ],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_WAIT,
+                json!({"reason": "a_reason_from_a_newer_daemon", "session": plain_session()}),
+            ),
+        ]),
+    );
+    assert_ne!(human.status.code(), Some(0), "{human:?}");
+    assert!(
+        String::from_utf8_lossy(&human.stdout).starts_with("Unknown\t"),
+        "the human run prints the result: {human:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("reason this client does not know"),
+        "{human:?}"
+    );
 }
 
 #[test]

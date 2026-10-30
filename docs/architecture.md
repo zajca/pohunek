@@ -2221,9 +2221,9 @@ never `unreachable!()`.
 | `SessionRetentionHold` | safe | never `None` (free to remove) | done |
 | `SessionWaitReason` | safe | `session wait` exits non-zero with `session_wait_reason_unknown` | done |
 | `DetectionRegionKind` | drop, display | dropped from `supported_regions` | done |
-| `PackageOrigin` | safe | the downgrade guard stays engaged | [#1338](https://github.com/zajca/pohunek/issues/1338) |
-| `PackageBindStatus` | safe | never `Unchanged`; consent is still asked | [#1338](https://github.com/zajca/pohunek/issues/1338) |
-| `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | [#1338](https://github.com/zajca/pohunek/issues/1338) |
+| `PackageOrigin` | safe | the downgrade guard stays engaged | done |
+| `PackageBindStatus` | safe | never `Unchanged`; consent is still asked | done |
+| `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | done |
 | `CommandExposure` | safe | read as the widest exposure (`peers`) wherever it is shown for consent | [#1690](https://github.com/zajca/pohunek/issues/1690) |
 | `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | done |
 | `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | `ProviderKind::Unknown` is never the `none` kind; an unknown `ConceptType` reaches the typed `assistant_bundle_mismatch` error | done |

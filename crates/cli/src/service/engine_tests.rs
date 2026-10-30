@@ -6604,6 +6604,14 @@ fn live_session_classification_covers_runtime_and_logical_state() {
     assert!(is_live(&live));
     live.state = SessionState::Done;
     assert!(is_live(&live), "a live runtime keeps the session live");
+    live.runtime
+        .as_mut()
+        .expect("the helper session has a runtime")
+        .state = protocol::RuntimeState::Unknown;
+    assert!(
+        is_live(&live),
+        "a runtime state this build does not know may still be live"
+    );
     live.runtime = None;
     assert!(!is_live(&live));
     let mut external = session("s-2", None);
