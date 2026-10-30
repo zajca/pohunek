@@ -84,7 +84,7 @@ pub enum Stage {
 pub struct ShutdownPlan {
     /// Bound of [`ShutdownPhase::Creates`].
     pub create_drain: Duration,
-    /// Bound of [`ShutdownPhase::Drivers`], shared by every driver and sink.
+    /// Bound of [`ShutdownPhase::Drivers`], shared by every driver, consumer and sink.
     pub driver_shutdown: Duration,
     /// Bound of [`ShutdownPhase::Registry`].
     pub registry_shutdown: Duration,

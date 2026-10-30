@@ -6870,16 +6870,22 @@ async fn daemon_shutdown_flushes_pending_agent_state_hooks_before_the_registry_p
         &config_dir,
         "agent-state",
         &format!(
-            "#!/bin/sh\nsleep 0.15\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
             marker.display()
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         config_dir: Some(config_dir),
+        shutdown_timeout: HANG_GUARD,
         ..SessionRegistryConfig::default()
     });
-    let tasks = crate::shutdown::DaemonShutdown::default();
+    // The bounds only cap a hang; the flush ends when the hook has run.
+    let tasks = crate::shutdown::DaemonShutdown::new(crate::shutdown::ShutdownPlan {
+        driver_shutdown: HANG_GUARD,
+        registry_shutdown: HANG_GUARD,
+        ..crate::shutdown::ShutdownPlan::default()
+    });
     registry.spawn_agent_state_hooks_in(&tasks);
     let created = registry
         .create(SessionNewParams {

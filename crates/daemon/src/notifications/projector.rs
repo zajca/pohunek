@@ -53,8 +53,9 @@ const MAX_DEFERRED_INPUTS_PER_SESSION: usize = 256;
 /// Derived debounced session notifications are routed through `attention` (the
 /// debounce coordinator) rather than persisted directly, and the resume edge
 /// resolves session-scoped notification keys through it too. The task is a
-/// driver of `tasks`: daemon shutdown cancels it and it drains the buffered
-/// session events first.
+/// consumer of `tasks`: it stops after the producers of session events (idle
+/// stop, retention), so the events they emit while stopping are projected, and
+/// it drains the buffered session events first.
 #[expect(
     clippy::must_use_candidate,
     reason = "the handle only stops the task before daemon shutdown does"

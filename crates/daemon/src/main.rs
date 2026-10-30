@@ -662,9 +662,11 @@ async fn run() -> Result<(), DaemonError> {
 
     // 11. Stop the daemon's tasks in ordered phases, each inside its own bound
     //     (see `pohunek_daemon::shutdown`): in-flight creates commit or
-    //     compensate (shutdown already refuses new ones), the drivers stop with
-    //     the attention coordinator last so any last defers/resolves they hand
-    //     over are accepted, the registry stops its own background work and
+    //     compensate (shutdown already refuses new ones), the producers (idle
+    //     stop, retention, package commands) stop first, then the consumers of
+    //     their events (notification projector, hook flush), and the attention
+    //     coordinator last so any last defers/resolves they hand over are
+    //     accepted, the registry stops its own background work and
     //     refuses a store write after that (a control connection still
     //     finishing an operation sees `registry_shut_down`, which is how a
     //     daemon that is exiting ends it), and the append-only event log
