@@ -94,10 +94,11 @@ MACOS_BUCKETS = {
     # Child images that only a parent test starts with `--ignored --exact`.
     "fixture": Bucket(
         ("pohunek-platform", "pohunek-daemon", "pohunek-test-support",
-         "pohunek-session-worker", "xtask"),
+         "pohunek-session-worker", "pohunek-cli", "xtask"),
         " or ".join((
             "(binary_id(=pohunek-platform) and test(/(^|::)hold$/))",
             "(package(=pohunek-daemon) and test(/(^|::)hold$/))",
+            "(binary_id(=pohunek-cli) and test(/(^|::)hold$/))",
             "(binary(=launchd) and test(/(^|::)fixture_entry$/))",
             "(binary(=process_lineage) and test(/(^|::)(hold|orphan)$/))",
             "(package(=pohunek-test-support) and test(/(^|::)(umask_probe_test_env|umask_probe_tempdir|hold|write_probe)$/))",
