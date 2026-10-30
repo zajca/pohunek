@@ -814,11 +814,9 @@ impl From<crate::workflow::Error> for Error {
     }
 }
 
-/// The way out of a missing daemon job.
-///
-/// `uninstall` is session-checked and keeps durable metadata; the version to
-/// install is the one `service.toml` names, which a refresh never changes.
-const DAEMON_JOB_MISSING_HINT: &str = "refresh-path cannot register a missing daemon job; if sessions are live, stop them (`pohunek session list` shows them; without a daemon job the daemon usually is not running, and uninstall refuses while sessions are live), save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata), install the version that is installed now (the `active_version` in the saved copy of service.toml; uninstall removes the installed binaries) from its own archive with the same --prefix, reapply the non-default settings from the saved copy except `search_path` under [environment] (restoring it brings the stale path back), and rerun `pohunek service refresh-path` if the path still differs; `pohunek service status` shows whether the daemon job is registered";
+/// The way back from a missing daemon job: the only documented step is
+/// `uninstall`; the recovery design for the pending-record cases is #1763.
+const DAEMON_JOB_MISSING_HINT: &str = "the daemon job is missing, so refresh-path cannot replace it, and this command changed nothing; `pohunek service uninstall` (which re-registers the job from service.toml) is the documented way back, see https://github.com/zajca/pohunek/issues/1763";
 
 impl Error {
     /// Attaches the warnings of a degraded judgement to a refusal that the

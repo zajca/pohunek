@@ -1452,22 +1452,16 @@ async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_resto
     harness.assert_installed(V2);
 }
 
-/// Asserts the way out a missing daemon job names, in the order it is walked.
+/// Asserts the minimal way back a missing daemon job names: the job is
+/// missing, nothing was changed, `uninstall` is the documented step, #1763.
 fn assert_daemon_job_missing_steps(error: &Error) {
     assert_steps_in_order(
         error.hint().expect("hint"),
         &[
-            "if sessions are live, stop them",
-            "`pohunek session list`",
-            "save a copy of service.toml",
+            "the daemon job is missing",
+            "this command changed nothing",
             "`pohunek service uninstall`",
-            "install the version that is installed now",
-            "`active_version` in the saved copy",
-            "from its own archive",
-            "same --prefix",
-            "reapply the non-default settings",
-            "except `search_path` under [environment]",
-            "rerun `pohunek service refresh-path` if the path still differs",
+            "issues/1763",
         ],
     );
 }

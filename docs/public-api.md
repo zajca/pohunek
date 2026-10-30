@@ -2838,7 +2838,8 @@ A daemon job that vanished after the record exists makes the first run return
 `service_rollback_failed`, whose original and rollback causes are both
 `service_daemon_job_missing` (the file is already restored and the record stays
 `rolling_back`); every rerun returns `service_daemon_job_missing`. The hint
-names the uninstall and reinstall way out. The store and preflight refusals
+says the job is missing, that the command changed nothing, and that
+`pohunek service uninstall` is the documented way back (#1763). The store and preflight refusals
 carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
 `service_upgrade_preflight_failed`) with texts that name the installed release. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
