@@ -52,13 +52,15 @@ pub(crate) enum RejectedAction {
     ///
     /// The quarantine file `metadata.rejected.jsonl` sits next to the store and
     /// keeps each line with an audit record; nothing deletes it. A line that
-    /// may belong to a session with a live runtime is refused unless
-    /// `--accept-pin-loss` states that no runtime depends on its package pin.
+    /// may belong to a session with a live runtime, or a `resume` line whose
+    /// pin cannot be read, is refused unless `--accept-pin-loss` states that
+    /// no runtime depends on its package pin.
     SetAside {
         /// Content hash from `pohunek store rejected list`.
         #[arg(value_hint = ValueHint::Other)]
         content_hash: String,
-        /// Accept dropping the package pin of a line that may own a live runtime.
+        /// Accept dropping the package pin of a line that may own a live
+        /// runtime or a `resume` line whose pin cannot be read.
         #[arg(long)]
         accept_pin_loss: bool,
         /// Emit machine-readable JSON instead of text.

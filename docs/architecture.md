@@ -2289,7 +2289,8 @@ is still strict for an enum whose tolerance ships in 0.38, and the 0.37
 TypeScript SDK checks `StateSource` against a closed set, so a new value of
 either needs a protocol bump and an N-1 adapter. A new value of a bump-only
 enum (`SessionState`, `SessionTurnEventKind`, `NotificationKind`) needs a
-protocol bump too, which 0.38 does not make, so those get no new value in 0.38.
+protocol bump too, so a release that makes no protocol bump adds no value to
+those.
 
 ## Testing Strategy
 

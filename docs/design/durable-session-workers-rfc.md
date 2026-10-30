@@ -1262,8 +1262,9 @@ cgroup namespace, whose paths are relative to another root than the journaled
 one (the worker then journals no path either). Residual: a same-user process
 holding `CAP_DAC_OVERRIDE` or `CAP_SYS_ADMIN` through a file capability can
 migrate anywhere, and a root-owned service that starts same-user jobs with a
-recorded copy of the submitter's environment (for example `at(1)`) runs them
-outside the subtree, so they count as foreign. The marker scheme already does
+recorded copy of the submitter's environment (for example `at(1)`), or a
+same-user server living in a logind session scope, runs them outside the
+subtree, so they count as foreign. The marker scheme already does
 not defend against a descendant that drops its markers on purpose.
 
 The same rows classify a worker that becomes unreachable while the daemon

@@ -2310,6 +2310,55 @@ async fn a_control_group_with_a_parent_segment_proves_nothing() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_control_group_with_an_empty_segment_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_control_group_with_an_empty_segment_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] =
+            format!("{}//other.service", fabricated_control_group()).into();
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_control_group_with_a_dot_segment_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_control_group_with_a_dot_segment_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] =
+            format!("{}/./other.service", fabricated_control_group()).into();
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_control_group_over_the_length_bound_proves_nothing() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_control_group_over_the_length_bound_proves_nothing",
+    );
+    a_journal_that_proves_nothing_keeps_the_removal_unconfirmed(|journal| {
+        journal["worker_control_group"] = format!(
+            "{}/{}",
+            fabricated_control_group(),
+            "a".repeat(pohunek_platform::process::MAX_CONTROL_GROUP_BYTES)
+        )
+        .into();
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn a_control_group_outside_any_user_manager_proves_nothing() {
     let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
         pohunek_test_support::host_lock::UNREADABLE_HOLDERS,

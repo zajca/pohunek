@@ -418,18 +418,18 @@ selects the suite by name (`the_release_binaries_serve_the_runtime_out_of_proces
 
 Adding a driver (for one of the four official runtimes; a new plugin lives
 outside this repository): a `runtime-packages/<runtime>/` directory without an
-entry in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
-fail with a message saying so. An entry names the runtime id, how its screen
-shows readiness, the marker that makes the model stub hold a reply (none when
-the stub holds every reply until the gate opens), which integration reports
-the conversation id (none, a hook that `integration install --profile`
-registers in the profile's config home, or the Hermes operator plugin), whether
-the resumed process reports itself again, a `prepare` function that writes the
+entry in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the
+suite fail with a message saying so. An entry names the runtime id, how its
+screen shows readiness, the marker that makes the model stub hold a reply (none
+when the stub holds every reply until the gate opens), which integration reports
+the conversation id (none, a hook that `integration install --profile` registers
+in the profile's config home, or the Hermes operator plugin), whether the
+resumed process reports itself again, a `prepare` function that writes the
 upstream's hermetic configuration (throwaway home or config directory, the
 loopback stub as its only model endpoint, every update, telemetry and
 marketplace switch off) and returns the profile `[env]`, and the text of the
-reply as it appears on screen. Reuse a stub from `crates/cli/tests/support/`
-or add one beside them. Drivers exist for `pi`, `codex`, `claude` and `hermes`.
+reply as it appears on screen. Reuse a stub from `crates/cli/tests/support/` or
+add one beside them. Drivers exist for `pi`, `codex`, `claude` and `hermes`.
 
 The Hermes driver writes a private Hermes home whose only model provider is
 the loopback endpoint of `crates/cli/tests/support/hermes_provider.rs` (the

@@ -137,6 +137,16 @@ limit) and logs one WARN with its path and size to `pohunekd.jsonl` (the same
 WARN covers an age-expired active file); the
 history it held is not kept. A daemon started without `service.toml` uses the
 values above.
+The optional `[inventory]` table bounds the version-probe cache behind
+`host.inspect`: `probe_cache_ttl_ms = 120000` (how long a successful probe
+stays valid, `1..=600000`), `probe_failure_ttl_ms = 10000` (how long a failed
+probe is remembered, `1..=600000`), `probe_cache_max_entries = 256`
+(`1..=4096`) and `probe_parallelism = 32` (most probes one inventory runs at
+once, `1..=256`). Every key is optional, a value outside its range makes the
+daemon refuse startup with the named configuration error, and the writer omits
+the table while every key equals its default, so a previous release still reads
+the file unless the operator set a key. Concurrent inventories probe each
+program once. The daemon reads edits when it starts.
 The optional `[worker_journals]` table holds `max_age_days = 7` (`1..=365`): how
 long the journal directory `<state>/workers/<session>/` of a session that no
 longer exists must be untouched before the daemon's startup collection may

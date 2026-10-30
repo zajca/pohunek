@@ -250,8 +250,9 @@ Hard constraints, decided on purpose — respect them in every change:
   tests for it, listed in `docs/public-api.md` ("External clients"). Core adds
   no CLI command only to serve a UI.
 - **Plugins live outside core.** Every new runtime package or workflow plugin
-  starts outside `zajca/pohunek`: an official plugin in `pohunekd/plugin-<name>`,
-  a third-party plugin in its author's account (`<owner>/pohunek-plugin-<name>`).
+  starts outside `zajca/pohunek`: an official plugin in
+  `pohunekd/plugin-<name>`, a third-party plugin in its author's account
+  (`<owner>/pohunek-plugin-<name>`).
   Do not add a directory under `runtime-packages/` or `compat/`, a package job
   to `.github/workflows/ci.yml`, or a test about one plugin to a core crate.
   The official runtimes still under `runtime-packages/` (Pi, Codex, Claude Code,

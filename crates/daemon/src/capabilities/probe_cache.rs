@@ -155,10 +155,16 @@ impl ProbeCache {
             return flatten(slots);
         }
 
-        let _flight = self
-            .flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _flight = match self.flight.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::debug!("inventory probe joined in-flight");
+                self.flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+        };
         slots = self.lookup(&keys, now);
         let to_run = distinct_missing(&keys, &slots);
         if !to_run.is_empty() {
