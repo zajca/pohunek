@@ -162,6 +162,12 @@ class VerifyArchiveIdTest(unittest.TestCase):
         self.assertIn("no trusted id found in /nonexistent/bin", result.stderr)
         self.assertIn("nothing was changed", result.stderr)
 
+    def test_no_trusted_id_names_the_host_requirement_not_the_archive(self):
+        result = self.verify("/nonexistent/bin")
+        self.assertIn("owned by root or by you", result.stderr)
+        self.assertIn("problem of the host, not of the archive", result.stderr)
+        self.assertNotIn("download and extract it again", result.stderr)
+
     def test_a_directory_writable_by_others_is_not_trusted(self):
         profile = self.root / "open"
         profile.mkdir()

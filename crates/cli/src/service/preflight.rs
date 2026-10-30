@@ -268,8 +268,9 @@ fn stale_recorded_path_warning(context: &Context, judged: &str) -> Option<String
          example after a Nix profile update. If that is the cause, do not accept the loss: \
          save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata \
          and refuses while sessions are live), reinstall the version that is installed now from its own archive with the \
-         same --prefix (`pohunek service install`), reapply any non-default settings from the \
-         saved copy, and rerun this upgrade. Installing the new \
+         same --prefix (`pohunek service install`), reapply the non-default settings from the \
+         saved copy except `search_path` under [environment] (restoring it brings the stale \
+         path back and the upgrade refuses again), and rerun this upgrade. Installing the new \
          release directly after the uninstall skips this check",
         stale.join(", "),
         if current.is_empty() {

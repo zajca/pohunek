@@ -60,7 +60,12 @@ for trusted_dir in $trusted_id_dirs; do
     host_id=$trusted_dir/id
     break
 done
-[ -n "$host_id" ] || refuse_archive "no trusted id found in $trusted_id_dirs"
+if [ -z "$host_id" ]; then
+    echo "no trusted id found in $trusted_id_dirs" >&2
+    echo "none of them holds an executable id in a directory that is closed to group and others (no group or other write) and owned by root or by you" >&2
+    echo "nothing was changed; this is a problem of the host, not of the archive: fix the owner or mode of the system directory that holds id and re-run the installer" >&2
+    exit 1
+fi
 manifest="$archive_dir/MANIFEST"
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     refuse_archive "the archive has no MANIFEST: $manifest"

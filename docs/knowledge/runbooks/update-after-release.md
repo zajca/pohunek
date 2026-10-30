@@ -987,8 +987,9 @@ If the warning matches your situation, do not accept the loss. Re-record the
 path: save a copy of `service.toml`, run `pohunek service uninstall` (it keeps
 durable metadata and refuses while sessions are live; stop them first),
 reinstall the version that is installed now from its own archive with the same
-`--prefix`, reapply any non-default settings from the saved copy, and rerun the
-upgrade. Installing the new release directly after the uninstall skips this
+`--prefix`, reapply the non-default settings from the saved copy, and rerun the
+upgrade. Do not restore `search_path` under `[environment]` from the saved copy:
+it is the stale value, and the upgrade would refuse again. Installing the new release directly after the uninstall skips this
 check, so sessions that were at risk are not reported. A command that refreshes
 the path in place is tracked in #319.
 
