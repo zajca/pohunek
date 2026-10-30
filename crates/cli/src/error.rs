@@ -305,6 +305,13 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Service(#[from] crate::service::Error),
 
+    /// `pohunek daemon start` could not verify the active version directory.
+    ///
+    /// Carries the service engine's error and code; only the recovery hint
+    /// differs, because `daemon start` installs nothing itself.
+    #[error(transparent)]
+    ActiveVersion(crate::service::Error),
+
     /// A `pohunek plugin` command was refused or could not resolve its target.
     #[error(transparent)]
     Plugin(#[from] crate::commands::plugin::Error),
@@ -596,6 +603,17 @@ impl CliError {
                         .to_owned(),
                 ),
             ),
+            CliError::ActiveVersion(error) => ProtocolError::new(
+                service_error_class(error),
+                error.code(),
+                error.to_string(),
+                match error {
+                    crate::service::Error::UntrustedVersion { .. } => {
+                        Some(ACTIVE_VERSION_HINT.to_owned())
+                    }
+                    other => other.hint().map(str::to_owned),
+                },
+            ),
             CliError::Service(error) => ProtocolError::new(
                 service_error_class(error),
                 error.code(),
@@ -646,6 +664,11 @@ impl CliError {
         self.to_protocol_error().recover
     }
 }
+
+/// Next step for a `daemon start` whose active version directory is untrusted
+/// or missing: only an install or upgrade of the installed release rewrites it.
+const ACTIVE_VERSION_HINT: &str = "reinstall the active version with `pohunek service install`, \
+     or `pohunek service upgrade` from the installed release, then rerun the command";
 
 /// The changes a setup stop reports, as a suffix of its message: empty when
 /// nothing was changed yet.

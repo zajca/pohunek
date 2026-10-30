@@ -56,8 +56,8 @@ pub(crate) enum Mode {
 /// # Errors
 ///
 /// Returns [`CliError::ServiceNotInstalled`] in service mode without
-/// `service.toml`, [`CliError::Service`] for an invalid one or an active
-/// version directory that fails `layout::verify_installed`
+/// `service.toml`, [`CliError::Service`] for an invalid one, [`CliError::ActiveVersion`]
+/// for an active version directory that fails `layout::verify_installed`
 /// (`service_version_untrusted`), and
 /// [`CliError::Spawn`] if the daemon binary cannot be located or launched.
 pub(crate) fn start(detach: bool, mode: Mode) -> Result<(), CliError> {
@@ -91,7 +91,7 @@ fn daemon_command(mode: Mode) -> Result<Command, CliError> {
             let config = ServiceConfig::load(&config_path)
                 .map_err(|error| CliError::Service(error.into()))?;
             let active = layout::verify_installed(config.layout(), &config.version_dir())
-                .map_err(CliError::Service)?;
+                .map_err(CliError::ActiveVersion)?;
             Ok(service_command(&active, &config_path))
         }
         Mode::DevSubprocess => Ok(dev_command(&locate_daemon()?)),

@@ -163,7 +163,10 @@ impl Host {
             stderr.contains(UNTRUSTED_MESSAGE),
             "the refusal is the service engine's untrusted-version error: {stderr}"
         );
-        assert!(stderr.contains("hint:"), "{stderr}");
+        assert!(
+            stderr.contains("hint: reinstall the active version with `pohunek service install`"),
+            "the refusal names reinstalling the active version: {stderr}"
+        );
         assert!(!self.marker().exists(), "the daemon must not run");
     }
 }
