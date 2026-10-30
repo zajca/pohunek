@@ -1,0 +1,4 @@
+## Unreleased (2026-10-30, service refresh-path, #319)
+
+- New `pohunek service refresh-path [--dry-run] [--json]`: runs the install-time login-shell discovery again under the transaction lock, prints the directories added and removed, and rewrites only `environment.search_path` of `service.toml` through the typed write (atomic, unknown keys kept). No job is replaced and no worker or daemon restarts, so the running daemon job keeps its `PATH` until its next replacement; `service check` and `service upgrade` read the recorded path and use the new one at once.
+- Refusals: `service_search_path_refresh_failed` when the login shell fails, hangs or prints junk (the fallback list never replaces a recorded path), `service_search_path_unmanaged` on a host that records no path, `service_refresh_blocked_by_transaction` while a transaction record exists, and `service_not_installed`.

@@ -64,7 +64,15 @@ fn subcommand_completion_lists_each_group_in_declaration_order() {
     let scenarios: &[(&[&str], &[&str])] = &[
         (
             &["pohunek", "service", ""],
-            &["install", "upgrade", "uninstall", "status", "check", "lock"],
+            &[
+                "install",
+                "upgrade",
+                "uninstall",
+                "refresh-path",
+                "status",
+                "check",
+                "lock",
+            ],
         ),
         (
             &["pohunek", "plugin", ""],

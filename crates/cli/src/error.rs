@@ -707,6 +707,9 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::UpgradeAtRisk { .. }
         | Error::UpgradeStoreUnusable { .. }
         | Error::UpgradeRuntimesRefused { .. }
+        | Error::SearchPathUnmanaged
+        | Error::SearchPathRefreshFailed { .. }
+        | Error::RefreshBlockedByTransaction
         | Error::LiveSessions { .. } => ErrorClass::Configuration,
         Error::Workflow { class, .. } => *class,
         Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,

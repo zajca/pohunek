@@ -42,6 +42,29 @@ pub struct InstallReport {
     pub runtimes: Option<EnsureReport>,
 }
 
+/// Result of `pohunek service refresh-path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefreshPathReport {
+    /// Whether the command only previewed the change (`--dry-run`).
+    pub dry_run: bool,
+    /// Whether the discovered path differs from the recorded one.
+    pub changed: bool,
+    /// Whether `service.toml` was rewritten: `changed` and not `dry_run`.
+    pub applied: bool,
+    /// The directories recorded before, in search order.
+    pub recorded: Vec<PathBuf>,
+    /// The directories the login shell reports now, in search order.
+    pub discovered: Vec<PathBuf>,
+    /// Discovered directories the recorded path lacks.
+    pub added: Vec<PathBuf>,
+    /// Recorded directories the discovered path lacks.
+    pub removed: Vec<PathBuf>,
+    /// The login shell that was tried.
+    pub shell_used: Option<PathBuf>,
+    /// Existing directories refused as untrusted.
+    pub dropped: Vec<DroppedPath>,
+}
+
 /// How the daemon job's executable search path was obtained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchPathReport {

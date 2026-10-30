@@ -102,6 +102,26 @@ pub(crate) enum Action {
         json: bool,
     },
 
+    /// Re-record the executable search path in `service.toml` from your login shell.
+    ///
+    /// Install records the `PATH` your login shell reports, and upgrades reuse
+    /// it. A prefix installed later, or a profile link that moved to another
+    /// store path (Nix generations), leaves the record behind; this command
+    /// runs the same discovery again, prints the directories added and
+    /// removed, and rewrites only the recorded path, atomically. Nothing is
+    /// stopped or restarted. `service check` and `service upgrade` judge with
+    /// the new path at once; the running daemon job gets it at its next
+    /// replacement, a version-changing upgrade. A login shell that fails or
+    /// prints junk never replaces the recorded path.
+    RefreshPath {
+        /// Print the change without writing `service.toml`.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show the daemon job, namespace, versions, and workers per generation.
     Status {
         /// Emit machine-readable JSON instead of human text.
@@ -165,6 +185,7 @@ impl Action {
             | Self::Upgrade { json, .. }
             | Self::Uninstall { json, .. }
             | Self::Check { json, .. }
+            | Self::RefreshPath { json, .. }
             | Self::Status { json } => *json,
             Self::Lock { .. } => false,
         }
@@ -201,6 +222,10 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
             let report = service::upgrade(from, accept_runtime_loss, budget).await?;
             emit(json, &report, render_upgrade)
+        }
+        Action::RefreshPath { dry_run, json } => {
+            let report = service::refresh_search_path(dry_run).await?;
+            emit(json, &report, render_refresh_path)
         }
         Action::Check {
             prefix,
@@ -337,6 +362,53 @@ fn wire_name<T: serde::Serialize>(value: &T) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default()
+}
+
+fn render_refresh_path(report: &report::RefreshPathReport) -> String {
+    let mut text = String::new();
+    if report.changed {
+        let verb = if report.applied {
+            "recorded"
+        } else {
+            "would record"
+        };
+        let _ = writeln!(text, "{verb} {} directories", report.discovered.len());
+        for entry in &report.added {
+            let _ = writeln!(text, "+ {}", entry.display());
+        }
+        for entry in &report.removed {
+            let _ = writeln!(text, "- {}", entry.display());
+        }
+        if report.added.is_empty() && report.removed.is_empty() {
+            let _ = writeln!(text, "the same directories, in a new order");
+        }
+        if report.applied {
+            let _ = writeln!(
+                text,
+                "service.toml is updated; `service check` and `service upgrade` use it now, \
+                 the running daemon job at its next replacement (a version-changing upgrade)"
+            );
+        } else {
+            let _ = writeln!(text, "dry run: service.toml is unchanged");
+        }
+    } else {
+        let _ = writeln!(
+            text,
+            "the recorded search path is current ({} directories); nothing to change",
+            report.recorded.len()
+        );
+    }
+    if let Some(shell) = &report.shell_used {
+        let _ = writeln!(text, "shell      {}", shell.display());
+    }
+    for dropped in &report.dropped {
+        let _ = writeln!(
+            text,
+            "warning: ignored PATH directory {} ({})",
+            dropped.path, dropped.reason
+        );
+    }
+    text
 }
 
 /// Appends the `PATH` source line and a warning for every fallback or refusal.
@@ -1187,6 +1259,81 @@ mod tests {
             .expect_err("install has no sessions to lose");
         Harness::try_parse_from(["service", "uninstall", "--accept-runtime-loss"])
             .expect_err("uninstall keeps its own --stop-sessions rule");
+    }
+
+    #[test]
+    fn refresh_path_parses_its_flags_and_takes_no_prefix() {
+        assert!(matches!(
+            parse(&["refresh-path"]),
+            Action::RefreshPath {
+                dry_run: false,
+                json: false
+            }
+        ));
+        let action = parse(&["refresh-path", "--dry-run", "--json"]);
+        assert!(matches!(
+            action,
+            Action::RefreshPath {
+                dry_run: true,
+                json: true
+            }
+        ));
+        assert!(action.wants_json());
+        Harness::try_parse_from(["service", "refresh-path", "--prefix", "/p"])
+            .expect_err("the prefix is the installed one");
+    }
+
+    #[test]
+    fn refresh_path_renders_the_difference_and_what_a_dry_run_leaves() {
+        let report = report::RefreshPathReport {
+            dry_run: false,
+            changed: true,
+            applied: true,
+            recorded: vec![PathBuf::from("/old")],
+            discovered: vec![PathBuf::from("/new")],
+            added: vec![PathBuf::from("/new")],
+            removed: vec![PathBuf::from("/old")],
+            shell_used: Some(PathBuf::from("/bin/zsh")),
+            dropped: Vec::new(),
+        };
+        let text = render_refresh_path(&report);
+        assert!(text.contains("recorded 1 directories"), "{text}");
+        assert!(text.contains("+ /new") && text.contains("- /old"), "{text}");
+        assert!(text.contains("next replacement"), "{text}");
+
+        let preview = render_refresh_path(&report::RefreshPathReport {
+            dry_run: true,
+            applied: false,
+            ..report.clone()
+        });
+        assert!(preview.contains("would record 1 directories"), "{preview}");
+        assert!(
+            preview.contains("dry run: service.toml is unchanged"),
+            "{preview}"
+        );
+
+        let current = render_refresh_path(&report::RefreshPathReport {
+            changed: false,
+            applied: false,
+            added: Vec::new(),
+            removed: Vec::new(),
+            discovered: report.recorded.clone(),
+            ..report
+        });
+        assert!(current.contains("is current"), "{current}");
+        let json = render_json(&report::RefreshPathReport {
+            dry_run: true,
+            changed: false,
+            applied: false,
+            recorded: Vec::new(),
+            discovered: Vec::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            shell_used: None,
+            dropped: Vec::new(),
+        })
+        .expect("json");
+        assert!(json.contains("\"dry_run\": true"), "{json}");
     }
 
     #[test]

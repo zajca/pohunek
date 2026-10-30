@@ -3998,7 +3998,7 @@ fn backup_error(path: PathBuf, detail: impl Into<String>) -> Error {
     }
 }
 
-fn file_exists(path: &Path) -> Result<bool, Error> {
+pub(super) fn file_exists(path: &Path) -> Result<bool, Error> {
     match std::fs::symlink_metadata(path) {
         Ok(_metadata) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),

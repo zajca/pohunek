@@ -1323,6 +1323,22 @@ impl ServiceConfig {
         Ok(config)
     }
 
+    /// Returns this configuration with only its executable search path changed.
+    ///
+    /// Everything else is kept, including the unknown keys of the file this
+    /// value was loaded from.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation errors of [`ServiceConfig::new`].
+    pub fn with_search_path(&self, search_path: SearchPath) -> Result<Self, ConfigError> {
+        let mut spec = self.to_spec();
+        spec.search_path = search_path;
+        let mut config = Self::new(spec)?;
+        config.unknown = self.unknown.clone();
+        Ok(config)
+    }
+
     /// Returns the keys and tables of the loaded file that this version does
     /// not know, in file order.
     ///

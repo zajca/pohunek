@@ -1229,6 +1229,157 @@ async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
     assert_eq!(registered.environment().get("PATH"), Some(&recorded));
 }
 
+/// A context whose login shell runs `body`, with `fallback` as the fallback list.
+fn scripted_discovery(
+    context: &Context,
+    root: &std::path::Path,
+    body: &str,
+    fallback: &std::path::Path,
+) -> Context {
+    crate::service::context::tests::make_dirs(root, fallback);
+    let shell = root.join("scripted-shell");
+    pohunek_test_support::fs::write_executable(&shell, format!("#!/bin/sh\n{body}\n"))
+        .expect("write shell");
+    let crate::service::context::PathDiscovery::Managed {
+        login_shell,
+        shell_defaulted,
+        ..
+    } = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery")
+    else {
+        panic!("managed discovery");
+    };
+    context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: vec![fallback.display().to_string()],
+        })
+}
+
+async fn refresh(
+    harness: &Harness,
+    dry_run: bool,
+) -> Result<crate::service::report::RefreshPathReport, Error> {
+    crate::service::refresh::refresh_search_path(&harness.context, None, dry_run).await
+}
+
+fn config_bytes(harness: &Harness) -> Vec<u8> {
+    std::fs::read(harness.context.config_path()).expect("read service.toml")
+}
+
+#[tokio::test]
+async fn refresh_path_records_the_current_login_shell_path_and_a_second_run_changes_nothing() {
+    let mut harness = Harness::new();
+    let (old, new) = (harness.root.join("old-bin"), harness.root.join("new-bin"));
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &old);
+    harness.install(V1).await.expect("install");
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &new);
+    let before = config_bytes(&harness);
+
+    let preview = refresh(&harness, true).await.expect("dry run");
+    assert!(preview.dry_run && preview.changed && !preview.applied);
+    assert_eq!(
+        (preview.added.as_slice(), preview.removed.as_slice()),
+        (&[new.clone()][..], &[old.clone()][..])
+    );
+    assert_eq!(config_bytes(&harness), before, "a dry run writes nothing");
+
+    let applied = refresh(&harness, false).await.expect("refresh");
+    assert!(applied.changed && applied.applied);
+    assert_eq!(applied.recorded, std::slice::from_ref(&old));
+    assert_eq!(applied.discovered, std::slice::from_ref(&new));
+    assert_eq!(
+        harness
+            .config()
+            .expect("config")
+            .search_path()
+            .to_env_value(),
+        new.display().to_string()
+    );
+    assert!(harness.pending().is_none(), "no transaction record is left");
+
+    let after = config_bytes(&harness);
+    let again = refresh(&harness, false).await.expect("second refresh");
+    assert!(!again.changed && !again.applied);
+    assert_eq!(
+        config_bytes(&harness),
+        after,
+        "a no-op refresh rewrites nothing"
+    );
+}
+
+#[tokio::test]
+async fn refresh_path_after_a_moved_path_lets_the_stale_store_entry_go() {
+    let mut harness = Harness::new();
+    let stale = harness.root.join("nix-store-old-bin");
+    let profile = harness.root.join("profile-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &stale);
+    harness.install(V1).await.expect("install");
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &profile);
+
+    let report = refresh(&harness, false).await.expect("refresh");
+
+    assert_eq!(report.removed, [stale]);
+    assert_eq!(report.added, [profile]);
+}
+
+#[tokio::test]
+async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_or_prints_junk() {
+    for (name, body) in [
+        ("fails", "exit 1"),
+        ("prints junk", "echo 'not a path report'; exit 0"),
+    ] {
+        let mut harness = Harness::new();
+        let recorded = harness.root.join("recorded-bin");
+        let fallback = harness.root.join("fallback-bin");
+        harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+        harness.install(V1).await.expect("install");
+        harness.context = scripted_discovery(&harness.context, &harness.root, body, &fallback);
+        let before = config_bytes(&harness);
+
+        let error = refresh(&harness, false).await.expect_err(name);
+
+        assert_eq!(
+            error.code(),
+            "service_search_path_refresh_failed",
+            "{name}: {error}"
+        );
+        assert_eq!(
+            config_bytes(&harness),
+            before,
+            "{name}: service.toml is unchanged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pending_transaction() {
+    let mut harness = Harness::new();
+    let error = refresh(&harness, false).await.expect_err("not installed");
+    assert_eq!(error.code(), "service_not_installed");
+
+    let first = harness.root.join("first-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &first);
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let error = refresh(&harness, false).await.expect_err("pending install");
+    assert_eq!(error.code(), "service_refresh_blocked_by_transaction");
+
+    harness.install(V1).await.expect("finish the install");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    let error = refresh(&harness, false).await.expect_err("unmanaged");
+    assert_eq!(error.code(), "service_search_path_unmanaged");
+}
+
 /// A context whose discovery-only variables are unusable.
 fn with_hostile_discovery_environment(context: &Context) -> Context {
     context.clone().with_environment_discovery(

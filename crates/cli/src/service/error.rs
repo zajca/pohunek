@@ -623,6 +623,27 @@ pub enum Error {
         detail: String,
     },
 
+    /// `service refresh-path` on a host whose daemon job carries no recorded
+    /// `PATH`.
+    #[error("this installation records no search path: the service manager's own PATH applies")]
+    SearchPathUnmanaged,
+
+    /// `service refresh-path` could not read the path from the login shell.
+    ///
+    /// The fallback list an install would record in that case is never put in
+    /// place of a recorded path.
+    #[error(
+        "the login shell did not supply a PATH ({detail}); the recorded search path is unchanged"
+    )]
+    SearchPathRefreshFailed {
+        /// Why the login shell failed, or that it was not asked.
+        detail: String,
+    },
+
+    /// A transaction is pending, so the recorded path stays as it is.
+    #[error("a `pohunek service` transaction is pending; the recorded search path is unchanged")]
+    RefreshBlockedByTransaction,
+
     /// Another `pohunek service` command holds the transaction lock.
     #[error("another `pohunek service` command is running (lock {})", path.display())]
     TransactionInProgress {
@@ -774,6 +795,9 @@ impl Error {
             Self::AcceptedRisks { .. } => "service_accepted_risks_invalid",
             Self::ConfigBackup { .. } => "service_config_backup_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
+            Self::SearchPathUnmanaged => "service_search_path_unmanaged",
+            Self::SearchPathRefreshFailed { .. } => "service_search_path_refresh_failed",
+            Self::RefreshBlockedByTransaction => "service_refresh_blocked_by_transaction",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
             Self::PrefixMismatch { .. } => "service_prefix_mismatch",
             Self::RollbackFailed { .. } => "service_rollback_failed",
@@ -908,6 +932,15 @@ impl Error {
             Self::TransactionInProgress { .. } => {
                 Some("wait for the other `pohunek service` command to finish, then retry")
             }
+            Self::SearchPathUnmanaged => Some(
+                "nothing to refresh: this installation takes the PATH of the service manager, which a login-shell discovery does not change",
+            ),
+            Self::SearchPathRefreshFailed { .. } => Some(
+                "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
+            ),
+            Self::RefreshBlockedByTransaction => Some(
+                "finish the pending transaction first (`pohunek service status` names it), then rerun `pohunek service refresh-path`",
+            ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")
             }
