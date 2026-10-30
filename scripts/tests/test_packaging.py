@@ -6,6 +6,7 @@ any host: staging, the archive manifest, and the deterministic archive.
 
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -183,6 +184,17 @@ class VerifyArchiveIdTest(unittest.TestCase):
         # reaches the manifest header; a shadow uid of 4242 would refuse them.
         self.assertNotIn("owned by another user", result.stderr)
         self.assertIn("MANIFEST is not a pohunek archive manifest", result.stderr)
+
+
+class InstallDaemonWarningTest(unittest.TestCase):
+    """The wrapper's stale-path hint matches the text the CLI warning starts with (#1683)."""
+
+    def test_the_wrapper_greps_the_cli_warning_prefix(self):
+        source = (ROOT / "crates/cli/src/service/preflight.rs").read_text()
+        match = re.search(r'STALE_PATH_WARNING: &str = "([^"]+)";', source)
+        self.assertIsNotNone(match, "STALE_PATH_WARNING not found in preflight.rs")
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        self.assertIn(f"grep -q '{match.group(1)}'", wrapper)
 
 
 class StageArchiveTest(unittest.TestCase):

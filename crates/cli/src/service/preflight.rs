@@ -266,9 +266,10 @@ fn stale_recorded_path_warning(context: &Context, judged: &str) -> Option<String
         "{STALE_PATH_WARNING} {} which a new install would not record (it would record {}); \
          a runtime found there may be older than the one your login shell resolves now, for \
          example after a Nix profile update. If that is the cause, do not accept the loss: \
-         run `pohunek service uninstall` (it keeps durable metadata and refuses while sessions \
-         are live), reinstall the version that is installed now from its own archive with the \
-         same --prefix (`pohunek service install`), and rerun this upgrade. Installing the new \
+         save a copy of service.toml, run `pohunek service uninstall` (it keeps durable metadata \
+         and refuses while sessions are live), reinstall the version that is installed now from its own archive with the \
+         same --prefix (`pohunek service install`), reapply any non-default settings from the \
+         saved copy, and rerun this upgrade. Installing the new \
          release directly after the uninstall skips this check",
         stale.join(", "),
         if current.is_empty() {

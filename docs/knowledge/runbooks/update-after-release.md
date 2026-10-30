@@ -984,9 +984,10 @@ a different path: it names the entries that discovery would not record and the
 entries it would record instead. (A failed login shell, the fallback list and a
 Linux install, which records the user manager's `PATH`, give no such warning.)
 If the warning matches your situation, do not accept the loss. Re-record the
-path: run `pohunek service uninstall` (it keeps durable metadata and refuses
-while sessions are live; stop them first), reinstall the version that is
-installed now from its own archive with the same `--prefix`, and rerun the
+path: save a copy of `service.toml`, run `pohunek service uninstall` (it keeps
+durable metadata and refuses while sessions are live; stop them first),
+reinstall the version that is installed now from its own archive with the same
+`--prefix`, reapply any non-default settings from the saved copy, and rerun the
 upgrade. Installing the new release directly after the uninstall skips this
 check, so sessions that were at risk are not reported. A command that refreshes
 the path in place is tracked in #319.
