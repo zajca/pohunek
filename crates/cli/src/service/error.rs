@@ -625,7 +625,7 @@ pub enum Error {
 
     /// `service refresh-path` on a host whose daemon job carries no recorded
     /// `PATH`.
-    #[error("this installation records no search path: the service manager's own PATH applies")]
+    #[error("this host's daemon job takes the service manager's own PATH, so there is no search path to refresh")]
     SearchPathUnmanaged,
 
     /// `service refresh-path` could not read the path from the login shell.

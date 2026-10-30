@@ -6,6 +6,7 @@
 //! and lives below a temporary root.
 
 use std::future::Future;
+use std::os::unix::fs::MetadataExt as _;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1229,11 +1230,13 @@ async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
     assert_eq!(registered.environment().get("PATH"), Some(&recorded));
 }
 
-/// A context whose login shell runs `body`, with `fallback` as the fallback list.
+/// A context whose login shell runs `body` under the probe deadline `timeout`,
+/// with `fallback` as the fallback list.
 fn scripted_discovery(
     context: &Context,
     root: &std::path::Path,
     body: &str,
+    timeout: std::time::Duration,
     fallback: &std::path::Path,
 ) -> Context {
     crate::service::context::tests::make_dirs(root, fallback);
@@ -1241,7 +1244,7 @@ fn scripted_discovery(
     pohunek_test_support::fs::write_executable(&shell, format!("#!/bin/sh\n{body}\n"))
         .expect("write shell");
     let crate::service::context::PathDiscovery::Managed {
-        login_shell,
+        mut login_shell,
         shell_defaulted,
         ..
     } = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
@@ -1249,6 +1252,9 @@ fn scripted_discovery(
     else {
         panic!("managed discovery");
     };
+    if let Some(spec) = login_shell.as_mut() {
+        spec.timeout = timeout;
+    }
     context
         .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Managed {
@@ -1300,43 +1306,78 @@ async fn refresh_path_records_the_current_login_shell_path_and_a_second_run_chan
     );
     assert!(harness.pending().is_none(), "no transaction record is left");
 
-    let after = config_bytes(&harness);
+    let inode = || {
+        std::fs::metadata(harness.context.config_path())
+            .expect("metadata")
+            .ino()
+    };
+    let (after, before_inode) = (config_bytes(&harness), inode());
     let again = refresh(&harness, false).await.expect("second refresh");
     assert!(!again.changed && !again.applied);
     assert_eq!(
         config_bytes(&harness),
         after,
-        "a no-op refresh rewrites nothing"
+        "a no-op refresh keeps the bytes"
+    );
+    assert_eq!(inode(), before_inode, "a no-op refresh replaces no file");
+}
+
+#[tokio::test]
+async fn refresh_path_follows_a_profile_link_that_moved_and_keeps_unknown_keys() {
+    use std::os::unix::fs::symlink;
+
+    let mut harness = Harness::new();
+    let (generation_one, generation_two) = (
+        harness.root.join("generation-1-bin"),
+        harness.root.join("generation-2-bin"),
+    );
+    for generation in [&generation_one, &generation_two] {
+        crate::service::context::tests::make_dirs(&harness.root, generation);
+    }
+    let link = harness.root.join("profile-bin");
+    symlink(&generation_one, &link).expect("profile link");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &link);
+    harness.install(V1).await.expect("install");
+    let canonical_one = std::fs::canonicalize(&generation_one).expect("canonical");
+    let canonical_two = std::fs::canonicalize(&generation_two).expect("canonical");
+    assert_eq!(
+        harness.config().expect("config").search_path().entries(),
+        std::slice::from_ref(&canonical_one),
+        "install records the link's target, not the link"
+    );
+    let mut text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
+    text.push_str("\n[future]\nflag = true\n");
+    std::fs::write(harness.context.config_path(), text).expect("add an unknown table");
+
+    std::fs::remove_file(&link).expect("remove link");
+    symlink(&generation_two, &link).expect("move the link");
+    let report = refresh(&harness, false).await.expect("refresh");
+
+    assert_eq!(report.removed, [canonical_one]);
+    assert_eq!(report.added, [canonical_two]);
+    assert!(
+        String::from_utf8(config_bytes(&harness))
+            .expect("utf-8")
+            .contains("flag = true"),
+        "the unknown table survives the rewrite"
     );
 }
 
 #[tokio::test]
-async fn refresh_path_after_a_moved_path_lets_the_stale_store_entry_go() {
-    let mut harness = Harness::new();
-    let stale = harness.root.join("nix-store-old-bin");
-    let profile = harness.root.join("profile-bin");
-    harness.context = discovering(&harness.context, &harness.root, "shell-a", &stale);
-    harness.install(V1).await.expect("install");
-    harness.context = discovering(&harness.context, &harness.root, "shell-b", &profile);
-
-    let report = refresh(&harness, false).await.expect("refresh");
-
-    assert_eq!(report.removed, [stale]);
-    assert_eq!(report.added, [profile]);
-}
-
-#[tokio::test]
-async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_or_prints_junk() {
+async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_hangs_or_prints_junk() {
+    let deadline = std::time::Duration::from_millis(100);
     for (name, body) in [
         ("fails", "exit 1"),
         ("prints junk", "echo 'not a path report'; exit 0"),
+        ("hangs", "exec sleep 3600"),
     ] {
         let mut harness = Harness::new();
         let recorded = harness.root.join("recorded-bin");
         let fallback = harness.root.join("fallback-bin");
         harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
         harness.install(V1).await.expect("install");
-        harness.context = scripted_discovery(&harness.context, &harness.root, body, &fallback);
+        harness.context =
+            scripted_discovery(&harness.context, &harness.root, body, deadline, &fallback);
         let before = config_bytes(&harness);
 
         let error = refresh(&harness, false).await.expect_err(name);

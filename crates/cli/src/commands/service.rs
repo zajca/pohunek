@@ -399,7 +399,12 @@ fn render_refresh_path(report: &report::RefreshPathReport) -> String {
         );
     }
     if let Some(shell) = &report.shell_used {
-        let _ = writeln!(text, "shell      {}", shell.display());
+        let note = if report.shell_defaulted {
+            " (default: $SHELL is unset)"
+        } else {
+            ""
+        };
+        let _ = writeln!(text, "shell      {}{note}", shell.display());
     }
     for dropped in &report.dropped {
         let _ = writeln!(
@@ -407,6 +412,9 @@ fn render_refresh_path(report: &report::RefreshPathReport) -> String {
             "warning: ignored PATH directory {} ({})",
             dropped.path, dropped.reason
         );
+    }
+    for warning in &report.warnings {
+        let _ = writeln!(text, "warning: {warning}");
     }
     text
 }
@@ -1294,12 +1302,16 @@ mod tests {
             added: vec![PathBuf::from("/new")],
             removed: vec![PathBuf::from("/old")],
             shell_used: Some(PathBuf::from("/bin/zsh")),
+            shell_defaulted: true,
             dropped: Vec::new(),
+            warnings: vec!["2 unknown keys are kept".to_owned()],
         };
         let text = render_refresh_path(&report);
         assert!(text.contains("recorded 1 directories"), "{text}");
         assert!(text.contains("+ /new") && text.contains("- /old"), "{text}");
         assert!(text.contains("next replacement"), "{text}");
+        assert!(text.contains("(default: $SHELL is unset)"), "{text}");
+        assert!(text.contains("warning: 2 unknown keys are kept"), "{text}");
 
         let preview = render_refresh_path(&report::RefreshPathReport {
             dry_run: true,
@@ -1330,7 +1342,9 @@ mod tests {
             added: Vec::new(),
             removed: Vec::new(),
             shell_used: None,
+            shell_defaulted: false,
             dropped: Vec::new(),
+            warnings: Vec::new(),
         })
         .expect("json");
         assert!(json.contains("\"dry_run\": true"), "{json}");

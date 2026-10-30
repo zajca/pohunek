@@ -57,7 +57,12 @@ pub(crate) async fn refresh_search_path(
         &context.paths().state_dir,
         &context.paths().runtime_dir,
     )?;
-    let (fresh, found) = context.install_search_path()?;
+    let (fresh, found) = context.install_search_path().map_err(|error| match error {
+        Error::SearchPath(reason) => Error::SearchPathRefreshFailed {
+            detail: reason.to_string(),
+        },
+        other => other,
+    })?;
     if found.source == "unmanaged" {
         return Err(Error::SearchPathUnmanaged);
     }
@@ -94,6 +99,10 @@ pub(crate) async fn refresh_search_path(
         added,
         removed,
         shell_used: found.shell_used,
+        shell_defaulted: found.shell_defaulted,
         dropped: found.dropped,
+        warnings: super::definition::unknown_keys_warning(&config)
+            .into_iter()
+            .collect(),
     })
 }
