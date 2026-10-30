@@ -8005,8 +8005,12 @@ async fn refreshing_the_path_lets_the_same_upgrade_through_without_the_flag() {
 #[test]
 fn an_unmanaged_host_gets_no_recorded_path_warning() {
     let harness = Harness::new();
+    let context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
     assert!(
-        super::preflight::recorded_path_warning(&harness.context, "/usr/bin:/bin").is_none(),
+        super::preflight::recorded_path_warning(&context, "/usr/bin:/bin").is_none(),
         "the user manager's PATH is not a recorded path"
     );
 }
