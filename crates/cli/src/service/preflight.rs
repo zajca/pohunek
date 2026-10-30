@@ -192,6 +192,95 @@ pub async fn gate_upgrade(
     accept_runtime_loss: bool,
     acceptance: &Acceptance,
 ) -> Result<Gated, Error> {
+    match gate_installed_release(
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        search_path,
+        variables,
+        plan,
+        accept_runtime_loss,
+        acceptance,
+    )
+    .await
+    {
+        Err(refusal @ Error::UpgradeAtRisk { .. }) => {
+            let warning = recorded_path_warning(context, search_path);
+            Err(refusal.with_warnings(warning.as_slice()))
+        }
+        decided => decided,
+    }
+}
+
+/// Runs the gate of a search-path refresh, which judges the installed release
+/// with the new `PATH` and carries no runtime plan.
+///
+/// An at-risk refusal is [`Error::RefreshAtRisk`] and carries no stale-path
+/// warning: the refresh is the remedy that warning points to.
+///
+/// # Errors
+///
+/// See [`gate_upgrade`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the judgement inputs are passed one by one, as gate_upgrade takes them"
+)]
+pub async fn gate_refresh(
+    preflight: &dyn AdoptionPreflight,
+    context: &Context,
+    daemon_dir: &VerifiedVersionDir,
+    version: &str,
+    search_path: &str,
+    variables: &BTreeMap<String, String>,
+    accept_runtime_loss: bool,
+    acceptance: &Acceptance,
+) -> Result<Gated, Error> {
+    gate_installed_release(
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        search_path,
+        variables,
+        ReleasePlan::Omitted,
+        accept_runtime_loss,
+        acceptance,
+    )
+    .await
+    .map_err(|error| match error {
+        Error::UpgradeAtRisk {
+            sessions,
+            stopped_sessions,
+            acceptance,
+            warnings,
+        } => Error::RefreshAtRisk {
+            sessions,
+            stopped_sessions,
+            acceptance,
+            warnings,
+        },
+        other => other,
+    })
+}
+
+/// The judgement of [`gate_upgrade`] and [`gate_refresh`], before either shapes
+/// an at-risk refusal.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the judgement inputs are passed one by one, as gate_upgrade takes them"
+)]
+async fn gate_installed_release(
+    preflight: &dyn AdoptionPreflight,
+    context: &Context,
+    daemon_dir: &VerifiedVersionDir,
+    version: &str,
+    search_path: &str,
+    variables: &BTreeMap<String, String>,
+    plan: ReleasePlan,
+    accept_runtime_loss: bool,
+    acceptance: &Acceptance,
+) -> Result<Gated, Error> {
     let report = judge_daemon(
         preflight,
         context,
@@ -206,13 +295,7 @@ pub async fn gate_upgrade(
     if let Some(plan) = &report.runtimes {
         runtimes::check_plan(plan)?;
     }
-    match decide(report, accept_runtime_loss, acceptance) {
-        Err(refusal @ Error::UpgradeAtRisk { .. }) => {
-            let warning = recorded_path_warning(context, search_path);
-            Err(refusal.with_warnings(warning.as_slice()))
-        }
-        decided => decided,
-    }
+    decide(report, accept_runtime_loss, acceptance)
 }
 
 /// Start of the warning an at-risk refusal of a managed installation carries.

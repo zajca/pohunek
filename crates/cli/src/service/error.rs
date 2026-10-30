@@ -461,6 +461,31 @@ pub enum Error {
         warnings: Vec<String>,
     },
 
+    /// A search-path refresh would restart the daemon so that it does not
+    /// adopt, or adopts without native recovery, live or stopped sessions.
+    #[error(
+        "{}",
+        at_risk_summary(
+            "search-path refresh",
+            sessions,
+            stopped_sessions,
+            acceptance,
+            warnings
+        )
+    )]
+    RefreshAtRisk {
+        /// Live sessions the preflight judged at risk and no earlier upgrade
+        /// accepted, ordered by id.
+        sessions: Vec<SessionVerdict>,
+        /// Stopped sessions whose retained native recovery is at risk and no
+        /// earlier upgrade accepted.
+        stopped_sessions: Vec<SessionVerdict>,
+        /// The at-risk verdicts an earlier upgrade accepted, which do not block.
+        acceptance: Box<AcceptanceGroups>,
+        /// Warnings of the judgement, so a refusal explains a degraded verdict.
+        warnings: Vec<String>,
+    },
+
     /// The new daemon would refuse to start with the installed metadata store.
     #[error(
         "upgrade refused: the new daemon cannot start with the metadata store {} ({code}): {detail}",
@@ -560,6 +585,20 @@ pub enum Error {
     #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, stopped_sessions, &AcceptanceGroups::default(), warnings))]
     RollbackAtRisk {
         /// Version that would be restored.
+        version: String,
+        /// Live sessions requiring explicit acceptance.
+        sessions: Vec<SessionVerdict>,
+        /// Stopped sessions whose retained native recovery is at risk.
+        stopped_sessions: Vec<SessionVerdict>,
+        /// Warnings of the judgement, so a refusal explains a degraded verdict.
+        warnings: Vec<String>,
+    },
+
+    /// Rolling back a search-path refresh would restart the previous daemon
+    /// definition so that it may lose live runtime or retained native recovery.
+    #[error("{}", at_risk_summary(&format!("rollback of the search-path refresh to {version}"), sessions, stopped_sessions, &AcceptanceGroups::default(), warnings))]
+    RefreshRollbackAtRisk {
+        /// Version that keeps running.
         version: String,
         /// Live sessions requiring explicit acceptance.
         sessions: Vec<SessionVerdict>,
@@ -756,7 +795,11 @@ impl Error {
     pub(crate) fn with_warnings(mut self, warnings: &[String]) -> Self {
         match &mut self {
             Self::UpgradeAtRisk { warnings: slot, .. }
-            | Self::RollbackAtRisk { warnings: slot, .. } => slot.extend_from_slice(warnings),
+            | Self::RefreshAtRisk { warnings: slot, .. }
+            | Self::RollbackAtRisk { warnings: slot, .. }
+            | Self::RefreshRollbackAtRisk { warnings: slot, .. } => {
+                slot.extend_from_slice(warnings);
+            }
             Self::UpgradePreflightFailed { detail, .. }
             | Self::RollbackPreflightFailed { detail, .. } => {
                 for warning in warnings {
@@ -808,7 +851,9 @@ impl Error {
             Self::StopTimeout { .. } => "service_stop_timeout",
             Self::UnreadableJournals { .. } => "service_unreadable_journals",
             Self::OutdatedJournals { .. } => "service_outdated_journals",
-            Self::UpgradeAtRisk { .. } => "service_upgrade_sessions_at_risk",
+            Self::UpgradeAtRisk { .. } | Self::RefreshAtRisk { .. } => {
+                "service_upgrade_sessions_at_risk"
+            }
             Self::UpgradeStoreUnusable { .. } => "service_upgrade_store_unusable",
             Self::UpgradePreflightFailed { .. } => "service_upgrade_preflight_failed",
             Self::UpgradeRuntimesRefused { .. } => "service_upgrade_runtimes_refused",
@@ -818,7 +863,9 @@ impl Error {
             Self::ManagerVariablesUnread { .. } => "service_manager_variables_unread",
             Self::RuntimeBackup { .. } => "service_runtime_backup_invalid",
             Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
-            Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
+            Self::RollbackAtRisk { .. } | Self::RefreshRollbackAtRisk { .. } => {
+                "service_rollback_sessions_at_risk"
+            }
             Self::RollbackPreflightFailed { .. } => "service_rollback_preflight_failed",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
@@ -882,6 +929,9 @@ impl Error {
             } else {
                 "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
             }),
+            Self::RefreshAtRisk { .. } => Some(
+                "preserve the required runtime or native recovery for the listed sessions, or run `pohunek service refresh-path --accept-runtime-loss` to restart the daemon with the new search path anyway and accept the loss of the listed sessions' runtime or native recovery; it records nothing, so a later upgrade judges the sessions again, and no session is changed",
+            ),
             Self::AcceptedRisks { .. } => Some(
                 "remove the ledger file and rerun with --accept-runtime-loss to accept the listed sessions again; the file only records what an earlier upgrade accepted",
             ),
@@ -914,6 +964,9 @@ impl Error {
             ),
             Self::RollbackAtRisk { .. } => Some(
                 "preserve the required runtime or native recovery for the listed sessions, or rerun the upgrade with --accept-runtime-loss to accept their loss during rollback",
+            ),
+            Self::RefreshRollbackAtRisk { .. } => Some(
+                "preserve the required runtime or native recovery for the listed sessions and rerun `pohunek service refresh-path`, or run `pohunek service refresh-path --accept-runtime-loss` to finish the rollback anyway and accept the loss of the listed sessions' runtime or native recovery; it records nothing",
             ),
             Self::RollbackPreflightFailed { .. } => Some(
                 "keep the transaction and restore the previous daemon only after its store and runtime compatibility can be proven",
@@ -983,9 +1036,17 @@ impl Error {
             Self::RefreshConfigChanged => Some(
                 "service.toml was edited while a search-path refresh was pending. Restore it as the refresh wrote it or as it was before the refresh, then rerun `pohunek service refresh-path`; or run `pohunek service uninstall`, which is session-checked and does not need the file to match the refresh",
             ),
-            Self::RefreshPending { .. } => {
-                Some("rerun `pohunek service refresh-path`; it resumes or rolls back the pending refresh")
-            }
+            Self::RefreshPending {
+                rolling_back: true, ..
+            } => Some(
+                "rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it); it finishes the rollback after judging the live sessions again, and if it refuses with the listed sessions, run `pohunek service refresh-path --accept-runtime-loss` to accept the loss of their runtime or native recovery (it records nothing)",
+            ),
+            Self::RefreshPending { .. } => Some(
+                "rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it); it resumes or rolls back the pending refresh",
+            ),
+            Self::Record { detail, .. } if detail.contains("is unsupported; expected") => Some(
+                "the record was written by a pohunek release with another record schema: rerun the command with the `pohunek` that started the transaction (the `./pohunek` of the release's unpacked archive if you used it, or `<prefix>/bin/pohunek` of the installed release)",
+            ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")
             }

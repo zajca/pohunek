@@ -512,7 +512,8 @@ fn pending_blocked_detail(pending: &service::report::PendingReport) -> String {
     if pending.operation == "refresh_path" {
         format!(
             "an interrupted search-path refresh of version {} stopped after step {}; \
-             rerun `pohunek service refresh-path` to resume or roll it back",
+             rerun `pohunek service refresh-path` with the same `pohunek` (the release's \
+             `./pohunek` if you used it) to resume or roll it back",
             pending.version, pending.step
         )
     } else {

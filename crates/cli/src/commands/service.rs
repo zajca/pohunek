@@ -1051,7 +1051,7 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
 /// installation, so it is no rollback for it.
 fn pending_hint(operation: &str) -> &'static str {
     if operation == "refresh_path" {
-        "rerun `pohunek service refresh-path`"
+        "rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it)"
     } else {
         "rerun it to resume, or uninstall to roll back"
     }
@@ -1745,7 +1745,9 @@ mod tests {
         };
         let refresh = status("refresh_path");
         assert!(
-            refresh.contains("(rerun `pohunek service refresh-path`)"),
+            refresh.contains(
+                "(rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it))"
+            ),
             "{refresh}"
         );
         assert!(!refresh.contains("uninstall"), "{refresh}");

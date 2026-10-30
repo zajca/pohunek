@@ -1360,19 +1360,33 @@ impl<'a> Engine<'a> {
                 return Err(error);
             }
         };
-        match preflight::gate_upgrade(
-            &*self.preflight,
-            self.context,
-            &daemon_dir,
-            self.reported(&record.version),
-            &job.value,
-            &job.variables,
-            plan,
-            self.accept_runtime_loss,
-            &acceptance,
-        )
-        .await
-        {
+        let judged = if record.operation == Operation::RefreshPath {
+            preflight::gate_refresh(
+                &*self.preflight,
+                self.context,
+                &daemon_dir,
+                self.reported(&record.version),
+                &job.value,
+                &job.variables,
+                self.accept_runtime_loss,
+                &acceptance,
+            )
+            .await
+        } else {
+            preflight::gate_upgrade(
+                &*self.preflight,
+                self.context,
+                &daemon_dir,
+                self.reported(&record.version),
+                &job.value,
+                &job.variables,
+                plan,
+                self.accept_runtime_loss,
+                &acceptance,
+            )
+            .await
+        };
+        match judged {
             Ok(mut gated) => {
                 if let Err(error) =
                     require_manager_variables(job, &gated.report, self.accept_runtime_loss)
@@ -3245,21 +3259,41 @@ async fn installed_job_path(context: &Context) -> Result<JobPath, Error> {
 ///
 /// `pending` is the record the upgrade resumes or rolls back: it judges with the
 /// launchd default that transaction journaled, as the gates after it do, and
-/// without one the installed job's `PATH`.
+/// without one the installed job's `PATH`. A pending search-path refresh is
+/// rolled back before the upgrade runs, so it is judged with the recorded path
+/// the rollback restores, not the refresh target the file may still hold.
 ///
 /// # Errors
 ///
-/// See [`job_path`].
+/// See [`job_path`]; [`Error::Record`] for a refresh record whose journal is
+/// missing or names an invalid search path.
 pub(crate) async fn adoption_job_path(
     context: &Context,
     pending: Option<&Record>,
 ) -> Result<JobPath, Error> {
-    match pending {
-        None => installed_job_path(context).await,
-        Some(record) => {
-            installed_job_path_in(context, record.journal_default(), PathUse::Forward).await
-        }
-    }
+    let Some(record) = pending else {
+        return installed_job_path(context).await;
+    };
+    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
+        path: context.config_path(),
+    })?;
+    let config = if record.operation == Operation::RefreshPath {
+        let record_error = |detail: String| Error::Record {
+            path: context.paths().state_dir.join(record::FILE_NAME),
+            detail,
+        };
+        let journal = record
+            .refresh
+            .as_ref()
+            .ok_or_else(|| record_error("a refresh record has no refresh journal".to_owned()))?;
+        let previous = SearchPath::new(journal.previous.clone()).map_err(|error| {
+            record_error(format!("the journaled search path is invalid: {error}"))
+        })?;
+        source.config.with_search_path(previous)?
+    } else {
+        source.config
+    };
+    job_path_for(context, &config, record.journal_default(), PathUse::Forward).await
 }
 
 /// [`installed_job_path`] inside a transaction: `journal_default` is the launchd

@@ -252,10 +252,28 @@ async fn an_early_gate_refusal_changes_nothing_and_the_flag_lets_it_through() {
 
     let error = refresh(harness, false).await.expect_err("refused");
 
-    let Error::UpgradeAtRisk { sessions, .. } = &error else {
+    let Error::RefreshAtRisk {
+        sessions, warnings, ..
+    } = &error
+    else {
         panic!("{error:?}");
     };
     assert_eq!(sessions[0].session_id, SESSION);
+    assert_eq!(error.code(), "service_upgrade_sessions_at_risk");
+    assert!(warnings.is_empty(), "no stale-path warning: {warnings:?}");
+    let hint = error.hint().expect("hint");
+    assert_steps_in_order(
+        hint,
+        &[
+            "`pohunek service refresh-path --accept-runtime-loss`",
+            "accept the loss",
+            "records nothing",
+        ],
+    );
+    assert!(
+        !hint.contains("rerun this upgrade") && !hint.contains("recorded so"),
+        "the hint names no upgrade and no ledger: {hint}"
+    );
     assert_eq!(config_bytes(harness), bytes);
     assert_eq!(inode(harness), node);
     assert_eq!(harness.pending(), None);
@@ -263,7 +281,7 @@ async fn an_early_gate_refusal_changes_nothing_and_the_flag_lets_it_through() {
     let dry = refresh(harness, true)
         .await
         .expect_err("a dry run refuses too");
-    assert!(matches!(dry, Error::UpgradeAtRisk { .. }), "{dry:?}");
+    assert!(matches!(dry, Error::RefreshAtRisk { .. }), "{dry:?}");
 
     let report = refresh_with(
         harness,
@@ -294,7 +312,7 @@ async fn a_late_gate_refusal_restores_the_path_without_touching_the_daemon() {
         .await
         .expect_err("the late gate refuses");
 
-    assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
+    assert!(matches!(error, Error::RefreshAtRisk { .. }), "{error:?}");
     assert_eq!(recorded(harness), [canonical(&r.old)]);
     assert_eq!(config_bytes(harness), bytes, "the old file is back");
     assert_eq!(replaces(harness), replaced, "no replacement was issued");
@@ -327,7 +345,7 @@ async fn a_risk_no_upgrade_accepted_refuses_and_the_flag_leaves_the_ledger_untou
         .await
         .expect_err("the second session was never accepted");
 
-    let Error::UpgradeAtRisk {
+    let Error::RefreshAtRisk {
         stopped_sessions, ..
     } = &error
     else {
@@ -521,14 +539,40 @@ async fn a_refused_rollback_gate_keeps_the_record_rolling_back_until_the_flag_fi
     );
 
     // The other commands refuse to start over it.
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &["rerun the same command", "resumes the rollback"],
+    );
     let error = harness.upgrade(V2).await.expect_err("pending refresh");
     assert_eq!(error.code(), "service_refresh_pending", "{error:?}");
+    assert_steps_in_order(
+        error.hint().expect("hint"),
+        &[
+            "`pohunek service refresh-path`",
+            "`./pohunek`",
+            "`pohunek service refresh-path --accept-runtime-loss`",
+        ],
+    );
     let again = refresh(harness, false).await.expect_err("still refused");
     assert_eq!(
         again.code(),
         "service_rollback_sessions_at_risk",
         "{again:?}"
     );
+    assert!(
+        matches!(again, Error::RefreshRollbackAtRisk { .. }),
+        "{again:?}"
+    );
+    let hint = again.hint().expect("hint");
+    assert_steps_in_order(
+        hint,
+        &[
+            "rerun `pohunek service refresh-path`",
+            "`pohunek service refresh-path --accept-runtime-loss`",
+            "records nothing",
+        ],
+    );
+    assert!(!hint.contains("rerun the upgrade"), "{hint}");
     assert!(harness.pending().expect("kept").rolling_back);
 
     let report = refresh_with(
@@ -652,7 +696,7 @@ async fn a_refresh_that_reached_registering_blocks_upgrade_and_install_and_leave
             assert_eq!(error.code(), "service_refresh_pending", "{step:?} {name}");
             assert_eq!(
                 error.hint(),
-                Some("rerun `pohunek service refresh-path`; it resumes or rolls back the pending refresh")
+                Some("rerun `pohunek service refresh-path` with the same `pohunek` (the release's `./pohunek` if you used it); it resumes or rolls back the pending refresh")
             );
         }
 
@@ -1222,4 +1266,122 @@ async fn a_rollback_over_a_hand_formatted_original_is_finished_by_a_rerun_after_
     assert_eq!(job_path_env(harness), old_env);
     assert_eq!(recorded(harness), [canonical(&r.old)]);
     assert_eq!(harness.pending(), None);
+}
+
+/// Judges a stopped session at risk only when the daemon job's `PATH` holds `dir`.
+#[derive(Debug)]
+struct RiskUnder {
+    inner: InProcessPreflight,
+    dir: String,
+}
+
+impl AdoptionPreflight for RiskUnder {
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        dir: &'a VerifiedVersionDir,
+        search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
+        plan: ReleasePlan,
+    ) -> Judging<'a> {
+        Box::pin(async move {
+            let mut report = self
+                .inner
+                .judge(context, dir, search_path, variables, probe_budget, plan)
+                .await?;
+            if search_path.contains(&self.dir) {
+                report.stopped_sessions = vec![risk_a()];
+            }
+            Ok(report)
+        })
+    }
+}
+
+fn risk_under(dir: &Path) -> RiskUnder {
+    RiskUnder {
+        inner: InProcessPreflight::default(),
+        dir: canonical(dir).display().to_string(),
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_over_a_pending_refresh_judges_the_path_it_runs_with_not_the_target() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Config).await;
+    assert_eq!(
+        recorded(harness),
+        [canonical(&r.new)],
+        "the target is written"
+    );
+
+    // The session is at risk only under the refresh target, which the upgrade
+    // rolls back before it runs.
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &risk_under(&r.new),
+        V2,
+        false,
+    )
+    .await
+    .expect("the check previews the restored path, which is not at risk");
+    assert_eq!(checked.pending_action, Some("roll_back"));
+    assert!(
+        checked
+            .preflight
+            .expect("the check judged")
+            .stopped_sessions
+            .is_empty(),
+        "the restored path is judged"
+    );
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(risk_under(&r.new)))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the upgrade is not refused over a risk of the target");
+    harness.assert_installed(V2);
+    assert_eq!(recorded(harness), [canonical(&r.old)]);
+}
+
+#[tokio::test]
+async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_restored_path() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Config).await;
+    let (bytes, pending) = (config_bytes(harness), record_bytes(harness));
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &risk_under(&r.old),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("the check previews the verdict the upgrade gives");
+    assert!(
+        matches!(checked, Error::UpgradeAtRisk { .. }),
+        "{checked:?}"
+    );
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(risk_under(&r.old)))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("refused before the refresh is rolled back");
+    assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
+    assert_eq!(config_bytes(harness), bytes, "nothing was rolled back");
+    assert_eq!(record_bytes(harness), pending);
+
+    harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(Box::new(risk_under(&r.old)))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the flag accepts the risk the upgrade runs with");
+    harness.assert_installed(V2);
 }

@@ -705,6 +705,7 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::VerifierMissing
         | Error::UnitVerification { .. }
         | Error::UpgradeAtRisk { .. }
+        | Error::RefreshAtRisk { .. }
         | Error::UpgradeStoreUnusable { .. }
         | Error::UpgradeRuntimesRefused { .. }
         | Error::SearchPathUnmanaged

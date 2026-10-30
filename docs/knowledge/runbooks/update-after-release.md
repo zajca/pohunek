@@ -996,7 +996,8 @@ keep their runtime unless the new daemon would not adopt them: the command
 takes the same adoption verdict as an upgrade and refuses with
 `service_upgrade_sessions_at_risk` before changing anything. Do not use
 `--accept-runtime-loss` for this cause, since it would drop resume and fork for
-the listed sessions although the runtime is current. `--dry-run` shows the
+the listed sessions although the runtime is current; on `refresh-path` it
+records nothing. `--dry-run` shows the
 difference and the verdict without a lock. A failure after the write rolls the
 path back and replaces the job with the old one again. `refresh-path` refuses
 while an install or upgrade record is pending
@@ -1009,9 +1010,13 @@ intend to lose it, and see
 https://github.com/zajca/pohunek/issues/1763 (recovery design).
 
 A refresh-path run that was interrupted leaves its own record
-(`pohunek service status` shows operation `refresh_path`). Rerun `pohunek
-service refresh-path` to finish it: it resumes with the path it journaled, or
-finishes a rollback that had begun, and then stops. `install`, `upgrade` and
+(`pohunek service status` shows operation `refresh_path`). Rerun
+`service refresh-path` with the same `pohunek` (the release's `./pohunek` if you
+used it; an installed older `pohunek` refuses the record with
+`service_record_invalid`) to finish it: it resumes with the path it journaled,
+or finishes a rollback that had begun, and then stops. If that rollback is
+refused for sessions at risk, `--accept-runtime-loss` on the same command
+accepts the loss of their runtime or native recovery and records nothing. `install`, `upgrade` and
 `uninstall` roll such a record back while the daemon job was not replaced yet;
 once it was, `install` and `upgrade` refuse with `service_refresh_pending`.
 `service_refresh_config_changed` means `service.toml` was edited while the

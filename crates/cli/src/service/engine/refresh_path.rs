@@ -69,7 +69,7 @@ impl Engine<'_> {
     /// [`Error::DaemonJobMissing`] without a daemon job,
     /// [`Error::RefreshConfigChanged`] when `service.toml` was edited during a
     /// pending refresh that has to act on the file, [`Error::RefreshPending`] for a dry run while one is
-    /// pending, the adoption refusals of an upgrade ([`Error::UpgradeAtRisk`],
+    /// pending, the adoption refusals of an upgrade ([`Error::RefreshAtRisk`],
     /// [`Error::UpgradeStoreUnusable`]) before any effect, and the failing
     /// step's error after a rollback.
     pub(crate) async fn refresh_path(
@@ -440,14 +440,13 @@ impl Engine<'_> {
             })?;
         let daemon_dir = layout::verify_installed(target.layout(), &daemon_dir)?;
         let acceptance = self.acceptance(target.active_version())?;
-        let gated = preflight::gate_upgrade(
+        let gated = preflight::gate_refresh(
             &*self.preflight,
             self.context,
             &daemon_dir,
             self.reported(target.active_version()),
             &job.value,
             &job.variables,
-            preflight::ReleasePlan::Omitted,
             self.accept_runtime_loss,
             &acceptance,
         )
@@ -499,7 +498,21 @@ impl Engine<'_> {
             let job = job_path_for(self.context, &restored, None, PathUse::Rollback).await?;
             gated = Some(
                 self.judge_rollback(layout, &record.version, &daemon_dir, &job)
-                    .await?,
+                    .await
+                    .map_err(|error| match error {
+                        Error::RollbackAtRisk {
+                            version,
+                            sessions,
+                            stopped_sessions,
+                            warnings,
+                        } => Error::RefreshRollbackAtRisk {
+                            version,
+                            sessions,
+                            stopped_sessions,
+                            warnings,
+                        },
+                        other => other,
+                    })?,
             );
         }
         if state == FileState::After {
