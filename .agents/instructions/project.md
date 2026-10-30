@@ -184,7 +184,9 @@ no snapshot guard:
 
 - `events.jsonl`: write-only journal, never read back; each line is a protocol
   `Event` whose enums fall under the protocol enum rule.
-- `session-idle-stop.json`: one optional integer (`default_after_secs`), no enum.
+- `session-idle-stop.json`: one optional integer (`default_after_secs`), no enum. The
+  record is unversioned and strict (`deny_unknown_fields`, a parse error stops the
+  daemon), so a new key needs a format version first.
 - assistant `snapshot.json`: regenerated at every launch in the per-launch runtime
   directory and only handed to the assistant session as prompt input; its `intent`
   string is not read back by any daemon or CLI code.

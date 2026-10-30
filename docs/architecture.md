@@ -996,7 +996,9 @@ serialized field set of a record kind or the serialized value set of a persisted
 enum differs from `crates/daemon/src/store/fixtures/shape/schema-<N>.txt` without
 a schema bump, and when an older schema has no migration step. The sibling guard
 `crates/daemon/src/host_state/records/shape_guard.rs` does the same for
-`governance.json` and `identity.json` against their format versions.
+`governance.json` and `identity.json` against their format versions, and
+`crates/package/src/registry/shape_guard.rs` does it for `registry.json` against
+`REGISTRY_SCHEMA`.
 
 ## Attach Streaming
 

@@ -523,6 +523,9 @@ Daemon, sessions, integrations, and project state:
   enum values) and its `fixtures/shape/schema-<N>.txt` snapshots.
 - `crates/daemon/src/host_state/records/shape_guard.rs` — governance and identity
   record guard and its `host_state/fixtures/*-<N>.txt` snapshots.
+- `crates/package/src/registry/shape_guard.rs` — `registry.json` guard (keys and
+  `PackageSource` values) and its `registry/fixtures/registry-<N>.txt` snapshots,
+  tied to `REGISTRY_SCHEMA`.
 - `crates/protocol/src/version.rs`
 - `crates/worker-protocol/src/version.rs`
 - `scripts/release` — compatibility-constant check against the previous tag.

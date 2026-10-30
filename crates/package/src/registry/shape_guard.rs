@@ -16,8 +16,10 @@
 //!    and register it in [`SNAPSHOTS`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
 
 use protocol::{PackageDigest, PackageId, PackageIdentity, PackageVersion};
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
 use super::{PackageRecord, PackageSource, RegistryState, REGISTRY_SCHEMA};
@@ -62,27 +64,34 @@ fn record(byte: char, id: &str, source: PackageSource) -> PackageRecord {
     }
 }
 
-/// Serialized values of [`PackageSource`]. The `match` has no wildcard arm, so a
-/// variant missing from the list fails to compile.
-fn source_values() -> Vec<String> {
-    let listed = [
-        PackageSource::Official,
-        PackageSource::ExplicitDigest,
-        PackageSource::Link,
-    ];
-    for value in &listed {
-        match value {
-            PackageSource::Official | PackageSource::ExplicitDigest | PackageSource::Link => {}
+/// Serialized values of the listed unit variants of a persisted enum. The list also
+/// feeds a `match` without a wildcard arm, so a variant missing from it fails to
+/// compile, and a listed value must round-trip through strict serde.
+macro_rules! unit_values {
+    ($ty:ident: $($variant:ident),+) => {{
+        let listed = [$($ty::$variant),+];
+        for value in &listed {
+            match value {
+                $($ty::$variant => {})+
+            }
         }
-    }
+        string_values(&listed)
+    }};
+}
+
+fn string_values<T>(listed: &[T]) -> Vec<String>
+where
+    T: Serialize + DeserializeOwned + PartialEq + Debug,
+{
     let values: BTreeSet<String> = listed
         .iter()
         .map(|value| {
-            let json = serde_json::to_value(value).expect("source serializes");
-            let back: PackageSource =
-                serde_json::from_value(json.clone()).expect("source deserializes");
+            let json = serde_json::to_value(value).expect("value serializes");
+            let back: T = serde_json::from_value(json.clone()).expect("value deserializes");
             assert_eq!(&back, value, "a listed value must round-trip");
-            json.as_str().expect("a source is a string").to_owned()
+            json.as_str()
+                .expect("a unit variant is a string")
+                .to_owned()
         })
         .collect();
     values.into_iter().collect()
@@ -91,7 +100,7 @@ fn source_values() -> Vec<String> {
 fn enums() -> Vec<EnumEntry> {
     vec![EnumEntry {
         path: "registry.packages[].source",
-        values: source_values(),
+        values: unit_values!(PackageSource: Official, ExplicitDigest, Link),
     }]
 }
 
