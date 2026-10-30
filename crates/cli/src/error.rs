@@ -834,7 +834,7 @@ const CLI_USAGE_EXIT_CODE: u8 = 2;
 /// Process exit statuses of `pohunek host command run`, one per `command_*`
 /// error class.
 ///
-/// The block 40..=51 is distinct from the generic failure (`1`), the usage error
+/// The block 40..=52 is distinct from the generic failure (`1`), the usage error
 /// (`2`) and the workflow limits (`124`/`125`). A status never carries the
 /// program's own exit code: that travels in the `--json` error's
 /// `details.process_exit`.
@@ -863,34 +863,49 @@ pub(crate) mod command_exit {
     pub(crate) const OUTPUT_NOT_UTF8: u8 = 50;
     /// The command could not be run on the host.
     pub(crate) const UNAVAILABLE: u8 = 51;
+    /// A `command_*` error code this build does not know, from a newer daemon.
+    pub(crate) const UNRECOGNIZED: u8 = 52;
 }
 
 /// The exit status of a `command.run` error, or `None` for any other error.
 ///
-/// Every [`protocol::CommandErrorKind`] has a status; a kind added later falls
-/// back to the generic failure until it gets one.
+/// Every [`protocol::CommandErrorKind`] has its own status. A `command_*` code
+/// no kind of this build carries exits [`command_exit::UNRECOGNIZED`], so a
+/// script can tell a newer daemon's refusal from an unreachable host (`1`).
 pub(crate) fn command_exit_code(error: &ProtocolError) -> Option<u8> {
     use protocol::CommandErrorKind as Kind;
-    let table = [
-        (Kind::Unsupported, command_exit::UNSUPPORTED),
-        (
-            Kind::PackageNotInstalled,
-            command_exit::PACKAGE_NOT_INSTALLED,
-        ),
-        (Kind::NotSelected, command_exit::NOT_SELECTED),
-        (Kind::PackageDisabled, command_exit::PACKAGE_DISABLED),
-        (Kind::NotDeclared, command_exit::NOT_DECLARED),
-        (Kind::NotExposed, command_exit::NOT_EXPOSED),
-        (Kind::Busy, command_exit::BUSY),
-        (Kind::Failed, command_exit::FAILED),
-        (Kind::TimedOut, command_exit::TIMED_OUT),
-        (Kind::OutputTooLarge, command_exit::OUTPUT_TOO_LARGE),
-        (Kind::OutputNotUtf8, command_exit::OUTPUT_NOT_UTF8),
-        (Kind::Unavailable, command_exit::UNAVAILABLE),
-    ];
-    table
-        .into_iter()
-        .find_map(|(kind, status)| (kind.code() == error.code).then_some(status))
+    let known = Kind::ALL.into_iter().find(|kind| kind.code() == error.code);
+    match known {
+        Some(kind) => Some(command_kind_status(kind)),
+        None => error
+            .code
+            .starts_with(COMMAND_CODE_PREFIX)
+            .then_some(command_exit::UNRECOGNIZED),
+    }
+}
+
+/// Prefix of every `command.run` error code.
+const COMMAND_CODE_PREFIX: &str = "command_";
+
+/// The status of `kind`; a kind added to the protocol later exits
+/// [`command_exit::UNRECOGNIZED`] until it gets its own.
+fn command_kind_status(kind: protocol::CommandErrorKind) -> u8 {
+    use protocol::CommandErrorKind as Kind;
+    match kind {
+        Kind::Unsupported => command_exit::UNSUPPORTED,
+        Kind::PackageNotInstalled => command_exit::PACKAGE_NOT_INSTALLED,
+        Kind::NotSelected => command_exit::NOT_SELECTED,
+        Kind::PackageDisabled => command_exit::PACKAGE_DISABLED,
+        Kind::NotDeclared => command_exit::NOT_DECLARED,
+        Kind::NotExposed => command_exit::NOT_EXPOSED,
+        Kind::Busy => command_exit::BUSY,
+        Kind::Failed => command_exit::FAILED,
+        Kind::TimedOut => command_exit::TIMED_OUT,
+        Kind::OutputTooLarge => command_exit::OUTPUT_TOO_LARGE,
+        Kind::OutputNotUtf8 => command_exit::OUTPUT_NOT_UTF8,
+        Kind::Unavailable => command_exit::UNAVAILABLE,
+        _ => command_exit::UNRECOGNIZED,
+    }
 }
 
 /// Whether a raw argv requested `--json`.

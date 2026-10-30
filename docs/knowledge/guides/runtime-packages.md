@@ -539,7 +539,10 @@ expose = "peers"              # "local" (default) or "peers"
   `descriptor_invalid`; an archive cannot contain a symbolic link.
 - `args` holds at most 64 arguments of 1 to 1024 bytes without control
   characters, passed literally: there are no placeholders, and a call supplies
-  no argument, environment variable or input of its own.
+  no argument, environment variable or input of its own. Unicode format
+  characters (bidirectional controls, zero-width characters) are accepted, so a
+  client that shows the arguments for consent must escape them; the CLI prints
+  each argument in its debug form.
 - `expose` says who may call the command. `local` (the default) means the
   owner's local control socket only. `peers` means every overlay peer the
   overlay policy admits, which can already launch any approved profile on the
@@ -984,6 +987,7 @@ exits with a status of its own, so a script can branch without parsing text:
 `command_not_selected`, 43 `command_package_disabled`, 44
 `command_not_declared`, 45 `command_not_exposed`, 46 `command_busy`, 47
 `command_failed`, 48 `command_timed_out`, 49 `command_output_too_large`, 50
-`command_output_not_utf8`, 51 `command_unavailable`. The program's own exit
+`command_output_not_utf8`, 51 `command_unavailable`, 52 any other `command_*`
+code (a newer daemon's error this CLI does not know). The program's own exit
 status or signal is in the `--json` error's `details.process_exit`, not in the
 exit status. Any other failure exits 1 and a usage error 2.

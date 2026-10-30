@@ -642,7 +642,10 @@ Shared payloads:
   `[commands.<name>]` tables, gated by the runtime feature
   `package-commands-v1`; a call supplies no argument, environment or input of
   its own. `package.install` and `package.link` list them so the owner reviews
-  and consents to the program, arguments and exposure before the install.
+  and consents to the program, arguments and exposure before the install. An
+  argument may contain Unicode format characters (bidirectional controls,
+  zero-width characters); a client that shows arguments for consent escapes
+  them, as the CLI does.
   `command.run` calls one (see [Package Commands](#package-commands)).
 - `PackageTrust`, a tagged object: `{"kind":"explicit_digest","digest":...}`
   requires the archive digest to equal `digest` and never authorizes an

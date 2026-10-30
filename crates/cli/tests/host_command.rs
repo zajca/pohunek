@@ -51,6 +51,9 @@ const OK_OUTPUT: &str = "h\u{e9}llo \u{4e16}\u{754c}\nsecond line\n";
 /// Exit status of a usage error.
 const USAGE_STATUS: i32 = 2;
 
+/// Exit status of a `command_*` error code no known kind carries.
+const UNRECOGNIZED_STATUS: i32 = 52;
+
 /// The fixture program. `$1` is the work directory, `$2` the mode and `$3` the
 /// command's tag; the modes are fixed in the descriptor's `args`.
 const SCRIPT: &str = r#"#!/bin/sh
@@ -59,6 +62,9 @@ case "$mode" in
 ok)
   : > "$dir/$id.ran"
   printf 'h\303\251llo \344\270\226\347\225\214\nsecond line\n'
+  ;;
+bare)
+  printf 'no newline'
   ;;
 exit)
   exit 3
@@ -78,8 +84,9 @@ esac
 "#;
 
 /// Commands of the fixture: name, mode, exposure.
-const COMMANDS: [(&str, &str, &str); 6] = [
+const COMMANDS: [(&str, &str, &str); 7] = [
     ("ok", "ok", "peers"),
+    ("bare", "bare", "peers"),
     ("ok-local", "ok", "local"),
     ("exit-three", "exit", "peers"),
     ("badutf8", "badutf8", "peers"),
@@ -229,6 +236,18 @@ async fn success_prints_output_verbatim() {
     assert_eq!(output.stdout, OK_OUTPUT.as_bytes());
     assert!(output.stderr.is_empty(), "{}", stderr_text(&output));
     assert!(harness.work().join("ok.ran").exists());
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn success_adds_no_newline_to_the_output() {
+    let harness = Harness::start().await;
+    harness.install_commands().await;
+
+    let output = harness.run_command(PACKAGE, "bare", &[]).await;
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_text(&output));
+    assert_eq!(output.stdout, b"no newline");
     harness.stop().await;
 }
 
@@ -499,8 +518,12 @@ async fn a_local_only_command_is_not_exposed_over_a_peer() {
     harness.stop().await;
 }
 
-#[test]
-fn a_daemon_without_the_method_exits_40() {
+/// Runs `host command run local` against a scripted daemon that answers every
+/// request with `error`, passing `run` a closure that invokes the CLI.
+fn against_scripted_daemon<T>(
+    error: &protocol::ProtocolError,
+    check: impl FnOnce(&dyn Fn(&[&str]) -> std::process::Output) -> T,
+) -> T {
     let env = TestEnv::new().expect("private CLI environment");
     let runtime = env.runtime_dir().join("pohunek");
     fs::create_dir(&runtime).expect("create the daemon socket directory");
@@ -513,23 +536,21 @@ fn a_daemon_without_the_method_exits_40() {
     let ending = Arc::new(AtomicBool::new(false));
     let server = {
         let ending = Arc::clone(&ending);
+        let error = error.clone();
         std::thread::spawn(move || {
             while let Ok((connection, _)) = listener.accept() {
                 if ending.load(Ordering::SeqCst) {
                     break;
                 }
+                let error = error.clone();
                 std::thread::spawn(move || {
                     let mut writer = connection.try_clone().expect("clone the connection");
                     for line in BufReader::new(connection).lines() {
                         let Ok(line) = line else { break };
                         let request: Request =
                             serde_json::from_str(&line).expect("one request line");
-                        let response = Response::err(
-                            PROTOCOL_VERSION,
-                            request.id(),
-                            protocol::ProtocolError::method_not_found(request.method()),
-                        )
-                        .expect("response");
+                        let response = Response::err(PROTOCOL_VERSION, request.id(), error.clone())
+                            .expect("response");
                         writeln!(
                             writer,
                             "{}",
@@ -549,23 +570,95 @@ fn a_daemon_without_the_method_exits_40() {
             .output()
             .expect("run CLI")
     };
-    let json = run(&["--json"]);
-    assert_eq!(json.status.code(), Some(40), "{json:?}");
-    let document: Value = serde_json::from_slice(&json.stdout).expect("one JSON document");
-    assert_eq!(document["err"]["code"], "command_unsupported", "{document}");
-    assert!(document["err"]["recover"].is_string(), "{document}");
-
-    let human = run(&[]);
-    assert_eq!(human.status.code(), Some(40), "{human:?}");
-    assert!(human.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&human.stderr).contains("does not support package commands"),
-        "{human:?}"
-    );
+    let outcome = check(&run);
 
     ending.store(true, Ordering::SeqCst);
     drop(std::os::unix::net::UnixStream::connect(&socket).expect("end the fixture daemon"));
     server.join().expect("the fixture daemon ends");
+    outcome
+}
+
+#[test]
+fn a_daemon_without_the_method_exits_40() {
+    let error = protocol::ProtocolError::method_not_found("command.run");
+    against_scripted_daemon(&error, |run| {
+        let json = run(&["--json"]);
+        assert_eq!(json.status.code(), Some(40), "{json:?}");
+        let document: Value = serde_json::from_slice(&json.stdout).expect("one JSON document");
+        assert_eq!(document["err"]["code"], "command_unsupported", "{document}");
+        assert!(document["err"]["recover"].is_string(), "{document}");
+
+        let human = run(&[]);
+        assert_eq!(human.status.code(), Some(40), "{human:?}");
+        assert!(human.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&human.stderr).contains("does not support package commands"),
+            "{human:?}"
+        );
+    });
+}
+
+#[test]
+fn every_command_error_kind_exits_with_its_own_status() {
+    let mut seen = std::collections::BTreeMap::new();
+    for kind in protocol::CommandErrorKind::ALL {
+        let error = protocol::ProtocolError::from(kind);
+        // A daemon never sends `command_unsupported`; the client derives it
+        // from `method_not_found`, so that kind is scripted that way.
+        let scripted = if kind == protocol::CommandErrorKind::Unsupported {
+            protocol::ProtocolError::method_not_found("command.run")
+        } else {
+            error
+        };
+        let status = against_scripted_daemon(&scripted, |run| {
+            let output = run(&["--json"]);
+            let document: Value =
+                serde_json::from_slice(&output.stdout).expect("one JSON document");
+            assert_eq!(document["err"]["code"], kind.code(), "{document}");
+            output.status.code().expect("an exit status")
+        });
+        assert!(
+            (40..UNRECOGNIZED_STATUS).contains(&status),
+            "{}: status {status} is outside the command block",
+            kind.code()
+        );
+        if let Some(other) = seen.insert(status, kind.code()) {
+            panic!("{} and {other} share status {status}", kind.code());
+        }
+    }
+}
+
+#[test]
+fn an_unknown_command_error_exits_52_and_a_foreign_error_exits_1() {
+    let unknown = protocol::ProtocolError::new(
+        protocol::ErrorClass::Runtime,
+        "command_from_a_newer_daemon",
+        "fixed text",
+        None,
+    );
+    against_scripted_daemon(&unknown, |run| {
+        let json = run(&["--json"]);
+        assert_eq!(json.status.code(), Some(UNRECOGNIZED_STATUS), "{json:?}");
+        let document: Value = serde_json::from_slice(&json.stdout).expect("one JSON document");
+        assert_eq!(
+            document["err"]["code"], "command_from_a_newer_daemon",
+            "{document}"
+        );
+        let human = run(&[]);
+        assert_eq!(human.status.code(), Some(UNRECOGNIZED_STATUS), "{human:?}");
+        assert!(human.stdout.is_empty(), "{human:?}");
+    });
+
+    let foreign = protocol::ProtocolError::new(
+        protocol::ErrorClass::Runtime,
+        "session_busy",
+        "fixed text",
+        None,
+    );
+    against_scripted_daemon(&foreign, |run| {
+        let output = run(&["--json"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+    });
 }
 
 #[test]

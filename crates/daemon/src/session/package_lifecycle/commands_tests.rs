@@ -244,6 +244,51 @@ async fn commands_need_the_package_commands_feature() {
 }
 
 #[tokio::test]
+async fn a_schema_fault_is_reported_before_a_missing_feature_requirement() {
+    let fixture = Fixture::new("commands-fault-order");
+    // Both documents break the schema and use `[commands]` without `requires`.
+    let runtime_with_commands = {
+        let base = Package::build(PACKAGE, "1.0.0", RUNTIME, INERT_PROGRAM);
+        let mut entries = package::read_archive(&base.bytes, &package::Limits::DEFAULT)
+            .expect("the fixture archive reads")
+            .entries()
+            .to_vec();
+        for entry in &mut entries {
+            if entry.path == "runtime.toml" {
+                let text = String::from_utf8(entry.contents.clone()).expect("utf-8 descriptor");
+                entry.contents = format!(
+                    "{}{HOST_STATE_COMMAND}",
+                    text.replacen("schema = 1", "schema = 2", 1)
+                )
+                .into_bytes();
+            }
+        }
+        Package::from_entries(&entries)
+    };
+    let commands_only = Package::with_descriptor_and_command_files(
+        &commands_document(COMMANDS_PACKAGE, "1.0.0", false, HOST_STATE_COMMAND).replacen(
+            "schema = 1",
+            "schema = 2",
+            1,
+        ),
+    );
+    let before = fixture.snapshot();
+    for (label, package) in [
+        ("runtime next to commands", &runtime_with_commands),
+        ("commands only", &commands_only),
+    ] {
+        let path = fixture.write_archive(package);
+        let refusal = fixture
+            .registry
+            .package_install(accepted(&path, package, true, true))
+            .await
+            .expect_err(label);
+        assert_eq!(refusal, PackageErrorKind::DescriptorInvalid, "{label}");
+    }
+    assert_eq!(fixture.snapshot(), before, "nothing was recorded");
+}
+
+#[tokio::test]
 async fn a_linked_directory_keeps_the_program_rules() {
     let fixture = Fixture::new("commands-link");
     let directory = temp_dir("commands-link-source");
@@ -457,33 +502,35 @@ async fn a_request_without_the_opt_in_is_refused_for_every_package_that_declares
         assert_eq!(installed.commands.len(), 1);
     }
 
-    // A linked directory is held to the same rule.
-    let directory = temp_dir("commands-opt-in-link");
-    fs::create_dir_all(directory.join("bin")).expect("create the program directory");
-    fs::write(
-        directory.join("runtime.toml"),
-        commands_document("means.linked", "1.0.0", true, HOST_STATE_COMMAND),
-    )
-    .expect("write the descriptor");
-    let program = directory.join(LINK_PROGRAM);
-    fs::write(&program, b"#!/bin/sh\n").expect("write the program");
-    fs::set_permissions(
-        &program,
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .expect("set the mode");
-    let before = fixture.snapshot();
-    let refusal = fixture
-        .registry
-        .package_link(PackageLinkParams {
-            directory: directory.to_str().expect("utf-8 path").to_owned(),
-            dry_run: false,
-            accept_commands: false,
-        })
-        .await
-        .expect_err("an old-style link is refused");
-    assert_eq!(refusal, PackageErrorKind::CommandsClientUnsupported);
-    assert_eq!(fixture.snapshot(), before, "nothing was written");
+    // A linked directory is held to the same rule, whether it exports commands
+    // only or a runtime as well, and a dry run is refused too.
+    for package in &packages {
+        let directory = temp_dir("commands-opt-in-link");
+        let archive = package::read_archive(&package.bytes, &package::Limits::DEFAULT)
+            .expect("the fixture archive reads");
+        for entry in archive.entries() {
+            let target = directory.join(&entry.path);
+            fs::create_dir_all(target.parent().expect("entry parent")).expect("create a directory");
+            fs::write(&target, &entry.contents).expect("write a package file");
+            let mode = if entry.executable { 0o755 } else { 0o644 };
+            fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .expect("set the mode");
+        }
+        let before = fixture.snapshot();
+        for dry_run in [true, false] {
+            let refusal = fixture
+                .registry
+                .package_link(PackageLinkParams {
+                    directory: directory.to_str().expect("utf-8 path").to_owned(),
+                    dry_run,
+                    accept_commands: false,
+                })
+                .await
+                .expect_err("an old-style link is refused");
+            assert_eq!(refusal, PackageErrorKind::CommandsClientUnsupported);
+            assert_eq!(fixture.snapshot(), before, "nothing was written");
+        }
+    }
 }
 
 #[tokio::test]
@@ -529,14 +576,18 @@ async fn a_catalog_cannot_authorize_a_package_that_exports_commands_only() {
         &key,
         catalog(8, vec![entry(&both, PACKAGE, RUNTIME, "1.0.0")]),
     );
-    let refusal = fixture
-        .registry
-        .package_install(protocol::PackageInstallParams {
-            accept_commands: true,
-            ..catalog_install(&fixture, &both, &document, false)
-        })
-        .await
-        .expect_err("an official package may not declare commands yet");
-    assert_eq!(refusal, PackageErrorKind::Untrusted);
-    assert_eq!(state(&fixture).high_water(), None);
+    let before = fixture.snapshot();
+    for dry_run in [true, false] {
+        let refusal = fixture
+            .registry
+            .package_install(protocol::PackageInstallParams {
+                accept_commands: true,
+                ..catalog_install(&fixture, &both, &document, dry_run)
+            })
+            .await
+            .expect_err("an official package may not declare commands yet");
+        assert_eq!(refusal, PackageErrorKind::Untrusted);
+        assert_eq!(fixture.snapshot(), before, "no package was recorded");
+        assert_eq!(state(&fixture).high_water(), None);
+    }
 }

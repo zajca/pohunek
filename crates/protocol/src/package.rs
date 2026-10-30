@@ -275,6 +275,11 @@ pub struct CommandInfo {
     /// Package-relative path of the executable the command runs.
     pub program: String,
     /// Fixed arguments, passed literally.
+    ///
+    /// An argument may contain Unicode format characters (bidirectional
+    /// controls, zero-width characters), which the descriptor checks accept. A
+    /// consumer that shows the arguments for consent escapes them first, as
+    /// the `pohunek` CLI does by printing each argument in its debug form.
     pub args: Vec<String>,
     /// Who may call the command.
     pub expose: CommandExposure,

@@ -151,25 +151,23 @@ impl RawExpose {
     }
 }
 
-/// Classifies `descriptor` by the exports it declares, after the feature
-/// checks that must win over any shape error.
+/// Classifies `descriptor` by the exports it declares, after the `requires`
+/// check that must win over any shape error.
 ///
 /// `requires` is checked first so an unknown feature wins over the parse error
-/// of a key only that feature's core understands, and the feature gates are
-/// checked before the commands are read so a `[commands]` table without
-/// `requires = ["package-commands-v1"]` is reported as a missing feature.
+/// of a key only that feature's core understands. The feature gates run later,
+/// after the schema and runtime API checks, in the parser of each export.
 ///
 /// # Errors
 ///
-/// The `requires` and gate errors of [`check_requires`] and [`check_gates`],
-/// and [`DefinitionError::Field`] for a runtime group that is only partly
-/// declared or a descriptor that exports neither a runtime nor commands.
+/// The `requires` errors of [`check_requires`], and [`DefinitionError::Field`]
+/// for a runtime group that is only partly declared or a descriptor that
+/// exports neither a runtime nor commands.
 pub(super) fn classify(
     descriptor: &Table,
     features: &FeatureTables<'_>,
 ) -> Result<Exports, DefinitionError> {
     check_requires(descriptor, features)?;
-    check_gates(descriptor, features)?;
     let declared = RUNTIME_GROUP
         .iter()
         .filter(|key| descriptor.contains_key(**key))
@@ -195,14 +193,19 @@ pub(super) fn classify(
 
 /// Parses a command-only descriptor into its identity and commands.
 ///
+/// The checks run in the order a runtime descriptor meets them: the document
+/// shape, the schema and runtime API, the feature gates, then the commands.
+///
 /// # Errors
 ///
 /// [`DefinitionError::Malformed`] when the document does not match the
 /// command-only schema, the schema and runtime API errors of a runtime
-/// descriptor, and the errors of [`commands_of`].
+/// descriptor, the gate errors of [`check_gates`], and the errors of
+/// [`commands_of`].
 pub(super) fn parse_commands_only(
     source: &str,
     descriptor: &Table,
+    features: &FeatureTables<'_>,
     executable: impl Fn(&str) -> Option<bool>,
 ) -> Result<PackageDescriptor, DefinitionError> {
     let raw: RawCommandsDocument =
@@ -215,6 +218,7 @@ pub(super) fn parse_commands_only(
             found: raw.runtime_api,
         });
     }
+    check_gates(descriptor, features)?;
     let identity = PackageIdentity {
         id: PackageId::parse(&raw.id).map_err(|source| DefinitionError::Identifier {
             field: "id",
@@ -289,7 +293,10 @@ fn validated(
 ) -> Result<CommandInfo, DefinitionError> {
     let field = |field, reason| DefinitionError::Field { field, reason };
     if raw.program.is_empty() || raw.program.len() > MAX_ARG_BYTES {
-        return Err(field("commands.program", "must be 1..=1024 bytes"));
+        return Err(field(
+            "commands.program",
+            "must be non-empty and within the argument length limit",
+        ));
     }
     if executable(&raw.program) != Some(true) {
         return Err(field(

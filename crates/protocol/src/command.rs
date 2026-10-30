@@ -98,6 +98,45 @@ pub enum CommandErrorKind {
 }
 
 impl CommandErrorKind {
+    /// Every kind this build knows, in declaration order.
+    ///
+    /// [`Self::ordinal`] matches every variant without a wildcard, so adding a
+    /// variant fails to compile until it has the next ordinal; list it here at
+    /// that position and grow the array. A compile-time assertion keeps the
+    /// listed kinds in ordinal order.
+    pub const ALL: [Self; 12] = [
+        Self::Unsupported,
+        Self::PackageNotInstalled,
+        Self::NotSelected,
+        Self::NotDeclared,
+        Self::NotExposed,
+        Self::PackageDisabled,
+        Self::Busy,
+        Self::Failed,
+        Self::TimedOut,
+        Self::OutputTooLarge,
+        Self::OutputNotUtf8,
+        Self::Unavailable,
+    ];
+
+    /// Position of the kind in [`Self::ALL`].
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Unsupported => 0,
+            Self::PackageNotInstalled => 1,
+            Self::NotSelected => 2,
+            Self::NotDeclared => 3,
+            Self::NotExposed => 4,
+            Self::PackageDisabled => 5,
+            Self::Busy => 6,
+            Self::Failed => 7,
+            Self::TimedOut => 8,
+            Self::OutputTooLarge => 9,
+            Self::OutputNotUtf8 => 10,
+            Self::Unavailable => 11,
+        }
+    }
+
     /// The stable wire error code.
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -164,6 +203,17 @@ impl CommandErrorKind {
         }
     }
 }
+
+const _: () = {
+    let mut index = 0;
+    while index < CommandErrorKind::ALL.len() {
+        assert!(
+            CommandErrorKind::ALL[index].ordinal() == index,
+            "CommandErrorKind::ALL is out of declaration order"
+        );
+        index += 1;
+    }
+};
 
 impl From<CommandErrorKind> for ProtocolError {
     fn from(kind: CommandErrorKind) -> Self {
