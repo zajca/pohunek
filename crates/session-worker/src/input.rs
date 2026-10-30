@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(&*log.lock().expect("write log"), b"a0a1b0");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_plan_that_cannot_retake_the_pty_stops_after_its_written_fragments() {
         const STALL: Duration = Duration::from_millis(50);
 
@@ -848,6 +848,11 @@ mod tests {
         });
         tokio::task::yield_now().await;
         release.send(()).expect("release the body");
+        // The attach write holds the PTY once it is parked; the plan's retake
+        // then waits on the stall, which the test elapses by hand because a
+        // running blocking write stops the clock from advancing by itself.
+        entered.notified().await;
+        tokio::time::advance(STALL).await;
 
         let error = control
             .await
