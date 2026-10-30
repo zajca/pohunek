@@ -5,6 +5,8 @@
 //!   `--service-config <config>/pohunek/service.toml`, so workers become
 //!   native service jobs exactly as under the login service. Without
 //!   `service.toml` this fails fast and points at `pohunek service install`.
+//!   The active version directory is verified like the service manager's own
+//!   run, so a directory another account could have changed is refused.
 //! - `--dev-subprocess`: run the `pohunekd` next to this CLI (or on `PATH`)
 //!   with `POHUNEK_WORKER_LAUNCHER=subprocess` and no service configuration,
 //!   for development and tests.
@@ -22,6 +24,7 @@ use std::process::Command;
 use pohunek_service_config::ServiceConfig;
 
 use crate::error::CliError;
+use crate::service::layout::{self, VerifiedVersionDir};
 
 /// The daemon binary name.
 const DAEMON_BIN: &str = "pohunekd";
@@ -52,7 +55,9 @@ pub(crate) enum Mode {
 /// # Errors
 ///
 /// Returns [`CliError::ServiceNotInstalled`] in service mode without
-/// `service.toml`, [`CliError::Service`] for an invalid one, and
+/// `service.toml`, [`CliError::Service`] for an invalid one or an active
+/// version directory that fails `layout::verify_installed`
+/// (`service_version_untrusted`), and
 /// [`CliError::Spawn`] if the daemon binary cannot be located or launched.
 pub(crate) fn start(detach: bool, mode: Mode) -> Result<(), CliError> {
     let mut command = daemon_command(mode)?;
@@ -84,14 +89,18 @@ fn daemon_command(mode: Mode) -> Result<Command, CliError> {
             }
             let config = ServiceConfig::load(&config_path)
                 .map_err(|error| CliError::Service(error.into()))?;
-            Ok(service_command(&config.daemon_executable(), &config_path))
+            let active = layout::verify_installed(config.layout(), &config.version_dir())
+                .map_err(CliError::Service)?;
+            Ok(service_command(&active, &config_path))
         }
         Mode::DevSubprocess => Ok(dev_command(&locate_daemon()?)),
     }
 }
 
-fn service_command(daemon: &Path, config_path: &Path) -> Command {
-    let mut command = Command::new(daemon);
+/// The service daemon command. It takes the verified version directory, so an
+/// unverified daemon executable cannot be run from here.
+fn service_command(active: &VerifiedVersionDir, config_path: &Path) -> Command {
+    let mut command = Command::new(active.daemon());
     command.arg(SERVICE_CONFIG_FLAG).arg(config_path);
     command
 }
@@ -181,8 +190,12 @@ mod tests {
     #[test]
     fn service_mode_passes_only_the_service_config() {
         let command = service_command(
-            Path::new("/p/libexec/pohunek/1.0.0/pohunekd"),
+            &layout::operator_release_for_test(Path::new("/p/libexec/pohunek/1.0.0")),
             Path::new("/c/pohunek/service.toml"),
+        );
+        assert_eq!(
+            command.get_program(),
+            OsStr::new("/p/libexec/pohunek/1.0.0/pohunekd")
         );
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
