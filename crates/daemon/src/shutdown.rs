@@ -13,6 +13,11 @@
 //! Drivers are cooperative: shutdown asks them to stop and waits. A driver
 //! still running at the phase bound is named in the report and left running;
 //! it is never aborted, so a store transaction it holds is not cut in half.
+//!
+//! Dropping the async runtime is the last step ([`drop_runtime`]). Tokio waits
+//! for every blocking thread there without a bound, so the drop is bounded by
+//! [`pohunek_service_config::RUNTIME_DROP_BOUND`]: a blocking write that never returns is named by the
+//! registry phase and left behind when the process exits.
 
 // Rust guideline compliant 2026-10-28
 
@@ -26,6 +31,7 @@ use pohunek_service_config::{
     Deadlines, ShutdownShortfall, DEFAULT_CREATE_DRAIN, DEFAULT_DRIVER_SHUTDOWN,
     DEFAULT_EVENT_LOG_FLUSH, DEFAULT_REGISTRY_SHUTDOWN,
 };
+use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, warn};
@@ -473,6 +479,35 @@ impl DaemonShutdown {
     }
 }
 
+/// What [`drop_runtime`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeDropReport {
+    /// Whether the drop gave up at its bound with a blocking task still
+    /// running; it ends with the process.
+    pub timed_out: bool,
+}
+
+/// Drops `runtime`, waiting at most `bound` for its blocking threads.
+///
+/// A blocking task that is still running at the bound is left behind and ends
+/// with the process, so a blocking write that never returns cannot keep the
+/// daemon alive past its exit timeout. A write that returns inside the bound
+/// completes normally.
+pub fn drop_runtime(runtime: Runtime, bound: Duration) -> RuntimeDropReport {
+    // The deadline is on the monotonic clock: `shutdown_timeout` blocks the
+    // calling thread outside any async context.
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(bound);
+    let timed_out = started.elapsed() >= bound;
+    if timed_out {
+        warn!(
+            bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            "daemon runtime drop reached its bound with blocking tasks still running; they end with the process"
+        );
+    }
+    RuntimeDropReport { timed_out }
+}
+
 /// Stops every slot of `stage` together and waits until `deadline`; returns
 /// the names of the tasks still running then.
 async fn stop_stage(
@@ -513,7 +548,8 @@ mod tests {
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
-    use pohunek_service_config::SHUTDOWN_MARGIN;
+    use pohunek_service_config::{RUNTIME_DROP_BOUND, SHUTDOWN_MARGIN};
+    use pohunek_test_support::wait::HANG_GUARD;
 
     use super::*;
     use crate::session::SessionRegistryConfig;
@@ -816,5 +852,98 @@ mod tests {
         late.stop().await;
         tokio::task::yield_now().await;
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// A multi-thread runtime with one blocking task that runs until the
+    /// returned sender is used or dropped; returns once the task is running.
+    fn runtime_with_blocking_task(
+        finished: Arc<AtomicBool>,
+    ) -> (Runtime, std::sync::mpsc::Sender<()>) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        drop(runtime.spawn_blocking(move || {
+            started.send(()).expect("test is waiting");
+            let _ = held.recv();
+            finished.store(true, Ordering::SeqCst);
+        }));
+        running
+            .recv_timeout(HANG_GUARD)
+            .expect("the blocking task started");
+        (runtime, release)
+    }
+
+    /// Runs `drop_runtime` on its own thread so a drop that hangs fails the
+    /// test at the hang guard instead of stalling it.
+    fn drop_on_thread(runtime: Runtime, bound: Duration) -> RuntimeDropReport {
+        let (done, report) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            done.send(drop_runtime(runtime, bound)).expect("test waits");
+        });
+        let report = report
+            .recv_timeout(HANG_GUARD)
+            .expect("the runtime drop returned");
+        thread.join().expect("drop thread");
+        report
+    }
+
+    #[test]
+    fn runtime_drop_is_bounded_when_a_blocking_task_never_returns() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let (runtime, release) = runtime_with_blocking_task(Arc::clone(&finished));
+
+        // timing-allowed: #1725 the bound is the behavior under test; the task
+        // only returns after the drop gave up, so the bound always expires
+        let report = drop_on_thread(runtime, Duration::from_millis(50));
+
+        assert_eq!(report, RuntimeDropReport { timed_out: true });
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the wedged task was left running, not aborted"
+        );
+        release.send(()).expect("the wedged task is still waiting");
+    }
+
+    #[test]
+    fn runtime_drop_returns_at_once_when_nothing_blocks() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        let report = drop_on_thread(runtime, HANG_GUARD);
+
+        assert_eq!(report, RuntimeDropReport { timed_out: false });
+    }
+
+    #[test]
+    fn a_blocking_write_that_finishes_inside_the_drop_bound_completes() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let (runtime, release) = runtime_with_blocking_task(Arc::clone(&finished));
+        let (done, report) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            done.send(drop_runtime(runtime, HANG_GUARD))
+                .expect("test waits");
+        });
+
+        // The drop cannot return before the task does: its bound is the hang
+        // guard, far above the time the release takes.
+        release.send(()).expect("the task is waiting");
+        let report = report
+            .recv_timeout(HANG_GUARD)
+            .expect("the runtime drop returned");
+        thread.join().expect("drop thread");
+
+        assert!(finished.load(Ordering::SeqCst), "the write ran to its end");
+        assert!(!report.timed_out);
+    }
+
+    #[test]
+    fn runtime_drop_bound_fits_inside_the_shutdown_margin() {
+        assert!(
+            RUNTIME_DROP_BOUND < SHUTDOWN_MARGIN,
+            "the margin keeps room for process teardown after the drop"
+        );
     }
 }

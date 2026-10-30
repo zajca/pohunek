@@ -1837,7 +1837,7 @@ impl SessionRegistry {
         let session_id = record.session_id.clone();
         self.inner
             .background
-            .spawn_blocking(move || store.record_session(&record))
+            .spawn_blocking("record_session", move || store.record_session(&record))
             .await
             .map_err(|_join_error| {
                 runtime_error(
@@ -1983,7 +1983,9 @@ impl SessionRegistry {
         let outcome = self
             .inner
             .background
-            .spawn_blocking(move || store.record_session_if_current(&expected, &record))
+            .spawn_blocking("record_session_if_current", move || {
+                store.record_session_if_current(&expected, &record)
+            })
             .await
             .map_err(|_join_error| {
                 runtime_error(
@@ -2061,7 +2063,7 @@ impl SessionRegistry {
         let session_id = id.0.clone();
         self.inner
             .background
-            .spawn_blocking(move || store.remove_session(&session_id))
+            .spawn_blocking("remove_session", move || store.remove_session(&session_id))
             .await
             .map_err(|_join_error| {
                 runtime_error(
@@ -2119,7 +2121,7 @@ impl SessionRegistry {
         self.store_for_write()?;
         self.inner
             .background
-            .spawn_blocking(move || {
+            .spawn_blocking("cleanup_session_worktrees", move || {
                 let mut warnings = Vec::new();
                 let cleanup = worktree.cleanup_session(&session_id, &mut warnings)?;
                 Ok((warnings, cleanup))
@@ -3010,63 +3012,69 @@ impl SessionRegistry {
         self.store_for_write()?;
         self.inner
             .background
-            .spawn_blocking(move || -> Result<ProjectRemoveResult, ProtocolError> {
-                // Resolve first so a missing/ambiguous reference errors before any
-                // worktree is touched, and so we have the id to scope the prune.
-                let record = projects.resolve(&reference)?;
-                let (pruned_count, skipped_worktrees) = if prune_worktrees {
-                    match &worktree {
-                        Some(manager) => {
-                            let skip: HashSet<PathBuf> =
-                                live.iter().map(|(path, _)| path.clone()).collect();
-                            // Remove-hook warnings have no field on the prune response, so
-                            // log them: the prune is a fire-and-forget admin action.
-                            let mut hook_warnings = Vec::new();
-                            let prune =
-                                manager.cleanup_project(&record.id(), &skip, &mut hook_warnings)?;
-                            for warning in &hook_warnings {
-                                warn!(
-                                    project_id = %record.id(),
-                                    warning = %warning.message,
-                                    detail = ?warning.detail,
-                                    "remove hook warning during project prune"
-                                );
+            .spawn_blocking(
+                "remove_project",
+                move || -> Result<ProjectRemoveResult, ProtocolError> {
+                    // Resolve first so a missing/ambiguous reference errors before any
+                    // worktree is touched, and so we have the id to scope the prune.
+                    let record = projects.resolve(&reference)?;
+                    let (pruned_count, skipped_worktrees) = if prune_worktrees {
+                        match &worktree {
+                            Some(manager) => {
+                                let skip: HashSet<PathBuf> =
+                                    live.iter().map(|(path, _)| path.clone()).collect();
+                                // Remove-hook warnings have no field on the prune response, so
+                                // log them: the prune is a fire-and-forget admin action.
+                                let mut hook_warnings = Vec::new();
+                                let prune = manager.cleanup_project(
+                                    &record.id(),
+                                    &skip,
+                                    &mut hook_warnings,
+                                )?;
+                                for warning in &hook_warnings {
+                                    warn!(
+                                        project_id = %record.id(),
+                                        warning = %warning.message,
+                                        detail = ?warning.detail,
+                                        "remove hook warning during project prune"
+                                    );
+                                }
+                                // Map each skipped worktree path back to its live session id.
+                                let skipped = prune
+                                    .skipped
+                                    .iter()
+                                    .filter_map(|path| {
+                                        live.iter()
+                                            .find(|(live_path, _)| live_path == path)
+                                            .map(|(_, id)| id.clone())
+                                    })
+                                    .collect();
+                                (prune.removed, skipped)
                             }
-                            // Map each skipped worktree path back to its live session id.
-                            let skipped = prune
-                                .skipped
-                                .iter()
-                                .filter_map(|path| {
-                                    live.iter()
-                                        .find(|(live_path, _)| live_path == path)
-                                        .map(|(_, id)| id.clone())
-                                })
-                                .collect();
-                            (prune.removed, skipped)
+                            // No worktree manager ⇒ no worktrees were ever created.
+                            None => (0, Vec::new()),
                         }
-                        // No worktree manager ⇒ no worktrees were ever created.
-                        None => (0, Vec::new()),
-                    }
-                } else {
-                    (0, Vec::new())
-                };
-                // Option (b): a skipped worktree means a live session still depends on
-                // this project, so forgetting the record would leave that worktree's
-                // binding pointing at a project that no longer exists. Keep the record
-                // (removed = false) and report the skips; the operator retries `rm`
-                // once those sessions stop. Only when nothing was skipped is the record
-                // actually forgotten.
-                let removed = if skipped_worktrees.is_empty() {
-                    projects.remove(&reference)?
-                } else {
-                    false
-                };
-                Ok(ProjectRemoveResult {
-                    removed,
-                    pruned_worktrees: pruned_count,
-                    skipped_worktrees,
-                })
-            })
+                    } else {
+                        (0, Vec::new())
+                    };
+                    // Option (b): a skipped worktree means a live session still depends on
+                    // this project, so forgetting the record would leave that worktree's
+                    // binding pointing at a project that no longer exists. Keep the record
+                    // (removed = false) and report the skips; the operator retries `rm`
+                    // once those sessions stop. Only when nothing was skipped is the record
+                    // actually forgotten.
+                    let removed = if skipped_worktrees.is_empty() {
+                        projects.remove(&reference)?
+                    } else {
+                        false
+                    };
+                    Ok(ProjectRemoveResult {
+                        removed,
+                        pruned_worktrees: pruned_count,
+                        skipped_worktrees,
+                    })
+                },
+            )
             .await
             .map_err(|_| runtime_error("project_remove_failed", "project remove task panicked"))?
     }
@@ -3112,24 +3120,27 @@ impl SessionRegistry {
         self.store_for_write()?;
         self.inner
             .background
-            .spawn_blocking(move || -> Result<WorktreeRemoveResult, ProtocolError> {
-                let mut warnings = Vec::new();
-                let removed = manager.remove_one(&path, &mut warnings)?;
-                if !removed {
-                    return Err(runtime_error(
-                        "worktree_not_owned",
-                        "pohunek did not create this worktree; remove it manually with git",
-                    ));
-                }
-                for warning in &warnings {
-                    warn!(
-                        warning = %warning.message,
-                        detail = ?warning.detail,
-                        "remove hook warning during worktree remove"
-                    );
-                }
-                Ok(WorktreeRemoveResult { removed: true })
-            })
+            .spawn_blocking(
+                "remove_worktree",
+                move || -> Result<WorktreeRemoveResult, ProtocolError> {
+                    let mut warnings = Vec::new();
+                    let removed = manager.remove_one(&path, &mut warnings)?;
+                    if !removed {
+                        return Err(runtime_error(
+                            "worktree_not_owned",
+                            "pohunek did not create this worktree; remove it manually with git",
+                        ));
+                    }
+                    for warning in &warnings {
+                        warn!(
+                            warning = %warning.message,
+                            detail = ?warning.detail,
+                            "remove hook warning during worktree remove"
+                        );
+                    }
+                    Ok(WorktreeRemoveResult { removed: true })
+                },
+            )
             .await
             .map_err(|err| {
                 runtime_error(
@@ -3424,7 +3435,9 @@ impl SessionRegistry {
             let session_id = id.0.clone();
             self.inner
                 .background
-                .spawn_blocking(move || store.clear_initial_input(&session_id))
+                .spawn_blocking("clear_initial_input", move || {
+                    store.clear_initial_input(&session_id)
+                })
                 .await
                 .map_err(|_join_error| {
                     runtime_error(
@@ -5703,7 +5716,7 @@ impl SessionRegistry {
         let updated_at = updated_at.to_owned();
         self.inner
             .background
-            .spawn_blocking(move || {
+            .spawn_blocking("replace_session_metadata", move || {
                 store.replace_session_metadata(&session_id, &metadata, &updated_at)
             })
             .await

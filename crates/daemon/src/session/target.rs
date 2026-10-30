@@ -556,7 +556,7 @@ impl SessionRegistry {
         self.store_for_write()?;
         self.inner
             .background
-            .spawn_blocking(move || manager.bind(&request))
+            .spawn_blocking("bind_target", move || manager.bind(&request))
             .await
             .map_err(|_join_error| {
                 runtime_error("worktree_bind_failed", "worktree bind task panicked")

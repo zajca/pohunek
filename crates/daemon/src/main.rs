@@ -69,7 +69,7 @@ use pohunek_daemon::session::{
     EnsureInputs, SessionRegistry, SessionRegistryConfig, IDLE_STOP_POLICY_NAME,
     RETENTION_POLICY_NAME,
 };
-use pohunek_daemon::shutdown::{DaemonShutdown, ShutdownPlan, Stage};
+use pohunek_daemon::shutdown::{drop_runtime, DaemonShutdown, ShutdownPlan, Stage};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::preflight::{
@@ -80,7 +80,7 @@ use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DETECT_FLAG, DRY_RUN_FLAG,
     ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
-use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming};
+use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming, RUNTIME_DROP_BOUND};
 
 /// File name of the unified logical-session metadata store under the data dir.
 const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
@@ -165,8 +165,25 @@ const UPGRADE_PREFLIGHT_ARG: &str = "upgrade-preflight";
 /// Name of the host agent profiles directory under the config directory.
 const PROFILES_SUBDIR: &str = "agents";
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The runtime is built here, not by `#[tokio::main]`, because dropping it
+    // waits for blocking threads without a bound; `drop_runtime` bounds it.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("pohunekd: fatal: cannot build the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(daemon_main());
+    drop_runtime(runtime, RUNTIME_DROP_BOUND);
+    code
+}
+
+async fn daemon_main() -> ExitCode {
     // The probe deadline of `upgrade-preflight` counts from here.
     let entry = std::time::Instant::now();
     if std::env::args_os()

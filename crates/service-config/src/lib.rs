@@ -542,6 +542,14 @@ pub const DEFAULT_EVENT_LOG_FLUSH: Duration = Duration::from_secs(5);
 /// the service manager's kill.
 pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(2);
 
+/// How long the daemon waits for its blocking threads when it drops the async
+/// runtime after the last shutdown phase.
+///
+/// Part of [`SHUTDOWN_MARGIN`]: a blocking store write that never returns is
+/// named by the registry phase and left behind here, and the process exits
+/// with the rest of the margin still unspent for teardown.
+pub const RUNTIME_DROP_BOUND: Duration = Duration::from_secs(1);
+
 /// Longest a stop waits behind an input write that holds the worker's control
 /// connection.
 ///
