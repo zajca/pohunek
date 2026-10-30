@@ -914,6 +914,102 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
     drop(observer);
 }
 
+/// Line the attach client types while it reads none of the output.
+const UNREAD_KEYSTROKE: &str = "keystroke-while-output-unread";
+
+/// Bytes the child prints before the client types: far more than the
+/// subscriber queue and the socket buffers between the child and the client
+/// hold, so the output path is blocked when the client types.
+const UNREAD_FLOOD_BYTES: usize = 16 * 1024 * 1024;
+
+#[tokio::test]
+async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_resyncs_after() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    let sink = fixture.root.join("typed");
+    let flooded = fixture.root.join("flooded");
+    let mut initialize = fixture.initialize(worker.worker_id().await);
+    initialize.executable = PathBuf::from("/bin/sh");
+    initialize.arguments = vec![
+        "-c".to_owned(),
+        format!(
+            "{{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > \"$2\"; }} & exec cat > \"$1\""
+        ),
+        "sh".to_owned(),
+        sink.to_str().expect("UTF-8 fixture path").to_owned(),
+        flooded.to_str().expect("UTF-8 fixture path").to_owned(),
+    ];
+    worker
+        .initialize(initialize)
+        .await
+        .expect("initialize the flooding child");
+
+    let stream_id = StreamId::new(ATTACH_STREAM_ID).expect("stream id");
+    let mut attach = worker
+        .open_attach(stream_id.clone(), AttachStart { dimensions: None })
+        .await
+        .expect("open attach stream");
+
+    // The client reads nothing, so every buffer between the child and it fills
+    // while the child prints.
+    wait_until("the child to finish its output", || async {
+        flooded.exists().then_some(())
+    })
+    .await;
+    let input = DataFrame::new(
+        FrameHeader {
+            version: attach.version,
+            stream_id: stream_id.clone(),
+            worker_instance_id: attach.worker_instance_id.clone(),
+            kind: FrameKind::Input {
+                write_id: WriteId::new(format!("attach-{ATTACH_STREAM_ID}-1")).expect("write id"),
+            },
+        },
+        format!("{UNREAD_KEYSTROKE}\n").into_bytes(),
+    )
+    .expect("attach input frame");
+    write_frame(&mut attach.stream, &input)
+        .await
+        .expect("send attach input");
+    wait_until("the child to receive the typed line", || async {
+        std::fs::read_to_string(&sink)
+            .ok()
+            .filter(|typed| typed.contains(UNREAD_KEYSTROKE))
+    })
+    .await;
+
+    // Reading resumes: the lost output is reported as a gap that a complete
+    // repaint follows, never as silently missing bytes.
+    tokio::time::timeout(DEADLINE, async {
+        let mut gap = false;
+        loop {
+            let frame = read_frame(&mut attach.stream)
+                .await
+                .expect("read attach frame")
+                .expect("attach stream stays open");
+            match frame.header().kind {
+                FrameKind::Gap { .. } => gap = true,
+                FrameKind::TerminalSnapshot { .. } if gap => return,
+                FrameKind::Error { .. } | FrameKind::Close { .. } | FrameKind::Exit { .. } => {
+                    panic!(
+                        "attach stream ended before the repaint: {:?}",
+                        frame.header().kind
+                    )
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("a gap and its repaint reach the client that resumed reading");
+
+    drop(attach);
+    worker
+        .stop(TransactionId::new("unread-output-cleanup").expect("transaction id"))
+        .await
+        .expect("stop the flooding child");
+}
+
 #[tokio::test]
 async fn worker_socket_rejects_a_protocol_range_above_its_window() {
     let above = Version::new(CURRENT_VERSION.get() + 1).expect("next version is nonzero");

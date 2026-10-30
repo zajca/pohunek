@@ -44,7 +44,9 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore,
+};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{event, Level};
@@ -3026,6 +3028,182 @@ async fn serve_data(
 
 /// Streams live output and, on an attach stream, accepts framed input.
 ///
+/// The writer runs as its own future, fed by a bounded output queue and an
+/// acknowledgement queue, while [`drive_stream`] handles input, lease and exit
+/// without ever awaiting a socket write. A client that stops reading output
+/// leaves the queue full; the subscriber then stops being drained and its own
+/// bounded queue turns into a `Gap` and repaint, so memory stays bounded and
+/// keystrokes keep reaching the PTY.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream framing keeps authenticated stream identity and lease explicit"
+)]
+async fn serve_stream_data<R, W>(
+    shared: &Shared,
+    pty: &PtyOwner,
+    reader: R,
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    worker_instance_id: &WorkerInstanceId,
+    mode: StreamMode,
+    subscriber: OutputSubscriber,
+    expected_lease_epoch: u64,
+    lease_epoch: &mut watch::Receiver<u64>,
+    peer: &PeerContext,
+    owner: &LeaseOwner,
+) -> Result<(), WorkerError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let (items, queued) = mpsc::channel(shared.config.attach_output_queue_events);
+    let (acks, queued_acks) = mpsc::unbounded_channel();
+    let ack_slots = Arc::new(Semaphore::new(shared.config.attach_ack_backlog));
+    let drive = drive_stream(
+        shared,
+        pty,
+        reader,
+        items,
+        acks,
+        ack_slots,
+        stream_id,
+        worker_instance_id,
+        mode,
+        subscriber,
+        expected_lease_epoch,
+        lease_epoch,
+        peer,
+        owner,
+    );
+    let write = write_stream_items(
+        writer,
+        pty,
+        version,
+        stream_id,
+        worker_instance_id,
+        shared.config.data_payload_bytes,
+        queued,
+        queued_acks,
+    );
+    tokio::pin!(drive);
+    tokio::pin!(write);
+    let driven = tokio::select! {
+        driven = &mut drive => driven,
+        written = &mut write => return written,
+    };
+    // The driver dropped its queues: flush what it queued.
+    driven?;
+    write.await
+}
+
+/// What a stream's writer sends in order with the output events.
+enum StreamItem {
+    /// One output event.
+    Event(OutputEvent),
+    /// Last frame: the stream ends after a close frame.
+    Close(CloseReason),
+    /// Last frame: the stream ends after an error frame.
+    Error(ControlError),
+}
+
+/// An input acknowledgement waiting for the writer.
+struct StreamAck {
+    write_id: WriteId,
+    bytes_written: u64,
+    /// Frees one acknowledgement slot once the ack was written.
+    _slot: OwnedSemaphorePermit,
+}
+
+/// Queues the last frame of a stream and ends the driver; the writer's result
+/// is the stream's result.
+async fn finish_stream(
+    items: &mpsc::Sender<StreamItem>,
+    item: StreamItem,
+) -> Result<(), WorkerError> {
+    let _ = items.send(item).await;
+    Ok(())
+}
+
+/// Writes queued acknowledgements ahead of queued output events until both
+/// queues are closed and empty, or a last frame was written.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream framing keeps authenticated stream identity explicit"
+)]
+async fn write_stream_items<W>(
+    writer: &mut W,
+    pty: &PtyOwner,
+    version: Version,
+    stream_id: &StreamId,
+    worker_instance_id: &WorkerInstanceId,
+    payload_limit: usize,
+    mut items: mpsc::Receiver<StreamItem>,
+    mut acks: mpsc::UnboundedReceiver<StreamAck>,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let mut items_open = true;
+    let mut acks_open = true;
+    while items_open || acks_open {
+        tokio::select! {
+            biased;
+            ack = acks.recv(), if acks_open => match ack {
+                Some(StreamAck { write_id, bytes_written, _slot }) => {
+                    write_data_frame(
+                        writer,
+                        version,
+                        stream_id,
+                        worker_instance_id,
+                        FrameKind::InputAck { write_id, bytes_written },
+                        Vec::new(),
+                    ).await?;
+                }
+                None => acks_open = false,
+            },
+            item = items.recv(), if items_open => match item {
+                Some(StreamItem::Event(output)) => {
+                    write_runtime_output_event(
+                        writer,
+                        version,
+                        stream_id,
+                        worker_instance_id,
+                        payload_limit,
+                        output,
+                        pty.output_forced_closed(),
+                    ).await?;
+                }
+                Some(StreamItem::Close(reason)) => {
+                    return write_data_frame(
+                        writer,
+                        version,
+                        stream_id,
+                        worker_instance_id,
+                        FrameKind::Close { reason },
+                        Vec::new(),
+                    ).await;
+                }
+                Some(StreamItem::Error(error)) => {
+                    return write_data_error(
+                        writer,
+                        version,
+                        stream_id,
+                        worker_instance_id,
+                        error,
+                    ).await;
+                }
+                None => items_open = false,
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Pulls live output into the stream's writer queue and, on an attach stream,
+/// accepts framed input. No arm awaits a socket write, so a client that stops
+/// reading output never stalls input.
+///
 /// One input read stays pending across every `select!` iteration (see
 /// [`read_owned_frame`]), so output that becomes ready while an input frame
 /// is only partly received never discards the bytes already consumed.
@@ -3042,12 +3220,13 @@ async fn serve_data(
     clippy::too_many_lines,
     reason = "the bidirectional data-stream select loop keeps lease, output, and input ordering in one place"
 )]
-async fn serve_stream_data<R, W>(
+async fn drive_stream<R>(
     shared: &Shared,
     pty: &PtyOwner,
     reader: R,
-    writer: &mut W,
-    version: Version,
+    items: mpsc::Sender<StreamItem>,
+    acks: mpsc::UnboundedSender<StreamAck>,
+    ack_slots: Arc<Semaphore>,
     stream_id: &StreamId,
     worker_instance_id: &WorkerInstanceId,
     mode: StreamMode,
@@ -3059,7 +3238,6 @@ async fn serve_stream_data<R, W>(
 ) -> Result<(), WorkerError>
 where
     R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
 {
     let mut next_input_sequence = 1_u64;
     let mut root_exit = pty.exit_receiver();
@@ -3074,17 +3252,9 @@ where
                 if changed.is_err() {
                     return Ok(());
                 }
-                write_data_frame(
-                    writer,
-                    version,
-                    stream_id,
-                    worker_instance_id,
-                    FrameKind::Close { reason: CloseReason::LeaseReleased },
-                    Vec::new(),
-                ).await?;
-                return Ok(());
+                return finish_stream(&items, StreamItem::Close(CloseReason::LeaseReleased)).await;
             }
-            changed = root_exit.changed(), if pending_output_exit.is_some() => {
+            changed = root_exit.changed(), if pending_output_exit.is_some() && items.capacity() > 0 => {
                 changed.map_err(|_closed| WorkerError::Pty(PtyError::ExitTimeout))?;
                 if root_exit.borrow().is_some() {
                     let output = pending_output_exit
@@ -3094,18 +3264,18 @@ where
                         return Ok(());
                     }
                     authorize_data_frame(shared, peer, owner)?;
-                    write_runtime_output_event(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        shared.config.data_payload_bytes,
-                        output,
-                        pty.output_forced_closed(),
-                    ).await?;
+                    if items.try_send(StreamItem::Event(output)).is_err() {
+                        return Ok(());
+                    }
                 }
             }
-            output = subscriber.recv(), if pending_output_exit.is_none() => {
+            reserved = items.reserve(), if items.capacity() == 0 => {
+                // A slot opened; the output arm below pulls the next event.
+                if reserved.is_err() {
+                    return Ok(());
+                }
+            }
+            output = subscriber.recv(), if pending_output_exit.is_none() && items.capacity() > 0 => {
                 let Some(output) = output else {
                     return Ok(());
                 };
@@ -3116,15 +3286,9 @@ where
                     continue;
                 }
                 authorize_data_frame(shared, peer, owner)?;
-                write_runtime_output_event(
-                    writer,
-                    version,
-                    stream_id,
-                    worker_instance_id,
-                    shared.config.data_payload_bytes,
-                    output,
-                    pty.output_forced_closed(),
-                ).await?;
+                if items.try_send(StreamItem::Event(output)).is_err() {
+                    return Ok(());
+                }
             }
             written = async {
                 let pending = pending_write.as_mut().expect("guarded pending attach write");
@@ -3134,104 +3298,68 @@ where
                     .take()
                     .expect("guarded pending attach write");
                 if let Err(error) = written {
-                    return write_data_error(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        input_control_error(error),
-                    ).await;
+                    return finish_stream(&items, StreamItem::Error(input_control_error(error))).await;
                 }
-                write_data_frame(
-                    writer,
-                    version,
-                    stream_id,
-                    worker_instance_id,
-                    FrameKind::InputAck {
-                        write_id,
-                        bytes_written,
-                    },
-                    Vec::new(),
-                ).await?;
+                let Ok(slot) = Arc::clone(&ack_slots).try_acquire_owned() else {
+                    return finish_stream(
+                        &items,
+                        StreamItem::Error(control_error_message(
+                            ControlCode::RuntimeFault,
+                            "attach acknowledgement backlog was exceeded",
+                            false,
+                        )),
+                    ).await;
+                };
+                if acks.send(StreamAck { write_id, bytes_written, _slot: slot }).is_err() {
+                    return Ok(());
+                }
                 next_input_sequence = match next_input_sequence.checked_add(1) {
                     Some(sequence) => sequence,
                     None => {
-                        return write_data_error(
-                            writer,
-                            version,
-                            stream_id,
-                            worker_instance_id,
-                            control_error_message(
+                        return finish_stream(&items, StreamItem::Error(control_error_message(
                                 ControlCode::InvalidRequest,
                                 "attach input sequence was exhausted",
                                 false,
-                            ),
-                        ).await;
+                            ))).await;
                     }
                 };
             }
-            (reader, input) = &mut next_input, if pending_write.is_none() => {
+            permit = ack_slots.acquire(), if ack_slots.available_permits() == 0 => {
+                // An acknowledgement was written; input reading resumes.
+                drop(permit);
+            }
+            (reader, input) = &mut next_input, if pending_write.is_none() && ack_slots.available_permits() > 0 => {
                 next_input.set(read_owned_frame(reader));
                 let input = match input {
                     Ok(Some(input)) => input,
                     Ok(None) => return Ok(()),
                     Err(error) => {
-                        return write_data_error(
-                            writer,
-                            version,
-                            stream_id,
-                            worker_instance_id,
-                            control_error(ControlCode::InvalidRequest, error, false),
-                        ).await;
+                        return finish_stream(&items, StreamItem::Error(control_error(ControlCode::InvalidRequest, error, false))).await;
                     }
                 };
                 authorize_data_frame(shared, peer, owner)?;
                 if mode != StreamMode::Attach {
-                    return write_data_error(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        control_error_message(
+                    return finish_stream(&items, StreamItem::Error(control_error_message(
                             ControlCode::InvalidRequest,
                             "output data stream received a client frame",
                             false,
-                        ),
-                    ).await;
+                        ))).await;
                 }
                 let (input_header, bytes) = input.into_parts();
                 let FrameKind::Input { write_id } = input_header.kind else {
-                    return write_data_error(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        control_error_message(
+                    return finish_stream(&items, StreamItem::Error(control_error_message(
                             ControlCode::InvalidRequest,
                             "attach data stream received a non-input frame",
                             false,
-                        ),
-                    ).await;
+                        ))).await;
                 };
                 if input_header.worker_instance_id != *worker_instance_id || input_header.stream_id != *stream_id {
-                    return write_data_error(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        identity_mismatch(),
-                    ).await;
+                    return finish_stream(&items, StreamItem::Error(identity_mismatch())).await;
                 }
                 if let Err(error) =
                     validate_attach_write_id(&write_id, stream_id, next_input_sequence)
                 {
-                    return write_data_error(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        error,
-                    ).await;
+                    return finish_stream(&items, StreamItem::Error(error)).await;
                 }
                 let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 // The worker answers the probe itself; the terminal's own

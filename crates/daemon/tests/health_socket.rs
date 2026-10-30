@@ -2939,6 +2939,73 @@ async fn an_attached_client_keeps_receiving_output_while_its_large_paste_waits_f
     let _ = handle.await;
 }
 
+/// Line the attach client types while it reads none of the agent's output.
+const KEYSTROKE_MARKER: &str = "keystroke-while-output-unread";
+
+/// Bytes the agent prints before the client types: far more than the
+/// subscriber queue and the socket buffers on the way hold, so the output path
+/// is blocked when the client types.
+const UNREAD_FLOOD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Shell script of an agent that prints a flood, then creates `flooded`, and
+/// records every line typed to it in `sink`.
+fn flooding_agent_script(sink: &Path, flooded: &Path) -> String {
+    format!(
+        "{{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > '{flooded}'; }} & exec cat > '{sink}'",
+        sink = sink.display(),
+        flooded = flooded.display(),
+    )
+}
+
+#[tokio::test]
+async fn keystrokes_reach_the_agent_while_the_attach_client_reads_no_output() {
+    let socket = temp_socket("attach-unread-output");
+    let sink_dir = temp_dir("attach-unread-output-sink");
+    let sink = sink_dir.join("typed");
+    let flooded = sink_dir.join("flooded");
+    let script = flooding_agent_script(&sink, &flooded);
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut client = connect(&socket).await;
+    let created = create_session(&mut client, &socket).await;
+    let attach = attach_session(&mut client, &created.id).await;
+    let raw = open_attach_stream(&socket, &attach.stream_id).await;
+    let (_raw_read, mut raw_write) = tokio::io::split(raw);
+
+    // The client never reads: the flood fills every buffer on the way.
+    wait_until("the agent to finish its output", || async {
+        flooded.exists().then_some(())
+    })
+    .await;
+    raw_write
+        .write_all(format!("{KEYSTROKE_MARKER}\n").as_bytes())
+        .await
+        .expect("type a line");
+    wait_until("the agent to receive the typed line", || async {
+        std::fs::read_to_string(&sink)
+            .ok()
+            .filter(|typed| typed.contains(KEYSTROKE_MARKER))
+    })
+    .await;
+
+    let _ = detach_stream(&mut client, &attach.stream_id).await;
+    let stop_req = Request::make(
+        "attach-unread-output-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut client, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn session_new_with_input_writes_text_to_shell_pty() {
     let socket = temp_socket("session-new-input-shell");

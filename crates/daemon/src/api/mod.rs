@@ -580,7 +580,7 @@ const CANCEL_ON_HANGUP: &[&str] = &[
 /// and is consumed there until the client disconnects.
 async fn serve_connection<S>(stream: S, state: DaemonState) -> Result<(), io::Error>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let codec = LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
@@ -818,7 +818,7 @@ async fn run_attach_connection<S>(
     stream_id: String,
 ) -> Result<(), io::Error>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
@@ -859,7 +859,7 @@ async fn run_attach_bridge<S>(
     on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let attach_stream_id = attach.stream_id.clone();
     let session_id = attach.session_id.clone();
@@ -890,7 +890,7 @@ async fn run_worker_attach_bridge<S>(
     on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let identity = WorkerFrameIdentity {
         version: data.version,
@@ -948,10 +948,13 @@ async fn bridge_worker_frames<S, W>(
     initial_input: Vec<u8>,
 ) -> Result<(), AttachBridgeError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
     W: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (worker_read, worker_write) = tokio::io::split(worker);
+    let (mut client_read, client_write) = tokio::io::split(&mut *stream);
+    let mut client_write = Some(client_write);
+    let mut pending_output: Option<PendingClientWrite<'_, S>> = None;
     let mut worker_write = Some(worker_write);
     let mut write_sequence = 1_u64;
     if !initial_input.is_empty() {
@@ -974,7 +977,7 @@ where
 
     loop {
         tokio::select! {
-            (worker_read, frame) = &mut next_frame => {
+            (worker_read, frame) = &mut next_frame, if pending_output.is_none() => {
                 next_frame.set(read_owned_frame(worker_read));
                 let Some(frame) = frame.map_err(AttachBridgeError::worker_stream)? else {
                     break;
@@ -1003,10 +1006,12 @@ where
                     }
                     FrameKind::Output { .. } | FrameKind::TerminalSnapshot { .. } => {
                         snapshot_started = true;
-                        stream
-                            .write_all(&payload)
-                            .await
-                            .map_err(AttachBridgeError::client_io)?;
+                        // The write stays pending across iterations: client
+                        // input keeps being read and forwarded meanwhile, and
+                        // no further worker frame is read until it completes,
+                        // which pushes back into the worker's bounded queues.
+                        let writer = client_write.take().expect("the client writer is idle");
+                        pending_output = Some(Box::pin(write_owned_client_output(writer, payload)));
                     }
                     FrameKind::Gap { .. } => snapshot_started = false,
                     FrameKind::InputAck { .. } => {}
@@ -1029,6 +1034,13 @@ where
                     }
                 }
             }
+            (writer, written) = async {
+                pending_output.as_mut().expect("guarded pending client write").await
+            }, if pending_output.is_some() => {
+                pending_output = None;
+                client_write = Some(writer);
+                written.map_err(AttachBridgeError::client_io)?;
+            }
             (writer, sent) = async {
                 pending_send.as_mut().expect("guarded pending worker send").await
             }, if pending_send.is_some() => {
@@ -1037,7 +1049,7 @@ where
                 sent.map_err(AttachBridgeError::worker_stream)?;
                 write_sequence = next_attach_sequence(write_sequence)?;
             }
-            read = stream.read(&mut input), if pending_send.is_none() => {
+            read = client_read.read(&mut input), if pending_send.is_none() => {
                 let count = read.map_err(AttachBridgeError::client_io)?;
                 if count == 0 {
                     break;
@@ -1160,6 +1172,25 @@ impl AttachBridgeError {
 type PendingWorkerSend<'a, W> = Pin<
     Box<dyn Future<Output = (tokio::io::WriteHalf<&'a mut W>, Result<(), io::Error>)> + Send + 'a>,
 >;
+
+/// A write of worker output to the public client that has not completed; it
+/// hands the client writer back with its result.
+type PendingClientWrite<'a, S> = Pin<
+    Box<dyn Future<Output = (tokio::io::WriteHalf<&'a mut S>, Result<(), io::Error>)> + Send + 'a>,
+>;
+
+/// Writes `payload` to the client over an owned writer, which it returns with
+/// the result so the write can stay pending across `select!` iterations.
+async fn write_owned_client_output<S>(
+    mut writer: tokio::io::WriteHalf<&mut S>,
+    payload: Vec<u8>,
+) -> (tokio::io::WriteHalf<&mut S>, Result<(), io::Error>)
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let written = writer.write_all(&payload).await;
+    (writer, written)
+}
 
 /// [`send_worker_attach_input`] over an owned writer, which it returns with
 /// the result so the send can stay pending across `select!` iterations.

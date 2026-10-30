@@ -14,6 +14,13 @@ pub(crate) const DEFAULT_HISTORY_BYTES: usize = 10_000_000;
 pub(crate) const DEFAULT_SUBSCRIBER_BYTES: usize = 1_000_000;
 /// Default maximum private-protocol data payload.
 pub(crate) const DEFAULT_DATA_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Default number of output events one attach or output stream queues for its
+/// writer; a slower client lets the subscriber's own bounded queue overflow
+/// into a repaint instead.
+pub(crate) const DEFAULT_ATTACH_OUTPUT_QUEUE_EVENTS: usize = 8;
+/// Default number of input acknowledgements one attach stream holds back
+/// behind a blocked output write before it stops reading input frames.
+pub(crate) const DEFAULT_ATTACH_ACK_BACKLOG: usize = 1_024;
 /// Default maximum private-protocol JSON line.
 pub(crate) const DEFAULT_CONTROL_LINE_BYTES: usize = 64 * 1024;
 /// Default lifetime of a one-use data-stream token.
@@ -85,6 +92,10 @@ const MAX_SUBSCRIBER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 /// Hard cap for retained completed input plans.
 const MAX_INPUT_DEDUP_ENTRIES: usize = 65_536;
+/// Upper bound for the per-stream output event queue.
+const MAX_ATTACH_OUTPUT_QUEUE_EVENTS: usize = 1_024;
+/// Upper bound for the per-stream held-back acknowledgements.
+const MAX_ATTACH_ACK_BACKLOG: usize = 65_536;
 /// Hard maximum keeps abandoned observation waits short and retry-oriented.
 const MAX_OBSERVATION_WAIT: Duration = Duration::from_secs(10);
 
@@ -152,6 +163,12 @@ pub struct WorkerConfig {
     pub subscriber_bytes: usize,
     /// Maximum data-frame payload.
     pub data_payload_bytes: usize,
+    /// Output events one stream queues for its writer before it stops pulling
+    /// from its subscriber.
+    pub attach_output_queue_events: usize,
+    /// Input acknowledgements one attach stream holds back behind a blocked
+    /// output write before it stops reading input frames.
+    pub attach_ack_backlog: usize,
     /// Maximum control-protocol line.
     pub control_line_bytes: usize,
     /// One-use stream-token lifetime.
@@ -206,6 +223,8 @@ impl WorkerConfig {
             history_bytes: DEFAULT_HISTORY_BYTES,
             subscriber_bytes: DEFAULT_SUBSCRIBER_BYTES,
             data_payload_bytes: DEFAULT_DATA_PAYLOAD_BYTES,
+            attach_output_queue_events: DEFAULT_ATTACH_OUTPUT_QUEUE_EVENTS,
+            attach_ack_backlog: DEFAULT_ATTACH_ACK_BACKLOG,
             control_line_bytes: DEFAULT_CONTROL_LINE_BYTES,
             data_token_ttl: DEFAULT_DATA_TOKEN_TTL,
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
@@ -226,6 +245,20 @@ impl WorkerConfig {
             notification_forward_timeout: DEFAULT_NOTIFICATION_FORWARD_TIMEOUT,
             max_notification_params_bytes: DEFAULT_MAX_NOTIFICATION_PARAMS_BYTES,
         }
+    }
+
+    /// Validates the per-stream queue bounds.
+    fn validate_stream_queues(&self) -> Result<(), ConfigError> {
+        validate_count(
+            "attach_output_queue_events",
+            self.attach_output_queue_events,
+            MAX_ATTACH_OUTPUT_QUEUE_EVENTS,
+        )?;
+        validate_count(
+            "attach_ack_backlog",
+            self.attach_ack_backlog,
+            MAX_ATTACH_ACK_BACKLOG,
+        )
     }
 
     /// Validates every bounded worker policy value.
@@ -260,6 +293,7 @@ impl WorkerConfig {
             self.data_payload_bytes,
             MAX_DATA_PAYLOAD_BYTES,
         )?;
+        self.validate_stream_queues()?;
         validate_bytes(
             "control_line_bytes",
             self.control_line_bytes,
