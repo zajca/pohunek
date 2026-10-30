@@ -2141,11 +2141,11 @@ async fn the_rejected_line_methods_are_local_only_and_list_every_line() {
             false,
             sha256_hex(&fixture.project),
         ),
-        (3, Some("resume"), true, false, sha256_hex(&fixture.resume)),
+        (3, Some("resume"), true, true, sha256_hex(&fixture.resume)),
         (4, Some("session"), true, true, sha256_hex(&fixture.live)),
         (5, Some("session"), true, false, sha256_hex(&fixture.ended)),
         (6, None, true, true, sha256_hex(&fixture.corrupt)),
-        (7, Some("resume"), true, false, sha256_hex(&fixture.resume)),
+        (7, Some("resume"), true, true, sha256_hex(&fixture.resume)),
     ];
     assert_eq!(summary, expected);
     assert!(
@@ -2161,6 +2161,16 @@ async fn the_rejected_line_methods_are_local_only_and_list_every_line() {
         )
         .await,
         "store_rejected_line_live"
+    );
+    assert_eq!(
+        refusal(
+            &mut local,
+            method::STORE_REJECTED_SET_ASIDE,
+            json!({ "content_hash": sha256_hex(&fixture.resume) })
+        )
+        .await,
+        "store_rejected_line_live",
+        "a resume line whose pin cannot be read needs the same consent"
     );
     assert_eq!(
         refusal(
@@ -2204,7 +2214,7 @@ async fn setting_lines_aside_moves_them_into_an_audited_owner_private_quarantine
     assert_eq!(moved.lines, [1]);
     assert_eq!(moved.quarantine_file, "metadata.rejected.jsonl");
     // The first rewrite dropped the blank line, so the numbers moved up.
-    let duplicate = set_aside(&mut local, &fixture.resume, false).await;
+    let duplicate = set_aside(&mut local, &fixture.resume, true).await;
     assert_eq!(duplicate.lines, [1, 5], "identical lines move together");
     let ended = set_aside(&mut local, &fixture.ended, false).await;
     assert_eq!(ended.lines, [2]);
@@ -2231,8 +2241,8 @@ async fn setting_lines_aside_moves_them_into_an_audited_owner_private_quarantine
         audited,
         [
             (1, fixture.project.clone(), false),
-            (1, fixture.resume.clone(), false),
-            (5, fixture.resume.clone(), false),
+            (1, fixture.resume.clone(), true),
+            (5, fixture.resume.clone(), true),
             (2, fixture.ended.clone(), false),
             (1, fixture.live.clone(), true),
         ]
@@ -2290,7 +2300,7 @@ async fn a_removal_refused_for_an_unreadable_line_proceeds_once_the_line_is_set_
     let _: protocol::StoreRejectedSetAsideResult = call(
         &mut local,
         method::STORE_REJECTED_SET_ASIDE,
-        json!({ "content_hash": listed.lines[0].content_hash }),
+        json!({ "content_hash": listed.lines[0].content_hash, "accept_pin_loss": true }),
     )
     .await;
     let removed: PackageUninstallResult =

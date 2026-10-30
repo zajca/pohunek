@@ -850,7 +850,7 @@ after protocol 3.
 
 | Method | Params | `ok` result | Notes |
 |---|---|---|---|
-| `store.rejected_list` | `null` | `{lines[], total}` | Each line is `{line, kind?, session_id?, reason, may_pin, may_own_runtime, content_hash}`. `line` is the 1-based position in `metadata.jsonl`; `kind` and `session_id` are the line's own text and, like `reason`, cut to `STORE_REJECTED_TEXT_MAX_BYTES` (128). `may_pin` is true when the readable `kind` is not `worktree` or `project` and the line does not decode as a record, so the pin it may hold cannot be read; a line that decodes but names an agent kind this build does not know has `may_pin` false and its pin counts like a loaded record's. `may_own_runtime` is true for a line whose session state cannot be read, including a line that is not a JSON object. `content_hash` is the lowercase hex SHA-256 of the line without its terminator. The raw line is never returned. At most `STORE_REJECTED_LIST_MAX_LINES` (100) lines are returned; `total` counts all of them. |
+| `store.rejected_list` | `null` | `{lines[], total}` | Each line is `{line, kind?, session_id?, reason, may_pin, may_own_runtime, content_hash}`. `line` is the 1-based position in `metadata.jsonl`; `kind` and `session_id` are the line's own text and, like `reason`, cut to `STORE_REJECTED_TEXT_MAX_BYTES` (128). `may_pin` is true when the readable `kind` is not `worktree` or `project` and the line does not decode as a record, so the pin it may hold cannot be read; a line that decodes but names an agent kind this build does not know has `may_pin` false and its pin counts like a loaded record's. `may_own_runtime` is true for a line whose session state cannot be read, including a line that is not a JSON object, and for a `resume` line whose pin cannot be read (`may_pin`): the session it resumes may be running. `content_hash` is the lowercase hex SHA-256 of the line without its terminator. The raw line is never returned. At most `STORE_REJECTED_LIST_MAX_LINES` (100) lines are returned; `total` counts all of them. |
 | `store.rejected_set_aside` | `{content_hash, accept_pin_loss?}` | `{content_hash, lines[], quarantine_file}` | Moves every rejected line with this hash, in one call, into `metadata.rejected.jsonl` next to the store. `lines` are the numbers the lines had before the move; `quarantine_file` is a file name, not a path. A line with `may_own_runtime` is refused with `store_rejected_line_live` unless `accept_pin_loss` is true, because dropping it drops the package pin that protects a root a live worker may run from. Params are strict: an unknown field is `bad_request`. |
 
 The quarantine file is owner-private (`0600`) JSON lines, written through an
@@ -858,9 +858,12 @@ atomic replace before the store is rewritten without the lines, both under the
 store's write lock; a crash between the two steps leaves the line in both files
 and a repeat appends a second record. Each record is
 `{quarantine_schema, set_aside_at, line, content_hash, kind?, reason, may_pin, may_own_runtime, accepted_pin_loss, text}`;
-`text` is the line exactly as stored. The daemon never reads or deletes the file.
-The stored line order of the other lines is unchanged, and blank lines are
-dropped by the rewrite.
+`text` is the line exactly as stored. The daemon reads the file only to append
+to it, never interprets or deletes it, and a quarantine file that is not UTF-8,
+not owner-private or over the store size limit fails every later set-aside with
+`store_quarantine_failed`. The other records are rewritten as any store write
+rewrites them: grouped by kind, blank lines dropped, and the lines that stay
+rejected kept as stored after them.
 
 | Code | Class | Meaning |
 |---|---|---|

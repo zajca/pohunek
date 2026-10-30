@@ -41,7 +41,7 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    `pohunek store rejected set-aside <content-hash>`: the line moves, with an
    audit record, into `metadata.rejected.jsonl` next to the store, and the
    uninstall can be retried. A line that may belong to a session with a live
-   runtime is refused with `store_rejected_line_live`; stop that session, or
+   runtime, or a `resume` line whose pin cannot be read, is refused with `store_rejected_line_live`; stop that session, or
    repeat with `--accept-pin-loss` once nothing depends on its package root.
    The quarantine file is owner-private and never deleted by the daemon; to put
    a line back, stop the daemon, append the record's `text` to `metadata.jsonl`

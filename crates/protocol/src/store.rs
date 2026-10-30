@@ -18,6 +18,9 @@ pub const STORE_REJECTED_LINE_NOT_FOUND: &str = "store_rejected_line_not_found";
 pub const STORE_REJECTED_LINE_LIVE: &str = "store_rejected_line_live";
 /// Machine code: the quarantine file or the store rewrite failed.
 pub const STORE_QUARANTINE_FAILED: &str = "store_quarantine_failed";
+/// Machine code: the method is served on the local control socket only. It is
+/// the code of `PackageErrorKind::LocalOnly`.
+const STORE_LOCAL_ONLY: &str = "local_only_method";
 /// Machine code: the store cannot be read or its schema is refused.
 pub const STORE_READ_FAILED: &str = "store_read_failed";
 
@@ -59,8 +62,9 @@ pub struct StoreRejectedLine {
     /// its readable `kind` is not `worktree` or `project`, and it does not
     /// decode as a record. Package gates fail closed while one exists.
     pub may_pin: bool,
-    /// Whether the session the line holds may own a live runtime. A line whose
-    /// state cannot be read counts as live.
+    /// Whether setting the line aside may drop the pin of a live runtime's
+    /// root. A line whose session state cannot be read counts as live, and so
+    /// does a `resume` line whose pin cannot be read.
     pub may_own_runtime: bool,
     /// Lowercase hex SHA-256 of the line text without its terminator.
     pub content_hash: String,
@@ -136,6 +140,17 @@ impl ProtocolError {
                 "stop the session or confirm no runtime depends on the line, then repeat with `--accept-pin-loss`"
                     .to_owned(),
             ),
+        )
+    }
+
+    /// A store method arrived on a remote connection.
+    #[must_use]
+    pub fn store_local_only() -> Self {
+        Self::new(
+            ErrorClass::Daemon,
+            STORE_LOCAL_ONLY,
+            "rejected-store-line methods are served on the local control socket only",
+            Some("run the command on the host that runs the daemon".to_owned()),
         )
     }
 

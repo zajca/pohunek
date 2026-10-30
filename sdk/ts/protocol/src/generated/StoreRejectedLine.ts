@@ -30,8 +30,9 @@ export type StoreRejectedLine = {
    */
   may_pin: boolean;
   /**
-   * Whether the session the line holds may own a live runtime. A line whose
-   * state cannot be read counts as live.
+   * Whether setting the line aside may drop the pin of a live runtime's
+   * root. A line whose session state cannot be read counts as live, and so
+   * does a `resume` line whose pin cannot be read.
    */
   may_own_runtime: boolean;
   /**

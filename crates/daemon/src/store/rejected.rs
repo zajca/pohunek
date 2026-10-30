@@ -70,13 +70,16 @@ fn content_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
-/// Whether the line may belong to a session with a live runtime.
+/// Whether setting the line aside may drop the pin of a live runtime's root.
 ///
 /// A line that is not a JSON object names no state at all, so it may be any
 /// record, including a live session; the upgrade preflight counts only lines
-/// it can read, but dropping a pin consents to more than that.
+/// it can read, but dropping a pin consents to more than that. A `resume`
+/// line holds no session state, yet its pin is unreadable and the session it
+/// resumes may be running, so it needs the same consent.
 fn may_be_live(line: &RejectedLine) -> bool {
     line.may_own_runtime
+        || (line.kind.as_deref() == Some("resume") && line.pin_unreadable())
         || !serde_json::from_str::<serde_json::Value>(&line.text)
             .is_ok_and(|value| value.is_object())
 }
@@ -168,9 +171,10 @@ impl Store {
     /// rewritten, so a failure at any point leaves the text in at least one of
     /// the two files; a repeat after a crash between the two steps appends a
     /// second record. The store's other records are rewritten as a rewrite
-    /// does, and the lines that stay rejected are kept as stored. A line that may own a live runtime is refused unless
-    /// `accept_pin_loss` is set, because dropping it drops the package pin that
-    /// keeps the root a live worker runs from.
+    /// does, and the lines that stay rejected are kept as stored. A line that
+    /// may own a live runtime, or a `resume` line whose pin cannot be read, is
+    /// refused unless `accept_pin_loss` is set, because dropping it drops the
+    /// package pin that keeps the root a live worker runs from.
     ///
     /// # Errors
     ///
