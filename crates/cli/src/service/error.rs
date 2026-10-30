@@ -981,7 +981,7 @@ impl Error {
                 "`pohunek service status` shows whether the daemon job is registered",
             ),
             Self::RefreshConfigChanged => Some(
-                "service.toml was edited while the refresh was pending: put it back as it was (or as the refresh wrote it), then rerun `pohunek service refresh-path`",
+                "service.toml was edited while a search-path refresh was pending. Restore it as the refresh wrote it or as it was before the refresh, then rerun `pohunek service refresh-path`; or run `pohunek service uninstall`, which is session-checked and does not depend on the file",
             ),
             Self::RefreshPending { .. } => {
                 Some("rerun `pohunek service refresh-path`; it resumes or rolls back the pending refresh")

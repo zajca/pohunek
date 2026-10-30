@@ -55,7 +55,9 @@
 //! copy, and version collection are not touched. Install and upgrade roll a
 //! refresh back before `registering` and refuse it with
 //! `service_refresh_pending` from `registering` on; uninstall rolls it back
-//! before `registering` and takes the session-checked flow after it.
+//! before `registering` and takes the session-checked flow after it, and also
+//! when the refresh cannot account for the edited `service.toml`. A refresh
+//! at `ready` is cleared by a rerun without reading the file.
 //!
 //! # Config migration
 //!
@@ -1037,7 +1039,18 @@ impl<'a> Engine<'a> {
         let gated = if options.purge && pending.operation == Operation::Install {
             self.rollback(&pending).await?
         } else {
-            self.rollback_pending(&pending).await?
+            match self.rollback_pending(&pending).await {
+                // A refresh that cannot account for the file has nothing to
+                // restore it to, and the removal below deletes the file with
+                // the installation, so it takes the session-checked flow. The
+                // record stays until that flow clears it.
+                Err(Error::RefreshConfigChanged | Error::RefreshConfigSchema { .. })
+                    if pending.operation == Operation::RefreshPath =>
+                {
+                    return Ok(None);
+                }
+                outcome => outcome?,
+            }
         };
         if let Some(gated) = gated {
             rolled_back.accepted_runtime_loss = gated.accepted;

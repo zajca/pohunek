@@ -1015,7 +1015,11 @@ finishes a rollback that had begun, and then stops. `install`, `upgrade` and
 `uninstall` roll such a record back while the daemon job was not replaced yet;
 once it was, `install` and `upgrade` refuse with `service_refresh_pending`.
 `service_refresh_config_changed` means `service.toml` was edited while the
-refresh was pending: put it back as it was, then rerun the command.
+refresh was pending. Restore it as the refresh wrote it or as it was before the
+refresh and rerun the command, or run `pohunek service uninstall`, which is
+session-checked and does not depend on the file. A refresh that already
+reached `ready` only clears its record, so the rerun succeeds whatever the file
+holds.
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without

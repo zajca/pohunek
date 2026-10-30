@@ -384,8 +384,19 @@ fn render_refresh_path(report: &report::RefreshPathReport) -> String {
     let mut text = String::new();
     if let Some(pending) = &report.rolled_back {
         let _ = writeln!(text, "{}", render_rolled_back(pending));
-    }
-    if report.changed {
+        // The directories the rollback restored are not a difference to
+        // record, so the diff and its "unchanged" line are left out.
+        let kept = report.workers_kept.map_or_else(
+            || "worker jobs are not touched".to_owned(),
+            |count| format!("{count} workers kept running"),
+        );
+        let daemon = if report.daemon_restart == "restarted" {
+            format!("daemon restarted with the previous search path; {kept}")
+        } else {
+            "the daemon was not touched".to_owned()
+        };
+        let _ = writeln!(text, "{daemon}");
+    } else if report.changed {
         let verb = if report.applied {
             "recorded"
         } else {
@@ -1022,12 +1033,27 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
         (Some(pending), false) => {
             let _ = writeln!(
                 text,
-                "pending    {} {} stopped after step {} (rerun it to resume, or uninstall to roll back)",
-                pending.operation, pending.version, pending.step
+                "pending    {} {} stopped after step {} ({})",
+                pending.operation,
+                pending.version,
+                pending.step,
+                pending_hint(pending.operation)
             );
             render_pending_warnings(text, pending);
         }
         (None, false) => {}
+    }
+}
+
+/// What the operator does with a stopped transaction of `operation`.
+///
+/// A refresh is resolved by its own command; uninstall would remove the whole
+/// installation, so it is no rollback for it.
+fn pending_hint(operation: &str) -> &'static str {
+    if operation == "refresh_path" {
+        "rerun `pohunek service refresh-path`"
+    } else {
+        "rerun it to resume, or uninstall to roll back"
     }
 }
 
@@ -1687,6 +1713,91 @@ mod tests {
         });
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
         assert!(text.contains("not installed (/c/pohunek/service.toml is missing)"));
+    }
+
+    #[test]
+    fn status_names_only_refresh_path_as_the_way_out_of_a_pending_refresh() {
+        let status = |operation| {
+            render_status(&report::StatusReport {
+                installed: false,
+                config_path: PathBuf::from("/c/pohunek/service.toml"),
+                namespace: None,
+                prefix: None,
+                active_version: None,
+                daemon: None,
+                daemon_error: None,
+                versions: Vec::new(),
+                workers: Vec::new(),
+                workers_error: None,
+                unreadable_journals: Vec::new(),
+                transaction_in_progress: false,
+                warnings: Vec::new(),
+                pending_transaction: Some(report::PendingReport {
+                    operation,
+                    version: "1.0.0".to_owned(),
+                    step: "config",
+                    rolling_back: false,
+                    preflight: None,
+                    accepted_runtime_loss: false,
+                    warnings: Vec::new(),
+                }),
+            })
+        };
+        let refresh = status("refresh_path");
+        assert!(
+            refresh.contains("(rerun `pohunek service refresh-path`)"),
+            "{refresh}"
+        );
+        assert!(!refresh.contains("uninstall"), "{refresh}");
+        let install = status("install");
+        assert!(
+            install.contains("(rerun it to resume, or uninstall to roll back)"),
+            "{install}"
+        );
+    }
+
+    #[test]
+    fn a_finished_rollback_renders_no_difference_and_names_the_daemon_restart() {
+        let rolled_back = report::RefreshPathReport {
+            applied: false,
+            daemon_restart: "restarted",
+            rolled_back: Some(report::PendingReport {
+                operation: "refresh_path",
+                version: "1.0.0".to_owned(),
+                step: "registered",
+                rolling_back: true,
+                preflight: None,
+                accepted_runtime_loss: false,
+                warnings: Vec::new(),
+            }),
+            ..refresh_report()
+        };
+        let text = render_refresh_path(&rolled_back);
+        assert!(
+            text.contains("rolled back an interrupted refresh_path"),
+            "{text}"
+        );
+        assert!(
+            text.contains("daemon restarted with the previous search path; 2 workers kept running"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("would record")
+                && !text.contains("recorded 1")
+                && !text.contains("unchanged")
+                && !text.contains("+ /new"),
+            "{text}"
+        );
+
+        let untouched = render_refresh_path(&report::RefreshPathReport {
+            daemon_restart: "none",
+            ..rolled_back
+        });
+        assert!(
+            untouched.contains("the daemon was not touched"),
+            "{untouched}"
+        );
+        assert!(!untouched.contains("unchanged"), "{untouched}");
     }
 
     #[test]

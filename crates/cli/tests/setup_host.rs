@@ -318,11 +318,15 @@ fn setup_config_still_writes_only_config_files() {
     );
 }
 
-/// An interrupted install that is still pending stops setup before any change,
-/// and the stop names the command that resumes it.
-#[test]
-fn a_pending_install_stops_setup_before_any_change() {
-    let env = TestEnv::new().expect("private environment");
+/// Writes a pending record of `operation` below `env`'s state directory and
+/// runs `setup --yes` over it; returns what setup printed to stderr after
+/// checking that it failed and wrote nothing.
+fn setup_over_pending(
+    env: &TestEnv,
+    operation: pohunek_cli::service::record::Operation,
+    version: &str,
+    refresh: Option<pohunek_cli::service::record::RefreshJournal>,
+) -> String {
     let binary = pohunek_test_support::bin_exe("pohunek");
     let state = env.state_home().join("pohunek");
     fs::create_dir_all(&state).expect("state directory");
@@ -330,8 +334,8 @@ fn a_pending_install_stops_setup_before_any_change() {
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
     let record = pohunek_cli::service::record::Record {
         schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
-        operation: pohunek_cli::service::record::Operation::Install,
-        version: "9.9.9-pending".to_owned(),
+        operation,
+        version: version.to_owned(),
         prefix: env.home().join(".local"),
         previous_version: None,
         version_dir_preexisted: false,
@@ -343,22 +347,18 @@ fn a_pending_install_stops_setup_before_any_change() {
         launchd_default_path: None,
         launchd_boot_identity: None,
         accepted_risks: None,
-        refresh: None,
+        refresh,
     };
     pohunek_cli::service::record::Store::new(state)
         .save(&record)
-        .expect("record the pending install");
+        .expect("record the pending transaction");
     let before = tree(env.root());
 
-    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+    let output = run_setup(env, &binary, &["setup", "--yes"]);
 
-    assert!(!output.status.success(), "a pending install stops setup");
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("interrupted install of version 9.9.9-pending")
-            && stderr.contains("pohunek service install")
-            && stderr.contains("pohunek service uninstall"),
-        "the stop names the pending install and its next step: {stderr}"
+        !output.status.success(),
+        "a pending transaction stops setup"
     );
     // Reading the transaction store creates its lock files. They coordinate
     // service commands and hold no configuration, so they are not a change.
@@ -370,7 +370,57 @@ fn a_pending_install_stops_setup_before_any_change() {
     assert_eq!(
         without_locks(tree(env.root())),
         without_locks(before),
-        "a pending install writes no configuration, package or hook"
+        "a pending transaction writes no configuration, package or hook"
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// An interrupted install that is still pending stops setup before any change,
+/// and the stop names the command that resumes it.
+#[test]
+fn a_pending_install_stops_setup_before_any_change() {
+    let env = TestEnv::new().expect("private environment");
+    let stderr = setup_over_pending(
+        &env,
+        pohunek_cli::service::record::Operation::Install,
+        "9.9.9-pending",
+        None,
+    );
+    assert!(
+        stderr.contains("interrupted install of version 9.9.9-pending")
+            && stderr.contains("pohunek service install")
+            && stderr.contains("pohunek service uninstall"),
+        "the stop names the pending install and its next step: {stderr}"
+    );
+}
+
+/// An interrupted search-path refresh is resolved by its own command: setup
+/// names `pohunek service refresh-path`, never a subcommand that does not
+/// exist or an uninstall that would remove the installation.
+#[test]
+fn a_pending_refresh_stops_setup_and_names_only_its_own_command() {
+    let env = TestEnv::new().expect("private environment");
+    let journal = pohunek_cli::service::record::RefreshJournal {
+        previous: Vec::new(),
+        target: Vec::new(),
+        digest_before: "0".repeat(64),
+        digest_after: "1".repeat(64),
+        daemon_before: None,
+    };
+    let stderr = setup_over_pending(
+        &env,
+        pohunek_cli::service::record::Operation::RefreshPath,
+        "9.9.9-pending",
+        Some(journal),
+    );
+    assert!(
+        stderr.contains("interrupted search-path refresh of version 9.9.9-pending")
+            && stderr.contains("rerun `pohunek service refresh-path`"),
+        "the stop names the refresh and its own command: {stderr}"
+    );
+    assert!(
+        !stderr.contains("service refresh_path") && !stderr.contains("pohunek service uninstall"),
+        "the stop names no nonexistent subcommand and no uninstall: {stderr}"
     );
 }
 

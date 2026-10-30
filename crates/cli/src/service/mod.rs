@@ -130,30 +130,52 @@ pub async fn upgrade(
 /// Re-records the daemon job's search path from a fresh login-shell discovery
 /// and replaces the daemon job with it.
 ///
-/// See [`engine::Engine::refresh_path`]; `dry_run` previews the change and the
+/// See [`refresh_discovering`]; `dry_run` previews the change and the
 /// adoption verdict, and `accept_runtime_loss` accepts the sessions that
 /// verdict lists as at risk. The login shell runs before any lock is taken.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`engine::Engine::refresh_path`] and
-/// [`refresh::discover`], and [`Error::InheritedLock`] when
-/// `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
+/// Returns the errors of [`refresh_discovering`] and [`Error::InheritedLock`]
+/// when `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
 pub async fn refresh_search_path(
     dry_run: bool,
     accept_runtime_loss: bool,
 ) -> Result<report::RefreshPathReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
-    let discovered = refresh::discover(&context)?;
     // The schema is judged before the service manager is contacted; the engine
     // repeats the read under the lock.
     refresh::load_installed_config(&context)?;
     let backend = connect_installed(&context).await?;
-    engine(&context, &backend, inherited)
-        .with_runtime_loss_accepted(accept_runtime_loss)
-        .refresh_path(discovered, dry_run)
-        .await
+    let engine =
+        engine(&context, &backend, inherited).with_runtime_loss_accepted(accept_runtime_loss);
+    refresh_discovering(&context, &engine, dry_run).await
+}
+
+/// Runs the login-shell discovery, then [`engine::Engine::refresh_path`].
+///
+/// The shell runs here, before the engine takes the transaction lock, so a
+/// slow shell never keeps another service command waiting. A discovery that
+/// fails is returned at once, unless a refresh record is pending: resuming or
+/// rolling that back never needs the fresh path, so the engine gets the
+/// failure and carries it as a warning. The pending record is looked at
+/// without the lock; the engine decides again under it.
+///
+/// # Errors
+///
+/// Returns the errors of [`engine::Engine::refresh_path`] and
+/// [`refresh::discover`].
+pub(crate) async fn refresh_discovering(
+    context: &Context,
+    engine: &engine::Engine<'_>,
+    dry_run: bool,
+) -> Result<report::RefreshPathReport, Error> {
+    let discovered = match refresh::discover(context) {
+        Err(error) if !engine.has_pending_refresh()? => return Err(error),
+        outcome => outcome,
+    };
+    engine.refresh_path(discovered, dry_run).await
 }
 
 /// Uninstalls the service.

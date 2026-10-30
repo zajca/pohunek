@@ -93,8 +93,7 @@ async fn refresh_with(
     engine: Engine<'_>,
     dry_run: bool,
 ) -> Result<RefreshPathReport, Error> {
-    let discovered = crate::service::refresh::discover(&harness.context)?;
-    engine.refresh_path(discovered, dry_run).await
+    crate::service::refresh_discovering(&harness.context, &engine, dry_run).await
 }
 
 /// Refreshes over the stopped-session verdicts `stopped`.
@@ -266,15 +265,13 @@ async fn an_early_gate_refusal_changes_nothing_and_the_flag_lets_it_through() {
         .expect_err("a dry run refuses too");
     assert!(matches!(dry, Error::UpgradeAtRisk { .. }), "{dry:?}");
 
-    let report = harness
-        .engine()
-        .with_runtime_loss_accepted(true)
-        .refresh_path(
-            crate::service::refresh::discover(&harness.context).expect("discovery"),
-            false,
-        )
-        .await
-        .expect("the flag accepts the loss");
+    let report = refresh_with(
+        harness,
+        harness.engine().with_runtime_loss_accepted(true),
+        false,
+    )
+    .await
+    .expect("the flag accepts the loss");
     assert!(report.applied && report.accepted_runtime_loss);
     assert_eq!(recorded(harness), [canonical(&r.new)]);
     assert_eq!(harness.ledger_bytes(), None, "the consent is not recorded");
@@ -534,17 +531,20 @@ async fn a_refused_rollback_gate_keeps_the_record_rolling_back_until_the_flag_fi
     );
     assert!(harness.pending().expect("kept").rolling_back);
 
-    let report = harness
-        .engine()
-        .with_runtime_loss_accepted(true)
-        .refresh_path(
-            crate::service::refresh::discover(&harness.context).expect("discovery"),
-            false,
-        )
-        .await
-        .expect("the flag finishes the rollback");
+    let report = refresh_with(
+        harness,
+        harness.engine().with_runtime_loss_accepted(true),
+        false,
+    )
+    .await
+    .expect("the flag finishes the rollback");
 
     assert!(!report.applied, "no new refresh starts in the same run");
+    assert_eq!(
+        report.daemon_restart, "restarted",
+        "the rollback replaced the job with the previous definition"
+    );
+    assert!(report.workers_kept.is_some());
     assert_eq!(
         report.rolled_back.as_ref().map(|pending| pending.operation),
         Some("refresh_path")
@@ -588,6 +588,7 @@ async fn a_rollback_that_stopped_after_restoring_the_file_is_finished_by_a_rerun
         .expect("the rerun finishes it");
 
     assert!(!report.applied);
+    assert_eq!(report.daemon_restart, "restarted");
     assert_eq!(
         report.rolled_back.map(|pending| pending.operation),
         Some("refresh_path")
@@ -635,7 +636,7 @@ async fn an_upgrade_rolls_a_refresh_before_registering_back_and_never_resumes_it
 
 #[tokio::test]
 async fn a_refresh_that_reached_registering_blocks_upgrade_and_install_and_leaves_everything() {
-    for step in [Step::Registered, Step::Ready] {
+    for step in [Step::Registering, Step::Registered, Step::Ready] {
         let r = refreshable().await;
         let harness = &r.harness;
         interrupt_after(harness, step).await;
@@ -713,7 +714,7 @@ async fn uninstall_rolls_a_refresh_back_before_registering_and_takes_the_full_fl
 
 #[tokio::test]
 async fn a_file_edited_during_a_pending_refresh_is_never_overwritten() {
-    for step in [Step::Config, Step::Registered] {
+    for step in [Step::Config, Step::Registering, Step::Registered] {
         let r = refreshable().await;
         let harness = &r.harness;
         interrupt_after(harness, step).await;
@@ -738,6 +739,158 @@ async fn a_file_edited_during_a_pending_refresh_is_never_overwritten() {
         assert_eq!(record_bytes(harness), record, "{step:?}");
         assert_eq!(replaces(harness), replaced, "{step:?}");
     }
+}
+
+#[tokio::test]
+async fn an_edited_file_never_blocks_the_uninstall_of_a_refresh_before_registering() {
+    for step in [Step::Config, Step::Definition] {
+        let r = refreshable().await;
+        let harness = &r.harness;
+        interrupt_after(harness, step).await;
+        let mut text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+        text.push_str("\n# edited by the operator\n");
+        std::fs::write(harness.context.config_path(), &text).expect("edit");
+        let error = refresh(harness, false).await.expect_err("edited");
+        assert_eq!(error.code(), "service_refresh_config_changed", "{step:?}");
+
+        let removed = harness
+            .engine()
+            .uninstall(UninstallOptions::default())
+            .await
+            .unwrap_or_else(|error| panic!("{step:?}: {error:?}"));
+
+        assert!(
+            removed.rolled_back.is_none(),
+            "{step:?}: nothing was restored over the edited file"
+        );
+        harness.assert_clean();
+        assert_eq!(harness.pending(), None, "{step:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_file_edited_after_the_refresh_finished_its_work_is_left_alone_and_the_record_cleared() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Ready).await;
+    let mut text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    text.push_str("\n# edited by the operator\n");
+    std::fs::write(harness.context.config_path(), &text).expect("edit");
+    let replaced = replaces(harness);
+
+    let report = refresh(harness, false)
+        .await
+        .expect("only the clear is left, whatever the file holds");
+
+    assert!(report.resumed && report.applied);
+    assert_eq!(harness.pending(), None);
+    assert_eq!(config_bytes(harness), text.as_bytes(), "the edit is kept");
+    assert_eq!(replaces(harness), replaced, "nothing is replaced again");
+}
+
+#[tokio::test]
+async fn a_file_restored_to_the_previous_path_by_hand_is_written_again_by_the_resume() {
+    let mut r = refreshable().await;
+    // A hand-written comment makes the original bytes differ from the
+    // canonical rendering a rollback writes.
+    let mut original = String::from_utf8(config_bytes(&r.harness)).expect("utf-8");
+    original.push_str("\n# my note\n");
+    std::fs::write(r.harness.context.config_path(), &original).expect("annotate");
+    interrupt_after(&r.harness, Step::Config).await;
+    let harness = &r.harness;
+    let previous = SearchPath::new(journal(harness).previous).expect("previous path");
+    harness
+        .config()
+        .expect("config")
+        .with_search_path(previous)
+        .expect("previous config")
+        .write(&harness.context.config_path())
+        .expect("restore by hand");
+    assert_ne!(config_bytes(harness), original.as_bytes());
+    r.harness.context = discovering(&r.harness.context, &r.harness.root, "shell-c", &r.old);
+    let harness = &r.harness;
+
+    let report = refresh(harness, false).await.expect("resume");
+
+    assert!(report.resumed && report.applied);
+    assert_eq!(recorded(harness), [canonical(&r.new)]);
+    assert_eq!(replaces(harness), 1);
+    assert_eq!(harness.pending(), None);
+}
+
+#[tokio::test]
+async fn a_failing_login_shell_does_not_block_resolving_a_pending_refresh() {
+    for step in [Step::Config, Step::Registered, Step::Ready] {
+        let mut r = refreshable().await;
+        interrupt_after(&r.harness, step).await;
+        let fallback = r.harness.root.join("fallback-bin");
+        r.harness.context = scripted_discovery(
+            &r.harness.context,
+            &r.harness.root,
+            "exit 1",
+            pohunek_test_support::wait::HANG_GUARD,
+            &fallback,
+        );
+        let harness = &r.harness;
+
+        let report = refresh(harness, false)
+            .await
+            .unwrap_or_else(|error| panic!("{step:?}: {error:?}"));
+
+        assert!(report.resumed && report.applied, "{step:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("login shell discovery failed")),
+            "{step:?}: {:?}",
+            report.warnings
+        );
+        assert_eq!(report.discovered, [canonical(&r.new)], "{step:?}");
+        assert_eq!(recorded(harness), [canonical(&r.new)], "{step:?}");
+        assert_eq!(replaces(harness), 1, "{step:?}");
+        assert_eq!(harness.pending(), None, "{step:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_failing_login_shell_does_not_block_finishing_a_pending_rollback() {
+    let mut r = refreshable().await;
+    let (old_env, new_env) = (
+        canonical(&r.old).display().to_string(),
+        canonical(&r.new).display().to_string(),
+    );
+    r.harness.fake.world().kept_process_path = Some(new_env);
+    r.harness.fake.world().refused_replace_path = Some(old_env.clone());
+    refresh(&r.harness, false)
+        .await
+        .expect_err("the restore is refused");
+    r.harness.fake.world().refused_replace_path = None;
+    let fallback = r.harness.root.join("fallback-bin");
+    r.harness.context = scripted_discovery(
+        &r.harness.context,
+        &r.harness.root,
+        "exit 1",
+        pohunek_test_support::wait::HANG_GUARD,
+        &fallback,
+    );
+    let harness = &r.harness;
+
+    let report = refresh(harness, false)
+        .await
+        .expect("the rollback needs no discovery");
+
+    assert!(report.rolled_back.is_some() && !report.applied);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("login shell discovery failed")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(job_path_env(harness), old_env);
+    assert_eq!(harness.pending(), None);
 }
 
 #[tokio::test]

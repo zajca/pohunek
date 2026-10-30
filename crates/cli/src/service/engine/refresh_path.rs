@@ -57,7 +57,10 @@ impl Engine<'_> {
     /// [`Error::RefreshBlockedByTransaction`]; a refresh that is rolling back
     /// is finished and the run stops; one before `registering` resumes with
     /// the journaled path (a warning names a different fresh discovery); one
-    /// from `registering` on resumes the replacement and its readiness proof.
+    /// from `registering` on resumes the replacement and its readiness proof;
+    /// one at `ready` is only cleared. A resume or rollback never needs the
+    /// fresh discovery, so a failed one is carried as a warning; a fresh
+    /// refresh returns it.
     ///
     /// # Errors
     ///
@@ -65,13 +68,13 @@ impl Engine<'_> {
     /// [`Error::RefreshConfigSchema`] for a file of another schema,
     /// [`Error::DaemonJobMissing`] without a daemon job,
     /// [`Error::RefreshConfigChanged`] when `service.toml` was edited during a
-    /// pending refresh, [`Error::RefreshPending`] for a dry run while one is
+    /// pending refresh that has to act on the file, [`Error::RefreshPending`] for a dry run while one is
     /// pending, the adoption refusals of an upgrade ([`Error::UpgradeAtRisk`],
     /// [`Error::UpgradeStoreUnusable`]) before any effect, and the failing
     /// step's error after a rollback.
     pub(crate) async fn refresh_path(
         &self,
-        discovered: Discovered,
+        discovered: Result<Discovered, Error>,
         dry_run: bool,
     ) -> Result<RefreshPathReport, Error> {
         let _transaction = if dry_run {
@@ -104,20 +107,31 @@ impl Engine<'_> {
         }
     }
 
+    /// Whether a refresh record is pending, read without the lock.
+    ///
+    /// Only a hint for the caller; the run decides again under the lock.
+    pub(crate) fn has_pending_refresh(&self) -> Result<bool, Error> {
+        Ok(self
+            .store
+            .load()?
+            .is_some_and(|record| record.operation == Operation::RefreshPath))
+    }
+
     /// Starts a refresh, or reports that nothing needs one.
     async fn refresh_fresh(
         &self,
         config: &ServiceConfig,
         bytes: &[u8],
-        discovered: Discovered,
+        discovered: Result<Discovered, Error>,
         dry_run: bool,
     ) -> Result<RefreshPathReport, Error> {
+        let discovered = discovered?;
         let recorded = config.search_path().entries().to_vec();
         let mut report = base_report(
             dry_run,
             recorded.clone(),
             discovered.search_path.entries().to_vec(),
-            &discovered.found,
+            Some(&discovered.found),
             unknown_keys_warning(config).into_iter().collect(),
         );
         if !report.changed {
@@ -183,7 +197,7 @@ impl Engine<'_> {
         record: Record,
         config: &ServiceConfig,
         bytes: &[u8],
-        discovered: Discovered,
+        discovered: Result<Discovered, Error>,
         dry_run: bool,
     ) -> Result<RefreshPathReport, Error> {
         if dry_run {
@@ -193,36 +207,43 @@ impl Engine<'_> {
             });
         }
         let journal = self.refresh_journal(&record)?.clone();
+        let mut warnings: Vec<String> = unknown_keys_warning(config).into_iter().collect();
+        let (fresh, found) = match discovered {
+            Ok(discovered) => (
+                Some(discovered.search_path.entries().to_vec()),
+                Some(discovered.found),
+            ),
+            Err(error) => {
+                warnings.push(format!(
+                    "the login shell discovery failed ({error}); the pending refresh was resolved without it"
+                ));
+                (None, None)
+            }
+        };
         let mut report = base_report(
             false,
             journal.previous.clone(),
-            discovered.search_path.entries().to_vec(),
-            &discovered.found,
-            unknown_keys_warning(config).into_iter().collect(),
+            fresh.clone().unwrap_or_else(|| journal.target.clone()),
+            found.as_ref(),
+            warnings,
         );
         if record.rolling_back {
+            let restarts = rollback_restarts_previous(&record);
             let (_resume, rolled_back) = self.resolve_plan(Plan::RollBack(record)).await?;
             report.accepted_runtime_loss = rolled_back
                 .as_ref()
                 .is_some_and(|rolled_back| rolled_back.accepted_runtime_loss);
             report.rolled_back = rolled_back;
+            if restarts {
+                report.daemon_restart = "restarted";
+                report.workers_kept = self.workers_kept().await;
+            }
             report.warnings.push(
                 "the pending search-path refresh was rolled back and this run stopped there; run `pohunek service refresh-path` again to record the current path"
                     .to_owned(),
             );
             return Ok(report);
         }
-        let state = classify_file(&journal, config, bytes);
-        if !matches!(state, FileState::Before | FileState::After) {
-            return Err(Error::RefreshConfigChanged);
-        }
-        let target_path = self.journaled_path(&journal.target)?;
-        let target = config.with_search_path(target_path)?;
-        let config_path = self.context.config_path();
-        check_layout_dirs(self.context, config.layout())?;
-        layout::verify_claim(config.layout(), &config.namespace())?;
-        check_rendering_size(&target, &config_path)?;
-        let definition = daemon_definition(self.context, &target)?;
         // The journaled path wins; a fresh discovery that differs is only reported.
         report.discovered.clone_from(&journal.target);
         report.added = journal
@@ -238,19 +259,47 @@ impl Engine<'_> {
             .cloned()
             .collect();
         report.changed = journal.previous != journal.target;
-        if discovered.search_path.entries() != journal.target.as_slice() {
+        if fresh
+            .as_deref()
+            .is_some_and(|fresh| fresh != journal.target.as_slice())
+        {
             report.warnings.push(
                 "the login shell reports a search path that differs from the one the interrupted refresh journaled; the journaled one was applied, so rerun `pohunek service refresh-path` to record the current one"
                     .to_owned(),
             );
         }
         report.resumed = true;
+        if record.step >= Step::Ready {
+            // Only the clear is left; the file is not read, so an edit of it
+            // cannot keep a finished refresh pending.
+            self.checkpoint(Step::Ready)?;
+            self.store.clear()?;
+            report.applied = true;
+            report.daemon_restart = "restarted";
+            report.workers_kept = self.workers_kept().await;
+            return Ok(report);
+        }
+        // The forward path continues from the file as the refresh left it or
+        // as it started. A file restored to the previous path's own rendering
+        // (by hand: a rollback marks the record `rolling_back` first) holds no
+        // refresh write, so it is written again like the unchanged original.
+        let state = classify_file(&journal, config, bytes);
+        if state == FileState::Edited {
+            return Err(Error::RefreshConfigChanged);
+        }
+        let target_path = self.journaled_path(&journal.target)?;
+        let target = config.with_search_path(target_path)?;
+        let config_path = self.context.config_path();
+        check_layout_dirs(self.context, config.layout())?;
+        layout::verify_claim(config.layout(), &config.namespace())?;
+        check_rendering_size(&target, &config_path)?;
+        let definition = daemon_definition(self.context, &target)?;
         self.execute_refresh(
             record,
             &target,
             &definition,
             report,
-            state == FileState::Before,
+            state != FileState::After,
         )
         .await
     }
@@ -428,7 +477,8 @@ impl Engine<'_> {
     /// # Errors
     ///
     /// Returns [`Error::RefreshConfigChanged`] for a file the journal does not
-    /// account for, the rollback gate's refusals, and the service-manager and
+    /// account for, [`Error::RefreshConfigSchema`] for a file of another
+    /// schema, the rollback gate's refusals, and the service-manager and
     /// readiness errors of the restoring replacement.
     pub(super) async fn rollback_refresh(
         &self,
@@ -436,6 +486,11 @@ impl Engine<'_> {
         layout: &InstallLayout,
     ) -> Result<Option<Gated>, Error> {
         let journal = self.refresh_journal(record)?;
+        // The strict current-schema reader is kept: re-rendering a file of
+        // another schema here would migrate it without a migration. A file of
+        // another schema is refused with `service_refresh_config_schema`,
+        // whose hint names the installed release's own `refresh-path`, and
+        // `uninstall` does not need the read.
         let (current, bytes) = refresh::load_installed_config(self.context)?;
         let state = classify_file(journal, &current, &bytes);
         let previous = self.journaled_path(&journal.previous)?;
@@ -518,12 +573,13 @@ fn classify_file(journal: &RefreshJournal, config: &ServiceConfig, bytes: &[u8])
     }
 }
 
-/// The report of a run that has not decided anything yet.
+/// The report of a run that has not decided anything yet; `found` is `None`
+/// when no discovery ran or it failed.
 fn base_report(
     dry_run: bool,
     recorded: Vec<PathBuf>,
     discovered: Vec<PathBuf>,
-    found: &SearchPathReport,
+    found: Option<&SearchPathReport>,
     warnings: Vec<String>,
 ) -> RefreshPathReport {
     let added = discovered
@@ -544,9 +600,9 @@ fn base_report(
         discovered,
         added,
         removed,
-        shell_used: found.shell_used.clone(),
-        shell_defaulted: found.shell_defaulted,
-        dropped: found.dropped.clone(),
+        shell_used: found.and_then(|found| found.shell_used.clone()),
+        shell_defaulted: found.is_some_and(|found| found.shell_defaulted),
+        dropped: found.map(|found| found.dropped.clone()).unwrap_or_default(),
         daemon_restart: "none",
         daemon_started: false,
         workers_kept: None,

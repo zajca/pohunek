@@ -1305,8 +1305,7 @@ async fn refresh(
     harness: &Harness,
     dry_run: bool,
 ) -> Result<crate::service::report::RefreshPathReport, Error> {
-    let discovered = crate::service::refresh::discover(&harness.context)?;
-    harness.engine().refresh_path(discovered, dry_run).await
+    crate::service::refresh_discovering(&harness.context, &harness.engine(), dry_run).await
 }
 
 fn config_bytes(harness: &Harness) -> Vec<u8> {
@@ -1432,13 +1431,22 @@ async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_or_prin
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
+/// Drives the command's entry in a thread while the login shell hangs, and
+/// takes the transaction lock from this one.
+#[test]
+fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
+    let test_runtime = runtime();
     let mut harness = Harness::new();
     let recorded = harness.root.join("recorded-bin");
     let fallback = harness.root.join("fallback-bin");
     harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
-    harness.install(V1).await.expect("install");
+    test_runtime.block_on(harness.install(V1)).expect("install");
     let started = harness.root.join("shell-started");
     let release = harness.root.join("shell-release");
     let body = format!(
@@ -1454,24 +1462,24 @@ async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
         pohunek_test_support::wait::HANG_GUARD,
         &fallback,
     );
-    let context = harness.context.clone();
-    let refresher = std::thread::spawn(move || crate::service::refresh::discover(&context));
-    pohunek_test_support::wait::poll_until("the login shell to start", || {
-        started.exists().then_some(())
+
+    // The entry the command runs: the shell and the engine's lock in one call.
+    let error = std::thread::scope(|scope| {
+        let refresher = scope.spawn(|| runtime().block_on(refresh(&harness, false)));
+        pohunek_test_support::wait::poll_until("the login shell to start", || {
+            started.exists().then_some(())
+        });
+
+        let store = Store::new(harness.context.paths().state_dir.clone());
+        let lock = test_runtime.block_on(store.lock());
+        let held = lock.is_ok();
+        drop(lock);
+        std::fs::write(&release, b"").expect("release the login shell");
+        let outcome = refresher.join().expect("refresh thread");
+        assert!(held, "the lock is free while the login shell hangs");
+        outcome.expect_err("the released shell fails")
     });
 
-    let store = Store::new(harness.context.paths().state_dir.clone());
-    let lock = store
-        .lock()
-        .await
-        .expect("the lock is free while the login shell hangs");
-    drop(lock);
-    std::fs::write(&release, b"").expect("release the login shell");
-
-    let error = refresher
-        .join()
-        .expect("refresh thread")
-        .expect_err("the released shell fails");
     assert_eq!(error.code(), "service_search_path_refresh_failed");
 }
 

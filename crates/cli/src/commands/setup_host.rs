@@ -504,6 +504,26 @@ fn release_for_fresh_host(
     }
 }
 
+/// Why setup stops over `pending`, and the command that resolves it.
+///
+/// A refresh record is resolved by its own command; uninstall would remove the
+/// whole installation, so it is no rollback for it.
+fn pending_blocked_detail(pending: &service::report::PendingReport) -> String {
+    if pending.operation == "refresh_path" {
+        format!(
+            "an interrupted search-path refresh of version {} stopped after step {}; \
+             rerun `pohunek service refresh-path` to resume or roll it back",
+            pending.version, pending.step
+        )
+    } else {
+        format!(
+            "an interrupted {} of version {} stopped after step {}; resume it by rerunning \
+             the interrupted `pohunek service {}`, or roll it back with `pohunek service uninstall`",
+            pending.operation, pending.version, pending.step, pending.operation
+        )
+    }
+}
+
 /// Reads the service state and the release plan without changing anything.
 ///
 /// # Errors
@@ -519,13 +539,8 @@ async fn plan_in(
     // as it was.
     let status = service::installed_facts(context)?;
     if let Some(pending) = &status.pending_transaction {
-        return Err(CliError::SetupBlocked {
-            detail: format!(
-                "an interrupted {} of version {} stopped after step {}; resume it by rerunning \
-                 the interrupted `pohunek service {}`, or roll it back with `pohunek service uninstall`",
-                pending.operation, pending.version, pending.step, pending.operation
-            ),
-        });
+        let detail = pending_blocked_detail(pending);
+        return Err(CliError::SetupBlocked { detail });
     }
     let (service, dir, layout, search_path) = if status.installed {
         match status.active_version.as_deref() {

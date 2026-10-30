@@ -2709,10 +2709,11 @@ directories the installer resolved and hands to the daemon job as its `PATH`
 bounded). Each directory is recorded as its canonical path and was trusted when
 resolved (owned by the user or root, not writable by group or others). The path is
 recorded at install and reaches the daemon job only when the installer writes
-the job definition (install, or an upgrade to a different version); upgrades
-reuse the recorded list, so a manual edit takes effect only at the next
-version-changing upgrade; `pohunek service refresh-path` re-records the path and
-replaces the daemon job with it (below). This key
+the job definition (install, an upgrade to a different version, or
+`pohunek service refresh-path`); upgrades reuse the recorded list, so a manual
+edit takes effect only at the next version-changing upgrade;
+`pohunek service refresh-path` re-records the path and replaces the daemon job
+with it (below). This key
 raised the `service.toml` `schema_version` to 2, the `[input]` table added
 for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_ms`
 and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
@@ -2826,7 +2827,9 @@ has begun. It fails with `service_upgrade_sessions_at_risk` or
 `service_upgrade_store_unusable` as an upgrade does, with
 `service_daemon_job_missing` when no daemon job is registered (nothing is
 changed), with `service_refresh_config_changed` when `service.toml` was edited
-during a pending refresh, and `service_refresh_pending` is what `install` and
+during a pending refresh that has to act on it (a refresh at `ready` only
+clears its record, and `uninstall` removes the installation whatever the file
+holds), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
 (`pohunek service refresh-path` resolves it). It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
