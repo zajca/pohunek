@@ -1017,9 +1017,10 @@ once it was, `install` and `upgrade` refuse with `service_refresh_pending`.
 `service_refresh_config_changed` means `service.toml` was edited while the
 refresh was pending. Restore it as the refresh wrote it or as it was before the
 refresh and rerun the command, or run `pohunek service uninstall`, which is
-session-checked and does not depend on the file. A refresh that already
-reached `ready` only clears its record, so the rerun succeeds whatever the file
-holds.
+session-checked and does not need the file to match the refresh. A refresh
+that already reached `ready` only clears its record: the rerun still reads and
+verifies the file (schema, user, roots, namespace) but does not compare it with
+the refresh, so an edited file of the current schema does not keep it pending.
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without

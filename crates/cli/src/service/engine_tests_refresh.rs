@@ -988,3 +988,120 @@ async fn a_dry_run_over_a_pending_refresh_fails_closed_and_leaves_the_record() {
     assert_eq!(error.code(), "service_refresh_pending");
     assert_eq!(harness.pending().expect("kept").step, Step::Config);
 }
+
+#[tokio::test]
+async fn a_rerun_at_ready_reads_the_file_and_keeps_the_record_when_it_is_unusable() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Ready).await;
+    let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    let record = record_bytes(harness);
+    let replaced = replaces(harness);
+
+    let error = refresh(harness, false).await.expect_err("other schema");
+
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    assert_eq!(record_bytes(harness), record, "the record is kept");
+    assert_eq!(
+        config_bytes(harness),
+        older.as_bytes(),
+        "the file is untouched"
+    );
+    assert_eq!(replaces(harness), replaced);
+
+    std::fs::write(harness.context.config_path(), b"not = [valid").expect("write junk");
+    let error = refresh(harness, false).await.expect_err("unreadable");
+    assert_eq!(error.code(), "service_config_invalid", "{error}");
+    assert_eq!(record_bytes(harness), record, "the record is kept");
+}
+
+#[tokio::test]
+async fn a_hand_restored_previous_path_with_another_value_changed_is_refused() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Config).await;
+    let previous = SearchPath::new(journal(harness).previous).expect("previous path");
+    harness
+        .config()
+        .expect("config")
+        .with_search_path(previous)
+        .expect("previous config")
+        .write(&harness.context.config_path())
+        .expect("restore by hand");
+    let restored = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    let changed = restored.replacen(
+        "launchctl_command_ms = 10000",
+        "launchctl_command_ms = 10001",
+        1,
+    );
+    assert_ne!(
+        changed, restored,
+        "the fixture records the launchctl deadline"
+    );
+    std::fs::write(harness.context.config_path(), &changed).expect("change a value");
+    let record = record_bytes(harness);
+    let replaced = replaces(harness);
+
+    let error = refresh(harness, false).await.expect_err("edited");
+    assert_eq!(error.code(), "service_refresh_config_changed", "{error}");
+    let error = harness
+        .upgrade(V1)
+        .await
+        .map(drop)
+        .expect_err("the rollback refuses too");
+    assert_eq!(error.code(), "service_refresh_config_changed", "{error}");
+
+    assert_eq!(config_bytes(harness), changed.as_bytes());
+    assert_eq!(record_bytes(harness), record);
+    assert_eq!(replaces(harness), replaced);
+}
+
+#[tokio::test]
+async fn the_entry_refuses_an_unmanaged_host_before_the_schema_read_and_the_connection() {
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    // A record the store cannot decode must not mask the refusal either.
+    std::fs::write(harness.engine().store.path(), b"not a record").expect("junk record");
+    let connected = std::cell::Cell::new(false);
+
+    let error = crate::service::refresh_entry(&harness.context, None, false, false, || {
+        connected.set(true);
+        async { Err(Error::SearchPathUnmanaged) }
+    })
+    .await
+    .expect_err("unmanaged");
+
+    assert_eq!(error.code(), "service_search_path_unmanaged", "{error}");
+    assert!(!connected.get(), "the service manager is not contacted");
+}
+
+#[tokio::test]
+async fn the_entry_reads_the_schema_before_it_connects_once_discovery_succeeded() {
+    let mut r = refreshable().await;
+    let text = String::from_utf8(config_bytes(&r.harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    std::fs::write(r.harness.context.config_path(), &older).expect("write schema 6");
+    r.harness.context = discovering(&r.harness.context, &r.harness.root, "shell-c", &r.new);
+    let connected = std::cell::Cell::new(false);
+
+    let error = crate::service::refresh_entry(&r.harness.context, None, false, false, || {
+        connected.set(true);
+        async { Err(Error::SearchPathUnmanaged) }
+    })
+    .await
+    .expect_err("other schema");
+
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    assert!(!connected.get(), "the service manager is not contacted");
+}

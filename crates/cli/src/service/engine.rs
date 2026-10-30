@@ -57,7 +57,8 @@
 //! `service_refresh_pending` from `registering` on; uninstall rolls it back
 //! before `registering` and takes the session-checked flow after it, and also
 //! when the refresh cannot account for the edited `service.toml`. A refresh
-//! at `ready` is cleared by a rerun without reading the file.
+//! at `ready` is cleared by a rerun that reads and verifies the file (schema,
+//! user, roots, namespace) but does not classify it against the journal.
 //!
 //! # Config migration
 //!

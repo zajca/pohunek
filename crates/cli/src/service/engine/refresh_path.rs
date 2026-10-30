@@ -107,16 +107,6 @@ impl Engine<'_> {
         }
     }
 
-    /// Whether a refresh record is pending, read without the lock.
-    ///
-    /// Only a hint for the caller; the run decides again under the lock.
-    pub(crate) fn has_pending_refresh(&self) -> Result<bool, Error> {
-        Ok(self
-            .store
-            .load()?
-            .is_some_and(|record| record.operation == Operation::RefreshPath))
-    }
-
     /// Starts a refresh, or reports that nothing needs one.
     async fn refresh_fresh(
         &self,
@@ -270,8 +260,9 @@ impl Engine<'_> {
         }
         report.resumed = true;
         if record.step >= Step::Ready {
-            // Only the clear is left; the file is not read, so an edit of it
-            // cannot keep a finished refresh pending.
+            // Only the clear is left. The file was read and verified above but
+            // is not classified against the journal, so an edit of it cannot
+            // keep a finished refresh pending.
             self.checkpoint(Step::Ready)?;
             self.store.clear()?;
             report.applied = true;
@@ -283,12 +274,12 @@ impl Engine<'_> {
         // as it started. A file restored to the previous path's own rendering
         // (by hand: a rollback marks the record `rolling_back` first) holds no
         // refresh write, so it is written again like the unchanged original.
-        let state = classify_file(&journal, config, bytes);
+        let target_path = self.journaled_path(&journal.target)?;
+        let target = config.with_search_path(target_path)?;
+        let state = classify_file(&journal, config, bytes, &target);
         if state == FileState::Edited {
             return Err(Error::RefreshConfigChanged);
         }
-        let target_path = self.journaled_path(&journal.target)?;
-        let target = config.with_search_path(target_path)?;
         let config_path = self.context.config_path();
         check_layout_dirs(self.context, config.layout())?;
         layout::verify_claim(config.layout(), &config.namespace())?;
@@ -492,7 +483,8 @@ impl Engine<'_> {
         // whose hint names the installed release's own `refresh-path`, and
         // `uninstall` does not need the read.
         let (current, bytes) = refresh::load_installed_config(self.context)?;
-        let state = classify_file(journal, &current, &bytes);
+        let target = current.with_search_path(self.journaled_path(&journal.target)?)?;
+        let state = classify_file(journal, &current, &bytes, &target);
         let previous = self.journaled_path(&journal.previous)?;
         let restored = match state {
             FileState::After => current.with_search_path(previous)?,
@@ -557,8 +549,16 @@ impl Engine<'_> {
 ///
 /// The rendering of a path restored by a rollback differs from the bytes the
 /// refresh started from only in formatting; it counts as restored when the
-/// file is its own canonical rendering and records the previous path.
-fn classify_file(journal: &RefreshJournal, config: &ServiceConfig, bytes: &[u8]) -> FileState {
+/// file is its own canonical rendering, records the previous path, and holds
+/// every other value the refresh wrote: `target` is the file's configuration
+/// with the journaled target path, whose rendering is the one `digest_after`
+/// names.
+fn classify_file(
+    journal: &RefreshJournal,
+    config: &ServiceConfig,
+    bytes: &[u8],
+    target: &ServiceConfig,
+) -> FileState {
     let digest = config_digest(bytes);
     if digest == journal.digest_after {
         FileState::After
@@ -566,6 +566,7 @@ fn classify_file(journal: &RefreshJournal, config: &ServiceConfig, bytes: &[u8])
         FileState::Before
     } else if config.search_path().entries() == journal.previous.as_slice()
         && bytes == config.to_toml().as_bytes()
+        && config_digest(target.to_toml().as_bytes()) == journal.digest_after
     {
         FileState::Restored
     } else {

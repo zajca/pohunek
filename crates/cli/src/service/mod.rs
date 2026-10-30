@@ -130,13 +130,13 @@ pub async fn upgrade(
 /// Re-records the daemon job's search path from a fresh login-shell discovery
 /// and replaces the daemon job with it.
 ///
-/// See [`refresh_discovering`]; `dry_run` previews the change and the
+/// See [`refresh_entry`]; `dry_run` previews the change and the
 /// adoption verdict, and `accept_runtime_loss` accepts the sessions that
 /// verdict lists as at risk. The login shell runs before any lock is taken.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`refresh_discovering`] and [`Error::InheritedLock`]
+/// Returns the errors of [`refresh_entry`] and [`Error::InheritedLock`]
 /// when `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
 pub async fn refresh_search_path(
     dry_run: bool,
@@ -144,38 +144,84 @@ pub async fn refresh_search_path(
 ) -> Result<report::RefreshPathReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
-    // The schema is judged before the service manager is contacted; the engine
-    // repeats the read under the lock.
-    refresh::load_installed_config(&context)?;
-    let backend = connect_installed(&context).await?;
+    refresh_entry(&context, inherited, dry_run, accept_runtime_loss, || {
+        connect_installed(&context)
+    })
+    .await
+}
+
+/// The order of [`refresh_search_path`] with the service-manager connection
+/// supplied by `connect`.
+///
+/// The discovery refusals that need no service manager and no read of
+/// `service.toml` ([`Error::NotInstalled`], [`Error::SearchPathUnmanaged`])
+/// come first; then the schema is judged, and only then is the service manager
+/// contacted. The engine repeats the schema read under the lock.
+pub(crate) async fn refresh_entry<Connect, Connecting>(
+    context: &Context,
+    inherited: Option<record::TransactionLock>,
+    dry_run: bool,
+    accept_runtime_loss: bool,
+    connect: Connect,
+) -> Result<report::RefreshPathReport, Error>
+where
+    Connect: FnOnce() -> Connecting,
+    Connecting: std::future::Future<Output = Result<Backend, Error>>,
+{
+    let discovered = discover_for_refresh(context)?;
+    refresh::load_installed_config(context)?;
+    let backend = connect().await?;
     let engine =
-        engine(&context, &backend, inherited).with_runtime_loss_accepted(accept_runtime_loss);
-    refresh_discovering(&context, &engine, dry_run).await
+        engine(context, &backend, inherited).with_runtime_loss_accepted(accept_runtime_loss);
+    engine.refresh_path(discovered, dry_run).await
 }
 
 /// Runs the login-shell discovery, then [`engine::Engine::refresh_path`].
 ///
-/// The shell runs here, before the engine takes the transaction lock, so a
-/// slow shell never keeps another service command waiting. A discovery that
-/// fails is returned at once, unless a refresh record is pending: resuming or
-/// rolling that back never needs the fresh path, so the engine gets the
-/// failure and carries it as a warning. The pending record is looked at
-/// without the lock; the engine decides again under it.
+/// See [`discover_for_refresh`] for how a failed discovery is treated.
 ///
 /// # Errors
 ///
 /// Returns the errors of [`engine::Engine::refresh_path`] and
 /// [`refresh::discover`].
+#[cfg(test)]
 pub(crate) async fn refresh_discovering(
     context: &Context,
     engine: &engine::Engine<'_>,
     dry_run: bool,
 ) -> Result<report::RefreshPathReport, Error> {
-    let discovered = match refresh::discover(context) {
-        Err(error) if !engine.has_pending_refresh()? => return Err(error),
-        outcome => outcome,
-    };
+    let discovered = discover_for_refresh(context)?;
     engine.refresh_path(discovered, dry_run).await
+}
+
+/// Runs the login-shell discovery of a refresh.
+///
+/// The shell runs before the engine takes the transaction lock, so a slow
+/// shell never keeps another service command waiting. [`Error::NotInstalled`]
+/// and [`Error::SearchPathUnmanaged`] are always returned. A failed, hung or
+/// junk login shell ([`Error::SearchPathRefreshFailed`]) is returned at once
+/// too, unless a refresh record is pending: resuming or rolling that back
+/// never needs the fresh path, so the engine gets the failure and carries it
+/// as a warning. The pending record is looked at without the lock; the engine
+/// decides again under it.
+///
+/// # Errors
+///
+/// Returns the errors of [`refresh::discover`] that are not deferred, and the
+/// record store's error when a failed discovery has to look for a pending
+/// record.
+fn discover_for_refresh(context: &Context) -> Result<Result<refresh::Discovered, Error>, Error> {
+    match refresh::discover(context) {
+        Err(error @ Error::SearchPathRefreshFailed { .. }) => {
+            let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+            if pending.is_some_and(|record| record.operation == record::Operation::RefreshPath) {
+                Ok(Err(error))
+            } else {
+                Err(error)
+            }
+        }
+        other => other.map(Ok),
+    }
 }
 
 /// Uninstalls the service.

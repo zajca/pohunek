@@ -2828,8 +2828,9 @@ has begun. It fails with `service_upgrade_sessions_at_risk` or
 `service_daemon_job_missing` when no daemon job is registered (nothing is
 changed), with `service_refresh_config_changed` when `service.toml` was edited
 during a pending refresh that has to act on it (a refresh at `ready` only
-clears its record, and `uninstall` removes the installation whatever the file
-holds), and `service_refresh_pending` is what `install` and
+clears its record after reading and verifying the file, without comparing it with
+the refresh, and `uninstall` removes the installation without needing the file to
+match the refresh), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
 (`pohunek service refresh-path` resolves it). It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
