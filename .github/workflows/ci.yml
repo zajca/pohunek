@@ -12,7 +12,10 @@ name: CI
 # and publishes nothing; it is part of the nightly tier, not of the main tier.
 # The rehearsal's synthetic-archive smoke scenarios (#1259) are their own job
 # that needs only this checkout, so they start in parallel with the build.
-# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
+# Runner images are pinned (#1731), never ubuntu-latest. The nextest archive producer (build-tests) and every job
+# that consumes its archive run on ubuntu-26.04, together, so they share one glibc. Jobs that build or run the
+# shipped binaries stay on ubuntu-24.04: the acceptance guests carry glibc 2.41 and `glibc-check` rejects binaries
+# built against 26.04's glibc 2.43. The other jobs stay on ubuntu-24.04 until a run on 26.04 covers them.
 on:
   push:
     branches: [main]
@@ -83,8 +86,11 @@ env:
   # binaries with default features in-job for the same reason.
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
-  # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
-  # platform-contracts, darwin-check). The full key also hashes the toolchain, the
+  # clippy, test-debug, bins, systemd, release, xtask, docs, hack, nightly-udeps,
+  # platform-contracts, darwin-check). The key does not name the runner image, so
+  # a cache is never restored on an older image than the one that saved it: a
+  # cache built on ubuntu-26.04 must not feed an ubuntu-24.04 job. The full key
+  # also hashes the toolchain, the
   # RUST*/CARGO* environment (RUSTFLAGS included), and the Cargo manifests.
   # rust-cache saves only on a key miss and the first finisher wins, so each
   # key has exactly one designated saver, the job that builds the superset
@@ -573,7 +579,7 @@ jobs:
     name: fmt + clippy
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -623,7 +629,7 @@ jobs:
     name: macOS lint from Linux (aarch64-apple-darwin clippy)
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     env:
       # No mold link argument: the lint links nothing, and with an explicit
       # `--target` RUSTFLAGS apply to the Apple target only.
@@ -658,7 +664,7 @@ jobs:
   # this job, so a failed or skipped selection runs everything.
   test-selection:
     name: test selection
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
     env:
@@ -783,7 +789,7 @@ jobs:
   # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -832,7 +838,7 @@ jobs:
     name: tests (${{ matrix.shard }}, fast)
     needs: [build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.fast_shards != '[]') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -929,7 +935,7 @@ jobs:
   # toolchain pin change runs every Rust job.
   changes:
     name: required jobs (paths filter)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       pull-requests: read
     outputs:
@@ -1203,7 +1209,7 @@ jobs:
     name: tests (heavy, PTY + Hermes)
     needs: [build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: relocated
@@ -1296,7 +1302,7 @@ jobs:
   # not carry one.
   systemd-supervision:
     name: real systemd supervision
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       POHUNEK_SYSTEMD_E2E: "1"
@@ -1315,9 +1321,10 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Designated `bins` saver: the build-bins binaries plus the test
-          # builds of the ignored systemd suites, a superset of build-bins.
-          shared-key: bins
+          # The key is per runner image: this job runs on ubuntu-26.04, and
+          # the `bins` entry belongs to the ubuntu-24.04 jobs that build the
+          # shipped binaries.
+          shared-key: systemd
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Require a running systemd user manager
@@ -1423,7 +1430,7 @@ jobs:
     name: tests (relay DB, PostgreSQL)
     needs: [changes, build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true') && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.relay_db != 'false') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     services:
       postgres:
         # Docker Official Image from Google's cache, pinned to its OCI index.
@@ -1520,7 +1527,7 @@ jobs:
     name: test selection audit (G3)
     needs: [build-tests]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
@@ -1617,7 +1624,7 @@ jobs:
     name: test selection check
     needs: [build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: relocated
@@ -1655,7 +1662,7 @@ jobs:
     name: test selection verdict
     needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos]
     if: ${{ always() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
       - name: Fail a test job that failed or was skipped without a narrowed selection
         if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')) || needs.integration-relay.result == 'failure' || needs.integration-relay.result == 'cancelled' || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
@@ -1699,7 +1706,7 @@ jobs:
     name: doctests
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -1729,7 +1736,7 @@ jobs:
   # request that changes a `release` filter input.
   release-build:
     name: release build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
     needs: changes
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release == 'true' }}
     env:
@@ -1817,7 +1824,7 @@ jobs:
   # It is kept as its own job so `docs check` always runs every PR.
   ts-drift:
     name: TS binding drift (xs check)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     needs: changes
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true' }}
     env:
@@ -1857,7 +1864,7 @@ jobs:
   # package selection.
   hermes-package:
     name: pinned Hermes compatibility (model-free)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.hermes != 'false') }}
     env:
@@ -2186,7 +2193,7 @@ jobs:
   # schedule and dispatch runs skip this job and run every package job.
   package-selection:
     name: runtime package selection
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     if: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
@@ -2329,7 +2336,7 @@ jobs:
   # needs this job.
   package-version-bump:
     name: package version bump
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     if: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
@@ -2455,7 +2462,7 @@ jobs:
   # this job proves the locked release still behaves as they say.
   pi-package:
     name: Pi runtime package (locked release, model-free)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.pi != 'false') }}
     env:
@@ -2596,7 +2603,7 @@ jobs:
   # of the runner image are the assumptions to check on its first run.
   codex-package:
     name: Codex runtime package (locked release, model-free)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.codex != 'false') }}
     env:
@@ -2733,7 +2740,7 @@ jobs:
   # postinstall are the assumptions to check on its first run.
   claude-package:
     name: Claude Code runtime package (locked release, model-free)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.claude != 'false') }}
     env:
@@ -3195,7 +3202,7 @@ jobs:
       - claude-package
       - hermes-compatibility-macos
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -3222,7 +3229,7 @@ jobs:
     name: build bins (pohunekd + pohunek-sessiond + pohunek)
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -3240,9 +3247,10 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore only: systemd-supervision saves `bins`.
+          # Designated `bins` saver; the upgrade workflow restores it. Both
+          # run on ubuntu-24.04, the glibc floor of the shipped binaries.
           shared-key: bins
-          save-if: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries are needed.
@@ -3286,7 +3294,7 @@ jobs:
   # `docs check`. Any other outcome of the selection runs it.
   sdk:
     name: SDK workspace
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
     needs: [build-bins, test-selection]
     if: ${{ !cancelled() && needs.build-bins.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     steps:
@@ -3458,7 +3466,7 @@ jobs:
     name: cargo-audit (RustSec advisories)
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -3485,7 +3493,7 @@ jobs:
 
   docs:
     name: docs check (schema + drift + source-map + runbooks + secrets + release)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
       - uses: actions/checkout@v4
 
@@ -3507,7 +3515,7 @@ jobs:
 
   feature-matrix:
     name: cargo-hack (feature powerset)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     # Expensive (issue #125): run only on schedule, push to main, manual
     # dispatch (always a full run), or when the dependency graph / feature
     # set / CI workflow changes.
@@ -3553,7 +3561,7 @@ jobs:
   # compiled out for the host (e.g. `#[cfg(target_os = "macos")]` on Linux).
   udeps:
     name: cargo-udeps (unused dependencies)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
@@ -3602,7 +3610,7 @@ jobs:
     name: cargo-shear (unused dependencies)
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
       - uses: actions/checkout@v4
         with:

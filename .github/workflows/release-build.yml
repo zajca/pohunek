@@ -20,7 +20,8 @@ name: Release build
 # packaging/runtime-catalog-anchor.json in the job's own ephemeral checkout, so
 # the archives and the rehearsal's throwaway signing key agree. The production
 # anchor is never changed, and a rehearsal bundle is never published.
-# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
+# Linux jobs stay on ubuntu-24.04 (#1731), never ubuntu-latest: they build, assemble or run the shipped binaries, and the
+# acceptance guests carry glibc 2.41, which `glibc-check` enforces; ubuntu-26.04 has glibc 2.43.
 on:
   workflow_call:
     inputs:

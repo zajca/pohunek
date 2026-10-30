@@ -1,6 +1,7 @@
 """Contract checks for the PR, main, and nightly CI tiers."""
 
 from pathlib import Path
+import collections
 import fnmatch
 import hashlib
 import importlib.machinery
@@ -2915,6 +2916,105 @@ class ArchiveToolchainTests(unittest.TestCase):
                 self.assertLess(min(setup), min(runs))
         self.assertTrue({"fast-tests", "integration", "integration-relay",
                          "test-selection-audit"} <= set(checked), checked)
+
+
+class RunnerImageTests(unittest.TestCase):
+    """The nextest archive producer and its consumers share one runner image,
+    and the jobs that build the shipped binaries stay on the glibc floor (#1731).
+    """
+
+    GLIBC_FLOOR = {"release-build", "build-bins", "sdk"}
+    FLOOR_WORKFLOWS = ("release.yml", "release-build.yml", "release-evidence.yml", "upgrade.yml")
+
+    @staticmethod
+    def runner(job: str) -> str:
+        match = re.search(r"(?m)^    runs-on: (\S+)", job)
+        if match is None:
+            raise AssertionError("job has no runs-on")
+        return match.group(1)
+
+    def test_the_archive_producer_and_its_consumers_share_one_image(self):
+        jobs = workflow_jobs()
+        group = {name for name, job in jobs.items()
+                 if re.search(r"(?m)^          name: nextest-archive$", job)}
+        self.assertTrue({"build-tests", "fast-tests", "integration"} <= group, group)
+        runners = {name: self.runner(jobs[name]) for name in group}
+        self.assertEqual(len(set(runners.values())), 1, runners)
+
+    def test_the_jobs_that_build_the_shipped_binaries_stay_on_the_glibc_floor(self):
+        jobs = workflow_jobs()
+        for name in self.GLIBC_FLOOR:
+            with self.subTest(job=name):
+                self.assertEqual(self.runner(jobs[name]), "ubuntu-24.04")
+        for workflow in self.FLOOR_WORKFLOWS:
+            text = (ROOT / ".github" / "workflows" / workflow).read_text()
+            with self.subTest(workflow=workflow):
+                self.assertEqual(
+                    set(re.findall(r"(?m)^\s+(?:runs-on|os): (ubuntu-\S+)", text)),
+                    {"ubuntu-24.04"},
+                )
+
+    @staticmethod
+    def cache_uses(entries):
+        """(key, image, saves) of every rust-cache step in `entries`, pairs of
+        (image, text). A step without `save-if` saves on a key miss."""
+        uses = []
+        for image, text in entries:
+            for step in text.split("uses: Swatinem/rust-cache")[1:]:
+                step = re.split(r"(?m)^\s*- ", step, maxsplit=1)[0]
+                key = re.search(r"(?m)^\s+shared-key: (\S+)\s*$", step)
+                save = re.search(r"(?m)^\s+save-if: (.+)$", step)
+                if key:
+                    uses.append((key.group(1), image, save is None or save.group(1) != "false"))
+        return uses
+
+    @classmethod
+    def cache_direction_violations(cls, entries):
+        """Keys saved from two images, and keys restored on an older image than
+        the one that saves them."""
+        savers = collections.defaultdict(set)
+        images = collections.defaultdict(set)
+        for key, image, saves in cls.cache_uses(entries):
+            images[key].add(image)
+            if saves:
+                savers[key].add(image)
+        return sorted(
+            key for key, saving in savers.items()
+            if len(saving) != 1 or min(images[key]) < max(saving)
+        )
+
+    def test_a_cache_is_never_restored_on_an_older_image_than_the_one_that_saved_it(self):
+        workflows = ROOT / ".github" / "workflows"
+        entries = [(self.runner(job), job) for job in workflow_jobs().values()
+                   if "runs-on: ubuntu" in job]
+        entries += [("ubuntu-24.04", (workflows / name).read_text())
+                    for name in self.FLOOR_WORKFLOWS]
+        uses = self.cache_uses(entries)
+        self.assertTrue({"bins", "systemd", "test-debug"} <= {key for key, _, _ in uses}, uses)
+        self.assertEqual(self.cache_direction_violations(entries), [])
+
+    def test_the_cache_direction_check_sees_a_saver_without_save_if(self):
+        def step(key, save_if=""):
+            return (f"      - uses: Swatinem/rust-cache@abc\n        with:\n"
+                    f"          shared-key: {key}\n{save_if}")
+        restore = "          save-if: false\n"
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-26.04", step("bins")),
+            ("ubuntu-24.04", step("bins", restore)),
+        ]), ["bins"])
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-24.04", step("bins")),
+            ("ubuntu-26.04", step("bins", restore)),
+        ]), [])
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-24.04", step("bins")),
+            ("ubuntu-26.04", step("bins")),
+        ]), ["bins"])
+
+    def test_no_workflow_follows_ubuntu_latest(self):
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                self.assertIsNone(re.search(r"(?m)^[^#\n]*ubuntu-latest", path.read_text()))
 
 
 AUDIT_JOB = "test-selection-audit"

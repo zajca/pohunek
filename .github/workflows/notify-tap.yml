@@ -7,7 +7,7 @@ name: Notify the Homebrew tap
 # no code from this repository or from a release asset, and reads the tag name
 # only through `env`, after the shell has matched it against a strict pattern.
 # A pre-release is skipped: the formula follows stable releases only.
-# Linux jobs are pinned to ubuntu-24.04: ubuntu-latest is ubuntu-26.04, which the suite does not support yet (#1731).
+# Linux jobs are pinned to ubuntu-24.04 (#1731), never ubuntu-latest: no run on ubuntu-26.04 covers them yet.
 on:
   workflow_run:
     workflows: [Release]
