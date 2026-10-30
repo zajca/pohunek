@@ -77,6 +77,8 @@ pub(super) const INTRODUCED_METHODS: &[&str] = &[
     method::SESSION_IDLE_STOP_SET,
     method::HOST_RESOLVE,
     method::COMMAND_RUN,
+    method::STORE_REJECTED_LIST,
+    method::STORE_REJECTED_SET_ASIDE,
 ];
 
 /// Event names protocol 3 defined; every other event is withheld from a

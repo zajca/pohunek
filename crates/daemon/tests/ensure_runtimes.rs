@@ -831,6 +831,72 @@ fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
     assert_eq!(fs::read(&second).expect("the unpinned profile"), profile);
 }
 
+/// A current-schema store line of `kind` that no loader accepts, as a record of
+/// a newer or damaged daemon leaves behind.
+fn unreadable_store_line(kind: &str) -> String {
+    format!(
+        "{{\"kind\":\"{kind}\",\"schema_version\":{},\"session_id\":\"s-unreadable\",\"desired_state\":\"suspended\"}}\n",
+        pohunek_daemon::store::STORE_SCHEMA_VERSION
+    )
+}
+
+/// An installed older version nothing known pins is outside the plan's retained
+/// set, so its missing root blocks nothing. A store line that may pin a package
+/// and cannot be read widens the set the plan judges to every installed version,
+/// so the same state refuses the bind, names the command that lists the line, and
+/// changes nothing; a line that carries no pin does not widen it.
+#[test]
+fn an_unreadable_store_line_that_may_pin_widens_the_set_the_plan_judges() {
+    let host = Host::new();
+    host.publish_at(&["claude"], 1);
+    host.write_claude_profile();
+    let older = host.step(false).packages[0].digest.clone();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.1.1");
+    host.publish_archives(2, &[("claude", &bytes, &digest)]);
+    let newer = host.step(false);
+    assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    // The release repinned the profile to the newer version, so nothing pins
+    // the older one; its root is gone.
+    host.remove_package_root(&older);
+    host.remove_release();
+    let second = host.write_profile("second", "base = \"claude\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read(&second).expect("the unpinned profile");
+    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+
+    let baseline = host.step(true);
+    assert!(baseline.refusals.is_empty(), "{:?}", baseline.refusals);
+    host.write_store(&unreadable_store_line("worktree"));
+    let no_pin = host.step(true);
+    assert!(
+        no_pin.refusals.is_empty(),
+        "a line that carries no pin leaves the set as it was: {:?}",
+        no_pin.refusals
+    );
+
+    host.write_store(&unreadable_store_line("session"));
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), [incompatible.as_str()]);
+        assert_eq!(report.refusals[0].subject, "second");
+        assert!(
+            report.refusals[0]
+                .detail
+                .contains("pohunek store rejected list"),
+            "the refusal names the command: {}",
+            report.refusals[0].detail
+        );
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(fs::read(&second).expect("the unpinned profile"), profile);
+}
+
 /// The state a digest-only profile repair starts from: the older version is
 /// installed, then replaced by a newer selected one, and nothing but the
 /// digest-only profile `second` refers to the older version. Returns the older

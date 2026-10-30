@@ -201,7 +201,7 @@ async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_profil
 
     assert!(daemon.contains(&pinned.digest));
     assert_eq!(
-        plan.iter().collect::<Vec<_>>(),
+        plan.known().iter().collect::<Vec<_>>(),
         daemon.iter().collect::<Vec<_>>()
     );
 }

@@ -68,6 +68,7 @@ use crate::project::detect::project_id;
 
 mod dry_run;
 mod legacy_binding;
+mod rejected;
 mod schema;
 #[cfg(test)]
 pub(crate) mod shape_guard;
@@ -77,6 +78,7 @@ mod legacy_binding_tests;
 
 pub(crate) use dry_run::{DryRun, DryRunState};
 pub(crate) use legacy_binding::RecoveryOutcome;
+pub use rejected::SetAsideError;
 pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
 
 #[cfg(unix)]
@@ -1467,30 +1469,15 @@ impl Store {
             return Ok(PinnedDigests::default());
         };
         let mut pinned = PinnedDigests::default();
-        let pin = |pin: &LaunchPin, digests: &mut Vec<protocol::PackageDigest>| {
-            if let Some(protocol::BindingProvenance::Package { package_digest, .. }) =
-                pin.binding().map(|binding| &binding.provenance)
-            {
-                digests.push(package_digest.clone());
-            }
-        };
         for line in self.checked_lines(&content)? {
             let schema::ParsedLine::Record { value, .. } = line else {
                 pinned.unreadable_lines += 1;
                 continue;
             };
-            let carries_no_pin = value
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| matches!(kind, "worktree" | "project"));
+            let carries_no_pin =
+                !kind_may_pin(value.get("kind").and_then(serde_json::Value::as_str));
             match serde_json::from_value::<Record>(value) {
-                Ok(Record::Session(record)) => {
-                    if let Some(recovery) = &record.recovery {
-                        pin(&recovery.launch_binding, &mut pinned.digests);
-                    }
-                }
-                Ok(Record::Resume(binding)) => pin(&binding.launch_binding, &mut pinned.digests),
-                Ok(Record::Worktree(_) | Record::Project(_)) => {}
+                Ok(record) => pinned.digests.extend(record_pin(&record)),
                 Err(_error) if carries_no_pin => {}
                 Err(_error) => pinned.unreadable_lines += 1,
             }
@@ -1578,6 +1565,21 @@ impl Store {
         projects: &[ProjectRecord],
         sessions: &[SessionRecord],
     ) -> io::Result<MetadataWriteOutcome> {
+        let rejected = self.rejected_line_texts()?;
+        self.write_records(resume, worktrees, projects, sessions, &rejected)
+    }
+
+    /// [`Self::write_all`] with the rejected lines named by the caller, in file
+    /// order. A caller that drops one of them takes responsibility for keeping
+    /// its text elsewhere.
+    fn write_records(
+        &self,
+        resume: &[ResumeBinding],
+        worktrees: &[WorktreeBinding],
+        projects: &[ProjectRecord],
+        sessions: &[SessionRecord],
+        rejected: &[String],
+    ) -> io::Result<MetadataWriteOutcome> {
         if resume
             .iter()
             .any(|binding| !kind_is_persistable(&binding.agent_base))
@@ -1607,8 +1609,8 @@ impl Store {
         for record in sessions {
             append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
         }
-        for text in self.rejected_line_texts()? {
-            body.push_str(&text);
+        for text in rejected {
+            body.push_str(text);
             body.push('\n');
         }
         self.commit_body(&body)
@@ -1930,6 +1932,21 @@ pub(crate) struct RejectedLine {
     pub(crate) reason: String,
     /// The line as stored, without its terminator.
     pub(crate) text: String,
+    /// The package digest a line that still decodes as a record pins. Such a
+    /// line is rejected only because its agent kind is not a runtime id, so
+    /// its pin is as readable as that of a loaded record.
+    pub(crate) decoded_pin: Option<protocol::PackageDigest>,
+    /// Whether the line decodes as a record at all.
+    pub(crate) decodable: bool,
+}
+
+impl RejectedLine {
+    /// Whether the line may pin a runtime package and the pin cannot be read:
+    /// its kind may pin (see [`kind_may_pin`]) and it does not decode. This is
+    /// the line count [`Store::pinned_package_digests`] reports as unreadable.
+    pub(crate) fn pin_unreadable(&self) -> bool {
+        kind_may_pin(self.kind.as_deref()) && !self.decodable
+    }
 }
 
 /// Partitions the lines of a store at the current schema into its record
@@ -1959,6 +1976,8 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 (text, (None, None, false, false), Err(error))
             }
         };
+        let mut decoded_pin = None;
+        let mut decodable = false;
         let reason = match parsed {
             Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
                 mirror_worker_instance_id(&mut record);
@@ -1969,7 +1988,9 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 resume.push(binding);
                 continue;
             }
-            Ok(Record::Session(_) | Record::Resume(_)) => {
+            Ok(record @ (Record::Session(_) | Record::Resume(_))) => {
+                decodable = true;
+                decoded_pin = record_pin(&record);
                 "the agent kind is not a runtime id".to_owned()
             }
             Ok(Record::Worktree(binding)) => {
@@ -1990,6 +2011,8 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
             removal_intent,
             reason,
             text: text.to_owned(),
+            decoded_pin,
+            decodable,
         });
     }
     ((resume, worktrees, projects, sessions), rejected)
@@ -2010,12 +2033,13 @@ fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, 
 /// debugging. The line stays in the store and every rewrite re-emits it
 /// unchanged. Editing the file while the daemon runs is unsafe, because a
 /// half-written read drops the lines after the cut at the next rewrite: the
-/// remedy is to stop the daemon, move the line into a backup file and start it.
+/// remedy is `pohunek store rejected set-aside`, which moves the line into the
+/// quarantine file under the write lock.
 fn warn_rejected(line: &RejectedLine) {
     warn!(
         reason = %line.reason,
         line = %line.text,
-        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning stop the daemon, move the line out of the file into a backup file and start the daemon"
+        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`"
     );
 }
 
@@ -2026,6 +2050,32 @@ const NON_SESSION_KINDS: [&str; 3] = ["resume", "worktree", "project"];
 /// whose discriminator is missing or unreadable still may.
 pub(crate) fn may_hold_session(kind: Option<&str>) -> bool {
     kind.is_none_or(|kind| !NON_SESSION_KINDS.contains(&kind))
+}
+
+/// Whether a line with this `kind` may pin a runtime package. Only a
+/// `worktree` or `project` record carries no pin; a `resume` record pins, and a
+/// missing or unreadable discriminator may.
+pub(crate) fn kind_may_pin(kind: Option<&str>) -> bool {
+    !matches!(kind, Some("worktree" | "project"))
+}
+
+/// The package digest `record` pins: its recovery's launch binding for a
+/// session, its launch binding for a resume binding.
+fn record_pin(record: &Record) -> Option<protocol::PackageDigest> {
+    let pin = |pin: &LaunchPin| match pin.binding().map(|binding| &binding.provenance) {
+        Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
+            Some(package_digest.clone())
+        }
+        _ => None,
+    };
+    match record {
+        Record::Session(record) => record
+            .recovery
+            .as_ref()
+            .and_then(|recovery| pin(&recovery.launch_binding)),
+        Record::Resume(binding) => pin(&binding.launch_binding),
+        Record::Worktree(_) | Record::Project(_) => None,
+    }
 }
 
 /// The kind, session id, liveness and removal intent a rejected line still names.

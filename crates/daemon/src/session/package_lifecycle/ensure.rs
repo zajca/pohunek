@@ -11,7 +11,7 @@
 
 // Rust guideline compliant 2026-10-14
 
-use super::super::packages::RetainedPins;
+use super::super::packages::{installed_digests, RetainedPins};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use package::catalog_state::CatalogState;
-use package::registry::{PackageSource, RegistryState, RetainedDigests};
+use package::registry::{PackageSource, RegistryState};
 use package::verify::VerifyError;
 use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
@@ -278,14 +278,41 @@ struct PlanInputs<'a> {
     /// The context a conflict check and a health check read installed packages
     /// through.
     planning: Option<&'a Context>,
-    /// The digests a session or a profile still pins.
-    retained: &'a RetainedDigests,
+    /// The digests a session or a profile still pins, and whether a store line
+    /// that may pin one cannot be read.
+    retained: &'a RetainedPins,
     /// Which profiles and sessions pin them.
     pins: &'a Pins,
     /// The launch base environment the config homes of the planned definitions
     /// are resolved with, as a launch resolves them.
     base: &'a BaseEnv,
 }
+
+impl PlanInputs<'_> {
+    /// Whether nothing can pin `digest`: no readable record pins it and no
+    /// unreadable store line may. Only then is an uninstall of it possible.
+    fn removable(&self, digest: &PackageDigest) -> bool {
+        !self.retained.known().contains(digest) && !self.retained.is_uncertain()
+    }
+
+    /// The sentence that explains a refusal judged over every installed
+    /// version, empty while no store line is unreadable.
+    fn unreadable_note(&self) -> &'static str {
+        if self.retained.is_uncertain() {
+            UNREADABLE_PIN_NOTE
+        } else {
+            ""
+        }
+    }
+}
+
+/// Appended to a refusal that every installed version took part in because a
+/// metadata-store line that may pin a package cannot be read.
+const UNREADABLE_PIN_NOTE: &str = "; a metadata-store line that cannot be read may pin a version, so every installed version counts: run `pohunek store rejected list`";
+
+/// The step that releases the pin an unreadable metadata-store line may hold,
+/// ending in `; then `.
+const UNREADABLE_PIN_STEP: &str = "a metadata-store line that cannot be read may pin it, so the registry refuses its removal until the line is set aside: run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`; then ";
 
 /// The release catalog, verified, and where its archives are.
 struct Release<'a> {
@@ -901,11 +928,7 @@ fn apply(
         report.packages.push(entry);
     }
     for bind in binds {
-        let retained = RetainedPins::from_known(retained_pins(
-            &inputs.store_path,
-            &profiles,
-            Some(&bind.name),
-        )?);
+        let retained = retained_pins(&inputs.store_path, &profiles, Some(&bind.name))?;
         let params = PackageBindProfileParams {
             profile: bind.name.clone(),
             digest: Some(bind.digest.clone()),
@@ -958,6 +981,10 @@ struct SessionRecord {
 /// What the metadata store's records use and pin.
 struct StoreView {
     records: Vec<SessionRecord>,
+    /// Lines that may pin a package and no loader accepts. They stay in the
+    /// store and are never searched for a digest, so the pins above are
+    /// incomplete while one exists.
+    unreadable_lines: usize,
 }
 
 impl StoreView {
@@ -988,6 +1015,14 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
         .filter_map(|session| session.recovery.as_ref())
         .chain(dry.resume.iter())
         .collect();
+    // A rejected line that still decodes pins what the daemon's gate reads from
+    // it, though no runtime of it is known.
+    let rejected_pins = dry.rejected.iter().filter_map(|line| {
+        line.decoded_pin.clone().map(|digest| SessionRecord {
+            runtime: None,
+            pin: Some(digest),
+        })
+    });
     let records = bindings
         .iter()
         .map(|binding| SessionRecord {
@@ -1003,24 +1038,50 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
                 Some(protocol::BindingProvenance::Builtin { .. }) | None => None,
             },
         })
+        .chain(rejected_pins)
         .collect();
-    Ok(StoreView { records })
+    let unreadable_lines = dry
+        .rejected
+        .iter()
+        .filter(|line| line.pin_unreadable())
+        .count();
+    Ok(StoreView {
+        records,
+        unreadable_lines,
+    })
 }
 
 /// Digests every installed package a session or profile still pins, excluding
 /// the pin of the profile `skip` when one is given. The offline step reads the
-/// same sources as the daemon's `retained_package_digests`, which an uninstall
-/// judges by.
+/// same sources as the daemon's `retained_package_pins`, which an uninstall
+/// judges by: a store line that may pin a package and cannot be read is never
+/// searched for a digest, and while one exists the gate set also holds every
+/// installed digest.
 pub(in crate::session) fn retained_pins(
     store_path: &Path,
     profiles: &ProfileRegistry,
     skip: Option<&str>,
-) -> Result<RetainedDigests, EnsureError> {
+) -> Result<RetainedPins, EnsureError> {
     let mut retained = profiles
         .pinned_digests_excluding(skip)
         .map_err(EnsureError::Profiles)?;
-    retained.extend(read_store(store_path)?.pins().cloned());
-    Ok(retained)
+    let store = read_store(store_path)?;
+    retained.extend(store.pins().cloned());
+    let installed = if store.unreadable_lines > 0 {
+        warn!(
+            unreadable_lines = store.unreadable_lines,
+            "package checks judge every installed package: the metadata store holds a line that may pin a package and cannot be read"
+        );
+        installed_digests(profiles.runtimes())
+            .map_err(|error| EnsureError::Registry(error.to_string()))?
+    } else {
+        Vec::new()
+    };
+    Ok(RetainedPins::with_unreadable(
+        retained,
+        store.unreadable_lines,
+        installed,
+    ))
 }
 
 /// Verifies the release catalog for the plan.
@@ -1446,7 +1507,10 @@ fn plan_runtime(
             report.refuse(
                 &subject,
                 &ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code,
-                "a retained version of this package has an incompatible integration",
+                &format!(
+                    "a retained version of this package has an incompatible integration{}",
+                    plan.unreadable_note()
+                ),
             );
             return Ok(None);
         }
@@ -1901,7 +1965,7 @@ fn coexistence_blocked(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
     let blocking = conflict(
         context,
         state,
-        plan.retained,
+        plan.retained.gate(),
         (&prepared.digest, &prepared.identity.id),
         &integration,
     );
@@ -2139,7 +2203,10 @@ fn rewrite_pin(
         report.refuse(
             name,
             &ProtocolError::from(kind).code,
-            "an installed version of this package is not compatible with a retained version",
+            &format!(
+                "an installed version of this package is not compatible with a retained version{}",
+                plan.unreadable_note()
+            ),
         );
         return Ok(None);
     }
@@ -2177,7 +2244,7 @@ fn rewrite_pin(
 fn bind_coexistence(
     plan: &PlanInputs<'_>,
     entry: &Planned,
-    retained: &RetainedDigests,
+    retained: &RetainedPins,
 ) -> Option<PackageErrorKind> {
     // A pending selection is judged over the global set by the install-time
     // check, which covers this set: the global set is a superset of it.
@@ -2195,7 +2262,7 @@ fn bind_coexistence(
     conflict(
         context,
         state,
-        retained,
+        retained.gate(),
         (&entry.digest, &entry.identity.id),
         &integration,
     )
@@ -2264,7 +2331,7 @@ fn install(
     store_path: &Path,
     profiles: &ProfileRegistry,
 ) -> Result<(), EnsureError> {
-    let retained = RetainedPins::from_known(retained_pins(store_path, profiles, None)?);
+    let retained = retained_pins(store_path, profiles, None)?;
     let state = read_state(context).map_err(kind_error)?;
     let digest = prepared.digest.clone();
     let definition = prepared.definition.clone();
@@ -2836,7 +2903,7 @@ fn held_hint(
     };
     let beside = |tail: String| {
         let mut detail = format!("{same}, so it cannot be installed, and {tail}");
-        if named && !plan.retained.contains(holder) {
+        if named && plan.removable(holder) {
             let altered = matches!(health_of(plan, holder), Health::Damaged(_));
             let command = uninstall_command(id, holder, altered);
             let follow = follow_up(plan, blocked, holder, holder, reserved, reasons)
@@ -2915,8 +2982,11 @@ fn removal_clause(
 /// `None` when nothing pins it. There is no command that unpins: a profile is
 /// edited, and a session pin goes with the sessions.
 fn pin_release(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Option<String> {
-    if !plan.retained.contains(digest) {
-        return None;
+    if !plan.retained.known().contains(digest) {
+        return plan
+            .retained
+            .is_uncertain()
+            .then(|| UNREADABLE_PIN_STEP.to_owned());
     }
     let profiles: Vec<String> = plan
         .pins
@@ -3051,7 +3121,7 @@ fn same_version_detail(
             .state
             .and_then(|state| state.selected(&prepared.identity.id))
             == Some(holder)
-        && !plan.retained.contains(holder)
+        && plan.removable(holder)
         && matches!(health_of(plan, holder), Health::Present);
     if removable {
         return format!(

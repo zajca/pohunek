@@ -87,10 +87,14 @@ rule. The current state of each place is stated separately.
 Every persisted record that cannot be migrated or adopted is logged at WARN,
 surfaced to the operator, and carries a recovery hint. A `metadata.jsonl` line
 no loader accepts stays in the file: every rewrite re-emits it unchanged after
-the parsed records. The only safe recovery is to stop the daemon, move the line
-out of `metadata.jsonl` into a backup file, and start the daemon; editing the
-file while the daemon runs can be read half-written, and the next rewrite then
-drops every line after the cut. An unreadable line never shrinks a retention
+the parsed records. The supported recovery is `pohunek store rejected list` and
+`pohunek store rejected set-aside <content-hash>`, which move the line into the
+owner-private quarantine file `metadata.rejected.jsonl` next to the store with an
+audit record, under the store's write lock; a line that may belong to a live
+runtime needs `--accept-pin-loss`. Editing `metadata.jsonl` while the daemon runs
+can be read half-written, and the next rewrite then drops every line after the
+cut; a daemon that predates the commands is recovered by stopping it, moving the
+line into a backup file and starting it. An unreadable line never shrinks a retention
 gate's set: package gates judge every installed digest while a line that may pin
 a package cannot be read (`package.uninstall` is refused with
 `package_retention_uncertain`; listing, inspecting and doctor still work), and no

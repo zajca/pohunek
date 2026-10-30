@@ -894,6 +894,9 @@ logged at WARN, surfaced to the operator, and carries a recovery hint. A
 `metadata.jsonl` line that no loader accepts stays in the file: every rewrite
 re-emits it unchanged after the parsed records, so the line is never lost to a
 later write; package gates treat it as possibly pinning any installed package.
+`pohunek store rejected list` shows such lines and `pohunek store rejected
+set-aside` moves one, with an audit record, into the owner-private
+`metadata.rejected.jsonl`, which the daemon never deletes.
 The operator-facing gate of the window is the upgrade preflight. `pohunek
 service check` and `pohunek service upgrade` of an existing service run
 `pohunekd upgrade-preflight` of the new archive before any effect; it prints a
@@ -1949,6 +1952,7 @@ Runtime state under the user data directory:
 ```text
 ~/.local/share/pohunek/
   metadata.jsonl           # logical sessions, worktrees, and projects (0600)
+  metadata.rejected.jsonl  # rejected store lines set aside, with audit records (0600)
   notifications/
     notifications.jsonl    # durable notification action log (0600)
     policy.json             # notification, retention, and compaction policy (0600)

@@ -120,6 +120,8 @@ mod setup_host;
 mod setup_host_native;
 #[path = "standalone_discovery.rs"]
 mod standalone_discovery;
+#[path = "store_cli.rs"]
+mod store_cli;
 #[path = "workflow_launchd.rs"]
 mod workflow_launchd;
 #[path = "workflow_reactions.rs"]

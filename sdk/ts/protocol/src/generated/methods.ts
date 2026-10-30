@@ -114,6 +114,9 @@ import type {
   SessionWaitResult,
   SessionWaitTurnParams,
   SessionWaitTurnResult,
+  StoreRejectedListResult,
+  StoreRejectedSetAsideParams,
+  StoreRejectedSetAsideResult,
   WorktreeRemoveParams,
   WorktreeRemoveResult,
 } from "./index";
@@ -185,6 +188,8 @@ export interface Methods {
   "session.stop": { params: SessionId; output: SessionStopResult };
   "session.wait": { params: SessionWaitParams; output: SessionWaitResult };
   "session.wait_turn": { params: SessionWaitTurnParams; output: SessionWaitTurnResult };
+  "store.rejected_list": { params: null; output: StoreRejectedListResult };
+  "store.rejected_set_aside": { params: StoreRejectedSetAsideParams; output: StoreRejectedSetAsideResult };
   "subscribe": { params: null; output: JsonValue };
   "worktree.remove": { params: WorktreeRemoveParams; output: WorktreeRemoveResult };
 }
@@ -257,6 +262,8 @@ export const METHOD_NAMES = [
   "session.stop",
   "session.wait",
   "session.wait_turn",
+  "store.rejected_list",
+  "store.rejected_set_aside",
   "subscribe",
   "worktree.remove",
 ] as const satisfies readonly (keyof Methods)[];
