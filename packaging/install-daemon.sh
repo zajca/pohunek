@@ -28,6 +28,11 @@
 # it writes, a pending transaction, the recorded installation), so a host the
 # final command would refuse never has its legacy install retired.
 #
+# The archive check (`packaging/verify-archive`) runs `id` from a fixed list of
+# system directories, never from PATH: /usr/bin, /bin and, on NixOS, the system
+# profile /run/current-system/sw/bin. A host with none of them is refused with
+# `no trusted id found` before anything is changed.
+#
 # After a successful install or upgrade the wrapper prints the exact commands
 # that bring the managed agent hook assets in line with the new release; the
 # daemon itself never rewrites files in an agent's config home.
@@ -249,6 +254,9 @@ if ! check_json=$("$archive_dir/pohunek" "$@"); then
     echo "nothing was changed; fix the reported problem and re-run $0" >&2
     if printf '%s\n' "$check_json" | grep -q 'service_upgrade_sessions_at_risk'; then
         echo "live sessions the upgrade would not carry over are listed above; re-run $0 --accept-runtime-loss to accept losing them" >&2
+        if printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with lists'; then
+            echo "the refusal also warns that the recorded search path may be stale; follow that warning before accepting the loss" >&2
+        fi
     fi
     exit 1
 fi

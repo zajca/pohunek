@@ -41,6 +41,26 @@ case "$host_os $host_arch" in
         exit 1
         ;;
 esac
+# `id` comes from a fixed list of system directories, never from PATH, so a
+# program planted earlier on PATH cannot report another account's uid. A
+# directory counts only when the directory it resolves to is closed to group
+# and others and owned by root or by this user. NixOS has no /usr/bin/id; its
+# system profile holds the tool.
+trusted_id_dirs="/usr/bin /bin /run/current-system/sw/bin"
+host_id=
+for trusted_dir in $trusted_id_dirs; do
+    [ -x "$trusted_dir/id" ] || continue
+    # A failed `find` leaves the directory untrusted.
+    open_to_others=$(find -L "$trusted_dir" -prune \( -perm -020 -o -perm -002 \) -print) || continue
+    [ -z "$open_to_others" ] || continue
+    if ! [ -O "$trusted_dir" ]; then
+        foreign_owner=$(find -L "$trusted_dir" -prune ! -user 0 -print) || continue
+        [ -z "$foreign_owner" ] || continue
+    fi
+    host_id=$trusted_dir/id
+    break
+done
+[ -n "$host_id" ] || refuse_archive "no trusted id found in $trusted_id_dirs"
 manifest="$archive_dir/MANIFEST"
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     refuse_archive "the archive has no MANIFEST: $manifest"
@@ -53,7 +73,7 @@ ancestor=$(CDPATH= cd -- "$archive_dir" && pwd -P)
 while [ "$ancestor" != / ]; do
     ancestor=$(dirname -- "$ancestor")
     if [ -n "$(find "$ancestor" -prune \( -perm -020 -o -perm -002 \) ! -perm -1000 -print)" ] \
-        || [ -n "$(find "$ancestor" -prune ! -user "$(/usr/bin/id -u)" ! -user 0 -print)" ]; then
+        || [ -n "$(find "$ancestor" -prune ! -user "$("$host_id" -u)" ! -user 0 -print)" ]; then
         refuse_archive "a directory above the archive is writable by another account or owned by another user: $ancestor"
     fi
 done
@@ -61,7 +81,7 @@ done
 # free of group and other write permission, and no entry may be a symbolic
 # link: another account could otherwise replace a member (the wrapper
 # re-executes itself from this tree) between the digest check and its use.
-host_uid=$(/usr/bin/id -u)
+host_uid=$("$host_id" -u)
 unsafe_entry=$(find "$archive_dir" \( -perm -020 -o -perm -002 \) -print -o \
     \( ! -user "$host_uid" ! -user 0 \) -print -o -type l -print | head -n 1)
 if [ -n "$unsafe_entry" ]; then
