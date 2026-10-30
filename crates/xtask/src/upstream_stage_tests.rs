@@ -296,11 +296,15 @@ impl Fixture {
     }
 
     fn posix_verify(&self) -> bool {
+        self.posix_verify_with_path(TOOL_PATH)
+    }
+
+    fn posix_verify_with_path(&self, path: &str) -> bool {
         Command::new("/bin/sh")
             .args(["-c", POSIX_VERIFY, "sh"])
             .arg(self.stage())
             .env_clear()
-            .env("PATH", TOOL_PATH)
+            .env("PATH", path)
             .status()
             .expect("run the POSIX verifier")
             .success()
@@ -811,6 +815,7 @@ fn a_link_with_a_missing_final_target_is_refused_by_both_verifiers() {
 fn a_regular_file_used_as_a_directory_in_a_link_target_is_refused() {
     for target in [
         "../lib/node_modules/@fake/up/package.json/.",
+        "../lib/node_modules/@fake/up/package.json/..",
         "../lib/node_modules/@fake/up/package.json/",
     ] {
         let fixture = Fixture::new();
@@ -833,6 +838,53 @@ fn a_regular_file_used_as_a_directory_in_a_link_target_is_refused() {
         fixture.assert_posix_refuses(format_args!(
             "POSIX verifier accepted a regular file as a directory: {target}"
         ));
+    }
+}
+
+/// A `readlink -e` that resolves like uutils: it drops `.`, pops `..` and a
+/// trailing slash without checking that a component is a directory, so it
+/// accepts `file/.` and `file/..` where GNU fails.
+const LENIENT_READLINK: &str = "#!/bin/sh\n\
+     [ \"$1\" = -e ] && exec realpath -m -- \"$2\"\n\
+     exec /usr/bin/readlink \"$@\"\n";
+
+#[test]
+fn the_posix_verifier_refuses_a_regular_file_used_as_a_directory_on_a_lenient_readlink() {
+    if !posix_verifier_available() {
+        return;
+    }
+    let shims = pohunek_test_support::tempdir().expect("shim dir");
+    write_executable(shims.path().join("readlink"), LENIENT_READLINK).expect("readlink shim");
+    let path = format!("{}:{TOOL_PATH}", shims.path().display());
+
+    let fixture = Fixture::new();
+    fixture.staged();
+    assert!(
+        fixture.posix_verify_with_path(&path),
+        "the lenient readlink must accept an honest stage"
+    );
+
+    for target in [
+        "../lib/node_modules/@fake/up/package.json/.",
+        "../lib/node_modules/@fake/up/package.json/..",
+        "../lib/node_modules/@fake/up/package.json/./x",
+        "../lib/node_modules/@fake/up/package.json/",
+        "../lib/node_modules/@fake/up/package.json//",
+    ] {
+        let fixture = Fixture::new();
+        let stage = fixture.staged();
+        symlink(target, stage.join("bin/odd")).expect("link through a regular file");
+        let manifest = stage.join("STAGE.links");
+        let mut links = fs::read_to_string(&manifest).expect("links manifest");
+        links.push_str("link\tbin/odd\t");
+        links.push_str(target);
+        links.push('\n');
+        write_file(manifest, links).expect("record link");
+
+        assert!(
+            !fixture.posix_verify_with_path(&path),
+            "POSIX verifier accepted a regular file as a directory on a lenient readlink: {target}"
+        );
     }
 }
 

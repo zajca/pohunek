@@ -278,7 +278,8 @@ resolved_inside() (
     case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
   done
   case $target in */) [ -d "$candidate" ] || exit 1 ;; esac
-  # Resolve the symlink itself to retain a final slash or dot after a file.
+  # The checks above refuse a final slash or dot after a file on every
+  # userland; this resolves the link itself, so it must stay inside the root.
   resolved=$(readlink -e "$path" && printf x) || exit 1
   case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
 )
