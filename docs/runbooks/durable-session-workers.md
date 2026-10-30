@@ -274,8 +274,11 @@ had. The daemon deletes that directory in two cases and never otherwise:
   workers gone. A failed store delete therefore leaves the journals in place,
   and the retried removal deletes them. A removal that proceeded past an
   unconfirmed process (`--accept-unconfirmed-cleanup`) keeps the directory as evidence
-  for the startup collection. A failed directory delete is only logged,
-  because the removal already succeeded.
+  for the startup collection. A record delete the store did not sync to
+  disk (a crash could undo it) keeps it too, because a replayed removal may
+  still need the journals; the startup collection removes the directory once
+  nothing names the session. A failed directory delete is only
+  logged, because the removal already succeeded.
 - **Startup collection.** Before the control server accepts requests, the
   daemon collects the directories no startup evidence names: no store record,
   resume binding, rejected store line, worker socket or claim, or supervisor
