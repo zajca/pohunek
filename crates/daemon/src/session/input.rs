@@ -7,7 +7,7 @@ use protocol::{
 };
 
 use crate::agent::host::{RuntimeDefinition, RuntimeHost};
-use crate::runtime::WriteReservation;
+use crate::runtime::{WorkerError, WriteReservation};
 use pohunek_worker_protocol::InspectSnapshot;
 
 use super::{
@@ -288,7 +288,7 @@ impl SessionRegistry {
         text: &str,
     ) -> Result<(), ProtocolError> {
         let input_gate = self.input_gate(session_id).await?;
-        let _input_guard = input_gate.lock_owned().await;
+        let input_guard = input_gate.lock_owned().await;
         let (runtime, rules) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -301,7 +301,7 @@ impl SessionRegistry {
 
         let writes = build_input_writes(text, rules)?;
         match runtime {
-            RuntimeHandle::Worker(worker) => {
+            RuntimeHandle::Worker(worker) if writes.submit_delay.is_zero() => {
                 worker
                     .reserve_write(worker_input_fragments(writes, Duration::ZERO))
                     .await
@@ -309,6 +309,33 @@ impl SessionRegistry {
                     .commit(|| self.inner.turns.note_input(session_id))
                     .await
                     .map_err(worker_error_to_protocol)?;
+            }
+            RuntimeHandle::Worker(worker) => {
+                let turns = self.inner.turns.clone();
+                let session_id = session_id.clone();
+                #[cfg(test)]
+                let delay_boundary = self
+                    .inner
+                    .input_delay_hold
+                    .lock()
+                    .expect("input delay hold test lock")
+                    .take();
+                // A transaction finishes both plans even when the caller goes
+                // away, so a typed body is never left without its Enter.
+                self.spawn_transaction("delayed_input", async move {
+                    let _input_guard = input_guard;
+                    write_delayed_input(
+                        &worker,
+                        writes,
+                        || turns.note_input(&session_id),
+                        #[cfg(test)]
+                        delay_boundary,
+                    )
+                    .await
+                })
+                .await
+                .map_err(|error| worker_input_task_error(&error))?
+                .map_err(worker_error_to_protocol)?;
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(unavailable_runtime_error(session_id, state, None));
@@ -527,8 +554,8 @@ impl SessionRegistry {
     /// Waited input for delayed-submit framing: the daemon writes the body,
     /// waits out the delay, re-checks the agent and only then writes Enter, so
     /// a prompt that appears during the delay is never answered by Enter.
-    /// The session input gate and the worker connection stay held across both
-    /// writes.
+    /// The session input gate stays held across both writes; the worker
+    /// connection is free while the delay runs.
     async fn write_delayed_waited_input(
         &self,
         session_id: &SessionId,
@@ -561,6 +588,7 @@ impl SessionRegistry {
                 self.clone(),
                 DelayedSubmitRun {
                     session_id: session_id.clone(),
+                    worker: worker.clone(),
                     runtime: runtime.clone(),
                     delay,
                     ack_delay,
@@ -1221,6 +1249,45 @@ fn worker_input_task_error(_error: &tokio::task::JoinError) -> ProtocolError {
     )
 }
 
+/// Writes the body, waits the submit delay and writes Enter as a second plan.
+///
+/// Neither plan holds the worker's control connection while the delay runs, so
+/// other control requests to the worker are served in between. `note_input`
+/// runs when the first plan starts sending.
+async fn write_delayed_input(
+    worker: &Worker,
+    writes: InputWritePlan,
+    note_input: impl FnOnce(),
+    #[cfg(test)] delay_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
+) -> Result<(), WorkerError> {
+    let delay = writes.submit_delay;
+    if writes.body.is_empty() {
+        worker
+            .reserve_write(vec![enter_fragment(Duration::ZERO)])
+            .await?
+            .commit(note_input)
+            .await?;
+        return Ok(());
+    }
+    worker
+        .reserve_write(vec![body_fragment(writes.body)])
+        .await?
+        .commit(note_input)
+        .await?;
+    #[cfg(test)]
+    if let Some(delay_boundary) = delay_boundary {
+        delay_boundary.wait().await;
+        delay_boundary.wait().await;
+    }
+    tokio::time::sleep(delay).await;
+    worker
+        .reserve_write(vec![enter_fragment(Duration::ZERO)])
+        .await?
+        .commit(|| {})
+        .await?;
+    Ok(())
+}
+
 fn worker_write_task_result(
     result: Result<Result<InputActivitySnapshot, ProtocolError>, tokio::task::JoinError>,
 ) -> Result<InputActivitySnapshot, ProtocolError> {
@@ -1370,6 +1437,7 @@ struct DelayedSubmit {
 
 struct DelayedSubmitRun {
     session_id: SessionId,
+    worker: Worker,
     runtime: SessionRuntimeIdentity,
     delay: Duration,
     ack_delay: Duration,
@@ -1391,12 +1459,13 @@ struct DelayedSubmitRun {
 async fn run_delayed_submit(
     registry: SessionRegistry,
     run: DelayedSubmitRun,
-    mut reservation: WriteReservation,
+    reservation: WriteReservation,
     input_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<InputActivitySnapshot, ProtocolError> {
     let _input_guard = input_guard;
     let DelayedSubmitRun {
         session_id,
+        worker,
         runtime,
         delay,
         ack_delay,
@@ -1410,9 +1479,10 @@ async fn run_delayed_submit(
         delay_boundary,
     } = run;
 
-    if body_empty {
+    let reservation = if body_empty {
         // Nothing to type: the reservation already holds the Enter plan.
         let _result = body_started_tx.send(());
+        reservation
     } else {
         let sessions = registry.inner.sessions.lock().await;
         let entry = sessions
@@ -1425,8 +1495,10 @@ async fn run_delayed_submit(
         if deadline.saturating_duration_since(tokio::time::Instant::now()) <= delay {
             return Err(ProtocolError::session_input_timeout());
         }
+        // Committing consumes the reservation, so the control connection is
+        // free for other requests while the delay runs.
         reservation
-            .commit_retaining(move || {
+            .commit(move || {
                 let _result = body_started_tx.send(());
                 drop(sessions);
             })
@@ -1443,7 +1515,16 @@ async fn run_delayed_submit(
             () = progress.abandon.cancelled() => return Err(progress.not_submitted()),
             () = tokio::time::sleep(delay) => {}
         }
-    }
+        // Reserved before the session lock below, which keeps the lock order
+        // of the control connection first and the session registry second.
+        tokio::select! {
+            biased;
+            () = progress.abandon.cancelled() => return Err(progress.not_submitted()),
+            reserved = worker.reserve_write(vec![enter_fragment(ack_delay)]) => {
+                reserved.map_err(worker_error_to_protocol)?
+            }
+        }
+    };
 
     let sessions = registry.inner.sessions.lock().await;
     let entry = sessions
@@ -1455,11 +1536,6 @@ async fn run_delayed_submit(
             InputNotSubmittedReason::AgentBlocked,
         ));
     }
-    if !body_empty {
-        reservation
-            .prepare_next(vec![enter_fragment(ack_delay)])
-            .map_err(worker_error_to_protocol)?;
-    }
     #[cfg(test)]
     if let Some(send_boundary) = send_boundary {
         send_boundary.wait().await;
@@ -1470,7 +1546,7 @@ async fn run_delayed_submit(
     }
     let turns = registry.inner.turns.clone();
     let completion = reservation
-        .commit_retaining(move || {
+        .commit(move || {
             turns.note_input(&session_id);
             drop(sessions);
         })

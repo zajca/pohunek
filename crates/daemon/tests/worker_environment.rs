@@ -705,6 +705,13 @@ const GATED_OUTPUT_THEN_DRAIN_SCRIPT: &str = "while [ ! -e \"$1\" ]; do sleep 0.
 /// Line the gated child prints while the attach write is still pending.
 const CHILD_OUTPUT_MARKER: &[u8] = b"child-output-marker";
 
+/// Delay a control plan owns after its body fragment, as a profile's
+/// `submit_delay_ms` configures it.
+const PLAN_DELAY_MS: u64 = 1_500;
+
+/// Attach stream that types while a control plan's delay runs.
+const INTERLEAVING_STREAM_ID: &str = "attach-interleaving";
+
 /// Attach stream whose own input write is pending while it reads output.
 const WRITING_STREAM_ID: &str = "attach-writing";
 
@@ -821,6 +828,87 @@ async fn an_attach_stream_receives_output_while_its_own_input_waits_for_the_chil
         .stop(TransactionId::new("writing-stream-cleanup").expect("transaction id"))
         .await
         .expect("stop the gated child");
+}
+
+#[tokio::test]
+async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    let mut initialize = fixture.initialize(worker.worker_id().await);
+    initialize.executable = PathBuf::from("/bin/cat");
+    worker
+        .initialize(initialize)
+        .await
+        .expect("initialize the echoing child");
+
+    let mut observer = worker
+        .open_attach(
+            StreamId::new(OBSERVER_STREAM_ID).expect("observer stream id"),
+            AttachStart { dimensions: None },
+        )
+        .await
+        .expect("open observer attach stream");
+    observer.dimension_update = None;
+    let stream_id = StreamId::new(INTERLEAVING_STREAM_ID).expect("stream id");
+    let mut attach = worker
+        .open_attach(stream_id.clone(), AttachStart { dimensions: None })
+        .await
+        .expect("open attach stream");
+
+    let plan = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .write(vec![
+                    InputFragment {
+                        bytes: SecretBytes::new(b"plan-body".to_vec()),
+                        delay_after_ms: PLAN_DELAY_MS,
+                    },
+                    InputFragment {
+                        bytes: SecretBytes::new(b"\r".to_vec()),
+                        delay_after_ms: 0,
+                    },
+                ])
+                .await
+        }
+    });
+    await_pty_echo(&mut observer, b"plan-body").await;
+
+    // The plan is inside its delay: its body is echoed and its Enter is not
+    // yet written. An attach write must reach the PTY now instead of queueing
+    // behind the plan.
+    let attach_input = DataFrame::new(
+        FrameHeader {
+            version: attach.version,
+            stream_id: stream_id.clone(),
+            worker_instance_id: attach.worker_instance_id.clone(),
+            kind: FrameKind::Input {
+                write_id: WriteId::new(format!("attach-{INTERLEAVING_STREAM_ID}-1"))
+                    .expect("write id"),
+            },
+        },
+        b"attach-mark".to_vec(),
+    )
+    .expect("attach input frame");
+    write_frame(&mut attach.stream, &attach_input)
+        .await
+        .expect("send attach input");
+    await_pty_echo(&mut observer, b"attach-mark").await;
+    assert!(
+        !plan.is_finished(),
+        "the attach write waited for the plan's delay to end"
+    );
+
+    plan.await
+        .expect("plan task joins")
+        .expect("the delayed plan completes");
+
+    drop(attach);
+    drop(observer);
+    worker
+        .stop(TransactionId::new("interleave-cleanup").expect("transaction id"))
+        .await
+        .expect("stop the echoing child");
 }
 
 #[tokio::test]

@@ -202,7 +202,6 @@ pub(crate) struct WriteCompletion {
 pub(crate) struct WriteReservation {
     inner: OwnedMutexGuard<Inner>,
     request: Option<ControlRequest>,
-    worker: Worker,
 }
 
 impl Drop for WriteReservation {
@@ -774,7 +773,6 @@ impl Worker {
         Ok(WriteReservation {
             inner,
             request: Some(request),
-            worker: self.clone(),
         })
     }
 
@@ -1227,23 +1225,6 @@ impl WriteReservation {
     where
         F: FnOnce(),
     {
-        self.commit_retaining(send_started).await
-    }
-
-    /// [`Self::commit`] that keeps the control connection reserved, so the
-    /// caller can prepare and commit a follow-up plan with
-    /// [`Self::prepare_next`] before anything else uses the connection.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::commit`].
-    pub(crate) async fn commit_retaining<F>(
-        &mut self,
-        send_started: F,
-    ) -> Result<WriteCompletion, WorkerError>
-    where
-        F: FnOnce(),
-    {
         let request = self.request.take().expect("a reservation commits once");
         let response = exchange_locked(&mut self.inner, request, send_started).await?;
         match response {
@@ -1253,21 +1234,6 @@ impl WriteReservation {
             }),
             other => response_error(other),
         }
-    }
-
-    /// Prepares the next plan on the connection this reservation still holds.
-    /// The previous plan must have been committed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError`] for a torn stream or invalid plan framing.
-    pub(crate) fn prepare_next(
-        &mut self,
-        fragments: Vec<InputFragment>,
-    ) -> Result<(), WorkerError> {
-        debug_assert!(self.request.is_none(), "the previous plan was committed");
-        self.request = Some(self.worker.prepare_plan(&mut self.inner, fragments)?);
-        Ok(())
     }
 }
 

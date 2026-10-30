@@ -7956,6 +7956,105 @@ async fn delayed_wait_input_times_out_after_enter_when_the_agent_never_works() {
     registry.stop(&id).await.expect("stop the session");
 }
 
+/// Parks a delayed submit between its body and its Enter, resizes the session
+/// meanwhile and checks the resize is served while the agent has seen only the
+/// body; Enter then follows once the submit continues. `acknowledge` reports
+/// the working activity a waited input needs. Returns the input's own result.
+async fn resize_between_body_and_enter(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    delay_boundary: &tokio::sync::Barrier,
+    request: tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>,
+    marker: &str,
+    acknowledge: bool,
+) -> Result<protocol::SessionInputResult, protocol::ProtocolError> {
+    reach_boundary(delay_boundary).await;
+    pohunek_test_support::wait::guard(
+        "the resize to be served while the submit delay is pending",
+        registry.resize(id, 100, 30),
+    )
+    .await
+    .expect("resize between the body and Enter");
+    let before_enter = read_session_output_after_rejection(registry, id).await;
+    assert!(
+        !before_enter.contains("got:"),
+        "Enter reached the agent before the delay ended: {before_enter:?}"
+    );
+    reach_boundary(delay_boundary).await;
+
+    let output = wait_for_session_output(registry, id, &[&format!("got:{marker}")]).await;
+    assert!(output.contains(marker), "output={output:?}");
+    if acknowledge {
+        assert!(
+            report_input_activity(registry, id, AgentActivity::Working, 1)
+                .await
+                .recorded
+        );
+    }
+    let result = request.await.expect("input task joins");
+    registry.stop(id).await.expect("stop the session");
+    result
+}
+
+#[tokio::test]
+async fn delayed_wait_input_serves_a_resize_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-wait-resize");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "resize-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+
+    let result = resize_between_body_and_enter(
+        &registry,
+        &id,
+        &delay_boundary,
+        request,
+        "resize-marker",
+        true,
+    )
+    .await
+    .expect("waited input is acknowledged");
+    assert_eq!(result.submitted, Some(true));
+}
+
+#[tokio::test]
+async fn delayed_plain_input_serves_a_resize_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-plain-resize");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "plain-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    resize_between_body_and_enter(
+        &registry,
+        &id,
+        &delay_boundary,
+        request,
+        "plain-marker",
+        false,
+    )
+    .await
+    .expect("plain input is delivered");
+}
+
 #[tokio::test]
 async fn delayed_wait_input_never_writes_enter_when_the_agent_blocks_during_the_delay() {
     let registry = delayed_submit_registry("delayed-wait-blocked");
