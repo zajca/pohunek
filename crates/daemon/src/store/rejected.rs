@@ -32,8 +32,10 @@ pub enum SetAsideError {
     #[error("no rejected metadata-store line has this content hash")]
     NotFound,
     /// The line may own a live runtime and the pin loss was not accepted.
+    /// `resume_pin_unreadable` is true when the refused line is a `resume`
+    /// line whose pin cannot be read, false when it may be a session record.
     #[error("the line may belong to a session with a live runtime")]
-    Live,
+    Live { resume_pin_unreadable: bool },
     /// The store could not be read, or the quarantine file or the store
     /// rewrite failed. The store still holds the line.
     #[error("the line could not be moved into the quarantine file: {0}")]
@@ -206,8 +208,13 @@ impl Store {
         if aside.is_empty() {
             return Err(SetAsideError::NotFound);
         }
-        if !accept_pin_loss && aside.iter().any(|(_, line)| may_be_live(line)) {
-            return Err(SetAsideError::Live);
+        if !accept_pin_loss {
+            if let Some((_, line)) = aside.iter().find(|(_, line)| may_be_live(line)) {
+                return Err(SetAsideError::Live {
+                    resume_pin_unreadable: !line.may_own_runtime
+                        && line.kind.as_deref() == Some("resume"),
+                });
+            }
         }
         let set_aside_at = crate::time::now_rfc3339();
         let records: Vec<QuarantineRecord<'_>> = aside

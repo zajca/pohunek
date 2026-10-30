@@ -130,16 +130,28 @@ impl ProtocolError {
     }
 
     /// The line may own a live runtime and the pin loss was not accepted.
+    ///
+    /// `resume_pin_unreadable` names the refused line kind: a `resume` line
+    /// whose package pin cannot be read, or otherwise a line that may be a
+    /// session record.
     #[must_use]
-    pub fn store_rejected_line_live() -> Self {
+    pub fn store_rejected_line_live(resume_pin_unreadable: bool) -> Self {
+        let (msg, recover) = if resume_pin_unreadable {
+            (
+                "the line is a `resume` line whose package pin cannot be read, and the session it resumes may be running",
+                "stop that session or confirm no runtime depends on the pin, then repeat with `--accept-pin-loss`",
+            )
+        } else {
+            (
+                "the line may belong to a session with a live runtime, so setting it aside can drop the package pin it holds",
+                "stop the session or confirm no runtime depends on the line, then repeat with `--accept-pin-loss`",
+            )
+        };
         Self::new(
             ErrorClass::Runtime,
             STORE_REJECTED_LINE_LIVE,
-            "the line may belong to a session with a live runtime, so setting it aside can drop the package pin it holds",
-            Some(
-                "stop the session or confirm no runtime depends on the line, then repeat with `--accept-pin-loss`"
-                    .to_owned(),
-            ),
+            msg,
+            Some(recover.to_owned()),
         )
     }
 

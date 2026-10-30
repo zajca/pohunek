@@ -87,7 +87,7 @@
     "SiYuan": "Optional personal notes/pointers; never a competing project authority."
   },
   "pluginRouting": {
-    "rule": "Core issues are only for core capabilities. Plugin work and admission work are filed where the plugin or the index lives, never in the core repository.",
+    "rule": "Core issues are only for core capabilities. Plugin work is filed where the plugin lives, and admission work where the index lives; until the index repository exists, admission work is a core issue under #1609.",
     "pluginWork": "Work on one plugin (a fix, a feature, an upstream bump) is an issue in that plugin's repository: pohunekd/plugin-<name> for an official plugin, <owner>/pohunek-plugin-<name> for a third-party one. Until an official runtime leaves runtime-packages/ (#1609), its work stays in this repository.",
     "admissionWork": "Admitting, updating or revoking a plugin is a pull request, and its tracking issue, in pohunekd/pohunek-plugin-index. That repository exists from a later release; until then admission work is a core issue under #1609.",
     "coreCapability": "A capability a plugin needs from core (a runtime feature, a descriptor key, an integration handler) is a core issue that names the plugin that needs it; the plugin adopts it against the nightly kit.",

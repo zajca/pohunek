@@ -114,7 +114,11 @@ impl SessionRegistry {
                 quarantine_file: pohunek_paths::REJECTED_QUARANTINE_NAME.to_owned(),
             }),
             Err(SetAsideError::NotFound) => Err(ProtocolError::store_rejected_line_not_found()),
-            Err(SetAsideError::Live) => Err(ProtocolError::store_rejected_line_live()),
+            Err(SetAsideError::Live {
+                resume_pin_unreadable,
+            }) => Err(ProtocolError::store_rejected_line_live(
+                resume_pin_unreadable,
+            )),
             Err(SetAsideError::Failed(error)) => {
                 warn!(error = %error, "setting a rejected metadata-store line aside failed");
                 Err(ProtocolError::store_quarantine_failed())

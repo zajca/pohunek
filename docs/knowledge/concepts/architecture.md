@@ -105,9 +105,10 @@ proof, and so does a daemon or worker outside the initial cgroup namespace,
 whose paths are relative to another root. A same-user process with
 `CAP_DAC_OVERRIDE` or `CAP_SYS_ADMIN` through a file capability can migrate
 anywhere, and a root-owned service that starts same-user jobs with a recorded
-copy of the submitter's environment (for example `at(1)`) runs them outside the
-subtree, so they count as foreign; the marker scheme does not defend against a
-descendant that drops its markers either.
+copy of the submitter's environment (for example `at(1)`), or a same-user
+server living in a logind session scope, runs them outside the subtree, so
+they count as foreign; the marker scheme does not defend against a descendant
+that drops its markers either.
 
 Darwin adds a privilege boundary Linux does not have: the kernel serves most
 process records only to the owner of the target process and refuses everyone

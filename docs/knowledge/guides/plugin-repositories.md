@@ -129,9 +129,10 @@ install by id.
 
 From the release that ships the snapshot, a core release bundles the official
 set of its day from `packaging/official-plugins.lock.json`, a snapshot of the
-official tier of the index. The release proves every locked plugin against its exact artifacts before
-it ships, so an offline install of a release carries the official plugins that
-were proven with it. Plugins admitted after the snapshot install from the index.
+official tier of the index. The release proves every locked plugin against its
+exact artifacts before it ships, so an offline install of a release carries the
+official plugins that were proven with it. Plugins admitted after the snapshot
+install from the index.
 
 ## Documentation split
 
@@ -152,5 +153,5 @@ Core owns the descriptor and manifest schemas, `runtime_api` and the runtime
 features, the integration handlers, the plugin kit, the reusable plugin
 workflows, the index format and verifier, and the release catalog. Change core
 only for a core capability a plugin needs; do not add a directory under
-`runtime-packages/` or `compat/`, a package job to `.github/workflows/ci.yml`, or
-a test about one plugin to a core crate.
+`runtime-packages/` or `compat/`, a package job to
+`.github/workflows/ci.yml`, or a test about one plugin to a core crate.

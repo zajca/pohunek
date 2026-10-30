@@ -2779,6 +2779,7 @@ async fn host_inspect_probes_each_program_once_in_parallel_without_blocking_the_
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
+    capture_daemon_log();
     let rig = ProbeRig::new();
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", rig.root.path());
@@ -2831,6 +2832,15 @@ async fn host_inspect_probes_each_program_once_in_parallel_without_blocking_the_
     // waits for them instead of probing the same programs again.
     let mut concurrent = connect_unix(&socket).await;
     let second = tokio::spawn(async move { inspect(&mut concurrent, Value::Null).await });
+    // The daemon logs when an inventory finds another one probing; waiting for
+    // it proves the second request joins the held probes instead of finding
+    // their results in the cache.
+    pohunek_test_support::wait::wait_until("the second inventory to join the probes", || {
+        let joined =
+            (!captured_log_lines("inventory probe joined in-flight").is_empty()).then_some(());
+        async move { joined }
+    })
+    .await;
     // The inventory runs off the async runtime: other requests are answered
     // while every probe is still held.
     let health = ok_payload(

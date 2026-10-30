@@ -257,8 +257,50 @@ where
     serde_json::from_value(value).unwrap_or_else(|error| panic!("{method} result: {error}"))
 }
 
+/// The `store_rejected_line_live` message names a `resume` line only for the
+/// fixture's unreadable-pin `resume` line, not for a possible session record.
+async fn assert_live_refusal_names_its_line_kind<S>(
+    local: &mut Framed<S, LinesCodec>,
+    fixture: &RejectedFixture,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resume_refusal = refused(
+        local,
+        method::STORE_REJECTED_SET_ASIDE,
+        json!({ "content_hash": sha256_hex(&fixture.resume) }),
+    )
+    .await;
+    assert!(
+        resume_refusal.msg.contains("`resume` line"),
+        "{resume_refusal:?}"
+    );
+    let session_refusal = refused(
+        local,
+        method::STORE_REJECTED_SET_ASIDE,
+        json!({ "content_hash": sha256_hex(&fixture.live) }),
+    )
+    .await;
+    assert!(
+        !session_refusal.msg.contains("`resume` line"),
+        "{session_refusal:?}"
+    );
+}
+
 /// The wire error code of a refused call.
 async fn refusal<S>(framed: &mut Framed<S, LinesCodec>, method: &str, params: Value) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    refused(framed, method, params).await.code
+}
+
+/// The error of a refused call.
+async fn refused<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    method: &str,
+    params: Value,
+) -> protocol::ProtocolError
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -266,7 +308,6 @@ where
         .await
         .into_result()
         .expect_err("the call is refused")
-        .code
 }
 
 fn descriptor(program: &str) -> String {
@@ -2172,6 +2213,7 @@ async fn the_rejected_line_methods_are_local_only_and_list_every_line() {
         "store_rejected_line_live",
         "a resume line whose pin cannot be read needs the same consent"
     );
+    assert_live_refusal_names_its_line_kind(&mut local, &fixture).await;
     assert_eq!(
         refusal(
             &mut local,

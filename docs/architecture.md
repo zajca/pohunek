@@ -1617,14 +1617,14 @@ workflows, the index and its verifier, and the official plugin snapshot are
 available from a later release; the rule applies from now on. Core owns what
 plugins build on: the descriptor and manifest schemas, `runtime_api` and the
 runtime features, the integration handlers, the plugin kit, the reusable plugin
-workflows, the index format and verifier, and the release catalog. A plugin
-that needs a new core capability gets it in a core pull request first, behind a
-runtime feature. The four
-official runtimes (Pi, Codex, Claude Code and Hermes) are the only directories
-under `runtime-packages/` and `compat/`, and `cargo xtask docs check` refuses
-any other (`plugin-directories`); they are changed in place until they move to
-their own repositories ([#1609](https://github.com/zajca/pohunek/issues/1609)).
-Naming, required CI, compatibility and admission are in the
+workflows, the index format and verifier, and the release catalog. A plugin that
+needs a new core capability gets it in a core pull request first, behind a
+runtime feature. The four official runtimes (Pi, Codex, Claude Code and Hermes)
+are the only directories under `runtime-packages/` and `compat/`, and
+`cargo xtask docs check` refuses any other (`plugin-directories`); they are
+changed in place until they move to their own repositories
+([#1609](https://github.com/zajca/pohunek/issues/1609)). Naming, required CI,
+compatibility and admission are in the
 [plugin repositories guide](knowledge/guides/plugin-repositories.md).
 
 A runtime feature is a named core capability within one `runtime_api` major
@@ -2289,7 +2289,8 @@ is still strict for an enum whose tolerance ships in 0.38, and the 0.37
 TypeScript SDK checks `StateSource` against a closed set, so a new value of
 either needs a protocol bump and an N-1 adapter. A new value of a bump-only
 enum (`SessionState`, `SessionTurnEventKind`, `NotificationKind`) needs a
-protocol bump too, which 0.38 does not make, so those get no new value in 0.38.
+protocol bump too, so a release that makes no protocol bump adds no value to
+those.
 
 ## Testing Strategy
 
