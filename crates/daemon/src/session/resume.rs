@@ -195,13 +195,16 @@ fn profile_changed(binding: &ResumeBinding, was_frozen: bool) -> ProtocolError {
     )
 }
 
+/// The refusal code naming an unverifiable native conversation.
+const NATIVE_EVIDENCE_UNAVAILABLE: &str = "native_identity_evidence_unavailable";
+
 fn native_evidence_unavailable(
     binding: &ResumeBinding,
     reason: impl std::fmt::Display,
 ) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
-        "native_identity_evidence_unavailable",
+        NATIVE_EVIDENCE_UNAVAILABLE,
         format!(
             "session {} native conversation evidence cannot be verified: {reason}",
             binding.session_id
@@ -234,6 +237,85 @@ impl SessionRegistry {
             return None;
         };
         Some((existence, reference, profile.env))
+    }
+
+    /// Clears the refused capabilities of each candidate in `sessions` and
+    /// reads the verified transcript modification time of each native
+    /// reference, in the order of `sessions`. Blocks: it reads the registry
+    /// and verifies package roots.
+    fn resolve_native_activity(
+        &self,
+        sessions: &mut [SessionInfo],
+        candidates: &[Option<ResumeBinding>],
+    ) -> Vec<Option<i128>> {
+        let sessions_len = sessions.len();
+        let mut lookup_inputs = Vec::with_capacity(sessions_len);
+        let mut resolutions = PinResolutions::default();
+        for (info, candidate) in sessions.iter_mut().zip(candidates) {
+            let Some(binding) = candidate.clone() else {
+                lookup_inputs.push(None);
+                continue;
+            };
+            let definition =
+                recovery_definition_memo(&self.inner.profiles, &binding, &mut resolutions);
+            clear_refused_capabilities(info, &binding, definition.as_ref());
+            let definition = definition.ok();
+            lookup_inputs.push(
+                info.native_session_id
+                    .clone()
+                    .zip(definition)
+                    .map(|(target, definition)| (target, binding, definition)),
+            );
+        }
+        let lookups = lookup_inputs
+            .into_iter()
+            .map(|input| self.native_activity_lookup(input?, &mut resolutions))
+            .collect::<Vec<_>>();
+        let mut modified = vec![None; sessions_len];
+        if lookups.iter().all(Option::is_none) {
+            return modified;
+        }
+        let Ok(base_environment) = self.launch_base_environment() else {
+            return modified;
+        };
+        let mut groups: Vec<ActivityGroup> = Vec::new();
+        for (index, lookup) in lookups.into_iter().enumerate() {
+            let Some((existence, reference, profile_env)) = lookup else {
+                continue;
+            };
+            let resolve =
+                |name: &str| effective_variable(&base_environment, profile_env.as_slice(), name);
+            let Ok(Some(store)) = existence.activity_store_root(&resolve) else {
+                continue;
+            };
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.existence == existence && group.store == store)
+            {
+                group.references.push((index, reference));
+            } else {
+                groups.push(ActivityGroup {
+                    existence,
+                    store,
+                    references: vec![(index, reference)],
+                });
+            }
+        }
+        for group in groups {
+            let references = group
+                .references
+                .iter()
+                .map(|(_, reference)| reference.clone())
+                .collect::<Vec<_>>();
+            for ((index, _), nanos) in group.references.into_iter().zip(
+                group
+                    .existence
+                    .modified_many_unix_nanos(&group.store, &references),
+            ) {
+                modified[index] = nanos;
+            }
+        }
+        modified
     }
 
     /// Adds verified native-reference last activity to public response copies,
@@ -269,81 +351,47 @@ impl SessionRegistry {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut lookup_inputs = Vec::with_capacity(sessions.len());
-        let mut resolutions = PinResolutions::default();
-        for (info, candidate) in sessions.iter_mut().zip(candidates) {
-            let Some(binding) = candidate else {
-                lookup_inputs.push(None);
-                continue;
-            };
-            let definition =
-                recovery_definition_memo(&self.inner.profiles, &binding, &mut resolutions);
-            clear_refused_capabilities(info, &binding, definition.as_ref());
-            let definition = definition.ok();
-            lookup_inputs.push(
-                info.native_session_id
-                    .clone()
-                    .zip(definition)
-                    .map(|(target, definition)| (target, binding, definition)),
-            );
-        }
-        let lookups = lookup_inputs
-            .into_iter()
-            .map(|input| self.native_activity_lookup(input?, &mut resolutions))
-            .collect::<Vec<_>>();
-        if lookups.iter().all(Option::is_none) {
+        if candidates.iter().all(Option::is_none) {
             return;
         }
-        let Ok(base_environment) = self.launch_base_environment() else {
-            return;
-        };
-        let sessions_len = sessions.len();
-        let modified = tokio::task::spawn_blocking(move || {
-            let mut groups: Vec<ActivityGroup> = Vec::new();
-            for (index, lookup) in lookups.into_iter().enumerate() {
-                let Some((existence, reference, profile_env)) = lookup else {
-                    continue;
-                };
-                let resolve = |name: &str| {
-                    effective_variable(&base_environment, profile_env.as_slice(), name)
-                };
-                let Ok(Some(store)) = existence.activity_store_root(&resolve) else {
-                    continue;
-                };
-                if let Some(group) = groups
-                    .iter_mut()
-                    .find(|group| group.existence == existence && group.store == store)
-                {
-                    group.references.push((index, reference));
-                } else {
-                    groups.push(ActivityGroup {
-                        existence,
-                        store,
-                        references: vec![(index, reference)],
-                    });
+        // Resolving a pin reads the registry record and hashes the package root,
+        // so the whole resolution runs on the blocking pool with the store walk.
+        let registry = self.clone();
+        let mut listed = sessions.to_vec();
+        let resolved = self
+            .inner
+            .background
+            .spawn_blocking("enrich_native_activity", move || {
+                let modified = registry.resolve_native_activity(&mut listed, &candidates);
+                (listed, modified)
+            })
+            .await;
+        let (listed, modified) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(%error, "recovery resolution of a listing did not finish");
+                // Without the resolution no capability is verified, so none is advertised.
+                for info in sessions.iter_mut() {
+                    let refusals = protocol::SessionCapabilityRefusals {
+                        resume: info
+                            .capabilities
+                            .resume
+                            .then(|| NATIVE_EVIDENCE_UNAVAILABLE.to_owned()),
+                        fork: info
+                            .capabilities
+                            .fork
+                            .then(|| NATIVE_EVIDENCE_UNAVAILABLE.to_owned()),
+                    };
+                    info.capabilities.resume = false;
+                    info.capabilities.fork = false;
+                    info.capability_refusals = (!refusals.is_empty()).then_some(refusals);
                 }
+                return;
             }
-            let mut modified = vec![None; sessions_len];
-            for group in groups {
-                let references = group
-                    .references
-                    .iter()
-                    .map(|(_, reference)| reference.clone())
-                    .collect::<Vec<_>>();
-                for ((index, _), nanos) in group.references.into_iter().zip(
-                    group
-                        .existence
-                        .modified_many_unix_nanos(&group.store, &references),
-                ) {
-                    modified[index] = nanos;
-                }
-            }
-            modified
-        })
-        .await;
-        let Ok(modified) = modified else {
-            return;
         };
+        for (info, listed) in sessions.iter_mut().zip(listed) {
+            *info = listed;
+        }
         for (info, modified) in sessions.iter_mut().zip(modified) {
             info.native_last_activity_at = modified
                 .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())

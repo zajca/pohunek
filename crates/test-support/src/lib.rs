@@ -73,6 +73,8 @@
 
 // Rust guideline compliant 2026-10-14
 
+#![forbid(unsafe_code)]
+
 #[cfg(target_os = "linux")]
 pub mod bind_redirect;
 #[cfg(feature = "catalog")]

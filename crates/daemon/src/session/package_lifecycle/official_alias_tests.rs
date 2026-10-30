@@ -5925,6 +5925,113 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
 }
 
 #[tokio::test]
+async fn listing_verifies_package_roots_off_the_thread_that_drives_the_list() {
+    let (fixture, _store_path, _ids) = stopped_built_in_claudes("claude-list-thread", 3).await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&fixture, &fixture.registry, RuntimeId::CLAUDE, &package, 5).await;
+    let restarted = restart(&fixture).await;
+    let store = restarted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .package_store()
+        .expect("package store")
+        .clone();
+
+    let before = store.verifying_threads().len();
+    let mut list = restarted.registry.list().await;
+    restarted.registry.enrich_native_activity(&mut list).await;
+    let verifying = store.verifying_threads().split_off(before);
+
+    assert!(
+        !verifying.is_empty(),
+        "the listing verifies the package root"
+    );
+    assert!(
+        !verifying.contains(&std::thread::current().id()),
+        "the test runtime drives the list on this thread, which hashes no root"
+    );
+}
+
+#[tokio::test]
+async fn a_package_root_changed_between_two_lists_clears_resume_on_the_second() {
+    for (tag, change) in [
+        (
+            "claude-list-tamper",
+            (|fixture: &Fixture, package: &Package| fixture.tamper(&package.digest))
+                as fn(&Fixture, &Package),
+        ),
+        ("claude-list-removed", |fixture, package| {
+            fs::remove_dir_all(fixture.root(&package.digest)).expect("remove the package root");
+        }),
+    ] {
+        let session = stopped_built_in_claude(tag).await;
+        let package = real_official(RuntimeId::CLAUDE);
+        install_real_official(
+            &session.fixture,
+            &session.fixture.registry,
+            RuntimeId::CLAUDE,
+            &package,
+            5,
+        )
+        .await;
+        let restarted = restart(&session.fixture).await;
+
+        assert_eq!(
+            listed_recovery(&restarted.registry, &session.id).await,
+            (true, true),
+            "{tag}: the intact root is resumable"
+        );
+        change(&session.fixture, &package);
+        assert_eq!(
+            listed_recovery(&restarted.registry, &session.id).await,
+            (false, false),
+            "{tag}: the changed root is not resumable"
+        );
+        assert_eq!(
+            listed_refusals(&restarted.registry, &session.id).await,
+            (
+                Some("runtime_incompatible".to_owned()),
+                Some("runtime_incompatible".to_owned())
+            ),
+            "{tag}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_lists_of_an_untouched_package_each_verify_it_and_both_report_resume() {
+    let (fixture, _store_path, ids) = stopped_built_in_claudes("claude-list-twice", 3).await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&fixture, &fixture.registry, RuntimeId::CLAUDE, &package, 5).await;
+    let restarted = restart(&fixture).await;
+    let store = restarted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .package_store()
+        .expect("package store")
+        .clone();
+
+    let mut verified = Vec::new();
+    for _ in 0..2 {
+        let before = store.root_verifications();
+        let mut list = restarted.registry.list().await;
+        restarted.registry.enrich_native_activity(&mut list).await;
+        assert_eq!(list.len(), ids.len());
+        assert!(list.iter().all(|info| info.capabilities.resume));
+        verified.push(store.root_verifications() - before);
+    }
+    assert!(verified[0] > 0, "each list verifies from disk");
+    assert_eq!(
+        verified[0], verified[1],
+        "nothing is remembered between lists"
+    );
+}
+
+#[tokio::test]
 async fn listing_sessions_of_one_package_verifies_its_root_once_per_runtime_source() {
     let (fixture, _store_path, ids) = stopped_built_in_claudes("claude-list-cost", 4).await;
     let package = real_official(RuntimeId::CLAUDE);

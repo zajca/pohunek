@@ -11,6 +11,8 @@
 //! The crate is a dev-dependency of the guard owners only and is never a normal
 //! dependency of a shipped binary.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
 
