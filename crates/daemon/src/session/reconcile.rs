@@ -10729,13 +10729,36 @@ while os.getppid() == parent:
         data
     }
 
+    /// An in-process worker server: the task serving it and the handle that
+    /// ends the connection handlers and runtime monitors it spawned.
+    struct WorkerTask {
+        task: tokio::task::JoinHandle<()>,
+        server: pohunek_session_worker::ServerHandle,
+    }
+
+    impl WorkerTask {
+        /// Stops serving new connections; handlers already running keep going
+        /// until [`WorkerTask::finish`].
+        fn abort(&self) {
+            self.task.abort();
+        }
+
+        /// Ends the server the way the death of its process would: when this
+        /// returns, the worker writes no journal and answers no request.
+        async fn finish(self) {
+            self.task.abort();
+            let _ = self.task.await;
+            self.server.terminate().await;
+        }
+    }
+
     async fn spawn_uninitialized_worker(
         root: &std::path::Path,
         runtime_root: &std::path::Path,
         slot: &str,
         claimed_session: &str,
         worker_id: &str,
-    ) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    ) -> (PathBuf, WorkerTask) {
         let socket = runtime_root
             .join(slot)
             .join(pohunek_paths::WORKER_SOCKET_NAME);
@@ -10756,10 +10779,17 @@ while os.getppid() == parent:
         .expect("bind worker");
         std::fs::set_permissions(runtime_root, std::fs::Permissions::from_mode(0o700))
             .expect("private runtime root");
+        let handle = server.handle();
         let task = tokio::spawn(async move {
             let _ = server.serve().await;
         });
-        (socket, task)
+        (
+            socket,
+            WorkerTask {
+                task,
+                server: handle,
+            },
+        )
     }
 
     async fn spawn_initialized_worker(
@@ -10767,12 +10797,7 @@ while os.getppid() == parent:
         runtime_root: &std::path::Path,
         session_id: &str,
         worker_id: &str,
-    ) -> (
-        crate::runtime::Worker,
-        WorkerInstanceId,
-        u32,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (crate::runtime::Worker, WorkerInstanceId, u32, WorkerTask) {
         spawn_initialized_worker_with_command(
             root,
             runtime_root,
@@ -10798,7 +10823,7 @@ while os.getppid() == parent:
         crate::runtime::Worker,
         WorkerInstanceId,
         u32,
-        tokio::task::JoinHandle<()>,
+        WorkerTask,
         Reporter,
     ) {
         let (controller, worker_instance_id, child_pid, task, mut reporters) =
@@ -10825,7 +10850,7 @@ while os.getppid() == parent:
         crate::runtime::Worker,
         WorkerInstanceId,
         u32,
-        tokio::task::JoinHandle<()>,
+        WorkerTask,
         Vec<Reporter>,
     ) {
         let (script, reporters) = identity_reporters(root, names);
@@ -10856,12 +10881,7 @@ while os.getppid() == parent:
         session_id: &str,
         worker_id: &str,
         command: String,
-    ) -> (
-        crate::runtime::Worker,
-        WorkerInstanceId,
-        u32,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (crate::runtime::Worker, WorkerInstanceId, u32, WorkerTask) {
         spawn_initialized_worker_with_launch(
             root,
             runtime_root,
@@ -10888,12 +10908,7 @@ while os.getppid() == parent:
         launch: LaunchIdentity,
         executable: PathBuf,
         command: String,
-    ) -> (
-        crate::runtime::Worker,
-        WorkerInstanceId,
-        u32,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (crate::runtime::Worker, WorkerInstanceId, u32, WorkerTask) {
         let (socket, task) =
             spawn_uninitialized_worker(root, runtime_root, session_id, session_id, worker_id).await;
         let controller = crate::runtime::Worker::connect(&socket, session_id, "crash-replay-setup")
@@ -16043,8 +16058,7 @@ generation "$1"
                 "the canonical worker is not adopted next to its shadow"
             );
 
-            shadow_task.abort();
-            let _ = shadow_task.await;
+            shadow_task.finish().await;
             assert!(
                 fixture.registry.retry_supervised_session(&id).await,
                 "the settled session needs no further retry"
@@ -19223,8 +19237,7 @@ generation "$1"
             // journal names a process that no longer runs, and its job has
             // ended. The loss sweep then takes down the PTY tree the stand-in
             // worker leaves behind.
-            worker.server_task.abort();
-            let _ = worker.server_task.await;
+            worker.server_task.finish().await;
             let journal = Journal::new(
                 fixture
                     .root
@@ -24132,7 +24145,7 @@ generation "$1"
             pub controller: crate::runtime::Worker,
             pub worker_instance_id: WorkerInstanceId,
             pub child_pid: u32,
-            pub server_task: tokio::task::JoinHandle<()>,
+            pub server_task: super::WorkerTask,
             pub reporter: Reporter,
         }
 
@@ -25526,7 +25539,7 @@ generation "$1"
                 )
                 .await;
             }
-            task.abort();
+            task.finish().await;
 
             let adoptable = verdict == Some(Verdict::Adoptable);
             assert_eq!(
@@ -25748,7 +25761,50 @@ generation "$1"
             serde_json::from_slice(&std::fs::read(&journal_path).expect("terminal journal"))
                 .expect("decode the terminal journal");
         assert_eq!(journal["phase"], "terminal");
-        task.abort();
+        task.finish().await;
+    }
+
+    /// Finishing an in-process worker leaves no writer behind: a controller
+    /// that stayed connected cannot acknowledge the terminal state afterwards,
+    /// so the acknowledgement's journal write cannot recreate a removed
+    /// fixture directory.
+    #[tokio::test]
+    async fn finishing_a_worker_task_ends_its_connection_handlers() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = "s-1670";
+        let (controller, _instance, child_pid, task) =
+            spawn_initialized_worker(&root, &runtime_root, session_id, "worker-1670").await;
+        let journal_path = root
+            .join("state/workers")
+            .join(session_id)
+            .join("worker-1670.json");
+        let pty_root = crate::procwatch::HostInspector::new()
+            .identity(child_pid)
+            .ok()
+            .flatten();
+        crate::procwatch::scoped_host::kill_if_current(
+            &crate::procwatch::HostInspector::new(),
+            pty_root.expect("the PTY root runs"),
+        );
+        wait_until("the worker reports the end", || async {
+            let phase = controller.inspect().await.ok()?.phase;
+            (phase == pohunek_worker_protocol::RuntimePhase::Exited).then_some(())
+        })
+        .await;
+        let session_directory = journal_path.parent().expect("session directory");
+        std::fs::remove_dir_all(session_directory).expect("remove the journal directory");
+
+        task.finish().await;
+
+        assert!(
+            controller.acknowledge_terminal().await.is_err(),
+            "a finished worker answers no request"
+        );
+        assert!(
+            !session_directory.exists(),
+            "a finished worker writes no journal"
+        );
     }
 
     /// Polls of a wait that must stay pending.
