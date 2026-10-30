@@ -29,9 +29,9 @@
 //! Every sample is destructured field by field (no `..`), so adding a field to a
 //! persisted struct fails to compile here until the sample and snapshot are
 //! revisited. Each enum-valued field is also pinned to its enum type in that
-//! function, so retyping an enum field fails to compile. A string field turned into
-//! an enum compiles; the unclassified-leaf check above catches it because its new
-//! values are not registered. Types with private fields ([`NativeSessionLaunch`] and its
+//! function, so retyping an enum field fails to compile. A free-text string field
+//! turned into an enum compiles and is not caught while its path stays in
+//! [`free_text`]; moving the path to the enum registry is a manual step. Types with private fields ([`NativeSessionLaunch`] and its
 //! components) cannot be destructured; their samples are populated through the
 //! full JSON form instead.
 //!
