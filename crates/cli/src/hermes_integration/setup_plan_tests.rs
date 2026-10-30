@@ -386,3 +386,92 @@ fn a_hermes_outside_the_package_range_does_not_leave_a_home_current() {
 
     assert_eq!(default_home(&planned).status, HERMES_UPDATE, "{planned:?}");
 }
+
+/// An environment whose home is `home` below `root`, inside a Git workspace.
+fn git_workspace_env(root: &Path) -> (IntegrationEnv, PathBuf) {
+    let home = root.join("home");
+    private_directory(&home);
+    fs::create_dir(home.join(".git")).expect("a Git workspace around the home");
+    let state_dir = root.join("state").join("pohunek");
+    private_directory(&state_dir);
+    let env = IntegrationEnv {
+        paths: crate::paths::Paths {
+            runtime_dir: root.join("run"),
+            socket: root.join("run/daemon.sock"),
+            data_dir: root.join("data"),
+            log_dir: root.join("log"),
+            cache_dir: root.join("cache"),
+            config_home: root.join("config"),
+            config_dir: root.join("config/pohunek"),
+            origin_source: pohunek_client::OriginSource::Environment,
+        },
+        home: Some(home.clone()),
+        state_dir,
+    };
+    (env, home)
+}
+
+/// A host without Hermes reports a skip, also when its home directory sits
+/// inside a Git workspace, which is what makes a Hermes home there unsafe.
+#[tokio::test]
+async fn an_upgrade_on_a_host_without_hermes_reports_a_skip() {
+    let (_guard, root) = temporary_directory("no-hermes-host");
+    let (env, home) = git_workspace_env(&root);
+
+    let applied = CliIntegrations
+        .reinstall(&env, &[], root.to_str().expect("utf-8 path"))
+        .await;
+
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    assert_eq!(applied[0].integration, "hermes");
+    assert_eq!(applied[0].status, "gap", "{applied:?}");
+    let detail = applied[0].detail.as_deref().expect("the skip says why");
+    assert!(detail.contains("Hermes is not installed"), "{detail}");
+    assert!(!home.join(".hermes").exists(), "nothing is created");
+}
+
+/// A Hermes home that exists but cannot be used is not a host without Hermes:
+/// a dangling symlink stays a failure.
+#[tokio::test]
+async fn an_upgrade_does_not_skip_a_dangling_hermes_home() {
+    let (_guard, root) = temporary_directory("dangling-hermes-host");
+    let (env, home) = git_workspace_env(&root);
+    std::os::unix::fs::symlink(root.join("nowhere"), home.join(".hermes"))
+        .expect("a dangling Hermes home");
+
+    let applied = CliIntegrations
+        .reinstall(&env, &[], root.to_str().expect("utf-8 path"))
+        .await;
+
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    assert_eq!(applied[0].status, "failed", "{applied:?}");
+}
+
+/// A home the preview showed that is gone at the apply is one failure, not a
+/// failure next to a skip.
+#[tokio::test]
+async fn a_previewed_hermes_home_that_vanishes_is_one_failure() {
+    let (_guard, root) = temporary_directory("vanished-hermes-host");
+    let (env, _home) = git_workspace_env(&root);
+    let previewed = [IntegrationReinstall {
+        integration: "hermes".to_owned(),
+        status: HERMES_UPDATE,
+        detail: None,
+    }];
+
+    let applied = reinstall_previewed_hermes_homes(
+        &env,
+        &previewed,
+        std::ffi::OsStr::new(root.to_str().expect("utf-8 path")),
+    );
+
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    assert_eq!(applied[0].status, "failed", "{applied:?}");
+    assert!(
+        applied[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("can no longer be found")),
+        "{applied:?}"
+    );
+}

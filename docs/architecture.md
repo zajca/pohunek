@@ -858,7 +858,12 @@ states the contract and then the current state.
   absence leaves those processes decided by lineage alone. The optional field
   `worker_control_group` (the worker's unified cgroup path, valid only within the
   boot named by `boot_identity`) is additive too: its absence leaves the Linux
-  sweep with start-time ordering alone.
+  sweep with start-time ordering alone. The optional field `boot_session_id` (the
+  boot session UUID on macOS, the kernel boot id on Linux) is additive in the same
+  way. A daemon whose host names another boot knows that no process of the
+  worker's runtime remains: the sweep is complete without scanning, the loss is
+  proven, and the session ends with its runtime. The journal of a worker started
+  by an earlier release lacks the field and keeps the unconfirmed outcome.
 - **Public-protocol clients.** The contract: a protocol change keeps the
   previous version served through adapters, so the advertised range is
   `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.

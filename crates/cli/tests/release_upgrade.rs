@@ -2486,7 +2486,7 @@ impl Upgrade {
 /// Checks the hooks the upgrade reinstalled: the Claude integration is listed
 /// and every integration is installed, except a Hermes home without the
 /// pohunek marker, which is a `gap` because that integration is installed only
-/// by hand.
+/// by hand, and a host without a Hermes home, which is skipped.
 fn assert_claude_hooks_reinstalled(report: &Value) {
     let integrations = report["integrations"]
         .as_array()
@@ -2498,13 +2498,14 @@ fn assert_claude_hooks_reinstalled(report: &Value) {
         "the upgrade did not reinstall the Claude hooks: {report}"
     );
     for item in integrations {
-        let unmarked_hermes_home = item["integration"] == "hermes"
+        let hermes_gap = item["integration"] == "hermes"
             && item["status"] == "gap"
-            && item["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.starts_with("no pohunek marker in this home;"));
+            && item["detail"].as_str().is_some_and(|detail| {
+                detail.starts_with("no pohunek marker in this home;")
+                    || detail.starts_with("Hermes is not installed (no ")
+            });
         assert!(
-            item["status"] == "installed" || unmarked_hermes_home,
+            item["status"] == "installed" || hermes_gap,
             "an integration was not reinstalled: {item} in {report}"
         );
     }

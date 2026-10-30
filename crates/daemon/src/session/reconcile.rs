@@ -200,6 +200,10 @@ pub(super) struct JournalEvidence {
     /// worker of the previous release.
     #[serde(default)]
     worker_control_group: Option<String>,
+    /// Identifier of the boot the worker ran in; absent for a worker that did
+    /// not record one.
+    #[serde(default)]
+    boot_session_id: Option<String>,
     #[serde(rename = "runtime_id")]
     worker_instance_id: Option<String>,
     /// Package release of the worker that wrote the journal; every journal of
@@ -306,6 +310,7 @@ impl JournalEvidence {
             spawn_id: self.worker_spawn_id.as_deref(),
             coalitions: self.worker_coalitions.as_deref(),
             control_group: self.worker_control_group.as_deref(),
+            boot_session_id: self.boot_session_id.as_deref(),
             worker_instance_id: self.worker_instance_id.as_deref(),
         }
     }
@@ -8434,6 +8439,7 @@ while os.getppid() == parent:
             worker_spawn_id: None,
             worker_coalitions: None,
             worker_control_group: None,
+            boot_session_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {
@@ -8628,6 +8634,7 @@ while os.getppid() == parent:
             worker_spawn_id: None,
             worker_coalitions: None,
             worker_control_group: None,
+            boot_session_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {
@@ -15019,6 +15026,163 @@ generation "$1"
             assert!(
                 marked.alive(),
                 "an unreadable marker is never a signal permit"
+            );
+        }
+
+        /// A worker journaled in a boot that is over leaves no process behind, so
+        /// processes with unreadable markers prove nothing against the loss: the
+        /// session ends with the runtime instead of staying `running`.
+        #[tokio::test]
+        async fn a_worker_of_an_earlier_boot_ends_the_session_with_its_runtime() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let marked = Marked::spawn(&fixture.root, "runtime-s-1723");
+            persist_record(&fixture.root, "s-1723", Some("runtime-s-1723"));
+            write_journal_record(
+                &fixture.root,
+                "s-1723",
+                "worker-s-1723",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-1723"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1723".to_owned()))
+                .await
+                .expect("inspect");
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_ne!(
+                info.state,
+                protocol::SessionState::Running,
+                "the session ends with its lost runtime"
+            );
+            assert!(marked.alive(), "nothing is signalled for an earlier boot");
+        }
+
+        /// The journal of a worker newer than this build carries keys it does not
+        /// know, and the daemon of the previous release read this build's
+        /// `boot_session_id` the same way: unknown keys are ignored.
+        #[tokio::test]
+        async fn a_journal_with_a_key_this_build_does_not_know_is_read() {
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_record(&fixture.root, "s-17232", Some("runtime-s-17232"));
+            write_journal_record(
+                &fixture.root,
+                "s-17232",
+                "worker-s-17232",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-17232"),
+                |_| {},
+            );
+            let path = fixture
+                .root
+                .join("state/workers/s-17232/worker-s-17232.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read the journal"))
+                    .expect("journal json");
+            value["a_key_from_a_newer_worker"] = serde_json::json!("future");
+            std::fs::write(&path, serde_json::to_vec(&value).expect("journal bytes"))
+                .expect("rewrite the journal");
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-17232").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+        }
+
+        /// A boot session id that is not in the exact shape of a platform boot
+        /// identifier proves nothing, however much it differs from the host's.
+        #[tokio::test]
+        async fn a_malformed_boot_session_id_proves_nothing() {
+            let shapes = [
+                "",
+                "a-boot-that-is-over",
+                "00000000-0000-4000-8000-00000000dea",
+                "00000000-0000-4000-8000-00000000dead0",
+                " 00000000-0000-4000-8000-00000000dead",
+                "00000000-0000-4000-8000-00000000deaz",
+                "0000000000004000800000000000dead",
+            ];
+            for (index, shape) in shapes.into_iter().enumerate() {
+                let inspector = Arc::new(RetryInspector::default());
+                inspector.fail_markers(true);
+                let fixture =
+                    fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+                let session = format!("s-1723{index}");
+                let runtime_id = format!("runtime-{session}");
+                let _marked = Marked::spawn(&fixture.root, &runtime_id);
+                persist_record(&fixture.root, &session, Some(&runtime_id));
+                write_journal_record(
+                    &fixture.root,
+                    &session,
+                    &format!("worker-{session}"),
+                    TEST_GENERATION,
+                    dead_worker(),
+                    Some(&runtime_id),
+                    |journal| journal.boot_session_id = Some(shape.to_owned()),
+                );
+
+                Box::pin(fixture.registry.reconcile_workers())
+                    .await
+                    .expect("reconcile");
+
+                let runtime = runtime_of(&fixture.registry, &session).await;
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+                    "{shape:?}"
+                );
+            }
+        }
+
+        /// A journal from the boot the host is in now proves nothing about
+        /// processes with unreadable markers, so the session stays `running`.
+        #[tokio::test]
+        async fn a_worker_of_the_current_boot_keeps_the_unconfirmed_cleanup() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let _marked = Marked::spawn(&fixture.root, "runtime-s-17231");
+            persist_record(&fixture.root, "s-17231", Some("runtime-s-17231"));
+            let current = HostInspector::new().boot_session_id().ok();
+            write_journal_record(
+                &fixture.root,
+                "s-17231",
+                "worker-s-17231",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-17231"),
+                |journal| journal.boot_session_id = current,
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-17231").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
         }
 

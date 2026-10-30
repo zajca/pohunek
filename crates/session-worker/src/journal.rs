@@ -436,6 +436,13 @@ pub struct JournalRecord {
     /// host reports no unified control group or the worker could not read it.
     #[serde(default)]
     pub worker_control_group: Option<String>,
+    /// Identifier of the boot the worker ran in, which changes at every reboot
+    /// and at no other time (the boot session UUID on macOS, the kernel boot id
+    /// on Linux). A daemon that finds another one on its host knows no process
+    /// of the worker's runtime survived. Absent when the host cannot name it or
+    /// for a worker of an earlier release.
+    #[serde(default)]
+    pub boot_session_id: Option<String>,
     /// Managed PTY root identity.
     pub child: Option<ChildIdentity>,
     /// PTY creation timestamp.
@@ -515,6 +522,7 @@ impl Debug for JournalRecord {
             .field("worker_spawn_id", &self.worker_spawn_id)
             .field("worker_coalitions", &self.worker_coalitions)
             .field("worker_control_group", &self.worker_control_group)
+            .field("boot_session_id", &self.boot_session_id)
             .field("child", &self.child)
             .field("pty_created_at", &self.pty_created_at)
             .field("cols", &self.cols)
@@ -575,6 +583,7 @@ impl JournalRecord {
             worker_spawn_id: None,
             worker_coalitions: None,
             worker_control_group: None,
+            boot_session_id: None,
             child: None,
             pty_created_at: None,
             cols: None,

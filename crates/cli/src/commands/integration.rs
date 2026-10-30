@@ -819,6 +819,9 @@ struct HermesHomes {
     selections: Vec<HermesSelection>,
     /// The failures of finding the homes.
     failures: Vec<IntegrationReinstall>,
+    /// The note that a host without a Hermes home is skipped. A preview that
+    /// showed a home reports its disappearance as a failure instead.
+    skipped: Vec<IntegrationReinstall>,
 }
 
 /// Finds the Hermes homes below `env`.
@@ -827,6 +830,7 @@ fn hermes_homes(env: &IntegrationEnv) -> HermesHomes {
         return HermesHomes {
             home: None,
             selections: Vec::new(),
+            skipped: Vec::new(),
             failures: vec![IntegrationReinstall {
                 integration: "hermes".to_owned(),
                 status: "failed",
@@ -840,6 +844,25 @@ fn hermes_homes(env: &IntegrationEnv) -> HermesHomes {
         };
     };
     let root = home.join(".hermes");
+    // Only a Hermes home that exists is a target; on a host without Hermes the
+    // upgrade has nothing to reinstall and says so instead of resolving a path
+    // that was never created.
+    if matches!(fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return HermesHomes {
+            home: Some(home.to_path_buf()),
+            selections: Vec::new(),
+            failures: Vec::new(),
+            skipped: vec![IntegrationReinstall {
+                integration: "hermes".to_owned(),
+                status: "gap",
+                detail: Some(format!(
+                    "Hermes is not installed (no {}), skipped",
+                    root.display()
+                )),
+            }],
+        };
+    }
     let mut selections = vec![(
         "hermes".to_owned(),
         format!("--hermes-home {}", root.display()),
@@ -872,6 +895,7 @@ fn hermes_homes(env: &IntegrationEnv) -> HermesHomes {
         home: Some(home.to_path_buf()),
         selections,
         failures,
+        skipped: Vec::new(),
     }
 }
 
@@ -884,6 +908,7 @@ fn reinstall_hermes_homes(env: &IntegrationEnv, search_path: &OsStr) -> Vec<Inte
     };
     let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
     let mut results = found.failures;
+    results.extend(found.skipped);
     results.extend(
         found.selections.into_iter().map(
             |(integration, selector, selection)| match plan_hermes_home(
@@ -1013,6 +1038,7 @@ pub(crate) fn hermes_home_plan(
     };
     let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
     let mut results = found.failures;
+    results.extend(found.skipped);
     results.extend(
         found.selections.into_iter().map(
             |(integration, selector, selection)| match plan_hermes_home(

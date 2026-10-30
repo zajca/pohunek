@@ -81,6 +81,16 @@ impl DarwinInspector {
         native::boot_session_uuid().map_err(|source| facility_error(OPERATION, source))
     }
 
+    /// Returns the identifier that changes at every reboot and at no other
+    /// time: the boot session UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed inspection failures.
+    pub fn boot_session_id(&self) -> Result<String, Error> {
+        self.boot_session_uuid()
+    }
+
     /// Returns when the host booted (`kern.boottime`), on the calendar clock.
     ///
     /// The kernel shifts it when the clock is set, while the times of files

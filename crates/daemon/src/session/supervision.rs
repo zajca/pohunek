@@ -231,6 +231,9 @@ pub(super) struct JournalWorker<'a> {
     /// Unified control-group path of the worker process, as recorded; absent
     /// when the worker's host reported none or the journal predates the field.
     pub(super) control_group: Option<&'a str>,
+    /// Identifier of the boot the worker ran in, as recorded; absent when the
+    /// worker's host could not name one or the journal predates the field.
+    pub(super) boot_session_id: Option<&'a str>,
     /// Runtime (PTY) identifier after initialization; its processes carry it
     /// as their ownership marker.
     pub(super) worker_instance_id: Option<&'a str>,
@@ -313,8 +316,25 @@ impl JournalWorker<'_> {
         // are kept.
         let same_boot =
             (spawn_id.is_some() || coalitions.is_some() || control_group.is_some()) && same_boot();
+        // Nothing survives a reboot, so a host that names another boot than the
+        // one the worker recorded holds no process of its runtime. A boot the
+        // host cannot name proves nothing.
+        let previous_boot = self.boot_session_id.is_some_and(|recorded| {
+            if !is_boot_uuid(recorded) {
+                tracing::warn!(
+                    session_id = self.session_id,
+                    worker_id = self.worker_id,
+                    "worker journal boot session id is malformed; the runtime sweep ignores it"
+                );
+                return false;
+            }
+            HostInspector::new()
+                .boot_session_id()
+                .is_ok_and(|current| current != recorded)
+        });
         WorkerBounds {
             start_identity,
+            previous_boot,
             spawn_id: spawn_id.filter(|_| same_boot),
             coalitions: coalitions.filter(|_| same_boot),
             control_group: control_group.filter(|_| same_boot),
@@ -331,6 +351,9 @@ impl JournalWorker<'_> {
 /// ownership markers it cannot read as possibly the runtime's.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct WorkerBounds {
+    /// The host booted again after the worker was started, so no process of
+    /// its runtime exists and there is nothing to sweep.
+    pub(super) previous_boot: bool,
     /// Start identity of the worker process instance. A same-user process
     /// whose markers cannot be read is provably foreign when it started
     /// before the worker, on a host whose start identities order starts.
@@ -353,6 +376,7 @@ pub(super) struct WorkerBounds {
 impl WorkerBounds {
     /// Bounds that prove nothing.
     pub(super) const NONE: Self = Self {
+        previous_boot: false,
         start_identity: None,
         spawn_id: None,
         coalitions: None,
@@ -365,6 +389,7 @@ impl WorkerBounds {
     /// it, so a fact bounds the runtime only when every worker agrees on it.
     pub(super) fn agreeing(self, other: &Self) -> Self {
         Self {
+            previous_boot: self.previous_boot && other.previous_boot,
             start_identity: self
                 .start_identity
                 .filter(|start| other.start_identity == Some(*start)),
@@ -805,6 +830,14 @@ impl SessionRegistry {
         bounds: WorkerBounds,
         expected_session_id: Option<&str>,
     ) -> SweepOutcome {
+        if bounds.previous_boot {
+            tracing::info!(
+                session_id,
+                worker_instance_id,
+                "the host booted again since the worker started; no process of its runtime remains"
+            );
+            return SweepOutcome::complete();
+        }
         let Some(grace) = self
             .inner
             .config
@@ -1987,6 +2020,19 @@ fn warn_unmarked(session_id: &str, worker_instance_id: &str, skipped: &[Skipped]
              are left running and the cleanup stays unconfirmed"
         );
     }
+}
+
+/// Whether `value` has the shape of the boot identifiers the platforms report:
+/// a canonical hyphenated UUID, as `kern.bootsessionuuid` and the Linux boot id
+/// both are. Any other text, a truncated or padded UUID included, is not one.
+fn is_boot_uuid(value: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut parts = value.split('-');
+    GROUPS.iter().all(|&length| {
+        parts
+            .next()
+            .is_some_and(|part| part.len() == length && part.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) && parts.next().is_none()
 }
 
 #[cfg(test)]
