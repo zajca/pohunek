@@ -232,11 +232,12 @@ debug = "line-tables-only"
 debug = false
 
 # The slowest tests spend their time inside these crates: lazy-DFA
-# determinization (regex-automata) and ed25519/SHA-256 signing and verification.
-# At opt-level 0 those loops dominate test CPU time. Each override sets only
-# opt-level, so `"*"` still disables their debuginfo. A bare name matches every
-# version in the lockfile. See .agents/instructions/verification.md, "Fast
-# loops", for when to add a crate.
+# determinization (regex-automata), ed25519/SHA-256 signing and verification,
+# and terminal screen parsing (vt100, which the Pi screen sweeps feed thousands
+# of screens). At opt-level 0 those loops dominate test CPU time. Each
+# override sets only opt-level, so `"*"` still disables their debuginfo. A
+# bare name matches every version in the lockfile. See
+# .agents/instructions/verification.md, "Fast loops", for when to add a crate.
 [profile.dev.package.regex-automata]
 opt-level = 3
 
@@ -247,6 +248,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.vt100]
 opt-level = 3
 
 # Keep release builds debuggable enough for a daemon while small.
