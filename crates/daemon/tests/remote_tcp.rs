@@ -693,6 +693,65 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
     let _ = handle.await;
 }
 
+/// Bytes the agent prints before the client types: far more than the
+/// subscriber queue and the socket buffers on the way hold, so the output path
+/// is blocked when the client types.
+const UNREAD_FLOOD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Line the attach client types while it reads none of the agent's output.
+const KEYSTROKE_MARKER: &str = "keystroke-while-output-unread";
+
+#[tokio::test]
+async fn keystrokes_reach_the_agent_over_tcp_while_the_client_reads_no_output() {
+    let sink_dir = temp_dir("remote-unread-output");
+    let sink = sink_dir.path().join("typed");
+    let flooded = sink_dir.path().join("flooded");
+    let script = format!(
+        "{{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > '{flooded}'; }} & exec cat > '{sink}'",
+        sink = sink.display(),
+        flooded = flooded.display(),
+    );
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        ..SessionRegistryConfig::default()
+    };
+    let (addr, socket, shutdown, handle) =
+        spawn_dual_servers("remote-unread-output", "0.0.0", config).await;
+
+    let mut control = connect_tcp(addr).await;
+    let created = create_session(&mut control, &socket).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream_tcp(addr, &attach.stream_id).await;
+
+    // The client reads none of the flood.
+    pohunek_test_support::wait::wait_until("the agent to finish its output", || async {
+        flooded.exists().then_some(())
+    })
+    .await;
+    raw.write_all(format!("{KEYSTROKE_MARKER}\n").as_bytes())
+        .await
+        .expect("type a line over the raw attach stream");
+    pohunek_test_support::wait::wait_until("the agent to receive the typed line", || async {
+        std::fs::read_to_string(&sink)
+            .ok()
+            .filter(|typed| typed.contains(KEYSTROKE_MARKER))
+    })
+    .await;
+
+    let _ = detach_stream(&mut control, &attach.stream_id).await;
+    let stop_req = Request::make(
+        "remote-unread-output-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn attach_over_tcp_round_trips_and_detach_keeps_session_running() {
     let (addr, socket, shutdown, handle) =
