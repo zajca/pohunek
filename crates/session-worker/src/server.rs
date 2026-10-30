@@ -8288,9 +8288,16 @@ mod tests {
     async fn launch_claim_fixture_running(
         script: &str,
     ) -> (super::Server, crate::PtyOwner, BarrierDirectory) {
+        launch_claim_fixture_with(script, crate::WorkerConfig::new()).await
+    }
+
+    /// [`launch_claim_fixture_running`] under `config`.
+    async fn launch_claim_fixture_with(
+        script: &str,
+        config: crate::WorkerConfig,
+    ) -> (super::Server, crate::PtyOwner, BarrierDirectory) {
         let directory = BarrierDirectory::new();
         let root = directory.path().to_path_buf();
-        let config = crate::WorkerConfig::new();
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-112".into(),
             worker_id: "worker-claim".into(),
@@ -10028,6 +10035,234 @@ mod tests {
             .await
             .expect("stream task")
             .expect("client EOF ends the stream cleanly");
+        pty.stop(
+            "test-cleanup",
+            server_stop_grace(),
+            crate::WorkerConfig::new().kill_reap_deadline,
+        )
+        .await
+        .expect("stop fixture PTY");
+    }
+
+    /// Child that prints far more than the stream's queues and buffers hold,
+    /// creates `flooded`, and records every line typed to it in `typed`. Its
+    /// working directory is the fixture directory.
+    const UNREAD_OUTPUT_SCRIPT: &str =
+        "{ head -c 4194304 /dev/zero | tr '\\0' y; : > flooded; } & exec cat > typed";
+    /// Worker task yields that let a worker that would read a frame do so.
+    const SCHEDULER_YIELDS: usize = 4096;
+
+    /// Encodes one attach input frame.
+    async fn attach_input_frame(
+        stream_id: &StreamId,
+        worker_instance_id: &WorkerInstanceId,
+        sequence: u64,
+        bytes: &[u8],
+    ) -> (WriteId, Vec<u8>) {
+        let write_id =
+            WriteId::new(format!("{ATTACH_INPUT_PREFIX}{stream_id}-{sequence}")).expect("write id");
+        let mut frame = Vec::new();
+        protocol::write_frame(
+            &mut frame,
+            &protocol::DataFrame::new(
+                FrameHeader {
+                    version: CURRENT_VERSION,
+                    stream_id: stream_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
+                    kind: FrameKind::Input {
+                        write_id: write_id.clone(),
+                    },
+                },
+                bytes.to_vec(),
+            )
+            .expect("input frame"),
+        )
+        .await
+        .expect("encode input frame");
+        (write_id, frame)
+    }
+
+    /// Input reading pauses at `attach_ack_backlog` unacknowledged frames
+    /// while a client reads no output, and resumes losslessly once it reads.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one attach stream scenario: spawn, flood, hold back acks, drain, verify"
+    )]
+    #[tokio::test]
+    async fn attach_input_pauses_at_the_ack_backlog_until_the_client_reads_output() {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-ack-backlog".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7600".to_owned(),
+        };
+        let mut config = crate::WorkerConfig::new();
+        config.attach_ack_backlog = 1;
+        let (server, pty, directory) =
+            launch_claim_fixture_with(UNREAD_OUTPUT_SCRIPT, config).await;
+        let subscriber = pty.subscribe_output(Some(0)).expect("output subscriber");
+        let stream_id = StreamId::new("a-backlog").expect("stream id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-claim").expect("runtime id");
+        let (worker_in, mut client_in) = tokio::io::duplex(ONE_BYTE_BUFFER);
+        let (mut worker_out, mut client_out) = tokio::io::duplex(CLIENT_BUFFER);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let served_pty = pty.clone();
+        let served_owner = owner.clone();
+        let (served_stream, served_instance) = (stream_id.clone(), worker_instance_id.clone());
+        let stream = tokio::spawn(async move {
+            serve_stream_data(
+                &server.shared,
+                &served_pty,
+                worker_in,
+                &mut worker_out,
+                CURRENT_VERSION,
+                &served_stream,
+                &served_instance,
+                StreamMode::Attach,
+                subscriber,
+                0,
+                &mut lease_rx,
+                &owner_peer(&served_owner),
+                &served_owner,
+            )
+            .await
+        });
+
+        // The client reads no output, so the writer is blocked in an output
+        // frame and cannot write any acknowledgement.
+        let flooded = directory.path().join("flooded");
+        pohunek_test_support::wait::wait_until("the child to finish its output", || async {
+            flooded.exists().then_some(())
+        })
+        .await;
+        let typed = directory.path().join("typed");
+        let (first_id, first) =
+            attach_input_frame(&stream_id, &worker_instance_id, 1, b"first-line\n").await;
+        client_in
+            .write_all(&first)
+            .await
+            .expect("send the first frame");
+        pohunek_test_support::wait::wait_until("the child to receive the first line", || async {
+            std::fs::read_to_string(&typed)
+                .ok()
+                .filter(|text| text.contains("first-line"))
+        })
+        .await;
+        // One acknowledgement is held back, so the second frame is not read.
+        let (second_id, second) =
+            attach_input_frame(&stream_id, &worker_instance_id, 2, b"second-line\n").await;
+        let sending = tokio::spawn(async move {
+            client_in
+                .write_all(&second)
+                .await
+                .expect("send the second frame");
+            client_in
+        });
+        for _ in 0..SCHEDULER_YIELDS {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !sending.is_finished(),
+            "the worker read an input frame beyond the acknowledgement backlog"
+        );
+
+        // Reading output drains the writer and both lines arrive, in order.
+        let mut acknowledged = Vec::new();
+        pohunek_test_support::wait::guard("both input frames to be acknowledged", async {
+            while acknowledged.len() < 2 {
+                let frame = protocol::read_frame(&mut client_out)
+                    .await
+                    .expect("read frame")
+                    .expect("stream stays open");
+                if let FrameKind::InputAck { write_id, .. } = frame.header().kind.clone() {
+                    acknowledged.push(write_id);
+                }
+            }
+        })
+        .await;
+        assert_eq!(acknowledged, vec![first_id, second_id]);
+        let client_in = sending.await.expect("sending task");
+        pohunek_test_support::wait::wait_until("the child to receive the second line", || async {
+            std::fs::read_to_string(&typed)
+                .ok()
+                .filter(|text| text.contains("second-line"))
+        })
+        .await;
+
+        // The client is gone: the unread rest of the flood fails to write.
+        drop(client_in);
+        drop(client_out);
+        let _ = stream.await.expect("stream task");
+        pty.stop(
+            "test-cleanup",
+            server_stop_grace(),
+            crate::WorkerConfig::new().kill_reap_deadline,
+        )
+        .await
+        .expect("stop fixture PTY");
+    }
+
+    /// A lease release ends a stream whose client reads no output: the close
+    /// frame follows the queued output instead of being lost.
+    #[tokio::test]
+    async fn lease_release_closes_an_attach_stream_whose_client_reads_no_output() {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-lease-blocked".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7700".to_owned(),
+        };
+        let (server, pty, directory) = launch_claim_fixture_running(UNREAD_OUTPUT_SCRIPT).await;
+        let subscriber = pty.subscribe_output(Some(0)).expect("output subscriber");
+        let stream_id = StreamId::new("a-lease").expect("stream id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-claim").expect("runtime id");
+        let (worker_in, client_in) = tokio::io::duplex(CLIENT_BUFFER);
+        let (mut worker_out, mut client_out) = tokio::io::duplex(CLIENT_BUFFER);
+        let (lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let served_pty = pty.clone();
+        let served_owner = owner.clone();
+        let stream = tokio::spawn(async move {
+            serve_stream_data(
+                &server.shared,
+                &served_pty,
+                worker_in,
+                &mut worker_out,
+                CURRENT_VERSION,
+                &stream_id,
+                &worker_instance_id,
+                StreamMode::Attach,
+                subscriber,
+                0,
+                &mut lease_rx,
+                &owner_peer(&served_owner),
+                &served_owner,
+            )
+            .await
+        });
+
+        let flooded = directory.path().join("flooded");
+        pohunek_test_support::wait::wait_until("the child to finish its output", || async {
+            flooded.exists().then_some(())
+        })
+        .await;
+        lease_tx.send(1).expect("release the lease");
+
+        pohunek_test_support::wait::guard("a close frame after the queued output", async {
+            loop {
+                let frame = protocol::read_frame(&mut client_out)
+                    .await
+                    .expect("read frame")
+                    .expect("stream stays open until its close frame");
+                if let FrameKind::Close { reason } = frame.header().kind.clone() {
+                    assert_eq!(reason, protocol::CloseReason::LeaseReleased);
+                    return;
+                }
+            }
+        })
+        .await;
+        stream
+            .await
+            .expect("stream task")
+            .expect("a lease release ends the stream cleanly");
+        drop(client_in);
         pty.stop(
             "test-cleanup",
             server_stop_grace(),
