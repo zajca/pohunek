@@ -320,6 +320,13 @@ impl SessionRegistry {
                     .lock()
                     .expect("input delay hold test lock")
                     .take();
+                #[cfg(test)]
+                let failure_boundary = self
+                    .inner
+                    .input_enter_failure_hold
+                    .lock()
+                    .expect("input enter failure hold test lock")
+                    .take();
                 // A transaction finishes both plans even when the caller goes
                 // away, so a typed body is never left without its Enter.
                 let registry = self.clone();
@@ -333,9 +340,16 @@ impl SessionRegistry {
                         delay_boundary,
                     )
                     .await;
+                    #[cfg(test)]
+                    if let (Err(DelayedInputFailure::Enter(_)), Some(boundary)) =
+                        (&outcome, failure_boundary)
+                    {
+                        boundary.wait().await;
+                        boundary.wait().await;
+                    }
                     match outcome {
                         Err(DelayedInputFailure::Enter(error))
-                            if !registry.input_runtime_running(&session_id).await =>
+                            if registry.input_runtime_ended(&session_id).await =>
                         {
                             // The process ended after the text arrived, so
                             // Enter has nothing left to reach. Plain input's
@@ -443,6 +457,18 @@ impl SessionRegistry {
             .input_delay_hold
             .lock()
             .expect("input delay hold test lock") = Some(boundary);
+    }
+
+    /// Parks the next plain delayed input after its Enter failed and before it
+    /// reads the session state: it meets `boundary` once the Enter failed and
+    /// again before the read.
+    #[cfg(test)]
+    pub(super) fn hold_next_enter_failure(&self, boundary: std::sync::Arc<tokio::sync::Barrier>) {
+        *self
+            .inner
+            .input_enter_failure_hold
+            .lock()
+            .expect("input enter failure hold test lock") = Some(boundary);
     }
 
     /// Parks the next waited input write after its Enter was sent and before
@@ -1325,12 +1351,21 @@ fn worker_write_task_result(
 }
 
 impl SessionRegistry {
-    /// Whether `session_id` still has a live runtime that input can reach.
-    async fn input_runtime_running(&self, session_id: &SessionId) -> bool {
+    /// Whether the process behind `session_id` is known to have ended: the
+    /// session is gone or no longer running, or its runtime is terminal or
+    /// lost. A runtime that is reconnecting, conflicting or incompatible may
+    /// still have a live process.
+    async fn input_runtime_ended(&self, session_id: &SessionId) -> bool {
         let sessions = self.inner.sessions.lock().await;
-        sessions
-            .get(session_id)
-            .is_some_and(|entry| input_runtime_identity(entry, session_id).is_ok())
+        sessions.get(session_id).map_or(true, |entry| {
+            entry.info.state != SessionState::Running
+                || entry.info.runtime.as_ref().is_some_and(|runtime| {
+                    matches!(
+                        runtime.state,
+                        protocol::RuntimeState::Terminal | protocol::RuntimeState::Lost
+                    )
+                })
+        })
     }
 
     /// Consumes the acknowledgement of a worker input whose caller stopped waiting.

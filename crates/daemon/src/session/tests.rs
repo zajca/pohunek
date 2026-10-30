@@ -8180,6 +8180,56 @@ async fn delayed_plain_input_succeeds_when_the_agent_exits_before_enter() {
 }
 
 #[tokio::test]
+async fn delayed_plain_input_reports_a_lost_control_connection_to_a_surviving_worker() {
+    let registry = delayed_submit_registry("delayed-plain-severed");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let failure_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_enter_failure(Arc::clone(&failure_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "severed-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    reach_boundary(&delay_boundary).await;
+    // The worker survives the lost connection, so Enter fails while the
+    // process lives.
+    let (worker, expected) = live_worker_and_identity(&registry, &id).await;
+    worker.sever_connection();
+    reach_boundary(&delay_boundary).await;
+    // The daemon is reconnecting to the surviving worker when the failed
+    // Enter reads the session state.
+    reach_boundary(&failure_boundary).await;
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &id,
+                &expected,
+                &WorkerError::Protocol("test disconnect".to_owned()),
+            )
+            .await
+    );
+    reach_boundary(&failure_boundary).await;
+
+    let error = request
+        .await
+        .expect("input task joins")
+        .expect_err("Enter cannot reach a worker whose connection was lost");
+    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
+    registry.stop(&id).await.expect("stop the session");
+}
+
+#[tokio::test]
 async fn delayed_wait_input_never_writes_enter_when_the_agent_blocks_during_the_delay() {
     let registry = delayed_submit_registry("delayed-wait-blocked");
     let id = create_delayed_session(&registry, "delayed-codex").await;

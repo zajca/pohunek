@@ -842,6 +842,10 @@ struct SessionRegistryInner {
     input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     input_delay_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Rendezvous the next plain delayed input meets after its Enter failed
+    /// and before it reads the session state.
+    #[cfg(test)]
+    input_enter_failure_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     input_sent_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Holds the next create once its target is bound, before its launch.
@@ -2506,6 +2510,7 @@ impl SessionRegistry {
                 input_send_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 input_delay_hold: std::sync::Mutex::new(None),
+                input_enter_failure_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 input_sent_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
