@@ -1613,6 +1613,18 @@ class SharedGateTests(ReleaseWorkflowFiles):
         self.assertRegex(job + "\n", READ_BLOCK)
         self.assertIn("runs-on: ubuntu-24.04", job)
         self.assertIn("postgres:17-alpine", job)
+        self.assertIn("POSTGRES_DB: pohunek_test\n", job)
+        self.assertIn('--health-cmd "pg_isready -U postgres -d pohunek_test"', job)
+        # The URL is resolved at step level: the `job` context is not
+        # available in job-level `env`.
+        step = re.search(r"(?m)^      - name: Test\n(?:        .*\n|\n)*", job)
+        self.assertIsNotNone(step)
+        self.assertIn(
+            "          RELAY_DATABASE_URL: postgresql://postgres@127.0.0.1:"
+            "${{ job.services.postgres.ports['5432'] }}/pohunek_test\n",
+            step.group(0),
+        )
+        self.assertNotRegex(job.partition("    steps:\n")[0], r"RELAY_DATABASE_URL")
 
     def test_ci_runs_the_gate_in_the_nightly_tier_and_on_a_pull_request_that_changes_it(self):
         block = jobs(self.ci)["release-gate"]

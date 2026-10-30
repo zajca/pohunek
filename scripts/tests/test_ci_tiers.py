@@ -3003,7 +3003,28 @@ class RunnerImageTests(unittest.TestCase):
                 found.append(name)
         return sorted(found)
 
+    # Jobs whose `runs-on` is an expression and that use the rust-cache, with
+    # the image each resolves to: the row matrix and the smoke matrix hold
+    # `ubuntu-24.04` as their only Linux runner (checked below), macOS legs
+    # carry their own `runner.os` in the key.
+    RESOLVED_EXPRESSION_RUNNERS = {"release-evidence.yml:rows", "release-evidence.yml:smoke"}
+
     def test_a_job_with_an_expression_runner_may_not_use_the_rust_cache(self):
+        workflows = ROOT / ".github" / "workflows"
+        every_job = {
+            f"{path.name}:{name}": job
+            for path in sorted(workflows.glob("*.yml"))
+            for name, job in workflow_jobs(path.read_text()).items()
+        }
+        self.assertEqual(
+            set(self.cached_jobs_on_an_expression_runner(every_job)),
+            self.RESOLVED_EXPRESSION_RUNNERS,
+        )
+        row_matrix = (ROOT / "scripts" / "release-workflow" / "row-matrix").read_text()
+        evidence = (workflows / "release-evidence.yml").read_text()
+        smoke = workflow_jobs(evidence)["smoke"]
+        for source in (row_matrix, smoke):
+            self.assertEqual(set(re.findall(r"ubuntu-[0-9.]+", source)), {"ubuntu-24.04"})
         self.assertEqual(self.cached_jobs_on_an_expression_runner(workflow_jobs()), [])
         cached = "    runs-on: ${{ matrix.os }}\n    steps:\n      - uses: Swatinem/rust-cache@abc\n"
         self.assertEqual(

@@ -134,7 +134,9 @@ passed, and a failing, cancelled or still pending check does not.
   `pinned Hermes compatibility (model-free)` and the Pi, Codex and Claude Code
   runtime package jobs, `real systemd supervision`, and the paths-filtered
   `TS binding drift (xs check)`, `upgrade from the previous release`,
-  `release build`, `cargo-hack (feature powerset)`, the `release rehearsal`
+  `release build`, `cargo-hack (feature powerset)`, `release gate (full test
+  set)` (the reusable `gate-tests.yml`, on a pull request that changes the
+  gate's own inputs, and nightly), the `release rehearsal`
   jobs, `SDK workspace (macOS arm64)` and
   `macOS package install and upgrade (macos-15)`. The `release rehearsal`
   jobs also skip every pull request from a fork and from Dependabot, so an
