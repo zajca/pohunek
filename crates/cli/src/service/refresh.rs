@@ -137,15 +137,23 @@ pub(crate) struct LoginPathOnlyAgent {
 /// search path does not.
 ///
 /// `None` is no verdict: a host that records no path, no installation or one
-/// `service.toml` cannot describe, an empty recorded path, or a login shell that
-/// fails or hangs. `Some` lists the programs only the login shell reaches,
-/// empty when every program it reaches resolves through the recorded path too.
+/// `service.toml` cannot describe (including a runtime root that does not exist
+/// yet), a transaction record that is pending (the file and the daemon job may
+/// then disagree), an empty recorded path, or a login shell that fails or
+/// hangs. `Some` lists the programs only the login shell reaches, empty when
+/// every program it reaches resolves through the recorded path too.
 /// Runs the bounded discovery without a lock and contacts no service manager.
 pub(crate) fn agents_behind_recorded_path(context: &Context) -> Option<Vec<LoginPathOnlyAgent>> {
     if !context.records_search_path() {
         return None;
     }
     let (config, _) = load_installed_config(context).ok()?;
+    if !matches!(
+        super::record::Store::new(context.paths().state_dir.clone()).load(),
+        Ok(None)
+    ) {
+        return None;
+    }
     if config.search_path().entries().is_empty() {
         return None;
     }

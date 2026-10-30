@@ -322,11 +322,12 @@ fn service_config_unknown_keys_check(config_dir: &Path) -> Option<DoctorCheck> {
 /// Reports agent programs that resolve through the login shell's search path
 /// but not through the one `service.toml` records.
 ///
-/// The probe runs the bounded login-shell discovery without a transaction lock
-/// (on a blocking thread, so the daemon probes are not held up). Nothing is
-/// reported on a host that records no path, without an installation, and when
-/// the login shell fails or hangs; `pohunek service refresh-path --dry-run`
-/// reports those.
+/// The probe runs the bounded login-shell discovery without a transaction lock,
+/// on a blocking thread; doctor waits for it (at most the login-shell timeout)
+/// before it probes the daemon. Nothing is reported on a host that records no
+/// path, without a verifiable installation, while a transaction record is
+/// pending, and when the login shell fails or hangs; `pohunek service
+/// refresh-path --dry-run` reports the discovery failures.
 async fn login_path_agents_check() -> Option<DoctorCheck> {
     let agents = tokio::task::spawn_blocking(|| {
         let context = crate::service::Context::resolve().ok()?;
@@ -355,7 +356,7 @@ fn login_path_agents_verdict(agents: &[LoginPathOnlyAgent]) -> DoctorCheck {
         LOGIN_PATH_AGENTS_CHECK,
         Status::Warn,
         format!(
-            "{found} resolves only through your login shell's search path, not the one recorded in service.toml, so the daemon cannot start it; compare with 'pohunek service refresh-path --dry-run', then record the current path with 'pohunek service refresh-path' (it restarts the daemon with that path)"
+            "{found} resolves only through your login shell's search path, not the one recorded in service.toml, so the daemon does not find it (unless an agent profile sets an absolute 'program'); compare with 'pohunek service refresh-path --dry-run', then record the current path with 'pohunek service refresh-path' (it restarts the daemon with that path)"
         ),
     )
 }
