@@ -257,7 +257,6 @@ where
     serde_json::from_value(value).unwrap_or_else(|error| panic!("{method} result: {error}"))
 }
 
-/// The wire error code of a refused call.
 /// The `store_rejected_line_live` message names a `resume` line only for the
 /// fixture's unreadable-pin `resume` line, not for a possible session record.
 async fn assert_live_refusal_names_its_line_kind<S>(
@@ -288,6 +287,7 @@ async fn assert_live_refusal_names_its_line_kind<S>(
     );
 }
 
+/// The wire error code of a refused call.
 async fn refusal<S>(framed: &mut Framed<S, LinesCodec>, method: &str, params: Value) -> String
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -295,6 +295,7 @@ where
     refused(framed, method, params).await.code
 }
 
+/// The error of a refused call.
 async fn refused<S>(
     framed: &mut Framed<S, LinesCodec>,
     method: &str,
