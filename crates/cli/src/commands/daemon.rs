@@ -5,8 +5,9 @@
 //!   `--service-config <config>/pohunek/service.toml`, so workers become
 //!   native service jobs exactly as under the login service. Without
 //!   `service.toml` this fails fast and points at `pohunek service install`.
-//!   The active version directory is verified like the service manager's own
-//!   run, so a directory another account could have changed is refused.
+//!   The active version directory is verified as the service engine verifies a
+//!   version before it runs it, so a directory another account could have
+//!   changed is refused.
 //! - `--dev-subprocess`: run the `pohunekd` next to this CLI (or on `PATH`)
 //!   with `POHUNEK_WORKER_LAUNCHER=subprocess` and no service configuration,
 //!   for development and tests.
