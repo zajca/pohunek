@@ -166,6 +166,9 @@ const UPGRADE_PREFLIGHT_ARG: &str = "upgrade-preflight";
 const PROFILES_SUBDIR: &str = "agents";
 
 fn main() -> ExitCode {
+    // Declared before the runtime so it drops after it, on a return and while
+    // a panic unwinds out of `block_on`: the log writer flushes last.
+    let _flush_logs = FlushLogs;
     // The runtime is built here, not by `#[tokio::main]`, because dropping it
     // waits for blocking threads without a bound; `drop_runtime` bounds it.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -180,18 +183,25 @@ fn main() -> ExitCode {
     };
     let code = runtime.block_on(daemon_main());
     drop_runtime(runtime, RUNTIME_DROP_BOUND);
-    // The log writer outlives the runtime drop, so its warning reaches the file.
-    drop(
-        LOG_GUARD
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take(),
-    );
     code
 }
 
 /// Keeps the log writer's worker alive until `main` has dropped the runtime.
 static LOG_GUARD: Mutex<Option<logging::LogGuard>> = Mutex::new(None);
+
+/// Drops the log writer's guard, which flushes the queued log lines.
+struct FlushLogs;
+
+impl Drop for FlushLogs {
+    fn drop(&mut self) {
+        drop(
+            LOG_GUARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
 
 async fn daemon_main() -> ExitCode {
     // The probe deadline of `upgrade-preflight` counts from here.
@@ -1421,6 +1431,29 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_log_guard_flushes_when_a_panic_unwinds_out_of_main() {
+        use super::{FlushLogs, LOG_GUARD};
+        use std::sync::PoisonError;
+
+        let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
+        *LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _flush_logs = FlushLogs;
+            panic!("a panic escaping block_on");
+        });
+
+        assert!(unwound.is_err());
+        assert!(
+            LOG_GUARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the guard was dropped while the panic unwound"
+        );
+    }
+
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

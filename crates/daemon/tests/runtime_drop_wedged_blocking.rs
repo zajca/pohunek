@@ -10,8 +10,6 @@
 
 // Rust guideline compliant 2026-10-30
 
-#![cfg(target_os = "linux")]
-
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -28,36 +26,20 @@ use serde_json::json;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
+/// The daemon's process-table view of a fixture root and the reaper built on it,
+/// included by path as the supervised suite does.
+#[path = "../src/procwatch/scoped_host.rs"]
+#[expect(
+    dead_code,
+    reason = "the scenario uses the reaper only; the scoped table view serves the daemon's own tests"
+)]
+mod scoped_host;
+
 /// Directory name the daemon uses below the XDG roots.
 const APP_DIR: &str = "pohunek";
 
 /// Text of the warning a drop that reached its bound logs.
 const DROP_WARNING: &str = "daemon runtime drop reached its bound";
-
-/// Pids of the processes whose command line holds every one of `needles`.
-fn processes_running(needles: &[&str]) -> Vec<Pid> {
-    let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let cmdline = String::from_utf8_lossy(&raw);
-        if needles.iter().all(|needle| cmdline.contains(needle)) {
-            found.push(Pid::from_raw(pid));
-        }
-    }
-    found
-}
 
 /// Whether any file below `dir` holds `needle`.
 fn any_file_contains(dir: &Path, needle: &str) -> bool {
@@ -72,18 +54,6 @@ fn any_file_contains(dir: &Path, needle: &str) -> bool {
             fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
         }
     })
-}
-
-/// Kills the git processes the scenario blocked, on every exit of the test;
-/// a git blocked opening a FIFO nobody writes would otherwise outlive it.
-struct ReapGit(String);
-
-impl Drop for ReapGit {
-    fn drop(&mut self) {
-        for pid in processes_running(&["rev-parse", &self.0]) {
-            let _ = kill(pid, Signal::SIGKILL);
-        }
-    }
 }
 
 fn private_dir(path: &Path) {
@@ -121,6 +91,9 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
         .expect("run git config");
     assert!(configured.success(), "git config include.path");
 
+    // Declared before the daemon's `Child`, so it drops after `kill_on_drop`
+    // stopped the daemon and no detection can start another git behind the reap.
+    let reaper = scoped_host::ScopeReaper::new(&repo);
     let mut daemon = env.tokio_command(bin_exe("pohunekd"));
     daemon
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -153,10 +126,10 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
         .expect("send project.add");
 
     // The request is in flight on a blocking thread once git is blocked on the FIFO.
-    let repo_text = repo.display().to_string();
-    let _reap = ReapGit(repo_text.clone());
     wait_until("git blocked on the configuration FIFO", || async {
-        processes_running(&["rev-parse", &repo_text])
+        reaper
+            .running()
+            .expect("inspect the processes working in the repository")
             .first()
             .copied()
     })
@@ -169,7 +142,10 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
 
     // Any blocked git counts: the daemon's own detection retries with another
     // git after its timeout kills the first, so the first pid may be gone.
-    let still_blocked = !processes_running(&["rev-parse", &repo_text]).is_empty();
+    let still_blocked = !reaper
+        .running()
+        .expect("inspect the processes working in the repository")
+        .is_empty();
     assert!(status.success(), "the daemon exits cleanly: {status:?}");
     assert!(
         still_blocked,
