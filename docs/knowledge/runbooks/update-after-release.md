@@ -1029,10 +1029,12 @@ the refresh, so an edited file of the current schema does not keep it pending.
 A `--dry-run` over a pending refresh is refused with `service_refresh_pending`;
 rerun the command without `--dry-run`. If the daemon job vanished while the
 refresh was pending, the first run returns `service_rollback_failed` and a rerun
-`service_daemon_job_missing`. The daemon job is missing and the command changed
-nothing; `pohunek service uninstall` (which re-registers the job from
-`service.toml`) is the documented way back, see
-[#1763](https://github.com/zajca/pohunek/issues/1763).
+`service_daemon_job_missing`. The daemon job is missing; a first run before any
+record exists changed nothing, and after the first run's `service_rollback_failed`
+`service.toml` is back on the previous search path and the record stays
+`rolling_back`. The documented way out is `pohunek service uninstall`, which
+removes the installation, its daemon job and `service.toml` and keeps durable
+metadata; see [#1763](https://github.com/zajca/pohunek/issues/1763).
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without

@@ -961,7 +961,7 @@ async fn without_a_daemon_job_nothing_changes_and_a_stopped_job_is_started() {
     for dry_run in [false, true] {
         let error = refresh(harness, dry_run).await.expect_err("no job");
         assert_eq!(error.code(), "service_daemon_job_missing");
-        assert_daemon_job_missing_steps(&error);
+        assert_daemon_job_missing_steps(&error, CHANGED_NOTHING);
     }
     assert_eq!(config_bytes(harness), before);
     assert_eq!(harness.pending(), None);
@@ -1452,19 +1452,24 @@ async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_resto
     harness.assert_installed(V2);
 }
 
-/// Asserts the minimal way back a missing daemon job names: the job is
-/// missing, nothing was changed, `uninstall` is the documented step, #1763.
-fn assert_daemon_job_missing_steps(error: &Error) {
+/// Asserts the minimal way out a missing daemon job names: the job is
+/// missing, what the command left behind, `uninstall` by its outcome, #1763.
+fn assert_daemon_job_missing_steps(error: &Error, left_behind: &str) {
     assert_steps_in_order(
         error.hint().expect("hint"),
         &[
             "the daemon job is missing",
-            "this command changed nothing",
-            "`pohunek service uninstall`",
+            left_behind,
+            "`pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata)",
+            "documented way out",
             "issues/1763",
         ],
     );
 }
+
+const CHANGED_NOTHING: &str = "this command changed nothing";
+const ROLLED_BACK: &str =
+    "service.toml is back on the previous search path and the record stays rolling_back";
 
 #[tokio::test]
 async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_and_uninstall_takes_it(
@@ -1487,7 +1492,7 @@ async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_an
         ),
         "the replacement and the rollback both report the missing job: {error:?}"
     );
-    assert_daemon_job_missing_steps(&error);
+    assert_daemon_job_missing_steps(&error, ROLLED_BACK);
     assert!(harness.pending().expect("the record is kept").rolling_back);
     assert_eq!(
         recorded(harness),
@@ -1497,7 +1502,7 @@ async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_an
 
     let again = refresh(harness, false).await.expect_err("every rerun");
     assert_eq!(again.code(), "service_daemon_job_missing", "{again:?}");
-    assert_daemon_job_missing_steps(&again);
+    assert_daemon_job_missing_steps(&again, CHANGED_NOTHING);
 
     harness
         .engine()

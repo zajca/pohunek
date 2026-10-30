@@ -814,9 +814,13 @@ impl From<crate::workflow::Error> for Error {
     }
 }
 
-/// The way back from a missing daemon job: the only documented step is
-/// `uninstall`; the recovery design for the pending-record cases is #1763.
-const DAEMON_JOB_MISSING_HINT: &str = "the daemon job is missing, so refresh-path cannot replace it, and this command changed nothing; `pohunek service uninstall` (which re-registers the job from service.toml) is the documented way back, see https://github.com/zajca/pohunek/issues/1763";
+/// The way out of a missing daemon job: `uninstall` is the only documented
+/// step; the recovery design for the pending-record cases is #1763.
+const DAEMON_JOB_MISSING_HINT: &str = "the daemon job is missing, so refresh-path cannot replace it, and this command changed nothing; `pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out, see https://github.com/zajca/pohunek/issues/1763";
+
+/// The same way out after a replacement that failed because the job vanished:
+/// the file was restored and the record stays `rolling_back`.
+const DAEMON_JOB_MISSING_ROLLED_BACK_HINT: &str = "the daemon job is missing, so refresh-path cannot replace it; service.toml is back on the previous search path and the record stays rolling_back; `pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out, see https://github.com/zajca/pohunek/issues/1763";
 
 impl Error {
     /// Attaches the warnings of a degraded judgement to a refusal that the
@@ -1059,7 +1063,7 @@ impl Error {
                 "inspect which daemon the service job now runs (for example through `systemctl cat` or `launchctl print`), and decide through which pohunek installation's commands it should be stopped or replaced before this command continues",
             ),
             Self::RollbackFailed { rollback, .. } if matches!(**rollback, Self::DaemonJobMissing) => {
-                Some(DAEMON_JOB_MISSING_HINT)
+                Some(DAEMON_JOB_MISSING_ROLLED_BACK_HINT)
             }
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")
