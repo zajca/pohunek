@@ -666,9 +666,13 @@ impl CliError {
 }
 
 /// Next step for a `daemon start` whose active version directory is untrusted
-/// or missing: only an install or upgrade of the installed release rewrites it.
-const ACTIVE_VERSION_HINT: &str = "reinstall the active version with `pohunek service install`, \
-     or `pohunek service upgrade` from the installed release, then rerun the command";
+/// or missing. An upgrade to the same version only re-verifies the directory
+/// and `service install` refuses an existing `service.toml`, so the directory
+/// is replaced by an upgrade to another version or by an uninstall and install.
+const ACTIVE_VERSION_HINT: &str =
+    "upgrade to another release version with `pohunek service upgrade`, \
+     or run `pohunek service uninstall` and `pohunek service install` (durable metadata is kept \
+     without `--purge`), then rerun the command";
 
 /// The changes a setup stop reports, as a suffix of its message: empty when
 /// nothing was changed yet.
