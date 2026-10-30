@@ -68,6 +68,7 @@ use crate::project::detect::project_id;
 
 mod dry_run;
 mod legacy_binding;
+mod rejected;
 mod schema;
 #[cfg(test)]
 pub(crate) mod shape_guard;
@@ -77,6 +78,7 @@ mod legacy_binding_tests;
 
 pub(crate) use dry_run::{DryRun, DryRunState};
 pub(crate) use legacy_binding::RecoveryOutcome;
+pub use rejected::SetAsideError;
 pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
 
 #[cfg(unix)]
@@ -1479,10 +1481,8 @@ impl Store {
                 pinned.unreadable_lines += 1;
                 continue;
             };
-            let carries_no_pin = value
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| matches!(kind, "worktree" | "project"));
+            let carries_no_pin =
+                !kind_may_pin(value.get("kind").and_then(serde_json::Value::as_str));
             match serde_json::from_value::<Record>(value) {
                 Ok(Record::Session(record)) => {
                     if let Some(recovery) = &record.recovery {
@@ -1578,6 +1578,21 @@ impl Store {
         projects: &[ProjectRecord],
         sessions: &[SessionRecord],
     ) -> io::Result<MetadataWriteOutcome> {
+        let rejected = self.rejected_line_texts()?;
+        self.write_records(resume, worktrees, projects, sessions, &rejected)
+    }
+
+    /// [`Self::write_all`] with the rejected lines named by the caller, in file
+    /// order. A caller that drops one of them takes responsibility for keeping
+    /// its text elsewhere.
+    fn write_records(
+        &self,
+        resume: &[ResumeBinding],
+        worktrees: &[WorktreeBinding],
+        projects: &[ProjectRecord],
+        sessions: &[SessionRecord],
+        rejected: &[String],
+    ) -> io::Result<MetadataWriteOutcome> {
         if resume
             .iter()
             .any(|binding| !kind_is_persistable(&binding.agent_base))
@@ -1607,8 +1622,8 @@ impl Store {
         for record in sessions {
             append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
         }
-        for text in self.rejected_line_texts()? {
-            body.push_str(&text);
+        for text in rejected {
+            body.push_str(text);
             body.push('\n');
         }
         self.commit_body(&body)
@@ -1932,6 +1947,13 @@ pub(crate) struct RejectedLine {
     pub(crate) text: String,
 }
 
+impl RejectedLine {
+    /// Whether the line may pin a runtime package; see [`kind_may_pin`].
+    pub(crate) fn may_pin(&self) -> bool {
+        kind_may_pin(self.kind.as_deref())
+    }
+}
+
 /// Partitions the lines of a store at the current schema into its record
 /// lists, and returns every line that was skipped.
 ///
@@ -2010,12 +2032,13 @@ fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, 
 /// debugging. The line stays in the store and every rewrite re-emits it
 /// unchanged. Editing the file while the daemon runs is unsafe, because a
 /// half-written read drops the lines after the cut at the next rewrite: the
-/// remedy is to stop the daemon, move the line into a backup file and start it.
+/// remedy is `pohunek store rejected set-aside`, which moves the line into the
+/// quarantine file under the write lock.
 fn warn_rejected(line: &RejectedLine) {
     warn!(
         reason = %line.reason,
         line = %line.text,
-        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning stop the daemon, move the line out of the file into a backup file and start the daemon"
+        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`"
     );
 }
 
@@ -2026,6 +2049,13 @@ const NON_SESSION_KINDS: [&str; 3] = ["resume", "worktree", "project"];
 /// whose discriminator is missing or unreadable still may.
 pub(crate) fn may_hold_session(kind: Option<&str>) -> bool {
     kind.is_none_or(|kind| !NON_SESSION_KINDS.contains(&kind))
+}
+
+/// Whether a line with this `kind` may pin a runtime package. Only a
+/// `worktree` or `project` record carries no pin; a `resume` record pins, and a
+/// missing or unreadable discriminator may.
+pub(crate) fn kind_may_pin(kind: Option<&str>) -> bool {
+    !matches!(kind, Some("worktree" | "project"))
 }
 
 /// The kind, session id, liveness and removal intent a rejected line still names.

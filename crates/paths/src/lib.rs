@@ -29,6 +29,9 @@ pub const KNOWLEDGE_CACHE_SUBDIR: &str = "knowledge";
 pub const ASSISTANT_RUNTIME_SUBDIR: &str = "assistant";
 /// Daemon metadata store filename under [`BasePaths::data_dir`].
 pub const METADATA_STORE_NAME: &str = "metadata.jsonl";
+/// Quarantine file next to [`METADATA_STORE_NAME`] that holds the store lines
+/// an operator set aside, each with its audit record.
+pub const REJECTED_QUARANTINE_NAME: &str = "metadata.rejected.jsonl";
 /// Infix between a metadata store name and its pre-migration backup suffix.
 const SCHEMA_BACKUP_INFIX: &str = ".pre-schema-";
 /// Suffix marker of a backup that is still being written.

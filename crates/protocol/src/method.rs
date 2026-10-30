@@ -37,7 +37,8 @@ use crate::{
     SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
     SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams,
+    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, StoreRejectedListResult,
+    StoreRejectedSetAsideParams, StoreRejectedSetAsideResult, WorktreeRemoveParams,
     WorktreeRemoveResult,
 };
 
@@ -741,6 +742,25 @@ method_table!(
     PackageBindProfileResult,
     "PackageBindProfileParams",
     "PackageBindProfileResult";
+
+    /// List the metadata-store lines no loader accepts (local-only).
+    StoreRejectedList,
+    STORE_REJECTED_LIST,
+    "store.rejected_list",
+    (),
+    StoreRejectedListResult,
+    "null",
+    "StoreRejectedListResult";
+
+    /// Move a rejected metadata-store line into the quarantine file
+    /// (local-only).
+    StoreRejectedSetAside,
+    STORE_REJECTED_SET_ASIDE,
+    "store.rejected_set_aside",
+    StoreRejectedSetAsideParams,
+    StoreRejectedSetAsideResult,
+    "StoreRejectedSetAsideParams",
+    "StoreRejectedSetAsideResult";
 
     /// Run one command a package declared, once, and return its stdout.
     CommandRun,

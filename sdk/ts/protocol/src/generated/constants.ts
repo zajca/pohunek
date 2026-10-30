@@ -24,6 +24,8 @@ export const PREVIOUS_VERSION_INTRODUCED_METHODS = [
   "session.idle_stop.set",
   "host.resolve",
   "command.run",
+  "store.rejected_list",
+  "store.rejected_set_aside",
 ] as const;
 /** Keys the previous protocol version spelled differently, as [previous, current]. */
 /** Methods whose handler forwards the asking client's range to other hosts; a client keeps advertising its whole window on them. */

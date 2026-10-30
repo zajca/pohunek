@@ -139,6 +139,15 @@ enum Commands {
         action: commands::plugin::Action,
     },
 
+    /// Inspect and repair the daemon's metadata store on this machine.
+    ///
+    /// Purely local: the store holds this user's durable records, so a remote
+    /// `--host` is rejected before anything runs.
+    Store {
+        #[command(subcommand)]
+        action: commands::store::Action,
+    },
+
     /// Install, inspect, and remove workflow plugins on this machine.
     ///
     /// Purely local: workflow plugins live in this user's own store and never
@@ -1690,6 +1699,7 @@ impl Commands {
             },
             Commands::Service { action } => action.wants_json(),
             Commands::Plugin { action } => action.wants_json(),
+            Commands::Store { action } => action.wants_json(),
             Commands::Workflow { action } => action.wants_json(),
             Commands::Setup { action, json, .. } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
@@ -1719,6 +1729,7 @@ impl Commands {
             | Commands::Daemon { .. }
             | Commands::Service { .. }
             | Commands::Plugin { .. }
+            | Commands::Store { .. }
             | Commands::Workflow { .. }
             | Commands::Health { .. }
             | Commands::Status { .. }
@@ -2023,6 +2034,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             // Package lifecycle is local-only; the global `--host` is checked,
             // not ignored.
             commands::plugin::run(action, &global_host).await
+        }
+        Commands::Store { action } => {
+            // The metadata store is local-only; the global `--host` is checked
+            // before any connection.
+            commands::store::run(action, &global_host).await
         }
         Commands::Workflow { action } => {
             // The workflow store is local-only; the global `--host` is checked
@@ -3045,6 +3061,7 @@ fn command_line_hosts(cli: &Cli) -> Vec<&str> {
                 | NotificationsAction::Delete { target, .. },
         } => vec![target.host.as_deref().unwrap_or(global)],
         Commands::Plugin { .. }
+        | Commands::Store { .. }
         | Commands::Workflow { .. }
         | Commands::Health { .. }
         | Commands::Status { .. }

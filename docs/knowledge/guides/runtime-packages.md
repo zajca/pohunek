@@ -766,8 +766,12 @@ read counts as incompatible.
   While a `metadata.jsonl` line that may pin a package cannot be read, every
   installed version counts as referenced, so a version stays held back with no
   session or profile naming it and `uninstall` fails with
-  `package_retention_uncertain`. Stop the daemon, move the line named in the
-  daemon log out of `metadata.jsonl` into a backup file and start the daemon.
+  `package_retention_uncertain`. List the line with `pohunek store rejected
+  list` and move it into the quarantine file with `pohunek store rejected
+  set-aside <content-hash>` (see the runtime package recovery runbook). The
+  offline `ensure` step reads the store the same way: it never searches such a
+  line for a digest, judges every installed version while one exists and names
+  the command in the refusal it causes.
 - `package.bind_profile` (the wire method behind `plugin profile migrate`)
   refuses to pin a version whose integration differs from the selected version
   of its package or from another referenced version (the pin being replaced does not count), with the same error, because the pin would be a retained

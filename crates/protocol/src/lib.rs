@@ -40,6 +40,7 @@ mod project;
 mod runtime_id;
 mod secret_env;
 mod session;
+mod store;
 pub mod tolerant;
 mod turn_wait;
 mod version;
@@ -176,6 +177,13 @@ pub use session::{
     SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind, SubagentInfo,
     SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
     TerminalDimensionsError, UnconfirmedProcess, WorktreeSource,
+};
+#[doc(inline)]
+pub use store::{
+    StoreRejectedLine, StoreRejectedListResult, StoreRejectedSetAsideParams,
+    StoreRejectedSetAsideResult, STORE_QUARANTINE_FAILED, STORE_READ_FAILED,
+    STORE_REJECTED_LINE_LIVE, STORE_REJECTED_LINE_NOT_FOUND, STORE_REJECTED_LIST_MAX_LINES,
+    STORE_REJECTED_TEXT_MAX_BYTES,
 };
 #[doc(inline)]
 pub use turn_wait::{

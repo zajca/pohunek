@@ -33,9 +33,23 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    session or host profile pins the digest; a pinned digest cannot be
    uninstalled (`package_referenced`). `package_retention_uncertain` means a line
    of `metadata.jsonl` that may pin a package cannot be read, so no digest can
-   be proven unpinned: stop the daemon, move the line the daemon log names into
-   a backup file, start the daemon and retry; listing and inspection keep
-   working meanwhile.
+   be proven unpinned; listing and inspection keep working meanwhile. Run
+   `pohunek store rejected list`: it prints each such line with its number,
+   kind, whether it may pin a package, whether it may belong to a live runtime,
+   why it was rejected and its content hash (`pohunek doctor` reports the count
+   as `metadata_store_rejected_lines`). Then run
+   `pohunek store rejected set-aside <content-hash>`: the line moves, with an
+   audit record, into `metadata.rejected.jsonl` next to the store, and the
+   uninstall can be retried. A line that may belong to a session with a live
+   runtime is refused with `store_rejected_line_live`; stop that session, or
+   repeat with `--accept-pin-loss` once nothing depends on its package root.
+   The quarantine file is owner-private and never deleted by the daemon; to put
+   a line back, stop the daemon, append the record's `text` to `metadata.jsonl`
+   and start it. `pohunek service uninstall --purge` keeps and reports it. A
+   daemon that predates these commands has the manual remedy: stop it, move the
+   line out of `metadata.jsonl` into a backup file and start it, because a hand
+   edit while the daemon runs risks a short read and data loss at the next
+   rewrite.
 2. Match each finding (implemented in
    `crates/daemon/src/session/package_lifecycle/` and
    `crates/package/src/registry.rs`):

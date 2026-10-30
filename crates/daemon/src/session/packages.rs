@@ -66,13 +66,25 @@ pub(super) struct RetainedPins {
 }
 
 impl RetainedPins {
-    /// A set whose pins are all known, as the offline planner reads them.
+    /// The known digests of a read that found `unreadable_lines` store lines
+    /// that may pin a package and cannot be read. While one exists the gate
+    /// also holds every digest in `installed`, so an unreadable line never
+    /// shrinks what a gate judges.
     #[must_use]
-    pub(super) fn from_known(known: RetainedDigests) -> Self {
+    pub(super) fn with_unreadable(
+        known: RetainedDigests,
+        unreadable_lines: usize,
+        installed: impl IntoIterator<Item = PackageDigest>,
+    ) -> Self {
+        let uncertain = unreadable_lines > 0;
+        let mut gate = known.clone();
+        if uncertain {
+            gate.extend(installed);
+        }
         Self {
-            gate: known.clone(),
             known,
-            uncertain: false,
+            gate,
+            uncertain,
         }
     }
 
@@ -93,6 +105,28 @@ impl RetainedPins {
     pub(super) fn is_uncertain(&self) -> bool {
         self.uncertain
     }
+}
+
+/// The digest of every installed package; empty without a package store.
+///
+/// # Errors
+///
+/// Returns an error when the package registry state cannot be read.
+pub(super) fn installed_digests(runtimes: &RuntimeHost) -> io::Result<Vec<PackageDigest>> {
+    runtimes
+        .package_store()
+        .map(|store| {
+            store.registry().state().map(|state| {
+                state
+                    .packages()
+                    .iter()
+                    .map(|record| record.digest().clone())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 impl SessionRegistry {
@@ -292,38 +326,23 @@ impl SessionRegistry {
             retained.extend(pinned_digest(&entry.snapshot.launch_binding));
         }
         drop(sessions);
-        let mut gate = retained.clone();
-        let uncertain = unreadable_lines > 0;
-        if uncertain {
+        let installed = if unreadable_lines > 0 {
             tracing::debug!(
                 unreadable_lines,
                 "package gates judge every installed package: the metadata store holds a line that may pin a package and cannot be read"
             );
             let runtimes = self.inner.profiles.runtimes().clone();
-            let installed = tokio::task::spawn_blocking(move || {
-                runtimes
-                    .package_store()
-                    .map(|store| {
-                        store.registry().state().map(|state| {
-                            state
-                                .packages()
-                                .iter()
-                                .map(|record| record.digest().clone())
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .transpose()
-            })
-            .await
-            .map_err(|join_error| io::Error::other(join_error.to_string()))?
-            .map_err(|error| io::Error::other(error.to_string()))?;
-            gate.extend(installed.into_iter().flatten());
-        }
-        Ok(RetainedPins {
-            known: retained,
-            gate,
-            uncertain,
-        })
+            tokio::task::spawn_blocking(move || installed_digests(&runtimes))
+                .await
+                .map_err(|join_error| io::Error::other(join_error.to_string()))??
+        } else {
+            Vec::new()
+        };
+        Ok(RetainedPins::with_unreadable(
+            retained,
+            unreadable_lines,
+            installed,
+        ))
     }
 
     /// Uninstalls the package `digest` unless a session still references it,

@@ -64,6 +64,7 @@ pub(super) async fn handle_daemon_doctor(
             from_file: overlays_from_file,
         },
         transport == ControlTransport::Local,
+        sessions.rejected_lines_state().await,
     )
     .await
     {

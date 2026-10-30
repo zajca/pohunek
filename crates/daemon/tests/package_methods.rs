@@ -5,6 +5,8 @@
 //! the overlay connection) serve one shared registry over a real plugin root.
 //! The Unix socket serves the whole lifecycle; every package method is refused
 //! on the remote connection before it reads a parameter or touches the disk.
+//! The same servers, over a registry that owns a metadata store, serve the
+//! `store.rejected_*` methods and the package gates that depend on them.
 
 // Rust guideline compliant 2026-10-12
 
@@ -79,6 +81,8 @@ fn package_methods(digest: &PackageDigest) -> Vec<(&'static str, Value)> {
 struct Servers {
     addr: SocketAddr,
     socket: PathBuf,
+    /// The metadata store, when the registry owns one.
+    store: Option<PathBuf>,
     plugins: PathBuf,
     /// Directory the daemon reads host profiles from.
     agents: PathBuf,
@@ -95,6 +99,25 @@ impl Servers {
 }
 
 async fn spawn_servers(tag: &str) -> Servers {
+    spawn_servers_over(tag, None).await
+}
+
+/// [`spawn_servers`] over a registry that owns a metadata store holding
+/// `store_content`.
+/// Writes `<root>/data/metadata.jsonl` owner-private and returns its path.
+fn write_data_store(root: &Path, content: &str) -> PathBuf {
+    let directory = root.join("data");
+    std::fs::create_dir(&directory).expect("create the data directory");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("make the data directory owner-private");
+    let path = directory.join("metadata.jsonl");
+    std::fs::write(&path, content).expect("write the metadata store");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("make the metadata store owner-private");
+    path
+}
+
+async fn spawn_servers_over(tag: &str, store_content: Option<&str>) -> Servers {
     let socket_dir = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
         .expect("create the socket directory");
     let socket = socket_dir.path().join("daemon.sock");
@@ -119,8 +142,10 @@ async fn spawn_servers(tag: &str) -> Servers {
         home: worker_home.clone(),
         daemon_socket: socket.clone(),
     };
+    let store = store_content.map(|content| write_data_store(socket_dir.path(), content));
     let config = SessionRegistryConfig {
         socket_path: Some(socket.clone()),
+        store_path: store.clone(),
         plugins_dir: Some(plugins.clone()),
         agents_dir: Some(agents.clone()),
         host_state_dir: Some(host_state),
@@ -177,6 +202,7 @@ async fn spawn_servers(tag: &str) -> Servers {
     Servers {
         addr,
         socket,
+        store,
         plugins,
         agents,
         shutdown,
@@ -1971,5 +1997,306 @@ async fn a_secret_slot_naming_a_launch_env_pair_is_refused_at_session_new() {
         !format!("{refused:?}").contains(SECRET),
         "the refusal quotes the secret: {refused:?}"
     );
+    servers.stop().await;
+}
+
+/// A current-schema line of `kind` that no loader accepts.
+fn rejected_line(kind: &str) -> String {
+    json!({
+        "kind": kind,
+        "schema_version": pohunek_daemon::store::STORE_SCHEMA_VERSION,
+        "unexpected": 1
+    })
+    .to_string()
+}
+
+/// A current-schema session line that no loader accepts, with `runtime`.
+fn rejected_session_line(session_id: &str, runtime: Value) -> String {
+    let mut line = json!({
+        "kind": "session",
+        "schema_version": pohunek_daemon::store::STORE_SCHEMA_VERSION,
+        "session_id": session_id,
+        "desired_state": "suspended"
+    });
+    if !runtime.is_null() {
+        line["runtime"] = runtime;
+    }
+    line.to_string()
+}
+
+/// Lowercase hex SHA-256 of `text`.
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn quarantine_records(servers: &Servers) -> Vec<Value> {
+    let path = servers
+        .store
+        .as_ref()
+        .expect("the registry owns a store")
+        .with_file_name("metadata.rejected.jsonl");
+    std::fs::read_to_string(path)
+        .expect("read the quarantine file")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a quarantine record"))
+        .collect()
+}
+
+fn store_text(servers: &Servers) -> String {
+    std::fs::read_to_string(servers.store.as_ref().expect("the registry owns a store"))
+        .expect("read the metadata store")
+}
+
+/// The rejected lines of the scenarios below, numbered as the store holds them
+/// (a blank line sits at 2, a duplicate of the resume line at 7).
+struct RejectedFixture {
+    project: String,
+    resume: String,
+    live: String,
+    ended: String,
+    corrupt: String,
+    content: String,
+}
+
+impl RejectedFixture {
+    fn new() -> Self {
+        let project = rejected_line("project");
+        let resume = rejected_line("resume");
+        let live = rejected_session_line("s-live", Value::Null);
+        let ended = rejected_session_line("s-ended", json!({ "state": "terminal" }));
+        let corrupt = "{not json".to_owned();
+        let content = format!("{project}\n\n{resume}\n{live}\n{ended}\n{corrupt}\n{resume}\n");
+        Self {
+            project,
+            resume,
+            live,
+            ended,
+            corrupt,
+            content,
+        }
+    }
+}
+
+async fn set_aside(
+    local: &mut Framed<UnixStream, LinesCodec>,
+    text: &str,
+    accept_pin_loss: bool,
+) -> protocol::StoreRejectedSetAsideResult {
+    call(
+        local,
+        method::STORE_REJECTED_SET_ASIDE,
+        json!({ "content_hash": sha256_hex(text), "accept_pin_loss": accept_pin_loss }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_rejected_line_methods_are_local_only_and_list_every_line() {
+    let fixture = RejectedFixture::new();
+    let servers = spawn_servers_over("store-rejected-list", Some(&fixture.content)).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let mut remote = connect_tcp(servers.addr).await;
+
+    for (name, params) in [
+        (method::STORE_REJECTED_LIST, Value::Null),
+        (
+            method::STORE_REJECTED_SET_ASIDE,
+            json!({ "content_hash": sha256_hex(&fixture.project) }),
+        ),
+    ] {
+        assert_eq!(
+            refusal(&mut remote, name, params).await,
+            LOCAL_ONLY,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        store_text(&servers),
+        fixture.content,
+        "the remote calls changed nothing"
+    );
+
+    let listed: protocol::StoreRejectedListResult =
+        call(&mut local, method::STORE_REJECTED_LIST, Value::Null).await;
+    assert_eq!(listed.total, 6);
+    let summary: Vec<_> = listed
+        .lines
+        .iter()
+        .map(|line| {
+            (
+                line.line,
+                line.kind.as_deref(),
+                line.may_pin,
+                line.may_own_runtime,
+                line.content_hash.clone(),
+            )
+        })
+        .collect();
+    let expected = [
+        (
+            1,
+            Some("project"),
+            false,
+            false,
+            sha256_hex(&fixture.project),
+        ),
+        (3, Some("resume"), true, false, sha256_hex(&fixture.resume)),
+        (4, Some("session"), true, true, sha256_hex(&fixture.live)),
+        (5, Some("session"), true, false, sha256_hex(&fixture.ended)),
+        (6, None, true, true, sha256_hex(&fixture.corrupt)),
+        (7, Some("resume"), true, false, sha256_hex(&fixture.resume)),
+    ];
+    assert_eq!(summary, expected);
+    assert!(
+        listed.lines.iter().all(|line| !line.reason.is_empty()),
+        "every line names why it is rejected"
+    );
+
+    assert_eq!(
+        refusal(
+            &mut local,
+            method::STORE_REJECTED_SET_ASIDE,
+            json!({ "content_hash": sha256_hex(&fixture.live) })
+        )
+        .await,
+        "store_rejected_line_live"
+    );
+    assert_eq!(
+        refusal(
+            &mut local,
+            method::STORE_REJECTED_SET_ASIDE,
+            json!({ "content_hash": "0".repeat(64) })
+        )
+        .await,
+        "store_rejected_line_not_found"
+    );
+    assert_eq!(
+        store_text(&servers),
+        fixture.content,
+        "a refusal changes nothing"
+    );
+    assert!(
+        !quarantine_path(&servers).exists(),
+        "a refusal writes no quarantine file"
+    );
+
+    drop(remote);
+    drop(local);
+    servers.stop().await;
+}
+
+fn quarantine_path(servers: &Servers) -> PathBuf {
+    servers
+        .store
+        .as_ref()
+        .expect("the registry owns a store")
+        .with_file_name("metadata.rejected.jsonl")
+}
+
+#[tokio::test]
+async fn setting_lines_aside_moves_them_into_an_audited_owner_private_quarantine_file() {
+    let fixture = RejectedFixture::new();
+    let servers = spawn_servers_over("store-rejected-move", Some(&fixture.content)).await;
+    let mut local = connect_unix(&servers.socket).await;
+
+    let moved = set_aside(&mut local, &fixture.project, false).await;
+    assert_eq!(moved.lines, [1]);
+    assert_eq!(moved.quarantine_file, "metadata.rejected.jsonl");
+    // The first rewrite dropped the blank line, so the numbers moved up.
+    let duplicate = set_aside(&mut local, &fixture.resume, false).await;
+    assert_eq!(duplicate.lines, [1, 5], "identical lines move together");
+    let ended = set_aside(&mut local, &fixture.ended, false).await;
+    assert_eq!(ended.lines, [2]);
+    let accepted = set_aside(&mut local, &fixture.live, true).await;
+    assert_eq!(accepted.lines, [1], "the number is the one before the move");
+    assert_eq!(
+        store_text(&servers),
+        format!("{}\n", fixture.corrupt),
+        "the store keeps only the line nobody set aside"
+    );
+
+    let records = quarantine_records(&servers);
+    let audited: Vec<_> = records
+        .iter()
+        .map(|record| {
+            (
+                record["line"].as_u64().expect("line"),
+                record["text"].as_str().expect("text").to_owned(),
+                record["accepted_pin_loss"].as_bool().expect("flag"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        audited,
+        [
+            (1, fixture.project.clone(), false),
+            (1, fixture.resume.clone(), false),
+            (5, fixture.resume.clone(), false),
+            (2, fixture.ended.clone(), false),
+            (1, fixture.live.clone(), true),
+        ]
+    );
+    assert!(records
+        .iter()
+        .all(|record| record["quarantine_schema"] == 1 && record["set_aside_at"].is_string()));
+    let mode = std::fs::metadata(quarantine_path(&servers))
+        .expect("quarantine metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the quarantine file is owner-private");
+
+    let after: protocol::StoreRejectedListResult =
+        call(&mut local, method::STORE_REJECTED_LIST, Value::Null).await;
+    assert_eq!(after.total, 1);
+    assert_eq!(after.lines[0].line, 1);
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_removal_refused_for_an_unreadable_line_proceeds_once_the_line_is_set_aside() {
+    let unreadable = rejected_line("resume");
+    let servers = spawn_servers_over("store-uninstall", Some(&format!("{unreadable}\n"))).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let (bytes, digest) = archive("/bin/sh");
+    let archive_path = servers.plugins.with_file_name("pi.tar.zst");
+    std::fs::write(&archive_path, &bytes).expect("write the archive");
+    let _: PackageInstallResult = call(
+        &mut local,
+        method::PACKAGE_INSTALL,
+        json!({
+            "archive_path": archive_path,
+            "trust": { "kind": "explicit_digest", "digest": digest },
+            "enable": false,
+            "select": false,
+            "dry_run": false
+        }),
+    )
+    .await;
+    let uninstall = json!({ "digest": digest, "remove_modified": false });
+
+    assert_eq!(
+        refusal(&mut local, method::PACKAGE_UNINSTALL, uninstall.clone()).await,
+        "package_retention_uncertain",
+        "a line that may pin the package keeps it installed"
+    );
+    let listed: protocol::StoreRejectedListResult =
+        call(&mut local, method::STORE_REJECTED_LIST, Value::Null).await;
+    assert_eq!(listed.total, 1);
+    assert!(listed.lines[0].may_pin);
+
+    let _: protocol::StoreRejectedSetAsideResult = call(
+        &mut local,
+        method::STORE_REJECTED_SET_ASIDE,
+        json!({ "content_hash": listed.lines[0].content_hash }),
+    )
+    .await;
+    let removed: PackageUninstallResult =
+        call(&mut local, method::PACKAGE_UNINSTALL, uninstall).await;
+    assert!(removed.reloaded);
+
+    drop(local);
     servers.stop().await;
 }

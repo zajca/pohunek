@@ -17,8 +17,11 @@ use protocol::{
 use crate::agent::host::VersionRefusal;
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
-use crate::session::ActiveSupervision;
+use crate::session::{ActiveSupervision, RejectedLinesState};
 use crate::Paths;
+
+/// Name of the check that reports the metadata-store lines no loader accepts.
+const METADATA_STORE_REJECTED_LINES_CHECK: &str = "metadata_store_rejected_lines";
 
 /// The bounded daemon doctor task did not produce a report.
 ///
@@ -51,6 +54,7 @@ pub(crate) async fn report(
     base_env: pohunek_worker_protocol::BaseEnv,
     overlays: OverlayChecks<'_>,
     include_profile_homes: bool,
+    rejected_lines: RejectedLinesState,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
@@ -95,6 +99,7 @@ pub(crate) async fn report(
     );
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
+    checks.push(rejected_lines_check(rejected_lines));
     Ok(bounded_report(checks))
 }
 
@@ -726,6 +731,30 @@ fn invalid_anchor_detail(fault: AnchorFault) -> String {
     format!("{fault}; official packages are refused until the anchor file is fixed and the daemon restarts.")
 }
 
+/// The check that reports the metadata-store lines no loader accepts. It
+/// carries counts and the command that lists them, never a line's text.
+fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
+    match state {
+        RejectedLinesState::Counted { total: 0, .. } => check(
+            METADATA_STORE_REJECTED_LINES_CHECK,
+            DoctorStatus::Ok,
+            "The metadata store holds no line this build cannot load.",
+        ),
+        RejectedLinesState::Counted { total, may_pin } => check(
+            METADATA_STORE_REJECTED_LINES_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "The metadata store keeps {total} line(s) this build cannot load, {may_pin} of them may pin a runtime package, so package removal and selection fail closed while they stay. Run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`."
+            ),
+        ),
+        RejectedLinesState::Unreadable => check(
+            METADATA_STORE_REJECTED_LINES_CHECK,
+            DoctorStatus::Fail,
+            "The metadata store cannot be read; check the daemon log.",
+        ),
+    }
+}
+
 fn governance_checks(diagnostic: HostGovernanceDiagnostic) -> [DoctorCheck; 6] {
     match diagnostic {
         HostGovernanceDiagnostic::Available(status) => {
@@ -898,6 +927,10 @@ mod tests {
             pohunek_worker_protocol::BaseEnv::default(),
             OverlayChecks::NONE,
             false,
+            RejectedLinesState::Counted {
+                total: 0,
+                may_pin: 0,
+            },
         )
         .await
         .expect("doctor report");
@@ -975,6 +1008,10 @@ mod tests {
             pohunek_worker_protocol::BaseEnv::default(),
             OverlayChecks::NONE,
             false,
+            RejectedLinesState::Counted {
+                total: 0,
+                may_pin: 0,
+            },
         )
         .await
         .expect("doctor report");
