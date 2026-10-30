@@ -87,9 +87,10 @@ env:
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
   # clippy, test-debug, bins, systemd, release, xtask, docs, hack, nightly-udeps,
-  # platform-contracts, darwin-check). A key that is saved is used by jobs of one
-  # runner image only: the key does not name the image, and a cache built on
-  # ubuntu-26.04 must not feed the ubuntu-24.04 jobs. The full key also hashes the toolchain, the
+  # platform-contracts, darwin-check). The key does not name the runner image, so
+  # a cache is never restored on an older image than the one that saved it: a
+  # cache built on ubuntu-26.04 must not feed an ubuntu-24.04 job. The full key
+  # also hashes the toolchain, the
   # RUST*/CARGO* environment (RUSTFLAGS included), and the Cargo manifests.
   # rust-cache saves only on a key miss and the first finisher wins, so each
   # key has exactly one designated saver, the job that builds the superset

@@ -2954,22 +2954,62 @@ class RunnerImageTests(unittest.TestCase):
                     {"ubuntu-24.04"},
                 )
 
-    def test_a_cache_is_never_restored_on_an_older_image_than_the_one_that_saved_it(self):
+    @staticmethod
+    def cache_uses(entries):
+        """(key, image, saves) of every rust-cache step in `entries`, pairs of
+        (image, text). A step without `save-if` saves on a key miss."""
+        uses = []
+        for image, text in entries:
+            for step in text.split("uses: Swatinem/rust-cache")[1:]:
+                step = re.split(r"(?m)^\s*- ", step, maxsplit=1)[0]
+                key = re.search(r"(?m)^\s+shared-key: (\S+)\s*$", step)
+                save = re.search(r"(?m)^\s+save-if: (.+)$", step)
+                if key:
+                    uses.append((key.group(1), image, save is None or save.group(1) != "false"))
+        return uses
+
+    @classmethod
+    def cache_direction_violations(cls, entries):
+        """Keys saved from two images, and keys restored on an older image than
+        the one that saves them."""
         savers = collections.defaultdict(set)
-        restorers = collections.defaultdict(set)
+        images = collections.defaultdict(set)
+        for key, image, saves in cls.cache_uses(entries):
+            images[key].add(image)
+            if saves:
+                savers[key].add(image)
+        return sorted(
+            key for key, saving in savers.items()
+            if len(saving) != 1 or min(images[key]) < max(saving)
+        )
+
+    def test_a_cache_is_never_restored_on_an_older_image_than_the_one_that_saved_it(self):
+        workflows = ROOT / ".github" / "workflows"
         entries = [(self.runner(job), job) for job in workflow_jobs().values()
                    if "runs-on: ubuntu" in job]
-        upgrade = (ROOT / ".github" / "workflows" / "upgrade.yml").read_text()
-        entries.append(("ubuntu-24.04", upgrade))
-        for runner, text in entries:
-            for key, save in re.findall(
-                r"(?m)^          shared-key: (\S+)\n          save-if: (.+)$", text
-            ):
-                (restorers if save == "false" else savers)[key].add(runner)
-        for key, runners in savers.items():
-            with self.subTest(key=key):
-                self.assertEqual(len(runners), 1, runners)
-                self.assertGreaterEqual(min(restorers[key] | runners), max(runners))
+        entries += [("ubuntu-24.04", (workflows / name).read_text())
+                    for name in self.FLOOR_WORKFLOWS]
+        uses = self.cache_uses(entries)
+        self.assertTrue({"bins", "systemd", "test-debug"} <= {key for key, _, _ in uses}, uses)
+        self.assertEqual(self.cache_direction_violations(entries), [])
+
+    def test_the_cache_direction_check_sees_a_saver_without_save_if(self):
+        def step(key, save_if=""):
+            return (f"      - uses: Swatinem/rust-cache@abc\n        with:\n"
+                    f"          shared-key: {key}\n{save_if}")
+        restore = "          save-if: false\n"
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-26.04", step("bins")),
+            ("ubuntu-24.04", step("bins", restore)),
+        ]), ["bins"])
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-24.04", step("bins")),
+            ("ubuntu-26.04", step("bins", restore)),
+        ]), [])
+        self.assertEqual(self.cache_direction_violations([
+            ("ubuntu-24.04", step("bins")),
+            ("ubuntu-26.04", step("bins")),
+        ]), ["bins"])
 
     def test_no_workflow_follows_ubuntu_latest(self):
         for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
