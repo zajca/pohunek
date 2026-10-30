@@ -2510,6 +2510,7 @@ impl SessionRegistry {
                 input_send_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 input_delay_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 input_enter_failure_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 input_sent_hold: std::sync::Mutex::new(None),

@@ -1357,7 +1357,7 @@ impl SessionRegistry {
     /// still have a live process.
     async fn input_runtime_ended(&self, session_id: &SessionId) -> bool {
         let sessions = self.inner.sessions.lock().await;
-        sessions.get(session_id).map_or(true, |entry| {
+        sessions.get(session_id).is_none_or(|entry| {
             entry.info.state != SessionState::Running
                 || entry.info.runtime.as_ref().is_some_and(|runtime| {
                     matches!(
