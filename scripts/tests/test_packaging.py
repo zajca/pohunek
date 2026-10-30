@@ -203,6 +203,21 @@ class InstallDaemonWarningTest(unittest.TestCase):
         self.assertIn(f"grep -q '{match.group(1)}'", wrapper)
 
 
+    def test_the_wrapper_names_the_refresh_before_the_loss_acceptance(self):
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        order = [
+            "service refresh-path --dry-run",
+            "then $archive_dir/pohunek service refresh-path",
+            "re-run $0 without --accept-runtime-loss",
+            "otherwise re-run $0 --accept-runtime-loss",
+        ]
+        position = -1
+        for step in order:
+            found = wrapper.find(step, position + 1)
+            self.assertGreater(found, position, f"{step!r} missing or out of order")
+            position = found
+
+
 class StageArchiveTest(unittest.TestCase):
     def test_daemon_archive_holds_the_binaries_installer_completions_and_docs(self):
         ws = Workspace(self)

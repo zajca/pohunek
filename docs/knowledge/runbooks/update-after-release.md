@@ -996,8 +996,10 @@ its next replacement. Do not use `--accept-runtime-loss` for this cause, since
 it would drop resume and fork for the listed sessions although the runtime is
 current. `refresh-path` refuses while a transaction record is pending
 (`service_refresh_blocked_by_transaction`), and an interrupted upgrade leaves
-one: `pohunek service status` names it, and an upgrade that is refused again
-with the same warning cannot be refreshed around. Stop the live sessions, save a
+one. First rerun the command `pohunek service status` names (it resumes or
+rolls the record back), then run `pohunek service refresh-path` and the
+upgrade. Only when the resumed upgrade is refused again with the same warning
+the record cannot be refreshed around: stop the live sessions, save a
 copy of `service.toml`, remove the record with `pohunek service uninstall` (it
 checks live sessions first), then install the version that is installed now from
 its own archive with the same `--prefix`: a fresh install discovers the current

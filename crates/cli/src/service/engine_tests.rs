@@ -1445,6 +1445,17 @@ async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
     assert_eq!(error.code(), "service_search_path_refresh_failed");
 }
 
+/// Asserts that `steps` occur in `hint` in the given order.
+fn assert_steps_in_order(hint: &str, steps: &[&str]) {
+    let mut from = 0;
+    for step in steps {
+        let Some(found) = hint[from..].find(step) else {
+            panic!("`{step}` is missing or out of order in: {hint}");
+        };
+        from += found + step.len();
+    }
+}
+
 #[tokio::test]
 async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_leaves_it_alone() {
     let mut harness = Harness::new();
@@ -1461,18 +1472,19 @@ async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_l
 
     assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
     let hint = error.hint().expect("hint");
-    assert!(
-        hint.contains("<prefix>/bin/pohunek service refresh-path")
-            && hint.contains("pohunek service uninstall")
-            && hint.contains("from its own archive")
-            && hint.contains("save a copy of service.toml")
-            && hint.contains("stop the live sessions")
-            && hint.contains("reapply the non-default settings")
-            && hint.contains("from its own archive")
-            && hint.contains("same --prefix")
-            && hint.contains("rerun the upgrade")
-            && hint.contains("except `search_path`"),
-        "{hint}"
+    assert_steps_in_order(
+        hint,
+        &[
+            "<prefix>/bin/pohunek service refresh-path",
+            "stop the live sessions",
+            "save a copy of service.toml",
+            "pohunek service uninstall",
+            "from its own archive",
+            "same --prefix",
+            "reapply the non-default settings",
+            "except `search_path`",
+            "rerun the upgrade",
+        ],
     );
     assert_eq!(config_bytes(&harness), before, "service.toml is untouched");
 
@@ -1505,11 +1517,20 @@ async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pen
     let error = refresh(&harness, false).await.expect_err("pending install");
     assert_eq!(error.code(), "service_refresh_blocked_by_transaction");
     let hint = error.hint().expect("hint");
-    assert!(
-        hint.contains("save a copy of service.toml")
-            && hint.contains("stop the live sessions")
-            && hint.contains("except `search_path`"),
-        "{hint}"
+    assert_steps_in_order(
+        hint,
+        &[
+            "rerunning the command it names",
+            "then rerun `pohunek service refresh-path`",
+            "stop the live sessions",
+            "save a copy of service.toml",
+            "pohunek service uninstall",
+            "from its own archive",
+            "same --prefix",
+            "reapply the non-default settings",
+            "except `search_path`",
+            "rerun the upgrade",
+        ],
     );
 
     harness.install(V1).await.expect("finish the install");
@@ -7935,29 +7956,38 @@ async fn a_store_path_runtime_below_the_range_points_at_refresh_path_without_a_l
     let [warning] = warnings.as_slice() else {
         panic!("one warning names the recorded path: {warnings:?}");
     };
-    for expected in [
-        super::preflight::STALE_PATH_WARNING,
-        stale.to_str().expect("utf-8"),
-        "pohunek service refresh-path --dry-run",
-        "do not accept the loss",
-    ] {
-        assert!(
-            warning.contains(expected),
-            "{expected} missing from {warning}"
-        );
-    }
+    assert_steps_in_order(
+        warning,
+        &[
+            super::preflight::STALE_PATH_WARNING,
+            stale.to_str().expect("utf-8"),
+            "do not accept the loss",
+            "./pohunek",
+            "refresh-path --dry-run",
+            "`pohunek service refresh-path`",
+            "rerun this upgrade",
+        ],
+    );
     assert!(
         !warning.contains(profile.to_str().expect("utf-8")) && !warning.contains("uninstall"),
         "{warning}"
     );
     assert!(!ran.exists(), "the refusal started the login shell");
+    let hint = error.hint().expect("hint");
+    assert_steps_in_order(
+        hint,
+        &[
+            "do not accept the loss",
+            "./pohunek",
+            "refresh-path --dry-run",
+            "then `pohunek service refresh-path`",
+            "then rerun the upgrade",
+            "otherwise preserve the required runtime",
+        ],
+    );
     assert!(
-        error
-            .hint()
-            .is_some_and(|hint| hint.contains("pohunek service refresh-path")
-                && hint.contains("otherwise preserve the required runtime")),
-        "{:?}",
-        error.hint()
+        !hint.contains("before passing --accept-runtime-loss"),
+        "{hint}"
     );
 }
 

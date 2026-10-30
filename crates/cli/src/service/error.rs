@@ -855,7 +855,7 @@ impl Error {
                 .iter()
                 .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING))
             {
-                "if the runtime moved since the search path was recorded, the warning names the recorded path and the `pohunek service refresh-path` remedy: refresh it before passing --accept-runtime-loss, which would drop the runtime or native recovery of the listed sessions although the runtime is current; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path`, then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
             } else {
                 "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
             }),
@@ -952,7 +952,7 @@ impl Error {
                 "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
             ),
             Self::RefreshBlockedByTransaction => Some(
-                "finish the pending transaction first (`pohunek service status` names it; rerunning the command it names resumes or rolls it back, `pohunek service uninstall` removes it after its session check; before that, stop the live sessions and save a copy of service.toml, and install the version that is installed now from its own archive with the same --prefix, which discovers the current path by itself, and reapply the non-default settings from the copy except `search_path` under [environment]), then rerun the upgrade",
+                "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If an upgrade is refused as at risk again and again, the record cannot be resumed around: stop the live sessions, save a copy of service.toml, run `pohunek service uninstall` (it refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix (a fresh install discovers the current path), reapply the non-default settings from the copy except `search_path` under [environment], and rerun the upgrade",
             ),
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")
