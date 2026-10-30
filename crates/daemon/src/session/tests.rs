@@ -8055,6 +8055,71 @@ async fn delayed_plain_input_serves_a_resize_while_the_submit_delay_runs() {
     .expect("plain input is delivered");
 }
 
+/// Stops the session while a delayed submit waits between body and Enter and
+/// returns the submit's own result once it continues.
+async fn stop_between_body_and_enter(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    delay_boundary: &tokio::sync::Barrier,
+    request: tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>,
+) -> protocol::ProtocolError {
+    reach_boundary(delay_boundary).await;
+    pohunek_test_support::wait::guard(
+        "the stop to be served while the submit delay is pending",
+        Box::pin(registry.stop(id)),
+    )
+    .await
+    .expect("stop between the body and Enter");
+    reach_boundary(delay_boundary).await;
+    request
+        .await
+        .expect("input task joins")
+        .expect_err("Enter must not reach a stopped session")
+}
+
+#[tokio::test]
+async fn delayed_wait_input_serves_a_stop_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-wait-stop");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "stop-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+
+    let error = stop_between_body_and_enter(&registry, &id, &delay_boundary, request).await;
+    assert_eq!(error.code, "session_not_running", "{error:?}");
+}
+
+#[tokio::test]
+async fn delayed_plain_input_serves_a_stop_while_the_submit_delay_runs() {
+    let registry = delayed_submit_registry("delayed-plain-stop");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "stop-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    let error = stop_between_body_and_enter(&registry, &id, &delay_boundary, request).await;
+    // The plain path has no session re-check: Enter meets the stopped worker.
+    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
+}
+
 #[tokio::test]
 async fn delayed_wait_input_never_writes_enter_when_the_agent_blocks_during_the_delay() {
     let registry = delayed_submit_registry("delayed-wait-blocked");

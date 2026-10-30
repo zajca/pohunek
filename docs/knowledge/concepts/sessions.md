@@ -129,15 +129,16 @@ duplicate `--until` values are deduplicated in first-occurrence order; omitted
 targets default to `idle` and `blocked`; the timeout range is `1..8000` ms
 (default 8000). The timeout is one overall deadline measured before the
 per-session input gate, so gate contention, the two-fragment worker-plan
-acknowledgement, and activity waiting all consume it. Fire-and-forget and
-zero-delay waited input send one plan with a body fragment and a separate submit
-fragment, the provider delay on the body fragment; delayed-framing waited input
-sends two single-fragment plans. A waited request rejects blocked activity
+acknowledgement, and activity waiting all consume it. Zero-delay input sends
+one plan with a body fragment and a separate submit fragment; delayed-framing
+input, waited or fire-and-forget, sends two single-fragment plans. A waited request rejects blocked activity
 as `session_agent_blocked` regardless of provider policy. Waited input on
 delayed framing is daemon-paced: the daemon writes the body, waits out the
 delay, re-checks activity and the runtime under the session lock, and only then
-writes Enter, holding the input gate and the worker connection across both
-writes. If the agent turned `blocked` meanwhile, or the deadline or a shutdown
+writes Enter, holding the input gate across both writes. The worker
+connection is released once the body is acknowledged, so resize, stop and
+observation requests are served during the delay. Plain (fire-and-forget)
+delayed input uses the same two plans without the re-check. If the agent turned `blocked` meanwhile, or the deadline or a shutdown
 arrives before Enter, Enter is not written and the call fails with
 `session_input_not_submitted`; the typed text may remain in the input box
 because arbitrary TUIs cannot retract it. A deadline that is not longer than the submit delay, or that or a shutdown arrives before the body is written, writes nothing (`session_input_timeout`, `daemon_shutting_down`). An `idle` target on delayed framing

@@ -706,9 +706,9 @@ const GATED_OUTPUT_THEN_DRAIN_SCRIPT: &str = "while [ ! -e \"$1\" ]; do sleep 0.
 /// Line the gated child prints while the attach write is still pending.
 const CHILD_OUTPUT_MARKER: &[u8] = b"child-output-marker";
 
-/// Delay a control plan owns after its body fragment, as a profile's
-/// `submit_delay_ms` configures it.
-const PLAN_DELAY_MS: u64 = 1_500;
+/// Delay of a control plan's body fragment. It never elapses: the scenario
+/// ends the worker while the plan is still inside it.
+const PLAN_HOLD_MS: u64 = 3_600_000;
 
 /// Attach stream that types while a control plan's delay runs.
 const INTERLEAVING_STREAM_ID: &str = "attach-interleaving";
@@ -863,7 +863,7 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
                 .write(vec![
                     InputFragment {
                         bytes: SecretBytes::new(b"plan-body".to_vec()),
-                        delay_after_ms: PLAN_DELAY_MS,
+                        delay_after_ms: PLAN_HOLD_MS,
                     },
                     InputFragment {
                         bytes: SecretBytes::new(b"\r".to_vec()),
@@ -894,9 +894,9 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
     write_frame(&mut attach.stream, &attach_input)
         .await
         .expect("send attach input");
-    // The PTY echoes bytes in the order it accepts them. The plan's Enter is
-    // written after the delay, so an attach write that lands inside the delay
-    // is echoed directly after the body.
+    // The PTY echoes bytes in the order it accepts them. The plan's Enter
+    // waits behind a delay that never ends, so an attach write is echoed
+    // directly after the body.
     let mut echoed = body_echo;
     echoed.extend(await_pty_echo(&mut observer, b"attach-mark").await);
     assert!(
@@ -907,16 +907,11 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
         String::from_utf8_lossy(&echoed)
     );
 
-    plan.await
-        .expect("plan task joins")
-        .expect("the delayed plan completes");
-
+    // The plan is still inside its delay and holds the control connection
+    // until the worker ends with the fixture.
+    plan.abort();
     drop(attach);
     drop(observer);
-    worker
-        .stop(TransactionId::new("interleave-cleanup").expect("transaction id"))
-        .await
-        .expect("stop the echoing child");
 }
 
 #[tokio::test]

@@ -694,7 +694,9 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     /// Adapts a plain writer whose writes never stall, such as a file.
     struct Unbounded<W>(W);
@@ -707,6 +709,164 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             self.0.flush()
         }
+    }
+
+    /// Records every write and parks the writes whose bytes are listed in
+    /// `parked` until the scenario releases one token per gated write.
+    struct Gated {
+        log: Arc<Mutex<Vec<u8>>>,
+        parked: Vec<&'static [u8]>,
+        entered: Arc<Notify>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl InputWriter for Gated {
+        fn write_within(&mut self, buf: &[u8], _stall: Option<Duration>) -> std::io::Result<usize> {
+            if self.parked.contains(&buf) {
+                self.entered.notify_one();
+                self.release
+                    .recv()
+                    .expect("the scenario releases the write");
+            }
+            self.log.lock().expect("write log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Rig {
+        coordinator: WriteCoordinator,
+        log: Arc<Mutex<Vec<u8>>>,
+        entered: Arc<Notify>,
+        release: mpsc::Sender<()>,
+    }
+
+    fn gated_coordinator(parked: Vec<&'static [u8]>, stall: Option<Duration>) -> Rig {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let (release, receiver) = mpsc::channel();
+        let writer = Gated {
+            log: Arc::clone(&log),
+            parked,
+            entered: Arc::clone(&entered),
+            release: receiver,
+        };
+        let coordinator = WriteCoordinator::new(writer, 8, stall).expect("coordinator");
+        Rig {
+            coordinator,
+            log,
+            entered,
+            release,
+        }
+    }
+
+    fn two_fragment_plan(write_id: &str, first: &[u8], second: &[u8]) -> InputPlan {
+        InputPlan {
+            write_id: write_id.to_owned(),
+            fragments: vec![
+                InputFragment {
+                    bytes: first.to_vec(),
+                    delay_after: Duration::ZERO,
+                },
+                InputFragment {
+                    bytes: second.to_vec(),
+                    delay_after: Duration::ZERO,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn control_plans_never_interleave_with_each_other() {
+        let Rig {
+            coordinator,
+            log,
+            entered,
+            release,
+        } = gated_coordinator(vec![b"a0"], None);
+        let first = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_control(PRODUCER, 1, two_fragment_plan("plan-a", b"a0", b"a1"))
+                    .await
+            }
+        });
+        // The first plan is parked inside its first fragment; the second plan
+        // queues behind it.
+        entered.notified().await;
+        let second = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_control(PRODUCER, 2, plan("plan-b", b"b0"))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        release.send(()).expect("release the first fragment");
+
+        first.await.expect("first joins").expect("first plan");
+        second.await.expect("second joins").expect("second plan");
+        assert_eq!(&*log.lock().expect("write log"), b"a0a1b0");
+    }
+
+    #[tokio::test]
+    async fn a_plan_that_cannot_retake_the_pty_stops_after_its_written_fragments() {
+        const STALL: Duration = Duration::from_millis(50);
+
+        let Rig {
+            coordinator,
+            log,
+            entered,
+            release,
+        } = gated_coordinator(vec![b"body", b"held"], Some(STALL));
+        let control = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_control(PRODUCER, 1, two_fragment_plan("plan-a", b"body", b"enter"))
+                    .await
+            }
+        });
+        entered.notified().await;
+        // The attach write queues for the PTY while the plan writes its body,
+        // takes it at the fragment boundary and parks there.
+        let attach = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .execute_stream(vec![InputFragment {
+                        bytes: b"held".to_vec(),
+                        delay_after: Duration::ZERO,
+                    }])
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        release.send(()).expect("release the body");
+
+        let error = control
+            .await
+            .expect("control joins")
+            .expect_err("the plan cannot retake the PTY");
+        assert!(
+            matches!(
+                error,
+                InputError::Stalled {
+                    written: 4,
+                    total: 9,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        release.send(()).expect("release the attach write");
+        attach.await.expect("attach joins").expect("attach write");
+        assert_eq!(&*log.lock().expect("write log"), b"bodyheld");
     }
 
     const PRODUCER: &str = "daemon-a";
