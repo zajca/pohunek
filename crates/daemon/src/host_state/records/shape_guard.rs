@@ -6,8 +6,9 @@
 //! current [`GOVERNANCE_FORMAT_VERSION`] and [`IDENTITY_FORMAT_VERSION`]. Each
 //! reader accepts exactly one format, so a daemon that meets a record with a new
 //! key or enum value refuses to start. Every enum is listed through
-//! `unit_values!` or `data_values!` and every string leaf must
-//! be a registered enum path or free text, as in `store::shape_guard`.
+//! `unit_values!` or `data_values!` and every string leaf must be a registered
+//! enum path or free text, as in the store guard; the helpers are the
+//! `pohunek-shape-guard` crate.
 //!
 //! The top-level wire structs are destructured field by field and each enum-valued
 //! field is pinned to its type. The protocol types nested below them keep private
@@ -23,7 +24,10 @@
 use std::collections::BTreeSet;
 
 use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
-use protocol::{EnrollmentStatus, HostOwner, QuarantineReason, ShareSuspensionIntent};
+use persisted_shape::{
+    check_snapshot, classify_leaves, collect_paths, collect_string_leaves, data_values,
+    unit_values, EnumEntry, Leaves, SnapshotGuard,
+};use protocol::{EnrollmentStatus, HostOwner, QuarantineReason, ShareSuspensionIntent};
 use serde_json::Value;
 
 use super::{
@@ -31,10 +35,7 @@ use super::{
     IdentityWireOwned, RetiredEnrollment, GOVERNANCE_FORMAT_VERSION, IDENTITY_FORMAT_VERSION,
 };
 use crate::host_state::approval_key::{generate_host_id, ApprovalKeyRecord};
-use crate::store::shape_guard::{
-    classify_leaves, collect_paths, collect_string_leaves, data_values, string_values, unit_values,
-    EnumEntry, Leaves,
-};
+
 
 /// Governance key and value snapshots by format version.
 const GOVERNANCE_SNAPSHOTS: &[(u8, &str)] = &[(2, include_str!("../fixtures/governance-2.txt"))];
@@ -188,8 +189,8 @@ fn host_owner_values() -> Vec<String> {
     let team = || HostOwner::Team(protocol::TeamId::parse(&identifier("team_", 3)).expect("team"));
     data_values!(
         HostOwner, Some("kind");
-        HostOwner::Principal(_) => principal(),
-        HostOwner::Team(_) => team(),
+        HostOwner::Principal(..) => principal(),
+        HostOwner::Team(..) => team(),
     )
 }
 
@@ -356,29 +357,19 @@ fn check_format(
     actual: &BTreeSet<String>,
     snapshots: &[(u8, &str)],
 ) -> Result<(), String> {
-    let rendered: String = actual
-        .iter()
-        .flat_map(|line| [line.as_str(), "\n"])
-        .collect();
-    let Some((_, expected)) = snapshots.iter().find(|(known, _)| *known == version) else {
-        return Err(format!(
-            "{record} format {version} has no snapshot. Add \
-             crates/daemon/src/host_state/fixtures/{record}-{version}.txt with the content \
-             below and register it:\n{rendered}"
-        ));
-    };
-    let expected: BTreeSet<String> = expected.lines().map(str::to_owned).collect();
-    if &expected == actual {
-        return Ok(());
-    }
-    let added: Vec<_> = actual.difference(&expected).collect();
-    let removed: Vec<_> = expected.difference(actual).collect();
-    Err(format!(
-        "the serialized {record} record changed without a format bump ({constant} = {version}).\n  \
-         added: {added:?}\n  removed: {removed:?}\n\
-         Bump {constant}, make the reader accept the previous format as well, and add \
-         fixtures/{record}-<new>.txt with the content below:\n{rendered}"
-    ))
+    let fixture = format!("crates/daemon/src/host_state/fixtures/{record}-<N>.txt");
+    check_snapshot(
+        &SnapshotGuard {
+            record: &format!("{record} record"),
+            bump: "format",
+            constant,
+            fixture: &fixture,
+            follow_up: "make the reader accept the previous format as well",
+        },
+        version,
+        actual,
+        snapshots,
+    )
 }
 
 #[test]

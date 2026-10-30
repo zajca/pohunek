@@ -21,6 +21,7 @@ members = [
     "crates/paths",
     "crates/service-config",
     "crates/test-support",
+    "crates/shape-guard",
     "crates/xtask",
     "crates/netbird",
     "crates/overlay",
@@ -72,6 +73,8 @@ pohunek-relay-protocol = { path = "crates/relay-protocol" }
 pohunek-relay-client = { path = "crates/relay-client" }
 pohunek-terminal = { path = "crates/terminal" }
 pohunek-test-support = { path = "crates/test-support" }
+# Dev-dependency only: the persisted-shape guard tests (never a normal dependency).
+pohunek-shape-guard = { path = "crates/shape-guard" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }
 pohunek-session-worker = { path = "crates/session-worker" }
 async-io = "2"

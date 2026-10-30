@@ -2989,6 +2989,7 @@ dependencies = [
  "pohunek-protocol",
  "pohunek-service-config",
  "pohunek-session-worker",
+ "pohunek-shape-guard",
  "pohunek-terminal",
  "pohunek-test-support",
  "pohunek-worker-protocol",
@@ -3096,6 +3097,7 @@ dependencies = [
  "nix 0.29.0",
  "pohunek-platform",
  "pohunek-protocol",
+ "pohunek-shape-guard",
  "pohunek-test-support",
  "rustix",
  "ruzstd",
@@ -3279,6 +3281,14 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pohunek-shape-guard"
+version = "0.38.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

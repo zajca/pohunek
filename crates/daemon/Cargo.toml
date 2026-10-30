@@ -68,6 +68,8 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 pohunek-test-support = { workspace = true, features = ["catalog"] }
+# Persisted-shape guard helpers; a dev-dependency only, never linked into the daemon.
+pohunek-shape-guard = { workspace = true }
 wait-timeout = "0.2"
 # The privacy sentinel emits a `log`-crate record to prove the capture bridges it.
 log = "0.4"

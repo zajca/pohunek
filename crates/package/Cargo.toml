@@ -28,6 +28,8 @@ rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 ruzstd = { workspace = true }
+# Registry shape guard helpers; a dev-dependency only, never linked into the package crate.
+pohunek-shape-guard = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true }

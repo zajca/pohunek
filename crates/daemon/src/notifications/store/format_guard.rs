@@ -8,7 +8,8 @@
 //! wrote, and then declines to use the store instead of reading part of it, so
 //! every addition must come with a format bump. Every enum is listed through
 //! `unit_values!` or `data_values!` and every string leaf must be a registered
-//! enum path or free text, as in `store::shape_guard`.
+//! enum path or free text, as in the store guard; the helpers are the
+//! `pohunek-shape-guard` crate.
 //!
 //! When the snapshot no longer matches, the test fails. To resolve it:
 //!
@@ -19,6 +20,10 @@
 
 use std::collections::BTreeSet;
 
+use persisted_shape::{
+    check_snapshot, classify_leaves, collect_paths, collect_string_leaves, data_values,
+    unit_values, EnumEntry, Leaves, SnapshotGuard,
+};
 use protocol::{
     NotificationKind, NotificationKindPolicy, NotificationPolicy, NotificationRecord,
     NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
@@ -26,10 +31,7 @@ use protocol::{
 use serde_json::{json, Value};
 
 use super::{StoreAction, NOTIFICATIONS_FORMAT_VERSION};
-use crate::store::shape_guard::{
-    classify_leaves, collect_paths, collect_string_leaves, data_values, string_values, unit_values,
-    EnumEntry, Leaves,
-};
+
 
 /// Key and value snapshots by format version.
 const SNAPSHOTS: &[(u32, &str)] = &[(1, include_str!("../fixtures/format-1.txt"))];
@@ -303,29 +305,18 @@ fn current_shape() -> BTreeSet<String> {
 
 /// Compares `actual` with the snapshot kept for `version`.
 fn check_format(version: u32, actual: &BTreeSet<String>) -> Result<(), String> {
-    let rendered: String = actual
-        .iter()
-        .flat_map(|line| [line.as_str(), "\n"])
-        .collect();
-    let Some((_, expected)) = SNAPSHOTS.iter().find(|(known, _)| *known == version) else {
-        return Err(format!(
-            "notification format {version} has no snapshot. Add \
-             crates/daemon/src/notifications/fixtures/format-{version}.txt with the content \
-             below and register it:\n{rendered}"
-        ));
-    };
-    let expected: BTreeSet<String> = expected.lines().map(str::to_owned).collect();
-    if &expected == actual {
-        return Ok(());
-    }
-    let added: Vec<_> = actual.difference(&expected).collect();
-    let removed: Vec<_> = expected.difference(actual).collect();
-    Err(format!(
-        "the serialized notification store changed without a format bump \
-         (NOTIFICATIONS_FORMAT_VERSION = {version}).\n  added: {added:?}\n  removed: {removed:?}\n\
-         Bump NOTIFICATIONS_FORMAT_VERSION, make the reader accept the previous format as well, \
-         and add fixtures/format-<new>.txt with the content below:\n{rendered}"
-    ))
+    check_snapshot(
+        &SnapshotGuard {
+            record: "notification store",
+            bump: "format",
+            constant: "NOTIFICATIONS_FORMAT_VERSION",
+            fixture: "crates/daemon/src/notifications/fixtures/format-<N>.txt",
+            follow_up: "make the reader accept the previous format as well",
+        },
+        version,
+        actual,
+        SNAPSHOTS,
+    )
 }
 
 #[test]

@@ -14,37 +14,39 @@
 //!    and register it in `SHAPE_SNAPSHOTS`.
 //!
 //! The snapshot also carries the serialized value set of every persisted enum, as
-//! `<kind>.<path>=<value>` lines. Each enum is listed once through [`unit_values!`]
-//! or `data_values!` (variants with data; each entry pairs a pattern with its
-//! sample), which generate the sample list and a `match` without a wildcard arm
-//! from the same variant list, so a new variant fails to compile until it is
-//! listed. Every listed value must round-trip through
-//! strict serde; a skipped `Unknown` variant contributes no value and must not.
-//! Every string-valued leaf of the samples must be a registered enum path or a
-//! free-text path ([`free_text`]); an unclassified leaf fails the guard, which is
-//! how a new enum-valued field is caught. A new enum value is a bump of
-//! [`STORE_SCHEMA_VERSION`], because an older daemon rejects the line or degrades
-//! it to a fallback variant.
+//! `<kind>.<path>=<value>` lines. Each enum is listed once through `unit_values!`
+//! or `data_values!` (variants with data; each entry pairs one variant with its
+//! sample) of the `pohunek-shape-guard` crate, which generate the sample list and
+//! a `match` without a wildcard arm from the same variant list, so a new variant
+//! fails to compile until it is listed. Every listed value must round-trip
+//! through strict serde; a skipped `Unknown` variant contributes no value and
+//! must not. Every string-valued leaf of the samples must be a registered enum
+//! path or a free-text path ([`free_text`]); an unclassified leaf fails the
+//! guard, which is how a new enum-valued field is caught. A new enum value is a
+//! bump of [`STORE_SCHEMA_VERSION`], because an older daemon rejects the line or
+//! degrades it to a fallback variant.
 //!
 //! Every sample is destructured field by field (no `..`), so adding a field to a
 //! persisted struct fails to compile here until the sample and snapshot are
 //! revisited. Each enum-valued field is also pinned to its enum type in that
 //! function, so retyping an enum field fails to compile. A free-text string field
 //! turned into an enum compiles and is not caught while its path stays in
-//! [`free_text`]; moving the path to the enum registry is a manual step. Types with private fields ([`NativeSessionLaunch`] and its
-//! components) cannot be destructured; their samples are populated through the
-//! full JSON form instead.
+//! [`free_text`]; moving the path to the enum registry is a manual step. Types
+//! with private fields ([`NativeSessionLaunch`] and its components) cannot be
+//! destructured; their samples are populated through the full JSON form instead.
 //!
 //! [`NativeSessionLaunch`]: crate::agent::NativeSessionLaunch
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
+use std::collections::BTreeSet;
 
+use persisted_shape::{
+    check_snapshot, classify_leaves, collect_paths, collect_string_leaves, data_values,
+    string_values, unit_values, EnumEntry, Leaves, SnapshotGuard,
+};
 use protocol::{
     AgentActivity, BackgroundKind, BackgroundStatus, BindingProvenance, CwdSource, ProjectSource,
     RuntimeState, SessionInfo, SessionState, SessionWarningKind, StateSource, SubagentLifecycle,
 };
-use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -528,59 +530,6 @@ fn stored_line(record: &Record) -> Value {
     serde_json::from_str(body.trim_end()).expect("stored line is json")
 }
 
-pub(crate) fn collect_paths(prefix: &str, value: &Value, out: &mut BTreeSet<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                out.insert(path.clone());
-                collect_paths(&path, child, out);
-            }
-        }
-        Value::Array(items) => {
-            let path = format!("{prefix}[]");
-            for item in items {
-                collect_paths(&path, item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// String-valued leaves of a serialized record: leaf path to the values seen there.
-pub(crate) type Leaves = BTreeMap<String, BTreeSet<String>>;
-
-pub(crate) fn collect_string_leaves(prefix: &str, value: &Value, out: &mut Leaves) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                collect_string_leaves(&path, child, out);
-            }
-        }
-        Value::Array(items) => {
-            let path = format!("{prefix}[]");
-            for item in items {
-                collect_string_leaves(&path, item, out);
-            }
-        }
-        Value::String(text) => {
-            out.entry(prefix.to_owned())
-                .or_default()
-                .insert(text.clone());
-        }
-        _ => {}
-    }
-}
-
 /// Deserializes `sample` into `T`, requires the serialized form to carry exactly
 /// the sample's keys (so a populated field is never dropped) and returns it with
 /// its key paths and string leaves.
@@ -610,104 +559,10 @@ where
     (value, actual, leaves)
 }
 
-/// Serialized values of `samples`, each checked to deserialize strictly back to
-/// itself. A plain string is the value. A data-carrying variant contributes the
-/// string under `tag` when the enum is internally tagged, or its only key when it
-/// is externally tagged (`{"literal": ..}`), so every variant name is a value.
-pub(crate) fn string_values<T>(samples: &[T], tag: Option<&str>) -> Vec<String>
-where
-    T: Serialize + DeserializeOwned + Debug,
-{
-    let mut values = BTreeSet::new();
-    for sample in samples {
-        let json = serde_json::to_value(sample).expect("sample serializes");
-        let back: T = serde_json::from_value(json.clone()).expect("sample deserializes strictly");
-        assert_eq!(
-            serde_json::to_value(&back).expect("round-tripped sample serializes"),
-            json,
-            "a listed value must round-trip"
-        );
-        let value = match (&json, tag) {
-            (Value::String(text), None) => text.clone(),
-            (Value::Object(map), Some(tag)) => map
-                .get(tag)
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("{json} carries no string under `{tag}`"))
-                .to_owned(),
-            (Value::Object(map), None) if map.len() == 1 => map
-                .keys()
-                .next()
-                .expect("an object with one key has a key")
-                .clone(),
-            _ => panic!("{json} is not a string, a tagged object or a one-key object"),
-        };
-        values.insert(value);
-    }
-    values.into_iter().collect()
-}
-
-/// Asserts that an `Unknown` variant never survives a strict round trip, so the
-/// daemon cannot persist it and an older store never needs to read it.
-pub(crate) fn assert_never_round_trips<T>(value: &T)
-where
-    T: Serialize + DeserializeOwned + PartialEq + Debug,
-{
-    let round_trips = serde_json::to_value(value)
-        .ok()
-        .and_then(|json| serde_json::from_value::<T>(json).ok())
-        .is_some_and(|back| back == *value);
-    assert!(
-        !round_trips,
-        "{value:?} must not round-trip through strict serde"
-    );
-}
-
-/// Serialized values of a unit-variant enum. The variants after `;` are skipped:
-/// they contribute no value and must not round-trip. The generated `match` has no
-/// wildcard arm, so a variant missing from both lists fails to compile.
-macro_rules! unit_values {
-    ($ty:ident: $($variant:ident),+ $(; skip $($skipped:ident),+)?) => {{
-        let listed = [$($ty::$variant),+];
-        for value in &listed {
-            match value {
-                $($ty::$variant => {})+
-                $($($ty::$skipped => {})+)?
-            }
-        }
-        $($($crate::store::shape_guard::assert_never_round_trips(&$ty::$skipped);)+)?
-        string_values(&listed, None)
-    }};
-}
-
-pub(crate) use unit_values;
-
-/// Serialized values of an enum with data-carrying variants. Each entry pairs a
-/// pattern with the sample that must match it, and the generated `match` lists the
-/// same patterns without a wildcard arm: a new variant fails to compile until an
-/// entry names it, and an entry cannot name a variant without supplying its sample.
-/// `$tag` is the internal tag key, or `None` for an externally tagged enum.
-macro_rules! data_values {
-    ($ty:ty, $tag:expr; $($pattern:pat_param => $sample:expr),+ $(,)?) => {{
-        let listed: Vec<$ty> = vec![$($sample),+];
-        let matchers: Vec<fn(&$ty) -> bool> = vec![$(|value| matches!(value, $pattern)),+];
-        for (value, matcher) in listed.iter().zip(&matchers) {
-            assert!(matcher(value), "{value:?} does not match the pattern it is listed under");
-        }
-        for value in &listed {
-            match value {
-                $($pattern => {})+
-            }
-        }
-        string_values(&listed, $tag)
-    }};
-}
-
-pub(crate) use data_values;
-
 fn native_arg_values() -> Vec<String> {
     data_values!(
         NativeArg, None;
-        NativeArg::Literal(_) => NativeArg::Literal("--flag".to_owned()),
+        NativeArg::Literal(..) => NativeArg::Literal("--flag".to_owned()),
         NativeArg::Reference => NativeArg::Reference,
     )
 }
@@ -721,10 +576,10 @@ fn record_kind_values() -> Vec<String> {
         || Box::new(serde_json::from_value::<SessionRecord>(session_json()).expect("session"));
     data_values!(
         Record, Some("kind");
-        Record::Session(_) => Record::Session(session()),
-        Record::Resume(_) => Record::Resume(resume()),
-        Record::Worktree(_) => Record::Worktree(worktree()),
-        Record::Project(_) => Record::Project(project()),
+        Record::Session(..) => Record::Session(session()),
+        Record::Resume(..) => Record::Resume(resume()),
+        Record::Worktree(..) => Record::Worktree(worktree()),
+        Record::Project(..) => Record::Project(project()),
     )
 }
 
@@ -749,12 +604,6 @@ fn under(roots: &[&str], relative: &str) -> Vec<String> {
         .iter()
         .map(|root| format!("{root}.{relative}"))
         .collect()
-}
-
-/// One persisted enum: every leaf path it is stored at and its serialized values.
-pub(crate) struct EnumEntry {
-    pub(crate) paths: Vec<String>,
-    pub(crate) values: Vec<String>,
 }
 
 #[expect(
@@ -999,75 +848,6 @@ fn free_text() -> Vec<Vec<String>> {
     entries
 }
 
-/// Maps a map-valued leaf (`...metadata.<key>`) to its `...metadata.*` entry.
-pub(crate) fn normalized_leaf(path: &str) -> String {
-    let segments: Vec<&str> = path.split('.').collect();
-    match segments.iter().position(|segment| *segment == "metadata") {
-        Some(index) if index + 1 < segments.len() => {
-            format!("{}.*", segments[..=index].join("."))
-        }
-        _ => path.to_owned(),
-    }
-}
-
-/// Checks that every string leaf is a registered enum value or free text, that
-/// every path of every registry entry matches a leaf, and returns the `path=value` snapshot lines.
-pub(crate) fn classify_leaves(
-    leaves: &Leaves,
-    enums: &[EnumEntry],
-    free: &[Vec<String>],
-) -> Result<BTreeSet<String>, String> {
-    let mut problems = Vec::new();
-    let mut seen = BTreeSet::new();
-    for (path, values) in leaves {
-        let key = normalized_leaf(path);
-        seen.insert(key.clone());
-        if let Some(entry) = enums.iter().find(|entry| entry.paths.contains(&key)) {
-            for value in values.iter().filter(|value| !entry.values.contains(*value)) {
-                problems.push(format!(
-                    "{path}={value} is not a value of the enum registered for that path"
-                ));
-            }
-        } else if !free.iter().any(|paths| paths.contains(&key)) {
-            problems.push(format!(
-                "string leaf {path} is neither a registered enum path (persisted_enums) nor free text (free_text)"
-            ));
-        }
-    }
-    for entry in enums
-        .iter()
-        .filter(|entry| !entry.paths.iter().all(|path| seen.contains(path)))
-    {
-        problems.push(format!(
-            "registered enum paths {:?} match no sample leaf",
-            entry.paths
-        ));
-    }
-    for paths in free
-        .iter()
-        .filter(|paths| !paths.iter().all(|path| seen.contains(path)))
-    {
-        problems.push(format!("free-text entry {paths:?} matches no sample leaf"));
-    }
-    if !problems.is_empty() {
-        return Err(format!(
-            "the persisted string leaves are not fully classified:\n  {}",
-            problems.join("\n  ")
-        ));
-    }
-    Ok(enums
-        .iter()
-        .flat_map(|entry| {
-            entry.paths.iter().flat_map(|path| {
-                entry
-                    .values
-                    .iter()
-                    .map(move |value| format!("{path}={value}"))
-            })
-        })
-        .collect())
-}
-
 /// The recursive key set and enum value set of every persisted record kind, one
 /// `kind.path` or `kind.path=value` per line.
 fn current_shape() -> BTreeSet<String> {
@@ -1140,39 +920,25 @@ fn sampled_shape() -> (BTreeSet<String>, Leaves) {
     (shape, leaves)
 }
 
-fn render(shape: &BTreeSet<String>) -> String {
-    shape
-        .iter()
-        .flat_map(|line| [line.as_str(), "\n"])
-        .collect()
-}
-
 /// Compares `actual` with the snapshot kept for `version`.
 fn check_shape(
     version: u32,
     actual: &BTreeSet<String>,
     snapshots: &[(u32, &str)],
 ) -> Result<(), String> {
-    let rendered = render(actual);
-    let Some((_, expected)) = snapshots.iter().find(|(known, _)| *known == version) else {
-        return Err(format!(
-            "schema version {version} has no shape snapshot. Add \
-             crates/daemon/src/store/fixtures/shape/schema-{version}.txt with the \
-             content below and register it in SHAPE_SNAPSHOTS:\n{rendered}"
-        ));
-    };
-    let expected: BTreeSet<String> = expected.lines().map(str::to_owned).collect();
-    if &expected == actual {
-        return Ok(());
-    }
-    let added: Vec<_> = actual.difference(&expected).collect();
-    let removed: Vec<_> = expected.difference(actual).collect();
-    Err(format!(
-        "the serialized shape (keys or enum values) of a persisted store record changed without a schema \
-         bump (schema {version}).\n  added: {added:?}\n  removed: {removed:?}\n\
-         Bump STORE_SCHEMA_VERSION, add a MIGRATIONS step from schema {version}, and \
-         add fixtures/shape/schema-<new>.txt with the content below:\n{rendered}"
-    ))
+    let follow_up = format!("add a MIGRATIONS step from schema {version}");
+    check_snapshot(
+        &SnapshotGuard {
+            record: "store record",
+            bump: "schema",
+            constant: "STORE_SCHEMA_VERSION",
+            fixture: "crates/daemon/src/store/fixtures/shape/schema-<N>.txt",
+            follow_up: &follow_up,
+        },
+        version,
+        actual,
+        snapshots,
+    )
 }
 
 #[test]
@@ -1202,7 +968,7 @@ fn a_changed_shape_without_a_new_snapshot_is_reported_as_an_unbumped_change() {
 fn a_bumped_schema_without_a_snapshot_is_reported() {
     let message = check_shape(STORE_SCHEMA_VERSION + 1, &current_shape(), SHAPE_SNAPSHOTS)
         .expect_err("a new schema needs its own snapshot");
-    assert!(message.contains("has no shape snapshot"), "{message}");
+    assert!(message.contains("has no snapshot"), "{message}");
 }
 
 #[test]
@@ -1344,20 +1110,4 @@ fn a_data_variant_contributes_its_variant_name_as_a_value() {
     let message = check_shape(STORE_SCHEMA_VERSION, &shape, SHAPE_SNAPSHOTS)
         .expect_err("a new data variant must fail the guard");
     assert!(message.contains("resume_args[]=env"), "{message}");
-}
-
-#[test]
-#[should_panic(expected = "does not match the pattern it is listed under")]
-fn a_sample_must_match_the_pattern_it_is_listed_under() {
-    data_values!(
-        NativeArg, None;
-        NativeArg::Literal(_) => NativeArg::Reference,
-        NativeArg::Reference => NativeArg::Reference,
-    );
-}
-
-#[test]
-#[should_panic(expected = "must not round-trip through strict serde")]
-fn a_value_that_round_trips_is_not_accepted_as_unknown() {
-    assert_never_round_trips(&AgentActivity::Idle);
 }

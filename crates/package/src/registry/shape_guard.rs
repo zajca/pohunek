@@ -16,10 +16,11 @@
 //!    and register it in [`SNAPSHOTS`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
 
+use persisted_shape::{
+    check_snapshot, classify_leaves, collect, unit_values, EnumEntry, Leaves, SnapshotGuard,
+};
 use protocol::{PackageDigest, PackageId, PackageIdentity, PackageVersion};
-use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
 use super::{PackageRecord, PackageSource, RegistryState, REGISTRY_SCHEMA};
@@ -28,23 +29,22 @@ use crate::manifest::ManifestDigest;
 /// Registry key and value snapshots by schema version.
 const SNAPSHOTS: &[(u32, &str)] = &[(1, include_str!("fixtures/registry-1.txt"))];
 
-/// Leaf path to the string values serialized there.
-type Leaves = BTreeMap<String, BTreeSet<String>>;
-
-/// An enum-valued leaf path and the values the enum serializes to.
-struct EnumEntry {
-    path: &'static str,
-    values: Vec<String>,
+/// Leaf paths that hold digests, identifiers and versions.
+fn free_text() -> Vec<Vec<String>> {
+    [
+        "registry.packages[].digest",
+        "registry.packages[].identity.id",
+        "registry.packages[].identity.version",
+        "registry.packages[].manifest",
+        "registry.selected.*",
+    ]
+    .iter()
+    .map(|path| vec![(*path).to_owned()])
+    .collect()
 }
 
-/// Leaf paths that hold digests, identifiers and versions.
-const FREE_TEXT: &[&str] = &[
-    "registry.packages[].digest",
-    "registry.packages[].identity.id",
-    "registry.packages[].identity.version",
-    "registry.packages[].manifest",
-    "registry.selected.*",
-];
+/// Maps whose keys are data, not schema: folded into `<map>.*`.
+const DYNAMIC_MAPS: &[&str] = &["registry.selected"];
 
 fn digest(byte: char) -> PackageDigest {
     PackageDigest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
@@ -64,42 +64,9 @@ fn record(byte: char, id: &str, source: PackageSource) -> PackageRecord {
     }
 }
 
-/// Serialized values of the listed unit variants of a persisted enum. The list also
-/// feeds a `match` without a wildcard arm, so a variant missing from it fails to
-/// compile, and a listed value must round-trip through strict serde.
-macro_rules! unit_values {
-    ($ty:ident: $($variant:ident),+) => {{
-        let listed = [$($ty::$variant),+];
-        for value in &listed {
-            match value {
-                $($ty::$variant => {})+
-            }
-        }
-        string_values(&listed)
-    }};
-}
-
-fn string_values<T>(listed: &[T]) -> Vec<String>
-where
-    T: Serialize + DeserializeOwned + PartialEq + Debug,
-{
-    let values: BTreeSet<String> = listed
-        .iter()
-        .map(|value| {
-            let json = serde_json::to_value(value).expect("value serializes");
-            let back: T = serde_json::from_value(json.clone()).expect("value deserializes");
-            assert_eq!(&back, value, "a listed value must round-trip");
-            json.as_str()
-                .expect("a unit variant is a string")
-                .to_owned()
-        })
-        .collect();
-    values.into_iter().collect()
-}
-
 fn enums() -> Vec<EnumEntry> {
     vec![EnumEntry {
-        path: "registry.packages[].source",
+        paths: vec!["registry.packages[].source".to_owned()],
         values: unit_values!(PackageSource: Official, ExplicitDigest, Link),
     }]
 }
@@ -145,83 +112,6 @@ fn assert_fields_are_reviewed(state: &RegistryState) {
     let _: &PackageSource = source;
 }
 
-/// Keys and string leaves of `value`, with the dynamic `selected` map keys folded
-/// into `selected.*`.
-fn collect(path: &str, value: &Value, keys: &mut BTreeSet<String>, leaves: &mut Leaves) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let child_path = if path == "registry.selected" {
-                    "registry.selected.*".to_owned()
-                } else {
-                    format!("{path}.{key}")
-                };
-                keys.insert(child_path.clone());
-                collect(&child_path, child, keys, leaves);
-            }
-        }
-        Value::Array(items) => {
-            let child_path = format!("{path}[]");
-            for item in items {
-                collect(&child_path, item, keys, leaves);
-            }
-        }
-        Value::String(text) => {
-            leaves
-                .entry(path.to_owned())
-                .or_default()
-                .insert(text.clone());
-        }
-        _ => {}
-    }
-}
-
-/// Checks every string leaf is a registered enum value or free text and returns
-/// the `path=value` snapshot lines of the registered enums.
-fn classify(leaves: &Leaves, enums: &[EnumEntry]) -> Result<BTreeSet<String>, String> {
-    let mut problems = Vec::new();
-    for (path, values) in leaves {
-        if let Some(entry) = enums.iter().find(|entry| entry.path == path) {
-            for value in values.iter().filter(|value| !entry.values.contains(*value)) {
-                problems.push(format!(
-                    "{path}={value} is not a value of the enum registered for that path"
-                ));
-            }
-        } else if !FREE_TEXT.contains(&path.as_str()) {
-            problems.push(format!(
-                "string leaf {path} is neither a registered enum path nor free text"
-            ));
-        }
-    }
-    for entry in enums
-        .iter()
-        .filter(|entry| !leaves.contains_key(entry.path))
-    {
-        problems.push(format!(
-            "registered enum path {} matches no sample leaf",
-            entry.path
-        ));
-    }
-    for path in FREE_TEXT.iter().filter(|path| !leaves.contains_key(**path)) {
-        problems.push(format!("free-text entry {path} matches no sample leaf"));
-    }
-    if !problems.is_empty() {
-        return Err(format!(
-            "the persisted string leaves are not fully classified:\n  {}",
-            problems.join("\n  ")
-        ));
-    }
-    Ok(enums
-        .iter()
-        .flat_map(|entry| {
-            entry
-                .values
-                .iter()
-                .map(move |value| format!("{}={value}", entry.path))
-        })
-        .collect())
-}
-
 fn registry_shape() -> BTreeSet<String> {
     let state = sample();
     assert_fields_are_reviewed(&state);
@@ -229,8 +119,11 @@ fn registry_shape() -> BTreeSet<String> {
         .expect("registry json");
     let mut shape = BTreeSet::from(["registry".to_owned()]);
     let mut leaves = Leaves::new();
-    collect("registry", &document, &mut shape, &mut leaves);
-    shape.extend(classify(&leaves, &enums()).unwrap_or_else(|message| panic!("{message}")));
+    collect("registry", &document, DYNAMIC_MAPS, &mut shape, &mut leaves);
+    shape.extend(
+        classify_leaves(&leaves, &enums(), &free_text())
+            .unwrap_or_else(|message| panic!("{message}")),
+    );
     shape
 }
 
@@ -240,29 +133,18 @@ fn check_schema(
     actual: &BTreeSet<String>,
     snapshots: &[(u32, &str)],
 ) -> Result<(), String> {
-    let rendered: String = actual
-        .iter()
-        .flat_map(|line| [line.as_str(), "\n"])
-        .collect();
-    let Some((_, expected)) = snapshots.iter().find(|(known, _)| *known == version) else {
-        return Err(format!(
-            "registry schema {version} has no snapshot. Add \
-             crates/package/src/registry/fixtures/registry-{version}.txt with the content \
-             below and register it:\n{rendered}"
-        ));
-    };
-    let expected: BTreeSet<String> = expected.lines().map(str::to_owned).collect();
-    if &expected == actual {
-        return Ok(());
-    }
-    let added: Vec<_> = actual.difference(&expected).collect();
-    let removed: Vec<_> = expected.difference(actual).collect();
-    Err(format!(
-        "the serialized registry record changed without a schema bump \
-         (REGISTRY_SCHEMA = {version}).\n  added: {added:?}\n  removed: {removed:?}\n\
-         Bump REGISTRY_SCHEMA, make parse_state accept the previous schema as well, and add \
-         fixtures/registry-<new>.txt with the content below:\n{rendered}"
-    ))
+    check_snapshot(
+        &SnapshotGuard {
+            record: "registry record",
+            bump: "schema",
+            constant: "REGISTRY_SCHEMA",
+            fixture: "crates/package/src/registry/fixtures/registry-<N>.txt",
+            follow_up: "make parse_state accept the previous schema as well",
+        },
+        version,
+        actual,
+        snapshots,
+    )
 }
 
 #[test]
@@ -309,7 +191,7 @@ fn an_unclassified_string_leaf_fails_the_guard() {
         "registry.packages[].channel".to_owned(),
         BTreeSet::from(["stable".to_owned()]),
     );
-    let message = classify(&leaves, &enums()).expect_err("an unclassified leaf must fail");
+    let message = classify_leaves(&leaves, &enums(), &free_text()).expect_err("an unclassified leaf must fail");
     assert!(
         message.contains("registry.packages[].channel is neither"),
         "{message}"
@@ -323,7 +205,7 @@ fn a_sample_value_outside_its_enum_fails_the_guard() {
         "registry.packages[].source".to_owned(),
         BTreeSet::from(["builtin".to_owned()]),
     );
-    let message = classify(&leaves, &enums()).expect_err("a foreign value must fail");
+    let message = classify_leaves(&leaves, &enums(), &free_text()).expect_err("a foreign value must fail");
     assert!(
         message.contains("registry.packages[].source=builtin is not a value"),
         "{message}"
