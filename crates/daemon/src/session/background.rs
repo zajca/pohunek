@@ -196,14 +196,25 @@ impl BackgroundTasks {
         handle
     }
 
-    /// Runs `work` on the blocking pool, tracked so shutdown waits for it.
-    pub(super) fn spawn_blocking<F, R>(&self, work: F) -> JoinHandle<R>
+    /// Runs `work` on the blocking pool as `name`, tracked so shutdown waits
+    /// for it and names it in the report while it has not returned.
+    pub(super) fn spawn_blocking<F, R>(&self, name: &'static str, work: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, LiveTask { name, abort: None });
+        let guard = LiveGuard {
+            live: Arc::clone(&self.live),
+            id,
+        };
         let in_flight = InFlight::enter(&self.in_flight);
         self.tracker.spawn_blocking(move || {
+            let _guard = guard;
             let _in_flight = in_flight;
             work()
         })
@@ -266,5 +277,50 @@ impl BackgroundTasks {
             still_running,
             outstanding: self.tracker.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The registry bound is the behavior under test; it elapses on the paused
+    // clock, which `advance` moves even while a blocking task is in flight.
+    // timing-allowed: #1725 the registry bound is the policy under test
+    const BOUND: Duration = Duration::from_secs(5);
+
+    #[tokio::test(start_paused = true)]
+    async fn wedged_blocking_write_is_named_in_the_registry_report() {
+        let tasks = BackgroundTasks::default();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        let write = tasks.spawn_blocking("record_session", move || {
+            started.send(()).expect("test is waiting");
+            let _ = held.recv();
+        });
+        running
+            .recv_timeout(pohunek_test_support::wait::HANG_GUARD)
+            .expect("the write started");
+
+        let shutdown = tasks.shutdown(BOUND);
+        tokio::pin!(shutdown);
+        tokio::select! {
+            _ = &mut shutdown => panic!("the shutdown ended while the write is wedged"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(BOUND).await;
+        let report = tokio::select! {
+            report = &mut shutdown => report,
+            () = tokio::task::yield_now() => panic!("the shutdown ignored its bound"),
+        };
+
+        assert_eq!(report.still_running, ["record_session"]);
+        assert_eq!(report.outstanding, 1);
+        assert!(tasks.is_quiescent(), "quiescent even with a straggler");
+        release.send(()).expect("the write is waiting");
+        write.await.expect("the write ends once released");
+        let report = tasks.shutdown(BOUND).await;
+        assert!(report.still_running.is_empty(), "{report:?}");
+        assert!(report.is_quiescent());
     }
 }

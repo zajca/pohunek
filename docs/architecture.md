@@ -537,6 +537,15 @@ replacement it accepts is the terminal acknowledgement (`terminal_acknowledged`
 turning true). Any other write is refused and logged as
 `worker.journal.sealed_write_refused`, because it would change an outcome the
 daemon may already have read.
+After the last phase the daemon drops its async runtime, waiting at most
+`RUNTIME_DROP_BOUND` (500 ms, part of the 2 s margin; the log writer's final flush follows it) for blocking threads; tokio
+itself waits for them without a bound, so a blocking store write that never
+returns would otherwise keep the process alive past `daemon_exit_timeout_ms`.
+A blocking write the registry tracks is named in the registry phase log
+while it has not returned; a blocking task outside the registry (hooks,
+notifications, package commands) is bounded but not named. A drop that reaches
+its bound logs a warning and the process exits, so the write that never returned
+is abandoned uncommitted and nothing committed is touched.
 
 Each session also counts the input its watchers have been handed and not yet
 applied: a rescan request, an output chunk of the detector, a worker snapshot or loss, a

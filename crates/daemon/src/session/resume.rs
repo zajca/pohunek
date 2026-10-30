@@ -405,7 +405,7 @@ impl SessionRegistry {
         let result = self
             .inner
             .background
-            .spawn_blocking(move || match desired {
+            .spawn_blocking("record_resume", move || match desired {
                 Some(binding) => store.record_resume(&binding),
                 None => store.remove_resume(&session_id),
             })

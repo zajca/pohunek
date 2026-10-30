@@ -2710,7 +2710,8 @@ warning at start and shortens the phase bounds in proportion so the service
 manager does not kill it before its event log flushed, and the
 `service_config_shutdown_budget` check of `pohunek doctor` is `warn` with the
 configured exit timeout and the least one that fits. The defaults fit the
-default exit timeout of 30000 ms. The optional `[inventory]` table sets the version-probe cache behind
+default exit timeout of 30000 ms. Of the margin, 500 ms is the bound on dropping the async runtime
+after the last phase (a blocking write that never returns is left behind there, not waited for). The optional `[inventory]` table sets the version-probe cache behind
 `host.inspect`: `probe_cache_ttl_ms` and `probe_failure_ttl_ms` (`1..=600000`,
 120000 and 10000 by default), `probe_cache_max_entries` (`1..=4096`, 256) and
 `probe_parallelism` (`1..=256`, 32, the most probes one inventory runs at

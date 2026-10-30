@@ -31,7 +31,7 @@ use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -69,7 +69,7 @@ use pohunek_daemon::session::{
     EnsureInputs, SessionRegistry, SessionRegistryConfig, IDLE_STOP_POLICY_NAME,
     RETENTION_POLICY_NAME,
 };
-use pohunek_daemon::shutdown::{DaemonShutdown, ShutdownPlan, Stage};
+use pohunek_daemon::shutdown::{drop_runtime, DaemonShutdown, ShutdownPlan, Stage};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::preflight::{
@@ -80,7 +80,7 @@ use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DETECT_FLAG, DRY_RUN_FLAG,
     ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
-use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming};
+use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming, RUNTIME_DROP_BOUND};
 
 /// File name of the unified logical-session metadata store under the data dir.
 const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
@@ -165,8 +165,45 @@ const UPGRADE_PREFLIGHT_ARG: &str = "upgrade-preflight";
 /// Name of the host agent profiles directory under the config directory.
 const PROFILES_SUBDIR: &str = "agents";
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Declared before the runtime so it drops after it, on a return and while
+    // a panic unwinds out of `block_on`: the log writer flushes last.
+    let _flush_logs = FlushLogs;
+    // The runtime is built here, not by `#[tokio::main]`, because dropping it
+    // waits for blocking threads without a bound; `drop_runtime` bounds it.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("pohunekd: fatal: cannot build the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(daemon_main());
+    drop_runtime(runtime, RUNTIME_DROP_BOUND);
+    code
+}
+
+/// Keeps the log writer's worker alive until `main` has dropped the runtime.
+static LOG_GUARD: Mutex<Option<logging::LogGuard>> = Mutex::new(None);
+
+/// Drops the log writer's guard, which flushes the queued log lines.
+struct FlushLogs;
+
+impl Drop for FlushLogs {
+    fn drop(&mut self) {
+        drop(
+            LOG_GUARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+async fn daemon_main() -> ExitCode {
     // The probe deadline of `upgrade-preflight` counts from here.
     let entry = std::time::Instant::now();
     if std::env::args_os()
@@ -481,7 +518,8 @@ async fn run() -> Result<(), DaemonError> {
 
     // 5. Initialize structured logging and durable worker state below B1's
     // owner-private application state directory.
-    let _log_guard = logging::init(&paths.log_dir)?;
+    *LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some(logging::init(&paths.log_dir)?);
     ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
     info!(
         daemon_version = DAEMON_VERSION,
@@ -1393,6 +1431,29 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_log_guard_flushes_when_a_panic_unwinds_out_of_main() {
+        use super::{FlushLogs, LOG_GUARD};
+        use std::sync::PoisonError;
+
+        let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
+        *LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _flush_logs = FlushLogs;
+            panic!("a panic escaping block_on");
+        });
+
+        assert!(unwound.is_err());
+        assert!(
+            LOG_GUARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the guard was dropped while the panic unwound"
+        );
+    }
+
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
