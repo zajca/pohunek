@@ -29851,13 +29851,31 @@ where
             .expect("report hold is never poisoned") = hold;
     };
     arm(Some(gate.clone()));
-    let op = tokio::spawn(op);
+    let mut op = tokio::spawn(op);
     for point in 0..holds {
-        guard(
-            "the operation to reach its parking point",
-            gate.entered.notified(),
-        )
-        .await;
+        tokio::select! {
+            parked = tokio::time::timeout(HANG_GUARD, gate.entered.notified()) => {
+                assert!(
+                    parked.is_ok(),
+                    "hang guard of {HANG_GUARD:?} elapsed waiting for the operation to reach \
+                     parking point {} of {holds}: {}",
+                    point + 1,
+                    forward_state(registry)
+                );
+            }
+            finished = &mut op => match finished {
+                Ok(_) => panic!(
+                    "the operation finished before parking point {} of {holds}: {}",
+                    point + 1,
+                    forward_state(registry)
+                ),
+                Err(error) => panic!(
+                    "the operation failed before parking point {} of {holds}: {error}; {}",
+                    point + 1,
+                    forward_state(registry)
+                ),
+            },
+        }
         if point + 1 < holds {
             gate.release.notify_waiters();
         }
@@ -29868,6 +29886,30 @@ where
         gate,
         op,
     }
+}
+
+/// The runtime and the memory-only causes of every session of `registry`, for
+/// the message of an operation that left its forward path early or is blocked
+/// before it. An operation blocked while it holds the sessions lock is
+/// reported as such instead of waiting for the lock.
+fn forward_state(registry: &SessionRegistry) -> String {
+    let Ok(sessions) = registry.inner.sessions.try_lock() else {
+        return "the sessions lock is held".to_owned();
+    };
+    sessions
+        .iter()
+        .map(|(id, entry)| {
+            let runtime = match &entry.runtime {
+                RuntimeHandle::Worker(_) => "worker".to_owned(),
+                RuntimeHandle::Unavailable(state) => format!("unavailable {state:?}"),
+            };
+            format!(
+                "{}: state {:?}, runtime {runtime}, not durable {:?}",
+                id.0, entry.info.state, entry.not_durable_logged
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl<T> ParkedForward<T> {

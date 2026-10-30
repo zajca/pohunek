@@ -3155,10 +3155,11 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
             .any(|row| row.contains(messages_stub::FIRST_CHUNK)),
         "no reply text is drawn while the start gate is closed: {rows:#?}"
     );
-    assert!(
-        fixture.stub.requests_containing(&prompt) >= 1,
-        "the stub received the prompt intact in the turn's request"
-    );
+    wait_until(
+        "the stub to receive the prompt intact in the turn's request",
+        || async { (fixture.stub.requests_containing(&prompt) >= 1).then_some(()) },
+    )
+    .await;
 
     fixture.stub.open_gate();
     fixture

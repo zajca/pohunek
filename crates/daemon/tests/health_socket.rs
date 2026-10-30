@@ -3955,11 +3955,15 @@ async fn claude_initial_input_is_delivered_once_the_prompt_box_renders() {
         &script,
         format!(
             r#"import os
+import termios
 import tty
 
+# Raw mode is set before the prompt box is drawn and without flushing
+# (TCSANOW, not tty.setraw's TCSAFLUSH), so input typed as soon as the box
+# renders is neither line-buffered nor discarded.
+tty.setraw(0, termios.TCSANOW)
 os.write(1, b"\x1b[?2004h")
 os.write(1, b"{screen_hex}")
-tty.setraw(0)
 with open({received:?}, "wb") as capture:
     while True:
         chunk = os.read(0, 4096)
