@@ -1026,6 +1026,15 @@ session-checked and does not need the file to match the refresh. A refresh
 that already reached `ready` only clears its record: the rerun still reads and
 verifies the file (schema, user, roots, namespace) but does not compare it with
 the refresh, so an edited file of the current schema does not keep it pending.
+A `--dry-run` over a pending refresh is refused with `service_refresh_pending`;
+rerun the command without `--dry-run`. If the daemon job vanished while the
+refresh was pending, the first run returns `service_rollback_failed` and a rerun
+`service_daemon_job_missing`; the way out is the one the hint names: if sessions
+are live, stop them, save a copy of `service.toml`, run `pohunek service
+uninstall`, install the version that is `active_version` in the saved copy from
+its own archive with the same `--prefix`, reapply the non-default settings
+except `search_path` under `[environment]`, and rerun `refresh-path` if the path
+still differs.
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without

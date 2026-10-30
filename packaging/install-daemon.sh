@@ -254,7 +254,10 @@ if ! check_json=$("$archive_dir/pohunek" "$@"); then
     echo "nothing was changed; fix the reported problem and re-run $0" >&2
     if printf '%s\n' "$check_json" | grep -q 'service_upgrade_sessions_at_risk'; then
         echo "live sessions the upgrade would not carry over are listed above" >&2
-        if printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with is:'; then
+        if printf '%s\n' "$check_json" | grep -q 'the path a pending search-path refresh'; then
+            echo "a search-path refresh is pending and the refusal judged with the path its rollback restores:" >&2
+            echo "run the same pohunek that started the refresh with: service refresh-path (without a dry run) to finish it, then re-run $0 without --accept-runtime-loss" >&2
+        elif printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with is:'; then
             echo "the refusal names the recorded search path; if a runtime moved since it was recorded, do not accept the loss:" >&2
             echo "run $archive_dir/pohunek service refresh-path --dry-run, then $archive_dir/pohunek service refresh-path, then re-run $0 without --accept-runtime-loss" >&2
             echo "otherwise re-run $0 --accept-runtime-loss to accept losing the listed sessions" >&2

@@ -255,6 +255,33 @@ class InstallDaemonRefreshEchoTest(unittest.TestCase):
             position = found
 
 
+    def test_a_pending_refresh_is_finished_without_a_dry_run_before_the_rerun(self):
+        wrapper = (PACKAGING / "install-daemon.sh").read_text()
+        restored = wrapper.index("grep -q 'the path a pending search-path refresh'")
+        installed = wrapper.index("grep -q 'the search path this upgrade judged with is:'")
+        self.assertLess(restored, installed)
+        lines = [
+            line
+            for line in self.echo_lines()
+            if "a search-path refresh is pending" in line or "service refresh-path (without a dry run)" in line
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("pending", lines[0])
+        order = [
+            "run the same pohunek that started the refresh",
+            "service refresh-path (without a dry run) to finish it",
+            "then re-run $0 without --accept-runtime-loss",
+        ]
+        position = -1
+        for step in order:
+            found = lines[1].find(step, position + 1)
+            self.assertGreater(found, position, f"{step!r} missing or out of order in {lines[1]!r}")
+            position = found
+        for line in lines:
+            self.assertNotIn("--dry-run", line)
+            self.assertNotIn("recorded search path", line)
+
+
 class StageArchiveTest(unittest.TestCase):
     def test_daemon_archive_holds_the_binaries_installer_completions_and_docs(self):
         ws = Workspace(self)

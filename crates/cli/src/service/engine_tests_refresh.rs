@@ -1386,9 +1386,18 @@ async fn an_upgrade_over_a_pending_refresh_is_refused_for_a_risk_under_the_resto
     )
     .await
     .expect_err("the check previews the verdict the upgrade gives");
+    let Error::UpgradeAtRisk {
+        warnings: check_warnings,
+        ..
+    } = &checked
+    else {
+        panic!("the check refuses like the upgrade: {checked:?}");
+    };
     assert!(
-        matches!(checked, Error::UpgradeAtRisk { .. }),
-        "{checked:?}"
+        check_warnings
+            .iter()
+            .any(|warning| warning.contains(super::preflight::RESTORED_PATH_NOTE)),
+        "the check judges with the restored path and says so: {check_warnings:?}"
     );
     let error = harness
         .engine()
@@ -1448,11 +1457,13 @@ fn assert_daemon_job_missing_steps(error: &Error) {
     assert_steps_in_order(
         error.hint().expect("hint"),
         &[
-            "stop the live sessions",
+            "if sessions are live, stop them",
             "`pohunek session list`",
             "save a copy of service.toml",
             "`pohunek service uninstall`",
-            "install the version that is installed now from its own archive",
+            "install the version that is installed now",
+            "`active_version` in the saved copy",
+            "from its own archive",
             "same --prefix",
             "reapply the non-default settings",
             "except `search_path` under [environment]",
@@ -1474,8 +1485,13 @@ async fn a_daemon_job_that_vanishes_after_the_record_exists_names_the_way_out_an
 
     assert_eq!(error.code(), "service_rollback_failed", "{error:?}");
     assert!(
-        matches!(&error, Error::RollbackFailed { rollback, .. } if matches!(**rollback, Error::DaemonJobMissing)),
-        "{error:?}"
+        matches!(
+            &error,
+            Error::RollbackFailed { original, rollback }
+                if matches!(**original, Error::DaemonJobMissing)
+                    && matches!(**rollback, Error::DaemonJobMissing)
+        ),
+        "the replacement and the rollback both report the missing job: {error:?}"
     );
     assert_daemon_job_missing_steps(&error);
     assert!(harness.pending().expect("the record is kept").rolling_back);

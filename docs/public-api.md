@@ -2825,8 +2825,8 @@ commands show a pending refresh as `pending_transaction` with `operation`
 `refresh_path`, and `rolling_back: true` (omitted otherwise) once its rollback
 has begun. It fails with `service_upgrade_sessions_at_risk` or
 `service_upgrade_store_unusable` as an upgrade does, with
-`service_daemon_job_missing` when no daemon job is registered (nothing is
-changed), with `service_refresh_config_changed` when `service.toml` was edited
+`service_daemon_job_missing` when a rerun, or the first run before any record
+exists, finds no registered daemon job (the latter changes nothing), with `service_refresh_config_changed` when `service.toml` was edited
 during a pending refresh that has to act on it (a refresh at `ready` only
 clears its record after reading and verifying the file, without comparing it with
 the refresh, and `uninstall` removes the installation without needing the file to
@@ -2834,9 +2834,11 @@ match the refresh), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
 (`pohunek service refresh-path` without `--dry-run` resolves it), and what a
 dry run returns over any pending refresh, because a dry run never resolves one.
-A daemon job that vanished after the record exists gives
-`service_daemon_job_missing` from the replacement and its rollback alike, and the
-hint names the uninstall and reinstall way out. The store and preflight refusals
+A daemon job that vanished after the record exists makes the first run return
+`service_rollback_failed`, whose original and rollback causes are both
+`service_daemon_job_missing` (the file is already restored and the record stays
+`rolling_back`); every rerun returns `service_daemon_job_missing`. The hint
+names the uninstall and reinstall way out. The store and preflight refusals
 carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
 `service_upgrade_preflight_failed`) with texts that name the installed release. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
