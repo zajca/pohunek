@@ -37,6 +37,7 @@ MACOS_PATH_OWNERSHIP = {
             "crates/logging/**",
             "crates/service-config/**",
             "crates/test-support/**",
+            "crates/shape-guard/**",
             "crates/daemon/**",
             "crates/cli/**",
             "crates/protocol/**",
