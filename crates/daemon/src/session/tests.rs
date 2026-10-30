@@ -8157,10 +8157,26 @@ async fn delayed_plain_input_succeeds_when_the_agent_exits_before_enter() {
     .await;
     reach_boundary(&delay_boundary).await;
 
-    request
+    let result = request
         .await
         .expect("input task joins")
         .expect("the text was delivered; Enter has no process left to reach");
+    // Plain input reports only that the daemon accepted it: no submit mark,
+    // activity boundary, `submitted` or `prompt_accepted`, none of which would
+    // be true without Enter.
+    assert_eq!(
+        result,
+        protocol::SessionInputResult {
+            accepted: true,
+            activity: None,
+            activity_source: None,
+            runtime: None,
+            activity_epoch: None,
+            activity_revision: None,
+            submitted: None,
+            prompt_accepted: None,
+        }
+    );
 }
 
 #[tokio::test]

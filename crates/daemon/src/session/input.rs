@@ -338,7 +338,8 @@ impl SessionRegistry {
                             if !registry.input_runtime_running(&session_id).await =>
                         {
                             // The process ended after the text arrived, so
-                            // Enter has nothing left to reach.
+                            // Enter has nothing left to reach. Plain input's
+                            // result claims no submit, so it stays truthful.
                             debug!(error = %error, "Enter skipped: the runtime ended after the text was delivered");
                             Ok(())
                         }
