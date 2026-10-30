@@ -92,7 +92,13 @@ pub fn collect(
     keys: &mut BTreeSet<String>,
     leaves: &mut Leaves,
 ) {
-    walk(prefix, value, dynamic_maps, &mut Some(keys), &mut Some(leaves));
+    walk(
+        prefix,
+        value,
+        dynamic_maps,
+        &mut Some(keys),
+        &mut Some(leaves),
+    );
 }
 
 /// Serialized values of `samples`, each checked to deserialize strictly back to
@@ -261,7 +267,7 @@ pub fn render(shape: &BTreeSet<String>) -> String {
 ///
 /// A message with the added and removed lines and the content of the new
 /// snapshot when the shape differs, or when `version` has no snapshot.
-pub fn check_snapshot<V: Display + PartialEq>(
+pub fn check_snapshot<V: Copy + Display + PartialEq>(
     guard: &SnapshotGuard<'_>,
     version: V,
     actual: &BTreeSet<String>,

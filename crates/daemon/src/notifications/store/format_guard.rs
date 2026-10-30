@@ -32,7 +32,6 @@ use serde_json::{json, Value};
 
 use super::{StoreAction, NOTIFICATIONS_FORMAT_VERSION};
 
-
 /// Key and value snapshots by format version.
 const SNAPSHOTS: &[(u32, &str)] = &[(1, include_str!("../fixtures/format-1.txt"))];
 

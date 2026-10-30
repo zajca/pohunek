@@ -27,7 +27,8 @@ use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 use persisted_shape::{
     check_snapshot, classify_leaves, collect_paths, collect_string_leaves, data_values,
     unit_values, EnumEntry, Leaves, SnapshotGuard,
-};use protocol::{EnrollmentStatus, HostOwner, QuarantineReason, ShareSuspensionIntent};
+};
+use protocol::{EnrollmentStatus, HostOwner, QuarantineReason, ShareSuspensionIntent};
 use serde_json::Value;
 
 use super::{
@@ -35,7 +36,6 @@ use super::{
     IdentityWireOwned, RetiredEnrollment, GOVERNANCE_FORMAT_VERSION, IDENTITY_FORMAT_VERSION,
 };
 use crate::host_state::approval_key::{generate_host_id, ApprovalKeyRecord};
-
 
 /// Governance key and value snapshots by format version.
 const GOVERNANCE_SNAPSHOTS: &[(u8, &str)] = &[(2, include_str!("../fixtures/governance-2.txt"))];

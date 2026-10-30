@@ -191,7 +191,8 @@ fn an_unclassified_string_leaf_fails_the_guard() {
         "registry.packages[].channel".to_owned(),
         BTreeSet::from(["stable".to_owned()]),
     );
-    let message = classify_leaves(&leaves, &enums(), &free_text()).expect_err("an unclassified leaf must fail");
+    let message = classify_leaves(&leaves, &enums(), &free_text())
+        .expect_err("an unclassified leaf must fail");
     assert!(
         message.contains("registry.packages[].channel is neither"),
         "{message}"
@@ -205,7 +206,8 @@ fn a_sample_value_outside_its_enum_fails_the_guard() {
         "registry.packages[].source".to_owned(),
         BTreeSet::from(["builtin".to_owned()]),
     );
-    let message = classify_leaves(&leaves, &enums(), &free_text()).expect_err("a foreign value must fail");
+    let message =
+        classify_leaves(&leaves, &enums(), &free_text()).expect_err("a foreign value must fail");
     assert!(
         message.contains("registry.packages[].source=builtin is not a value"),
         "{message}"
