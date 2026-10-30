@@ -40,6 +40,12 @@ export type SessionRemoveResult = {
    */
   accepted_unconfirmed_processes?: Array<UnconfirmedProcess>;
   /**
+   * How many processes the removal accepted when more than the list above
+   * holds (the daemon log names all of them). Omitted when the list is
+   * complete.
+   */
+  accepted_unconfirmed_total?: number;
+  /**
    * Non-fatal warnings the removal raised, such as a failing `pre-remove`
    * or `post-remove` worktree hook. The session record is gone once the
    * result is returned, so this is the only place they are reported.

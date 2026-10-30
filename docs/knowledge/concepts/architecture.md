@@ -88,7 +88,7 @@ puts in a resource and a jetsam coalition that both differ from the worker's,
 such as a job launchd started after the worker, is ignored as well: a descendant
 keeps the worker's coalitions through every fork, exec and reparenting.
 
-A worker also journals `boot_session_id` (the boot session UUID on macOS, the kernel boot id on Linux; only the canonical UUID shape counts). After a host reboot the daemon sees another boot than the journal and treats the runtime as ended without scanning, so the session leaves `running` with the lost runtime; a journal without the field (a worker of 0.38.x or earlier) keeps the unconfirmed outcome.
+A worker also journals `boot_session_id` (the boot session UUID on macOS, the kernel boot id on Linux; only the canonical UUID shape counts). After a host reboot the daemon sees another boot than the journal and treats the runtime as ended without scanning, so the session leaves `running` with the lost runtime; a journal without the field (a worker of 0.38.x or earlier) falls back, on Linux, to its `boot_identity` (the same kernel boot id) and, on macOS, keeps the unconfirmed outcome.
 
 Linux decides such a process by its cgroup. The worker journals the unified
 cgroup path it runs in as the optional `worker_control_group` (no schema bump,

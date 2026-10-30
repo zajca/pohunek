@@ -86,12 +86,34 @@ const MAX_LOGGED_UNMARKED_PROCESSES: usize = 8;
 
 /// Most unreadable-marker processes one removal may accept.
 ///
-/// The accepted processes are returned in the `session.remove` result, which
-/// is built after the destructive cleanup, so the list must always fit one
-/// response line (the client frames lines at 1 MiB). 64 entries of pid, start
-/// identity and a bounded command name take a few kilobytes; a removal with
-/// more candidates than this is refused before anything is deleted.
-pub(super) const MAX_ACCEPTED_UNCONFIRMED_PROCESSES: usize = 64;
+/// Accepting a process never signals it: the consent only lets the record be
+/// removed although the process cannot be inspected. The bound keeps the work
+/// and the daemon log of one removal bounded (one WARN line per accepted
+/// process); a removal with more candidates than this is refused with their
+/// count before anything is deleted. A macOS host can hold several hundred
+/// processes whose environment the kernel withholds.
+pub(super) const MAX_ACCEPTED_UNCONFIRMED_PROCESSES: usize = 1024;
+
+/// Most accepted processes the `session.remove` result lists.
+///
+/// The result is built after the destructive cleanup, so it must always fit
+/// one response line (the client frames lines at 1 MiB). 64 entries of pid,
+/// start identity and a bounded command name take a few kilobytes. The rest
+/// is counted in `accepted_unconfirmed_total` and named in the daemon log.
+pub(super) const MAX_LISTED_UNCONFIRMED_PROCESSES: usize = 64;
+
+/// Splits the accepted processes of a removal into the part its result lists
+/// and, when some do not fit, the total count.
+pub(super) fn bound_accepted_listing(
+    mut accepted: Vec<protocol::UnconfirmedProcess>,
+) -> (Vec<protocol::UnconfirmedProcess>, Option<u32>) {
+    if accepted.len() <= MAX_LISTED_UNCONFIRMED_PROCESSES {
+        return (accepted, None);
+    }
+    let total = u32::try_from(accepted.len()).unwrap_or(u32::MAX);
+    accepted.truncate(MAX_LISTED_UNCONFIRMED_PROCESSES);
+    (accepted, Some(total))
+}
 
 /// Recovery hint of a removal refused because of unreadable-marker processes.
 pub(super) const UNREADABLE_CANDIDATES_RECOVER: &str =
@@ -318,8 +340,15 @@ impl JournalWorker<'_> {
             (spawn_id.is_some() || coalitions.is_some() || control_group.is_some()) && same_boot();
         // Nothing survives a reboot, so a host that names another boot than the
         // one the worker recorded holds no process of its runtime. A boot the
-        // host cannot name proves nothing.
-        let previous_boot = self.boot_session_id.is_some_and(|recorded| {
+        // host cannot name proves nothing. A journal without `boot_session_id`
+        // falls back to `boot_identity` when that is a canonical UUID: on Linux
+        // it is the kernel boot id, the same value; on macOS it encodes
+        // `kern.boottime`, which a clock change shifts, and is never a proof.
+        let recorded_boot = match self.boot_session_id {
+            Some(recorded) => Some(recorded),
+            None => Some(self.boot_identity).filter(|recorded| is_boot_uuid(recorded)),
+        };
+        let previous_boot = recorded_boot.is_some_and(|recorded| {
             if !is_boot_uuid(recorded) {
                 tracing::warn!(
                     session_id = self.session_id,
@@ -556,6 +585,23 @@ pub(super) fn record_accepted_process(
         candidate.to_unconfirmed_process(),
         worker_instance_id.to_owned(),
     ));
+}
+
+/// How many of `candidates` are not among the `accepted` processes yet, so a
+/// process an earlier runtime's sweep listed is counted once.
+pub(super) fn count_unaccepted(
+    accepted: &[(UnconfirmedProcess, String)],
+    candidates: &[UnreadableCandidate],
+) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            !accepted.iter().any(|(known, _)| {
+                known.pid == candidate.identity.pid
+                    && known.start_identity.get() == candidate.identity.start_identity.get()
+            })
+        })
+        .count()
 }
 
 /// The verdict of a lost-runtime sweep together with what blocked it.

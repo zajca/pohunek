@@ -541,7 +541,7 @@ and the daemon log has the panic.
   call (it uses the `session.remove_accepting_unconfirmed` method, so an older
   daemon answers `method_not_found`): the processes are not signalled, and the result lists them as
   `accepted_unconfirmed_processes` (`pid N (start S, command `name`)` in human
-  output; the command name is escaped because the process chooses it; more than 64 candidates refuse the removal before anything is deleted). One that does carry the runtime marker keeps running unsupervised
+  output; the command name is escaped because the process chooses it; the result lists the first 64 and `accepted_unconfirmed_total` is the full count, the daemon log names every one, and more than 1024 candidates refuse the removal with a count of at least the candidates found before anything is deleted). One that does carry the runtime marker keeps running unsupervised
   after the worktree, logs, and record are gone. Any other unconfirmed reason
   still refuses, and reconciliation and the retention sweep never have the
   consent. A removal finished by

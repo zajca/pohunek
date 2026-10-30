@@ -6410,12 +6410,15 @@ impl SessionRegistry {
         let released = self
             .release_removed_session(id, job.as_ref(), worker_instance_id.as_deref(), cleanup)
             .await?;
+        let (accepted_unconfirmed_processes, accepted_unconfirmed_total) =
+            supervision::bound_accepted_listing(released.accepted_unconfirmed);
         Ok(SessionRemoveResult {
             removed: released.evicted,
             stopped,
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
-            accepted_unconfirmed_processes: released.accepted_unconfirmed,
+            accepted_unconfirmed_processes,
+            accepted_unconfirmed_total,
             warnings: released.warnings,
         })
     }

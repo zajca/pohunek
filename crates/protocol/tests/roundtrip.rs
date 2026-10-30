@@ -4719,6 +4719,7 @@ fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
         worktrees_removed: 1,
         worktrees_failed: 0,
         accepted_unconfirmed_processes: Vec::new(),
+        accepted_unconfirmed_total: None,
         warnings: Vec::new(),
     };
     assert_eq!(
@@ -4761,6 +4762,21 @@ fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
         ])
     );
     assert_eq!(line_roundtrip(&result), result);
+
+    result.accepted_unconfirmed_total = Some(335);
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize remove result")
+            ["accepted_unconfirmed_total"],
+        json!(335),
+        "a total larger than the list is carried"
+    );
+    assert_eq!(line_roundtrip(&result), result);
+    result.accepted_unconfirmed_total = None;
+    let mut with_unknown = serde_json::to_value(&result).expect("serialize remove result");
+    with_unknown["a_key_from_a_newer_daemon"] = json!(true);
+    let decoded: SessionRemoveResult =
+        serde_json::from_value(with_unknown).expect("an unknown key is ignored");
+    assert_eq!(decoded, result);
 
     result.warnings = vec![SessionWarning {
         kind: SessionWarningKind::Hook,

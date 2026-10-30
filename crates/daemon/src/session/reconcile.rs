@@ -25,10 +25,11 @@ use super::claim::{same_claim, ClaimKey, ClaimOrigin, PendingRelease};
 use super::conflict_stop::is_conflict_proven_removal;
 use super::settle::RescanSignal;
 use super::supervision::{
-    classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
-    record_accepted_process, with_settle_window, Cleanup, JobEvidence, JournalWorker, Unreachable,
-    WorkerBounds, CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
-    RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
+    classify_unreachable, count_unaccepted, describe_unreadable_candidates, job_identity_mismatch,
+    observe, record_accepted_process, with_settle_window, Cleanup, JobEvidence, JournalWorker,
+    Unreachable, WorkerBounds, CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES,
+    RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER,
+    UNSUPERVISED_WORKER,
 };
 use super::tmpdir::TmpdirOwners;
 use super::{
@@ -2989,13 +2990,15 @@ impl SessionRegistry {
                 }
                 if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
                 {
-                    for candidate in &outcome.unreadable {
+                    for (index, candidate) in outcome.unreadable.iter().enumerate() {
                         record_accepted_process(&mut accepted, candidate, &worker_instance_id);
                         // Stops at the first excess process so the work stays
                         // bounded however many candidates a host has.
                         if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
+                            let found = accepted.len()
+                                + count_unaccepted(&accepted, &outcome.unreadable[index + 1..]);
                             let mut error = ambiguous(format!(
-                                "more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} unreadable processes one removal can accept may belong to its runtimes"
+                                "at least {found} unreadable processes may belong to its runtimes, more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} one removal can accept"
                             ));
                             error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
                             return Err(error);
@@ -15151,6 +15154,152 @@ generation "$1"
                     "{shape:?}"
                 );
             }
+        }
+
+        /// Reconciles a lost worker whose journal records `boot_identity` and
+        /// `boot_session_id` and returns the session's loss reason and state.
+        async fn lost_session_of_boots(
+            tag: &str,
+            boot_identity: &str,
+            boot_session_id: Option<&str>,
+        ) -> (Option<String>, protocol::SessionState, bool) {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let session = format!("s-{tag}");
+            let runtime_id = format!("runtime-{session}");
+            let marked = Marked::spawn(&fixture.root, &runtime_id);
+            persist_record(&fixture.root, &session, Some(&runtime_id));
+            write_journal_record(
+                &fixture.root,
+                &session,
+                &format!("worker-{session}"),
+                TEST_GENERATION,
+                dead_worker(),
+                Some(&runtime_id),
+                |journal| {
+                    journal.boot_identity = boot_identity.to_owned();
+                    journal.boot_session_id = boot_session_id.map(ToOwned::to_owned);
+                },
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId(session))
+                .await
+                .expect("inspect");
+            (
+                info.runtime.expect("runtime").loss_reason,
+                info.state,
+                marked.alive(),
+            )
+        }
+
+        const OTHER_BOOT: &str = "00000000-0000-4000-8000-00000000beef";
+
+        /// A journal from before `boot_session_id` falls back to its
+        /// `boot_identity` when that is a boot UUID: on Linux it is the kernel
+        /// boot id.
+        #[tokio::test]
+        async fn a_journal_without_a_boot_session_id_proves_a_reboot_by_its_boot_uuid() {
+            let (reason, state, alive) = lost_session_of_boots("17411", OTHER_BOOT, None).await;
+
+            assert_eq!(reason.as_deref(), Some(RUNTIME_LOST));
+            assert_ne!(state, protocol::SessionState::Running);
+            assert!(alive, "nothing is signalled for an earlier boot");
+        }
+
+        /// The boot of the host proves nothing, whatever the journal's shape of
+        /// boot identity is, so a clock-based macOS value never counts.
+        #[tokio::test]
+        async fn a_boot_identity_that_is_not_a_boot_uuid_proves_nothing() {
+            let current = HostInspector::new()
+                .boot_session_id()
+                .unwrap_or_else(|_| OTHER_BOOT.to_owned());
+            for (index, identity) in [
+                "1700000000.000000",
+                "boot-test",
+                "00000000-0000-4000-8000-00000000be",
+            ]
+            .into_iter()
+            .chain([current.as_str()])
+            .enumerate()
+            {
+                let (reason, state, _) =
+                    lost_session_of_boots(&format!("1742{index}"), identity, None).await;
+
+                assert_eq!(
+                    reason.as_deref(),
+                    Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+                    "{identity:?}"
+                );
+                assert_eq!(state, protocol::SessionState::Running, "{identity:?}");
+            }
+        }
+
+        /// A journaled `boot_session_id` decides alone: a malformed one is no
+        /// proof and does not hand the decision to `boot_identity`, and a
+        /// current one outranks a `boot_identity` of another boot.
+        #[tokio::test]
+        async fn the_boot_session_id_outranks_the_boot_identity() {
+            let current = HostInspector::new()
+                .boot_session_id()
+                .unwrap_or_else(|_| OTHER_BOOT.to_owned());
+            let (malformed, _, _) =
+                lost_session_of_boots("17413", OTHER_BOOT, Some("garbage")).await;
+            let (same_boot, _, _) =
+                lost_session_of_boots("17414", OTHER_BOOT, Some(current.as_str())).await;
+
+            assert_eq!(malformed.as_deref(), Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED));
+            assert_eq!(same_boot.as_deref(), Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED));
+        }
+
+        /// Consent to unreadable-marker processes never signals them: the record
+        /// is removed and the process keeps running.
+        #[tokio::test]
+        async fn accepting_unreadable_processes_removes_the_session_and_signals_none() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let marked = Marked::spawn(&fixture.root, "runtime-s-17415");
+            persist_record(&fixture.root, "s-17415", Some("runtime-s-17415"));
+            write_live_journal(
+                &fixture.root,
+                "s-17415",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-17415"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let id = SessionId("s-17415".to_owned());
+
+            let refused = fixture
+                .registry
+                .remove_with(&id, crate::session::UnconfirmedCleanup::Refuse)
+                .await
+                .expect_err("without consent the unreadable process refuses the removal");
+            assert_eq!(refused.code, SUPERVISION_AMBIGUOUS, "{refused:?}");
+            assert!(marked.alive());
+
+            let removed = fixture
+                .registry
+                .remove_with(&id, crate::session::UnconfirmedCleanup::Accept)
+                .await
+                .expect("consent lets the removal proceed");
+
+            assert!(removed.removed, "{removed:?}");
+            assert!(
+                !removed.accepted_unconfirmed_processes.is_empty(),
+                "{removed:?}"
+            );
+            assert!(marked.alive(), "an accepted process is never signalled");
         }
 
         /// A journal from the boot the host is in now proves nothing about

@@ -3078,6 +3078,17 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
             }
             output.push_str(")\n");
         }
+        if let Some(total) = result.accepted_unconfirmed_total {
+            let unlisted = usize::try_from(total)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(result.accepted_unconfirmed_processes.len());
+            if unlisted > 0 {
+                let _ = writeln!(
+                    output,
+                    "    ... and {unlisted} more (the daemon log names every one)"
+                );
+            }
+        }
     }
     write_warnings(&mut output, &result.warnings);
     output
@@ -4102,6 +4113,7 @@ mod tests {
                         command: None,
                     },
                 ],
+                accepted_unconfirmed_total: None,
                 warnings: Vec::new(),
             },
         );
@@ -4118,6 +4130,31 @@ mod tests {
     }
 
     #[test]
+    fn renders_remove_result_counts_the_accepted_processes_it_does_not_list() {
+        let output = render_remove_human(
+            "s-42",
+            &SessionRemoveResult {
+                removed: true,
+                stopped: false,
+                worktrees_removed: 0,
+                worktrees_failed: 0,
+                accepted_unconfirmed_processes: vec![protocol::UnconfirmedProcess {
+                    pid: 7,
+                    start_identity: protocol::ProcessStartIdentity::new(3),
+                    command: None,
+                }],
+                accepted_unconfirmed_total: Some(335),
+                warnings: Vec::new(),
+            },
+        );
+
+        assert!(
+            output.contains("    ... and 334 more (the daemon log names every one)\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn renders_remove_result_worktree_cleanup_failure() {
         let output = render_remove_human(
             "s-42",
@@ -4127,6 +4164,7 @@ mod tests {
                 worktrees_removed: 1,
                 worktrees_failed: 2,
                 accepted_unconfirmed_processes: Vec::new(),
+                accepted_unconfirmed_total: None,
                 warnings: Vec::new(),
             },
         );
@@ -4147,6 +4185,7 @@ mod tests {
                 worktrees_removed: 1,
                 worktrees_failed: 0,
                 accepted_unconfirmed_processes: Vec::new(),
+                accepted_unconfirmed_total: None,
                 warnings: vec![protocol::SessionWarning {
                     kind: protocol::SessionWarningKind::Hook,
                     message: "pre-remove hook failed".to_owned(),
@@ -4408,6 +4447,7 @@ mod tests {
                 start_identity: protocol::ProcessStartIdentity::new(99),
                 command: Some("gpg-agent".to_owned()),
             }],
+            accepted_unconfirmed_total: None,
             warnings: Vec::new(),
         };
 
