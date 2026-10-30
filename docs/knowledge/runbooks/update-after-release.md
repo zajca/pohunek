@@ -988,13 +988,18 @@ archive), because the installed one may predate the command. Compare with
 `pohunek service refresh-path --dry-run`, which runs the login-shell discovery
 as install does and prints the directories it would add and remove, record the
 current path with `pohunek service refresh-path`, and rerun the upgrade. The
-command changes only the recorded path in `service.toml`, takes the transaction
-lock only after the discovery, and refuses while an install or upgrade record
-is pending. Nothing is stopped or restarted: `service check` and `service
-upgrade` judge with the new path at once, and the running daemon job gets it at
-its next replacement. Do not use `--accept-runtime-loss` for this cause, since
-it would drop resume and fork for the listed sessions although the runtime is
-current. `refresh-path` refuses while a transaction record is pending
+command runs the discovery before it takes the transaction lock, records the
+path in `service.toml` and replaces the daemon job with it in one transaction,
+so `service check`, `service upgrade` and the running daemon all use the new
+path. Only the daemon restarts; worker jobs keep running, and live sessions
+keep their runtime unless the new daemon would not adopt them: the command
+takes the same adoption verdict as an upgrade and refuses with
+`service_upgrade_sessions_at_risk` before changing anything. Do not use
+`--accept-runtime-loss` for this cause, since it would drop resume and fork for
+the listed sessions although the runtime is current. `--dry-run` shows the
+difference and the verdict without a lock. A failure after the write rolls the
+path back and replaces the job with the old one again. `refresh-path` refuses
+while an install or upgrade record is pending
 (`service_refresh_blocked_by_transaction`), and an interrupted upgrade leaves
 one. First rerun the command `pohunek service status` names (it resumes or
 rolls the record back), then run `pohunek service refresh-path` and the
@@ -1002,6 +1007,15 @@ upgrade. If the resumed upgrade is refused again with the same warning, the
 record keeps blocking `refresh-path`: do not accept the runtime loss unless you
 intend to lose it, and see
 https://github.com/zajca/pohunek/issues/1763 (recovery design).
+
+A refresh-path run that was interrupted leaves its own record
+(`pohunek service status` shows operation `refresh_path`). Rerun `pohunek
+service refresh-path` to finish it: it resumes with the path it journaled, or
+finishes a rollback that had begun, and then stops. `install`, `upgrade` and
+`uninstall` roll such a record back while the daemon job was not replaced yet;
+once it was, `install` and `upgrade` refuse with `service_refresh_pending`.
+`service_refresh_config_changed` means `service.toml` was edited while the
+refresh was pending: put it back as it was, then rerun the command.
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without

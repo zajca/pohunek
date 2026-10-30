@@ -102,21 +102,33 @@ pub(crate) enum Action {
         json: bool,
     },
 
-    /// Re-record the executable search path in `service.toml` from your login shell.
+    /// Re-record the executable search path from your login shell and restart the daemon with it.
     ///
     /// Install records the `PATH` your login shell reports, and upgrades reuse
     /// it. A prefix installed later, or a profile link that moved to another
-    /// store path (Nix generations), leaves the record behind; this command
-    /// runs the same discovery again, prints the directories added and
-    /// removed, and rewrites only the recorded path, atomically. Nothing is
-    /// stopped or restarted. `service check` and `service upgrade` judge with
-    /// the new path at once; the running daemon job gets it at its next
-    /// replacement, a version-changing upgrade. A login shell that fails or
-    /// prints junk never replaces the recorded path.
+    /// store path (Nix generations), leaves the record behind, and the running
+    /// daemon keeps the `PATH` its job was registered with. This command runs
+    /// the same discovery again, prints the directories added and removed,
+    /// rewrites the recorded path atomically and replaces the daemon job, in
+    /// one transaction: it records the path and restarts the daemon, or it
+    /// changes nothing. Only the daemon restarts; worker jobs keep running. The
+    /// new daemon's adoption verdict is taken first, as for an upgrade: live
+    /// sessions it would not adopt refuse the run unless `--accept-runtime-loss`
+    /// is given. A login shell that fails or prints junk never replaces the
+    /// recorded path. `--dry-run` takes no lock and changes nothing.
     RefreshPath {
-        /// Print the change without writing `service.toml`.
+        /// Print the change and the adoption verdict without changing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Proceed even if live or stopped sessions would lose runtime or
+        /// native recovery with the new path.
+        ///
+        /// The new daemon's adoption preflight lists them; the run refuses
+        /// without this flag. It never overrides a metadata store the new
+        /// daemon cannot start with, and it records nothing in the
+        /// accepted-risk ledger.
+        #[arg(long)]
+        accept_runtime_loss: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -223,8 +235,12 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             let report = service::upgrade(from, accept_runtime_loss, budget).await?;
             emit(json, &report, render_upgrade)
         }
-        Action::RefreshPath { dry_run, json } => {
-            let report = service::refresh_search_path(dry_run).await?;
+        Action::RefreshPath {
+            dry_run,
+            accept_runtime_loss,
+            json,
+        } => {
+            let report = service::refresh_search_path(dry_run, accept_runtime_loss).await?;
             emit(json, &report, render_refresh_path)
         }
         Action::Check {
@@ -366,6 +382,9 @@ fn wire_name<T: serde::Serialize>(value: &T) -> String {
 
 fn render_refresh_path(report: &report::RefreshPathReport) -> String {
     let mut text = String::new();
+    if let Some(pending) = &report.rolled_back {
+        let _ = writeln!(text, "{}", render_rolled_back(pending));
+    }
     if report.changed {
         let verb = if report.applied {
             "recorded"
@@ -382,14 +401,32 @@ fn render_refresh_path(report: &report::RefreshPathReport) -> String {
         if report.added.is_empty() && report.removed.is_empty() {
             let _ = writeln!(text, "the same directories, in a new order");
         }
-        if report.applied {
-            let _ = writeln!(
-                text,
-                "service.toml is updated; `service check` and `service upgrade` use it now, \
-                 the running daemon job at its next replacement (a version-changing upgrade)"
-            );
-        } else {
-            let _ = writeln!(text, "dry run: service.toml is unchanged");
+        let kept = report.workers_kept.map_or_else(
+            || "worker jobs are not touched".to_owned(),
+            |count| format!("{count} workers kept running"),
+        );
+        match report.daemon_restart {
+            "restarted" => {
+                let started = if report.daemon_started {
+                    " (it was not running and was started)"
+                } else {
+                    ""
+                };
+                let resumed = if report.resumed { ", resumed" } else { "" };
+                let _ = writeln!(
+                    text,
+                    "daemon restarted with the new search path{started}; {kept}{resumed}"
+                );
+            }
+            "would_restart" => {
+                let _ = writeln!(
+                    text,
+                    "dry run: service.toml and the daemon are unchanged; a real run would restart the daemon; {kept}"
+                );
+            }
+            _ => {
+                let _ = writeln!(text, "service.toml and the daemon are unchanged");
+            }
         }
     } else {
         let _ = writeln!(
@@ -397,6 +434,11 @@ fn render_refresh_path(report: &report::RefreshPathReport) -> String {
             "the recorded search path is current ({} directories); nothing to change",
             report.recorded.len()
         );
+    }
+    if let Some(preflight) = &report.preflight {
+        text.push('\n');
+        render_preflight(&mut text, preflight, report.accepted_runtime_loss);
+        text.push('\n');
     }
     if let Some(shell) = &report.shell_used {
         let note = if report.shell_defaulted {
@@ -1275,14 +1317,21 @@ mod tests {
             parse(&["refresh-path"]),
             Action::RefreshPath {
                 dry_run: false,
+                accept_runtime_loss: false,
                 json: false
             }
         ));
-        let action = parse(&["refresh-path", "--dry-run", "--json"]);
+        let action = parse(&[
+            "refresh-path",
+            "--dry-run",
+            "--accept-runtime-loss",
+            "--json",
+        ]);
         assert!(matches!(
             action,
             Action::RefreshPath {
                 dry_run: true,
+                accept_runtime_loss: true,
                 json: true
             }
         ));
@@ -1291,9 +1340,8 @@ mod tests {
             .expect_err("the prefix is the installed one");
     }
 
-    #[test]
-    fn refresh_path_renders_the_difference_and_what_a_dry_run_leaves() {
-        let report = report::RefreshPathReport {
+    fn refresh_report() -> report::RefreshPathReport {
+        report::RefreshPathReport {
             dry_run: false,
             changed: true,
             applied: true,
@@ -1304,50 +1352,73 @@ mod tests {
             shell_used: Some(PathBuf::from("/bin/zsh")),
             shell_defaulted: true,
             dropped: Vec::new(),
+            daemon_restart: "restarted",
+            daemon_started: false,
+            workers_kept: Some(2),
+            resumed: false,
+            rolled_back: None,
+            preflight: None,
+            accepted_runtime_loss: false,
             warnings: vec!["2 unknown keys are kept".to_owned()],
-        };
+        }
+    }
+
+    #[test]
+    fn refresh_path_renders_the_difference_the_restart_and_what_a_dry_run_leaves() {
+        let report = refresh_report();
         let text = render_refresh_path(&report);
         assert!(text.contains("recorded 1 directories"), "{text}");
         assert!(text.contains("+ /new") && text.contains("- /old"), "{text}");
-        assert!(text.contains("next replacement"), "{text}");
+        assert!(
+            text.contains("daemon restarted with the new search path; 2 workers kept running"),
+            "{text}"
+        );
+        assert!(!text.contains("next replacement"), "{text}");
         assert!(text.contains("(default: $SHELL is unset)"), "{text}");
         assert!(text.contains("warning: 2 unknown keys are kept"), "{text}");
+
+        let started = render_refresh_path(&report::RefreshPathReport {
+            daemon_started: true,
+            ..report.clone()
+        });
+        assert!(
+            started.contains("(it was not running and was started)"),
+            "{started}"
+        );
 
         let preview = render_refresh_path(&report::RefreshPathReport {
             dry_run: true,
             applied: false,
+            daemon_restart: "would_restart",
             ..report.clone()
         });
         assert!(preview.contains("would record 1 directories"), "{preview}");
         assert!(
-            preview.contains("dry run: service.toml is unchanged"),
+            preview.contains("dry run: service.toml and the daemon are unchanged"),
             "{preview}"
         );
+        assert!(preview.contains("would restart the daemon"), "{preview}");
 
         let current = render_refresh_path(&report::RefreshPathReport {
             changed: false,
             applied: false,
+            daemon_restart: "none",
             added: Vec::new(),
             removed: Vec::new(),
             discovered: report.recorded.clone(),
-            ..report
+            ..report.clone()
         });
         assert!(current.contains("is current"), "{current}");
         let json = render_json(&report::RefreshPathReport {
             dry_run: true,
             changed: false,
             applied: false,
-            recorded: Vec::new(),
-            discovered: Vec::new(),
-            added: Vec::new(),
-            removed: Vec::new(),
-            shell_used: None,
-            shell_defaulted: false,
-            dropped: Vec::new(),
-            warnings: Vec::new(),
+            daemon_restart: "none",
+            ..report
         })
         .expect("json");
         assert!(json.contains("\"dry_run\": true"), "{json}");
+        assert!(json.contains("\"daemon_restart\": \"none\""), "{json}");
     }
 
     #[test]
@@ -1374,6 +1445,7 @@ mod tests {
                 operation: "upgrade",
                 version: "0.9.0".to_owned(),
                 step: "config",
+                rolling_back: false,
                 preflight: None,
                 accepted_runtime_loss: false,
                 warnings: Vec::new(),
@@ -1574,6 +1646,7 @@ mod tests {
             operation: "upgrade",
             version: "2.0.0".to_owned(),
             step: "registered",
+            rolling_back: false,
             preflight: None,
             accepted_runtime_loss: false,
             warnings: vec![
@@ -1606,6 +1679,7 @@ mod tests {
                 operation: "install",
                 version: "1.0.0".to_owned(),
                 step: "config",
+                rolling_back: false,
                 preflight: None,
                 accepted_runtime_loss: false,
                 warnings: Vec::new(),
@@ -1721,6 +1795,7 @@ mod tests {
                 operation: "install",
                 version: "1.0.0".to_owned(),
                 step: "ready",
+                rolling_back: false,
                 preflight: None,
                 accepted_runtime_loss: false,
                 warnings: Vec::new(),

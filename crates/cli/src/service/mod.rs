@@ -127,19 +127,33 @@ pub async fn upgrade(
         .await
 }
 
-/// Re-records the daemon job's search path from a fresh login-shell discovery.
+/// Re-records the daemon job's search path from a fresh login-shell discovery
+/// and replaces the daemon job with it.
 ///
-/// See [`refresh::refresh_search_path`]; `dry_run` previews the change.
+/// See [`engine::Engine::refresh_path`]; `dry_run` previews the change and the
+/// adoption verdict, and `accept_runtime_loss` accepts the sessions that
+/// verdict lists as at risk. The login shell runs before any lock is taken.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`refresh::refresh_search_path`], and
-/// [`Error::InheritedLock`] when `POHUNEK_SERVICE_LOCK_TOKEN` proves no live
-/// lock holder.
-pub async fn refresh_search_path(dry_run: bool) -> Result<report::RefreshPathReport, Error> {
+/// Returns the errors of [`engine::Engine::refresh_path`] and
+/// [`refresh::discover`], and [`Error::InheritedLock`] when
+/// `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
+pub async fn refresh_search_path(
+    dry_run: bool,
+    accept_runtime_loss: bool,
+) -> Result<report::RefreshPathReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
-    refresh::refresh_search_path(&context, inherited.as_ref(), dry_run).await
+    let discovered = refresh::discover(&context)?;
+    // The schema is judged before the service manager is contacted; the engine
+    // repeats the read under the lock.
+    refresh::load_installed_config(&context)?;
+    let backend = connect_installed(&context).await?;
+    engine(&context, &backend, inherited)
+        .with_runtime_loss_accepted(accept_runtime_loss)
+        .refresh_path(discovered, dry_run)
+        .await
 }
 
 /// Uninstalls the service.
@@ -1558,6 +1572,7 @@ mod tests {
             launchd_default_path: None,
             launchd_boot_identity: None,
             accepted_risks: None,
+            refresh: None,
         };
         assert_eq!(
             checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),

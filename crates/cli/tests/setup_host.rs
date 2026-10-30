@@ -343,6 +343,7 @@ fn a_pending_install_stops_setup_before_any_change() {
         launchd_default_path: None,
         launchd_boot_identity: None,
         accepted_risks: None,
+        refresh: None,
     };
     pohunek_cli::service::record::Store::new(state)
         .save(&record)

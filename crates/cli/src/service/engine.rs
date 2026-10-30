@@ -36,6 +36,27 @@
 //! Rollback, collection, and uninstall verify the claim before deleting
 //! anything; a rolled-back install and a finished uninstall release it.
 //!
+//! # Search-path refresh
+//!
+//! `pohunek service refresh-path` runs as its own transaction kind
+//! ([`Operation::RefreshPath`], implemented in the `refresh_path` module): it
+//! rewrites the recorded search path in `service.toml` and replaces the daemon
+//! job with the new definition so the running daemon gets the path, or it
+//! changes nothing. The record journals the path before and after and the
+//! digests of the file before and after the write; a resume uses the
+//! journaled path and never a fresh discovery. It uses the steps `config`,
+//! `definition`, `registering`, `registered`, and `ready`. The adoption gate
+//! judges the live sessions with the new `PATH` before any effect and again
+//! right before the replacement. Readiness requires a new daemon process,
+//! because the old one answers the same version. A failure before `registering`
+//! restores the previous path with no daemon effect; a failure from
+//! `registering` on restores it and replaces the job again, with the rollback
+//! gate on the previous path. The accepted-risk ledger, the runtimes, the CLI
+//! copy, and version collection are not touched. Install and upgrade roll a
+//! refresh back before `registering` and refuse it with
+//! `service_refresh_pending` from `registering` on; uninstall rolls it back
+//! before `registering` and takes the session-checked flow after it.
+//!
 //! # Config migration
 //!
 //! A `service.toml` written by a previous release (`schema_version` 2, 3, 4, 5 or 6,
@@ -161,7 +182,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
-use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
+use pohunek_platform::process::{HostInspector, Pid, ProcessIdentity, ProcessInspector};
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
@@ -198,6 +219,8 @@ use super::usage::{Journals, Usage};
 use super::verify::UnitVerifier;
 use crate::commands::integration::IntegrationEnv;
 use crate::paths::Paths;
+
+mod refresh_path;
 
 /// Durable metadata `--purge` removes from the data directory.
 ///
@@ -550,6 +573,7 @@ impl<'a> Engine<'a> {
                     launchd_default_path: None,
                     launchd_boot_identity: None,
                     accepted_risks: None,
+                    refresh: None,
                 };
                 self.store.save(&record)?;
                 record
@@ -725,6 +749,7 @@ impl<'a> Engine<'a> {
                 launchd_default_path,
                 launchd_boot_identity,
                 accepted_risks: None,
+                refresh: None,
             };
             self.store.save(&record)?;
             record
@@ -1168,8 +1193,16 @@ impl<'a> Engine<'a> {
         late.warnings.extend(warnings.iter().cloned());
         if swap {
             if let Some(dir) = config.daemon_executable().parent() {
-                self.pass_swap_gate(record, layout, dir, &job, &warnings, late)
-                    .await?;
+                self.pass_swap_gate(
+                    record,
+                    layout,
+                    dir,
+                    &job,
+                    &warnings,
+                    preflight::ReleasePlan::Included,
+                    late,
+                )
+                .await?;
             }
         }
         self.run_runtimes(record, layout, late, &job, &warnings)
@@ -1277,12 +1310,18 @@ impl<'a> Engine<'a> {
     /// and journals what it accepted.
     ///
     /// A refusal leaves the running daemon untouched, which `late.refused`
-    /// records.
+    /// records. `plan` says whether the judgement includes the release's
+    /// runtime plan: an upgrade's does, a search-path refresh keeps the
+    /// installed release and has none.
     ///
     /// # Errors
     ///
     /// Returns the refusals of the gate and a filesystem error when the
     /// accepted set cannot be journaled.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the gate's inputs are passed one by one, as gate_upgrade takes them"
+    )]
     async fn pass_swap_gate(
         &self,
         record: &mut Record,
@@ -1290,6 +1329,7 @@ impl<'a> Engine<'a> {
         daemon_dir: &Path,
         job: &JobPath,
         warnings: &[String],
+        plan: preflight::ReleasePlan,
         late: &mut LateGate,
     ) -> Result<(), Error> {
         let acceptance = match self.gate_acceptance(record) {
@@ -1313,7 +1353,7 @@ impl<'a> Engine<'a> {
             self.reported(&record.version),
             &job.value,
             &job.variables,
-            preflight::ReleasePlan::Included,
+            plan,
             self.accept_runtime_loss,
             &acceptance,
         )
@@ -1436,8 +1476,16 @@ impl<'a> Engine<'a> {
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
-            self.pass_swap_gate(record, config.layout(), dir, &job, &warnings, late)
-                .await?;
+            self.pass_swap_gate(
+                record,
+                config.layout(),
+                dir,
+                &job,
+                &warnings,
+                preflight::ReleasePlan::Included,
+                late,
+            )
+            .await?;
         }
         // Record the intent before the service-manager effect. A crash
         // between these calls replays the idempotent stop on resume, and
@@ -1831,6 +1879,9 @@ impl<'a> Engine<'a> {
                     self.wait_ready(previous).await?;
                 }
             }
+            Operation::RefreshPath => {
+                gated = self.rollback_refresh(record, &layout).await?;
+            }
         }
         let namespace = self.context.namespace()?;
         layout::claim_existing_prefix(&layout, &namespace)?;
@@ -1883,16 +1934,21 @@ impl<'a> Engine<'a> {
         previous: &str,
         record: &Record,
     ) -> Result<Gated, Error> {
-        let daemon_dir =
-            layout
-                .version_dir(previous)
-                .ok_or_else(|| Error::RollbackPreflightFailed {
-                    version: previous.to_owned(),
-                    detail: "previous version has no valid installation directory".to_owned(),
-                })?;
-        let daemon_dir = layout::verify_installed(layout, &daemon_dir)?;
+        let daemon_dir = rollback_daemon_dir(layout, previous)?;
         let job = journal_job_path(self.context, record).await?;
-        let warnings = job_warnings(self.context, &job);
+        self.judge_rollback(layout, previous, &daemon_dir, &job)
+            .await
+    }
+
+    /// Judges a rollback that restarts `previous` with the daemon job's `job`.
+    async fn judge_rollback(
+        &self,
+        layout: &InstallLayout,
+        previous: &str,
+        daemon_dir: &VerifiedVersionDir,
+        job: &JobPath,
+    ) -> Result<Gated, Error> {
+        let warnings = job_warnings(self.context, job);
         let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight: &*self.preflight,
@@ -1901,7 +1957,7 @@ impl<'a> Engine<'a> {
                 layout,
                 inspector: &*self.inspector,
             },
-            &daemon_dir,
+            daemon_dir,
             previous,
             self.reported(previous),
             &job.value,
@@ -1910,7 +1966,7 @@ impl<'a> Engine<'a> {
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
-        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)?;
+        require_manager_variables(job, &gated.report, self.accept_runtime_loss)?;
         gated.warnings = warnings;
         Ok(gated)
     }
@@ -2102,6 +2158,12 @@ impl<'a> Engine<'a> {
                     .map_err(|source| supervisor_error("install daemon", source)),
                 result => result.map_err(|source| supervisor_error("replace daemon", source)),
             },
+            // The job exists and is replaced in place; a missing job is an
+            // error, because the refresh promised a restart of that job.
+            (Operation::RefreshPath, _) => daemon
+                .replace(definition)
+                .await
+                .map_err(|source| supervisor_error("replace daemon", source)),
             (Operation::Upgrade, _) => match daemon.replace(definition).await {
                 // A migration stopped the daemon job before it rewrote
                 // `service.toml`, so there is nothing to replace; the new
@@ -2136,11 +2198,37 @@ impl<'a> Engine<'a> {
     /// main process, and a job that serves a version outside its expectation
     /// is refused immediately instead of being waited for.
     async fn wait_served(&self, serving: &Serving<'_>, version: &str) -> Result<(), Error> {
+        self.wait_served_after(serving, version, None).await
+    }
+
+    /// Waits until the supervised daemon answers `daemon.health` as `version`
+    /// from a process other than `replaced`.
+    ///
+    /// A replacement that keeps the version is proven only by a new main
+    /// process: the old process answers the same version until it is stopped.
+    /// Without a `replaced` process any daemon the job runs counts.
+    async fn wait_restarted(
+        &self,
+        version: &str,
+        replaced: Option<ProcessIdentity>,
+    ) -> Result<(), Error> {
+        self.wait_served_after(&Serving::Strict(version), version, replaced)
+            .await
+    }
+
+    /// [`Self::wait_served`], additionally refusing the job's main process
+    /// `replaced` as the answer.
+    async fn wait_served_after(
+        &self,
+        serving: &Serving<'_>,
+        version: &str,
+        replaced: Option<ProcessIdentity>,
+    ) -> Result<(), Error> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
             let mut last = match self.backend.control().health().await {
                 Ok(health) if self.serving_matches(&health.result.daemon_version, serving) => {
-                    match self.served_by_job(health.pid).await {
+                    match self.served_by_job(health.pid, replaced).await {
                         Ok(()) => return Ok(()),
                         Err(mismatch) => Some(mismatch),
                     }
@@ -2150,7 +2238,7 @@ impl<'a> Engine<'a> {
                         "daemon reports version {}",
                         health.result.daemon_version
                     )),
-                    Serving::Allowed(allowed) => match self.served_by_job(health.pid).await {
+                    Serving::Allowed(allowed) => match self.served_by_job(health.pid, None).await {
                         Ok(()) => {
                             return Err(Error::SupervisedVersion {
                                 served: health.result.daemon_version.clone(),
@@ -2182,16 +2270,24 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Checks that `pid`, the process serving the socket, is the daemon job.
+    /// Checks that `pid`, the process serving the socket, is the daemon job and
+    /// not the `replaced` process.
     ///
     /// Returns the observed mismatch as a readiness detail otherwise.
-    async fn served_by_job(&self, pid: Pid) -> Result<(), String> {
+    async fn served_by_job(
+        &self,
+        pid: Pid,
+        replaced: Option<ProcessIdentity>,
+    ) -> Result<(), String> {
         let observation = self.backend.daemon().inspect().await.map_err(|error| {
             format!(
                 "daemon socket is served by pid {pid}; the daemon job cannot be inspected: {error}"
             )
         })?;
         match (observation.state, observation.process) {
+            (ServiceState::Running, Some(process)) if replaced == Some(process) => Err(format!(
+                "daemon socket is served by pid {pid}, the process the job ran before the replacement; the job has not restarted"
+            )),
             (ServiceState::Running, Some(process)) if process.pid == pid => Ok(()),
             (ServiceState::Running, Some(process)) => Err(format!(
                 "daemon socket is served by pid {pid}; the supervised job runs pid {}",
@@ -2633,11 +2729,19 @@ fn allowed_removal_versions(active: &str, pending: Option<&Record>) -> Vec<Strin
 }
 
 /// Whether rollback would start the previous daemon after this recorded step.
+///
+/// A refresh-path rollback restarts the daemon with the previous search path
+/// once the job may have been replaced.
 pub(crate) fn rollback_restarts_previous(record: &Record) -> bool {
-    record.operation == Operation::Upgrade
-        && (record.step >= Step::Registering
-            || record.runtime_stop
-            || (record.config_backup.is_some() && record.step >= Step::StopDaemon))
+    match record.operation {
+        Operation::Install => false,
+        Operation::Upgrade => {
+            record.step >= Step::Registering
+                || record.runtime_stop
+                || (record.config_backup.is_some() && record.step >= Step::StopDaemon)
+        }
+        Operation::RefreshPath => record.step >= Step::Registering,
+    }
 }
 
 /// Returns whether a session may still own a live PTY.
@@ -2678,6 +2782,7 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
         operation: record.operation.as_str(),
         version: record.version.clone(),
         step: record.step.as_str(),
+        rolling_back: record.rolling_back,
         preflight: None,
         accepted_runtime_loss: false,
         warnings: Vec::new(),
@@ -2767,11 +2872,30 @@ pub(crate) async fn journal_job_path(context: &Context, record: &Record) -> Resu
     .await
 }
 
+/// The verified installation directory of the daemon a rollback restarts.
+fn rollback_daemon_dir(
+    layout: &InstallLayout,
+    previous: &str,
+) -> Result<VerifiedVersionDir, Error> {
+    let daemon_dir =
+        layout
+            .version_dir(previous)
+            .ok_or_else(|| Error::RollbackPreflightFailed {
+                version: previous.to_owned(),
+                detail: "previous version has no valid installation directory".to_owned(),
+            })?;
+    layout::verify_installed(layout, &daemon_dir)
+}
+
 /// Whether rolling back `record` stops the daemon job before restoring.
+///
+/// A refresh-path rollback never stops the job: the restored definition
+/// replaces it.
 pub(crate) fn rollback_stops_daemon(record: &Record) -> bool {
-    record.step >= Step::Registering
-        || record.runtime_stop
-        || (record.config_backup.is_some() && record.step >= Step::StopDaemon)
+    record.operation != Operation::RefreshPath
+        && (record.step >= Step::Registering
+            || record.runtime_stop
+            || (record.config_backup.is_some() && record.step >= Step::StopDaemon))
 }
 
 /// What an install or upgrade does with the pending transaction record.
@@ -2980,13 +3104,15 @@ pub(crate) async fn ensure_no_daemon_job(backend: &Backend) -> Result<(), Error>
 /// Returns [`Error::PendingInstall`] for another install that reached the
 /// registration step: it may already run its daemon with live workers, so
 /// only its own `install` may finish it and only the uninstall flow's
-/// session checks may remove it.
+/// session checks may remove it, and [`Error::RefreshPending`] for a search-path
+/// refresh that reached that step.
 pub(crate) fn install_plan(
     pending: Option<Record>,
     prefix: &Path,
     version: &str,
 ) -> Result<Plan, Error> {
     match pending {
+        Some(record) if record.operation == Operation::RefreshPath => refresh_plan(record),
         Some(record)
             if record.operation == Operation::Install
                 && record.version == version
@@ -3014,9 +3140,14 @@ pub(crate) fn install_plan(
 ///
 /// Returns [`Error::PendingInstall`] for any pending install: rolling it
 /// back would remove its daemon, which runs the new version once the record
-/// reached `ready`.
+/// reached `ready`, and [`Error::RefreshPending`] for a search-path refresh
+/// that reached `registering`.
 pub(crate) fn upgrade_plan(pending: Option<Record>, version: &str) -> Result<Plan, Error> {
     match pending {
+        // Matched before the same-version resume arm: a refresh record names
+        // the active version, and resuming it as an upgrade would skip its
+        // own steps.
+        Some(record) if record.operation == Operation::RefreshPath => refresh_plan(record),
         Some(record) if record.operation == Operation::Install => Err(Error::PendingInstall {
             version: record.version,
             step: record.step.as_str(),
@@ -3029,6 +3160,25 @@ pub(crate) fn upgrade_plan(pending: Option<Record>, version: &str) -> Result<Pla
         }
         Some(record) => Ok(Plan::RollBack(record)),
         None => Ok(Plan::Fresh),
+    }
+}
+
+/// What an install or upgrade does with a pending search-path refresh.
+///
+/// Before `registering` the refresh has not replaced the daemon job, so it is
+/// rolled back (the recorded path is restored, no daemon effect) and the
+/// command starts over. From `registering` on the daemon may already run with
+/// the new path and live workers, and only `refresh-path` itself, which
+/// completes or rolls back with the adoption gate, or the session-checked
+/// uninstall may decide that.
+fn refresh_plan(record: Record) -> Result<Plan, Error> {
+    if record.step >= Step::Registering {
+        Err(Error::RefreshPending {
+            step: record.step.as_str(),
+            rolling_back: record.rolling_back,
+        })
+    } else {
+        Ok(Plan::RollBack(record))
     }
 }
 

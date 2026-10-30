@@ -239,9 +239,10 @@ pub(super) fn recorded_path_warning(context: &Context, judged: &str) -> Option<S
          moved since it was recorded, for example after a Nix profile update, do not accept \
          the loss: with the `pohunek` of the release you are installing (`./pohunek` in its \
          unpacked archive), compare with `pohunek service refresh-path --dry-run`, record the \
-         current path with `pohunek service refresh-path`, and rerun this upgrade. A pending \
-         transaction blocks refresh-path (`pohunek service status` names it); see the update \
-         runbook"
+         current path with `pohunek service refresh-path` (it restarts the daemon with that \
+         path after the same adoption check), and rerun this upgrade. A pending transaction \
+         of another kind blocks refresh-path (`pohunek service status` names it); see the \
+         update runbook"
     ))
 }
 

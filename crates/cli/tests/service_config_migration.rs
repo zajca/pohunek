@@ -433,6 +433,7 @@ fn pending_migration(
         launchd_default_path: None,
         launchd_boot_identity: None,
         accepted_risks: None,
+        refresh: None,
     };
     store.save(&record).expect("journal interrupted migration");
 }

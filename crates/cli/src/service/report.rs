@@ -53,11 +53,13 @@ pub struct RefreshPathReport {
     pub dry_run: bool,
     /// Whether the discovered path differs from the recorded one.
     pub changed: bool,
-    /// Whether `service.toml` was rewritten: `changed` and not `dry_run`.
+    /// Whether the refresh took effect: `service.toml` records the new path and
+    /// the daemon job runs with it.
     pub applied: bool,
     /// The directories recorded before, in search order.
     pub recorded: Vec<PathBuf>,
-    /// The directories the login shell reports now, in search order.
+    /// The directories the login shell reports now, in search order; for a
+    /// resumed refresh, the directories the interrupted run journaled.
     pub discovered: Vec<PathBuf>,
     /// Discovered directories the recorded path lacks.
     pub added: Vec<PathBuf>,
@@ -69,6 +71,24 @@ pub struct RefreshPathReport {
     pub shell_defaulted: bool,
     /// Existing directories refused as untrusted.
     pub dropped: Vec<DroppedPath>,
+    /// What happened to the daemon job: `restarted`, `would_restart` (a dry
+    /// run of a change), or `none`.
+    pub daemon_restart: &'static str,
+    /// Whether the daemon job was registered but not running, so the
+    /// replacement started it (or would).
+    pub daemon_started: bool,
+    /// Worker jobs the restart leaves running; `None` when they could not be
+    /// listed.
+    pub workers_kept: Option<usize>,
+    /// Whether an interrupted refresh was resumed.
+    pub resumed: bool,
+    /// An interrupted refresh that was rolled back instead of resumed.
+    pub rolled_back: Option<PendingReport>,
+    /// The new daemon's adoption verdict the refresh passed (or, for a dry
+    /// run, would be judged by); `null` when no verdict was needed.
+    pub preflight: Option<PreflightReport>,
+    /// Whether `--accept-runtime-loss` accepted at-risk sessions in the verdict.
+    pub accepted_runtime_loss: bool,
     /// Conditions the operator should know, such as keys of `service.toml`
     /// this version does not know.
     pub warnings: Vec<String>,
@@ -296,15 +316,18 @@ pub struct KeptVersion {
     pub reason: String,
 }
 
-/// An interrupted install or upgrade.
+/// An interrupted install, upgrade, or search-path refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingReport {
-    /// `install` or `upgrade`.
+    /// `install`, `upgrade`, or `refresh_path`.
     pub operation: &'static str,
     /// The version it was installing.
     pub version: String,
     /// The last completed step.
     pub step: &'static str,
+    /// Whether its rollback has begun; shown only when it has.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rolling_back: bool,
     /// The previous daemon's read-only verdict when rollback replaced it.
     pub preflight: Option<PreflightReport>,
     /// Whether the operator accepted the rollback's at-risk sessions.

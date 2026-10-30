@@ -654,6 +654,26 @@ pub enum Error {
     #[error("a `pohunek service` transaction is pending; the recorded search path is unchanged")]
     RefreshBlockedByTransaction,
 
+    /// `service refresh-path` found no daemon job to replace.
+    ///
+    /// The refresh records the path and replaces the job together or changes
+    /// nothing, so without a job it changes nothing.
+    #[error("no daemon job is registered, so the new search path has nothing to take effect in; the recorded search path is unchanged")]
+    DaemonJobMissing,
+
+    /// `service.toml` changed while a search-path refresh was pending.
+    #[error("service.toml is neither the file the pending search-path refresh started from nor the one it wrote, so it was edited meanwhile; nothing was changed")]
+    RefreshConfigChanged,
+
+    /// A search-path refresh is pending and blocks this command.
+    #[error("a search-path refresh is pending at step {step}{}", if *rolling_back { " (rolling back)" } else { "" })]
+    RefreshPending {
+        /// The step the refresh reached.
+        step: &'static str,
+        /// Whether its rollback has begun.
+        rolling_back: bool,
+    },
+
     /// Another `pohunek service` command holds the transaction lock.
     #[error("another `pohunek service` command is running (lock {})", path.display())]
     TransactionInProgress {
@@ -809,6 +829,9 @@ impl Error {
             Self::RefreshConfigSchema { .. } => "service_refresh_config_schema",
             Self::SearchPathRefreshFailed { .. } => "service_search_path_refresh_failed",
             Self::RefreshBlockedByTransaction => "service_refresh_blocked_by_transaction",
+            Self::DaemonJobMissing => "service_daemon_job_missing",
+            Self::RefreshConfigChanged => "service_refresh_config_changed",
+            Self::RefreshPending { .. } => "service_refresh_pending",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
             Self::PrefixMismatch { .. } => "service_prefix_mismatch",
             Self::RollbackFailed { .. } => "service_rollback_failed",
@@ -855,7 +878,7 @@ impl Error {
                 .iter()
                 .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING))
             {
-                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path`, then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path` (it restarts the daemon with the new path), then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
             } else {
                 "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
             }),
@@ -954,6 +977,15 @@ impl Error {
             Self::RefreshBlockedByTransaction => Some(
                 "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it, and see https://github.com/zajca/pohunek/issues/1763 (recovery design)",
             ),
+            Self::DaemonJobMissing => Some(
+                "`pohunek service status` shows whether the daemon job is registered",
+            ),
+            Self::RefreshConfigChanged => Some(
+                "service.toml was edited while the refresh was pending: put it back as it was (or as the refresh wrote it), then rerun `pohunek service refresh-path`",
+            ),
+            Self::RefreshPending { .. } => {
+                Some("rerun `pohunek service refresh-path`; it resumes or rolls back the pending refresh")
+            }
             Self::PrefixMismatch { .. } => {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")
             }

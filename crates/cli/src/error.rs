@@ -711,6 +711,9 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::RefreshConfigSchema { .. }
         | Error::SearchPathRefreshFailed { .. }
         | Error::RefreshBlockedByTransaction
+        | Error::DaemonJobMissing
+        | Error::RefreshConfigChanged
+        | Error::RefreshPending { .. }
         | Error::LiveSessions { .. } => ErrorClass::Configuration,
         Error::Workflow { class, .. } => *class,
         Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,

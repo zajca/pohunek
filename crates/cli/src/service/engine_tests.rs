@@ -22,7 +22,7 @@ use pohunek_daemon::store::{
 };
 use pohunek_paths::BasePaths;
 use pohunek_platform::process::{
-    Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
+    Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_service_config::preflight::{SessionVerdict, StoreState, Verdict};
@@ -59,6 +59,9 @@ use pohunek_platform::supervisor::UnitEnvironment;
 #[cfg(target_os = "linux")]
 #[path = "engine_tests_unit_environment.rs"]
 mod unit_environment;
+
+#[path = "engine_tests_refresh.rs"]
+mod refresh_path;
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
@@ -471,6 +474,16 @@ fn engine_over<'a>(context: &'a Context, backend: &'a Backend) -> Engine<'a> {
     engine
 }
 
+/// A test action run when `replace` succeeds.
+#[derive(Clone)]
+struct ReplaceHook(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for ReplaceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplaceHook(..)")
+    }
+}
+
 #[derive(Debug, Default)]
 struct World {
     registered: Option<JobDefinition>,
@@ -491,6 +504,16 @@ struct World {
     refused_replace: Option<String>,
     /// Version whose daemon installation is refused during rollback.
     refused_install: Option<String>,
+    /// Daemon starts so far; each one gives the main process a new start identity.
+    restarts: u64,
+    /// `PATH` whose definition `replace` refuses without effect.
+    refused_replace_path: Option<String>,
+    /// `PATH` whose definition `replace` accepts without restarting the
+    /// daemon process: the old process keeps running and answering.
+    kept_process_path: Option<String>,
+    /// Runs once, when the next `replace` succeeds: the old daemon having
+    /// accepted work meanwhile.
+    replace_hook: Option<ReplaceHook>,
     /// A daemon store write made when the replacement starts.
     store_on_replace: Option<PathBuf>,
     /// A final store write made while the replacement stops.
@@ -568,6 +591,7 @@ impl DaemonSupervisor for Fake {
             }
             world.registered = Some(definition.clone());
             world.running = true;
+            world.restarts += 1;
             if world.registration == Registration::FailsAfterRegistering {
                 return Err(supervisor::Error::Operation {
                     operation: "install",
@@ -591,8 +615,21 @@ impl DaemonSupervisor for Fake {
                     source: "injected failure".into(),
                 });
             }
+            let path = definition.environment().get("PATH").cloned();
+            if path.is_some() && world.refused_replace_path == path {
+                return Err(supervisor::Error::Operation {
+                    operation: "replace",
+                    source: "injected failure for this PATH".into(),
+                });
+            }
             world.registered = Some(definition.clone());
             world.running = true;
+            if path.is_none() || world.kept_process_path != path {
+                world.restarts += 1;
+            }
+            if let Some(hook) = world.replace_hook.take() {
+                (hook.0)();
+            }
             if let Some(path) = world.store_on_replace.take() {
                 write_new_store(&path);
             }
@@ -616,7 +653,7 @@ impl DaemonSupervisor for Fake {
                 },
                 process: (world.running && !world.processless).then_some(ProcessIdentity {
                     pid: DAEMON_PID,
-                    start_identity: StartIdentity::new(1),
+                    start_identity: StartIdentity::new(1 + world.restarts),
                 }),
                 definition: Some(definition.facts()),
             })
@@ -1268,7 +1305,8 @@ async fn refresh(
     harness: &Harness,
     dry_run: bool,
 ) -> Result<crate::service::report::RefreshPathReport, Error> {
-    crate::service::refresh::refresh_search_path(&harness.context, None, dry_run).await
+    let discovered = crate::service::refresh::discover(&harness.context)?;
+    harness.engine().refresh_path(discovered, dry_run).await
 }
 
 fn config_bytes(harness: &Harness) -> Vec<u8> {
@@ -1417,15 +1455,7 @@ async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
         &fallback,
     );
     let context = harness.context.clone();
-    let refresher = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(crate::service::refresh::refresh_search_path(
-                &context, None, false,
-            ))
-    });
+    let refresher = std::thread::spawn(move || crate::service::refresh::discover(&context));
     pohunek_test_support::wait::poll_until("the login shell to start", || {
         started.exists().then_some(())
     });
