@@ -1105,6 +1105,41 @@ async fn install_status_upgrade_and_uninstall_round_trip() {
     ));
 }
 
+/// An uninstall never starts the configured daemon from an active version
+/// directory that fails verification; deleting the directory itself stays
+/// refused until the operator removes it.
+#[tokio::test]
+async fn an_uninstall_never_starts_a_daemon_from_an_untrusted_version_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.world().running = false;
+    let version_dir = harness.layout().version_dir(V1).expect("version directory");
+    std::fs::set_permissions(&version_dir, std::fs::Permissions::from_mode(0o775))
+        .expect("loosen the version directory");
+    let started_before = {
+        let world = harness.fake.world();
+        (world.installs, world.replaces)
+    };
+
+    let result = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::UntrustedVersion { .. })),
+        "the removal of the untrusted directory is refused: {result:?}"
+    );
+    let world = harness.fake.world();
+    assert_eq!(
+        (world.installs, world.replaces),
+        started_before,
+        "no daemon was started from the untrusted directory"
+    );
+}
+
 #[tokio::test]
 async fn an_install_interrupted_after_every_step_resumes_to_one_installation() {
     for step in STEPS {

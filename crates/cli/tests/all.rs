@@ -24,6 +24,8 @@ mod codex_package;
 mod completion_dynamic;
 #[path = "daemon_packaging.rs"]
 mod daemon_packaging;
+#[path = "daemon_start_service.rs"]
+mod daemon_start_service;
 #[path = "doctor_worker_compat.rs"]
 mod doctor_worker_compat;
 #[path = "hermes_integration.rs"]

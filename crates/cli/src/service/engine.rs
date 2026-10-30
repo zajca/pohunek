@@ -919,6 +919,7 @@ impl<'a> Engine<'a> {
         let reachable = match self
             .ensure_daemon(
                 &definition,
+                (&layout, &config.version_dir()),
                 config.active_version(),
                 &allowed_removal_versions(config.active_version(), registered.as_ref()),
                 &mut report,
@@ -2212,10 +2213,13 @@ impl<'a> Engine<'a> {
     /// it actually serves, which a removal may reach only within `allowed`
     /// ([`allowed_removal_versions`]; see [`Error::SupervisedVersion`]).
     /// A daemon started here is the configured one and must report `version`
-    /// exactly.
+    /// exactly. Starting it first verifies the active version directory
+    /// `active`, so an untrusted directory is never executed and the daemon
+    /// counts as unreachable.
     async fn ensure_daemon(
         &self,
         definition: &JobDefinition,
+        active: (&InstallLayout, &Path),
         version: &str,
         allowed: &[String],
         report: &mut UninstallReport,
@@ -2224,6 +2228,7 @@ impl<'a> Engine<'a> {
         let running = match daemon.inspect().await {
             Ok(observation) if observation.state == ServiceState::Running => true,
             Ok(_stopped) => {
+                layout::verify_installed(active.0, active.1)?;
                 daemon
                     .replace(definition)
                     .await
@@ -2232,6 +2237,7 @@ impl<'a> Engine<'a> {
                 false
             }
             Err(supervisor::Error::NotFound(_)) => {
+                layout::verify_installed(active.0, active.1)?;
                 daemon
                     .install(definition)
                     .await

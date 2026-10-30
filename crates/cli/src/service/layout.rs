@@ -626,7 +626,14 @@ pub fn verify_installed(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVe
     }
     let versions = open_existing_owner_dir(&layout.versions_dir())?
         .ok_or_else(|| untrusted("the versions directory does not exist"))?;
-    let directory = open_version(&versions, &version)?;
+    let directory = match open_version(&versions, &version) {
+        Err(Error::Filesystem { source, .. })
+            if matches!(source.raw_os_error(), Some(libc::ENOENT)) =>
+        {
+            return Err(untrusted("it is missing"));
+        }
+        opened => opened?,
+    };
     for binary in BINARIES {
         if open_binary(&directory, binary)?.is_none() {
             return Err(Error::UntrustedVersion {

@@ -305,6 +305,13 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Service(#[from] crate::service::Error),
 
+    /// `pohunek daemon start` could not verify the active version directory.
+    ///
+    /// Carries the service engine's error and code; only the recovery hint
+    /// differs, because `daemon start` installs nothing itself.
+    #[error(transparent)]
+    ActiveVersion(crate::service::Error),
+
     /// A `pohunek plugin` command was refused or could not resolve its target.
     #[error(transparent)]
     Plugin(#[from] crate::commands::plugin::Error),
@@ -596,6 +603,17 @@ impl CliError {
                         .to_owned(),
                 ),
             ),
+            CliError::ActiveVersion(error) => ProtocolError::new(
+                service_error_class(error),
+                error.code(),
+                error.to_string(),
+                match error {
+                    crate::service::Error::UntrustedVersion { .. } => {
+                        Some(ACTIVE_VERSION_HINT.to_owned())
+                    }
+                    other => other.hint().map(str::to_owned),
+                },
+            ),
             CliError::Service(error) => ProtocolError::new(
                 service_error_class(error),
                 error.code(),
@@ -646,6 +664,16 @@ impl CliError {
         self.to_protocol_error().recover
     }
 }
+
+/// Next step for a `daemon start` whose active version directory is untrusted
+/// or missing. No single command repairs it: an upgrade to the same version
+/// only re-verifies the directory and `service install` refuses an existing
+/// `service.toml`, so the runbook section explains the refusal and the recovery is tracked
+/// in #1763.
+const ACTIVE_VERSION_HINT: &str = "the active version directory is untrusted or missing: make \
+     sure nothing runs from it; see the \"Active version directory refused\" section of the \
+     debug-daemon runbook (docs/knowledge/runbooks/debug-daemon.md); the recovery is tracked \
+     in https://github.com/zajca/pohunek/issues/1763";
 
 /// The changes a setup stop reports, as a suffix of its message: empty when
 /// nothing was changed yet.

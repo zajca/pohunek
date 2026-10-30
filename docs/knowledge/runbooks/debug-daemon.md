@@ -406,3 +406,21 @@ commands perform client-side fan-out rather than reading a shared store.
 Do not treat installed config files as the daemon source of truth. A missing
 `attach.conf` or prompt template does not mean the daemon is unhealthy; verify
 daemon health first, then run `pohunek setup config` for the missing files.
+
+## Active version directory refused
+
+`pohunek daemon start` (and the assistant's automatic daemon start) verifies the
+active version directory of `service.toml` before it runs that version's
+`pohunekd`. It refuses with `service_version_untrusted` when the directory or one
+of its binaries is not what `pohunek service install` publishes: missing, a link,
+writable by another account or of another owner or mode.
+`pohunek service uninstall` applies the same check before it starts a stopped
+daemon and treats a refusal as an unreachable daemon; while worker jobs are
+still live the uninstall then fails with the same code, because the sessions can
+be stopped only through the daemon.
+
+Make sure nothing runs from that directory. No single command repairs it:
+`pohunek service upgrade` to the same version only re-verifies the directory, and
+`pohunek service install` refuses an existing `service.toml`. The full recovery
+procedure, including live worker jobs that cannot be stopped without the daemon,
+is tracked in [#1763](https://github.com/zajca/pohunek/issues/1763).
