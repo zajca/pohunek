@@ -9,7 +9,7 @@
 
 // Rust guideline compliant 2026-06-26
 
-use pohunek_service_config::ServiceConfig;
+use pohunek_service_config::{ConfigError, ServiceConfig, SCHEMA_VERSION};
 
 use super::context::Context;
 use super::error::Error;
@@ -30,6 +30,7 @@ use super::report::RefreshPathReport;
 /// Returns [`Error::NotInstalled`] without an installation,
 /// [`Error::RefreshBlockedByTransaction`] while a transaction record exists,
 /// [`Error::SearchPathUnmanaged`] when the host records no path,
+/// [`Error::RefreshConfigSchema`] for a `service.toml` of another schema,
 /// [`Error::SearchPathRefreshFailed`] when the login shell supplies none (the
 /// fallback list never replaces a recorded path), and the configuration and
 /// write errors of `service.toml`.
@@ -75,7 +76,15 @@ pub(crate) async fn refresh_search_path(
     if store.load()?.is_some() {
         return Err(Error::RefreshBlockedByTransaction);
     }
-    let config = ServiceConfig::load(&config_path)?;
+    let config = match ServiceConfig::load(&config_path) {
+        Err(ConfigError::UnsupportedSchema { found }) => {
+            return Err(Error::RefreshConfigSchema {
+                found,
+                current: SCHEMA_VERSION,
+            });
+        }
+        loaded => loaded?,
+    };
     config.verify_installation(
         context.uid(),
         &context.paths().state_dir,

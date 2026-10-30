@@ -2812,7 +2812,10 @@ next replacement. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
 fallback list never replaces a recorded path), `service_search_path_unmanaged`
 where the host records no path, `service_refresh_blocked_by_transaction` while a
-transaction record exists, and `service_not_installed`. A set but relative `$SHELL`, or a
+transaction record exists, `service_refresh_config_schema` for a `service.toml` of another
+schema than this release writes (nothing is rewritten; for an older file, uninstall and install
+the installed version from its archive; for a newer one, run the installed release's own
+`refresh-path`), and `service_not_installed`. A set but relative `$SHELL`, or a
 non-UTF-8 `HOME`, `USER`, or `LOGNAME`, fails the install
 (`service_environment_invalid`, `service_environment_not_utf8`). When the
 installer cannot resolve the search path, `pohunek service` fails with the CLI

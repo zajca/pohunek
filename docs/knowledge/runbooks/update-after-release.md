@@ -1001,6 +1001,10 @@ with the same warning cannot be refreshed around. Remove the record with
 `pohunek service uninstall` (it checks live sessions first), then install the
 version that is installed now from its own archive: a fresh install discovers
 the current path, so no `refresh-path` is needed.
+The same way out applies when `refresh-path` reports `service_refresh_config_schema`:
+it rewrites only a `service.toml` of the schema its own release writes, so an
+installation recorded by an older release (schema 6 or below) is left
+untouched and needs the uninstall and fresh install instead.
 
 ### Stopped sessions on an older official package version
 

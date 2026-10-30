@@ -1364,12 +1364,11 @@ async fn refresh_path_follows_a_profile_link_that_moved_and_keeps_unknown_keys()
 }
 
 #[tokio::test]
-async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_hangs_or_prints_junk() {
-    let deadline = std::time::Duration::from_millis(100);
+async fn refresh_path_keeps_the_recorded_path_when_the_login_shell_fails_or_prints_junk() {
+    let deadline = pohunek_test_support::wait::HANG_GUARD;
     for (name, body) in [
         ("fails", "exit 1"),
         ("prints junk", "echo 'not a path report'; exit 0"),
-        ("hangs", "exec sleep 3600"),
     ] {
         let mut harness = Harness::new();
         let recorded = harness.root.join("recorded-bin");
@@ -1403,12 +1402,18 @@ async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
     harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
     harness.install(V1).await.expect("install");
     let started = harness.root.join("shell-started");
-    let body = format!("touch '{}'; exec sleep 3600", started.display());
+    let release = harness.root.join("shell-release");
+    let body = format!(
+        "touch '{}'; while [ ! -e '{}' ] && [ -d '{}' ]; do sleep 0.01; done; exit 1",
+        started.display(),
+        release.display(),
+        harness.root.display()
+    );
     harness.context = scripted_discovery(
         &harness.context,
         &harness.root,
         &body,
-        std::time::Duration::from_secs(8),
+        pohunek_test_support::wait::HANG_GUARD,
         &fallback,
     );
     let context = harness.context.clone();
@@ -1431,12 +1436,47 @@ async fn refresh_path_holds_no_transaction_lock_while_the_login_shell_runs() {
         .await
         .expect("the lock is free while the login shell hangs");
     drop(lock);
+    std::fs::write(&release, b"").expect("release the login shell");
 
     let error = refresher
         .join()
         .expect("refresh thread")
-        .expect_err("the shell hangs");
+        .expect_err("the released shell fails");
     assert_eq!(error.code(), "service_search_path_refresh_failed");
+}
+
+#[tokio::test]
+async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_leaves_it_alone() {
+    let mut harness = Harness::new();
+    let recorded = harness.root.join("recorded-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
+    harness.install(V1).await.expect("install");
+    let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
+    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 7");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
+    let before = config_bytes(&harness);
+
+    let error = refresh(&harness, false).await.expect_err("older schema");
+
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    let hint = error.hint().expect("hint");
+    assert!(
+        hint.contains("pohunek service uninstall") && hint.contains("from its own archive"),
+        "{hint}"
+    );
+    assert_eq!(config_bytes(&harness), before, "service.toml is untouched");
+
+    let newer = text.replacen("schema_version = 7", "schema_version = 8", 1);
+    std::fs::write(harness.context.config_path(), &newer).expect("write schema 8");
+    let error = refresh(&harness, false).await.expect_err("newer schema");
+    assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
+    let hint = error.hint().expect("hint");
+    assert!(
+        hint.contains("newer release") && hint.contains("<prefix>/bin/pohunek"),
+        "{hint}"
+    );
+    assert_eq!(config_bytes(&harness), newer.into_bytes(), "untouched");
 }
 
 #[tokio::test]

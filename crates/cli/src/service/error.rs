@@ -628,6 +628,16 @@ pub enum Error {
     #[error("this host's daemon job takes the service manager's own PATH, so there is no search path to refresh")]
     SearchPathUnmanaged,
 
+    /// `service refresh-path` on a `service.toml` of another schema than this
+    /// release writes.
+    #[error("service.toml has schema {found}, but this release refreshes only schema {current}")]
+    RefreshConfigSchema {
+        /// The `schema_version` the file declares.
+        found: i64,
+        /// The schema this release reads and writes.
+        current: u32,
+    },
+
     /// `service refresh-path` could not read the path from the login shell.
     ///
     /// The fallback list an install would record in that case is never put in
@@ -796,6 +806,7 @@ impl Error {
             Self::ConfigBackup { .. } => "service_config_backup_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
             Self::SearchPathUnmanaged => "service_search_path_unmanaged",
+            Self::RefreshConfigSchema { .. } => "service_refresh_config_schema",
             Self::SearchPathRefreshFailed { .. } => "service_search_path_refresh_failed",
             Self::RefreshBlockedByTransaction => "service_refresh_blocked_by_transaction",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
@@ -930,6 +941,12 @@ impl Error {
             }
             Self::SearchPathUnmanaged => Some(
                 "nothing to refresh: this installation takes the PATH of the service manager, which a login-shell discovery does not change",
+            ),
+            Self::RefreshConfigSchema { found, current } if *found > i64::from(*current) => Some(
+                "service.toml was written by a newer release: run `pohunek service refresh-path` of the installed release (`<prefix>/bin/pohunek`); this binary never rewrites it",
+            ),
+            Self::RefreshConfigSchema { .. } => Some(
+                "refresh-path never rewrites a service.toml of an older schema; run `pohunek service uninstall` (it keeps durable metadata and refuses while sessions are live), install the version that is installed now from its own archive with the same --prefix (a fresh install discovers the current path), and rerun the upgrade",
             ),
             Self::SearchPathRefreshFailed { .. } => Some(
                 "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
