@@ -1,3 +1,4 @@
 ## Unreleased (2026-10-30, daemon start verifies the active version, #1360)
 
 - `pohunek daemon start` in service mode verifies the active version directory (`layout::verify_installed`) before it runs that version's `pohunekd`, and refuses an untrusted one with `service_version_untrusted`, the code the service engine uses; a missing active version directory gets the same code. `--dev-subprocess` is unchanged.
+- `pohunek service uninstall` verifies the active version directory before it starts a stopped daemon to list sessions, and treats a refusal as an unreachable daemon. The refusal of `daemon start` names the recovery: remove the untrusted directory, then upgrade to another version or save `service.toml`, uninstall, install the same version from its archive with the same prefix, reapply the settings except `search_path`.

@@ -165,10 +165,17 @@ impl Host {
         );
         assert!(
             stderr.contains(
-                "hint: upgrade to another release version with `pohunek service upgrade`"
+                "hint: make sure nothing runs from that version directory and remove it, then"
             ),
             "the refusal names the way to replace the active version: {stderr}"
         );
+        for step in [
+            "pohunek service upgrade",
+            "--stop-sessions",
+            "save a copy of service.toml",
+        ] {
+            assert!(stderr.contains(step), "the hint names `{step}`: {stderr}");
+        }
         assert!(!self.marker().exists(), "the daemon must not run");
     }
 }
