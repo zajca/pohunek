@@ -223,6 +223,10 @@ pub struct PackageStore {
     /// listing.
     #[cfg(test)]
     verifications: Arc<AtomicU64>,
+    /// The threads that verified a package root, so tests can tell a root
+    /// verified on an async task from one verified on the blocking pool.
+    #[cfg(test)]
+    verifying_threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
     /// Registry records read so far, for the same bound.
     #[cfg(test)]
     state_reads: Arc<AtomicU64>,
@@ -262,6 +266,8 @@ impl PackageStore {
             #[cfg(test)]
             verifications: Arc::default(),
             #[cfg(test)]
+            verifying_threads: Arc::default(),
+            #[cfg(test)]
             state_reads: Arc::default(),
         }
     }
@@ -287,6 +293,11 @@ impl PackageStore {
     fn ready_root(&self, digest: &PackageDigest) -> Result<VerifiedRoot, PackageRejection> {
         #[cfg(test)]
         self.verifications.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.verifying_threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(std::thread::current().id());
         let referenced = RetainedDigests::from_iter([digest.clone()]);
         let roots = self
             .registry
@@ -390,6 +401,15 @@ impl PackageStore {
     #[cfg(test)]
     pub(crate) fn root_verifications(&self) -> u64 {
         self.verifications.load(Ordering::Relaxed)
+    }
+
+    /// The threads that verified a package root, in order.
+    #[cfg(test)]
+    pub(crate) fn verifying_threads(&self) -> Vec<std::thread::ThreadId> {
+        self.verifying_threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// How many registry records this store has read.
