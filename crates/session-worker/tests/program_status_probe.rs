@@ -222,12 +222,11 @@ async fn an_echoed_probe_reply_is_not_answered_again() {
 }
 
 #[tokio::test]
-async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
+async fn a_probe_reply_lands_while_a_paced_plan_delay_runs() {
     let cwd = tempdir().expect("temp dir");
     // The shell prints a probe after reading the plan's first fragment and a
-    // second one once the test opened the gate; the plan holds the input lock
-    // until the test drops it, so the second probe finds the first reply still
-    // pending.
+    // second one once the test opened the gate. The plan is inside its delay
+    // and holds no input lock, so each probe is answered at once.
     let gate = cwd.path().join("go");
     let script = format!(
         "stty raw -echo; head -c 1 >/dev/null; printf '{PROBE_ST}'; printf P1; \
@@ -265,15 +264,15 @@ async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
     assert_eq!(
         dump(&output, 1),
         REPLY_HEX,
-        "the single reply is written once the plan released the lock"
+        "the first reply is written during the plan's delay"
     );
-    // A second reply would sit in the input ahead of the marker.
-    write_stream(&pty, b"Z").await;
+    // The second probe's reply follows the first one in the input; its first
+    // byte is what the second dump reads.
     let output = output_until(&pty, ":END2").await;
     assert_eq!(
         dump(&output, 2),
-        "5a",
-        "the two probes coalesced into one reply"
+        "1b",
+        "the second probe is answered with its own reply"
     );
 }
 

@@ -551,7 +551,7 @@ const OBSERVER_STREAM_ID: &str = "attach-observer";
 /// Reads an observer stream until its output contains `marker`. The PTY echoes
 /// each accepted input byte, so an echoed line proves the attach write was
 /// accepted and now holds the execution lock.
-async fn await_pty_echo(observer: &mut DataStream, marker: &[u8]) {
+async fn await_pty_echo(observer: &mut DataStream, marker: &[u8]) -> Vec<u8> {
     let mut echoed = Vec::new();
     let outcome = tokio::time::timeout(DEADLINE, async {
         while !echoed.windows(marker.len()).any(|window| window == marker) {
@@ -580,6 +580,7 @@ async fn await_pty_echo(observer: &mut DataStream, marker: &[u8]) {
         echoed.len(),
         String::from_utf8_lossy(&echoed[echoed.len().saturating_sub(120)..])
     );
+    echoed
 }
 
 #[tokio::test]
@@ -872,7 +873,7 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
                 .await
         }
     });
-    await_pty_echo(&mut observer, b"plan-body").await;
+    let body_echo = await_pty_echo(&mut observer, b"plan-body").await;
 
     // The plan is inside its delay: its body is echoed and its Enter is not
     // yet written. An attach write must reach the PTY now instead of queueing
@@ -893,10 +894,17 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
     write_frame(&mut attach.stream, &attach_input)
         .await
         .expect("send attach input");
-    await_pty_echo(&mut observer, b"attach-mark").await;
+    // The PTY echoes bytes in the order it accepts them. The plan's Enter is
+    // written after the delay, so an attach write that lands inside the delay
+    // is echoed directly after the body.
+    let mut echoed = body_echo;
+    echoed.extend(await_pty_echo(&mut observer, b"attach-mark").await);
     assert!(
-        !plan.is_finished(),
-        "the attach write waited for the plan's delay to end"
+        echoed
+            .windows(b"plan-bodyattach-mark".len())
+            .any(|window| window == b"plan-bodyattach-mark"),
+        "the attach write did not land between the plan's fragments: {:?}",
+        String::from_utf8_lossy(&echoed)
     );
 
     plan.await

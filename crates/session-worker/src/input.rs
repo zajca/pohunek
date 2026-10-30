@@ -213,7 +213,7 @@ impl WriteCoordinator {
     /// handling.
     ///
     /// The plan is bounded by the coordinator's stall: waiting for the
-    /// execution lock held by an attach write and every PTY write count as no
+    /// plan lock, the execution lock held by an attach write and every PTY write count as no
     /// progress. A control caller must never wedge its connection behind a
     /// human's input, so a plan that cannot take a lock within the stall fails
     /// with [`InputError::Stalled`] and stops after the fragments already
