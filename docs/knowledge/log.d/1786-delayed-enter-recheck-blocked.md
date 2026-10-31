@@ -1,0 +1,4 @@
+## Unreleased (2026-10-31, delayed Enter re-checks blocked for refusing runtimes, #1786 #544)
+
+- A fire-and-forget `session.input` with a nonzero submit delay checked the activity before the body only. It now re-checks under the session lock before Enter and, for a runtime whose rules refuse input while blocked (Hermes, Pi), withholds Enter and fails with `session_input_not_submitted` (the waited path already did). Claude and Codex keep delivering while blocked.
+- #544 is resolved without a new activity value: the folder-trust, login, theme, API-key and permission dialogs read `blocked`, `idle` is the prompt shown and ready, and the first-input readiness is the `[input] ready` gate. A daemon-boundary scenario pins the order (trust dialog blocked, then the prompt box idle, initial input written only after it).

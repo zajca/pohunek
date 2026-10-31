@@ -8126,6 +8126,93 @@ async fn delayed_plain_input_serves_a_stop_while_the_submit_delay_runs() {
         .expect("the text was delivered before the stop");
 }
 
+/// A Hermes stand-in that answers `got:<line>` once it receives Enter.
+#[cfg(unix)]
+fn delayed_hermes_registry(tag: &str) -> SessionRegistry {
+    let runtime = temp_dir(&format!("{tag}-runtime"));
+    let script = runtime.join("hermes");
+    write_executable(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'; exit 0; fi\nwhile IFS= read -r line; do echo got:$line; done\n",
+    );
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "delayed-hermes",
+        &format!(
+            "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
+            script.display()
+        ),
+    );
+    SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delayed_plain_input_withholds_enter_when_the_agent_turns_blocked_during_the_delay() {
+    let registry = delayed_hermes_registry("delayed-plain-blocked");
+    let id = create_delayed_session(&registry, "delayed-hermes").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id: id,
+                    text: "first-marker".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    // The body is in the agent's input box; a dialog draws before Enter.
+    reach_boundary(&delay_boundary).await;
+    assert!(
+        report_agent_activity(&registry, &id, "hermes", AgentActivity::Blocked, 1)
+            .await
+            .recorded
+    );
+    reach_boundary(&delay_boundary).await;
+    let error = request
+        .await
+        .expect("input task joins")
+        .expect_err("Enter must be withheld while the agent reads blocked");
+    assert_eq!(error.code, "session_input_not_submitted", "{error:?}");
+
+    // The dialog clears and the next input submits: its Enter ends the one
+    // line the agent has read, which therefore holds both bodies. Had the
+    // first Enter been written, `first-marker` would have been answered alone.
+    assert!(
+        report_agent_activity(&registry, &id, "hermes", AgentActivity::Idle, 2)
+            .await
+            .recorded
+    );
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: id.clone(),
+            text: "second-marker".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("input after the dialog cleared");
+    let output = wait_for_session_output(&registry, &id, &["got:"]).await;
+    let answer = output
+        .lines()
+        .find(|line| line.contains("got:"))
+        .expect("the agent answered one line");
+    assert!(
+        answer.contains("first-marker") && answer.contains("second-marker"),
+        "the first body was submitted on its own: {output:?}"
+    );
+    registry.stop(&id).await.expect("stop the session");
+}
+
 #[tokio::test]
 async fn delayed_plain_input_succeeds_when_the_agent_exits_before_enter() {
     // The text ends with a newline, so the fake TUI reads its line and exits
@@ -12256,11 +12343,21 @@ async fn report_input_activity(
     activity: AgentActivity,
     sequence: u64,
 ) -> protocol::SessionReportAgentResult {
+    report_agent_activity(registry, session_id, "codex", activity, sequence).await
+}
+
+async fn report_agent_activity(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    agent: &str,
+    activity: AgentActivity,
+    sequence: u64,
+) -> protocol::SessionReportAgentResult {
     registry
         .report_agent(protocol::SessionReportAgentParams {
             session_id: session_id.clone(),
             source: "test:pohunek-input-wait".to_owned(),
-            agent: "codex".to_owned(),
+            agent: agent.to_owned(),
             activity: Some(activity),
             seq: Some(protocol::ReportSequence::new(sequence)),
             pid: None,
