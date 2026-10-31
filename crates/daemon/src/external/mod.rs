@@ -1391,6 +1391,9 @@ fn parse_transcript(
 /// records within `TRANSCRIPT_SCAN_BYTE_LIMIT` bytes and takes the first
 /// session id, transcript path and absolute working directory they carry.
 ///
+/// A line is read as bytes: one that is not valid UTF-8 is skipped like an
+/// unparseable one and never fails the file.
+///
 /// The top-level keys are read from every record and win. The declared head
 /// paths are read from the first line only, as a fallback for a value no
 /// top-level key supplied: later records of a rollout carry ids of their own,
@@ -1414,12 +1417,14 @@ fn parse_jsonl_head(
     let byte_limit =
         u64::try_from(TRANSCRIPT_SCAN_BYTE_LIMIT).expect("transcript byte limit fits in u64");
     for (index, line) in BufReader::new(file.take(byte_limit))
-        .lines()
+        .split(b'\n')
         .take(TRANSCRIPT_SCAN_LINE_LIMIT)
         .enumerate()
     {
         let line = line?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        // A line that is not valid UTF-8, or that the byte limit cut inside a
+        // multibyte character, is unparseable like any other bad line.
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         let is_head = index == 0;

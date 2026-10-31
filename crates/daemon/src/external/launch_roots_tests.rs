@@ -1443,6 +1443,55 @@ async fn without_declared_paths_a_nested_rollout_head_is_not_attributed() {
     assert!(indexed_sessions(&rig).await.is_empty());
 }
 
+#[tokio::test]
+async fn a_line_that_is_not_utf8_does_not_drop_the_attribution_of_the_file() {
+    let rig = Rig::with_packages(|plugins| {
+        install_acme(plugins, &head_paths_descriptor(HEAD_PATHS_TABLE));
+    });
+    let tree = rig.home().join(".acme/sessions/2026/10/31");
+    fs::create_dir_all(&tree).expect("rollout directory");
+
+    // A good head, then a line of invalid UTF-8.
+    let mut bytes = format!("{}\n", rollout_head(ROLLOUT_ID, "/work")).into_bytes();
+    bytes.extend_from_slice(b"{\"payload\":\"\xff\xfe\"}\n");
+    bytes.extend_from_slice(format!("{}\n", rollout_item(OTHER_ID, "/elsewhere")).as_bytes());
+    fs::write(tree.join("rollout-bad-line.jsonl"), bytes).expect("write the rollout");
+
+    // A top-level id in a record after an invalid line is still read.
+    let mut bytes = b"\xff\xfe\n".to_vec();
+    bytes.extend_from_slice(b"{\"sessionId\":\"after-bad\",\"cwd\":\"/after\"}\n");
+    fs::write(tree.join("rollout-bad-first.jsonl"), bytes).expect("write the rollout");
+
+    // The scan limit cuts the last line inside a multibyte character.
+    let head = rollout_head("cut-limit", "/cut");
+    let filler = "{\"note\":\"".to_owned();
+    let mut cut = format!("{head}\n{filler}").into_bytes();
+    let room = super::TRANSCRIPT_SCAN_BYTE_LIMIT - cut.len();
+    cut.extend(std::iter::repeat_n(b'a', room - 1));
+    cut.push(0xC3); // first byte of a two-byte character, cut by the limit
+    cut.extend_from_slice(&[0xA9, b'"', b'}', b'\n']);
+    fs::write(tree.join("rollout-cut.jsonl"), cut).expect("write the rollout");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get(ROLLOUT_ID),
+        Some(&Some(PathBuf::from("/work"))),
+        "{indexed:?}"
+    );
+    assert_eq!(
+        indexed.get("after-bad"),
+        Some(&Some(PathBuf::from("/after"))),
+        "{indexed:?}"
+    );
+    assert_eq!(
+        indexed.get("cut-limit"),
+        Some(&Some(PathBuf::from("/cut"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key(OTHER_ID), "{indexed:?}");
+}
+
 /// The session ids, with their working directories, a full pass over the data
 /// root of `rig` indexes.
 async fn indexed_sessions(rig: &Rig) -> std::collections::BTreeMap<String, Option<PathBuf>> {
