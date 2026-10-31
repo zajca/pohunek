@@ -16,6 +16,7 @@ use std::time::Duration;
 use protocol::RuntimeRef;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::{
     start, RootRegistration, RootScan, TranscriptSink, TranscriptWatch, WatchBackend, WatchEvent,
@@ -224,7 +225,15 @@ impl Harness {
         });
         let shutdown = CancellationToken::new();
         let roots = vec![claude_root(&root_path)];
-        let handle = start(backend, roots, Arc::clone(&sink), shutdown.clone(), None).await;
+        let handle = start(
+            backend,
+            roots,
+            Arc::clone(&sink),
+            shutdown.clone(),
+            &TaskTracker::new(),
+            None,
+        )
+        .await;
         Self {
             handle,
             input,
@@ -530,6 +539,7 @@ async fn a_hint_under_a_symlinked_nested_root_is_owned_by_the_nested_provider() 
         roots,
         Arc::clone(&sink),
         CancellationToken::new(),
+        &TaskTracker::new(),
         None,
     )
     .await;
@@ -703,6 +713,7 @@ async fn an_open_failure_starts_unavailable_and_recovers_on_restart() {
         vec![claude_root(root.path())],
         Arc::clone(&sink),
         CancellationToken::new(),
+        &TaskTracker::new(),
         Some(io::Error::other("cannot open")),
     )
     .await;
@@ -753,6 +764,7 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
         roots,
         Arc::clone(&sink),
         CancellationToken::new(),
+        &TaskTracker::new(),
         None,
     )
     .await;
@@ -798,6 +810,7 @@ async fn a_root_that_stops_being_an_alias_is_picked_up_by_the_next_pass() {
         roots,
         Arc::clone(&sink),
         CancellationToken::new(),
+        &TaskTracker::new(),
         None,
     )
     .await;
@@ -919,6 +932,7 @@ async fn registration_walks_run_off_the_runner_thread() {
         vec![claude_root(root.path())],
         Arc::new(FakeSink::default()),
         CancellationToken::new(),
+        &TaskTracker::new(),
         None,
     )
     .await;
@@ -938,13 +952,21 @@ async fn shutdown_interrupts_a_registration_that_is_still_walking() {
     let (release, blocked) = std::sync::mpsc::channel();
     let (backend, _threads) = blocking_probe(root.path(), Some(blocked));
     let shutdown = CancellationToken::new();
-    let started = tokio::spawn(start(
-        backend,
-        vec![claude_root(root.path())],
-        Arc::new(FakeSink::default()),
-        shutdown.clone(),
-        None,
-    ));
+    let tasks = TaskTracker::new();
+    let started = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            start(
+                backend,
+                vec![claude_root(root.path())],
+                Arc::new(FakeSink::default()),
+                shutdown,
+                &tasks,
+                None,
+            )
+            .await
+        }
+    });
 
     shutdown.cancel();
     let finished = tokio::time::timeout(Duration::from_secs(30), started).await;
@@ -989,6 +1011,7 @@ impl RealSinkHarness {
             vec![claude_root(root.path())],
             sink,
             shutdown.clone(),
+            &TaskTracker::new(),
             None,
         )
         .await;
@@ -1093,6 +1116,7 @@ async fn a_pending_parse_below_a_root_that_left_is_dropped_by_the_next_pass() {
         Arc::clone(&provider),
         Arc::clone(&sink),
         CancellationToken::new(),
+        &TaskTracker::new(),
         None,
     )
     .await;

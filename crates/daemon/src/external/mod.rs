@@ -22,6 +22,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, warn};
 
 use watch::{RootProvider, RootScan, TranscriptSink, WatchBackend, WatcherHandle};
@@ -118,6 +119,8 @@ struct ExternalSessionsInner {
     entries: AsyncMutex<HashMap<Pid, ExternalEntry>>,
     rescan: Notify,
     shutdown: CancellationToken,
+    /// The observer task and the transcript watcher it starts.
+    tasks: TaskTracker,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +337,7 @@ impl ExternalSessions {
                 entries: AsyncMutex::new(HashMap::new()),
                 rescan: Notify::new(),
                 shutdown: CancellationToken::new(),
+                tasks: TaskTracker::new(),
             }),
         }
     }
@@ -351,7 +355,7 @@ impl ExternalSessions {
     /// Spawns the external observer task.
     pub(crate) fn spawn_observer(&self, registry: SessionRegistry, config: ExternalObserverConfig) {
         let sessions = self.clone();
-        tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             run_observer(registry, sessions, config).await;
         });
     }
@@ -359,6 +363,20 @@ impl ExternalSessions {
     /// Stops the observer loop and the transcript watcher.
     pub(crate) fn shutdown(&self) {
         self.inner.shutdown.cancel();
+    }
+
+    /// Waits until the observer and the watcher have ended.
+    ///
+    /// Call it after [`Self::shutdown`]; both tasks stop on that signal, and
+    /// the wait does not return before they have.
+    pub(crate) async fn stopped(&self) {
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
+    }
+
+    /// Number of observer and watcher tasks still running.
+    pub(crate) fn tasks_running(&self) -> usize {
+        self.inner.tasks.len()
     }
 
     /// Returns a cancellation token fired when the observer shuts down.
@@ -1026,7 +1044,15 @@ async fn start_transcript_index_with(
         ),
         Err(error) => (ReopenableBackend { inner: None }, Some(error)),
     };
-    let watcher = watch::start(backend, roots, sink, sessions.shutdown_token(), open_error).await;
+    let watcher = watch::start(
+        backend,
+        roots,
+        sink,
+        sessions.shutdown_token(),
+        &sessions.inner.tasks,
+        open_error,
+    )
+    .await;
     (index, watcher)
 }
 
@@ -1690,6 +1716,66 @@ mod observer_tests {
         })
         .await;
         sessions.shutdown();
+    }
+
+    /// Spawns an observer over a fixed root on `sessions` and waits until it
+    /// and the watcher it starts are running.
+    async fn running_observer(
+        sessions: &ExternalSessions,
+        registry: SessionRegistry,
+        root: &std::path::Path,
+    ) {
+        sessions.spawn_observer(
+            registry,
+            ExternalObserverConfig {
+                roots: ObservedRoots::Fixed(vec![TranscriptRoot {
+                    parser: TranscriptParser::JsonlHeadV1,
+                    agent_base: RuntimeRef::claude(),
+                    path: root.to_path_buf(),
+                    private: false,
+                    max_depth: None,
+                }]),
+                sweep_interval: SWEEP_INTERVAL,
+            },
+        );
+        // The observer starts the watcher, so both run on the tracker.
+        pohunek_test_support::wait::wait_until(
+            "the observer and its watcher to be running",
+            || async { (sessions.tasks_running() == 2).then_some(()) },
+        )
+        .await;
+    }
+
+    fn quiet_registry() -> SessionRegistry {
+        SessionRegistry::new_with_inspector(
+            SessionRegistryConfig::default(),
+            Arc::new(CountingInspector::default()) as Arc<dyn ProcessInspector>,
+        )
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_until_the_observer_and_its_watcher_have_ended() {
+        let (root, _transcript) = transcript_root();
+        let sessions = ExternalSessions::new();
+        running_observer(&sessions, quiet_registry(), root.path()).await;
+
+        sessions.shutdown();
+        tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, sessions.stopped())
+            .await
+            .expect("the observer and the watcher end on shutdown");
+        assert_eq!(sessions.tasks_running(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_waits_for_the_external_observer() {
+        let (root, _transcript) = transcript_root();
+        let registry = quiet_registry();
+        running_observer(registry.external_for_test(), registry.clone(), root.path()).await;
+
+        let report = registry.shutdown().await;
+
+        assert!(report.is_quiescent(), "{report:?}");
+        assert_eq!(registry.external_for_test().tasks_running(), 0);
     }
 }
 
