@@ -617,8 +617,10 @@ native hook in a repository that product `git` then runs in calls
 `pohunek_test_support::git::pin_hooks`, because product `git` inherits the developer's
 Git files and a global `core.hooksPath` would replace the repository's hooks. Every Python
 test module that runs `git` imports `hermetic_git` (`scripts/tests/hermetic_git.py`)
-before anything else (enforced by `scripts/tests/test_hermetic_git.py`), which isolates the
-whole test process from the developer's Git files; script tests run with
+before its first statement that is not an import (enforced by
+`scripts/tests/test_hermetic_git.py`), which isolates the whole test process from the
+developer's Git files and gives it a private `HOME` (`CARGO_HOME` and `RUSTUP_HOME` keep the
+real toolchain); script tests run with
 `python3 -m unittest discover -s scripts/tests`, which puts the helper on the import path. The hermetic scan does not check the Rust
 rule; review does.
 

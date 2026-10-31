@@ -1,12 +1,14 @@
 """Script tests run git without the developer's Git configuration (#1779).
 
 The scenario gives a child process a hostile global, XDG and system Git
-configuration and runs the git steps the script tests run: init, commit, an
-annotated tag and a remote URL lookup. With `hermetic_git` imported they
+configuration under a real home and runs the git steps the script tests run:
+init, commit, an annotated tag, a remote URL lookup, and an include of a file
+under `~`. With `hermetic_git` imported they
 succeed and none of the hostile settings applies; without it the same steps
 fail, which shows the configuration is hostile.
 """
 
+import ast
 import os
 from pathlib import Path
 import re
@@ -40,6 +42,9 @@ STEPS = textwrap.dedent(
     git("remote", "add", "origin", "https://example.invalid/repo.git")
     print(git("ls-remote", "--get-url", "origin"))
     print(" ".join(git("ls-files").split()))
+    git("config", "--local", "include.path", "~/extra.gitconfig")
+    print("toolchain=" + os.environ["CARGO_HOME"] + "," + os.environ["RUSTUP_HOME"])
+    print("leak=" + subprocess.run(["git", "config", "--get", "leak.key"], capture_output=True, text=True).stdout.strip())
     """
 )
 
@@ -67,10 +72,13 @@ def hostile_environment(root):
     (xdg / "git").mkdir(parents=True)
     (xdg / "git" / "config").write_text(hostile)
     (xdg / "git" / "ignore").write_text("*.log\n")
+    (root / "extra.gitconfig").write_text("[leak]\n\tkey = reached\n")
+    (root / ".cargo").mkdir()
+    (root / ".rustup").mkdir()
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("GIT_")
+        if not key.startswith("GIT_") and key not in ("CARGO_HOME", "RUSTUP_HOME")
     }
     environment.update(
         HOME=str(root),
@@ -80,6 +88,17 @@ def hostile_environment(root):
         PYTHONPATH=str(TESTS),
     )
     return environment, marker
+
+
+def imports_helper_first(source):
+    """Whether `import hermetic_git` precedes every statement that is not an import or a docstring."""
+    for index, statement in enumerate(ast.parse(source).body):
+        if isinstance(statement, ast.Import) and any(alias.name == "hermetic_git" for alias in statement.names):
+            return True
+        is_docstring = index == 0 and isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+        if not is_docstring and not isinstance(statement, (ast.Import, ast.ImportFrom)):
+            return False
+    return False
 
 
 class HermeticGitTests(unittest.TestCase):
@@ -100,6 +119,12 @@ class HermeticGitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "https://example.invalid/repo.git")
         self.assertEqual(result.stdout.splitlines()[1], "file noise.log", "a personal ignore file applied")
+        self.assertEqual(result.stdout.splitlines()[3], "leak=", "a setting under the real HOME was reached")
+        root = marker.parent
+        self.assertEqual(
+            result.stdout.splitlines()[2], f"toolchain={root}/.cargo,{root}/.rustup",
+            "the toolchain homes of the real HOME are kept",
+        )
         self.assertFalse(marker.exists(), "the global core.hooksPath hook ran")
 
     def test_the_same_steps_fail_without_the_isolation(self):
@@ -114,9 +139,9 @@ class HermeticGitTests(unittest.TestCase):
             if not RUNS_GIT.search(source):
                 continue
             with self.subTest(module=path.name):
-                self.assertRegex(
-                    source, re.compile(r"^import hermetic_git\b", re.MULTILINE),
-                    f"{path.name} runs git without importing hermetic_git",
+                self.assertTrue(
+                    imports_helper_first(source),
+                    f"{path.name} runs git without importing hermetic_git before its first other statement",
                 )
 
 

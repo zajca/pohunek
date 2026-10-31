@@ -1,16 +1,23 @@
 """Process-wide git isolation for the script tests.
 
 A test module that runs `git` (directly, or through the script it tests)
-imports this module first. The import replaces the developer's Git
+imports this module before its first statement that is not an import. The import replaces the developer's Git
 configuration for the whole test process: no global or system configuration
 file, no personal ignore or attributes file (the XDG directory names a path no
-account owns), no `-c` parameters, no variable that selects a repository, a
-fixed identity and no prompt. A global `commit.gpgsign`, `core.hooksPath`, `init.templateDir`,
+account owns), a private empty `HOME` (so no `~` lookup of git, gpg or a
+credential helper reaches the developer's home), no `-c` parameters, no variable
+that selects a repository, a fixed identity and no prompt. The toolchain
+directories of the real home stay reachable through `CARGO_HOME` and
+`RUSTUP_HOME`. A global `commit.gpgsign`, `core.hooksPath`, `init.templateDir`,
 `gpg.ssh.program` or `url.<base>.insteadOf` therefore cannot reach a fixture
 repository, and child processes inherit the same environment.
 """
 
+import atexit
 import os
+import shutil
+import tempfile
+from pathlib import Path
 
 IDENTITY_NAME = "test"
 IDENTITY_EMAIL = "test@example.invalid"
@@ -39,8 +46,21 @@ REPOSITORY_SELECTION = (
 )
 
 
+def private_home(environment):
+    """Points `HOME` at a new empty directory, keeping the toolchain homes."""
+    real = environment.get("HOME")
+    if real:
+        for variable, name in (("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")):
+            if variable not in environment and Path(real, name).is_dir():
+                environment[variable] = str(Path(real, name))
+    home = tempfile.mkdtemp(prefix="hg-home-")
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    environment["HOME"] = home
+
+
 def isolate(environment):
     """Makes `environment` (a mutable mapping) ignore the developer's Git files."""
+    private_home(environment)
     for name in REPOSITORY_SELECTION:
         environment.pop(name, None)
     for name in [name for name in environment if name.startswith("GIT_CONFIG_KEY_") or name.startswith("GIT_CONFIG_VALUE_")]:
