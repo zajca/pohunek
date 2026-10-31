@@ -42,6 +42,13 @@ on:
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != '' && format('CI [tier={0}] [dispatch={1}]', inputs.tier, inputs.dispatch_id) || (github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier)) || ' ' }}
 
 
+# A required job that fails in a pull request or `workflow_dispatch` run cancels
+# the run (#1075): the job's last step uses .github/actions/cancel-run, and a
+# `cancel-after-<job>` job does the same when a called workflow ends red. The
+# step needs `actions: write`, granted per job and never for the workflow.
+# Push runs, scheduled runs and the advisory audit job never cancel. The failing
+# job and the run end as `cancelled`; the `::error` annotation names the job that
+# failed first and `test selection verdict` is the red check.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
 # drain (#1209): the running main run completes, and GitHub keeps only the
 # newest push pending behind it, replacing an older pending one. Each scheduled
@@ -135,6 +142,9 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) }}
     needs: [changes, test-selection]
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: write
     # The lane's test phase takes about 450 s on macos-15; the rest of the
     # budget covers the toolchain, cache restore and a cold build.
     timeout-minutes: 45
@@ -305,6 +315,9 @@ jobs:
           name: macos-lane-junit
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # The macOS packages the PR lane does not test (issue #361): their macOS-only
   # test code runs here on main and nightly, never on a pull request.
@@ -313,6 +326,9 @@ jobs:
     # No pull_request branch: this job never starts on a pull request.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) }}
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -376,6 +392,9 @@ jobs:
           name: macos-tier-junit
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # The version-A release daemon for aarch64-apple-darwin, built once per run
   # (issue #1210). `macos-package` and `hermes-compatibility-macos` download
@@ -386,6 +405,9 @@ jobs:
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true')) }}
     needs: changes
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 45
     env:
       # mold is Linux-only: keep the default linker on macOS runners.
@@ -431,6 +453,9 @@ jobs:
           path: ${{ runner.temp }}/macos-release-daemon.tar
           retention-days: 1
           if-no-files-found: error
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Native Apple Silicon packaging (issue #104): the daemon archive is packaged
   # from the binaries of `macos-release-build`, and the nightly tier rebuilds
@@ -448,6 +473,9 @@ jobs:
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true') }}
     needs: [changes, macos-release-build]
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 90
     env:
       # mold is Linux-only: keep the default linker on macOS runners.
@@ -571,6 +599,9 @@ jobs:
           PKG_ACCEPT_ARCHIVE: ${{ steps.package-a.outputs.archive }}
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
         run: scripts/acceptance/macos-package-install
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
   # selection whose every changed file has no Rust tests and no gate but
@@ -580,6 +611,9 @@ jobs:
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -612,6 +646,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Lints the macOS-only code on a Linux runner in about two minutes cold
   # (issue #365), so a `cfg(target_os = "macos")` compile or lint error fails a
@@ -630,6 +667,9 @@ jobs:
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     env:
       # No mold link argument: the lint links nothing, and with an explicit
       # `--target` RUSTFLAGS apply to the Apple target only.
@@ -657,6 +697,9 @@ jobs:
 
       - name: Clippy for aarch64-apple-darwin
         run: scripts/darwin-check
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Selects the pull request's tests with the selector of its merge base
   # (scripts/ci-test-selection); every other event runs every test. A test
@@ -667,6 +710,7 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     outputs:
@@ -783,6 +827,9 @@ jobs:
           path: ${{ runner.temp }}/test-selection/
           retention-days: 1
           if-no-files-found: error
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Compiles every workspace test binary exactly once for the fast shards, the
   # heavy job, and the relay DB job (issue #170). Designated `test-debug`
@@ -790,6 +837,9 @@ jobs:
   build-tests:
     name: build tests (nextest archive)
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -833,12 +883,18 @@ jobs:
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
     needs: [build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.fast_shards != '[]') }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -925,6 +981,9 @@ jobs:
           if-no-files-found: warn
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./relocated/.github/actions/cancel-run
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
   # drift) only run when their inputs change or on a schedule; the
   # always-critical jobs (fmt, clippy, fast tests, heavy tests, doctests,
@@ -938,6 +997,7 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       pull-requests: read
+      actions: write
     outputs:
       relay: ${{ steps.filter.outputs.relay }}
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
@@ -1222,12 +1282,18 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   integration:
     name: tests (heavy, PTY + Hermes)
     needs: [build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     defaults:
       run:
         working-directory: relocated
@@ -1312,6 +1378,9 @@ jobs:
           name: nextest-junit-heavy
           path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./relocated/.github/actions/cancel-run
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
   # user manager (transient worker units, the namespaced daemon unit, the
@@ -1321,6 +1390,9 @@ jobs:
   systemd-supervision:
     name: real systemd supervision
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       POHUNEK_SYSTEMD_E2E: "1"
@@ -1423,6 +1495,9 @@ jobs:
       - name: Workflow event reactions
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'workflow_reactions::'
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Issue #525: a session started on the previous release survives
   # `pohunek service upgrade` to this build. The job is the reusable
@@ -1437,6 +1512,26 @@ jobs:
     permissions:
       contents: read
 
+  cancel-after-upgrade-test:
+    name: cancel the run after upgrade-test fails
+    needs: upgrade-test
+    if: ${{ needs.upgrade-test.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run (fail fast)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          FAILED_JOB: upgrade-test
+        run: |
+          set -eu
+          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+
   # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
   # their own job whose Postgres service only starts when relay-relevant files
   # changed (issue #121) — except on the nightly sweep and nightly manual
@@ -1449,6 +1544,9 @@ jobs:
     needs: [changes, build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true') && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.relay_db != 'false') }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     services:
       postgres:
         # Docker Official Image from Google's cache, pinned to its OCI index.
@@ -1536,6 +1634,9 @@ jobs:
           name: nextest-junit-relay-db
           path: relocated/target/nextest/relay-db/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./relocated/.github/actions/cancel-run
 
   # G3 of #1218: each package's tests run from a tree holding only the files
   # whose change selects that package, so a test that reads a path outside
@@ -1546,6 +1647,9 @@ jobs:
     needs: [build-tests]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
@@ -1634,6 +1738,9 @@ jobs:
           name: test-selection-audit
           path: ${{ runner.temp }}/test-selection-audit/
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Skipping the shards a narrowed plan does not start can drop no selected
   # test: every selected test must lie in a planned shard. It runs on every
@@ -1643,6 +1750,9 @@ jobs:
     needs: [build-tests, test-selection]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     defaults:
       run:
         working-directory: relocated
@@ -1669,6 +1779,9 @@ jobs:
 
       - name: Verify the planned shards hold every selected test
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./relocated/.github/actions/cancel-run
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
@@ -1725,6 +1838,9 @@ jobs:
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -1749,12 +1865,18 @@ jobs:
       # Nextest does not execute rustdoc tests; preserve the cargo test gate.
       - name: Documentation tests
         run: cargo test --doc --workspace --all-features
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Full release build: schedule, push to main, manual dispatch, or a pull
   # request that changes a `release` filter input.
   release-build:
     name: release build
     runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: changes
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release == 'true' }}
     env:
@@ -1778,6 +1900,9 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Release rehearsal (issue #150): the PR-time proof of the release assembly.
   # It runs the same reusable workflows as a tag with mode `rehearsal`: the
@@ -1803,6 +1928,26 @@ jobs:
     with:
       mode: rehearsal
 
+  cancel-after-release-rehearsal-build:
+    name: cancel the run after release-rehearsal-build fails
+    needs: release-rehearsal-build
+    if: ${{ needs.release-rehearsal-build.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run (fail fast)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          FAILED_JOB: release-rehearsal-build
+        run: |
+          set -eu
+          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+
   # The rehearsal's synthetic-archive smoke scenarios (issue #1259, D1/D2).
   # The scenarios read only this checkout, so the job waits for `changes`
   # alone: it starts in parallel with the rehearsal build and before the
@@ -1816,6 +1961,26 @@ jobs:
     uses: ./.github/workflows/release-smoke-scenarios.yml
     permissions:
       contents: read
+
+  cancel-after-release-rehearsal-scenarios:
+    name: cancel the run after release-rehearsal-scenarios fails
+    needs: release-rehearsal-scenarios
+    if: ${{ needs.release-rehearsal-scenarios.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run (fail fast)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          FAILED_JOB: release-rehearsal-scenarios
+        run: |
+          set -eu
+          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   release-rehearsal:
     name: release rehearsal (evidence, assembly, archive smoke)
@@ -1836,6 +2001,26 @@ jobs:
       # scenario result is not `success`.
       scenarios_result: ${{ needs.release-rehearsal-scenarios.result }}
 
+  cancel-after-release-rehearsal:
+    name: cancel the run after release-rehearsal fails
+    needs: release-rehearsal
+    if: ${{ needs.release-rehearsal.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run (fail fast)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          FAILED_JOB: release-rehearsal
+        run: |
+          set -eu
+          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+
   # The release gate's test steps, run between releases (#1727): in the
   # nightly tier (schedule or a nightly dispatch) and on a pull request that
   # changes a `release_gate` filter input. It never runs on push to main or a
@@ -1851,6 +2036,26 @@ jobs:
     permissions:
       contents: read
 
+  cancel-after-release-gate:
+    name: cancel the run after release-gate fails
+    needs: release-gate
+    if: ${{ needs.release-gate.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run (fail fast)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          FAILED_JOB: release-gate
+        run: |
+          set -eu
+          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+
   # TS-binding drift is gated by paths filter (issue #125); it only runs on
   # schedule, push to main, manual dispatch (always a full run), or when the
   # protocol/generation inputs change.
@@ -1858,6 +2063,9 @@ jobs:
   ts-drift:
     name: TS binding drift (xs check)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: changes
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true' }}
     env:
@@ -1886,6 +2094,9 @@ jobs:
         run: cargo xtask ts check
         env:
           RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Official Hermes runtime package against the pinned, locked Hermes
   # release. `compat stage-upstream` stages the runtime with the provisioner
@@ -1898,6 +2109,9 @@ jobs:
   hermes-package:
     name: pinned Hermes compatibility (model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.hermes != 'false') }}
     env:
@@ -2206,6 +2420,9 @@ jobs:
           name: package-junit-hermes
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Runtime package selection for pull requests (issue #149). `cargo xtask
   # package affected` classifies every file the pull request changes against
@@ -2229,6 +2446,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     outputs:
@@ -2355,6 +2573,9 @@ jobs:
               echo "${package}_baseline_digest=$digest"
             done
           } >> "$GITHUB_OUTPUT"
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Version gate of the official packages (issue #894). `cargo xtask package
   # bump` fails a pull request that changes a package's archive without a
@@ -2372,6 +2593,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -2483,6 +2705,9 @@ jobs:
           if [ "$(jq -r '.verdict' "$RUNNER_TEMP/package-bump.json")" = undecided ]; then
             echo "::warning::the catalog of release v$VERSION is absent; the version bump gate is undecided"
           fi
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Official Pi runtime package against the real, locked Pi release. The job
   # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,
@@ -2495,6 +2720,9 @@ jobs:
   pi-package:
     name: Pi runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.pi != 'false') }}
     env:
@@ -2621,6 +2849,9 @@ jobs:
           name: package-junit-pi
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Official Codex runtime package against the real, locked Codex release. The
   # job installs the npm tree pinned by `compat/codex/npm/package-lock.json`,
@@ -2636,6 +2867,9 @@ jobs:
   codex-package:
     name: Codex runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.codex != 'false') }}
     env:
@@ -2754,6 +2988,9 @@ jobs:
           name: package-junit-codex
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Official Claude Code runtime package against the real, locked Claude Code
   # release. The job installs the npm tree pinned by
@@ -2773,6 +3010,9 @@ jobs:
   claude-package:
     name: Claude Code runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.claude != 'false') }}
     env:
@@ -2900,6 +3140,9 @@ jobs:
           name: package-junit-claude
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Native Apple Silicon counterpart of `hermes-package`. It provisions
   # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD
@@ -2914,6 +3157,9 @@ jobs:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true') }}
     needs: [changes, macos-release-build]
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: write
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       # mold is Linux-only: keep the default linker on macOS runners.
@@ -3214,6 +3460,9 @@ jobs:
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
             ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Each test runs at most once per OS in a run (#1226): this job reads every
   # JUnit report of the run and fails on a test two jobs of the same OS ran,
@@ -3234,6 +3483,9 @@ jobs:
       - hermes-compatibility-macos
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -3250,6 +3502,9 @@ jobs:
 
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).
@@ -3261,6 +3516,9 @@ jobs:
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
+    permissions:
+      contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -3319,6 +3577,9 @@ jobs:
           name: hermes-e2e-package
           path: target/hermes-e2e
           if-no-files-found: error
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
   # selection whose every changed file has no Rust tests and no gate but
@@ -3326,6 +3587,9 @@ jobs:
   sdk:
     name: SDK workspace
     runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
+    permissions:
+      contents: read
+      actions: write
     needs: [build-bins, test-selection]
     if: ${{ !cancelled() && needs.build-bins.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     steps:
@@ -3418,6 +3682,9 @@ jobs:
           POHUNEK_PYTHON_BIN: /usr/bin/python3
           POHUNEK_HERMES_PACKAGE: ${{ github.workspace }}/target/hermes-e2e/hermes.tar.zst
           POHUNEK_HERMES_CATALOG_DIR: ${{ github.workspace }}/target/hermes-e2e/catalog
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # The SDK workspace on Apple Silicon (issue #103): typecheck, lint, unit
   # tests, and the SDK e2e suite against the real macOS pohunekd,
@@ -3427,6 +3694,9 @@ jobs:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.sdk_macos == 'true') }}
     needs: changes
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -3485,6 +3755,9 @@ jobs:
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Dependency hygiene (M-STATIC-VERIFICATION): security advisories, the Cargo
   # feature matrix, and unused dependencies. Kept off the critical `test` job so
@@ -3525,6 +3798,9 @@ jobs:
   docs:
     name: docs check (schema + drift + source-map + runbooks + secrets + release)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -3543,10 +3819,16 @@ jobs:
         run: cargo xtask docs check
         env:
           RUSTFLAGS: -D warnings
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   feature-matrix:
     name: cargo-hack (feature powerset)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     # Expensive (issue #125): run only on schedule, push to main, manual
     # dispatch (always a full run), or when the dependency graph / feature
     # set / CI workflow changes.
@@ -3584,6 +3866,9 @@ jobs:
       # exercises the everything-on case.
       - name: Check feature powerset
         run: cargo hack --feature-powerset --workspace clippy --all-targets
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Pull requests get the stable source-level `shear` job below. cargo-udeps
   # needs the nightly toolchain and a full workspace build, so it runs only on
@@ -3593,6 +3878,9 @@ jobs:
   udeps:
     name: cargo-udeps (unused dependencies)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
@@ -3626,6 +3914,9 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo udeps --workspace --all-targets --all-features
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
 
   # Unused-dependency check for every event, including pull requests. It reads
   # manifests and sources without compiling, so it needs only stable cargo for
@@ -3642,6 +3933,9 @@ jobs:
     needs: test-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -3657,3 +3951,6 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo shear --locked --deny-warnings --format=github
+      - name: Cancel the run (fail fast)
+        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run

@@ -157,6 +157,21 @@ passed, and a failing, cancelled or still pending check does not.
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
 
+**Fail fast.** When a required job of a pull request run or a
+`workflow_dispatch` run of `ci.yml` fails, its last step (`Cancel the run (fail
+fast)`, the composite `.github/actions/cancel-run`) cancels the run, so the jobs
+that are still running free their runners for other work. The five jobs that
+call a reusable workflow have a `cancel-after-<job>` job instead, which cancels
+when the called workflow ends red. Push runs (`main` drains), scheduled runs,
+the advisory `cargo-audit` job and a job that was itself cancelled never
+trigger it. Read such a run accordingly: the job that failed and the run end as
+`cancelled`, while the failed step stays red in the job log and the step's
+`::error` annotation (`Fail fast`) names the job that failed first. So a
+cancelled job in a pull request run can mean that another job failed first, and
+the `test selection verdict` check, which still runs after the cancel, is the
+red check. A fork or Dependabot pull request has a read-only token, so the
+cancel call is refused and the run keeps its real failure.
+
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the
 route is in the [contribution workflow](../.agents/skills/contribute/SKILL.md)),

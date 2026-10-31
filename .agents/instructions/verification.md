@@ -275,6 +275,21 @@ sources, which the filter leaves out, surfaces in the nightly tier. Ordinary
 worker, PTY, hook, daemon, and CLI changes need no dispatch: pull-request CI
 already runs the macOS lanes.
 
+**Fail fast.** When a required job of a pull request run or a
+`workflow_dispatch` run of `ci.yml` fails, its last step (`Cancel the run (fail
+fast)`, the composite `.github/actions/cancel-run`) cancels the run, so the jobs
+that are still running free their runners for other work. The five jobs that
+call a reusable workflow have a `cancel-after-<job>` job instead, which cancels
+when the called workflow ends red. Push runs (`main` drains), scheduled runs,
+the advisory `cargo-audit` job and a job that was itself cancelled never
+trigger it. Read such a run accordingly: the job that failed and the run end as
+`cancelled`, while the failed step stays red in the job log and the step's
+`::error` annotation (`Fail fast`) names the job that failed first. So a
+cancelled job in a pull request run can mean that another job failed first, and
+the `test selection verdict` check, which still runs after the cancel, is the
+red check. A fork or Dependabot pull request has a read-only token, so the
+cancel call is refused and the run keeps its real failure.
+
 **Fork heads.** This applies to every dispatch, rerun and `head_ref` rule in
 this repository's agent instructions. A fork head is never dispatched, never run
 through a ref such as `refs/pull/<N>/head`, and its jobs are never rerun by an
