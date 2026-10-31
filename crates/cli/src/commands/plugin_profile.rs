@@ -32,6 +32,7 @@ use super::plugin::{
     Error,
 };
 use crate::client::Client;
+use crate::commands::profile_bind::{self, PinCheck, UNCHECKED_PIN_NOTE};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::LOCAL_HOST;
@@ -723,6 +724,7 @@ async fn run_migrate(args: &MigrateArgs) -> Result<(), CliError> {
     };
     let preview = client
         .call::<method::PackageBindProfile>(PackageBindProfileParams {
+            expected_previous: None,
             profile: name.to_owned(),
             digest: requested,
             dry_run: true,
@@ -749,14 +751,20 @@ async fn run_migrate(args: &MigrateArgs) -> Result<(), CliError> {
         .into());
     }
     // The call names the package the owner consented to, so a package
-    // selected between the preview and this call cannot change the target.
-    let bound = client
-        .call::<method::PackageBindProfile>(PackageBindProfileParams {
-            profile: name.to_owned(),
-            digest: Some(preview.package.digest.clone()),
-            dry_run: false,
-        })
-        .await?;
+    // selected between the preview and this call cannot change the target, and
+    // the pin the preview showed, so a pin made since is refused, not replaced.
+    let check = PinCheck::probe(&mut client).await?;
+    if !check.daemon_checks() {
+        eprintln!("{UNCHECKED_PIN_NOTE}");
+    }
+    let bound = profile_bind::bind(
+        &mut client,
+        check,
+        name,
+        preview.package.digest.clone(),
+        preview.previous.clone(),
+    )
+    .await?;
     print_output(args.json, &bound, || render_migration(&bound))
 }
 

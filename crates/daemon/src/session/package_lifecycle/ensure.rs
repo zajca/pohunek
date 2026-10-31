@@ -24,17 +24,17 @@ use package::registry::{PackageSource, RegistryState};
 use package::verify::VerifyError;
 use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
+    AcceptedGap, CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
-    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
+    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_LISTED_MORE_THAN_ONCE,
     CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
     CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST, CODE_GAP_UPDATE_VERSION_UNORDERED,
-    CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, CODE_PINNED_TARGET_NOT_OFFICIAL,
-    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
-    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION, CODE_PINNED_VERSION_UNKNOWN,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
-    ENSURE_REPORT_VERSION,
+    CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_LISTED_MORE_THAN_ONCE,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
+    CODE_PINNED_TARGET_NOT_OFFICIAL, CODE_PINNED_TO_NEWER_VERSION,
+    CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION,
+    CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE,
+    CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{
@@ -101,6 +101,9 @@ pub struct EnsureInputs {
     /// installed `service.toml` cannot be read. An unreadable file refuses the
     /// plan, because the integration homes are read through it.
     pub environment: Result<crate::runtime::LaunchEnvironment, String>,
+    /// Conditions an apply reports as gaps instead of refusing them; a
+    /// detecting plan reports every such condition as a gap already.
+    pub accepted_gaps: Vec<AcceptedGap>,
 }
 
 /// A failure that stops the step before a report exists.
@@ -351,6 +354,8 @@ struct Report {
     /// keeps that runtime's not-serving gap even when the program is off the
     /// search path.
     profiled: Vec<String>,
+    /// Refusals the owner accepted as gaps.
+    accepted: Vec<AcceptedGap>,
 }
 
 impl Report {
@@ -368,6 +373,7 @@ impl Report {
             gaps: Vec::new(),
             undetected: Vec::new(),
             profiled: Vec::new(),
+            accepted: inputs.accepted_gaps.clone(),
         }
     }
 
@@ -399,10 +405,15 @@ impl Report {
         });
     }
 
-    /// Records a condition as a gap under `--detect`, and as a refusal
-    /// otherwise, so the upgrade's plan does not change.
+    /// Records a condition as a gap under `--detect` and when the owner accepted
+    /// exactly that gap, and as a refusal otherwise, so the upgrade's plan does
+    /// not change.
     fn gap_or_refuse(&mut self, subject: &str, gap_code: &str, refusal_code: &str, detail: &str) {
-        if self.detect {
+        let accepted = self
+            .accepted
+            .iter()
+            .any(|gap| gap.runtime == subject && gap.code == refusal_code);
+        if self.detect || accepted {
             self.gap(subject, gap_code, detail);
         } else {
             self.refuse(subject, refusal_code, detail);
@@ -930,6 +941,7 @@ fn apply(
     for bind in binds {
         let retained = retained_pins(&inputs.store_path, &profiles, Some(&bind.name))?;
         let params = PackageBindProfileParams {
+            expected_previous: None,
             profile: bind.name.clone(),
             digest: Some(bind.digest.clone()),
             dry_run: false,
@@ -1424,6 +1436,34 @@ fn plan_installed(
     })
 }
 
+/// Reports a runtime whose release catalog entries for this platform are not
+/// exactly one: none is a gap or a refusal, and several are a malformed
+/// release. Several for a runtime only the detection planned (`used` is
+/// false) are a gap alone, because an apply never plans such a runtime.
+fn report_listing(report: &mut Report, subject: &str, listed: usize, used: bool) {
+    if listed == 0 {
+        report.gap_or_refuse(
+            subject,
+            CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+            CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+            "the release catalog lists no package of this runtime for this platform",
+        );
+    } else if used {
+        report.gap_or_refuse(
+            subject,
+            CODE_PACKAGE_LISTED_MORE_THAN_ONCE,
+            CODE_PACKAGE_LISTED_MORE_THAN_ONCE,
+            "the release catalog lists more than one package of this runtime for this platform",
+        );
+    } else {
+        report.gap(
+            subject,
+            CODE_GAP_LISTED_MORE_THAN_ONCE,
+            "the release catalog lists more than one package of this runtime for this platform",
+        );
+    }
+}
+
 /// Plans one official runtime with a usable release catalog: its one release
 /// package for this platform, verified, and whether the host already has it
 /// selected and healthy.
@@ -1448,12 +1488,7 @@ fn plan_runtime(
         })
         .count();
     if listed != 1 {
-        report.gap_or_refuse(
-            &subject,
-            CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-            CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-            "the release catalog lists no single package of this runtime for this platform",
-        );
+        report_listing(report, &subject, listed, !reasons.is_empty());
         return Ok(None);
     }
     let Some(prepared) = prepare_release_archive(release, &runtime, report) else {

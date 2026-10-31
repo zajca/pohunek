@@ -581,9 +581,9 @@ async fn a_second_setup_on_a_configured_host_is_a_no_op() {
 }
 
 /// A fresh host whose plan lists a gap that the install engine's runtime step,
-/// which applies without detection, refuses: a profile's runtime without a
-/// package for this platform. The run stops before any change instead of
-/// rolling the install back.
+/// which applies without detection, refuses and setup does not accept: a
+/// runtime a profile uses, which the release catalog lists more than once. The
+/// run stops before any change instead of rolling the install back.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
@@ -614,8 +614,8 @@ async fn a_refusal_of_the_install_runtime_step_stops_setup_before_any_change() {
         "integrations": [],
         "gaps": [{
             "runtime": "codex",
-            "code": "official_package_unavailable_for_platform",
-            "detail": "the release catalog lists no single package of this runtime for this platform",
+            "code": "official_package_listed_more_than_once",
+            "detail": "the release catalog lists more than one package of this runtime for this platform",
         }],
         "refusals": [],
     }))
@@ -642,6 +642,69 @@ async fn a_refusal_of_the_install_runtime_step_stops_setup_before_any_change() {
         roots.each_ref().map(|root| snapshot(root)),
         before,
         "nothing is written"
+    );
+}
+
+/// A fresh host whose profile uses a runtime that the release catalog lists no
+/// package of for this platform. The preview lists the gap; the install
+/// engine's real runtime step, which applies without detection, refuses that
+/// runtime unless setup hands it the gap, so the install going on shows the
+/// accepted gap reached the step's argv: the service and the other runtime are
+/// installed and no package of the gapped runtime appears. The profile over the
+/// gapped runtime cannot work, so the closing doctor check is the only problem
+/// the run reports, and the profile is untouched.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_platform_gap_the_owner_saw_does_not_stop_the_install() {
+    let host = FreshHost::with_runtimes(&["codex"]);
+    let agents = config_dir(&host.installation).join("agents");
+    directory(&agents, PRIVATE_DIR);
+    let profile = agents.join("work.toml");
+    fs::write(&profile, "base = \"claude\"\n").expect("write the profile");
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    let planned = plan(&host.installation.context, &host.release, &host.planner)
+        .await
+        .expect("plan the run");
+    assert!(
+        planned
+            .preview
+            .gaps
+            .iter()
+            .any(|gap| gap.runtime == "claude"
+                && gap.code == "official_package_unavailable_for_platform"),
+        "{:?}",
+        planned.preview.gaps
+    );
+
+    let error = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect_err("the profile over the gapped runtime fails the closing check");
+
+    assert_eq!(error.code(), "setup_incomplete");
+    let message = error.to_string();
+    assert!(
+        message.contains("doctor reports a failed check: agent_profile_work")
+            && message.contains("setup installed no package for claude")
+            && message.contains("run `pohunek setup` again")
+            && !message.contains("runtimes not present")
+            && !message.contains("refuse"),
+        "the doctor check is the only problem: {message}"
+    );
+    assert!(
+        message.contains("package codex: installed") && !message.contains("package claude"),
+        "the install went on without the gapped runtime: {message}"
+    );
+    assert!(
+        installed_at_this_version(&host.installation).await,
+        "the service is installed"
+    );
+    assert_eq!(
+        fs::read_to_string(&profile).expect("read the profile"),
+        "base = \"claude\"\n",
+        "the profile is untouched"
     );
 }
 
@@ -1166,10 +1229,10 @@ fn supported_banner(runtime: &str) -> String {
 /// archive: this build's binaries, the throwaway trust anchor beside the
 /// daemon and the signed `runtime/`, sealed with the archive's verifier and
 /// `MANIFEST`, so setup verifies it before it runs anything from it.
-fn stage_release(installation: &Installation, key: &SigningKey) -> PathBuf {
+fn stage_release(installation: &Installation, key: &SigningKey, runtimes: &[&str]) -> PathBuf {
     let release = installation.root.join("archive");
     setup_release::stage_binaries(&release);
-    setup_release::sign(&release, key);
+    setup_release::sign_runtimes(&release, key, runtimes);
     setup_release::seal(&release);
     release
 }
@@ -1325,6 +1388,12 @@ impl FreshHost {
     /// A host with fake `claude` and `codex` on its search path and their
     /// config homes present, and no pohunek state at all.
     fn new() -> Self {
+        Self::with_runtimes(&setup_release::RELEASE_RUNTIMES)
+    }
+
+    /// The same host, with a release whose catalog lists only the packages of
+    /// `runtimes`.
+    fn with_runtimes(runtimes: &[&str]) -> Self {
         let mut installation = Installation::new();
         let root = canonical(&installation.root);
         let home = root.join("home");
@@ -1335,7 +1404,7 @@ impl FreshHost {
         system_tools(&tools);
         let interpreters = root.join("interpreters");
         directory(&interpreters, PRIVATE_DIR);
-        let release = stage_release(&installation, &test_key());
+        let release = stage_release(&installation, &test_key(), runtimes);
         installation.context =
             installation
                 .context

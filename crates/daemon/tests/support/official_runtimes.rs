@@ -446,7 +446,7 @@ pub(crate) fn package_binding(runtime: &str) -> LaunchBinding {
 }
 
 /// The canonical archive of `runtime-packages/<runtime>` and its digest.
-fn built_archive(runtime: &str) -> (Vec<u8>, PackageDigest) {
+pub(crate) fn built_archive(runtime: &str) -> (Vec<u8>, PackageDigest) {
     archive_of(
         &workspace_root().join("runtime-packages").join(runtime),
         runtime,

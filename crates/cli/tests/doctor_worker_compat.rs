@@ -277,9 +277,9 @@ fn login_path_check(document: &Value) -> Option<&Value> {
 /// resolves on macOS, where `service.toml` records a search path, and adds no
 /// such check elsewhere or when the login shell gives no answer. The
 /// installation, the login shell and the programs are below the hermetic
-/// root. The platform gate and the probe's own macOS-only discovery back each
-/// other up, so removing only the gate is not observable on Linux; the macOS
-/// lane fails when the check call or the gate is removed.
+/// root. The platform gate is redundant with the probe's own macOS-only
+/// discovery, so removing it is observable on no lane; the macOS lane fails
+/// when the check call is removed or the gate is negated.
 #[tokio::test]
 async fn doctor_reports_agents_only_the_login_shell_path_resolves_through_cli() {
     let harness = Harness::start().await;

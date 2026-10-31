@@ -413,6 +413,7 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
     let text = format!("base = \"{}\"\n", RuntimeId::HERMES);
     let path = fixture.write_profile(PROFILE, &text);
     let bind = |dry_run| PackageBindProfileParams {
+        expected_previous: None,
         profile: PROFILE.to_owned(),
         digest: None,
         dry_run,
@@ -1616,6 +1617,7 @@ async fn an_unresolved_built_in_spec_is_never_repaired_from_the_package_that_ser
     fixture
         .registry
         .package_bind_profile(PackageBindProfileParams {
+            expected_previous: None,
             profile: DAMAGED_PROFILE.to_owned(),
             digest: None,
             dry_run: false,
@@ -3516,6 +3518,7 @@ async fn adopt_session_beside_a_profile_named_like_its_runtime(
     adopted
         .registry
         .package_bind_profile(PackageBindProfileParams {
+            expected_previous: None,
             profile: RuntimeId::CLAUDE.to_owned(),
             digest: None,
             dry_run: false,
@@ -3929,6 +3932,16 @@ fn forget_active_agent_origin(store_path: &Path, id: &protocol::SessionId) {
         .expect("write the record without an origin");
 }
 
+/// A bind of `profile` that names no pin it expects to replace.
+fn unconditional_bind(profile: &str, digest: Option<PackageDigest>) -> PackageBindProfileParams {
+    PackageBindProfileParams {
+        expected_previous: None,
+        profile: profile.to_owned(),
+        digest,
+        dry_run: false,
+    }
+}
+
 #[tokio::test]
 async fn an_observed_nested_agent_in_a_record_without_an_origin_is_restored_as_observed() {
     let tag = "codex-nested-origin";
@@ -3986,11 +3999,7 @@ async fn an_observed_nested_agent_in_a_record_without_an_origin_is_restored_as_o
     .await;
     adopted
         .registry
-        .package_bind_profile(PackageBindProfileParams {
-            profile: RuntimeId::CODEX.to_owned(),
-            digest: None,
-            dry_run: false,
-        })
+        .package_bind_profile(unconditional_bind(RuntimeId::CODEX, None))
         .await
         .expect("pin the codex profile to the served package");
     let codex = adopted
@@ -4223,6 +4232,7 @@ async fn bind_claude_profile(fixture: &Fixture) {
     fixture
         .registry
         .package_bind_profile(PackageBindProfileParams {
+            expected_previous: None,
             profile: PROFILE.to_owned(),
             digest: None,
             dry_run: false,

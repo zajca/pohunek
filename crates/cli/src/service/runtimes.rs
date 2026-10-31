@@ -21,8 +21,9 @@ use std::time::Duration;
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus, ProfileAction,
-    ProfileStatus, DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
+    AcceptedGap, CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus,
+    ProfileAction, ProfileStatus, ACCEPT_GAP_FLAG, DETECT_FLAG, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -103,13 +104,15 @@ pub type Running<'a> = Pin<Box<dyn Future<Output = Result<EnsureReport, Error>> 
 /// Runs `pohunekd ensure-official-runtimes` of the release in `dir`.
 pub trait RuntimeStep: Debug + Send + Sync {
     /// Returns the report of a plan (`dry_run`) or of an apply in `dir`, run
-    /// with the `PATH` `search_path` gives the daemon job.
+    /// with the `PATH` `search_path` gives the daemon job. Both report the
+    /// `accepted` gaps as gaps instead of refusing them.
     fn run<'a>(
         &'a self,
         context: &'a Context,
         dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
+        accepted: &'a [AcceptedGap],
     ) -> Running<'a>;
 }
 
@@ -142,8 +145,19 @@ impl RuntimeStep for DaemonRuntimes {
         dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
+        accepted: &'a [AcceptedGap],
     ) -> Running<'a> {
-        Box::pin(run_daemon(*self, context, dir, dry_run, false, search_path))
+        Box::pin(run_daemon(
+            *self,
+            context,
+            dir,
+            Flags {
+                dry_run,
+                detect: false,
+                accepted,
+            },
+            search_path,
+        ))
     }
 }
 
@@ -162,13 +176,49 @@ impl DaemonRuntimes {
         dir: &VerifiedVersionDir,
         search_path: &str,
     ) -> Result<EnsureReport, Error> {
-        run_daemon(*self, context, dir, true, true, search_path).await
+        run_daemon(
+            *self,
+            context,
+            dir,
+            Flags {
+                dry_run: true,
+                detect: true,
+                accepted: &[],
+            },
+            search_path,
+        )
+        .await
     }
 }
 
+/// The flags one run of the step's daemon takes.
+#[derive(Clone, Copy)]
+struct Flags<'a> {
+    /// Adds [`DRY_RUN_FLAG`]: the run plans and changes nothing.
+    dry_run: bool,
+    /// Adds [`DETECT_FLAG`]; only meaningful for a dry run.
+    detect: bool,
+    /// One [`ACCEPT_GAP_FLAG`] per gap; not with `detect`.
+    accepted: &'a [AcceptedGap],
+}
+
+/// The command that runs the step in `daemon` with `flags`.
+fn ensure_command(daemon: &Path, flags: Flags<'_>) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(daemon);
+    command.arg(ENSURE_RUNTIMES_ARG);
+    if flags.dry_run {
+        command.arg(DRY_RUN_FLAG);
+    }
+    if flags.detect {
+        command.arg(DETECT_FLAG);
+    }
+    for gap in flags.accepted {
+        command.arg(ACCEPT_GAP_FLAG).arg(gap.to_arg());
+    }
+    command
+}
+
 /// Runs the step's daemon with the environment the installed daemon gets.
-///
-/// `detect` adds [`DETECT_FLAG`] and is only meaningful for a dry run.
 ///
 /// A run that outlives its timeout is ended and reaped before this returns, so
 /// a caller that restores state after the error never races the process. When
@@ -178,23 +228,16 @@ async fn run_daemon(
     runtimes: DaemonRuntimes,
     context: &Context,
     dir: &VerifiedVersionDir,
-    dry_run: bool,
-    detect: bool,
+    flags: Flags<'_>,
     search_path: &str,
 ) -> Result<EnsureReport, Error> {
+    let dry_run = flags.dry_run;
     let daemon = dir.daemon();
     let failure = |detail: String| Error::UpgradeRuntimesFailed {
         binary: daemon.clone(),
         detail,
     };
-    let mut command = tokio::process::Command::new(&daemon);
-    command.arg(ENSURE_RUNTIMES_ARG);
-    if dry_run {
-        command.arg(DRY_RUN_FLAG);
-    }
-    if detect {
-        command.arg(DETECT_FLAG);
-    }
+    let mut command = ensure_command(&daemon, flags);
     command
         .env_clear()
         .envs(context.bootstrap_environment()?)
@@ -734,8 +777,11 @@ mod tests {
             DaemonRuntimes::default(),
             &context,
             &trusted(root.as_path()),
-            true,
-            false,
+            Flags {
+                dry_run: true,
+                detect: false,
+                accepted: &[],
+            },
             "/usr/bin:/bin",
         )
         .await
@@ -745,8 +791,11 @@ mod tests {
             DaemonRuntimes::default(),
             &context,
             &trusted(root.as_path()),
-            false,
-            false,
+            Flags {
+                dry_run: false,
+                detect: false,
+                accepted: &[],
+            },
             "/usr/bin:/bin",
         )
         .await
@@ -784,8 +833,11 @@ mod tests {
             DaemonRuntimes::default(),
             &context,
             &trusted(root.as_path()),
-            true,
-            false,
+            Flags {
+                dry_run: true,
+                detect: false,
+                accepted: &[],
+            },
             &search_path,
         )
         .await
@@ -794,8 +846,11 @@ mod tests {
             DaemonRuntimes::default(),
             &context,
             &trusted(root.as_path()),
-            false,
-            false,
+            Flags {
+                dry_run: false,
+                detect: false,
+                accepted: &[],
+            },
             &search_path,
         )
         .await
@@ -805,8 +860,11 @@ mod tests {
                 DaemonRuntimes::default(),
                 &context,
                 &trusted(root.as_path()),
-                true,
-                false,
+                Flags {
+                    dry_run: true,
+                    detect: false,
+                    accepted: &[],
+                },
                 "/usr/bin:/bin",
             )
             .await
@@ -826,8 +884,11 @@ mod tests {
                 DaemonRuntimes::default(),
                 &context,
                 &trusted(root.as_path()),
-                true,
-                false,
+                Flags {
+                    dry_run: true,
+                    detect: false,
+                    accepted: &[],
+                },
                 "/usr/bin:/bin",
             )
             .await
@@ -851,8 +912,11 @@ mod tests {
                 DaemonRuntimes::default(),
                 &context,
                 &trusted(root.as_path()),
-                false,
-                false,
+                Flags {
+                    dry_run: false,
+                    detect: false,
+                    accepted: &[],
+                },
                 "/usr/bin:/bin",
             )
             .await
@@ -872,8 +936,11 @@ mod tests {
                 DaemonRuntimes::default(),
                 &context,
                 &trusted(root.as_path()),
-                false,
-                false,
+                Flags {
+                    dry_run: false,
+                    detect: false,
+                    accepted: &[],
+                },
                 "/usr/bin:/bin",
             )
             .await
@@ -910,7 +977,13 @@ mod tests {
         hanging_daemon(root.as_path(), &pid_file);
 
         let error = short_timeouts(Duration::from_secs(10))
-            .run(&context, &trusted(root.as_path()), false, "/usr/bin:/bin")
+            .run(
+                &context,
+                &trusted(root.as_path()),
+                false,
+                "/usr/bin:/bin",
+                &[],
+            )
             .await
             .expect_err("the apply does not finish");
         let detail = failure_detail(error);

@@ -24,10 +24,11 @@ use pohunek_daemon::lock::InstanceLock;
 use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileAction, ProfileStatus, SelectedPackage,
-    UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
-    CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST,
-    CODE_GAP_UPDATE_VERSION_UNORDERED, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+    UseReason, ACCEPT_GAP_FLAG, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH,
+    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_LISTED_MORE_THAN_ONCE,
+    CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
+    CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST, CODE_GAP_UPDATE_VERSION_UNORDERED,
+    CODE_PACKAGE_LISTED_MORE_THAN_ONCE, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
     CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, CODE_PINNED_TO_NEWER_VERSION,
     CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN,
     CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
@@ -272,6 +273,43 @@ impl Host {
             command.arg(DRY_RUN_FLAG);
         }
         command.output().expect("run the daemon binary")
+    }
+
+    /// Publishes a catalog that lists two versions of the `claude` package,
+    /// both for this platform and core.
+    fn publish_two_versions_of_claude(&self) {
+        let (older, older_digest) = official_runtimes::variant_archive("claude", OLDER_VERSION);
+        let (newer, newer_digest) = official_runtimes::variant_archive("claude", NEWER_VERSION);
+        self.publish_archives(
+            FIRST_SEQUENCE,
+            &[
+                ("claude", &older, &older_digest),
+                ("claude", &newer, &newer_digest),
+            ],
+        );
+    }
+
+    /// Runs the step with `extra` arguments and returns its raw output.
+    fn raw_step_with(&self, dry_run: bool, extra: &[&str]) -> Output {
+        let mut command = self.env.command(&self.binary);
+        command.arg(ENSURE_RUNTIMES_ARG);
+        if dry_run {
+            command.arg(DRY_RUN_FLAG);
+        }
+        command.args(extra);
+        command.output().expect("run the daemon binary")
+    }
+
+    /// Runs the step with `extra` arguments, which must exit successfully,
+    /// and parses its report.
+    fn step_with(&self, dry_run: bool, extra: &[&str]) -> EnsureReport {
+        let output = self.raw_step_with(dry_run, extra);
+        assert!(
+            output.status.success(),
+            "the step exits 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("the step prints its report as JSON")
     }
 
     /// Runs the step, which must exit successfully, and parses its report.
@@ -1728,6 +1766,165 @@ fn a_platform_without_a_package_is_a_gap_with_detect_and_a_refusal_without() {
     );
     assert!(plan.packages.is_empty());
     assert!(!host.plugins_dir().exists());
+}
+
+const ACCEPT_CLAUDE_UNAVAILABLE: [&str; 2] = [
+    ACCEPT_GAP_FLAG,
+    "claude:official_package_unavailable_for_platform",
+];
+
+/// The owner accepted the gap in the preview: the plan and the apply report the
+/// runtime as that gap, and change nothing for it.
+#[test]
+fn an_accepted_platform_gap_stays_a_gap_in_the_plan_and_the_apply() {
+    let host = Host::new();
+    host.publish(&["codex"]);
+    let profile = host.write_claude_profile();
+
+    for dry_run in [true, false] {
+        let report = host.step_with(dry_run, &ACCEPT_CLAUDE_UNAVAILABLE);
+
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(
+            gap_codes(&report),
+            [("claude", CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM)]
+        );
+        assert!(report.packages.is_empty());
+        assert_eq!(host.profile_text(), profile);
+        let roots = fs::read_dir(host.plugins_dir().join("packages")).map_or(0, Iterator::count);
+        assert_eq!(roots, 0, "no package is installed");
+    }
+}
+
+/// Only the exact runtime and code pair is accepted; anything else still
+/// refuses, and so does the same runtime under another code.
+#[test]
+fn a_gap_that_was_not_accepted_still_refuses() {
+    let host = Host::new();
+    host.publish(&["codex"]);
+    host.write_claude_profile();
+
+    for accepted in [
+        ["codex:official_package_unavailable_for_platform"],
+        ["claude:official_package_archive_invalid"],
+    ] {
+        let report = host.step_with(false, &[ACCEPT_GAP_FLAG, accepted[0]]);
+
+        assert_eq!(
+            refusal_codes(&report),
+            [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM],
+            "{accepted:?}"
+        );
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+}
+
+/// A mistyped flag never starts the daemon, and the accepted gaps do not mix
+/// with the detection plan.
+#[test]
+fn a_malformed_accept_flag_is_a_usage_error_and_changes_nothing() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    let profile = host.write_claude_profile();
+
+    for extra in [
+        vec![ACCEPT_GAP_FLAG],
+        vec![ACCEPT_GAP_FLAG, "claude"],
+        vec![ACCEPT_GAP_FLAG, ":code"],
+        vec!["--accept-gaps", "claude:code"],
+        vec![DETECT_FLAG, ACCEPT_GAP_FLAG, "claude:code"],
+    ] {
+        let output = host.raw_step_with(true, &extra);
+
+        assert!(!output.status.success(), "{extra:?}");
+        assert!(output.stdout.is_empty(), "{extra:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(ENSURE_RUNTIMES_ARG),
+            "{extra:?}"
+        );
+    }
+    assert_eq!(host.profile_text(), profile);
+    assert!(!host.plugins_dir().exists());
+}
+
+/// The accepted value is the refusal's code. A condition whose gap has another
+/// code is accepted by the refusal code and then reported under the gap code;
+/// naming the gap code accepts nothing.
+#[tokio::test]
+async fn an_accepted_refusal_is_named_by_its_refusal_code_not_by_its_gap_code() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.remove_package_root(Host::installed_pi_digest().as_str());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.write_profile("work", "base = \"pi\"\n");
+    let conflict = ProtocolError::from(PackageErrorKind::RuntimeConflict).code;
+    let by_refusal = format!("pi:{conflict}");
+    let by_gap = format!("pi:{CODE_GAP_SERVED_BY_OTHER_PACKAGE}");
+
+    for dry_run in [true, false] {
+        let accepted = host.step_with(dry_run, &[ACCEPT_GAP_FLAG, &by_refusal]);
+        let named_by_gap = host.step_with(dry_run, &[ACCEPT_GAP_FLAG, &by_gap]);
+
+        assert!(accepted.refusals.is_empty(), "{:?}", accepted.refusals);
+        assert_eq!(
+            gap_codes(&accepted),
+            [("pi", CODE_GAP_SERVED_BY_OTHER_PACKAGE)]
+        );
+        assert_eq!(
+            refusal_codes(&named_by_gap),
+            [conflict.as_str()],
+            "{:?}",
+            named_by_gap.refusals
+        );
+    }
+}
+
+/// A runtime the catalog lists twice and a profile uses is a malformed release:
+/// a refusal for the apply and a gap of its own code for the detection.
+#[test]
+fn a_used_runtime_listed_twice_is_refused_under_its_own_code() {
+    let host = Host::new();
+    host.publish_two_versions_of_claude();
+    host.write_claude_profile();
+    host.put_program("claude");
+
+    let applied = host.step(false);
+    let detected = host.detect_step();
+
+    assert_eq!(
+        refusal_codes(&applied),
+        [CODE_PACKAGE_LISTED_MORE_THAN_ONCE]
+    );
+    assert_eq!(
+        gap_codes(&detected),
+        [("claude", CODE_PACKAGE_LISTED_MORE_THAN_ONCE)]
+    );
+}
+
+/// A runtime only the detection found, which the catalog lists twice, is a gap
+/// of its own code; the apply plans nothing for it and refuses nothing.
+#[test]
+fn a_detect_only_runtime_listed_twice_blocks_nothing() {
+    let host = Host::new();
+    host.publish_two_versions_of_claude();
+    host.put_program("claude");
+
+    let detected = host.detect_step();
+    let applied = host.step(false);
+
+    assert!(detected.refusals.is_empty(), "{:?}", detected.refusals);
+    assert_eq!(
+        gap_codes(&detected),
+        [("claude", CODE_GAP_LISTED_MORE_THAN_ONCE)]
+    );
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert!(applied.packages.is_empty());
 }
 
 #[test]

@@ -1,0 +1,4 @@
+---
+kind: fixed
+---
+`pohunek setup` on a fresh host no longer stops when a runtime the host uses has no package for this platform: the preview lists it as a gap, the install goes on and the runtime stays a gap. A runtime that a profile, session or integration uses and the release catalog lists more than once still stops setup before any change, and a runtime only the detection found and the catalog lists twice no longer stops it (`official_package_listed_more_than_once` and `catalog_lists_runtime_more_than_once` replace the shared gap code for that case). `package.bind_profile` takes an optional `expected_previous` pin (advertised as `package_bind_profile_expected_supported`) and refuses a changed pin with `package_profile_pin_changed`; `pohunek setup` and `pohunek plugin profile migrate --yes` send the pin they showed, so a profile pinned since is no longer overwritten, and against a daemon that cannot check it they print a note.

@@ -21,7 +21,7 @@ use pohunek_test_support::catalog::{
 use protocol::{BindingProvenance, RuntimeId};
 
 /// Runtime packages the release carries.
-const RELEASE_RUNTIMES: [&str; 3] = ["claude", "codex", "pi"];
+pub(crate) const RELEASE_RUNTIMES: [&str; 3] = ["claude", "codex", "pi"];
 
 /// Sequence number of the release catalog.
 const CATALOG_SEQUENCE: u64 = 1;
@@ -78,13 +78,16 @@ pub(crate) fn seal(release: &Path) {
 /// Writes the trust anchor of `key` beside the daemon in `release`, and the
 /// release's `runtime/`: one archive per release runtime under `packages/`,
 /// built from `runtime-packages`, and a catalog of them signed by `key`.
-pub(crate) fn sign(release: &Path, key: &SigningKey) {
+///
+/// A release that carries only the packages of `runtimes` has a catalog that
+/// lists no package of any other runtime for this platform.
+pub(crate) fn sign_runtimes(release: &Path, key: &SigningKey, runtimes: &[&str]) {
     fs::write(release.join(ANCHOR_FILE_NAME), anchor_for(key)).expect("write the trust anchor");
     let runtime = release.join(RUNTIME_DIR);
     let packages = runtime.join(PACKAGES_DIR);
     fs::create_dir_all(&packages).expect("packages directory");
     let mut entries = Vec::new();
-    for name in RELEASE_RUNTIMES {
+    for name in runtimes {
         let (bytes, entry) = official_archive(name);
         fs::write(packages.join(format!("{name}{ARCHIVE_SUFFIX}")), bytes)
             .expect("write the package archive");

@@ -190,7 +190,7 @@ use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
 use pohunek_service_config::preflight::PreflightReport;
-use pohunek_service_config::runtimes::EnsureReport;
+use pohunek_service_config::runtimes::{AcceptedGap, EnsureReport};
 use pohunek_service_config::{
     body_after_header, ConfigError, ServiceConfig, UpgradeSource, MAX_CONFIG_BYTES, SCHEMA_VERSION,
 };
@@ -337,6 +337,9 @@ pub struct Engine<'a> {
     /// Whether the operator asked to replace a refused version directory of the
     /// release being installed (`--repair`).
     repair: bool,
+    /// Gaps the runtime step reports instead of refusing: the ones the owner
+    /// accepted in the setup preview.
+    accepted_gaps: Vec<AcceptedGap>,
     /// Verifies the rendered units before they are registered.
     #[cfg(target_os = "linux")]
     unit_verifier: UnitVerifier,
@@ -369,6 +372,7 @@ impl<'a> Engine<'a> {
             integrations: Box::new(CliIntegrations),
             accept_runtime_loss: false,
             repair: false,
+            accepted_gaps: Vec::new(),
             #[cfg(target_os = "linux")]
             unit_verifier: UnitVerifier::default(),
             #[cfg(test)]
@@ -399,6 +403,16 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn with_runtime_loss_accepted(mut self, accepted: bool) -> Self {
         self.accept_runtime_loss = accepted;
+        self
+    }
+
+    /// Lets the runtime step report `gaps` as gaps instead of refusing them,
+    /// so the install goes on and the runtime stays a gap. Only the gaps the
+    /// owner saw in the setup preview are passed; any other condition still
+    /// refuses and rolls the install back.
+    #[must_use]
+    pub fn with_accepted_gaps(mut self, gaps: Vec<AcceptedGap>) -> Self {
+        self.accepted_gaps = gaps;
         self
     }
 
@@ -1739,7 +1753,7 @@ impl<'a> Engine<'a> {
         let dir = layout::verify_installed(layout, &dir)?;
         let plan = self
             .runtimes
-            .run(self.context, &dir, true, search_path)
+            .run(self.context, &dir, true, search_path, &self.accepted_gaps)
             .await?;
         runtimes::check_plan(&plan)?;
         if !runtimes::needs_apply(&plan) {
@@ -1764,7 +1778,7 @@ impl<'a> Engine<'a> {
         }
         let applied = self
             .runtimes
-            .run(self.context, &dir, false, search_path)
+            .run(self.context, &dir, false, search_path, &self.accepted_gaps)
             .await?;
         runtimes::check_applied(dir.path(), &applied)?;
         late.runtimes = Some(applied);
@@ -1812,7 +1826,7 @@ impl<'a> Engine<'a> {
                 Ok(dir) => match job_search_path(self.context, config, journal_default).await {
                     Ok(job) => self
                         .runtimes
-                        .run(self.context, &dir, true, &job.value)
+                        .run(self.context, &dir, true, &job.value, &self.accepted_gaps)
                         .await
                         .map(|plan| (plan, job)),
                     Err(error) => Err(error),

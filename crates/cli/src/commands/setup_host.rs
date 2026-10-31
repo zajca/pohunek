@@ -38,13 +38,15 @@ use std::path::Path;
 use std::pin::Pin;
 
 use pohunek_paths::InstallLayout;
+use pohunek_service_config::runtimes::AcceptedGap;
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
-    ProfileAction, Refusal, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, RELEASE_RUNTIME_DIR,
+    ProfileAction, Refusal, CODE_PACKAGE_LISTED_MORE_THAN_ONCE,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, RELEASE_RUNTIME_DIR,
 };
 use protocol::{
-    method, DoctorStatus, IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams,
-    PackageBindProfileParams, PackageDigest, PackageInstallParams, PackageSelectParams,
+    method, DoctorReport, DoctorStatus, IntegrationInstallState, IntegrationRecovery,
+    IntegrationStatusParams, PackageDigest, PackageInstallParams, PackageSelectParams,
     PackageSetEnabledParams, PackageTrust, RuntimeRef,
 };
 use serde::Serialize;
@@ -56,6 +58,7 @@ use crate::commands::integration::{
     hermes_home_plan, reinstall_after_upgrade, reinstall_previewed_hermes_homes, IntegrationEnv,
     HERMES_CURRENT, HERMES_UPDATE,
 };
+use crate::commands::profile_bind::{self, PinCheck, UNCHECKED_PIN_NOTE};
 use crate::commands::setup::{config_files, install_config_into, ConfigResult};
 use crate::error::CliError;
 use crate::hermes_integration::runner::safe_ancestor;
@@ -128,16 +131,22 @@ const CONFIRM_PROMPT: &str = "Apply this plan? [y/N] ";
 /// Package status the install engine leaves a package in once it installed it.
 const ENGINE_INSTALLED: &str = "installed";
 
-/// Gap codes that the install engine's runtime step, which runs without
-/// detection, reports as refusals for every runtime the plan lists them for.
+/// Gap codes the install engine's runtime step, which runs without detection,
+/// would refuse and that setup accepts: the owner sees them in the preview, and
+/// the runtime stays a gap after the install.
 ///
-/// Detection only adds the runtimes the catalog lists for this platform, so a
-/// runtime without a package here is one the host uses. The same gap also
-/// names a runtime the release catalog lists more than once for this
-/// platform; setup refuses that release even where the engine would not plan
-/// the runtime. A runtime served by another package can be a detected one the
-/// engine never plans, so that gap is not here.
-const ENGINE_REFUSED_GAPS: [&str; 1] = [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM];
+/// The gap code is also the refusal code the engine's step reports for the
+/// condition, which is what the accepted value names. Detection only adds the
+/// runtimes the catalog lists for this platform, so a runtime without a
+/// package here is one the host uses.
+const ACCEPTED_GAPS: [&str; 1] = [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM];
+
+/// Gap codes the install engine's runtime step refuses and setup does not
+/// accept: a runtime a profile, a session or an integration uses, which the
+/// release catalog lists more than once for this platform. The release is
+/// malformed. A runtime only the detection found has another code and blocks
+/// nothing.
+const REFUSED_GAPS: [&str; 1] = [CODE_PACKAGE_LISTED_MORE_THAN_ONCE];
 
 /// Profile status the install engine leaves a profile in once it pinned it.
 const ENGINE_BOUND: &str = "bound";
@@ -419,12 +428,12 @@ fn serves_hermes(plan: &EnsureReport) -> bool {
 }
 
 /// Stops a run that would install the service while the plan lists a gap that
-/// the install engine's own runtime step refuses.
+/// the install engine's own runtime step refuses and setup does not accept.
 ///
 /// The engine applies the plan without detection. There, a runtime the host
-/// uses (a profile, a session or an integration) without a package for this
-/// platform is a refusal, and a refusal rolls the install back. The plan lists
-/// it as a gap, so it stops the run here, before any change.
+/// uses with a malformed release catalog is a refusal, and a refusal rolls the
+/// install back. The plan lists it as a gap, so it stops the run here, before
+/// any change.
 ///
 /// # Errors
 ///
@@ -433,7 +442,7 @@ fn refuse_install_gaps(plan: &EnsureReport) -> Result<(), CliError> {
     let refused: Vec<String> = plan
         .gaps
         .iter()
-        .filter(|gap| ENGINE_REFUSED_GAPS.contains(&gap.code.as_str()))
+        .filter(|gap| REFUSED_GAPS.contains(&gap.code.as_str()))
         .map(|gap| format!("{}: {} ({})", gap.runtime, gap.detail, gap.code))
         .collect();
     if refused.is_empty() {
@@ -441,11 +450,25 @@ fn refuse_install_gaps(plan: &EnsureReport) -> Result<(), CliError> {
     }
     Err(CliError::SetupBlocked {
         detail: format!(
-            "installing the service refuses what this plan lists as gaps: {}; remove or repin \
-             the profile that uses the runtime, then re-run `pohunek setup`",
+            "installing the service refuses what this plan lists as gaps: {}; use a release \
+             whose catalog lists the runtime once, or remove or repin the profile that uses \
+             it, then re-run `pohunek setup`",
             refused.join("; ")
         ),
     })
+}
+
+/// The gaps of the previewed plan the install engine reports as gaps instead
+/// of refusing: the owner saw them in the preview and confirmed the plan.
+fn accepted_gaps(plan: &EnsureReport) -> Vec<AcceptedGap> {
+    plan.gaps
+        .iter()
+        .filter(|gap| ACCEPTED_GAPS.contains(&gap.code.as_str()))
+        .map(|gap| AcceptedGap {
+            runtime: gap.runtime.clone(),
+            code: gap.code.clone(),
+        })
+        .collect()
 }
 
 /// Whether the plan installs or selects a Hermes package, which changes the
@@ -787,7 +810,14 @@ async fn install_service(
     applied: &mut Vec<String>,
     planner: &dyn ReleasePlanner,
 ) -> Result<(VerifiedVersionDir, String, EnsureReport), CliError> {
-    let installed = service::install_in(context, Some(from.to_path_buf()), None, false).await?;
+    let installed = service::install_in(
+        context,
+        Some(from.to_path_buf()),
+        None,
+        false,
+        accepted_gaps(previewed),
+    )
+    .await?;
     applied.push(format!("service: installed version {}", installed.version));
     applied.extend(engine_changes(installed.runtimes.as_ref()));
     let version_dir = installed
@@ -820,8 +850,9 @@ async fn install_service(
 /// The owner may have taken a while to answer, and a profile pinned or a
 /// package changed meanwhile would otherwise be overwritten with the preview's
 /// choice. The plan must match the preview exactly; nothing is changed
-/// otherwise. A change made between this read and the pin it affects is not
-/// seen: the pin request cannot name the pin it expects to replace.
+/// otherwise. A change made between this read and the pin it affects is
+/// refused by a daemon that checks the pin the request expects to replace; one
+/// that cannot is not asked, and the change is not seen.
 ///
 /// # Errors
 ///
@@ -1104,6 +1135,21 @@ fn check_catalog_transition(
     }
 }
 
+/// Turns the daemon's refusal of a profile whose pin changed since the plan
+/// into the stop setup reports; any other error passes through.
+fn pin_changed(error: CliError, profile: &str, applied: &[String]) -> CliError {
+    if !profile_bind::is_pin_changed(&error) {
+        return error;
+    }
+    CliError::SetupIncomplete {
+        detail: format!(
+            "profile {profile} was pinned to another package since the plan was read; \
+             nothing was changed for it. Run `pohunek setup` again to see the new plan"
+        ),
+        applied: applied.to_vec(),
+    }
+}
+
 /// Applies the packages and profile pins the plan still lists, over the
 /// daemon's RPCs, recording one line per outcome.
 ///
@@ -1163,24 +1209,37 @@ async fn apply_remaining(
             applied.push(format!("package {}: selected", package.runtime));
         }
     }
-    for profile in remaining
+    let pending: Vec<&ProfileAction> = remaining
         .profiles
         .iter()
         .filter(|profile| profile.status.is_pending())
-    {
-        let digest = PackageDigest::parse(&profile.digest).map_err(|_malformed| {
-            CliError::SetupIncomplete {
-                detail: format!("profile {}: its planned digest is not valid", profile.name),
-                applied: Vec::new(),
-            }
-        })?;
-        let bound = client
-            .call::<method::PackageBindProfile>(PackageBindProfileParams {
-                profile: profile.name.clone(),
-                digest: Some(digest),
-                dry_run: false,
+        .collect();
+    let check = if pending.is_empty() {
+        None
+    } else {
+        Some(PinCheck::probe(client).await?)
+    };
+    if check.is_some_and(|check| !check.daemon_checks()) {
+        applied.push(UNCHECKED_PIN_NOTE.to_owned());
+    }
+    for profile in pending {
+        let invalid = |what: &str| CliError::SetupIncomplete {
+            detail: format!("profile {}: its planned {what} is not valid", profile.name),
+            applied: Vec::new(),
+        };
+        let digest =
+            PackageDigest::parse(&profile.digest).map_err(|_malformed| invalid("digest"))?;
+        let previous = profile
+            .previous_digest
+            .as_deref()
+            .map(|previous| {
+                PackageDigest::parse(previous).map_err(|_malformed| invalid("previous digest"))
             })
-            .await?;
+            .transpose()?;
+        let check = check.expect("a pending profile was probed");
+        let bound = profile_bind::bind(client, check, &profile.name, digest, previous)
+            .await
+            .map_err(|error| pin_changed(error, &profile.name, applied))?;
         applied.push(format!(
             "profile {}: {}",
             profile.name,
@@ -1268,10 +1327,11 @@ async fn verdict(
         health: health.status,
         doctor: diagnosis.overall.as_str().to_owned(),
     };
+    let doctor_failures = failed_doctor_checks(&diagnosis, previewed);
     let problems = verdict_problems(
         &verdict,
         catalog_recorded_by_install && after.catalog == CatalogStatus::Record,
-        diagnosis.overall == DoctorStatus::Fail,
+        &doctor_failures,
     );
     if problems.is_empty() {
         Ok(verdict)
@@ -1287,7 +1347,7 @@ async fn verdict(
 fn verdict_problems(
     verdict: &Verdict,
     catalog_unrecorded: bool,
-    doctor_failed: bool,
+    doctor_failures: &[String],
 ) -> Vec<String> {
     let mut problems = Vec::new();
     if !verdict.packages_missing.is_empty() {
@@ -1323,10 +1383,39 @@ fn verdict_problems(
     if !verdict.hooks_failed.is_empty() {
         problems.push(format!("hooks failed: {}", verdict.hooks_failed.join("; ")));
     }
-    if doctor_failed {
-        problems.push("doctor reports a failed check; run `pohunek doctor`".to_owned());
+    if !doctor_failures.is_empty() {
+        problems.push(format!(
+            "doctor reports a failed check: {}; run `pohunek doctor`",
+            doctor_failures.join("; ")
+        ));
     }
     problems
+}
+
+/// The failed doctor checks as `name: detail`. When the preview left a runtime
+/// as an accepted gap, the list ends with the runtimes that have no package, so
+/// a profile over one of them is traced to its cause and the next step.
+fn failed_doctor_checks(diagnosis: &DoctorReport, previewed: &EnsureReport) -> Vec<String> {
+    let mut failures: Vec<String> = diagnosis
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorStatus::Fail)
+        .map(|check| format!("{}: {}", check.name, check.detail))
+        .collect();
+    let left: Vec<&str> = previewed
+        .gaps
+        .iter()
+        .filter(|gap| ACCEPTED_GAPS.contains(&gap.code.as_str()))
+        .map(|gap| gap.runtime.as_str())
+        .collect();
+    if !failures.is_empty() && !left.is_empty() {
+        failures.push(format!(
+            "setup installed no package for {}, so a profile over it stays unusable until the \
+             release lists one: update to a release that does, then run `pohunek setup` again",
+            left.join(", ")
+        ));
+    }
+    failures
 }
 
 /// The hook lines of `hooks` with `status`, as `integration: detail`.
@@ -1546,6 +1635,24 @@ fn refusal_text(refusals: &[Refusal]) -> String {
         .join("; ")
 }
 
+/// The line that says the install goes on over the gaps the engine reports as
+/// gaps instead of refusing them, when the plan installs the service and lists
+/// such a gap.
+fn accepted_gaps_note(preview: &Preview) -> Option<String> {
+    let left: Vec<&str> = preview
+        .gaps
+        .iter()
+        .filter(|gap| ACCEPTED_GAPS.contains(&gap.code.as_str()))
+        .map(|gap| gap.runtime.as_str())
+        .collect();
+    (matches!(preview.service, ServiceStep::Install { .. }) && !left.is_empty()).then(|| {
+        format!(
+            "the service is installed anyway; no package is installed for: {}",
+            left.join(", ")
+        )
+    })
+}
+
 /// Renders the preview: every effect and gap, before anything is written.
 fn render_plan(plan: &HostPlan) -> String {
     let preview = &plan.preview;
@@ -1637,6 +1744,9 @@ fn render_plan(plan: &HostPlan) -> String {
     let _ = writeln!(out, "gaps:");
     for gap in &preview.gaps {
         let _ = writeln!(out, "  {}: {} ({})", gap.runtime, gap.detail, gap.code);
+    }
+    if let Some(note) = accepted_gaps_note(preview) {
+        let _ = writeln!(out, "{note}");
     }
     out
 }

@@ -10,34 +10,35 @@ use protocol::{
     BackgroundKind, BackgroundRevision, BackgroundStatus, ConceptDeprecation, ConceptIntent,
     ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
     DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
-    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode, HostApprovalSignature,
-    HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
-    IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
-    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
-    IntegrationRecovery, IntegrationUninstallState, NotificationCreateParams,
-    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
-    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationPolicy, NotificationPolicyParams, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdatedEvent,
-    ObservationParamsError, OutputOffset, OwnerRevision, PackageBindStatus, PackageFault,
-    PackageFindingKind, PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason,
-    PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce,
-    ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId,
-    ReportSequence, Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry,
-    RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground,
-    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
-    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
-    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin, ForkCwdMode,
+    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
+    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
+    IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
+    IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery,
+    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationPolicy,
+    NotificationPolicyParams, NotificationRecord, NotificationRetentionParams,
+    NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault, PackageFindingKind,
+    PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PrincipalId,
+    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
+    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
+    Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
+    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
+    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
+    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -3488,6 +3489,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
+        package_bind_profile_expected_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3521,7 +3523,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_input_ack_supported": true,
             "session_new_secret_env_supported": true,
             "session_idle_stop_supported": true,
-            "package_install_commands_supported": true
+            "package_install_commands_supported": true,
+            "package_bind_profile_expected_supported": true
         })
     );
 
@@ -3573,6 +3576,44 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
         !caps.package_install_commands_supported,
         "a host that omits the commands flag rejects accept_commands"
     );
+    assert!(
+        !caps.package_bind_profile_expected_supported,
+        "a host that omits the expected-pin flag rejects expected_previous"
+    );
+}
+
+#[test]
+fn a_profile_bind_names_the_pin_it_expects_to_replace_only_when_it_has_one() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let params = |expected: serde_json::Value| {
+        let mut value = json!({"profile": "work", "dry_run": false});
+        if !expected.is_null() {
+            value["expected_previous"] = expected;
+        }
+        serde_json::from_value::<PackageBindProfileParams>(value)
+    };
+
+    let unconditional = params(serde_json::Value::Null).expect("no condition");
+    let unpinned = params(json!("unpinned")).expect("expects no pin");
+    let pinned = params(json!({"pinned": {"digest": digest}})).expect("expects a pin");
+
+    assert_eq!(unconditional.expected_previous, None);
+    assert_eq!(unpinned.expected_previous, Some(ExpectedPin::Unpinned));
+    assert!(matches!(
+        pinned.expected_previous,
+        Some(ExpectedPin::Pinned { .. })
+    ));
+    assert_eq!(
+        serde_json::to_value(&unconditional).expect("serialize"),
+        json!({"profile": "work", "dry_run": false}),
+        "an unconditional bind is the wire shape an older daemon accepts"
+    );
+    assert_eq!(
+        serde_json::to_value(&unpinned).expect("serialize")["expected_previous"],
+        json!("unpinned")
+    );
+    params(json!({"pinned": {}})).expect_err("a pin needs its digest");
+    params(json!("any")).expect_err("only `unpinned` is a bare word");
 }
 
 #[test]

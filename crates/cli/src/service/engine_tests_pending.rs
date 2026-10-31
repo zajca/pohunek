@@ -148,19 +148,34 @@ async fn the_rollback_to_the_previous_version_judges_its_adoption_again() {
 
 /// A resumed upgrade refused with the stale-path warning names the rollback
 /// first, because `refresh-path` is refused while the upgrade is pending.
-#[test]
-fn the_resumed_stale_path_hint_names_the_rollback_before_refresh_path() {
-    let refused = Error::UpgradeAtRisk {
-        sessions: Vec::new(),
-        stopped_sessions: vec![risk_a()],
-        acceptance: Box::default(),
-        warnings: vec![format!(
-            "{} /old",
-            super::super::preflight::STALE_PATH_WARNING
-        )],
-        resumed: true,
-    };
+#[tokio::test]
+async fn a_resumed_stale_path_refusal_names_the_rollback_before_refresh_path() {
+    let mut harness = Harness::new();
+    let stale = harness.root.join("nix-store-user-environment-bin");
+    let profile = harness.root.join("profile-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &stale);
+    std::fs::write(stale.join("claude"), "2.1.288\n").expect("stale claude");
+    harness.install(V1).await.expect("install");
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &profile);
+    std::fs::write(profile.join("claude"), "2.1.302\n").expect("profile claude");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Definition);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted");
 
+    let refused = harness
+        .engine()
+        .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the resume judges the recorded runtime and refuses");
+
+    assert!(
+        matches!(refused, Error::UpgradeAtRisk { .. }),
+        "{refused:?}"
+    );
     assert_steps_in_order(
         refused.hint().expect("hint"),
         &[
@@ -170,4 +185,5 @@ fn the_resumed_stale_path_hint_names_the_rollback_before_refresh_path() {
             "then rerun the upgrade",
         ],
     );
+    assert_eq!(harness.pending().expect("kept").step, Step::Definition);
 }
