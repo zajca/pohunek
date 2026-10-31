@@ -2915,6 +2915,13 @@ impl SessionRegistry {
         release
     }
 
+    /// Holds the registry's session table until the returned value drops, so a
+    /// task that needs the table waits.
+    #[cfg(test)]
+    pub(crate) async fn hold_sessions_for_test(&self) -> impl Drop + '_ {
+        self.inner.sessions.lock().await
+    }
+
     /// The registry's external session store and observer tasks.
     #[cfg(test)]
     pub(crate) fn external_for_test(&self) -> &ExternalSessions {

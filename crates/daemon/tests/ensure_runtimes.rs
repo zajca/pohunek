@@ -6523,24 +6523,58 @@ async fn run_cell(cell: &Cell, runtime: &str) {
     }
 }
 
-/// Every cell of the holder contract table that applies to the reserved runtimes.
-#[tokio::test]
-async fn the_holder_contract_table_holds_for_the_reserved_runtimes() {
-    for cell in CELLS {
-        for runtime in cell.runtimes.iter().filter(|runtime| **runtime != "pi") {
+/// The cells of the holder contract table that apply to `runtime`, every
+/// second one starting at `half`. Each cell builds its own host, so the
+/// runtimes and the two halves run as separate tests.
+async fn the_holder_contract_table_holds_for(runtime: &str, half: usize) {
+    let mut ran = 0_usize;
+    for (index, cell) in CELLS
+        .iter()
+        .filter(|cell| cell.runtimes.contains(&runtime))
+        .enumerate()
+    {
+        if index % 2 == half {
             run_cell(cell, runtime).await;
+            ran += 1;
         }
     }
+    assert!(ran > 0, "the table has cells for {runtime} in half {half}");
 }
 
-/// Every cell of the holder contract table that applies to Pi.
-#[tokio::test]
-async fn the_holder_contract_table_holds_for_pi() {
-    for cell in CELLS {
-        if cell.runtimes.contains(&"pi") {
-            run_cell(cell, "pi").await;
-        }
-    }
+macro_rules! holder_table_tests {
+    ($($first:ident, $second:ident: $runtime:literal;)+) => {
+        $(
+            #[tokio::test]
+            async fn $first() {
+                the_holder_contract_table_holds_for($runtime, 0).await;
+            }
+
+            #[tokio::test]
+            async fn $second() {
+                the_holder_contract_table_holds_for($runtime, 1).await;
+            }
+        )+
+    };
+}
+
+holder_table_tests! {
+    the_holder_contract_table_holds_for_claude_first_half, the_holder_contract_table_holds_for_claude_second_half: "claude";
+    the_holder_contract_table_holds_for_codex_first_half, the_holder_contract_table_holds_for_codex_second_half: "codex";
+    the_holder_contract_table_holds_for_hermes_first_half, the_holder_contract_table_holds_for_hermes_second_half: "hermes";
+    the_holder_contract_table_holds_for_pi_first_half, the_holder_contract_table_holds_for_pi_second_half: "pi";
+}
+
+/// The runtimes the table is split over are exactly the runtimes it names.
+#[test]
+fn the_holder_contract_table_names_only_runtimes_that_have_a_test() {
+    let named: std::collections::BTreeSet<&str> = CELLS
+        .iter()
+        .flat_map(|cell| cell.runtimes.iter().copied())
+        .collect();
+    assert_eq!(
+        named,
+        std::collections::BTreeSet::from(["claude", "codex", "hermes", "pi"])
+    );
 }
 
 /// An unmanaged Pi whose unselected holder is altered: plan and apply report the

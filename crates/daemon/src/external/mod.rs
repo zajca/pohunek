@@ -1766,6 +1766,45 @@ mod observer_tests {
         assert_eq!(sessions.tasks_running(), 0);
     }
 
+    /// An observer parked in a rescan cannot end within the deadline: the
+    /// report names it and is not quiescent, and it ends once released.
+    #[tokio::test]
+    async fn registry_shutdown_names_an_observer_that_outlives_the_deadline() {
+        let (root, _transcript) = transcript_root();
+        let inspector = Arc::new(CountingInspector::default());
+        let registry = SessionRegistry::new_with_inspector(
+            SessionRegistryConfig {
+                // timing-allowed: #1601 the registry deadline expiring is the policy under test
+                shutdown_timeout: Duration::from_millis(50),
+                ..SessionRegistryConfig::default()
+            },
+            Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+        );
+        // The rescan reads the session table after its first process sweep, so
+        // holding the table parks the observer there.
+        let table = registry.hold_sessions_for_test().await;
+        running_observer(registry.external_for_test(), registry.clone(), root.path()).await;
+        pohunek_test_support::wait::wait_until("the observer to enter a rescan", || async {
+            (inspector.sweeps.load(Ordering::SeqCst) >= 1).then_some(())
+        })
+        .await;
+
+        let report = registry.shutdown().await;
+
+        assert!(
+            report.still_running.contains(&"external_observer"),
+            "{report:?}"
+        );
+        assert!(!report.is_quiescent(), "{report:?}");
+        drop(table);
+        tokio::time::timeout(
+            pohunek_test_support::wait::HANG_GUARD,
+            registry.external_for_test().stopped(),
+        )
+        .await
+        .expect("the observer ends once the table is free");
+    }
+
     #[tokio::test]
     async fn registry_shutdown_waits_for_the_external_observer() {
         let (root, _transcript) = transcript_root();
