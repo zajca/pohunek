@@ -442,7 +442,7 @@ never starts) for non-relay changes.
 
 The CI workflow's PR/macOS path ownership and tier conditions are guarded by
 `scripts/tests/test_ci_tiers.py`; run
-`python3 -m unittest scripts.tests.test_ci_tiers` when changing the workflow.
+`python3 -m unittest discover -s scripts/tests -p test_ci_tiers.py` when changing the workflow.
 The inventory distinguishes PR-triggering inputs from inputs covered by the
 post-merge main tier, so narrowing a filter cannot silently drop coverage.
 Because only the nightly tier runs the release rehearsal after merge, the same
@@ -612,8 +612,17 @@ the process working directory lies inside the scope. Every `git` in Rust test co
 `pohunek_test_support::git::command()` (or `TestEnv::git_command()`): no global or
 system Git configuration, a `HOME` no account owns (a `TestEnv` keeps its private one), a
 fixed identity, no prompt; only a scenario whose subject is how `git` reacts to settings it
-puts in place uses `git::command_with_inherited_environment()`. The hermetic scan does not
-check this; review does.
+puts in place uses `git::command_with_inherited_environment()`. A test that installs a
+native hook in a repository that product `git` then runs in calls
+`pohunek_test_support::git::pin_hooks`, because product `git` inherits the developer's
+Git files and a global `core.hooksPath` would replace the repository's hooks. Every Python
+test module that runs `git` imports `hermetic_git` (`scripts/tests/hermetic_git.py`)
+before its first statement that is not an import (enforced by
+`scripts/tests/test_hermetic_git.py`), which isolates the whole test process from the
+developer's Git files and gives it a private `HOME` (`CARGO_HOME` and `RUSTUP_HOME` keep the
+real toolchain); script tests run with
+`python3 -m unittest discover -s scripts/tests`, which puts the helper on the import path. The hermetic scan does not check the Rust
+rule; review does.
 
 No test leaves a session worker running. A real daemon starts each
 `pohunek-sessiond` in its own process group and lets it outlive the daemon, and a

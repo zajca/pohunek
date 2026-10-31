@@ -987,6 +987,7 @@ fn init_git_repo() -> TestEnv {
     std::fs::write(env.cwd().join("README.md"), "init\n").expect("write README");
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "init"]);
+    pohunek_test_support::git::pin_hooks(env.cwd());
     env
 }
 

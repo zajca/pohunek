@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 TOOL = Path(__file__).resolve().parents[1] / "changelog"
 
 LABEL = "no-changelog"

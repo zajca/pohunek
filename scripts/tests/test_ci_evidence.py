@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "ci-evidence"

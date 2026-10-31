@@ -22,6 +22,8 @@ import sys
 import tempfile
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 SCRIPT = Path(__file__).resolve().parents[1] / "stress-changed-tests"
 LINUX = sys.platform.startswith("linux")
 WAIT_SECONDS = 60

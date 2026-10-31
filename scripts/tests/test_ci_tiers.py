@@ -16,6 +16,8 @@ import time
 import tomllib
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CI = (ROOT / ".github" / "workflows" / "ci.yml").read_text()

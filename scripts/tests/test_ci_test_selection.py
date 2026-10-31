@@ -19,6 +19,8 @@ import tempfile
 import textwrap
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-test-selection"
 
 # Runs the script's own code with module constants overridden, so a timeout

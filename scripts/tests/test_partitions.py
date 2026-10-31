@@ -29,6 +29,8 @@ import time
 import tomllib
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 SCRIPT = Path(__file__).resolve().parents[1] / "test-partitions"
 REPO_ROOT = SCRIPT.parent.parent
 LOADER = importlib.machinery.SourceFileLoader("partitions", str(SCRIPT))

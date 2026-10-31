@@ -23,6 +23,8 @@ import time
 import unittest
 import xml.etree.ElementTree as ElementTree
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts" / "release-workflow"
 

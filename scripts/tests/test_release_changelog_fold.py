@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 SCRIPTS = Path(__file__).resolve().parents[1]
 RELEASE = SCRIPTS / "release"
 CHANGELOG_TOOL = SCRIPTS / "changelog"
