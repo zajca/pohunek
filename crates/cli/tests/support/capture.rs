@@ -36,9 +36,15 @@ pub(crate) const NEUTRAL_ROOT: &str = "/tmp/ph-sample";
 /// wrap it at narrow widths, so a random fixture root would leak a host path
 /// into the captures that [`write_capture`] cannot neutralise. A recording
 /// launches its sessions in directories of this fixed, short root instead. It
-/// is `/dev/shm/ph-<name>` and is removed when the value is dropped.
+/// is `/dev/shm/ph-<name>` and is removed when the value is dropped. The root
+/// is shared by every recording of one runtime, so creating it takes an
+/// exclusive lock on `/dev/shm/ph-<name>.lock` that the value holds until it is
+/// dropped; recordings of one runtime therefore run one after the other, in
+/// separate test processes too.
 pub(crate) struct RecordingRoot {
     path: std::path::PathBuf,
+    /// Holds the lock; released when the file closes, after the root is removed.
+    _lock: fs::File,
 }
 
 impl RecordingRoot {
@@ -55,13 +61,34 @@ impl RecordingRoot {
     /// 0700.
     // hermetic-allowed: #1525 a fixed short path under tmpfs keeps recorded screens reproducible; recording is an opt-in run, never part of the gates
     pub(crate) fn new(name: &str) -> Self {
-        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::{
+            DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+        };
 
         let path = std::path::PathBuf::from(format!("/dev/shm/ph-{name}"));
         // The owner of the current process, read from its own `/proc` entry.
         let me = fs::metadata("/proc/self")
             .expect("read the current user")
             .uid();
+        // hermetic-allowed: #1525 the lock beside the fixed recording root serialises recordings of one runtime; recording is an opt-in run, never part of the gates
+        let lock_path = std::path::PathBuf::from(format!("/dev/shm/ph-{name}.lock"));
+        match fs::symlink_metadata(&lock_path) {
+            Ok(existing) => assert!(
+                existing.is_file() && existing.uid() == me,
+                "{} exists and is not a file of the current user",
+                lock_path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect {}: {error}", lock_path.display()),
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .expect("open the recording lock");
+        lock.lock().expect("lock the recording root");
         match fs::symlink_metadata(&path) {
             Ok(existing) => {
                 assert!(
@@ -86,7 +113,7 @@ impl RecordingRoot {
             "{} is not an owner-private directory",
             path.display()
         );
-        Self { path }
+        Self { path, _lock: lock }
     }
 
     /// A fresh directory `name` below the root.

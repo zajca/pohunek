@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 
 use watch::{RootProvider, RootScan, TranscriptSink, WatchBackend, WatcherHandle};
 
-use crate::agent::host::TranscriptParser;
+use crate::agent::host::{HeadKeyPath, HeadPaths, TranscriptParser};
 use crate::integration::{ConfigHomes, LaunchHome};
 use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
@@ -152,6 +152,9 @@ pub(crate) struct TranscriptRoot {
     path: PathBuf,
     /// The compiled parser the runtime's descriptor names for its transcripts.
     parser: TranscriptParser,
+    /// The key paths of the first line the descriptor declares for
+    /// `jsonl-head-v1`.
+    head_paths: HeadPaths,
     /// The declared bound on the directory levels below `path`; see
     /// [`TranscriptRoot::depth_limit`] for what a walk lists.
     max_depth: Option<u8>,
@@ -593,7 +596,13 @@ impl TranscriptIndex {
             #[cfg(test)]
             self.parses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match parse_transcript(owner.parser, owner.agent_base.clone(), &owner.path, path) {
+            match parse_transcript(
+                owner.parser,
+                &owner.head_paths,
+                owner.agent_base.clone(),
+                &owner.path,
+                path,
+            ) {
                 Ok(candidate) => candidate.map(|candidate| TranscriptCandidate {
                     owner: Arc::new(owner.clone()),
                     ..candidate
@@ -1091,6 +1100,7 @@ struct Declared {
     /// symlink into another tree is seen where it leads.
     tree: PathBuf,
     parser: TranscriptParser,
+    head_paths: HeadPaths,
     max_depth: Option<u8>,
 }
 
@@ -1147,6 +1157,7 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
             path,
             tree,
             parser: transcripts.parser(),
+            head_paths: transcripts.head_paths().clone(),
             max_depth: transcripts.max_depth(),
         });
     }
@@ -1179,6 +1190,7 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
                 agent_base: entry.runtime,
                 path: entry.path,
                 parser: entry.parser,
+                head_paths: entry.head_paths,
                 private: entry.profile.is_some(),
                 max_depth: entry.max_depth,
             });
@@ -1364,12 +1376,13 @@ fn transcript_matches_process(
 /// owning runtime's descriptor names.
 fn parse_transcript(
     parser: TranscriptParser,
+    head_paths: &HeadPaths,
     agent_base: RuntimeRef,
     root: &Path,
     path: &Path,
 ) -> io::Result<Option<TranscriptCandidate>> {
     match parser {
-        TranscriptParser::JsonlHeadV1 => parse_jsonl_head(agent_base, path),
+        TranscriptParser::JsonlHeadV1 => parse_jsonl_head(agent_base, head_paths, path),
         TranscriptParser::MuseSessionV1 => muse::parse_session(agent_base, root, path),
     }
 }
@@ -1377,8 +1390,15 @@ fn parse_transcript(
 /// The `jsonl-head-v1` parser: reads at most `TRANSCRIPT_SCAN_LINE_LIMIT`
 /// records within `TRANSCRIPT_SCAN_BYTE_LIMIT` bytes and takes the first
 /// session id, transcript path and absolute working directory they carry.
+///
+/// The top-level keys are read from every record and win. The declared head
+/// paths are read from the first line only, as a fallback for a value no
+/// top-level key supplied: later records of a rollout carry ids of their own,
+/// so a path never reaches past the head, and a first line that does not parse
+/// yields none.
 fn parse_jsonl_head(
     agent_base: RuntimeRef,
+    head_paths: &HeadPaths,
     path: &Path,
 ) -> io::Result<Option<TranscriptCandidate>> {
     let file = match File::open(path) {
@@ -1389,16 +1409,20 @@ fn parse_jsonl_head(
     let mut native_session_id = None;
     let mut native_session_path = None;
     let mut cwd = None;
+    let mut head_session_id = None;
+    let mut head_cwd = None;
     let byte_limit =
         u64::try_from(TRANSCRIPT_SCAN_BYTE_LIMIT).expect("transcript byte limit fits in u64");
-    for line in BufReader::new(file.take(byte_limit))
+    for (index, line) in BufReader::new(file.take(byte_limit))
         .lines()
         .take(TRANSCRIPT_SCAN_LINE_LIMIT)
+        .enumerate()
     {
         let line = line?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let is_head = index == 0;
         if native_session_id.is_none() {
             native_session_id = first_string(
                 &value,
@@ -1410,13 +1434,23 @@ fn parse_jsonl_head(
                 ],
             );
         }
+        let absolute = |text: String| Some(PathBuf::from(text)).filter(|path| path.is_absolute());
+        if is_head {
+            head_session_id = head_paths
+                .id()
+                .and_then(|keys| string_at(&value, keys))
+                .filter(|id| !id.is_empty());
+            head_cwd = head_paths
+                .cwd()
+                .and_then(|keys| string_at(&value, keys))
+                .and_then(absolute);
+        }
         if native_session_path.is_none() {
             native_session_path = first_string(&value, &["transcript_path", "transcriptPath"]);
         }
         if cwd.is_none() {
             cwd = first_string(&value, &["cwd", "working_directory", "workingDirectory"])
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
+                .and_then(absolute)
                 .map(|path| normalize_path(&path));
         }
         if native_session_id.is_some() && native_session_path.is_some() && cwd.is_some() {
@@ -1424,6 +1458,8 @@ fn parse_jsonl_head(
         }
     }
 
+    let native_session_id = native_session_id.or(head_session_id);
+    let cwd = cwd.or_else(|| head_cwd.map(|path| normalize_path(&path)));
     if native_session_id.is_none() && native_session_path.is_none() && cwd.is_none() {
         return Ok(None);
     }
@@ -1453,6 +1489,7 @@ fn unattributed_candidate(
         agent_base: agent_base.clone(),
         path: PathBuf::new(),
         parser: TranscriptParser::JsonlHeadV1,
+        head_paths: HeadPaths::default(),
         max_depth: None,
         private: true,
     });
@@ -1466,6 +1503,15 @@ fn unattributed_candidate(
         cwd,
         updated_at,
     }
+}
+
+/// The string at the declared chain of object keys, if every key is present.
+fn string_at(value: &Value, path: &HeadKeyPath) -> Option<String> {
+    path.keys()
+        .iter()
+        .try_fold(value, |current, key| current.get(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1502,7 +1548,7 @@ mod tests {
     use protocol::RuntimeRef;
 
     use super::{parse_transcript, TRANSCRIPT_SCAN_BYTE_LIMIT};
-    use crate::agent::host::TranscriptParser;
+    use crate::agent::host::{HeadPaths, TranscriptParser};
 
     /// FIFO permissions used by the bounded-read test fixture.
     const TRANSCRIPT_FIFO_MODE: libc::mode_t = 0o600;
@@ -1523,6 +1569,7 @@ mod tests {
         let parser = thread::spawn(move || {
             let result = parse_transcript(
                 TranscriptParser::JsonlHeadV1,
+                &HeadPaths::default(),
                 RuntimeRef::claude(),
                 Path::new(""),
                 &parser_path,
@@ -1596,7 +1643,7 @@ mod observer_tests {
         start_transcript_index, ExternalObserverConfig, ExternalSessions, ObservedRoots,
         TranscriptRoot,
     };
-    use crate::agent::host::TranscriptParser;
+    use crate::agent::host::{HeadPaths, TranscriptParser};
     use crate::procwatch::{
         Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
         ProcessInspector,
@@ -1686,6 +1733,7 @@ mod observer_tests {
         let (root, transcript) = transcript_root();
         let roots = vec![TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::claude(),
             path: root.path().to_path_buf(),
             private: false,
@@ -1730,6 +1778,7 @@ mod observer_tests {
             ExternalObserverConfig {
                 roots: ObservedRoots::Fixed(vec![TranscriptRoot {
                     parser: TranscriptParser::JsonlHeadV1,
+                    head_paths: HeadPaths::default(),
                     agent_base: RuntimeRef::claude(),
                     path: root.to_path_buf(),
                     private: false,
@@ -1828,7 +1877,7 @@ mod scan_tests {
 
     use super::watch::RootScan;
     use super::{ScanLimits, TranscriptIndex, TranscriptRoot, SCAN_LIMITS};
-    use crate::agent::host::TranscriptParser;
+    use crate::agent::host::{HeadPaths, TranscriptParser};
 
     const GENEROUS: ScanLimits = SCAN_LIMITS;
 
@@ -1844,6 +1893,7 @@ mod scan_tests {
     fn root(path: &Path) -> TranscriptRoot {
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::claude(),
             path: path.to_path_buf(),
             private: false,
@@ -2122,6 +2172,7 @@ mod scan_tests {
         let inner_path = dir.path().join("codex");
         let inner = TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::codex(),
             path: inner_path.clone(),
             private: false,
@@ -2207,6 +2258,7 @@ mod scan_tests {
         let claude = root(&claude_dir);
         let codex = TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::codex(),
             path: link.clone(),
             private: false,
@@ -2250,6 +2302,7 @@ mod scan_tests {
             root(&claude_dir),
             TranscriptRoot {
                 parser: TranscriptParser::JsonlHeadV1,
+                head_paths: HeadPaths::default(),
                 agent_base: RuntimeRef::codex(),
                 path: link.clone(),
                 private: false,

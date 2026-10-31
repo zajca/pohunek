@@ -128,12 +128,13 @@ copies of that descriptor and its detection manifest in
   held `done` or `idle` beats a stale spinner title, and the record's
   `working` stands over an idle title. `done` turns into `idle` on the next
   key press; both read idle, so that change is no transition. `error` reads
-  idle. Codex 0.160.0 to 0.162.x emit no records and read from the title and
-  the screen alone. A record never releases the initial prompt: `manifest_idle`
+  idle. Codex 0.160.0 (recorded: no records) and 0.161.x to 0.162.x (not run; no
+  records according to the Codex source) read from the title and the screen
+  alone. A record never releases the initial prompt: `manifest_idle`
   still waits for the title or the screen.
 - **Background terminals.** Codex reports `working` while a background
   terminal runs, also after the turn ended. The rule `background_terminals_idle`
-  (priority 550, below `weak_blocker`; `overrides_program_status`) reads idle for the footer
+  (priority 650, above `weak_blocker`; `overrides_program_status`, evaluated only while a record is held) reads idle for the footer
   `N background terminal(s) running · /ps to view · /stop to close` when the
   working row of a running turn is not on screen, so a dev server left running
   does not keep the turn open. The footer is truncated, not wrapped, at narrow
@@ -141,9 +142,12 @@ copies of that descriptor and its detection manifest in
   `N background term`. While a turn runs the footer joins the working row and
   the row's `(Ns • esc to interrupt)` group gates the rule off. A screen
   with an idle title, no row and no footer reads `working` from the record
-  (synthetic scenario). The window between Enter and the server's
-  acknowledgement and a goal that continues between turns would look like that
-  from the Codex source; neither was recorded on 0.164.0.
+  (synthetic scenario). A turn that is sent while the server has not acknowledged
+  it yet (the stub holds the response before `response.created`) reads
+  `working` from the first moment on 0.164.0
+  (`a_real_codex_reads_working_before_the_server_acknowledges_the_turn`). A goal
+  that continues between turns would look like the synthetic screen from the
+  Codex source; it was not recorded on 0.164.0.
 - **MCP startup.** The Codex source treats MCP startup as running work
   (title spinner, `Starting MCP servers` row, `working` record) before any
   turn; the recorded startup sequence of 0.164.0 shows `idle`, `working`,
@@ -162,8 +166,9 @@ copies of that descriptor and its detection manifest in
 The screens in `compat/codex/screens/` (named screens at 100 columns, widths 20
 to 200 in `widths/`, each with the OSC title Codex had set in a `.title` file)
 were captured from a real interactive Codex 0.164.0 in a PTY with a fresh
-`CODEX_HOME`, a loopback Responses stub as the model provider, no credential,
-and no network (a network namespace with only loopback). They cover the idle
+`CODEX_HOME`, a loopback Responses stub as the model provider and no credential
+(the 0.164.0 runs recorded in `compat/codex/compatibility-lock.json` used a network
+namespace with only loopback; the recapture check below did not). They cover the idle
 screen, a turn held before its first output (`Working (0s • esc to
 interrupt)`), a streaming reply, the screen after a turn, a tool approval
 prompt (`Would you like to run the following command?`) and, in
@@ -171,9 +176,11 @@ prompt (`Would you like to run the following command?`) and, in
 `*.program-status` files beside them are the ordered, de-duplicated OSC 7501
 root records of the same runs (`capture_the_real_codex_screens` and
 `capture_the_real_codex_background_terminal_screens` write the screens and the
-sequences; `POHUNEK_CODEX_CAPTURE_DIR` names the output directory). The
-captures run in the alternate screen: Codex enters it (`ESC [ ? 1049 h`) by
-default. The question prompt, the sign-in screen, the first-run folder dialog,
+sequences; `POHUNEK_CODEX_CAPTURE_DIR` names the output directory, and the
+second test writes its screens to `background/` below it). The capture run
+saw Codex enter the alternate screen (`ESC [ ? 1049 h`); the committed fact is
+`alternate-screen.fact`, which `codex_enters_the_alternate_screen` pins; only a
+recapture refreshes it. The question prompt, the sign-in screen, the first-run folder dialog,
 the startup dialogs and the update popup could not be recaptured on 0.164.0
 (no stub marker reaches them, or no newer release exists to announce); they are
 the captures of 0.160.0 in `compat/codex/screens/n-1`, `startup-dialogs` and
@@ -188,8 +195,8 @@ composer.
   background-terminal footer above.
 - Screen rules: the 0.164.0 approval prompt is blocked from the screen text
   alone at every captured width except 30, where the question and the
-  confirmation line scroll out of the 24 rows; there only the title and the
-  record say blocked. The 0.160.0 approval and question prompts are blocked
+  confirmation line wrap over several rows, so no single-line phrase matches;
+  there only the title and the record say blocked. The 0.160.0 approval and question prompts are blocked
   from the screen text alone at 30 columns and wider.
 - `codex resume <id>` against a fresh home restores the conversation from
   Codex's own session store (checked by hand; the id is the one in
@@ -365,8 +372,14 @@ absence of egress).
   and runs that file.
 
 Update procedure for a new Codex release: install it from the locked npm tree,
-rerun the real-Codex tests, recapture the screens and program-status sequences
-with `POHUNEK_CODEX_CAPTURE_DIR` (in a network namespace with only loopback),
-move the previous captures to `compat/codex/screens/n-1` (the older set is
-deleted and `min` raised to the previous release), move the lock and the
+move the current captures to `compat/codex/screens/n-1` (the older set is
+deleted and `min` raised to the previous release), rerun the real-Codex tests,
+then recapture the screens and program-status sequences with
+`POHUNEK_CODEX_CAPTURE_DIR` set to the absolute path of `compat/codex/screens`
+(`POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test all -- --include-ignored
+--test-threads 1 codex_package::capture_the_real`). The two capture tests also
+serialise on a lock beside their fixed recording root `/dev/shm/ph-codex`. A
+recapture of 0.164.0 reproduced the committed layout (including `background/`
+and `alternate-screen.fact`); only the clock times, elapsed seconds and the
+spinner glyph of the captured rows and titles differed. Move the lock and the
 descriptor's `below` together, and bump the package `version`.

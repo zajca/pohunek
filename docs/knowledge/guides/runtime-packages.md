@@ -111,6 +111,7 @@ The features this core implements:
 | `integration-muse-hook-v1` | 0.38.0 | `integration.handler = "muse-hook-v1"` |
 | `package-commands-v1` | 0.38.0 | `[commands.<name>]` |
 | `input-refuse-while-blocked-v1` | 0.39.0 | `[input] refuse_while_blocked` |
+| `transcripts-head-paths-v1` | 0.39.0 | `[transcripts] id_path`, `cwd_path` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -217,6 +218,35 @@ tree), the observer attributes both trees to neither and logs a warning
 `external.transcript_roots.ambiguous` with code `transcripts_ambiguous_owner`
 for each home; the other roots stay watched. The official `codex` package
 declares `sessions` and the official `claude` package declares `projects`.
+
+### Nested ids in the first line
+
+`jsonl-head-v1` reads the session id and the working directory from top-level
+keys. A transcript whose first line wraps them (Codex rollouts start with
+`{"timestamp", "type", "payload": {"id", "cwd", ...}}`) names the key paths
+(runtime feature `transcripts-head-paths-v1`, listed in `requires`):
+
+```toml
+requires = ["transcripts-head-paths-v1"]
+
+[transcripts]
+parser = "jsonl-head-v1"
+dir = "sessions"
+id_path = ["payload", "id"]      # native session id, a string
+cwd_path = ["payload", "cwd"]    # absolute working directory, a string
+```
+
+Each path is a list of one to three object keys of at most 32 bytes made of
+`A-Z`, `a-z`, `0-9` and `_`; there is no separator, index, wildcard or
+expression. Either key may be given alone, and both need `parser =
+"jsonl-head-v1"`. The paths apply to the first line of the file only, and only
+when it parses as JSON: later records carry ids of their own. A top-level key
+of any record wins over the value at a path, and a path value that
+is not a string (or, for `cwd_path`, not an absolute path) is ignored. An empty
+list, a longer list, an unsafe key, a non-list value or a parser other than
+`jsonl-head-v1` is refused (`descriptor_invalid`); a path without the feature in
+`requires` is refused with `runtime_feature_unsupported`, and an older core
+refuses the package the same way instead of ignoring the keys.
 
 ### Transcripts outside the config home
 
@@ -690,9 +720,13 @@ other app, records without an app and records of children (an `id=` pair) are
 ignored. `answer_probe = true` makes the session worker answer the program's
 `ESC ] 7501 ; ? ESC \` probe, which programs such as Claude Code and Pi wait
 for before they report; leave it off for a program that reports without a probe
-(Codex). A rule may set `overrides_program_status = true`: when it is the screen
-winner it beats a non-blocked record (for a state the program reports
-misleadingly). The table and the flag are rejected when malformed, and a rule
+(Codex). A rule may set `overrides_program_status = true`: while a record is held
+it is evaluated like any other rule and, as the screen winner, beats a
+non-blocked record (for a state the program reports misleadingly); with no
+record held it is skipped, so the screen reads as it would without the rule
+(since 0.39.0; earlier cores evaluate the rule whether or not a record is held,
+so a package that ranks such a rule above a blocker also lists a 0.39.0 feature
+in `requires`, as the official Codex package does). The table and the flag are rejected when malformed, and a rule
 flag without the table is an error.
 
 The record is arbitrated with the screen rules (a visible dialog always wins

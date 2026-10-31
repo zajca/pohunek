@@ -110,6 +110,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "input-refuse-while-blocked-v1",
         since: "0.39.0",
     },
+    RuntimeFeature {
+        id: "transcripts-head-paths-v1",
+        since: "0.39.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -148,6 +152,14 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "transcripts-data-root-v1",
         rule: GateRule::Key("native_reference.existence.dir_name"),
+    },
+    FeatureGate {
+        feature: "transcripts-head-paths-v1",
+        rule: GateRule::Key("transcripts.id_path"),
+    },
+    FeatureGate {
+        feature: "transcripts-head-paths-v1",
+        rule: GateRule::Key("transcripts.cwd_path"),
     },
     FeatureGate {
         feature: "integration-muse-hook-v1",

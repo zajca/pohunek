@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use protocol::RuntimeRef;
 
-use crate::agent::host::TranscriptParser;
+use crate::agent::host::{HeadPaths, TranscriptParser};
 
 use tokio_util::sync::CancellationToken;
 
@@ -125,6 +125,7 @@ impl Live {
         let sessions = ExternalSessions::new();
         let roots = vec![TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::claude(),
             path: root.clone(),
             private: false,
@@ -535,6 +536,7 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
     let roots = vec![
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::claude(),
             path: outer.clone(),
             private: false,
@@ -542,6 +544,7 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
         },
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
             private: false,
@@ -675,6 +678,7 @@ fn create_subagent_dirs(tree: &Path, day: &str) {
 fn dated_root(path: &Path) -> TranscriptRoot {
     TranscriptRoot {
         parser: TranscriptParser::MuseSessionV1,
+        head_paths: HeadPaths::default(),
         agent_base: RuntimeRef::codex(),
         path: path.to_path_buf(),
         private: false,
@@ -727,6 +731,7 @@ async fn a_dated_tree_larger_than_the_watch_share_keeps_the_newest_sessions_live
         dated_root(&dated),
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::claude(),
             path: other.clone(),
             private: false,
@@ -815,6 +820,7 @@ async fn a_transcript_below_the_depth_bound_is_never_indexed() {
     let sessions = ExternalSessions::new();
     let roots = vec![TranscriptRoot {
         parser: TranscriptParser::JsonlHeadV1,
+        head_paths: HeadPaths::default(),
         agent_base: RuntimeRef::claude(),
         path: root.clone(),
         private: false,

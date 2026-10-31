@@ -5,3 +5,4 @@ transcripts-data-root-v1 0.38.0
 integration-muse-hook-v1 0.38.0
 package-commands-v1 0.38.0
 input-refuse-while-blocked-v1 0.39.0
+transcripts-head-paths-v1 0.39.0

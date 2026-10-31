@@ -996,6 +996,105 @@ async fn a_transcript_root_of_its_own_installs_only_with_its_feature_and_valid()
     servers.stop().await;
 }
 
+const HEAD_PATHS_FEATURE: &str = "\"transcripts-head-paths-v1\"";
+
+/// A `[transcripts]` table below the config home with the given extra keys.
+fn head_paths_transcripts(parser: &str, extra: &str) -> String {
+    format!(
+        "\n[config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n\
+         [transcripts]\nparser = \"{parser}\"\ndir = \"sessions\"\n{extra}"
+    )
+}
+
+#[tokio::test]
+async fn transcript_head_paths_install_only_with_their_feature_and_valid() {
+    let servers = spawn_servers("pkg-head-paths").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let valid = "id_path = [\"payload\", \"id\"]\ncwd_path = [\"payload\", \"cwd\"]\n";
+
+    // Either key is refused without `requires`.
+    let gated = [
+        (
+            "id-path",
+            head_paths_transcripts("jsonl-head-v1", "id_path = [\"payload\", \"id\"]\n"),
+        ),
+        (
+            "cwd-path",
+            head_paths_transcripts("jsonl-head-v1", "cwd_path = [\"payload\", \"cwd\"]\n"),
+        ),
+    ]
+    .map(|(name, tables)| (name, descriptor_requiring("", &tables)));
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &gated,
+        "runtime_feature_unsupported",
+    )
+    .await;
+
+    let refused = [
+        ("empty-path", "id_path = []\n".to_owned()),
+        (
+            "too-deep",
+            "id_path = [\"a\", \"b\", \"c\", \"d\"]\n".to_owned(),
+        ),
+        ("empty-key", "id_path = [\"payload\", \"\"]\n".to_owned()),
+        ("dotted-key", "id_path = [\"payload.id\"]\n".to_owned()),
+        ("indexed-key", "cwd_path = [\"items[0]\"]\n".to_owned()),
+        ("wildcard-key", "cwd_path = [\"*\"]\n".to_owned()),
+        ("long-key", format!("id_path = [\"{}\"]\n", "k".repeat(33))),
+        ("text-path", "id_path = \"payload.id\"\n".to_owned()),
+        ("number-key", "id_path = [1]\n".to_owned()),
+    ]
+    .map(|(name, extra)| {
+        (
+            name,
+            descriptor_requiring(
+                HEAD_PATHS_FEATURE,
+                &head_paths_transcripts("jsonl-head-v1", &extra),
+            ),
+        )
+    });
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &refused,
+        "package_descriptor_invalid",
+    )
+    .await;
+    // The fixed layout of the other parser takes no key paths.
+    let other_parser = [(
+        "muse-parser",
+        descriptor_requiring(
+            &format!("{HEAD_PATHS_FEATURE}, \"transcripts-data-root-v1\""),
+            &head_paths_transcripts("muse-session-v1", valid),
+        ),
+    )];
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &other_parser,
+        "package_descriptor_invalid",
+    )
+    .await;
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let document = descriptor_requiring(
+        HEAD_PATHS_FEATURE,
+        &head_paths_transcripts("jsonl-head-v1", valid),
+    );
+    let (_digest, result) =
+        install_descriptor(&mut local, &servers.plugins, "nested", &document, false).await;
+    result.expect("a valid head path with its feature installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
 /// Hook descriptors whose directory-name existence is invalid.
 fn invalid_dir_name_existences() -> Vec<(&'static str, String)> {
     let with = |existence: &str| hook_descriptor(DATA_ROOT_FEATURE, existence, "");

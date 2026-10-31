@@ -1233,7 +1233,15 @@ plain components, no `.` or `..`, no empty segment, bounded). The table requires
 or a missing `[config_home]` is `descriptor_invalid`. The official Codex
 package declares `sessions` and the official Claude Code package declares
 `projects`; a runtime without the
-table contributes no transcript root. Trees of two different runtimes that are
+table contributes no transcript root. With the runtime feature
+`transcripts-head-paths-v1` (listed in `requires`), `jsonl-head-v1` also takes
+`id_path` and `cwd_path`, each a list of one to three plain object keys
+(`A-Za-z0-9_`, at most 32 bytes each), and reads the native session id and the
+absolute working directory at those paths of the file's first line only; a
+top-level key of any record wins, and the official Codex package declares
+`["payload", "id"]` and `["payload", "cwd"]`. A longer, empty or unsafe path, a
+non-list value or another parser is `descriptor_invalid`; a path without the
+feature is `runtime_feature_unsupported`. Trees of two different runtimes that are
 the same directory or nested in each other are attributed to neither; the
 daemon logs the warning `external.transcript_roots.ambiguous` with code
 `transcripts_ambiguous_owner`.

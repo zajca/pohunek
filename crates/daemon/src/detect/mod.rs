@@ -621,7 +621,8 @@ impl Detector {
         // A pending candidate needs repeated observations to confirm, so it
         // keeps evaluating even over unchanged context.
         if self.context_dirty || self.needs_visible_recheck || self.state.has_pending() {
-            let screen_hit = self.manifest_evidence(ContextFreshness::all());
+            let screen_hit =
+                self.manifest_evidence(ContextFreshness::all(), self.program_status.is_some());
             if let Some(hit) = &screen_hit {
                 self.sight_visible_blocker(hit);
             }
@@ -652,7 +653,7 @@ impl Detector {
         // clear alone, or the idle title cached from before the blocker, can
         // never release the latched prompt.
         let idle_hit = || {
-            self.manifest_evidence(ContextFreshness::all())
+            self.manifest_evidence(ContextFreshness::all(), false)
                 .filter(|hit| hit.evidence.activity == AgentActivity::Idle)
         };
         let screen_idle =
@@ -738,7 +739,7 @@ impl Detector {
         if !self.initial_input_pending || self.input_readiness != InputReadiness::ManifestIdle {
             return;
         }
-        if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
+        if let Some(hit) = self.manifest_evidence(ContextFreshness::all(), false) {
             self.sight_visible_blocker(&hit);
         }
     }
@@ -802,20 +803,27 @@ impl Detector {
         };
         overlay_program_status(
             self.program_status.as_ref(),
-            self.manifest_evidence(freshness),
+            self.manifest_evidence(freshness, self.program_status.is_some()),
         )
     }
 
-    fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ManifestEvidenceHit> {
+    fn manifest_evidence(
+        &self,
+        freshness: ContextFreshness,
+        program_status_held: bool,
+    ) -> Option<ManifestEvidenceHit> {
         self.manifest.as_ref().and_then(|manifest| {
             manifest_hit(
                 manifest,
                 &self.screen,
                 self.latest_title.as_deref(),
                 self.latest_progress.as_deref(),
-                self.title_seq,
-                self.screen_seq,
+                Arrivals {
+                    title: self.title_seq,
+                    screen: self.screen_seq,
+                },
                 freshness,
+                program_status_held,
             )
         })
     }
@@ -902,9 +910,9 @@ impl ChunkLatch {
                 screen,
                 latest_title,
                 latest_progress,
-                0,
-                0,
+                Arrivals::default(),
                 freshness,
+                self.program_status.is_some(),
             ),
         );
         if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
@@ -985,19 +993,29 @@ fn match_context_for(
     context
 }
 
+/// Sequence points of the latest arrival of the title and of the screen text.
+#[derive(Debug, Default, Clone, Copy)]
+struct Arrivals {
+    title: u64,
+    screen: u64,
+}
+
 /// The winning manifest evidence over explicit context pieces: the pure,
 /// shared counterpart of [`Detector::manifest_evidence`], for the same
-/// borrow-split reason as [`match_context_for`].
+/// borrow-split reason as [`match_context_for`]. `program_status_held`
+/// enables the rules that override a record; readiness passes `false`, so a
+/// record never releases a prompt.
 fn manifest_hit(
     manifest: &Manifest,
     screen: &ScreenTracker,
     latest_title: Option<&str>,
     latest_progress: Option<&str>,
-    title_arrival: u64,
-    screen_arrival: u64,
+    arrivals: Arrivals,
     freshness: ContextFreshness,
+    program_status_held: bool,
 ) -> Option<ManifestEvidenceHit> {
-    let context = match_context_for(manifest, screen, latest_title, latest_progress, freshness);
+    let context = match_context_for(manifest, screen, latest_title, latest_progress, freshness)
+        .with_program_status_held(program_status_held);
     let matched = manifest.match_context(&context)?;
     let source = manifest_source(&matched.region);
     if matched.activity == AgentActivity::Blocked
@@ -1010,8 +1028,8 @@ fn manifest_hit(
     // Arrival sequence for eligible idle sources; other sources cannot
     // release strict initial input.
     let arrival = match source {
-        StateSource::OscTitle => title_arrival,
-        StateSource::Screen => screen_arrival,
+        StateSource::OscTitle => arrivals.title,
+        StateSource::Screen => arrivals.screen,
         StateSource::OscProgress
         | StateSource::Process
         | StateSource::Report
@@ -1070,9 +1088,12 @@ impl ReadinessObserver<'_> {
                 screen,
                 self.latest_title,
                 self.latest_progress,
-                self.title_arrival,
-                *self.screen_seq,
+                Arrivals {
+                    title: self.title_arrival,
+                    screen: *self.screen_seq,
+                },
                 ContextFreshness::all(),
+                false,
             )
         });
         if hit.is_some_and(|hit| {

@@ -25,6 +25,18 @@
 //! max_depth = 4
 //! ```
 //!
+//! `jsonl-head-v1` also reads a session id and a working directory that sit
+//! below an object key of the first line, when the descriptor names the key
+//! paths (feature `transcripts-head-paths-v1`):
+//!
+//! ```toml
+//! [transcripts]
+//! parser = "jsonl-head-v1"
+//! dir = "sessions"
+//! id_path = ["payload", "id"]
+//! cwd_path = ["payload", "cwd"]
+//! ```
+//!
 //! The parser is a closed set compiled into core; a descriptor only names one.
 //! A runtime without the table contributes no transcript root to the external
 //! observer.
@@ -60,6 +72,77 @@ pub const MAX_TRANSCRIPT_DIR_BYTES: usize = crate::agent::MAX_EXISTENCE_TEXT_BYT
 /// Shares the descriptor-relative path depth bound for the same reason as
 /// [`MAX_TRANSCRIPT_DIR_BYTES`].
 pub const MAX_TRANSCRIPT_DIR_COMPONENTS: usize = MAX_EXISTENCE_PATH_COMPONENTS;
+
+/// Most object keys a `[transcripts]` head path may chain.
+pub const MAX_HEAD_PATH_KEYS: usize = 3;
+
+/// Longest key of a head path, in bytes.
+///
+/// Keys name fields of a transcript's first line, so they are short
+/// identifiers; the bound keeps a descriptor from carrying free text.
+pub const MAX_HEAD_PATH_KEY_BYTES: usize = 32;
+
+/// A validated chain of object keys that leads to a string in the first line
+/// of a transcript.
+///
+/// A key is `[A-Za-z0-9_]`, so a path is data to walk, never an expression: no
+/// separator, index, wildcard or escape exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadKeyPath(Vec<String>);
+
+impl HeadKeyPath {
+    /// Validates `keys` as the path declared at `field`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] when the path is empty or longer
+    /// than [`MAX_HEAD_PATH_KEYS`], or a key is empty, longer than
+    /// [`MAX_HEAD_PATH_KEY_BYTES`] or holds a character outside
+    /// `[A-Za-z0-9_]`.
+    pub fn new(field: &'static str, keys: &[String]) -> Result<Self, DefinitionError> {
+        let key_is_plain = |key: &String| {
+            !key.is_empty()
+                && key.len() <= MAX_HEAD_PATH_KEY_BYTES
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        };
+        if keys.is_empty() || keys.len() > MAX_HEAD_PATH_KEYS || !keys.iter().all(key_is_plain) {
+            return Err(DefinitionError::Field {
+                field,
+                reason: "must be a short list of plain object keys",
+            });
+        }
+        Ok(Self(keys.to_vec()))
+    }
+
+    /// The object keys, outermost first.
+    #[must_use]
+    pub fn keys(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The key paths a `jsonl-head-v1` declaration names for the first line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeadPaths {
+    id: Option<HeadKeyPath>,
+    cwd: Option<HeadKeyPath>,
+}
+
+impl HeadPaths {
+    /// The path of the native session id, when declared.
+    #[must_use]
+    pub fn id(&self) -> Option<&HeadKeyPath> {
+        self.id.as_ref()
+    }
+
+    /// The path of the working directory, when declared.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&HeadKeyPath> {
+        self.cwd.as_ref()
+    }
+}
 
 /// A transcript parser compiled into core.
 ///
@@ -123,6 +206,7 @@ pub struct Transcripts {
     dir: String,
     root: Option<ConfigHome>,
     max_depth: Option<u8>,
+    head_paths: HeadPaths,
 }
 
 impl Transcripts {
@@ -153,7 +237,44 @@ impl Transcripts {
             dir: dir.to_owned(),
             root: None,
             max_depth: None,
+            head_paths: HeadPaths::default(),
         })
+    }
+
+    /// This declaration reading the session id and the working directory from
+    /// the declared key paths of the first line.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] when the parser is not
+    /// `jsonl-head-v1` or a path is not a short list of plain object keys.
+    /// Passing neither path declares none.
+    pub fn with_head_paths(
+        mut self,
+        id_path: Option<&[String]>,
+        cwd_path: Option<&[String]>,
+    ) -> Result<Self, DefinitionError> {
+        if self.parser != TranscriptParser::JsonlHeadV1 {
+            return Err(DefinitionError::Field {
+                field: "transcripts.parser",
+                reason: "must be jsonl-head-v1 to declare head paths",
+            });
+        }
+        self.head_paths = HeadPaths {
+            id: id_path
+                .map(|keys| HeadKeyPath::new("transcripts.id_path", keys))
+                .transpose()?,
+            cwd: cwd_path
+                .map(|keys| HeadKeyPath::new("transcripts.cwd_path", keys))
+                .transpose()?,
+        };
+        Ok(self)
+    }
+
+    /// The key paths of the first line; empty unless declared.
+    #[must_use]
+    pub fn head_paths(&self) -> &HeadPaths {
+        &self.head_paths
     }
 
     /// This declaration with its own root: `root_env` names the variable that
