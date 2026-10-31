@@ -929,15 +929,19 @@ const UNREAD_FLOOD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Releases the flooding child, once the attach stream is open, so the stream
 /// is subscribed before the child prints its first byte. A non-blocking open
-/// of a FIFO fails with `ENXIO` until the child reads it, so the wait for the
+/// of a FIFO fails with `ENXIO` until the child opens it for reading, so the wait for the
 /// child is bounded by the hang guard.
 async fn start_flooding(start: &Path) {
     let mut fifo = wait_until("the child to wait for the start line", || async {
-        std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(start)
-            .ok()
+        {
+            Ok(fifo) => Some(fifo),
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => None,
+            Err(error) => panic!("open the start FIFO: {error}"),
+        }
     })
     .await;
     fifo.write_all(b"go\n").expect("release the flooding child");
