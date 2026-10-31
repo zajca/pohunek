@@ -1714,6 +1714,10 @@ where
         if let Some(end) = route_stdin_input(&decoded.bytes, ctx.reborrow()).await? {
             return Ok(Some(end));
         }
+        if ctx.stream_input.detaching {
+            // A detach chosen in the menu ends the attach before the shortcut.
+            return Ok(None);
+        }
         match shortcut {
             Shortcut::Detach => {
                 // The attach loop writes what the stream takes of the input
@@ -1922,6 +1926,13 @@ where
                 read = socket_read.read(&mut socket_buf), if stdout.queued() < OUTPUT_QUEUE_BYTES => {
                     let read = read?;
                     if read == 0 && stream_input.shut_down {
+                        // The raw stream cannot carry a typed failure, so the
+                        // daemon's detach reply reports one.
+                        if let Ok(detach) = send_detach(&mut client, &stream_id).await {
+                            if let Some(error) = stream_error_from_detach(detach) {
+                                return Err(error);
+                            }
+                        }
                         return Ok(AttachStreamEnd::InputClosed);
                     }
                     let input = &socket_buf[..read];

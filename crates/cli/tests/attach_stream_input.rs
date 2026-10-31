@@ -99,8 +99,8 @@ enum StreamBehavior {
     FloodWhileReading,
     /// Reads no input until `INPUT_GATE` opens, then reads it to its end.
     HoldInput,
-    /// Reads the input to its end, answers with `ANSWER` and closes the
-    /// stream, as the daemon does once it delivered a finished input.
+    /// Reads the input to its end, writes `ANSWER` and closes the stream; the
+    /// answer reaches the client only while it keeps the connection open.
     AnswerAfterInput,
 }
 
@@ -407,7 +407,7 @@ fn an_attach_client_detaches_past_an_unread_paste_and_reports_what_it_dropped() 
 }
 
 #[test]
-fn a_piped_attach_shows_the_output_that_follows_its_delivered_input() {
+fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let root = env.root().to_path_buf();
     for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -439,8 +439,15 @@ fn a_piped_attach_shows_the_output_that_follows_its_delivered_input() {
     // that answer instead of closing it with the end of its input.
     stdin.write_all(KEYSTROKE).expect("pipe the input");
     drop(stdin);
-    let mut shown = Vec::new();
-    stdout.read_to_end(&mut shown).expect("read the CLI output");
+    let (output, shown_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut shown = Vec::new();
+        let _count = stdout.read_to_end(&mut shown);
+        let _sent = output.send(shown);
+    });
+    let shown = shown_rx
+        .recv_timeout(HANG_GUARD)
+        .expect("the client ends once the stream closed");
     let status = cli.0.wait().expect("wait for pohunek attach");
 
     assert!(status.success(), "{status}");
@@ -450,7 +457,7 @@ fn a_piped_attach_shows_the_output_that_follows_its_delivered_input() {
     );
     assert!(
         shown.windows(ANSWER.len()).any(|window| window == ANSWER),
-        "the client shows what follows its delivered input: {:?}",
+        "the client keeps reading until the stream closes: {:?}",
         String::from_utf8_lossy(&shown)
     );
 }
