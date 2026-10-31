@@ -937,10 +937,10 @@ fn job_missing_effects_text(effects: Option<&JobMissingEffects>) -> String {
 }
 
 /// The way to abandon an upgrade an earlier run left pending, which the
-/// at-risk refusal of its resume and a blocked `refresh-path` name.
+/// at-risk refusal of its resume names.
 macro_rules! abandon_pending_upgrade {
     () => {
-        " To abandon the pending upgrade instead, roll it back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>` (`pohunek service status` shows that version as `from`); the previous daemon's adoption verdict is taken again before it is restored."
+        "; to abandon the pending upgrade instead, roll it back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>` (`pohunek service status` shows that version as `from`), and the previous daemon's adoption verdict is taken again before it is restored"
     };
 }
 
@@ -963,8 +963,6 @@ macro_rules! at_risk_plain {
 }
 
 const AT_RISK_RESTORED_PATH_HINT: &str = at_risk_restored_path!();
-const AT_RISK_RESTORED_PATH_RESUMED_HINT: &str =
-    concat!(at_risk_restored_path!(), abandon_pending_upgrade!());
 const AT_RISK_STALE_PATH_HINT: &str = at_risk_stale_path!();
 const AT_RISK_STALE_PATH_RESUMED_HINT: &str =
     concat!(at_risk_stale_path!(), abandon_pending_upgrade!());
@@ -1022,7 +1020,7 @@ impl Error {
             },
             Self::RollbackFailed { original, rollback } => Self::RollbackFailed {
                 original: Box::new(original.with_job_missing_effects(effects)),
-                rollback: Box::new(rollback.with_job_missing_effects(effects)),
+                rollback,
             },
             other => other,
         }
@@ -1044,9 +1042,7 @@ impl Error {
     pub(crate) fn is_job_missing(&self) -> bool {
         match self {
             Self::DaemonJobMissing { .. } => true,
-            Self::RollbackFailed { original, rollback } => {
-                original.is_job_missing() || rollback.is_job_missing()
-            }
+            Self::RollbackFailed { original, .. } => original.is_job_missing(),
             _ => false,
         }
     }
@@ -1203,8 +1199,7 @@ impl Error {
                     .iter()
                     .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING));
                 Some(match (restored, stale, resumed) {
-                    (true, _, false) => AT_RISK_RESTORED_PATH_HINT,
-                    (true, _, true) => AT_RISK_RESTORED_PATH_RESUMED_HINT,
+                    (true, _, _) => AT_RISK_RESTORED_PATH_HINT,
                     (false, true, false) => AT_RISK_STALE_PATH_HINT,
                     (false, true, true) => AT_RISK_STALE_PATH_RESUMED_HINT,
                     (false, false, false) => AT_RISK_HINT,

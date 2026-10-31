@@ -76,7 +76,7 @@ async fn a_resume_refused_at_risk_names_the_rollback_that_restores_the_previous_
         refused.hint().expect("hint"),
         &[
             "pass --accept-runtime-loss",
-            "To abandon the pending upgrade instead",
+            "no session is changed; to abandon the pending upgrade instead",
             "`pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>`",
             "shows that version as `from`",
         ],

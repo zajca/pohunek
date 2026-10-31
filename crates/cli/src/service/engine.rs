@@ -855,13 +855,14 @@ impl<'a> Engine<'a> {
         let mut late = LateGate::default();
         let result = self
             .run_steps(&mut record, &layout, staged, &target, &mut late)
-            .await
-            .map_err(|error| if resumed { error.resumed() } else { error });
+            .await;
         // A refusal never touches the running daemon. Rolling back a record
         // at `Registering` would replace it, and the replacement may not have
         // happened yet, so that record is kept for a resume instead.
         let result = match result {
-            Err(error) if late.refused && record.step >= Step::Registering => return Err(error),
+            Err(error) if late.refused && record.step >= Step::Registering => {
+                return Err(if resumed { error.resumed() } else { error });
+            }
             other => other,
         };
         self.settle(&record, result).await?;
