@@ -2823,10 +2823,14 @@ the previous path and job. Worker jobs are never touched and the accepted-risk
 ledger is never written. `status`, `check` and the reports of the other service
 commands show a pending refresh as `pending_transaction` with `operation`
 `refresh_path`, and `rolling_back: true` (omitted otherwise) once its rollback
-has begun. It fails with `service_upgrade_sessions_at_risk` or
+has begun. A pending upgrade also carries `previous_version`, the version it
+started from (omitted for the other operations); the text of `status` shows it as
+`pending upgrade <to> from <previous>`, and rolling the upgrade back means
+`pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>`. It fails with `service_upgrade_sessions_at_risk` or
 `service_upgrade_store_unusable` as an upgrade does, with
-`service_daemon_job_missing` when a rerun, or the first run before any record
-exists, finds no registered daemon job (the latter changes nothing), with `service_refresh_config_changed` when `service.toml` was edited
+`service_daemon_job_missing` when a run before `registering` rolls back for lack
+of a registered daemon job, or the first run before any record exists finds none
+(the latter changes nothing), with `service_refresh_config_changed` when `service.toml` was edited
 during a pending refresh that has to act on it (a refresh at `ready` only
 clears its record after reading and verifying the file, without comparing it with
 the refresh, and `uninstall` removes the installation without needing the file to
@@ -2837,15 +2841,19 @@ dry run returns over any pending refresh, because a dry run never resolves one.
 While a refresh is stopped at `registering` or rolling back from `registering` on, and its active version directory is refused or missing, `refresh-path` fails with `service_version_untrusted` (wrapped in `service_rollback_failed` when the first run was a rollback), and `upgrade --repair --from <release of that version>` publishes the directory before it returns `service_refresh_pending`, whose message states that the directory was restored; the record and `service.toml` are untouched and `refresh-path` then finishes the refresh or its rollback.
 A daemon job that vanished after the record exists makes the run roll back:
 before `registering` the file is restored and the record cleared and the run
-returns `service_daemon_job_missing`; from `registering` on the first run returns
-`service_rollback_failed` with the missing job among its causes (the record stays
-`rolling_back`), and every rerun returns `service_daemon_job_missing`. Each such
-message states the effects the run had, read from the files after it ended:
-`service.toml` unchanged, put back on the previous search path, or recording the
-new search path, and the record absent, cleared, `rolling_back` or kept; it
-states none when a file cannot be read. The hint names `pohunek service uninstall` (it removes the
-installation, its daemon job and `service.toml`, and keeps durable metadata) as
-the documented way out (#1763). The store and preflight refusals
+returns `service_daemon_job_missing`; from `registering` on the rollback
+registers the job again from the previous definition, after the same adoption
+gate, and the run still returns `service_daemon_job_missing` with the record
+cleared. A rolling-back record that a rerun finds without a job is finished the
+same way. Each such message states the effects the run had, read from the files
+after it ended: `service.toml` unchanged, put back on the previous search path,
+or recording the new search path; the record absent, cleared, `rolling_back` or
+kept; and whether the rollback registered the job again. It states none when a
+file cannot be read. The hint names `pohunek service upgrade --from
+<prefix>/libexec/pohunek/<active version>`, which registers a missing job again
+from `service.toml` and keeps the settings and the live sessions, with
+`pohunek service uninstall` as the alternative; after a rollback that registered
+the job again it says to rerun `refresh-path`. The store and preflight refusals
 carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
 `service_upgrade_preflight_failed`) with texts that name the installed release. It fails with `service_search_path_refresh_failed` when the
 login shell fails, hangs or prints junk or yields no usable directory (the
@@ -2889,8 +2897,8 @@ and `--accept-runtime-loss` apply and a refusal changes nothing), and never
 stops or retires worker jobs. The success reports of `install` and `upgrade` carry an additive `repair`
 object (`version`, `restored`, `set_aside`, `daemon` as `none`, `installed`,
 `started`, `restarted` or `kept`, a resumed transaction that had already replaced the
-daemon, which still runs from the moved entry until `upgrade --repair --from` is rerun
-once the record is cleared; `null` without the flag and when nothing was repaired).
+daemon, which still runs from the moved entry until `upgrade --repair --from` is
+rerun; `null` without the flag and when nothing was repaired).
 `UpgradeReport.unchanged` states that the active version did not change; a
 repair of it can still restart the daemon. The trust claim is that of `service install --from`
 (the operator chose the release, each binary answers `--version`, a sealed

@@ -1036,8 +1036,13 @@ one. First rerun the command `pohunek service status` names (it resumes or
 rolls the record back), then run `pohunek service refresh-path` and the
 upgrade. If the resumed upgrade is refused again with the same warning, the
 record keeps blocking `refresh-path`: do not accept the runtime loss unless you
-intend to lose it, and see
-https://github.com/zajca/pohunek/issues/1763 (recovery design).
+intend to lose it. To abandon the pending upgrade instead, roll it back with
+`pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>`;
+`pohunek service status` shows that version as `from` (`pending upgrade <to>
+from <previous>`, and `pending_transaction.previous_version` in `--json`). The
+previous daemon's adoption verdict is taken again before it is restored, and
+`service.toml` returns to that version with every other setting kept. The
+upgrade's own refusal says the same when it is a resume that was refused.
 
 A refresh-path run that was interrupted leaves its own record
 (`pohunek service status` shows operation `refresh_path`). Rerun
@@ -1059,15 +1064,21 @@ the refresh, so an edited file of the current schema does not keep it pending.
 A `--dry-run` over a pending refresh is refused with `service_refresh_pending`;
 rerun the command without `--dry-run`. If the daemon job vanished while the
 refresh was pending, a run before `registering` rolls the refresh back and
-returns `service_daemon_job_missing`; from `registering` on it returns
-`service_rollback_failed` with the missing job among its causes, and a rerun
-`service_daemon_job_missing`. The message states what the run did, read from the
-files after it ended: `service.toml` was not changed by the run, the run put it
-back on the previous search path, or it records the new search path; and the
-transaction record does not exist, was cleared, stays `rolling_back` or is kept.
-A message that cannot read either file states no effect. The documented way out is `pohunek service uninstall`, which removes the
-installation, its daemon job and `service.toml` and keeps durable metadata; see
-[#1763](https://github.com/zajca/pohunek/issues/1763).
+returns `service_daemon_job_missing`; from `registering` on the rollback
+registers the job again from the previous definition, after the same adoption
+gate, and the run still returns `service_daemon_job_missing` with the record
+cleared. A rolling-back record that a rerun finds without a job is finished the
+same way, so a missing daemon job is registered again by that rerun. The message
+states what the run did, read from the files after it ended: `service.toml` was
+not changed by the run, the run put it back on the previous search path, or it
+records the new search path; the transaction record does not exist, was cleared,
+stays `rolling_back` or is kept; and whether the rollback registered the daemon
+job again. A message that cannot read either file states no effect. When the
+job is still missing, `pohunek service upgrade --from
+<prefix>/libexec/pohunek/<active version>` registers it again from
+`service.toml` and keeps the settings and the live sessions (use the release
+archive of that version with `--repair` if its directory is refused); `pohunek
+service uninstall` removes the installation instead.
 
 `refresh-path` rewrites only a `service.toml` of the schema its own release
 writes, and reports `service_refresh_config_schema` for another one without

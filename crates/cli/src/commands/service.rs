@@ -365,7 +365,7 @@ fn render_repair(text: &mut String, repair: &report::RepairReport) {
         "started" => "the daemon job was stopped and was started",
         "restarted" => "the daemon was restarted; worker jobs keep running",
         "kept" => {
-            "the resumed transaction had already replaced the daemon, which still runs from the moved entry: once the record is cleared, rerun `pohunek service upgrade --repair --from <release of this version>` to restart it behind the adoption gate"
+            "the resumed transaction had already replaced the daemon, which still runs from the moved entry: rerun `pohunek service upgrade --repair --from <release of this version>` to restart it behind the adoption gate"
         }
         _ => "the daemon job was not touched",
     };
@@ -920,7 +920,7 @@ fn render_check(report: &report::CheckReport) -> String {
             text,
             "pending    {} {} stopped after step {} would be {}",
             pending.operation,
-            pending.version,
+            pending_version(pending),
             pending.step,
             if action == "resume" {
                 "resumed"
@@ -1097,7 +1097,9 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
             let _ = writeln!(
                 text,
                 "running    {} {} is at step {} in another `pohunek service` command",
-                pending.operation, pending.version, pending.step
+                pending.operation,
+                pending_version(pending),
+                pending.step
             );
             render_pending_warnings(text, pending);
         }
@@ -1112,13 +1114,22 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
                 text,
                 "pending    {} {} stopped after step {} ({})",
                 pending.operation,
-                pending.version,
+                pending_version(pending),
                 pending.step,
                 pending_hint(pending.operation)
             );
             render_pending_warnings(text, pending);
         }
         (None, false) => {}
+    }
+}
+
+/// The version of a pending transaction, with the version an upgrade started
+/// from.
+fn pending_version(pending: &report::PendingReport) -> String {
+    match &pending.previous_version {
+        Some(previous) => format!("{} from {previous}", pending.version),
+        None => pending.version.clone(),
     }
 }
 
@@ -1137,7 +1148,9 @@ fn pending_hint(operation: &str) -> &'static str {
 fn render_rolled_back(pending: &report::PendingReport) -> String {
     let mut text = format!(
         "rolled back an interrupted {} of {} (stopped after step {})",
-        pending.operation, pending.version, pending.step
+        pending.operation,
+        pending_version(pending),
+        pending.step
     );
     render_pending_warnings(&mut text, pending);
     if let Some(preflight) = &pending.preflight {
@@ -1550,6 +1563,7 @@ mod tests {
             pending_transaction: Some(report::PendingReport {
                 operation: "upgrade",
                 version: "0.9.0".to_owned(),
+                previous_version: None,
                 step: "config",
                 rolling_back: false,
                 preflight: None,
@@ -1751,6 +1765,7 @@ mod tests {
         let text = render_rolled_back(&report::PendingReport {
             operation: "upgrade",
             version: "2.0.0".to_owned(),
+            previous_version: None,
             step: "registered",
             rolling_back: false,
             preflight: None,
@@ -1784,6 +1799,7 @@ mod tests {
             pending_transaction: Some(report::PendingReport {
                 operation: "install",
                 version: "1.0.0".to_owned(),
+                previous_version: None,
                 step: "config",
                 rolling_back: false,
                 preflight: None,
@@ -1815,6 +1831,7 @@ mod tests {
                 pending_transaction: Some(report::PendingReport {
                     operation,
                     version: "1.0.0".to_owned(),
+                    previous_version: None,
                     step: "config",
                     rolling_back: false,
                     preflight: None,
@@ -1846,6 +1863,7 @@ mod tests {
             rolled_back: Some(report::PendingReport {
                 operation: "refresh_path",
                 version: "1.0.0".to_owned(),
+                previous_version: None,
                 step: "registered",
                 rolling_back: true,
                 preflight: None,
@@ -1880,6 +1898,31 @@ mod tests {
             "{untouched}"
         );
         assert!(!untouched.contains("unchanged"), "{untouched}");
+    }
+
+    #[test]
+    fn a_pending_upgrade_names_the_version_it_started_from() {
+        let pending = report::PendingReport {
+            operation: "upgrade",
+            version: "0.9.0".to_owned(),
+            previous_version: Some("0.8.0".to_owned()),
+            step: "config",
+            rolling_back: false,
+            preflight: None,
+            accepted_runtime_loss: false,
+            warnings: Vec::new(),
+        };
+        assert_eq!(pending_version(&pending), "0.9.0 from 0.8.0");
+        assert_eq!(
+            render_rolled_back(&pending),
+            "rolled back an interrupted upgrade of 0.9.0 from 0.8.0 (stopped after step config)"
+        );
+        let installing = report::PendingReport {
+            operation: "install",
+            previous_version: None,
+            ..pending
+        };
+        assert_eq!(pending_version(&installing), "0.9.0");
     }
 
     #[test]
@@ -2010,6 +2053,7 @@ mod tests {
             pending_transaction: Some(report::PendingReport {
                 operation: "install",
                 version: "1.0.0".to_owned(),
+                previous_version: None,
                 step: "ready",
                 rolling_back: false,
                 preflight: None,

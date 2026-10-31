@@ -497,6 +497,9 @@ pub enum Error {
         acceptance: Box<AcceptanceGroups>,
         /// Warnings of the judgement, so a refusal explains a degraded verdict.
         warnings: Vec<String>,
+        /// Whether the refused swap belongs to an upgrade an earlier run left
+        /// pending, which the operator can also abandon.
+        resumed: bool,
     },
 
     /// A search-path refresh would restart the daemon so that it does not
@@ -897,6 +900,9 @@ pub struct JobMissingEffects {
     pub file: FileEffect,
     /// What is left of the transaction record.
     pub record: RecordEffect,
+    /// Whether the rollback of the run registered the daemon job again from
+    /// the previous definition.
+    pub job_registered: bool,
 }
 
 impl JobMissingEffects {
@@ -914,7 +920,12 @@ impl JobMissingEffects {
             RecordEffect::KeptRollingBack => "the transaction record stays rolling_back",
             RecordEffect::Kept => "the transaction record is kept",
         };
-        format!("; {file}; {record}")
+        let job = if self.job_registered {
+            "; the rollback registered the daemon job again from the previous definition"
+        } else {
+            ""
+        };
+        format!("; {file}; {record}{job}")
     }
 }
 
@@ -925,9 +936,47 @@ fn job_missing_effects_text(effects: Option<&JobMissingEffects>) -> String {
         .unwrap_or_default()
 }
 
-/// The way out of a missing daemon job: `uninstall` is the only documented
-/// step; the recovery design for the pending-record cases is #1763.
-const DAEMON_JOB_MISSING_HINT: &str = "`pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out of a missing daemon job, see https://github.com/zajca/pohunek/issues/1763";
+/// The way to abandon an upgrade an earlier run left pending, which the
+/// at-risk refusal of its resume names.
+macro_rules! abandon_pending_upgrade {
+    () => {
+        "; to abandon the pending upgrade instead, roll it back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>` (`pohunek service status` shows that version as `from`), and the previous daemon's adoption verdict is taken again before it is restored"
+    };
+}
+
+macro_rules! at_risk_restored_path {
+    () => {
+        "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the same `pohunek` that started the pending search-path refresh (the release's `./pohunek` if you used it), run `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) to finish it, then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+    };
+}
+
+macro_rules! at_risk_stale_path {
+    () => {
+        "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path` (it restarts the daemon with the new path), then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+    };
+}
+
+macro_rules! at_risk_plain {
+    () => {
+        "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
+    };
+}
+
+const AT_RISK_RESTORED_PATH_HINT: &str = at_risk_restored_path!();
+const AT_RISK_STALE_PATH_HINT: &str = at_risk_stale_path!();
+const AT_RISK_STALE_PATH_RESUMED_HINT: &str = "if the runtime moved since the search path was recorded, do not accept the loss for that cause: `pohunek service refresh-path` is refused while this upgrade is pending, so first roll the pending upgrade back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>` (`pohunek service status` shows that version as `from`; the previous daemon's adoption verdict is taken again before it is restored), then with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive) run `pohunek service refresh-path --dry-run` and `pohunek service refresh-path` (it restarts the daemon with the new path), then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed";
+const AT_RISK_HINT: &str = at_risk_plain!();
+const AT_RISK_RESUMED_HINT: &str = concat!(at_risk_plain!(), abandon_pending_upgrade!());
+
+/// The way out of a refresh blocked by a pending upgrade or install.
+const REFRESH_BLOCKED_HINT: &str = "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it. To abandon a pending upgrade instead, roll it back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>` (`pohunek service status` shows that version as `from`); the previous daemon's adoption verdict is taken again before it is restored";
+
+/// The way out of a missing daemon job: `upgrade` over the installed active
+/// version registers it again from `service.toml`.
+const DAEMON_JOB_MISSING_HINT: &str = "`pohunek service upgrade --from <prefix>/libexec/pohunek/<active version>` registers the daemon job again from service.toml and keeps the settings and the live sessions (use the release archive of that version with `--repair` if its directory is refused); `pohunek service uninstall` removes the installation instead";
+
+/// What a refused refresh leaves when its rollback registered the job again.
+const DAEMON_JOB_REGISTERED_AGAIN_HINT: &str = "the rollback registered the daemon job again, so rerun `pohunek service refresh-path` to try the refresh again";
 
 /// The way out of a refused or missing version directory, for the commands
 /// that take a release with `--from`.
@@ -942,6 +991,26 @@ const UNTRUSTED_REFRESH_VERSION_HINT: &str = "`pohunek service upgrade` and `ins
 const UNTRUSTED_ACTIVE_VERSION_HINT: &str = "live worker jobs can be stopped only through the daemon, and the active version's daemon is refused: restore its directory with `pohunek service upgrade --repair --from <unpacked release archive of that version>`, then rerun `pohunek service uninstall --stop-sessions`";
 
 impl Error {
+    /// Marks an at-risk refusal as that of a resumed upgrade.
+    pub(crate) fn resumed(self) -> Self {
+        match self {
+            Self::UpgradeAtRisk {
+                sessions,
+                stopped_sessions,
+                acceptance,
+                warnings,
+                ..
+            } => Self::UpgradeAtRisk {
+                sessions,
+                stopped_sessions,
+                acceptance,
+                warnings,
+                resumed: true,
+            },
+            other => other,
+        }
+    }
+
     /// Fills the effects of every missing-job refusal inside `self`.
     pub(crate) fn with_job_missing_effects(self, effects: JobMissingEffects) -> Self {
         match self {
@@ -950,7 +1019,7 @@ impl Error {
             },
             Self::RollbackFailed { original, rollback } => Self::RollbackFailed {
                 original: Box::new(original.with_job_missing_effects(effects)),
-                rollback: Box::new(rollback.with_job_missing_effects(effects)),
+                rollback,
             },
             other => other,
         }
@@ -972,9 +1041,7 @@ impl Error {
     pub(crate) fn is_job_missing(&self) -> bool {
         match self {
             Self::DaemonJobMissing { .. } => true,
-            Self::RollbackFailed { original, rollback } => {
-                original.is_job_missing() || rollback.is_job_missing()
-            }
+            Self::RollbackFailed { original, .. } => original.is_job_missing(),
             _ => false,
         }
     }
@@ -1121,19 +1188,23 @@ impl Error {
             Self::StopTimeout { .. } => {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
-            Self::UpgradeAtRisk { warnings, .. } => Some(if warnings
-                .iter()
-                .any(|warning| warning.contains(super::preflight::RESTORED_PATH_NOTE))
-            {
-                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the same `pohunek` that started the pending search-path refresh (the release's `./pohunek` if you used it), run `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) to finish it, then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
-            } else if warnings
-                .iter()
-                .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING))
-            {
-                "if the runtime moved since the search path was recorded, do not accept the loss for that cause: with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive), run `pohunek service refresh-path --dry-run`, then `pohunek service refresh-path` (it restarts the daemon with the new path), then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
-            } else {
-                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed"
-            }),
+            Self::UpgradeAtRisk {
+                warnings, resumed, ..
+            } => {
+                let restored = warnings
+                    .iter()
+                    .any(|warning| warning.contains(super::preflight::RESTORED_PATH_NOTE));
+                let stale = warnings
+                    .iter()
+                    .any(|warning| warning.starts_with(super::preflight::STALE_PATH_WARNING));
+                Some(match (restored, stale, resumed) {
+                    (true, _, _) => AT_RISK_RESTORED_PATH_HINT,
+                    (false, true, false) => AT_RISK_STALE_PATH_HINT,
+                    (false, true, true) => AT_RISK_STALE_PATH_RESUMED_HINT,
+                    (false, false, false) => AT_RISK_HINT,
+                    (false, false, true) => AT_RISK_RESUMED_HINT,
+                })
+            }
             Self::RefreshAtRisk { .. } => Some(
                 "preserve the required runtime or native recovery for the listed sessions, or run `pohunek service refresh-path --accept-runtime-loss` to restart the daemon with the new search path anyway and accept the loss of the listed sessions' runtime or native recovery; it records nothing, so a later upgrade judges the sessions again, and no session is changed",
             ),
@@ -1220,11 +1291,6 @@ impl Error {
             Self::SupervisedVersion { .. } => Some(
                 "inspect which daemon the service job now runs (for example through `systemctl cat` or `launchctl print`), and decide through which pohunek installation's commands it should be stopped or replaced before this command continues",
             ),
-            Self::RollbackFailed { rollback, .. }
-                if matches!(**rollback, Self::DaemonJobMissing { .. }) =>
-            {
-                Some(DAEMON_JOB_MISSING_HINT)
-            }
             Self::RollbackFailed { rollback, .. } if rollback.is_refused_directory() => {
                 rollback.hint()
             }
@@ -1246,9 +1312,13 @@ impl Error {
             Self::SearchPathRefreshFailed { .. } => Some(
                 "fix the login shell (a shell rc file that hangs or prints junk is the usual cause) and rerun `pohunek service refresh-path`",
             ),
-            Self::RefreshBlockedByTransaction => Some(
-                "finish the pending transaction first: `pohunek service status` names it, and rerunning the command it names resumes or rolls it back; then rerun `pohunek service refresh-path`. If the resumed upgrade is refused again with the same warning, the record keeps blocking refresh-path: do not accept the runtime loss unless you intend to lose it, and see https://github.com/zajca/pohunek/issues/1763 (recovery design)",
-            ),
+            Self::RefreshBlockedByTransaction => Some(REFRESH_BLOCKED_HINT),
+            Self::DaemonJobMissing {
+                effects: Some(JobMissingEffects {
+                    job_registered: true,
+                    ..
+                }),
+            } => Some(DAEMON_JOB_REGISTERED_AGAIN_HINT),
             Self::DaemonJobMissing { .. } => Some(DAEMON_JOB_MISSING_HINT),
 
             Self::RefreshConfigChanged => Some(
@@ -1257,7 +1327,7 @@ impl Error {
             Self::RefreshPending {
                 rolling_back: true, ..
             } => Some(
-                "rerun `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) and with the same `pohunek` (the release's `./pohunek` if you used it); it finishes the rollback after judging the live sessions again, and if it refuses with the listed sessions, run `pohunek service refresh-path --accept-runtime-loss` to accept the loss of their runtime or native recovery (it records nothing)",
+                "rerun `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) and with the same `pohunek` (the release's `./pohunek` if you used it); it finishes the rollback after judging the live sessions again (a missing daemon job is registered again by that rerun), and if it refuses with the listed sessions, run `pohunek service refresh-path --accept-runtime-loss` to accept the loss of their runtime or native recovery (it records nothing)",
             ),
             Self::RefreshPending { .. } => Some(
                 "rerun `pohunek service refresh-path` without --dry-run (a dry run is refused while a refresh is pending) and with the same `pohunek` (the release's `./pohunek` if you used it); it resumes or rolls back the pending refresh",

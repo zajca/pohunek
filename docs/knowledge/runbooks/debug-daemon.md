@@ -477,8 +477,11 @@ The trust claim of the repair is that of `pohunek service install` with `--from`
 chose the release, each binary answers `--version`, and a sealed release's
 `runtime/` files are present. It does not verify a digest of the binaries.
 Processes that already run, live workers and a daemon that was not restarted
-because the preflight refused, and the daemon of a resumed transaction that had already replaced it (`daemon: kept`), which still runs from the moved entry: once the record is cleared, rerun `pohunek service upgrade --repair --from <release of that version>` to restart it behind the adoption gate, are not attested: their image may come from the
-refused directory. Once the daemon is reachable again,
+because the preflight refused are not attested: their image may come from the
+refused directory. The daemon of a resumed transaction that had already
+replaced it (`daemon: kept`) is one of them, and it still runs from the moved
+entry: rerun `pohunek service upgrade --repair --from <release of that version>`
+to restart it behind the adoption gate. Once the daemon is reachable again,
 `pohunek service uninstall --stop-sessions`, or `pohunek session stop <session>`
 for one session, is the answer to suspected tampering; the repair does not
 decide that for you.
