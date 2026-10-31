@@ -1238,7 +1238,7 @@ table contributes no transcript root. With the runtime feature
 `id_path` and `cwd_path`, each a list of one to three plain object keys
 (`A-Za-z0-9_`, at most 32 bytes each), and reads the native session id and the
 absolute working directory at those paths of the file's first line only; a
-top-level key of that first line wins, and the official Codex package declares
+top-level key of any record wins, and the official Codex package declares
 `["payload", "id"]` and `["payload", "cwd"]`. A longer, empty or unsafe path, a
 non-list value or another parser is `descriptor_invalid`; a path without the
 feature is `runtime_feature_unsupported`. Trees of two different runtimes that are

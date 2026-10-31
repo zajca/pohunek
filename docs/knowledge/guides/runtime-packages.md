@@ -219,7 +219,7 @@ tree), the observer attributes both trees to neither and logs a warning
 for each home; the other roots stay watched. The official `codex` package
 declares `sessions` and the official `claude` package declares `projects`.
 
-### Nested ids in the first record
+### Nested ids in the first line
 
 `jsonl-head-v1` reads the session id and the working directory from top-level
 keys. A transcript whose first line wraps them (Codex rollouts start with
@@ -241,7 +241,7 @@ Each path is a list of one to three object keys of at most 32 bytes made of
 expression. Either key may be given alone, and both need `parser =
 "jsonl-head-v1"`. The paths apply to the first line of the file only, and only
 when it parses as JSON: later records carry ids of their own. A top-level key
-of that first line wins over the value at a path, and a path value that
+of any record wins over the value at a path, and a path value that
 is not a string (or, for `cwd_path`, not an absolute path) is ignored. An empty
 list, a longer list, an unsafe key, a non-list value or a parser other than
 `jsonl-head-v1` is refused (`descriptor_invalid`); a path without the feature in
@@ -723,7 +723,10 @@ for before they report; leave it off for a program that reports without a probe
 (Codex). A rule may set `overrides_program_status = true`: while a record is held
 it is evaluated like any other rule and, as the screen winner, beats a
 non-blocked record (for a state the program reports misleadingly); with no
-record held it is skipped, so the screen reads as it would without the rule. The table and the flag are rejected when malformed, and a rule
+record held it is skipped, so the screen reads as it would without the rule
+(since 0.39.0; earlier cores evaluate the rule whether or not a record is held,
+so a package that ranks such a rule above a blocker also lists a 0.39.0 feature
+in `requires`, as the official Codex package does). The table and the flag are rejected when malformed, and a rule
 flag without the table is an error.
 
 The record is arbitrated with the screen rules (a visible dialog always wins

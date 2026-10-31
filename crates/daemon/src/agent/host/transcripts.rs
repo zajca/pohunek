@@ -26,7 +26,7 @@
 //! ```
 //!
 //! `jsonl-head-v1` also reads a session id and a working directory that sit
-//! below an object key of the first record, when the descriptor names the key
+//! below an object key of the first line, when the descriptor names the key
 //! paths (feature `transcripts-head-paths-v1`):
 //!
 //! ```toml
@@ -242,13 +242,13 @@ impl Transcripts {
     }
 
     /// This declaration reading the session id and the working directory from
-    /// the declared key paths of the first record.
+    /// the declared key paths of the first line.
     ///
     /// # Errors
     ///
     /// Returns a [`DefinitionError::Field`] when the parser is not
-    /// `jsonl-head-v1`, a path is not a short list of plain object keys, or
-    /// neither path is given.
+    /// `jsonl-head-v1` or a path is not a short list of plain object keys.
+    /// Passing neither path declares none.
     pub fn with_head_paths(
         mut self,
         id_path: Option<&[String]>,

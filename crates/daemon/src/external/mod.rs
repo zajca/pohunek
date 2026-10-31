@@ -1391,11 +1391,11 @@ fn parse_transcript(
 /// records within `TRANSCRIPT_SCAN_BYTE_LIMIT` bytes and takes the first
 /// session id, transcript path and absolute working directory they carry.
 ///
-/// The top-level keys are read from every record. The declared head paths are
-/// read from the first line only: later records of a rollout carry ids of
-/// their own, so a path never reaches past the head, and a first line that does
-/// not parse yields none. A
-/// value found at a top-level key of the first line wins over the same value at a head path.
+/// The top-level keys are read from every record and win. The declared head
+/// paths are read from the first line only, as a fallback for a value no
+/// top-level key supplied: later records of a rollout carry ids of their own,
+/// so a path never reaches past the head, and a first line that does not parse
+/// yields none.
 fn parse_jsonl_head(
     agent_base: RuntimeRef,
     head_paths: &HeadPaths,
@@ -1409,6 +1409,8 @@ fn parse_jsonl_head(
     let mut native_session_id = None;
     let mut native_session_path = None;
     let mut cwd = None;
+    let mut head_session_id = None;
+    let mut head_cwd = None;
     let byte_limit =
         u64::try_from(TRANSCRIPT_SCAN_BYTE_LIMIT).expect("transcript byte limit fits in u64");
     for (index, line) in BufReader::new(file.take(byte_limit))
@@ -1432,26 +1434,23 @@ fn parse_jsonl_head(
                 ],
             );
         }
-        if native_session_id.is_none() && is_head {
-            native_session_id = head_paths
+        let absolute = |text: String| Some(PathBuf::from(text)).filter(|path| path.is_absolute());
+        if is_head {
+            head_session_id = head_paths
                 .id()
                 .and_then(|keys| string_at(&value, keys))
                 .filter(|id| !id.is_empty());
+            head_cwd = head_paths
+                .cwd()
+                .and_then(|keys| string_at(&value, keys))
+                .and_then(absolute);
         }
         if native_session_path.is_none() {
             native_session_path = first_string(&value, &["transcript_path", "transcriptPath"]);
         }
         if cwd.is_none() {
-            let absolute =
-                |text: String| Some(PathBuf::from(text)).filter(|path| path.is_absolute());
             cwd = first_string(&value, &["cwd", "working_directory", "workingDirectory"])
                 .and_then(absolute)
-                .or_else(|| {
-                    is_head
-                        .then(|| head_paths.cwd().and_then(|keys| string_at(&value, keys)))
-                        .flatten()
-                        .and_then(absolute)
-                })
                 .map(|path| normalize_path(&path));
         }
         if native_session_id.is_some() && native_session_path.is_some() && cwd.is_some() {
@@ -1459,6 +1458,8 @@ fn parse_jsonl_head(
         }
     }
 
+    let native_session_id = native_session_id.or(head_session_id);
+    let cwd = cwd.or_else(|| head_cwd.map(|path| normalize_path(&path)));
     if native_session_id.is_none() && native_session_path.is_none() && cwd.is_none() {
         return Ok(None);
     }

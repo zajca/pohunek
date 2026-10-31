@@ -1342,7 +1342,34 @@ async fn a_rollout_head_is_attributed_by_the_declared_nested_id_and_cwd() {
 }
 
 #[tokio::test]
-async fn a_nested_path_reads_only_the_first_record_and_a_top_level_key_wins() {
+async fn the_shipped_codex_package_attributes_a_real_shaped_rollout_head() {
+    let rig = Rig::with_packages(|_| {});
+    let path = rig
+        .home()
+        .join(".codex/sessions/2026/10/31/rollout-2026-10-31T10-00-00-a.jsonl");
+    fs::create_dir_all(path.parent().expect("rollout directory")).expect("rollout directory");
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            rollout_head(ROLLOUT_ID, "/work"),
+            rollout_item(OTHER_ID, "/elsewhere")
+        ),
+    )
+    .expect("write the rollout");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get(ROLLOUT_ID),
+        Some(&Some(PathBuf::from("/work"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key(OTHER_ID), "{indexed:?}");
+}
+
+#[tokio::test]
+async fn a_nested_path_reads_only_the_first_line_and_a_top_level_key_of_any_record_wins() {
     let rig = Rig::with_packages(|plugins| {
         install_acme(plugins, &head_paths_descriptor(HEAD_PATHS_TABLE));
     });
@@ -1361,6 +1388,13 @@ async fn a_nested_path_reads_only_the_first_record_and_a_top_level_key_wins() {
         "payload": {"id": ROLLOUT_ID, "cwd": "/work"},
     });
     fs::write(tree.join("rollout-top.jsonl"), format!("{top}\n")).expect("write the rollout");
+    // A top-level key of a later record wins over the head's path values.
+    let late = format!(
+        "{}\n{}\n",
+        rollout_head("nested-id", "/nested"),
+        serde_json::json!({"sessionId": "late-top", "cwd": "/late"})
+    );
+    fs::write(tree.join("rollout-late.jsonl"), late).expect("write the rollout");
     // A non-string id is ignored; a relative cwd is ignored while the id stays.
     let odd = serde_json::json!({"payload": {"id": 7, "cwd": "/ignored"}});
     fs::write(tree.join("rollout-odd.jsonl"), format!("{odd}\n")).expect("write the rollout");
@@ -1375,7 +1409,13 @@ async fn a_nested_path_reads_only_the_first_record_and_a_top_level_key_wins() {
         "{indexed:?}"
     );
     assert_eq!(indexed.get("relative-cwd"), Some(&None), "{indexed:?}");
-    assert_eq!(indexed.len(), 2, "{indexed:?}");
+    assert_eq!(
+        indexed.get("late-top"),
+        Some(&Some(PathBuf::from("/late"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key("nested-id"), "{indexed:?}");
+    assert_eq!(indexed.len(), 3, "{indexed:?}");
 }
 
 #[tokio::test]

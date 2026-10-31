@@ -860,6 +860,14 @@ fn an_override_rule_beats_a_weak_blocker_only_while_a_record_is_held() {
         with_record.activity(),
         Some((AgentActivity::Blocked, StateSource::Screen))
     );
+
+    // A record returns: the override rule applies again.
+    with_record.feed(&record("state=working:app=probe"));
+    with_record.feed(&screen);
+    assert_eq!(
+        with_record.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen))
+    );
 }
 
 #[test]
