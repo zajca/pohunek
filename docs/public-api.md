@@ -342,6 +342,16 @@ TypeScript SDK (`@pohunek/sdk`) implements the same contract: both are driven by
 The JSON control stream is newline-delimited UTF-8 JSON. One JSON value is sent
 per line. The current daemon and Rust SDK cap control lines at 1 MiB.
 
+When the daemon stops, a control or remote connection answers the request lines
+it has already read (a bounded number), and any line that arrives after the signal while it is being served, with the
+daemon-class `daemon_shutting_down` (stamped with the connection's negotiated
+version) and then closes; the line is not dispatched. A watched wait in flight
+gets the same reply, an event subscription or attach stream ends as a normal
+close, and a mutating request already running completes and is answered before
+the connection closes. A client that cannot read the code, such as one on an
+older protocol, sees an ordinary daemon error followed by the end of the
+connection.
+
 Raw terminal bytes are never multiplexed onto a JSON control connection. Attach
 uses a separate connection described in "Attach Stream".
 
@@ -2398,16 +2408,6 @@ wait that daemon shutdown ends, the daemon-class `daemon_shutting_down`. Restart
 from a fresh screen/tail after runtime change. A worker on the immediately preceding
 private protocol remains usable for existing lifecycle and attach operations,
 but observation returns `worker_feature_unavailable`.
-
-When the daemon stops, a control or remote connection answers the request lines
-it has already read (a bounded number), and any line that arrives after the signal while it is being served, with the
-daemon-class `daemon_shutting_down` (stamped with the connection's negotiated
-version) and then closes; the line is not dispatched. A watched wait in flight
-gets the same reply, an event subscription or attach stream ends as a normal
-close, and a mutating request already running completes and is answered before
-the connection closes. A client that cannot read the code, such as one on an
-older protocol, sees an ordinary daemon error followed by the end of the
-connection.
 
 ### Turn Waits
 

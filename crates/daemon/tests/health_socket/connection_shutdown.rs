@@ -13,7 +13,9 @@ use std::sync::Mutex;
 
 use nix::unistd::mkfifo;
 use pohunek_daemon::api::{ConnectionTasks, OverlaySource, RemoteServer};
-use pohunek_daemon::shutdown::{DaemonShutdown, DaemonShutdownReport, ShutdownPhase, ShutdownPlan};
+use pohunek_daemon::shutdown::{
+    DaemonShutdown, DaemonShutdownReport, ShutdownPhase, ShutdownPlan, Stage,
+};
 use pohunek_test_support::wait::guard;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +52,11 @@ async fn run_past_the_bounds(
         }
     }
 }
+
+/// Events written to the subscriber that stopped reading, and the size of the
+/// value each one carries; together they exceed the socket buffers.
+const STALL_EVENTS: usize = 1_000;
+const STALL_PADDING_BYTES: usize = 4_000;
 
 /// The tracked server of one transport and the way to stop it.
 struct Stopping {
@@ -129,9 +136,10 @@ fn assert_shutting_down(reply: Option<Response>, what: &str) {
     assert_eq!(error.code, "daemon_shutting_down", "{what}: {error:?}");
 }
 
-/// A `session.wait` in flight and a mutating request pipelined behind it are
-/// both answered with `daemon_shutting_down` at the signal; the second is never
-/// dispatched, so its edit is not made, and the connection then ends.
+/// A `session.wait` in flight and two mutating requests pipelined behind it are
+/// all answered with `daemon_shutting_down` at the signal; the pipelined ones
+/// are never dispatched, so their edits are not made, and the connection then
+/// ends.
 #[tokio::test]
 async fn a_request_pipelined_behind_a_wait_is_refused_when_the_daemon_stops() {
     let captured = Captured::default();
@@ -153,19 +161,21 @@ async fn a_request_pipelined_behind_a_wait_is_refused_when_the_daemon_stops() {
         ),
     )
     .await;
-    send(
-        &mut control,
-        &Request::make(
-            "metadata",
-            method::SESSION_SET_METADATA,
-            serde_json::json!({
-                "session_id": session.id,
-                "metadata": { PIPELINED_KEY: "1" },
-            }),
-        ),
-    )
-    .await;
-    // The wait is parked in the daemon, and the second line is queued behind it.
+    for id in ["metadata-1", "metadata-2"] {
+        send(
+            &mut control,
+            &Request::make(
+                id,
+                method::SESSION_SET_METADATA,
+                serde_json::json!({
+                    "session_id": session.id,
+                    "metadata": { PIPELINED_KEY: id },
+                }),
+            ),
+        )
+        .await;
+    }
+    // The wait is parked in the daemon, and the other lines are queued behind it.
     wait_until("the wait to park in the daemon", || async {
         captured.text().contains(WAIT_PARKED).then_some(())
     })
@@ -174,7 +184,14 @@ async fn a_request_pipelined_behind_a_wait_is_refused_when_the_daemon_stops() {
     stopping.raise_signal();
 
     assert_shutting_down(next_reply(&mut control).await, "the wait");
-    assert_shutting_down(next_reply(&mut control).await, "the pipelined request");
+    assert_shutting_down(
+        next_reply(&mut control).await,
+        "the first pipelined request",
+    );
+    assert_shutting_down(
+        next_reply(&mut control).await,
+        "the second pipelined request",
+    );
     assert!(
         next_reply(&mut control).await.is_none(),
         "the connection ends after the replies"
@@ -187,7 +204,7 @@ async fn a_request_pipelined_behind_a_wait_is_refused_when_the_daemon_stops() {
         .metadata;
     assert!(
         !metadata.contains_key(PIPELINED_KEY),
-        "the pipelined request was dispatched: {metadata:?}"
+        "a pipelined request was dispatched: {metadata:?}"
     );
     let report = stopping.tasks.run(&stopping.registry).await;
     assert!(report.is_quiescent(), "{report:?}");
@@ -229,6 +246,62 @@ async fn idle_connections_and_subscriptions_end_with_the_daemon() {
     );
     let report = stopping.tasks.run(&stopping.registry).await;
     assert!(report.is_quiescent(), "{report:?}");
+    let _ = stopping.server.await;
+}
+
+/// A subscriber that has stopped reading holds the daemon's write open. The
+/// signal ends that write, so the connection does not use up the drivers bound
+/// and the later stages are still awaited.
+#[tokio::test]
+async fn a_subscriber_that_stopped_reading_does_not_use_up_the_drivers_bound() {
+    let socket = temp_socket("conn-stalled-subscriber");
+    let stopping = Stopping::start(&socket, ShutdownPlan::default()).await;
+    let consumer_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran = Arc::clone(&consumer_ran);
+    stopping
+        .tasks
+        .add_step("consumer_probe", Stage::Consumer, move || async move {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    let mut control = connect(&socket).await;
+    let session = create_session(&mut control, &socket).await;
+    let mut subscriber = connect(&socket).await;
+    let ack = exchange(
+        &mut subscriber,
+        &Request::make("subscribe", method::SUBSCRIBE, serde_json::json!({})),
+    )
+    .await;
+    assert!(ack.is_ok(), "{ack:?}");
+    // Events the subscriber never reads fill the socket buffers until the
+    // daemon's write to it blocks.
+    let padding = "x".repeat(STALL_PADDING_BYTES);
+    for round in 0..STALL_EVENTS {
+        let reply = exchange(
+            &mut control,
+            &Request::make(
+                "metadata",
+                method::SESSION_SET_METADATA,
+                serde_json::json!({
+                    "session_id": session.id,
+                    "metadata": { "stall": format!("{round}{padding}") },
+                }),
+            ),
+        )
+        .await;
+        assert!(reply.is_ok(), "{reply:?}");
+    }
+
+    // The session and the flood ran on the real clock; the bounds pass on the
+    // paused one.
+    tokio::time::pause();
+    stopping.raise_signal();
+    let report = run_past_the_bounds(&stopping.tasks, &stopping.registry).await;
+
+    assert!(report.is_quiescent(), "{report:?}");
+    assert!(
+        consumer_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the consumer stage was awaited"
+    );
     let _ = stopping.server.await;
 }
 
@@ -277,8 +350,10 @@ fn capture_logs(captured: &Captured) -> tracing::subscriber::DefaultGuard {
 fn wedged_repository(root: &Path) -> (PathBuf, PathBuf) {
     let repo = root.join("wedged-repo");
     fs::create_dir(&repo).expect("create the repository directory");
+    let env = TestEnv::new().expect("create the git environment");
     let git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
+        let status = env
+            .git_command()
             .arg("-C")
             .arg(&repo)
             .args(args)

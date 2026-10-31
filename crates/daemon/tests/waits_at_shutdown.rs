@@ -340,7 +340,8 @@ async fn an_attach_stream_open_when_the_daemon_stops_is_ended_and_recorded_as_cl
 
     fixture.stop();
 
-    // The raw stream ends: the daemon closes the bridge itself.
+    // The raw stream ends; `attach_closed` below tells that the daemon ended
+    // the bridge and not only that the process exited.
     let mut buffer = [0_u8; 4_096];
     loop {
         let read = guard("the attach stream to end", raw.read(&mut buffer))

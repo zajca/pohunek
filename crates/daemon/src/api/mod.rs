@@ -689,13 +689,12 @@ where
                 return Ok(());
             }
             Dispatch::Attach(stream_id) => {
-                connection.set_state(ConnectionState::Attach);
                 let hangup = framed.get_ref().hangup_watch(&stream_id);
                 run_attach_connection(
                     framed,
                     state.sessions.clone(),
                     stream_id,
-                    (hangup, connection.token()),
+                    (hangup, &connection),
                 )
                 .await?;
                 return Ok(());
@@ -738,6 +737,9 @@ where
 }
 
 /// The most request lines [`refuse_buffered`] answers after the stop signal.
+/// The refusals are written without awaiting the peer, so the cap keeps a client
+/// that floods the socket from holding the connection open; no real client
+/// pipelines more than a handful of requests, and 64 is far above that.
 const MAX_REFUSED_LINES: usize = 64;
 
 /// The reply to a request that arrives, or is still waiting, once the daemon is
@@ -952,11 +954,12 @@ async fn run_attach_connection<S>(
     mut framed: Framed<S, LinesCodec>,
     registry: SessionRegistry,
     stream_id: String,
-    (hangup, stopping): (Option<HangupWatch>, &CancellationToken),
+    (hangup, connection): (Option<HangupWatch>, &Connection),
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let stopping = connection.token();
     let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
@@ -973,6 +976,7 @@ where
         }
     };
 
+    connection.set_state(ConnectionState::Attach(attach.session_id.clone()));
     let parts = framed.into_parts();
     let mut stream = parts.io;
     let submitted = attach.session_id.clone();
@@ -1454,14 +1458,22 @@ where
                 Some(Ok(_)) => {}
             },
             evt = session_events.recv() => match evt {
-                Ok(event) => forward_event(framed, event, version).await?,
+                Ok(event) => {
+                    if !forward_until_stopped(framed, event, version, stopping).await? {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             evt = notification_events.recv() => match evt {
-                Ok(event) => forward_event(framed, event, version).await?,
+                Ok(event) => {
+                    if !forward_until_stopped(framed, event, version, stopping).await? {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
                 }
@@ -1470,6 +1482,25 @@ where
         }
     }
     Ok(())
+}
+
+/// Forwards `event` unless `stopping` is cancelled first; returns whether the
+/// subscription goes on. A subscriber that has stopped reading holds the write
+/// open, so the stop signal has to end it.
+async fn forward_until_stopped<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    event: Event,
+    version: protocol::ProtocolVersion,
+    stopping: &CancellationToken,
+) -> Result<bool, io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        () = stopping.cancelled() => Ok(false),
+        sent = forward_event(framed, event, version) => sent.map(|()| true),
+    }
 }
 
 /// Writes `event` in the shape of the connection's negotiated `version`.

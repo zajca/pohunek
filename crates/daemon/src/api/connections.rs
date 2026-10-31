@@ -13,6 +13,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use protocol::SessionId;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::warn;
@@ -28,8 +29,8 @@ pub(super) enum ConnectionState {
     Request(String),
     /// Streaming session and notification events.
     Subscription,
-    /// Bridging a raw attach stream.
-    Attach,
+    /// Bridging a raw attach stream to the session.
+    Attach(SessionId),
 }
 
 impl ConnectionState {
@@ -38,7 +39,7 @@ impl ConnectionState {
             Self::Idle => "idle".to_owned(),
             Self::Request(method) => format!("request {method}"),
             Self::Subscription => "subscription".to_owned(),
-            Self::Attach => "attach".to_owned(),
+            Self::Attach(session) => format!("attach {}", session.0),
         }
     }
 }
