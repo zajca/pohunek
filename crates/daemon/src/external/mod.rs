@@ -1395,7 +1395,7 @@ fn parse_transcript(
 /// read from the first line only: later records of a rollout carry ids of
 /// their own, so a path never reaches past the head, and a first line that does
 /// not parse yields none. A
-/// value found at a top-level key wins over the same value at a head path.
+/// value found at a top-level key of the first line wins over the same value at a head path.
 fn parse_jsonl_head(
     agent_base: RuntimeRef,
     head_paths: &HeadPaths,
@@ -1442,14 +1442,16 @@ fn parse_jsonl_head(
             native_session_path = first_string(&value, &["transcript_path", "transcriptPath"]);
         }
         if cwd.is_none() {
+            let absolute =
+                |text: String| Some(PathBuf::from(text)).filter(|path| path.is_absolute());
             cwd = first_string(&value, &["cwd", "working_directory", "workingDirectory"])
+                .and_then(absolute)
                 .or_else(|| {
                     is_head
                         .then(|| head_paths.cwd().and_then(|keys| string_at(&value, keys)))
                         .flatten()
+                        .and_then(absolute)
                 })
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
                 .map(|path| normalize_path(&path));
         }
         if native_session_id.is_some() && native_session_path.is_some() && cwd.is_some() {

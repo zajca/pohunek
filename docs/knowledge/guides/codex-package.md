@@ -166,8 +166,9 @@ copies of that descriptor and its detection manifest in
 The screens in `compat/codex/screens/` (named screens at 100 columns, widths 20
 to 200 in `widths/`, each with the OSC title Codex had set in a `.title` file)
 were captured from a real interactive Codex 0.164.0 in a PTY with a fresh
-`CODEX_HOME`, a loopback Responses stub as the model provider and no credential.
-They cover the idle
+`CODEX_HOME`, a loopback Responses stub as the model provider and no credential
+(the 0.164.0 runs recorded in `compat/codex/compatibility-lock.json` used a network
+namespace with only loopback; the recapture check below did not). They cover the idle
 screen, a turn held before its first output (`Working (0s • esc to
 interrupt)`), a streaming reply, the screen after a turn, a tool approval
 prompt (`Would you like to run the following command?`) and, in
@@ -178,7 +179,8 @@ root records of the same runs (`capture_the_real_codex_screens` and
 sequences; `POHUNEK_CODEX_CAPTURE_DIR` names the output directory, and the
 second test writes its screens to `background/` below it). The capture run
 saw Codex enter the alternate screen (`ESC [ ? 1049 h`); the committed fact is
-`alternate-screen.fact`, asserted by `codex_enters_the_alternate_screen`. The question prompt, the sign-in screen, the first-run folder dialog,
+`alternate-screen.fact`, which `codex_enters_the_alternate_screen` pins; only a
+recapture refreshes it. The question prompt, the sign-in screen, the first-run folder dialog,
 the startup dialogs and the update popup could not be recaptured on 0.164.0
 (no stub marker reaches them, or no newer release exists to announce); they are
 the captures of 0.160.0 in `compat/codex/screens/n-1`, `startup-dialogs` and

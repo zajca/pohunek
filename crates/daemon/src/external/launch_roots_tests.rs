@@ -1361,9 +1361,11 @@ async fn a_nested_path_reads_only_the_first_record_and_a_top_level_key_wins() {
         "payload": {"id": ROLLOUT_ID, "cwd": "/work"},
     });
     fs::write(tree.join("rollout-top.jsonl"), format!("{top}\n")).expect("write the rollout");
-    // A non-string value and a relative cwd are ignored.
-    let odd = serde_json::json!({"payload": {"id": 7, "cwd": "relative/dir"}});
+    // A non-string id is ignored; a relative cwd is ignored while the id stays.
+    let odd = serde_json::json!({"payload": {"id": 7, "cwd": "/ignored"}});
     fs::write(tree.join("rollout-odd.jsonl"), format!("{odd}\n")).expect("write the rollout");
+    let relative = serde_json::json!({"payload": {"id": "relative-cwd", "cwd": "relative/dir"}});
+    fs::write(tree.join("rollout-rel.jsonl"), format!("{relative}\n")).expect("write the rollout");
 
     let indexed = indexed_sessions(&rig).await;
 
@@ -1372,7 +1374,8 @@ async fn a_nested_path_reads_only_the_first_record_and_a_top_level_key_wins() {
         Some(&Some(PathBuf::from("/top"))),
         "{indexed:?}"
     );
-    assert_eq!(indexed.len(), 1, "{indexed:?}");
+    assert_eq!(indexed.get("relative-cwd"), Some(&None), "{indexed:?}");
+    assert_eq!(indexed.len(), 2, "{indexed:?}");
 }
 
 #[tokio::test]

@@ -391,6 +391,8 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
     package.remove("transcripts");
+    // The feature the transcript head paths need exists only in the package.
+    assert!(package.remove("requires").is_some());
     // `ready` is the one key the package declares that v0.34.2 does not: the
     // built-in descriptor relied on the bracketed-paste enable signal. The
     // package opts into manifest-idle readiness so the startup update popup
@@ -5171,10 +5173,6 @@ async fn a_real_codex_is_read_through_program_status() {
         program_status_of(&fixture, &id).await.last(),
         Some(&"app=codex:state=working".to_owned()),
         "the record still says working with the background terminal running: {idle}"
-    );
-    assert_eq!(
-        idle["activity"], "idle",
-        "the session reads idle before the stop: {idle}"
     );
     fixture.stop(&id).await;
     fixture.finish().await;

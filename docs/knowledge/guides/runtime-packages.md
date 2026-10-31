@@ -241,7 +241,7 @@ Each path is a list of one to three object keys of at most 32 bytes made of
 expression. Either key may be given alone, and both need `parser =
 "jsonl-head-v1"`. The paths apply to the first line of the file only, and only
 when it parses as JSON: later records carry ids of their own. A top-level key
-the parser already reads wins over the value at a path, and a path value that
+of that first line wins over the value at a path, and a path value that
 is not a string (or, for `cwd_path`, not an absolute path) is ignored. An empty
 list, a longer list, an unsafe key, a non-list value or a parser other than
 `jsonl-head-v1` is refused (`descriptor_invalid`); a path without the feature in
