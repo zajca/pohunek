@@ -58,6 +58,7 @@ MACOS_PATH_OWNERSHIP = {
             "scripts/test-partitions",
             ".config/nextest.toml",
             ".github/actions/hermes-test-python/**",
+            ".github/actions/setup-uv/**",
             "crates/relay-client/**",
             "crates/relay-protocol/**",
             "Cargo.lock",
@@ -139,6 +140,7 @@ MACOS_PATH_OWNERSHIP = {
             ".config/nextest.toml",
             "rust-toolchain.toml",
             ".github/actions/setup-rust/**",
+            ".github/actions/setup-uv/**",
         },
         "main": {
             "Cargo.toml",
@@ -1232,19 +1234,67 @@ class HermesTestInterpreterActionTests(unittest.TestCase):
 
     def test_the_composite_installs_the_pinned_uv_and_exports_the_interpreter(self):
         action = self.ACTION.read_text()
-        self.assertIn(
-            "uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0",
-            action,
-        )
-        self.assertIn('version: "0.9.28"', action)
+        self.assertIn("uses: ./.github/actions/setup-uv\n", action)
         self.assertIn("enable-cache: true", action)
         self.assertIn("printf 'POHUNEK_PYTHON_BIN=%s\\n' \"$python_bin\" >> \"$GITHUB_ENV\"", action)
 
     def test_the_composite_uses_only_commit_pinned_actions_and_is_in_the_lane_filter(self):
         for use in re.findall(r"uses: (\S+)", self.ACTION.read_text()):
-            self.assertRegex(use, r"@[0-9a-f]{40}", use)
+            if not use.startswith("./"):
+                self.assertRegex(use, r"@[0-9a-f]{40}", use)
         self.assertIn(".github/actions/hermes-test-python/**", filter_paths("macos"))
         self.assertIn(".github/actions/hermes-test-python/**", MACOS_PATH_OWNERSHIP["platform-contracts"]["pr"])
+
+
+class SetupUvActionTests(unittest.TestCase):
+    """uv is installed from one pinned, checksummed composite, never from a version manifest."""
+
+    ACTION = ROOT / ".github" / "actions" / "setup-uv" / "action.yml"
+    PINNED = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0"
+
+    def files_with_setup_uv(self):
+        found = {}
+        for path in [*(ROOT / ".github" / "workflows").glob("*.yml"), *(ROOT / ".github" / "actions").glob("*/action.yml")]:
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if line.lstrip().startswith("uses: astral-sh/setup-uv"):
+                    found.setdefault(path, []).append((number, line.strip()))
+        return found
+
+    def test_only_the_composite_uses_the_upstream_action(self):
+        found = self.files_with_setup_uv()
+        self.assertEqual(set(found), {self.ACTION})
+        self.assertEqual([line for _, line in found[self.ACTION]], [f"uses: {self.PINNED}"])
+
+    def test_every_install_site_uses_the_composite_and_pins_no_version_itself(self):
+        sites = 0
+        for path in (ROOT / ".github").rglob("*.yml"):
+            text = path.read_text()
+            if path == self.ACTION:
+                continue
+            sites += text.count("uses: ./.github/actions/setup-uv\n")
+            self.assertNotIn("0.9.28", text, path)
+        self.assertEqual(sites, 7)
+
+    def test_the_composite_pins_one_version_and_a_checksum_per_target(self):
+        action = self.ACTION.read_text()
+        self.assertEqual(re.findall(r'UV_VERSION: "([^"]+)"', action)[:1], ["0.9.28"])
+        for name in ("X86_64_LINUX", "AARCH64_LINUX", "AARCH64_DARWIN", "X86_64_DARWIN"):
+            match = re.search(rf"UV_SHA256_{name}: ([0-9a-f]{{64}})\n", action)
+            self.assertIsNotNone(match, name)
+        self.assertEqual(len(set(re.findall(r"UV_SHA256_\w+: ([0-9a-f]{64})", action))), 4)
+        self.assertRegex(action, r"version: \$\{\{ steps\.seed\.outputs\.version \}\}")
+
+    def test_the_download_is_verified_before_extraction_and_the_installed_uv_is_required(self):
+        action = self.ACTION.read_text()
+        self.assertLess(action.index("| $check)"), action.index("tar -xzf"))
+        self.assertIn("--proto '=https'", action)
+        for limit in ("--connect-timeout", "--speed-limit", "--speed-time", "--max-time", "--retry-max-time"):
+            self.assertIn(limit, action)
+        self.assertIn('if [ "$UV_PATH" != "${SEEDED_DIR}/uv" ]', action)
+
+    def test_the_composite_is_in_the_lane_filter(self):
+        self.assertIn(".github/actions/setup-uv/**", filter_paths("macos"))
+        self.assertIn(".github/actions/setup-uv/**", MACOS_PATH_OWNERSHIP["platform-contracts"]["pr"])
 
 
 class RuntimePackageSelectionTests(unittest.TestCase):

@@ -218,9 +218,8 @@ jobs:
 
       - name: Install uv for provisioned upstreams
         if: ${{ matrix.rows != '' }}
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
-          version: "0.9.28"
           enable-cache: false
 
       - name: Run the rows and write their attestations
@@ -628,9 +627,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv for provisioned upstreams
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
-          version: "0.9.28"
           enable-cache: false
 
       - name: Build xtask
