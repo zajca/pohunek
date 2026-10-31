@@ -333,6 +333,8 @@ impl SessionRegistry {
                 self.spawn_transaction("delayed_input", async move {
                     let _input_guard = input_guard;
                     let outcome = write_delayed_input(
+                        &registry,
+                        &session_id,
                         &worker,
                         writes,
                         || turns.note_input(&session_id),
@@ -357,15 +359,15 @@ impl SessionRegistry {
                             debug!(error = %error, "Enter skipped: the runtime ended after the text was delivered");
                             Ok(())
                         }
+                        Err(DelayedInputFailure::Refused(error)) => Err(error),
                         Err(
                             DelayedInputFailure::Text(error) | DelayedInputFailure::Enter(error),
-                        ) => Err(error),
+                        ) => Err(worker_error_to_protocol(error)),
                         Ok(()) => Ok(()),
                     }
                 })
                 .await
-                .map_err(|error| worker_input_task_error(&error))?
-                .map_err(worker_error_to_protocol)?;
+                .map_err(|error| worker_input_task_error(&error))??;
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(unavailable_runtime_error(session_id, state, None));
@@ -1297,14 +1299,21 @@ enum DelayedInputFailure {
     Text(WorkerError),
     /// The text arrived and Enter could not be delivered.
     Enter(WorkerError),
+    /// The text arrived and the agent read `blocked` before Enter, so Enter
+    /// was withheld: it could answer a dialog the operator never saw.
+    Refused(ProtocolError),
 }
 
 /// Writes the body, waits the submit delay and writes Enter as a second plan.
 ///
 /// Neither plan holds the worker's control connection while the delay runs, so
 /// other control requests to the worker are served in between. `note_input`
-/// runs when the first plan starts sending.
+/// runs when the first plan starts sending. Enter is written only if the
+/// session's input rules still admit the activity it reads under the session
+/// lock, which stays held until Enter's send starts.
 async fn write_delayed_input(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
     worker: &Worker,
     writes: InputWritePlan,
     note_input: impl FnOnce(),
@@ -1334,11 +1343,26 @@ async fn write_delayed_input(
         delay_boundary.wait().await;
     }
     tokio::time::sleep(delay).await;
-    worker
+    // Reserved before the session lock below, which keeps the lock order of
+    // the control connection first and the session registry second.
+    let reservation = worker
         .reserve_write(vec![enter_fragment(Duration::ZERO)])
         .await
-        .map_err(DelayedInputFailure::Enter)?
-        .commit(|| {})
+        .map_err(DelayedInputFailure::Enter)?;
+    let sessions = registry.inner.sessions.lock().await;
+    if let Some(entry) = sessions.get(session_id) {
+        if entry
+            .input_rules
+            .validate_activity(entry.info.activity)
+            .is_err()
+        {
+            return Err(DelayedInputFailure::Refused(
+                ProtocolError::session_input_not_submitted(InputNotSubmittedReason::AgentBlocked),
+            ));
+        }
+    }
+    reservation
+        .commit(move || drop(sessions))
         .await
         .map_err(DelayedInputFailure::Enter)?;
     Ok(())

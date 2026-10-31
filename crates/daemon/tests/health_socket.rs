@@ -4085,6 +4085,187 @@ with open({received:?}, "wb") as capture:
     let _ = handle.await;
 }
 
+/// Waits for an `agent_state` event with `activity` from `source` and returns
+/// the session it concerns.
+async fn wait_for_any_agent_state(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    activity: AgentActivity,
+    source: StateSource,
+) -> SessionId {
+    let expected_activity = serde_json::to_value(activity).expect("serialize activity");
+    let expected_source = serde_json::to_value(source).expect("serialize source");
+    wait::guard("the agent_state event", async {
+        loop {
+            let line = framed
+                .next()
+                .await
+                .expect("a streamed event line")
+                .expect("event framing ok");
+            let streamed: Event = serde_json::from_str(&line).expect("parse event");
+            if streamed.event() == event::AGENT_STATE
+                && streamed.payload()["activity"] == expected_activity
+                && streamed.payload()["source"] == expected_source
+            {
+                let id = streamed.payload()["session_id"]
+                    .as_str()
+                    .expect("event session id");
+                return SessionId(id.to_owned());
+            }
+        }
+    })
+    .await
+}
+
+/// Writes a Claude stub that draws the recorded folder-trust dialog, logs what
+/// it sees to `log` in order (`dialog`, `gate`, `box`, `input:<bytes>`), waits
+/// for a write to the fifo `gate`, then draws the prompt box.
+fn write_claude_trust_stub(script: &Path, log: &Path, gate: &Path) {
+    let trust = std::fs::read_to_string(
+        pohunek_test_support::workspace_root().join("compat/claude/screens/trust.txt"),
+    )
+    .expect("read the recorded trust dialog");
+    let trust_screen = format!("\x1b[2J\x1b[H{}", trust.trim_end().replace('\n', "\r\n"));
+    let hex = |text: &str| {
+        text.bytes()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    std::fs::write(
+        script,
+        format!(
+            r#"import os
+import select
+import termios
+import tty
+
+tty.setraw(0, termios.TCSANOW)
+log = open({log:?}, "ab", buffering=0)
+gate = os.open({gate:?}, os.O_RDONLY | os.O_NONBLOCK)
+
+def note(text):
+    log.write(text + b"\n")
+
+os.write(1, b"\x1b[?2004h")
+os.write(1, b"{trust}")
+note(b"dialog")
+released = False
+while not released:
+    ready, _, _ = select.select([0, gate], [], [])
+    if 0 in ready:
+        note(b"input:" + os.read(0, 4096))
+    if gate in ready:
+        os.read(gate, 16)
+        released = True
+note(b"gate")
+os.write(1, b"{prompt}")
+note(b"box")
+while True:
+    chunk = os.read(0, 4096)
+    if not chunk:
+        break
+    note(b"input:" + chunk)
+"#,
+            log = log.display().to_string(),
+            gate = gate.display().to_string(),
+            trust = hex(&trust_screen),
+            prompt = hex(CLAUDE_PROMPT_BOX_SCREEN),
+        ),
+    )
+    .expect("write Claude stub with a trust dialog");
+}
+
+/// A session whose Claude stub first draws the recorded folder-trust dialog
+/// (`compat/claude/screens/trust.txt`) reads `blocked`, and its initial input
+/// is not written before the prompt box renders: the stub logs what it does in
+/// order, and the input follows the box. `idle` then means the prompt box is
+/// ready for input.
+#[tokio::test]
+async fn claude_initial_input_waits_behind_the_trust_dialog_until_the_prompt_box_renders() {
+    let socket = temp_socket("claude-trust");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "create the gate fifo"
+    );
+    let script = socket.dir.join("claude-trust.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudetrust", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make("subscribe-claude-trust", method::SUBSCRIBE, Value::Null);
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
+
+    let mut params = session_params(&socket);
+    "claudetrust".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let create = tokio::spawn({
+        let socket = socket.path.clone();
+        async move {
+            let mut control = connect(&socket).await;
+            let response = create_session_with_params(&mut control, params).await;
+            (control, response)
+        }
+    });
+
+    // The dialog reads blocked, and the call that carries the input is still
+    // waiting for the prompt box.
+    let id = wait_for_any_agent_state(&mut subscriber, AgentActivity::Blocked, StateSource::Screen)
+        .await;
+    assert!(!create.is_finished(), "the input waits behind the dialog");
+    tokio::task::spawn_blocking(move || std::fs::write(&gate, b"go").expect("open the gate"))
+        .await
+        .expect("join the gate writer");
+    wait_for_agent_state_event(
+        &mut subscriber,
+        &id,
+        AgentActivity::Idle,
+        StateSource::Screen,
+    )
+    .await;
+    let (mut control, response) = wait::guard("the session to be created", create)
+        .await
+        .expect("join the create call");
+    let created: SessionInfo =
+        serde_json::from_value(ok_payload(response)).expect("claude session info");
+    assert_eq!(created.id, id);
+
+    read_file_until(&log, b"hello Claude").await;
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    let steps: Vec<&str> = steps.lines().collect();
+    assert_eq!(&steps[..3], ["dialog", "gate", "box"], "{steps:?}");
+    assert!(
+        steps[3].starts_with("input:") && steps[3].contains("hello Claude"),
+        "the input follows the prompt box: {steps:?}"
+    );
+
+    let stop_req = Request::make(
+        "claude-trust-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Writes `agents_dir/manifests/<name>.toml` with `manifest` and a Claude
 /// profile `name` over `script` that selects it as its override manifest.
 fn write_claude_profile_with_manifest(
