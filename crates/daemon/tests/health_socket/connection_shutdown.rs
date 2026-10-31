@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use nix::unistd::mkfifo;
 use pohunek_daemon::api::{ConnectionTasks, OverlaySource, RemoteServer};
 use pohunek_daemon::shutdown::{DaemonShutdown, DaemonShutdownReport, ShutdownPhase, ShutdownPlan};
-use pohunek_test_support::wait::{guard, wait_until};
+use pohunek_test_support::wait::guard;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::MakeWriter;
@@ -243,8 +243,8 @@ impl Captured {
 }
 
 impl std::io::Write for Captured {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        std::io::Write::write(&mut *self.0.lock().expect("log capture lock"), bytes)
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut *self.0.lock().expect("log capture lock"), buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

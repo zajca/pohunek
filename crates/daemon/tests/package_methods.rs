@@ -191,24 +191,12 @@ async fn spawn_servers_over(tag: &str, store_content: Option<&str>) -> Servers {
         let _ = remote_tx.send(());
     });
     let task = tokio::spawn(async move {
-        let unix_serve = unix.serve(
-            pohunek_daemon::api::ConnectionTasks::new(
-                "control_connections",
-                &tokio_util::sync::CancellationToken::new(),
-            ),
-            async move {
-                let _ = unix_rx.await;
-            },
-        );
-        let remote_serve = remote.serve(
-            pohunek_daemon::api::ConnectionTasks::new(
-                "remote_connections",
-                &tokio_util::sync::CancellationToken::new(),
-            ),
-            async move {
-                let _ = remote_rx.await;
-            },
-        );
+        let unix_serve = unix.serve(untracked("control_connections"), async move {
+            let _ = unix_rx.await;
+        });
+        let remote_serve = remote.serve(untracked("remote_connections"), async move {
+            let _ = remote_rx.await;
+        });
         tokio::join!(unix_serve, remote_serve);
     });
     Servers {
@@ -2462,4 +2450,9 @@ async fn a_removal_refused_for_an_unreadable_line_proceeds_once_the_line_is_set_
 
     drop(local);
     servers.stop().await;
+}
+
+/// Connection tasks whose shutdown token nothing cancels.
+fn untracked(name: &'static str) -> pohunek_daemon::api::ConnectionTasks {
+    pohunek_daemon::api::ConnectionTasks::new(name, &tokio_util::sync::CancellationToken::new())
 }

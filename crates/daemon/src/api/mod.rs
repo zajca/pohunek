@@ -621,19 +621,18 @@ where
             refuse_buffered(&mut framed, pending.take(), negotiated_version).await?;
             return Ok(());
         }
-        let line = match pending.take() {
-            Some(line) => line,
-            None => {
-                connection.set_state(ConnectionState::Idle);
-                let next = tokio::select! {
-                    biased;
-                    () = connection.token().cancelled() => continue,
-                    next = framed.next() => next,
-                };
-                match read_control_line(next)? {
-                    Some(line) => line,
-                    None => break,
-                }
+        let line = if let Some(line) = pending.take() {
+            line
+        } else {
+            connection.set_state(ConnectionState::Idle);
+            let next = tokio::select! {
+                biased;
+                () = connection.token().cancelled() => continue,
+                next = framed.next() => next,
+            };
+            match read_control_line(next)? {
+                Some(line) => line,
+                None => break,
             }
         };
 
@@ -685,25 +684,7 @@ where
                 framed.send(response_line).await.map_err(codec_to_io)?;
             }
             Dispatch::Subscribe(ack_line, version) => {
-                // Subscribe BEFORE sending the ack so no event emitted between
-                // the ack and the recv loop is missed.
-                let mut session_events = state.sessions.subscribe();
-                let (_notification_sender, mut notification_events) =
-                    if let Some(notifications) = &state.notifications {
-                        (None, notifications.subscribe())
-                    } else {
-                        let (sender, receiver) = broadcast::channel(1);
-                        (Some(sender), receiver)
-                    };
-                framed.send(ack_line).await.map_err(codec_to_io)?;
-                connection.set_state(ConnectionState::Subscription);
-                run_event_subscription(
-                    &mut framed,
-                    (&mut session_events, &mut notification_events),
-                    version,
-                    connection.token(),
-                )
-                .await?;
+                serve_subscription(&mut framed, &state, (ack_line, version), &connection).await?;
                 // The connection is consumed by the subscription stream.
                 return Ok(());
             }
@@ -722,6 +703,38 @@ where
         }
     }
     Ok(())
+}
+
+/// Acknowledges a `subscribe` request and streams events on the connection
+/// until the client disconnects or the daemon stops.
+async fn serve_subscription<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    state: &DaemonState,
+    (ack_line, version): (String, ProtocolVersion),
+    connection: &Connection,
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Subscribe BEFORE sending the ack so no event emitted between the ack and
+    // the recv loop is missed.
+    let mut session_events = state.sessions.subscribe();
+    let (_notification_sender, mut notification_events) =
+        if let Some(notifications) = &state.notifications {
+            (None, notifications.subscribe())
+        } else {
+            let (sender, receiver) = broadcast::channel(1);
+            (Some(sender), receiver)
+        };
+    framed.send(ack_line).await.map_err(codec_to_io)?;
+    connection.set_state(ConnectionState::Subscription);
+    run_event_subscription(
+        framed,
+        (&mut session_events, &mut notification_events),
+        version,
+        connection.token(),
+    )
+    .await
 }
 
 /// The most request lines [`refuse_buffered`] answers after the stop signal.
