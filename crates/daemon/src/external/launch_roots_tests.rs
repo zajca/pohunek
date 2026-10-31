@@ -1395,6 +1395,11 @@ async fn a_nested_path_reads_only_the_first_line_and_a_top_level_key_of_any_reco
         serde_json::json!({"sessionId": "late-top", "cwd": "/late"})
     );
     fs::write(tree.join("rollout-late.jsonl"), late).expect("write the rollout");
+    // A relative top-level cwd does not block the absolute cwd at the path.
+    let rel_top =
+        serde_json::json!({"cwd": "rel/dir", "payload": {"id": "rel-top", "cwd": "/abs"}});
+    fs::write(tree.join("rollout-reltop.jsonl"), format!("{rel_top}\n"))
+        .expect("write the rollout");
     // A non-string id is ignored; a relative cwd is ignored while the id stays.
     let odd = serde_json::json!({"payload": {"id": 7, "cwd": "/ignored"}});
     fs::write(tree.join("rollout-odd.jsonl"), format!("{odd}\n")).expect("write the rollout");
@@ -1414,8 +1419,13 @@ async fn a_nested_path_reads_only_the_first_line_and_a_top_level_key_of_any_reco
         Some(&Some(PathBuf::from("/late"))),
         "{indexed:?}"
     );
+    assert_eq!(
+        indexed.get("rel-top"),
+        Some(&Some(PathBuf::from("/abs"))),
+        "{indexed:?}"
+    );
     assert!(!indexed.contains_key("nested-id"), "{indexed:?}");
-    assert_eq!(indexed.len(), 3, "{indexed:?}");
+    assert_eq!(indexed.len(), 4, "{indexed:?}");
 }
 
 #[tokio::test]

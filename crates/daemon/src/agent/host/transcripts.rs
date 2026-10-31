@@ -78,11 +78,11 @@ pub const MAX_HEAD_PATH_KEYS: usize = 3;
 
 /// Longest key of a head path, in bytes.
 ///
-/// Keys name fields of a transcript's first record, so they are short
+/// Keys name fields of a transcript's first line, so they are short
 /// identifiers; the bound keeps a descriptor from carrying free text.
 pub const MAX_HEAD_PATH_KEY_BYTES: usize = 32;
 
-/// A validated chain of object keys that leads to a string in the first record
+/// A validated chain of object keys that leads to a string in the first line
 /// of a transcript.
 ///
 /// A key is `[A-Za-z0-9_]`, so a path is data to walk, never an expression: no
@@ -123,7 +123,7 @@ impl HeadKeyPath {
     }
 }
 
-/// The key paths a `jsonl-head-v1` declaration names for the first record.
+/// The key paths a `jsonl-head-v1` declaration names for the first line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeadPaths {
     id: Option<HeadKeyPath>,
@@ -271,7 +271,7 @@ impl Transcripts {
         Ok(self)
     }
 
-    /// The key paths of the first record; empty unless declared.
+    /// The key paths of the first line; empty unless declared.
     #[must_use]
     pub fn head_paths(&self) -> &HeadPaths {
         &self.head_paths

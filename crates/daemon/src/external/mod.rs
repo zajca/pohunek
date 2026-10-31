@@ -152,7 +152,7 @@ pub(crate) struct TranscriptRoot {
     path: PathBuf,
     /// The compiled parser the runtime's descriptor names for its transcripts.
     parser: TranscriptParser,
-    /// The key paths of the first record the descriptor declares for
+    /// The key paths of the first line the descriptor declares for
     /// `jsonl-head-v1`.
     head_paths: HeadPaths,
     /// The declared bound on the directory levels below `path`; see
