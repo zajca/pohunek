@@ -4904,8 +4904,9 @@ Attach stream rules:
   client that needs to know the program read its input observes the terminal
   output or the session activity instead.
 - The end of a client's input is a shutdown of its write half (a FIN) on a
-  transport that has one: a Unix or TCP socket, the Rust SDK's
-  `RawStream::shutdown`. The daemon then stops reading the client, keeps
+  transport that has one: a Unix or TCP socket. With the Rust SDK, call
+  `AsyncWriteExt::shutdown` on the stream inside a `RawStream::Local` or
+  `RawStream::Remote`. The daemon then stops reading the client, keeps
   forwarding output and closes the stream once the program's terminal accepted
   the last input frame it sent ("written to the program's terminal", not "read
   by the program"), or earlier when the program exits, the session stops, the

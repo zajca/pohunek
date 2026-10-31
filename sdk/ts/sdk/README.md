@@ -245,14 +245,15 @@ const raw = await attachRawLocal(socketPath, attached.stream_id);
 
 try {
   const writer = raw.writable.getWriter();
-  await writer.write(new TextEncoder().encode("pwd\r"));
+  await writer.write(new TextEncoder().encode("printf 'do%sne\\n' \"\"\r"));
   writer.releaseLock();
   // Closing the stream is a disconnect: wait for the output of the command
-  // (or the session activity) before closing or detaching.
+  // (or the session activity) before closing or detaching. The terminal echoes
+  // the typed line as `do%sne`, so only the command's output contains `done`.
   const reader = raw.readable.getReader();
   const decoder = new TextDecoder();
   let seen = "";
-  while (!/pwd\r?\n\//.test(seen)) {
+  while (!seen.includes("done")) {
     const { value, done } = await reader.read();
     if (done) break;
     seen += decoder.decode(value, { stream: true });
