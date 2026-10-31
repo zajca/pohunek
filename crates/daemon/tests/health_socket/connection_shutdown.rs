@@ -3,8 +3,8 @@
 //! The scenarios serve the control socket (and, for the last one, a remote
 //! listener) the way `pohunekd` does: the connections are tracked by a
 //! [`ConnectionTasks`] that stops with the signal and is awaited by a
-//! [`DaemonShutdown`], and the signal is raised as `main` raises it, by
-//! `begin_daemon_shutdown` on the registry and a cancelled token.
+//! [`DaemonShutdown`], and the signal is raised as `main` raises it: a cancelled
+//! token, then `begin_daemon_shutdown` on the registry.
 
 // Rust guideline compliant 2026-10-31
 
@@ -101,10 +101,10 @@ impl Stopping {
         }
     }
 
-    /// Raises the stop signal as `pohunekd` does.
+    /// Raises the stop signal as `pohunekd` does: the connections first.
     fn raise_signal(&self) {
-        self.registry.begin_daemon_shutdown();
         self.signal.cancel();
+        self.registry.begin_daemon_shutdown();
     }
 }
 
@@ -388,8 +388,8 @@ async fn a_remote_request_that_outlives_the_bound_is_named_by_its_transport() {
         .expect("send project.add");
     let _wedge = hold_fifo_open(fifo).await;
 
-    registry.begin_daemon_shutdown();
     signal.cancel();
+    registry.begin_daemon_shutdown();
     let report = run_past_the_bounds(&tasks, &registry).await;
 
     assert_eq!(

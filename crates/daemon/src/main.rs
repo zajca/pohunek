@@ -754,8 +754,10 @@ async fn run() -> Result<(), DaemonError> {
     let shutdown_token = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        shutdown_sessions.begin_daemon_shutdown();
+        // The connections stop first: a line pipelined behind a wait that the
+        // registry answers must not be dispatched in the gap before they do.
         shutdown_token.cancel();
+        shutdown_sessions.begin_daemon_shutdown();
     });
 
     let control_connections = ConnectionTasks::new("control_connections", &shutdown);
@@ -791,9 +793,9 @@ async fn run() -> Result<(), DaemonError> {
     //     their events (notification projector, hook flush), and the attention
     //     coordinator last so any last defers/resolves they hand over are
     //     accepted, the registry stops its own background work and
-    //     refuses a store write after that (a control connection still
-    //     finishing an operation sees `registry_shut_down`, which is how a
-    //     daemon that is exiting ends it), and the append-only event log
+    //     refuses a store write after that (a control connection that
+    //     outlived the drivers bound and still finishes an operation sees
+    //     `registry_shut_down`, which is how a daemon that is exiting ends it), and the append-only event log
     //     flushes last so events buffered at shutdown are not lost. The report
     //     is logged by the run.
     drop(tasks.run(&sessions).await);
@@ -1394,8 +1396,8 @@ where
             let begin_daemon_shutdown = begin_daemon_shutdown
                 .take()
                 .expect("daemon shutdown callback is available for the first failure");
-            begin_daemon_shutdown();
             shutdown.cancel();
+            begin_daemon_shutdown();
         }
     }
 

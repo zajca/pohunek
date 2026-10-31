@@ -2400,7 +2400,7 @@ private protocol remains usable for existing lifecycle and attach operations,
 but observation returns `worker_feature_unavailable`.
 
 When the daemon stops, a control or remote connection answers the request lines
-it has already read, and any line that arrives after the signal, with the
+it has already read (a bounded number), and any line that arrives after the signal while it is being served, with the
 daemon-class `daemon_shutting_down` (stamped with the connection's negotiated
 version) and then closes; the line is not dispatched. A watched wait in flight
 gets the same reply, an event subscription or attach stream ends as a normal
