@@ -247,6 +247,11 @@ try {
   const writer = raw.writable.getWriter();
   await writer.write(new TextEncoder().encode("pwd\r"));
   writer.releaseLock();
+  // Closing the stream is a disconnect: wait for the output of the command
+  // (or the session activity) before closing or detaching.
+  const reader = raw.readable.getReader();
+  await reader.read();
+  reader.releaseLock();
 } finally {
   await raw.close();
   await client.call("session.detach", { stream_id: attached.stream_id }).catch(() => undefined);

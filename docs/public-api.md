@@ -4903,19 +4903,33 @@ Attach stream rules:
 - The raw stream carries no acknowledgement of the input a client writes. A
   client that needs to know the program read its input observes the terminal
   output or the session activity instead.
-- While the program does not read the client's input, the daemon keeps the
-  attach until the client closes the connection and the daemon can see it. On
-  a Unix socket the daemon sees a connection that was closed completely, also
-  while a paste waits for the program. A client that only shut down its write
-  half (a piped stdin that ended) keeps the attach and its pending input is
-  delivered, so a client that has input to finish must shut down its write half
-  and keep reading until the daemon closes the stream: closing the whole
-  connection right after writing is a disconnect, and input the daemon has not
-  yet passed to the program may be dropped. On a TCP connection (a remote host or the relay) the daemon sees
-  a client's close only when it reads or writes the connection, so a client
-  that disconnects while the program neither reads input nor writes output
-  keeps the attach until the program reads, the session stops or the lease is
-  released.
+- The end of a client's input is a shutdown of its write half (a FIN) on a
+  transport that has one: a Unix or TCP socket, the Rust SDK's
+  `RawStream::shutdown`. The daemon then stops reading the client, keeps
+  forwarding output and closes the stream once the program's terminal accepted
+  the last input frame it sent ("written to the program's terminal", not "read
+  by the program"), or earlier when the program exits, the session stops, the
+  lease is released or an output write fails. Output still queued behind the
+  last acknowledgement when the stream ends may not be shown. A client with no
+  input closes at once. A client must keep reading until the daemon closes the
+  stream.
+- A complete close of the connection is a disconnect. On a Unix socket the
+  daemon sees it while a paste waits for the program and during that drain, and
+  ends the attach at once; bytes the terminal has not accepted are dropped. The
+  TS SDK and WebSocket clients have no end of input: `writable.close()` sends
+  no FIN, `RawStream.close()` and a WebSocket close are a complete close of the
+  connection (a relay's close reaches a Unix-socket daemon as a complete close
+  of its upstream connection). A client that must know its input arrived
+  watches the output or the session activity and then detaches
+  (`session.detach`) or closes. A `pohunek` CLI older than this release that
+  pipes input into a slow program ends its input with a half-close followed by
+  its exit, which counts as a disconnect on a Unix socket.
+- On a TCP connection (a remote host, or a relay whose upstream is TCP) the
+  daemon sees a client's close only when it reads or writes the connection. It
+  cannot tell a complete close from a half-close: both end the client's input
+  and are drained. A client that disconnects while the program neither reads
+  input nor writes output keeps the attach until the program reads, the session
+  stops or the lease is released.
 
 Rust SDK helpers:
 
