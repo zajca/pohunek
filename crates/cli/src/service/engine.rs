@@ -884,8 +884,8 @@ impl<'a> Engine<'a> {
             integrations,
             repair: self.repair_report(
                 version,
-                set_aside.or(rollback_restore.set_aside),
-                rollback_restore.restored,
+                set_aside.clone().or(rollback_restore.set_aside),
+                rollback_restore.restored || set_aside.is_some(),
                 "none",
             ),
             refused_entries: layout::refused_entries(&layout)?,

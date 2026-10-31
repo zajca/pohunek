@@ -505,3 +505,28 @@ async fn upgrade_registers_a_missing_daemon_job_again_and_restarts_nothing_else(
     assert_eq!(config_bytes(&harness), settings);
     harness.assert_installed(V1);
 }
+
+/// A directory the owner cannot even open is refused and moved aside by the
+/// rename in its parent.
+#[tokio::test]
+async fn repair_sets_aside_a_directory_the_owner_cannot_open() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.world().running = false;
+    std::fs::set_permissions(
+        version_dir(&harness, V1),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("close the version directory");
+
+    let report = repair_with(&harness, harness.engine(), V1)
+        .await
+        .expect("repair");
+
+    assert!(report.repair.expect("repair").set_aside.is_some());
+    harness.assert_installed(V1);
+    for entry in refused_entries(&harness) {
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755))
+            .expect("reopen the set-aside entry for cleanup");
+    }
+}

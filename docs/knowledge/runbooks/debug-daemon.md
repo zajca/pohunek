@@ -413,8 +413,7 @@ daemon health first, then run `pohunek setup config` for the missing files.
 active version directory of `service.toml` before it runs that version's
 `pohunekd`. It refuses with `service_version_untrusted` when the directory or one
 of its binaries is not what `pohunek service install` publishes: missing, a link,
-writable by another account or of another owner or mode, or holding an extra or
-missing binary. `pohunek service uninstall` applies the same check before it
+writable by another account or of another owner or mode, or lacking a binary. `pohunek service uninstall` applies the same check before it
 starts a stopped daemon and treats a refusal as an unreachable daemon; while
 worker jobs are still live the uninstall then fails with the same code naming the
 active version, because the sessions can be stopped only through the daemon.

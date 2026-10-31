@@ -900,7 +900,7 @@ const DAEMON_JOB_MISSING_HINT: &str = "`pohunek service uninstall` (it removes t
 
 /// The way out of a refused or missing version directory, for the commands
 /// that take a release with `--from`.
-pub(crate) const UNTRUSTED_VERSION_HINT: &str = "make sure nothing runs from that version directory, then rerun the command with `--repair` and `--from` the unpacked release archive of the version the path names: it moves the directory aside, publishes the release's copy, and keeps service.toml and the live sessions";
+pub(crate) const UNTRUSTED_VERSION_HINT: &str = "make sure nothing runs from that version directory, then run `pohunek service upgrade --repair --from <unpacked release archive of the version the path names>` (`pohunek service install --repair` while an install is interrupted): it moves the directory aside, publishes the release's copy, and keeps service.toml and the live sessions";
 
 /// The way out of an uninstall refused because the active version directory
 /// cannot be trusted while worker jobs are live.

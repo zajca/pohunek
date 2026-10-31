@@ -518,8 +518,22 @@ pub fn version_state(layout: &InstallLayout, version: &str) -> Result<VersionSta
     match verify_installed(layout, &dir) {
         Ok(_verified) => Ok(VersionState::Trusted),
         Err(error @ Error::UntrustedVersion { .. }) => Ok(VersionState::Refused(error)),
+        // A directory the owner cannot open is refused too; renaming it aside
+        // needs only the parent.
+        Err(error @ Error::Filesystem { .. }) if is_access_denied(&error) => {
+            Ok(VersionState::Refused(error))
+        }
         Err(other) => Err(other),
     }
+}
+
+/// Whether `error` is the operating system refusing access to an entry.
+fn is_access_denied(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Filesystem { source, .. }
+            if matches!(source.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+    )
 }
 
 /// Renames the entry of `version` aside as `.pohunek-refused-<version>-<random>`.
