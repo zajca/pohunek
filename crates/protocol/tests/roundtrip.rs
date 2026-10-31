@@ -3102,7 +3102,6 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         ProtocolError::agent_fork_unsupported(),
         ProtocolError::agent_runtime_unsupported(),
         ProtocolError::session_input_rejected(),
-        ProtocolError::session_input_blocked(),
         ProtocolError::session_agent_blocked(),
         ProtocolError::session_terminal_unavailable(),
         ProtocolError::session_has_no_managed_terminal(),
@@ -3118,6 +3117,15 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         assert!(!error.msg.contains("base64"));
         assert_eq!(line_roundtrip(&error), error);
     }
+
+    let blocked = ProtocolError::session_input_blocked();
+    assert_eq!(blocked.class, ErrorClass::Runtime);
+    assert!(!blocked.msg.contains("base64"));
+    assert!(blocked
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("session.attach")));
+    assert_eq!(line_roundtrip(&blocked), blocked);
 
     let timeout = ProtocolError::session_input_timeout();
     assert_eq!(timeout.class, ErrorClass::Runtime);

@@ -181,12 +181,29 @@ impl InputRules {
         Self::hermes(bracketed_paste, submit_delay)
     }
 
-    /// Whether the rules carry a provider safety contract (restricted text or
-    /// no automated input while blocked), as opposed to historical
-    /// unrestricted input.
+    /// Whether the rules validate the text as safe text (the Hermes contract),
+    /// as opposed to historical unrestricted text. The refusal of input while
+    /// blocked is reported separately by [`Self::refuses_while_blocked`].
     #[must_use]
     pub(crate) fn is_restricted(self) -> bool {
-        self.text_policy != InputTextPolicy::Unrestricted || !self.allow_while_blocked
+        self.text_policy != InputTextPolicy::Unrestricted
+    }
+
+    /// Declares whether `session.input` is refused while the agent reads
+    /// `blocked`. A runtime whose dialogs replace its prompt sets this so plain
+    /// text cannot answer a dialog the operator never saw.
+    #[must_use]
+    pub(crate) const fn refusing_while_blocked(self, refuse: bool) -> Self {
+        Self {
+            allow_while_blocked: !refuse,
+            ..self
+        }
+    }
+
+    /// Whether programmatic input is refused while the agent reads `blocked`.
+    #[must_use]
+    pub(crate) const fn refuses_while_blocked(self) -> bool {
+        !self.allow_while_blocked
     }
 
     /// Replaces framing while retaining the compiled provider safety contract.
@@ -211,17 +228,12 @@ impl InputRules {
         Ok(())
     }
 
-    /// Whether the adapter permits automated input while blocked on owner action.
-    pub(crate) const fn allows_while_blocked(self) -> bool {
-        self.allow_while_blocked
-    }
-
     /// Validates whether programmatic input is permitted in the visible state.
     pub(crate) fn validate_activity(
         self,
         activity: Option<AgentActivity>,
     ) -> Result<(), ProtocolError> {
-        if activity == Some(AgentActivity::Blocked) && !self.allows_while_blocked() {
+        if activity == Some(AgentActivity::Blocked) && self.refuses_while_blocked() {
             Err(ProtocolError::session_input_blocked())
         } else {
             Ok(())
@@ -864,7 +876,7 @@ mod tests {
 
         let hermes = rules(protocol::RuntimeRef::hermes());
         assert!(hermes.is_restricted());
-        assert!(!hermes.allows_while_blocked());
+        assert!(hermes.refuses_while_blocked());
 
         let unresolved = rules(protocol::RuntimeRef::from_wire("acme"));
         assert!(!unresolved.is_restricted());

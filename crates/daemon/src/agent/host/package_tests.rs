@@ -1061,6 +1061,16 @@ fn a_recovered_safe_text_runtime_keeps_its_input_safety_when_its_package_fails_v
         std::time::Duration::from_millis(5),
     ));
     assert!(!open.to_standalone_rules().is_restricted());
+
+    // A runtime that only refuses input while blocked keeps that refusal
+    // without the safe-text contract.
+    let refusing = crate::store::StoredInputRules::from(
+        crate::agent::InputRules::unrestricted(true, std::time::Duration::from_millis(5))
+            .refusing_while_blocked(true),
+    );
+    let standalone = refusing.to_standalone_rules();
+    assert!(!standalone.is_restricted());
+    assert!(standalone.refuses_while_blocked());
 }
 
 /// The fixture descriptor of runtime `acme` with an `[integration]` table.

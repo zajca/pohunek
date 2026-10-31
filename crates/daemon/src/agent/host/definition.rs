@@ -514,7 +514,7 @@ impl RuntimeDefinition {
                         bracketed_paste: input_rules.bracketed_paste,
                         submit_delay_ms,
                         text_policy: text_policy_name(input_rules.text_policy),
-                        allow_while_blocked: input_rules.allows_while_blocked(),
+                        allow_while_blocked: !input_rules.refuses_while_blocked(),
                     },
                     submit_delay_configurable,
                     prompt_arg,
@@ -682,11 +682,14 @@ impl RuntimeDefinition {
                 source,
             })?;
         let manifest = manifest(&raw.runtime.detect_manifest)?;
-        let input_rules = input_rules_for(
+        let mut input_rules = input_rules_for(
             raw.input.text_policy.into_policy(),
             raw.input.bracketed_paste,
             Duration::from_millis(raw.input.submit_delay_ms),
         );
+        if raw.input.refuse_while_blocked {
+            input_rules = input_rules.refusing_while_blocked(true);
+        }
         let input_readiness = raw.input.ready.into_readiness();
         let (native, hook_existence) = raw.native_and_existence()?;
         let config_home = raw
@@ -1228,6 +1231,9 @@ struct RawInput {
     bracketed_paste: bool,
     submit_delay_ms: u64,
     text_policy: RawTextPolicy,
+    /// Absent means plain text is delivered while the session reads `blocked`.
+    #[serde(default)]
+    refuse_while_blocked: bool,
     /// Absent means the descriptor's delay is final.
     #[serde(default)]
     submit_delay_configurable: bool,

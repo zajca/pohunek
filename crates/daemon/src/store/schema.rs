@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 11;
+pub const STORE_SCHEMA_VERSION: u32 = 12;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -94,6 +94,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 10,
         apply: migrate_v10_to_v11,
+    },
+    Migration {
+        from: 11,
+        apply: migrate_v11_to_v12,
     },
 ];
 
@@ -174,6 +178,13 @@ fn migrate_v9_to_v10(_record: &mut Map<String, Value>) {}
 /// A record written without the field has no recorded verdict, which is how
 /// every schema 10 runtime reads, so no record needs rewriting.
 fn migrate_v10_to_v11(_record: &mut Map<String, Value>) {}
+
+/// Schema 11 to 12: a recovery snapshot's `input_rules` may record that input
+/// is refused while the agent reads `blocked` (`refuse_while_blocked`).
+///
+/// A record written without the field reads `false`, which is how every
+/// schema 11 snapshot behaves, so no record needs rewriting.
+fn migrate_v11_to_v12(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

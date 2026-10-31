@@ -106,6 +106,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "package-commands-v1",
         since: "0.38.0",
     },
+    RuntimeFeature {
+        id: "input-refuse-while-blocked-v1",
+        since: "0.39.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -152,6 +156,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "package-commands-v1",
         rule: GateRule::Key("commands"),
+    },
+    FeatureGate {
+        feature: "input-refuse-while-blocked-v1",
+        rule: GateRule::Key("input.refuse_while_blocked"),
     },
 ];
 

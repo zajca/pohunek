@@ -318,12 +318,17 @@ pub struct StoredInputRules {
     /// Delay before the submit byte, in whole milliseconds.
     #[serde(default)]
     pub submit_delay_ms: u64,
-    /// Whether the runtime's safety contract (safe-text validation and no
+    /// Whether the runtime's safe-text contract (text validation, and no
     /// automated input while blocked) applies. Kept so a session whose runtime
     /// definition cannot be resolved again keeps the protections it launched
     /// with.
     #[serde(default)]
     pub restricted: bool,
+    /// Whether `session.input` is refused while the agent reads `blocked`,
+    /// for a runtime that declares it without the safe-text contract. A record
+    /// written before the field existed reads `false`.
+    #[serde(default)]
+    pub refuse_while_blocked: bool,
 }
 
 impl From<InputRules> for StoredInputRules {
@@ -334,6 +339,7 @@ impl From<InputRules> for StoredInputRules {
             // rather than truncate, so a pathological value can never wrap.
             submit_delay_ms: u64::try_from(rules.submit_delay.as_millis()).unwrap_or(u64::MAX),
             restricted: rules.is_restricted(),
+            refuse_while_blocked: rules.refuses_while_blocked(),
         }
     }
 }
@@ -349,6 +355,7 @@ impl StoredInputRules {
             InputRules::restricted(self.bracketed_paste, delay)
         } else {
             InputRules::unrestricted(self.bracketed_paste, delay)
+                .refusing_while_blocked(self.refuse_while_blocked)
         }
     }
 
@@ -2726,6 +2733,7 @@ mod tests {
                 bracketed_paste: false,
                 submit_delay_ms: 150,
                 restricted: false,
+                refuse_while_blocked: false,
             },
             native_launch: Some(launch(
                 SessionRefKind::Id,
@@ -2816,7 +2824,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":11,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":12,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2832,7 +2840,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":11,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":12,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2944,7 +2952,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":11,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":12,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -2965,6 +2973,7 @@ mod tests {
             bracketed_paste: false,
             submit_delay_ms: 25,
             restricted: false,
+            refuse_while_blocked: false,
         };
         let rules = stored.to_input_rules(
             crate::agent::host::fixture::official_host()
@@ -3066,7 +3075,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":11,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":12,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
