@@ -993,7 +993,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let ((mut resume, worktrees, projects, mut sessions), rejected) = self.read_for_write()?;
         if let Some(existing) = sessions
             .iter_mut()
             .find(|existing| existing.session_id == record.session_id)
@@ -1009,7 +1009,7 @@ impl Store {
             sessions.push(record.clone());
         }
         drop_resume_of_terminal_session(&mut resume, record);
-        match self.write_all(&resume, &worktrees, &projects, &sessions)? {
+        match self.write_all(&resume, &worktrees, &projects, &sessions, &rejected)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
             MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
                 Ok(SessionWriteOutcome::AppliedDurabilityUncertain {
@@ -1042,7 +1042,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let ((mut resume, worktrees, projects, mut sessions), rejected) = self.read_for_write()?;
         let Some(existing) = sessions
             .iter_mut()
             .find(|existing| existing.session_id == record.session_id)
@@ -1060,7 +1060,7 @@ impl Store {
         keep_initial_input_settled(existing, &mut replacement);
         *existing = replacement;
         drop_resume_of_terminal_session(&mut resume, record);
-        match self.write_all(&resume, &worktrees, &projects, &sessions)? {
+        match self.write_all(&resume, &worktrees, &projects, &sessions, &rejected)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
             MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
                 Ok(SessionWriteOutcome::AppliedDurabilityUncertain {
@@ -1081,7 +1081,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let ((resume, worktrees, projects, mut sessions), rejected) = self.read_for_write()?;
         let Some(record) = sessions.iter_mut().find(|record| {
             record.session_id == session_id
                 && record
@@ -1093,7 +1093,7 @@ impl Store {
         };
         record.transaction = None;
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(true))
     }
 
@@ -1114,7 +1114,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let ((resume, worktrees, projects, mut sessions), rejected) = self.read_for_write()?;
         let Some(record) = sessions
             .iter_mut()
             .find(|record| record.session_id == session_id)
@@ -1127,7 +1127,7 @@ impl Store {
             recovery.metadata.clone_from(metadata);
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(true))
     }
 
@@ -1137,13 +1137,13 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let ((resume, worktrees, projects, mut sessions), rejected) = self.read_for_write()?;
         let before = sessions.len();
         sessions.retain(|record| record.session_id != session_id);
         let removed = before != sessions.len();
         if removed {
             return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
                 .with_value(true));
         }
         Ok(StoreMutation::Synced(false))
@@ -1156,7 +1156,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, sessions) = self.read_all()?;
+        let ((mut resume, worktrees, projects, sessions), rejected) = self.read_for_write()?;
         let mut replacement = binding.clone();
         if let Some(authoritative) = sessions
             .iter()
@@ -1183,7 +1183,7 @@ impl Store {
             resume.push(replacement);
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(()))
     }
 
@@ -1194,14 +1194,14 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, sessions) = self.read_all()?;
+        let ((mut resume, worktrees, projects, sessions), rejected) = self.read_for_write()?;
         let before = resume.len();
         resume.retain(|binding| binding.session_id != session_id);
         if resume.len() == before {
             return Ok(StoreMutation::Synced(()));
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(()))
     }
 
@@ -1243,7 +1243,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
+        let ((resume, mut worktrees, projects, sessions), rejected) = self.read_for_write()?;
         if let Some(existing) = worktrees.iter_mut().find(|existing| {
             existing.session_id == binding.session_id
                 && existing.repository == binding.repository
@@ -1254,7 +1254,7 @@ impl Store {
             worktrees.push(binding.clone());
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(()))
     }
 
@@ -1265,13 +1265,13 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
+        let ((resume, mut worktrees, projects, sessions), rejected) = self.read_for_write()?;
         let before = worktrees.len();
         worktrees.retain(|binding| binding.session_id != session_id);
         let removed = before - worktrees.len();
         if removed > 0 {
             return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
                 .with_value(removed));
         }
         Ok(StoreMutation::Synced(0))
@@ -1297,7 +1297,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
+        let ((resume, mut worktrees, projects, sessions), rejected) = self.read_for_write()?;
         let before = worktrees.len();
         worktrees.retain(|existing| {
             existing.session_id != binding.session_id
@@ -1306,7 +1306,7 @@ impl Store {
         });
         if worktrees.len() != before {
             return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
                 .with_value(true));
         }
         Ok(StoreMutation::Synced(false))
@@ -1338,7 +1338,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
+        let ((resume, worktrees, mut projects, sessions), rejected) = self.read_for_write()?;
         let pos = projects
             .iter()
             .position(|existing| existing.git_common_dir == git_common_dir);
@@ -1351,7 +1351,7 @@ impl Store {
             None => projects.push(updated.clone()),
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(Some(updated)))
     }
 
@@ -1371,7 +1371,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
+        let ((resume, worktrees, mut projects, sessions), rejected) = self.read_for_write()?;
         if let Some(existing) = projects
             .iter_mut()
             .find(|existing| existing.git_common_dir == record.git_common_dir)
@@ -1381,7 +1381,7 @@ impl Store {
             projects.push(record.clone());
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
             .with_value(()))
     }
 
@@ -1394,13 +1394,13 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
+        let ((resume, worktrees, mut projects, sessions), rejected) = self.read_for_write()?;
         let before = projects.len();
         projects.retain(|project| project.git_common_dir != git_common_dir);
         let removed = projects.len() != before;
         if removed {
             return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .write_all(&resume, &worktrees, &projects, &sessions, &rejected)?
                 .with_value(true));
         }
         Ok(StoreMutation::Synced(false))
@@ -1516,6 +1516,21 @@ impl Store {
         Ok(self.partition_logged(lines).0)
     }
 
+    /// Reads and partitions every record for a mutation, with the text of every
+    /// line no loader accepts, in file order, from the same decode. A missing
+    /// file yields no records and no lines.
+    fn read_for_write(&self) -> io::Result<(StoreRecords, Vec<String>)> {
+        let Some(content) = self.read_content()? else {
+            return Ok(((Vec::new(), Vec::new(), Vec::new(), Vec::new()), Vec::new()));
+        };
+        let lines = self.checked_lines(&content)?;
+        let (records, rejected) = self.partition_logged(lines);
+        Ok((
+            records,
+            rejected.into_iter().map(|line| line.text).collect(),
+        ))
+    }
+
     /// [`partition_lines_logged`] that warns about each distinct rejected line
     /// once per store instance.
     fn partition_logged(
@@ -1535,44 +1550,17 @@ impl Store {
         partitioned
     }
 
-    /// The raw text of every line no loader accepts, in file order. A missing
-    /// file yields an empty list. Nothing is logged: the loaders already warn.
-    fn rejected_line_texts(&self) -> io::Result<Vec<String>> {
-        let Some(content) = self.read_content()? else {
-            return Ok(Vec::new());
-        };
-        let lines = self.checked_lines(&content)?;
-        Ok(partition_lines(lines)
-            .1
-            .into_iter()
-            .map(|line| line.text)
-            .collect())
-    }
-
     /// Serialize all records (resume, then worktree, then project, then session)
     /// and every line no loader accepts, unchanged and in file order (each ends
     /// in `\n`, whatever terminator it had), to a temp
     /// file and rename it over the store path. One `rename(2)` commits all kinds.
     ///
-    /// The rejected lines are read again here, under the write lock every caller
-    /// holds, so a rewrite never drops a line this build cannot parse: it may be
-    /// a record a newer daemon wrote, or evidence of a runtime upgrade preflight
-    /// must still count.
+    /// `rejected` is the text of every line no loader accepts, from the decode
+    /// that produced the records, so a rewrite never drops a line this build
+    /// cannot parse: it may be a record a newer daemon wrote, or evidence of a
+    /// runtime upgrade preflight must still count. A caller that drops one of
+    /// them takes responsibility for keeping its text elsewhere.
     fn write_all(
-        &self,
-        resume: &[ResumeBinding],
-        worktrees: &[WorktreeBinding],
-        projects: &[ProjectRecord],
-        sessions: &[SessionRecord],
-    ) -> io::Result<MetadataWriteOutcome> {
-        let rejected = self.rejected_line_texts()?;
-        self.write_records(resume, worktrees, projects, sessions, &rejected)
-    }
-
-    /// [`Self::write_all`] with the rejected lines named by the caller, in file
-    /// order. A caller that drops one of them takes responsibility for keeping
-    /// its text elsewhere.
-    fn write_records(
         &self,
         resume: &[ResumeBinding],
         worktrees: &[WorktreeBinding],

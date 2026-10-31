@@ -236,7 +236,7 @@ impl Store {
             .map_err(SetAsideError::Failed)?;
         let kept_texts: Vec<String> = kept.into_iter().map(|(_, line)| line.text).collect();
         let outcome = self
-            .write_records(&resume, &worktrees, &projects, &sessions, &kept_texts)
+            .write_all(&resume, &worktrees, &projects, &sessions, &kept_texts)
             .map_err(SetAsideError::Failed)?;
         // A committed rewrite whose durability is uncertain is logged by the
         // conversion; the lines are already in the quarantine file.
