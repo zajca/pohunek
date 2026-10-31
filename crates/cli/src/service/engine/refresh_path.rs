@@ -387,12 +387,16 @@ impl Engine<'_> {
         let result = self
             .run_refresh_steps(&mut record, target, definition, &mut late, rewrite)
             .await
+            // Only a kept record is pending; a refusal before `registering`
+            // rolled the refresh back.
             .map_err(|error| match error {
-                Error::UntrustedVersion { path, detail } => Error::UntrustedRefreshVersion {
-                    version: record.version.clone(),
-                    path,
-                    detail,
-                },
+                Error::UntrustedVersion { path, detail } if record.step >= Step::Registering => {
+                    Error::UntrustedRefreshVersion {
+                        version: record.version.clone(),
+                        path,
+                        detail,
+                    }
+                }
                 other => other,
             });
         // A refusal never touches the running daemon. Rolling back a record at

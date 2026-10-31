@@ -1968,3 +1968,21 @@ async fn a_resuming_refresh_over_a_refused_or_missing_directory_is_repaired_in_t
             .expect("the version directory is trusted");
     }
 }
+
+/// A refusal before `registering` rolls the refresh back, so the plain
+/// one-step refusal applies.
+#[tokio::test]
+async fn a_refused_directory_before_registering_rolls_the_refresh_back_with_the_plain_refusal() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Definition).await;
+    let dir = harness.layout().version_dir(V1).expect("version directory");
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o775))
+        .expect("loosen the version directory");
+
+    let error = refresh(harness, false).await.expect_err("refused");
+
+    assert!(matches!(error, Error::UntrustedVersion { .. }), "{error:?}");
+    assert_steps_in_order(error.hint().expect("hint"), &["upgrade --repair --from"]);
+    assert_eq!(harness.pending(), None, "the refresh was rolled back");
+}
