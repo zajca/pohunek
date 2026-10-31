@@ -342,6 +342,82 @@ pub(crate) async fn lifecycle(installation: &Installation) -> Vec<String> {
     workers
 }
 
+/// Runs the recovery of a refused active version directory over a live
+/// session: install, a session, a group-writable version directory and a
+/// removed daemon job, the refusal without `--repair`, the repair, the session
+/// still live under the new daemon, and `uninstall --stop-sessions` through it.
+///
+/// The removed daemon job stands for a daemon `daemon start` refuses to run;
+/// the worker job of the session stays in the manager.
+pub(crate) async fn repair_lifecycle(installation: &Installation) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let from = installation.stage();
+    let namespace = installation.context.namespace().expect("namespace");
+    let backend = connect(&installation.context, &namespace).await;
+    let engine = Engine::new(&installation.context, &backend);
+    let version_dir = installation.prefix().join("libexec/pohunek").join(VERSION);
+
+    engine
+        .install(&from, &installation.prefix(), VERSION)
+        .await
+        .expect("install");
+    let session = installation.new_session("repair").await;
+    let settings = std::fs::read(installation.context.config_path()).expect("service.toml");
+
+    backend
+        .daemon()
+        .uninstall()
+        .await
+        .expect("remove the daemon job");
+    std::fs::set_permissions(&version_dir, std::fs::Permissions::from_mode(0o775))
+        .expect("loosen the version directory");
+
+    let refused = engine.upgrade(&from, VERSION).await;
+    let Err(error) = &refused else {
+        panic!("a refused directory was reused without --repair: {refused:?}");
+    };
+    assert_eq!(error.code(), "service_version_untrusted");
+    assert!(error.hint().is_some_and(|hint| hint.contains("--repair")));
+
+    let uninstall = engine
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await;
+    let Err(error) = &uninstall else {
+        panic!("the uninstall reached a daemon that cannot start: {uninstall:?}");
+    };
+    assert_eq!(error.code(), "service_version_untrusted");
+
+    let repaired = Engine::new(&installation.context, &backend)
+        .with_repair(true)
+        .upgrade(&from, VERSION)
+        .await
+        .expect("repair");
+    let repair = repaired.repair.expect("the repair block");
+    assert!(repair.restored);
+    assert_eq!(repair.daemon, "installed");
+    assert!(repair.set_aside.as_deref().is_some_and(Path::exists));
+    assert_eq!(
+        std::fs::read(installation.context.config_path()).expect("service.toml"),
+        settings,
+        "service.toml is untouched"
+    );
+    installation.live(&session).await;
+
+    let removed = engine
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall with --stop-sessions");
+    assert_eq!(removed.stopped_sessions, [session]);
+    assert_eq!(removed.refused_entries.len(), 1);
+}
+
 /// Polls `probe` until it yields a value, failing after [`WAIT`].
 pub(crate) async fn eventually<T, F, Fut>(what: &str, mut probe: F) -> T
 where

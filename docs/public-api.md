@@ -2834,6 +2834,7 @@ match the refresh), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
 (`pohunek service refresh-path` without `--dry-run` resolves it), and what a
 dry run returns over any pending refresh, because a dry run never resolves one.
+While a refresh is stopped at `registering` or rolling back from `registering` on, and its active version directory is refused or missing, `refresh-path` fails with `service_version_untrusted` (wrapped in `service_rollback_failed` when the first run was a rollback), and `upgrade --repair --from <release of that version>` publishes the directory before it returns `service_refresh_pending`, whose message states that the directory was restored; the record and `service.toml` are untouched and `refresh-path` then finishes the refresh or its rollback.
 A daemon job that vanished after the record exists makes the run roll back:
 before `registering` the file is restored and the record cleared and the run
 returns `service_daemon_job_missing`; from `registering` on the first run returns
@@ -2866,6 +2867,40 @@ file is `service_config_invalid`; resuming an interrupted install whose
 running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.
+
+`pohunek service install --repair` and `pohunek service upgrade --repair` are the
+supported recovery for a refused (`service_version_untrusted`) or missing version
+directory. The flag acts only on the directory of the version the run installs: a
+refused entry is renamed to `.pohunek_refused-<version>-<random>` in the versions
+directory (a rename that never follows a link and moves any entry type), the
+staged and probed release copy is published with the no-replace move, and
+`service.toml` is never rewritten. The renamed-aside entry is kept: it is not a
+version, is never swept or collected and is never a `--from` source; the upgrade
+and uninstall reports list the entries as `refused_entries` (omitted when none
+exists). A missing directory is published without the flag; a refused one
+without it fails with the same code and changes nothing. A directory that passes
+the installed-directory check is never replaced, and one that differs from the
+release still fails with `service_version_conflict`. An upgrade whose `--from`
+probes as the active version then makes the daemon job run from the restored
+directory (a missing job is registered again, a stopped one started, a running
+one restarted as a new process when the directory was restored or `--repair` was
+given, after the adoption preflight judged the release; `service_upgrade_sessions_at_risk`
+and `--accept-runtime-loss` apply and a refusal changes nothing), and never
+stops or retires worker jobs. The success reports of `install` and `upgrade` carry an additive `repair`
+object (`version`, `restored`, `set_aside`, `daemon` as `none`, `installed`,
+`started`, `restarted` or `kept`, a resumed transaction that had already replaced the
+daemon, which still runs from the moved entry until `upgrade --repair --from` is rerun
+once the record is cleared; `null` without the flag and when nothing was repaired).
+`UpgradeReport.unchanged` states that the active version did not change; a
+repair of it can still restart the daemon. The trust claim is that of `service install --from`
+(the operator chose the release, each binary answers `--version`, a sealed
+release's `runtime/` files are present) and no digest of the binaries is
+verified; running processes are not attested. When an `uninstall` finds live
+worker jobs and an untrusted or missing active version directory it fails with
+`service_version_untrusted`, a message naming the active version and a hint with
+the `service upgrade --repair` command; no new error code exists. The
+[debug daemon runbook](knowledge/runbooks/debug-daemon.md#active-version-directory-refused)
+is the procedure.
 
 `pohunekd ensure-official-runtimes` is the offline runtime step of the release;
 `--dry-run` computes its plan without changing anything. `--dry-run --detect` also

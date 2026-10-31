@@ -666,14 +666,13 @@ impl CliError {
 }
 
 /// Next step for a `daemon start` whose active version directory is untrusted
-/// or missing. No single command repairs it: an upgrade to the same version
-/// only re-verifies the directory and `service install` refuses an existing
-/// `service.toml`, so the runbook section explains the refusal and the recovery is tracked
-/// in #1763.
+/// or missing: the upgrade with `--repair` replaces the directory from the
+/// release archive, keeps `service.toml` and the live sessions, and restarts
+/// only the daemon.
 const ACTIVE_VERSION_HINT: &str = "the active version directory is untrusted or missing: make \
-     sure nothing runs from it; see the \"Active version directory refused\" section of the \
-     debug-daemon runbook (docs/knowledge/runbooks/debug-daemon.md); the recovery is tracked \
-     in https://github.com/zajca/pohunek/issues/1763";
+     sure nothing runs from it, then run `pohunek service upgrade --repair --from <unpacked \
+     release archive of the active version>` (`pohunek service status` names the version); it \
+     keeps service.toml and the live sessions and restarts only the daemon";
 
 /// The changes a setup stop reports, as a suffix of its message: empty when
 /// nothing was changed yet.

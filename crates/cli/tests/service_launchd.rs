@@ -53,6 +53,13 @@ async fn install_status_upgrade_refuse_and_uninstall_against_launchd() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_active_directory_is_repaired_over_a_live_session_against_launchd() {
+    let installation = Installation::new();
+
+    native::repair_lifecycle(&installation).await;
+}
+
 /// Asserts that `label` is not loaded in `gui/<uid>`.
 fn assert_absent(label: &str) {
     let target = format!("gui/{}/{label}", nix::unistd::Uid::effective().as_raw());

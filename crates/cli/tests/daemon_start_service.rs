@@ -169,7 +169,11 @@ impl Host {
             ),
             "the refusal carries the daemon start hint: {stderr}"
         );
-        assert!(stderr.contains("issues/1763"), "{stderr}");
+        assert!(
+            stderr.contains("pohunek service upgrade --repair --from <unpacked release archive"),
+            "the hint names the repair command: {stderr}"
+        );
+        assert!(!stderr.contains("issues/1763"), "{stderr}");
         assert!(!self.marker().exists(), "the daemon must not run");
     }
 }

@@ -413,14 +413,81 @@ daemon health first, then run `pohunek setup config` for the missing files.
 active version directory of `service.toml` before it runs that version's
 `pohunekd`. It refuses with `service_version_untrusted` when the directory or one
 of its binaries is not what `pohunek service install` publishes: missing, a link,
-writable by another account or of another owner or mode.
-`pohunek service uninstall` applies the same check before it starts a stopped
-daemon and treats a refusal as an unreachable daemon; while worker jobs are
-still live the uninstall then fails with the same code, because the sessions can
-be stopped only through the daemon.
+writable by another account or of another owner or mode, or lacking a binary. `pohunek service uninstall` applies the same check before it
+starts a stopped daemon and treats a refusal as an unreachable daemon; while
+worker jobs are still live the uninstall then fails with the same code naming the
+active version, because the sessions can be stopped only through the daemon.
 
-Make sure nothing runs from that directory. No single command repairs it:
-`pohunek service upgrade` to the same version only re-verifies the directory, and
-`pohunek service install` refuses an existing `service.toml`. The full recovery
-procedure, including live worker jobs that cannot be stopped without the daemon,
-is tracked in [#1763](https://github.com/zajca/pohunek/issues/1763).
+One command recovers it and keeps `service.toml` and the live sessions:
+`pohunek service upgrade --repair --from <unpacked release archive of the active
+version>`. `pohunek service status` names the active version. Run the `pohunek`
+of that release archive, so the version it reports is the one being restored.
+
+1. Make sure nothing runs from the refused directory. Check the
+   processes that execute from `<prefix>/libexec/pohunek/<version>/` and stop
+   what you started yourself; the command does not decide for you whether a
+   running process is trustworthy.
+2. Run the command above.
+   - A **missing** directory is published without `--repair`, because nothing is
+     destroyed; a **refused** one needs the flag, and without it the command
+     refuses with the same code and changes nothing.
+   - The refused entry (a directory, or a link itself, never followed) is renamed
+     to `.pohunek_refused-<version>-<random>` in the same versions directory.
+     Nothing from it is executed, probed or copied: the release archive is staged
+     and probed first, and the replacement is a no-replace move of that staged
+     copy.
+   - The daemon job is then started (stopped job), registered again from
+     `service.toml` (missing job), or restarted as a new process (running job).
+     A running daemon is judged by the adoption preflight first, with the
+     release, exactly as for an upgrade: sessions it would not adopt refuse the
+     run with `service_upgrade_sessions_at_risk` and nothing has changed, unless
+     you pass `--accept-runtime-loss`. Worker jobs are never stopped or retired
+     by the repair.
+   - If the command stops partway, rerun it with `--repair`: a rerun restarts the
+     daemon even when the directory is already trusted, which closes the window
+     in which a daemon from the old directory could keep running.
+3. If the release archive of that version is not available, upgrade to a release
+   you have: `pohunek service upgrade --from <release-dir>` runs a
+   normal upgrade of the active version to that release. `--repair` acts only on
+   the directory of the version being installed, and a refused directory of the
+   old version is never executed.
+4. To remove the installation instead, restore the directory with step 2 and then
+   run `pohunek service uninstall --stop-sessions`, which now reaches the daemon.
+
+The same flag covers the neighbouring cases. An interrupted upgrade whose
+previous version's directory is refused or missing is rolled back by running
+`pohunek service upgrade --repair --from <release-dir>` with the release archive
+of the previous version (the directory is published before the rollback, and its
+adoption gates run as usual). An interrupted upgrade whose target directory is
+refused resumes the same way with the release archive of the target version. An
+interrupted install is resumed with
+`pohunek service install --repair --from <release-dir> --prefix <prefix>`.
+
+A `refresh-path` that is stopped at `registering`, or rolling back from
+`registering` on (`service_rollback_failed`, or a rerun that reports `service_version_untrusted`), over a refused or missing active
+directory takes two steps, because `upgrade` and `install` refuse a pending
+refresh with `service_refresh_pending`: run
+`pohunek service upgrade --repair --from <release-dir>` with the release archive
+of the active version (add no flag when the directory is missing). It restores
+the directory before it refuses, restarts no daemon, runs no gate and changes
+neither `service.toml` nor the record, and the refusal states that the directory
+was restored. Then rerun `pohunek service refresh-path` to finish the refresh or its rollback.
+
+The trust claim of the repair is that of `pohunek service install` with `--from`: you
+chose the release, each binary answers `--version`, and a sealed release's
+`runtime/` files are present. It does not verify a digest of the binaries.
+Processes that already run, live workers and a daemon that was not restarted
+because the preflight refused, and the daemon of a resumed transaction that had already replaced it (`daemon: kept`), which still runs from the moved entry: once the record is cleared, rerun `pohunek service upgrade --repair --from <release of that version>` to restart it behind the adoption gate, are not attested: their image may come from the
+refused directory. Once the daemon is reachable again,
+`pohunek service uninstall --stop-sessions`, or `pohunek session stop <session>`
+for one session, is the answer to suspected tampering; the repair does not
+decide that for you.
+
+On macOS a directory the owner has no permissions on (mode 000, for example)
+cannot be renamed: run `chmod 700 <dir>` on that one directory yourself (it stays refused, so the
+repair still sets it aside), then repair.
+The `.pohunek_refused-*` entries stay in the versions directory. They are never
+swept or collected and are not versions; `pohunek service upgrade` and
+`pohunek service uninstall` list them. They are the only evidence of what ran, so
+inspect them if you suspect tampering, then delete them yourself (a tree with
+links or foreign-owned entries may need the owner's or root's help).

@@ -787,7 +787,7 @@ async fn install_service(
     applied: &mut Vec<String>,
     planner: &dyn ReleasePlanner,
 ) -> Result<(VerifiedVersionDir, String, EnsureReport), CliError> {
-    let installed = service::install_in(context, Some(from.to_path_buf()), None).await?;
+    let installed = service::install_in(context, Some(from.to_path_buf()), None, false).await?;
     applied.push(format!("service: installed version {}", installed.version));
     applied.extend(engine_changes(installed.runtimes.as_ref()));
     let version_dir = installed

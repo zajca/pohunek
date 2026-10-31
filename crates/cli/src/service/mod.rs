@@ -66,7 +66,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Installs this CLI's version from `from` below `prefix`.
 ///
 /// `from` defaults to the directory of the running `pohunek`, and `prefix`
-/// to `$HOME/.local`.
+/// to `$HOME/.local`. With `repair`, a refused directory of this version is
+/// moved aside and the release's copy is published in its place.
 ///
 /// # Errors
 ///
@@ -75,8 +76,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn install(
     from: Option<PathBuf>,
     prefix: Option<PathBuf>,
+    repair: bool,
 ) -> Result<report::InstallReport, Error> {
-    install_in(&Context::resolve()?, from, prefix).await
+    install_in(&Context::resolve()?, from, prefix, repair).await
 }
 
 /// Installs this CLI's version as [`install`] does, for the installation
@@ -89,6 +91,7 @@ pub async fn install_in(
     context: &Context,
     from: Option<PathBuf>,
     prefix: Option<PathBuf>,
+    repair: bool,
 ) -> Result<report::InstallReport, Error> {
     let inherited = inherited_lock(context)?;
     let from = staged_dir(context, from)?;
@@ -99,6 +102,7 @@ pub async fn install_in(
     let namespace = context.namespace()?;
     let backend = Backend::connect(context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
     engine(context, &backend, inherited)
+        .with_repair(repair)
         .install(&from, &prefix, VERSION)
         .await
 }
@@ -111,11 +115,15 @@ pub async fn install_in(
 /// [`Error::UpgradeAtRisk`] when live sessions would lose their runtime or
 /// native recovery and `accept_runtime_loss` is `false`,
 /// [`Error::UpgradeStoreUnusable`] when the new daemon cannot start with the
-/// metadata store, and the same errors as [`install`] otherwise.
+/// metadata store, and the same errors as [`install`] otherwise. With `repair`,
+/// a refused directory of this version is moved aside and the release's copy is
+/// published in its place, and the daemon of the active version is restarted
+/// from it.
 pub async fn upgrade(
     from: Option<PathBuf>,
     accept_runtime_loss: bool,
     preflight_budget: Duration,
+    repair: bool,
 ) -> Result<report::UpgradeReport, Error> {
     let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
@@ -123,6 +131,7 @@ pub async fn upgrade(
     let backend = connect_installed(&context).await?;
     engine(&context, &backend, inherited)
         .with_runtime_loss_accepted(accept_runtime_loss)
+        .with_repair(repair)
         .upgrade(&from, VERSION)
         .await
 }

@@ -32,3 +32,11 @@ async fn install_status_upgrade_refuse_and_uninstall_against_the_user_manager() 
         .join(namespace.sessions_slice())
         .exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"]
+async fn a_refused_active_directory_is_repaired_over_a_live_session_against_the_user_manager() {
+    let installation = Installation::new();
+
+    native::repair_lifecycle(&installation).await;
+}

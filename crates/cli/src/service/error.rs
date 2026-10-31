@@ -255,6 +255,44 @@ pub enum Error {
         detail: String,
     },
 
+    /// The active version directory cannot be trusted, so the daemon cannot be
+    /// started to stop the live worker jobs an uninstall found.
+    ///
+    /// Worker jobs end only through the daemon; recovering the directory is
+    /// the way out, and the uninstall is rerun afterwards. Carries the code of
+    /// [`Error::UntrustedVersion`].
+    #[error(
+        "the active version {version} cannot be trusted ({}: {detail}), so the daemon cannot start and the live worker jobs cannot be stopped through it",
+        path.display()
+    )]
+    UntrustedActiveVersion {
+        /// The active version.
+        version: String,
+        /// The offending version directory or binary.
+        path: PathBuf,
+        /// What exactly was wrong with it.
+        detail: String,
+    },
+
+    /// The version directory a pending search-path refresh restarts the daemon
+    /// from, forward or in its rollback, cannot be trusted.
+    ///
+    /// Carries the code of [`Error::UntrustedVersion`]. `upgrade` and
+    /// `install` refuse the pending refresh, so the way out is the two-step
+    /// sequence the hint names.
+    #[error(
+        "the daemon of the pending search-path refresh runs version {version}, which cannot be trusted ({}: {detail}), so the refresh can neither finish nor be rolled back",
+        path.display()
+    )]
+    UntrustedRefreshVersion {
+        /// The version the refresh restarts.
+        version: String,
+        /// The offending version directory or binary.
+        path: PathBuf,
+        /// What exactly was wrong with it.
+        detail: String,
+    },
+
     /// The prefix belongs to another installation namespace.
     ///
     /// Version directories and `<prefix>/bin/pohunek` are shared by every
@@ -736,12 +774,24 @@ pub enum Error {
     RefreshConfigChanged,
 
     /// A search-path refresh is pending and blocks this command.
-    #[error("a search-path refresh is pending at step {step}{}", if *rolling_back { " (rolling back)" } else { "" })]
+    #[error(
+        "a search-path refresh is pending at step {step}{}{}",
+        if *rolling_back { " (rolling back)" } else { "" },
+        match restored {
+            Some(true) => "; the version directory its daemon runs from was restored",
+            Some(false) => "; its version directory is trusted, nothing was changed",
+            None => "",
+        }
+    )]
     RefreshPending {
         /// The step the refresh reached.
         step: &'static str,
         /// Whether its rollback has begun.
         rolling_back: bool,
+        /// What `upgrade` did to the version directory the rollback restarts
+        /// the daemon from: `Some(true)` restored it, `Some(false)` found it
+        /// trusted. `None` when no version directory was examined.
+        restored: Option<bool>,
     },
 
     /// Another `pohunek service` command holds the transaction lock.
@@ -879,6 +929,18 @@ fn job_missing_effects_text(effects: Option<&JobMissingEffects>) -> String {
 /// step; the recovery design for the pending-record cases is #1763.
 const DAEMON_JOB_MISSING_HINT: &str = "`pohunek service uninstall` (it removes the installation, its daemon job and service.toml, and keeps durable metadata) is the documented way out of a missing daemon job, see https://github.com/zajca/pohunek/issues/1763";
 
+/// The way out of a refused or missing version directory, for the commands
+/// that take a release with `--from`.
+pub(crate) const UNTRUSTED_VERSION_HINT: &str = "make sure nothing runs from that version directory, then run `pohunek service upgrade --repair --from <unpacked release archive of the version the path names>` (`pohunek service install --repair` while an install is interrupted): it moves the directory aside, publishes the release's copy, and keeps service.toml and the live sessions";
+
+/// The way out of a pending search-path refresh whose daemon replacement or
+/// rollback needs a version directory that cannot be trusted.
+const UNTRUSTED_REFRESH_VERSION_HINT: &str = "`pohunek service upgrade` and `install` refuse a pending refresh, so restore the directory in two steps: run `pohunek service upgrade --repair --from <unpacked release archive of the version the path names>` (it restores that directory, changes no daemon and no setting, and ends with `service_refresh_pending`), then rerun `pohunek service refresh-path` to finish the refresh or its rollback";
+
+/// The way out of an uninstall refused because the active version directory
+/// cannot be trusted while worker jobs are live.
+const UNTRUSTED_ACTIVE_VERSION_HINT: &str = "live worker jobs can be stopped only through the daemon, and the active version's daemon is refused: restore its directory with `pohunek service upgrade --repair --from <unpacked release archive of that version>`, then rerun `pohunek service uninstall --stop-sessions`";
+
 impl Error {
     /// Fills the effects of every missing-job refusal inside `self`.
     pub(crate) fn with_job_missing_effects(self, effects: JobMissingEffects) -> Self {
@@ -891,6 +953,18 @@ impl Error {
                 rollback: Box::new(rollback.with_job_missing_effects(effects)),
             },
             other => other,
+        }
+    }
+
+    /// Whether `self` is, or its rollback failure wraps, a refused version
+    /// directory.
+    fn is_refused_directory(&self) -> bool {
+        match self {
+            Self::UntrustedVersion { .. }
+            | Self::UntrustedActiveVersion { .. }
+            | Self::UntrustedRefreshVersion { .. } => true,
+            Self::RollbackFailed { rollback, .. } => rollback.is_refused_directory(),
+            _ => false,
         }
     }
 
@@ -954,7 +1028,9 @@ impl Error {
             Self::VersionProbe { .. } => "service_version_probe_failed",
             Self::VersionMismatch { .. } => "service_version_mismatch",
             Self::VersionConflict { .. } => "service_version_conflict",
-            Self::UntrustedVersion { .. } => "service_version_untrusted",
+            Self::UntrustedVersion { .. }
+            | Self::UntrustedActiveVersion { .. }
+            | Self::UntrustedRefreshVersion { .. } => "service_version_untrusted",
             Self::PrefixOwned { .. } => "service_prefix_owned",
             Self::AlreadyInstalled { .. } => "service_already_installed",
             Self::NotInstalled { .. } => "service_not_installed",
@@ -1030,9 +1106,9 @@ impl Error {
             Self::InstallIncomplete { .. } => Some(
                 "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it, or run `pohunek service uninstall`, which checks for live sessions before removing it",
             ),
-            Self::UntrustedVersion { .. } => Some(
-                "make sure nothing runs from that version directory, remove it, and rerun the command to install it again",
-            ),
+            Self::UntrustedVersion { .. } => Some(UNTRUSTED_VERSION_HINT),
+            Self::UntrustedActiveVersion { .. } => Some(UNTRUSTED_ACTIVE_VERSION_HINT),
+            Self::UntrustedRefreshVersion { .. } => Some(UNTRUSTED_REFRESH_VERSION_HINT),
             Self::PrefixOwned { .. } => Some(
                 "pass another --prefix, or uninstall the installation of that namespace first; if it no longer exists, delete the named ownership record",
             ),
@@ -1148,6 +1224,9 @@ impl Error {
                 if matches!(**rollback, Self::DaemonJobMissing { .. }) =>
             {
                 Some(DAEMON_JOB_MISSING_HINT)
+            }
+            Self::RollbackFailed { rollback, .. } if rollback.is_refused_directory() => {
+                rollback.hint()
             }
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")

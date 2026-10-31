@@ -213,7 +213,7 @@ use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
     StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
-use super::report::{AcceptanceGroups, IntegrationReinstall};
+use super::report::{IntegrationReinstall, RepairReport};
 use super::rollback;
 use super::runtimes::{self, CliIntegrations, DaemonRuntimes, IntegrationStep, RuntimeStep};
 use super::settings;
@@ -267,6 +267,27 @@ struct LateGate {
     warnings: Vec<String>,
 }
 
+/// What restoring a version directory did.
+#[derive(Debug, Default)]
+struct Restore {
+    /// Whether the release's copy was published.
+    restored: bool,
+    /// Where the refused entry was moved.
+    set_aside: Option<PathBuf>,
+}
+
+/// The inputs of an upgrade to the version that is already active.
+struct ActiveUpgrade<'a> {
+    release: &'a VerifiedVersionDir,
+    config: &'a ServiceConfig,
+    layout: &'a InstallLayout,
+    state: layout::VersionState,
+    rollback_restore: Restore,
+    rollback_restarted_daemon: bool,
+    from_version: String,
+    rolled_back: Option<PendingReport>,
+}
+
 /// A test action run just before the adoption preflight of the daemon swap.
 #[cfg(test)]
 struct SwapHook(Box<dyn Fn() + Send + Sync>);
@@ -313,6 +334,9 @@ pub struct Engine<'a> {
     /// Whether the operator accepted losing the runtime or native recovery of
     /// the sessions the preflight lists (`--accept-runtime-loss`).
     accept_runtime_loss: bool,
+    /// Whether the operator asked to replace a refused version directory of the
+    /// release being installed (`--repair`).
+    repair: bool,
     /// Verifies the rendered units before they are registered.
     #[cfg(target_os = "linux")]
     unit_verifier: UnitVerifier,
@@ -344,6 +368,7 @@ impl<'a> Engine<'a> {
             runtimes: Box::new(DaemonRuntimes::default()),
             integrations: Box::new(CliIntegrations),
             accept_runtime_loss: false,
+            repair: false,
             #[cfg(target_os = "linux")]
             unit_verifier: UnitVerifier::default(),
             #[cfg(test)]
@@ -374,6 +399,16 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn with_runtime_loss_accepted(mut self, accepted: bool) -> Self {
         self.accept_runtime_loss = accepted;
+        self
+    }
+
+    /// Lets install and upgrade move a refused version directory of the
+    /// release they install aside and publish the release's copy
+    /// (`--repair`), and makes an upgrade of the active version restart a
+    /// running daemon.
+    #[must_use]
+    pub fn with_repair(mut self, repair: bool) -> Self {
+        self.repair = repair;
         self
     }
 
@@ -501,6 +536,10 @@ impl<'a> Engine<'a> {
     /// run its daemon, staging and probe errors, the failing step's error after
     /// a rollback, and [`Error::InstallIncomplete`] when a step at or after
     /// `registering` fails, keeping the record for a resume or an uninstall.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the install reads in transaction order; splitting it would separate the rollback decisions from the steps they depend on"
+    )]
     pub async fn install(
         &self,
         from: &Path,
@@ -556,8 +595,18 @@ impl<'a> Engine<'a> {
         let namespace = config.namespace();
         let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();
+        let daemon_replaced = resume
+            .as_ref()
+            .is_some_and(|record| record.step >= Step::Registered);
+        // Only `--repair` sets a refused directory of this version aside, and the
+        // claim above is verified before anything moves. A resume looks at the
+        // directory even without the flag, so its refusal names the flag instead
+        // of surfacing as an incomplete install.
+        let state = self.install_version_state(&layout, version, resumed);
         let started = async {
+            let state = state?;
             let staged = layout::stage(&layout, &source, self.reported(version)).await?;
+            let set_aside = Self::set_aside(&layout, &staged, version, &state)?;
             let record = if let Some(record) = resume {
                 record
             } else {
@@ -581,10 +630,10 @@ impl<'a> Engine<'a> {
                 self.store.save(&record)?;
                 record
             };
-            Ok::<_, Error>((staged, record))
+            Ok::<_, Error>((staged, record, set_aside))
         }
         .await;
-        let (staged, mut record) = match started {
+        let (staged, mut record, set_aside) = match started {
             Ok(started) => started,
             // Without a record no rollback runs, so a claim this call made
             // is given up here instead.
@@ -614,7 +663,28 @@ impl<'a> Engine<'a> {
             rolled_back,
             search_path: search_path_report,
             runtimes: late.runtimes,
+            repair: self.repair_report(
+                version,
+                set_aside.clone(),
+                set_aside.is_some(),
+                resumed_daemon(daemon_replaced, set_aside.is_some()),
+            ),
         })
+    }
+
+    /// The state of the directory an install looks at before it stages: only a
+    /// resume or `--repair` reads it, and any other install reads nothing.
+    fn install_version_state(
+        &self,
+        layout: &InstallLayout,
+        version: &str,
+        resumed: bool,
+    ) -> Result<layout::VersionState, Error> {
+        if self.repair || resumed {
+            self.checked_version_state(layout, version)
+        } else {
+            Ok(layout::VersionState::Trusted)
+        }
     }
 
     /// Fails when `service.toml` or a daemon job of this namespace exists.
@@ -670,9 +740,31 @@ impl<'a> Engine<'a> {
         let _transaction = self.transaction().await?;
         upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
-        let plan = upgrade_plan(self.store.load()?, version)?;
+        let pending = self.store.load()?;
+        if let Some(record) = &pending {
+            self.restore_for_pending_refresh(record, from, version)
+                .await?;
+        }
+        let plan = upgrade_plan(pending, version)?;
         let release = self.upgrade_source(&plan, from)?;
         let (gated, job_path) = self.adoption_gate(&plan, &release, version).await?;
+        // The rollback restarts the previous daemon from its version
+        // directory, so a missing or refused one is restored before it runs.
+        let rollback_restore = match &plan {
+            Plan::RollBack(record)
+                if record.operation == Operation::Upgrade
+                    && record.previous_version.as_deref() == Some(version) =>
+            {
+                self.restore_rollback_target(record, &release, version)
+                    .await?
+            }
+            _ => Restore::default(),
+        };
+        let rollback_restarted_daemon = matches!(
+            &plan,
+            Plan::RollBack(record)
+                if record.operation == Operation::Upgrade && rollback_restarts_previous(record)
+        );
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
         // schema-2 to schema-6 installation upgrades into this one
@@ -692,38 +784,31 @@ impl<'a> Engine<'a> {
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
-        let staged = layout::stage(&layout, &release, self.reported(version)).await?;
+        let state = self.checked_version_state(&layout, version)?;
         let resumed = resume.is_some();
+        let daemon_replaced = resume
+            .as_ref()
+            .is_some_and(|record| record.step >= Step::Registered);
         let from_version = resume
             .as_ref()
             .and_then(|record| record.previous_version.clone())
             .unwrap_or_else(|| config.active_version().to_owned());
         if resume.is_none() && config.active_version() == version {
-            let (removed_versions, kept_versions, gc_error) = self
-                .refresh_active_version(staged, &layout, version)
-                .await?;
-            return Ok(UpgradeReport {
-                warnings: unknown_keys_warning(config).into_iter().collect(),
-                from_version,
-                to_version: version.to_owned(),
-                unchanged: true,
-                resumed: false,
-                removed_versions,
-                kept_versions,
-                gc_error,
-                preflight: rolled_back
-                    .as_ref()
-                    .and_then(|report| report.preflight.clone()),
-                accepted_runtime_loss: rolled_back
-                    .as_ref()
-                    .is_some_and(|report| report.accepted_runtime_loss),
-                acceptance: AcceptanceGroups::default(),
-                rolled_back,
-                config_schema_migration: None,
-                runtimes: None,
-                integrations: Vec::new(),
-            });
+            return self
+                .upgrade_active_version(ActiveUpgrade {
+                    release: &release,
+                    config,
+                    layout: &layout,
+                    state,
+                    rollback_restore,
+                    rollback_restarted_daemon,
+                    from_version,
+                    rolled_back,
+                })
+                .await;
         }
+        let staged = layout::stage(&layout, &release, self.reported(version)).await?;
+        let set_aside = Self::set_aside(&layout, &staged, version, &state)?;
         // A previous-schema source makes this a migration transaction: the record
         // journals the exact backup from the start, before any effect.
         let mut record = if let Some(record) = &resume {
@@ -813,6 +898,13 @@ impl<'a> Engine<'a> {
                 .map(|backup| backup.source_schema_version),
             runtimes: late.runtimes.or(post),
             integrations,
+            repair: self.repair_report(
+                version,
+                set_aside.clone().or(rollback_restore.set_aside),
+                rollback_restore.restored || set_aside.is_some(),
+                resumed_daemon(daemon_replaced, set_aside.is_some()),
+            ),
+            refused_entries: layout::refused_entries(&layout)?,
         })
     }
 
@@ -979,8 +1071,16 @@ impl<'a> Engine<'a> {
         };
         let (live, workers) = self.blocking(&sessions).await?;
         if !live.is_empty() || !workers.is_empty() {
-            // Live runtimes can be stopped only through the daemon.
-            reachable?;
+            // Live runtimes can be stopped only through the daemon, which an
+            // untrusted active version directory keeps from starting.
+            reachable.map_err(|error| match error {
+                Error::UntrustedVersion { path, detail } => Error::UntrustedActiveVersion {
+                    version: config.active_version().to_owned(),
+                    path,
+                    detail,
+                },
+                other => other,
+            })?;
             if !options.stop_sessions {
                 return Err(Error::LiveSessions {
                     sessions: live,
@@ -1153,12 +1253,11 @@ impl<'a> Engine<'a> {
         late: &mut LateGate,
     ) -> Result<(), Error> {
         let version = record.version.clone();
+        // A directory a repair set aside is republished on a resume past
+        // `binaries`; an identical one is reused and a different one refused.
+        layout::publish(layout, &staged, &version)?;
         if record.step < Step::Binaries {
-            layout::publish(layout, &staged, &version)?;
             self.advance(record, Step::Binaries)?;
-        } else {
-            layout::verify_existing(layout, &staged, &version)?;
-            layout::discard(layout, &staged)?;
         }
         self.checkpoint(Step::Binaries)?;
 
@@ -2566,6 +2665,7 @@ impl<'a> Engine<'a> {
         if !namespace_bound && layout::release_prefix(layout, namespace)? {
             report.removed.push(layout::owner_record(layout));
         }
+        report.refused_entries = layout::refused_entries(layout)?;
         Ok(())
     }
 
@@ -2628,26 +2728,316 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Re-installs the CLI of an already active version and collects its
-    /// garbage, for an upgrade that restarts nothing.
+    /// Reads the state of `version`'s directory, refusing a refused one unless
+    /// the operator asked for `--repair`.
     ///
-    /// The staged binaries are only proven to match the existing version
-    /// directory; they were meant for this same version and replace nothing.
+    /// The prefix claim is verified by the callers before any effect on the
+    /// directory.
     ///
     /// # Errors
     ///
-    /// Returns the staging-trust and CLI-install errors before any garbage
-    /// is collected.
-    async fn refresh_active_version(
+    /// Returns [`Error::UntrustedVersion`] for a refused directory without
+    /// `--repair` and the errors of [`layout::version_state`].
+    fn checked_version_state(
         &self,
-        staged: layout::Staged,
         layout: &InstallLayout,
         version: &str,
-    ) -> Result<(Vec<String>, Vec<KeptVersion>, Option<String>), Error> {
-        layout::verify_existing(layout, &staged, version)?;
-        layout::discard(layout, &staged)?;
+    ) -> Result<layout::VersionState, Error> {
+        match layout::version_state(layout, version)? {
+            layout::VersionState::Refused(error) if !self.repair => Err(error),
+            state => Ok(state),
+        }
+    }
+
+    /// Moves the refused entry of `version` aside once `staged` proved the
+    /// release's copy, and returns where it went.
+    ///
+    /// A directory that is missing or trusted is left alone. The staged copy is
+    /// discarded when the move fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem errors of [`layout::set_aside_refused`].
+    fn set_aside(
+        layout: &InstallLayout,
+        staged: &Staged,
+        version: &str,
+        state: &layout::VersionState,
+    ) -> Result<Option<PathBuf>, Error> {
+        if !matches!(state, layout::VersionState::Refused(_)) {
+            return Ok(None);
+        }
+        layout::set_aside_refused(layout, version).inspect_err(|_| {
+            // Scratch only: the next stage sweeps it if removal fails too.
+            let _cleanup = layout::discard(layout, staged);
+        })
+    }
+
+    /// The repair block of a report, present when `--repair` was given or a
+    /// repair effect took place.
+    fn repair_report(
+        &self,
+        version: &str,
+        set_aside: Option<PathBuf>,
+        restored: bool,
+        daemon: &'static str,
+    ) -> Option<RepairReport> {
+        (self.repair || restored || set_aside.is_some() || daemon != "none").then(|| RepairReport {
+            version: version.to_owned(),
+            restored,
+            set_aside,
+            daemon,
+        })
+    }
+
+    /// Publishes the release as `version` before a rollback to `version`
+    /// restarts its daemon, when the directory is missing or refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns the layout, claim and staging errors, and
+    /// [`Error::UntrustedVersion`] for a refused directory without `--repair`.
+    async fn restore_rollback_target(
+        &self,
+        record: &Record,
+        release: &VerifiedVersionDir,
+        version: &str,
+    ) -> Result<Restore, Error> {
+        let layout = install_layout(&record.prefix)?;
+        check_layout_dirs(self.context, &layout)?;
+        layout::claim_prefix(&layout, &self.context.namespace()?)?;
+        let state = self.checked_version_state(&layout, version)?;
+        if matches!(state, layout::VersionState::Trusted) {
+            return Ok(Restore::default());
+        }
+        let staged = layout::stage(&layout, release, self.reported(version)).await?;
+        let set_aside = Self::set_aside(&layout, &staged, version, &state)?;
+        layout::publish(&layout, &staged, version)?;
+        Ok(Restore {
+            restored: true,
+            set_aside,
+        })
+    }
+
+    /// Restores the version directory a pending search-path refresh runs its
+    /// daemon from, before `upgrade` refuses the pending refresh.
+    ///
+    /// Only a refresh that reached `registering` replaces the daemon, forward
+    /// or in its rollback, and only `version` equal to the refresh's own
+    /// version names that directory; any other command is left to the plan's
+    /// refusal. Nothing restarts, so no gate runs, and neither `service.toml`
+    /// nor the record changes. A missing directory is published without a
+    /// flag, a refused one is set aside only with `--repair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RefreshPending`] saying whether the directory was
+    /// restored, and the release, claim, staging and publishing errors.
+    async fn restore_for_pending_refresh(
+        &self,
+        record: &Record,
+        from: &Path,
+        version: &str,
+    ) -> Result<(), Error> {
+        if record.operation != Operation::RefreshPath
+            || !rollback_restarts_previous(record)
+            || record.version != version
+        {
+            return Ok(());
+        }
+        let layout = install_layout(&record.prefix)?;
+        let release = layout::operator_release(&layout, from)?;
+        let restore = self
+            .restore_rollback_target(record, &release, version)
+            .await?;
+        Err(Error::RefreshPending {
+            step: record.step.as_str(),
+            rolling_back: record.rolling_back,
+            restored: Some(restore.restored),
+        })
+    }
+
+    /// Upgrades to the version that is already active: restores its directory
+    /// when it is missing or refused, makes the daemon job run from it, and
+    /// collects garbage.
+    ///
+    /// The adoption gate runs before any effect when a running daemon is going
+    /// to be replaced. A trusted directory without `--repair` restarts nothing,
+    /// except that a missing daemon job is registered again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate's refusals, the staging, publishing and CLI-install
+    /// errors, and the service-manager and readiness errors of the daemon step.
+    async fn upgrade_active_version(&self, run: ActiveUpgrade<'_>) -> Result<UpgradeReport, Error> {
+        let ActiveUpgrade {
+            release,
+            config,
+            layout,
+            state,
+            rollback_restore,
+            rollback_restarted_daemon,
+            from_version,
+            rolled_back,
+        } = run;
+        let version = config.active_version();
+        let needs_restore = !matches!(state, layout::VersionState::Trusted);
+        // A rollback that restarted the previous daemon already runs it from
+        // the restored directory.
+        let restarts = (needs_restore || self.repair) && !rollback_restarted_daemon;
+        let running = restarts
+            && matches!(self.backend.daemon().inspect().await,
+                Ok(observation) if observation.state == ServiceState::Running);
+        let mut gated = if running {
+            Some(self.repair_gate(release, config).await?)
+        } else {
+            None
+        };
+        let mut set_aside = rollback_restore.set_aside;
+        let staged = layout::stage(layout, release, self.reported(version)).await?;
+        if needs_restore {
+            set_aside = Self::set_aside(layout, &staged, version, &state)?.or(set_aside);
+            layout::publish(layout, &staged, version)?;
+        } else {
+            layout::verify_existing(layout, &staged, version)?;
+            layout::discard(layout, &staged)?;
+        }
+        let published = needs_restore || rollback_restore.restored;
+        let (daemon, late_gate) = self
+            .repair_daemon_job(release, config, restarts, gated.is_some())
+            .await?;
+        gated = late_gate.or(gated);
         layout::install_cli(layout, version)?;
-        Ok(self.collect_garbage_reported(layout, version).await)
+        let (removed_versions, kept_versions, gc_error) =
+            self.collect_garbage_reported(layout, version).await;
+        let mut warnings: Vec<String> = unknown_keys_warning(config).into_iter().collect();
+        if let Some(gated) = &gated {
+            warnings.extend(gated.warnings.iter().cloned());
+        }
+        Ok(UpgradeReport {
+            warnings,
+            from_version,
+            to_version: version.to_owned(),
+            unchanged: true,
+            resumed: false,
+            removed_versions,
+            kept_versions,
+            gc_error,
+            accepted_runtime_loss: gated.as_ref().is_some_and(|gated| gated.accepted)
+                || rolled_back
+                    .as_ref()
+                    .is_some_and(|report| report.accepted_runtime_loss),
+            acceptance: gated
+                .as_ref()
+                .map(|gated| gated.acceptance.clone())
+                .unwrap_or_default(),
+            preflight: gated.map(|Gated { report, .. }| report).or_else(|| {
+                rolled_back
+                    .as_ref()
+                    .and_then(|report| report.preflight.clone())
+            }),
+            rolled_back,
+            config_schema_migration: None,
+            runtimes: None,
+            integrations: Vec::new(),
+            repair: self.repair_report(version, set_aside, published, daemon),
+            refused_entries: layout::refused_entries(layout)?,
+        })
+    }
+
+    /// Judges the live sessions against the daemon that is about to restart
+    /// from the restored directory, as the early gate of an upgrade does.
+    ///
+    /// The release is judged, never the installed tree, and no runtime plan is
+    /// carried. Nothing is recorded in the accepted-risk ledger.
+    async fn repair_gate(
+        &self,
+        release: &VerifiedVersionDir,
+        config: &ServiceConfig,
+    ) -> Result<Gated, Error> {
+        let job = job_path(self.context, config, None).await?;
+        let warnings = job_warnings(self.context, &job);
+        let acceptance = self.acceptance(config.active_version())?;
+        let mut gated = preflight::gate_upgrade_over(
+            &*self.preflight,
+            self.context,
+            release,
+            self.reported(config.active_version()),
+            &job.value,
+            &job.variables,
+            preflight::ReleasePlan::Omitted,
+            self.accept_runtime_loss,
+            &acceptance,
+            judged_path(None),
+        )
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
+        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)?;
+        gated.warnings = warnings;
+        Ok(gated)
+    }
+
+    /// Makes the daemon job run the active version's restored directory.
+    ///
+    /// A missing job is installed, which needs no gate: starting the active
+    /// version over its own workers is the normal state. A registered job is
+    /// replaced only when `restarts` holds; a stopped one starts, and a running
+    /// one is gated (unless `gated` says the caller already did) and must come
+    /// back as a new process. Returns what happened and the gate this call ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate's refusals, the service-manager errors, and
+    /// [`Error::DaemonNotReady`].
+    async fn repair_daemon_job(
+        &self,
+        release: &VerifiedVersionDir,
+        config: &ServiceConfig,
+        restarts: bool,
+        gated: bool,
+    ) -> Result<(&'static str, Option<Gated>), Error> {
+        let version = config.active_version();
+        let daemon = self.backend.daemon();
+        let definition = daemon_definition(self.context, config)?;
+        let observation = match daemon.inspect().await {
+            Ok(observation) => observation,
+            Err(supervisor::Error::NotFound(_)) => {
+                self.prepare_definition(config, &definition).await?;
+                daemon
+                    .install(&definition)
+                    .await
+                    .map_err(|source| supervisor_error("install daemon", source))?;
+                self.wait_ready(version).await?;
+                return Ok(("installed", None));
+            }
+            Err(source) => return Err(supervisor_error("inspect daemon", source)),
+        };
+        if !restarts {
+            return Ok(("none", None));
+        }
+        if observation.state != ServiceState::Running {
+            daemon
+                .replace(&definition)
+                .await
+                .map_err(|source| supervisor_error("start daemon", source))?;
+            self.wait_ready(version).await?;
+            return Ok(("started", None));
+        }
+        // A daemon that came up since the early look is judged before it is
+        // replaced.
+        let late = if gated {
+            None
+        } else {
+            Some(self.repair_gate(release, config).await?)
+        };
+        // The definition is unchanged, so only a new main process proves the
+        // restart; the process read here is the one being replaced.
+        daemon
+            .replace(&definition)
+            .await
+            .map_err(|source| supervisor_error("replace daemon", source))?;
+        self.wait_restarted(version, observation.process).await?;
+        Ok(("restarted", late))
     }
 
     /// Runs [`Self::collect_garbage`] for an upgrade report.
@@ -3131,6 +3521,21 @@ pub(crate) async fn ensure_no_daemon_job(backend: &Backend) -> Result<(), Error>
     }
 }
 
+/// What a resumed transaction's repair reports for the daemon job.
+///
+/// A resume past the daemon replacement runs only its remaining steps, so the
+/// daemon keeps running from the directory it started in, which is the moved
+/// entry when the repair set it aside (`kept`). Otherwise the daemon is
+/// replaced by the transaction's own steps, or already runs from the directory
+/// it started in (`none`).
+fn resumed_daemon(daemon_replaced: bool, set_aside: bool) -> &'static str {
+    if daemon_replaced && set_aside {
+        "kept"
+    } else {
+        "none"
+    }
+}
+
 /// Decides what an install of `version` into `prefix` does with `pending`.
 ///
 /// # Errors
@@ -3210,6 +3615,7 @@ fn refresh_plan(record: Record) -> Result<Plan, Error> {
         Err(Error::RefreshPending {
             step: record.step.as_str(),
             rolling_back: record.rolling_back,
+            restored: None,
         })
     } else {
         Ok(Plan::RollBack(record))

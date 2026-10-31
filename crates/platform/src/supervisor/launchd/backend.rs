@@ -948,8 +948,15 @@ impl Expected {
         }
     }
 
+    /// Whether `path` is the job's executable, or that file in the version
+    /// directory a repair moved aside ([`pohunek_paths::is_set_aside_copy`]).
     fn matches_executable(&self, path: &Path) -> bool {
-        path == self.executable || self.canonical.as_deref() == Some(path)
+        path == self.executable
+            || self.canonical.as_deref() == Some(path)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|canonical| pohunek_paths::is_set_aside_copy(canonical, path))
     }
 }
 
@@ -1507,6 +1514,21 @@ mod tests {
         assert!(expected.matches_executable(Path::new("/opt/pohunek/bin/pohunek-sessiond")));
         assert!(expected.matches_executable(Path::new("/private/opt/pohunek/bin/pohunek-sessiond")));
         assert!(!expected.matches_executable(Path::new("/bin/sh")));
+        // The version directory a repair moved aside is still the job's image.
+        let (versions, aside) = (
+            "/private/opt/pohunek/libexec/pohunek",
+            ".pohunek_refused-1.0.0-0123456789abcdef",
+        );
+        let expected = Expected {
+            canonical: Some(PathBuf::from(format!("{versions}/1.0.0/pohunek-sessiond"))),
+            ..expected
+        };
+        assert!(
+            expected.matches_executable(Path::new(&format!("{versions}/{aside}/pohunek-sessiond")))
+        );
+        assert!(!expected.matches_executable(Path::new(&format!(
+            "{versions}/.pohunek_refused-2.0.0-0123456789abcdef/pohunek-sessiond"
+        ))));
     }
 
     #[test]

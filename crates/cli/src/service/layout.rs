@@ -28,6 +28,7 @@
 // Rust guideline compliant 2026-10-08
 
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -101,6 +102,23 @@ const STAGING_PREFIX: &str = ".pohunek-staging-";
 
 /// Name prefix of entries staged for removal.
 const REMOVAL_PREFIX: &str = ".pohunek-removed-";
+
+/// Name prefix of version directories a repair moved aside.
+///
+/// `_` is not allowed in a version, so the name never parses as one: every
+/// release lists, collects and refuses it as a non-version, and neither
+/// [`sweep`] nor [`is_scratch`] matches it. The entry is the only evidence of
+/// what ran from the refused directory, so only the operator deletes it.
+pub const REFUSED_PREFIX: &str = pohunek_paths::SET_ASIDE_VERSION_PREFIX;
+
+/// How many random names [`set_aside_refused`] draws before it gives up.
+///
+/// A collision needs the same 64 random bits twice in one versions directory,
+/// so more than one retry only guards a broken random source.
+const ASIDE_ATTEMPTS: usize = 4;
+
+/// Random bytes in the name of a set-aside entry.
+const ASIDE_RANDOM_BYTES: usize = pohunek_paths::SET_ASIDE_SUFFIX_CHARS / 2;
 
 /// Name of the prefix ownership record inside the versions directory.
 ///
@@ -456,6 +474,135 @@ pub fn discard(layout: &InstallLayout, staged: &Staged) -> Result<(), Error> {
     remove_tree(&versions, &staged.name).map(drop)
 }
 
+/// What the versions directory holds under one version name.
+#[derive(Debug)]
+pub enum VersionState {
+    /// No entry of that name exists.
+    Missing,
+    /// The entry is exactly what publishing creates.
+    Trusted,
+    /// An entry exists and [`verify_installed`] refused it; the refusal is
+    /// the error it returned.
+    Refused(Error),
+}
+
+/// Classifies the entry of `version` in the versions directory without
+/// following links and without executing or copying anything from it.
+///
+/// A missing entry is told from a refused one by listing the trusted versions
+/// directory, so a present directory that lacks a binary is `Refused`.
+///
+/// # Errors
+///
+/// Returns the errors of [`open_existing_owner_dir`] for an untrusted versions
+/// directory or ancestor, a filesystem error, and [`Error::UntrustedVersion`]
+/// for a name that is not a version.
+pub fn version_state(layout: &InstallLayout, version: &str) -> Result<VersionState, Error> {
+    let dir = layout
+        .version_dir(version)
+        .ok_or_else(|| Error::UntrustedVersion {
+            path: layout.versions_dir().join(version),
+            detail: "it is not a version directory".to_owned(),
+        })?;
+    let Some(versions) = open_existing_owner_dir(&layout.versions_dir())? else {
+        return Ok(VersionState::Missing);
+    };
+    let listed = versions
+        .entry_names()
+        .map_err(|source| fs_error("list version directories", source))?
+        .iter()
+        .any(|name| name == OsStr::new(version));
+    if !listed {
+        return Ok(VersionState::Missing);
+    }
+    match verify_installed(layout, &dir) {
+        Ok(_verified) => Ok(VersionState::Trusted),
+        Err(error @ Error::UntrustedVersion { .. }) => Ok(VersionState::Refused(error)),
+        // A directory the owner cannot open is refused too; renaming it aside
+        // needs only the parent.
+        Err(error @ Error::Filesystem { .. }) if is_access_denied(&error) => {
+            Ok(VersionState::Refused(error))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Whether `error` is the operating system refusing access to an entry.
+fn is_access_denied(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Filesystem { source, .. }
+            if matches!(source.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+    )
+}
+
+/// Renames the entry of `version` aside as `.pohunek_refused-<version>-<random>`.
+///
+/// The rename is a descriptor-relative no-replace move, so a link, a foreign
+/// directory or any other entry type moves as itself and nothing it points to
+/// is followed. Returns the new path, or `None` when no entry of that name
+/// exists.
+///
+/// # Errors
+///
+/// Returns a filesystem error when the versions directory is unsafe or the
+/// move fails.
+pub fn set_aside_refused(layout: &InstallLayout, version: &str) -> Result<Option<PathBuf>, Error> {
+    const OPERATION: &str = "set aside version directory";
+
+    let versions = open_owner_dir(&layout.versions_dir(), PUBLIC_MODE)?;
+    for _ in 0..ASIDE_ATTEMPTS {
+        let mut random = [0_u8; ASIDE_RANDOM_BYTES];
+        getrandom::getrandom(&mut random).map_err(|source| Error::Io {
+            operation: "generate a name for a set-aside version directory",
+            path: versions.path().join(version),
+            source: io::Error::other(source.to_string()),
+        })?;
+        let mut suffix = String::with_capacity(ASIDE_RANDOM_BYTES * 2);
+        for byte in random {
+            write!(suffix, "{byte:02x}").expect("writing hexadecimal to a String cannot fail");
+        }
+        let name = format!("{REFUSED_PREFIX}{version}-{suffix}");
+        match versions.move_no_replace(version, &versions, &name) {
+            Ok(MoveOutcome::Moved) => return Ok(Some(versions.path().join(name))),
+            Ok(_exists) => {}
+            Err(source) if source.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(source) => return Err(fs_error(OPERATION, source)),
+        }
+    }
+    Err(Error::Io {
+        operation: OPERATION,
+        path: versions.path().join(version),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "every generated name for the set-aside entry was taken",
+        ),
+    })
+}
+
+/// Lists the entries earlier repairs moved aside, in name order.
+///
+/// # Errors
+///
+/// Returns a filesystem error when the versions directory is unsafe.
+pub fn refused_entries(layout: &InstallLayout) -> Result<Vec<PathBuf>, Error> {
+    let Some(versions) = open_existing_owner_dir(&layout.versions_dir())? else {
+        return Ok(Vec::new());
+    };
+    let mut found: Vec<PathBuf> = versions
+        .entry_names()
+        .map_err(|source| fs_error("list version directories", source))?
+        .into_iter()
+        .filter(|name| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with(REFUSED_PREFIX))
+        })
+        .map(|name| versions.path().join(name))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
 /// Returns whether `version` has a version directory.
 ///
 /// # Errors
@@ -522,6 +669,16 @@ pub fn version_of(layout: &InstallLayout, path: &Path) -> Option<String> {
         .to_str()
         .and_then(valid_install_version)
         .map(str::to_owned)
+}
+
+/// Whether `path` lies inside an entry a repair set aside.
+#[must_use]
+pub fn in_refused_entry(layout: &InstallLayout, path: &Path) -> bool {
+    path.strip_prefix(layout.versions_dir())
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|first| first.as_os_str().to_str())
+        .is_some_and(|name| name.starts_with(REFUSED_PREFIX))
 }
 
 /// How a release directory was vetted.

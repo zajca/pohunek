@@ -1637,12 +1637,33 @@ fn before_exec(source: &ProcessError, activating: bool) -> bool {
     activating && matches!(source, ProcessError::PermissionDenied { .. })
 }
 
+/// The path of a live process image, without the ` (deleted)` the kernel
+/// appends to `/proc/<pid>/exe` once the file was unlinked, unless a file of
+/// that literal name exists.
+///
+/// A directory that was removed and published again leaves its running
+/// workers on an unlinked image; the main process and its command line still
+/// bind them to the unit.
+fn live_image_path(executable: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const SUFFIX: &[u8] = b" (deleted)";
+    match executable.as_os_str().as_bytes().strip_suffix(SUFFIX) {
+        Some(stripped) if !executable.exists() => {
+            std::borrow::Cow::Owned(PathBuf::from(std::ffi::OsStr::from_bytes(stripped)))
+        }
+        _ => std::borrow::Cow::Borrowed(executable),
+    }
+}
+
 /// Checks that the main process runs the command systemd recorded.
 ///
 /// Returns whether the process is bound to the unit. The executable is
 /// compared after resolving symlinks in the recorded path, because
-/// `/proc/<pid>/exe` is always canonical. Empty arguments are skipped on both
-/// sides since the process inspector omits them. While a unit is
+/// `/proc/<pid>/exe` is always canonical. A worker whose version directory a
+/// repair moved aside still reports the moved path, which counts as the
+/// recorded executable ([`pohunek_paths::is_set_aside_copy`]). Empty arguments
+/// are skipped on both sides since the process inspector omits them. While a unit is
 /// `activating`, the main process may not run `ExecStart` yet, so a mismatch
 /// then leaves it unbound rather than being invalid data.
 fn verify_live_command(
@@ -1650,8 +1671,10 @@ fn verify_live_command(
     live: &LiveCommand,
     active_state: &str,
 ) -> Result<bool, Error> {
-    let executable_matches = std::fs::canonicalize(&definition.executable)
-        .is_ok_and(|expected| expected == live.executable);
+    let image = live_image_path(&live.executable);
+    let executable_matches = std::fs::canonicalize(&definition.executable).is_ok_and(|expected| {
+        expected == *image || pohunek_paths::is_set_aside_copy(&expected, &image)
+    });
     let expected: Vec<String> =
         std::iter::once(definition.executable.to_string_lossy().into_owned())
             .chain(definition.arguments.iter().cloned())
@@ -2359,6 +2382,65 @@ mod tests {
         };
         assert!(matches!(
             verify_live_command(&missing, &other_executable, "active"),
+            Err(Error::InvalidData { .. })
+        ));
+    }
+
+    /// A worker whose version directory a repair moved aside keeps running
+    /// the image it started with: the recorded path names the republished
+    /// directory and the process reports the moved one.
+    #[test]
+    fn a_live_command_in_a_set_aside_version_directory_matches_exec_start() {
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let versions = std::fs::canonicalize(root.path()).expect("canonical root");
+        let image = versions.join("1.0.0/pohunek-sessiond");
+        std::fs::create_dir_all(image.parent().expect("parent")).expect("version directory");
+        std::fs::write(&image, b"").expect("republished image");
+        let facts = DefinitionFacts {
+            executable: image.clone(),
+            arguments: Vec::new(),
+        };
+        let live = |executable: PathBuf| LiveCommand {
+            executable,
+            cmdline: vec![image.to_string_lossy().into_owned()],
+        };
+
+        let unlinked = PathBuf::from(format!("{} (deleted)", image.display()));
+        assert!(
+            verify_live_command(&facts, &live(unlinked), "active").expect("unlinked image"),
+            "a republished directory leaves the worker on an unlinked image"
+        );
+        let aside = versions.join(".pohunek_refused-1.0.0-0123456789abcdef/pohunek-sessiond");
+        assert!(verify_live_command(&facts, &live(aside), "active").expect("moved image"));
+        for other in [
+            ".pohunek_refused-2.0.0-0123456789abcdef/pohunek-sessiond",
+            ".pohunek_refused-1.0.0-0123456789abcde/pohunek-sessiond",
+            ".pohunek_refused-1.0.0-0123456789abcdef/other",
+            "1.0.1/pohunek-sessiond",
+            ".pohunek_refused-1.0.0-0123456789abcdef/nested/pohunek-sessiond",
+        ] {
+            assert!(
+                matches!(
+                    verify_live_command(&facts, &live(versions.join(other)), "active"),
+                    Err(Error::InvalidData { .. })
+                ),
+                "{other}"
+            );
+        }
+        // Only the daemon and worker images are accepted: another binary in
+        // the same layout is a different unit's image.
+        let plugin = versions.join("1.0.0/plugin-tool");
+        std::fs::write(&plugin, b"").expect("plugin image");
+        let plugin_facts = DefinitionFacts {
+            executable: plugin.clone(),
+            arguments: Vec::new(),
+        };
+        let moved_plugin = LiveCommand {
+            executable: versions.join(".pohunek_refused-1.0.0-0123456789abcdef/plugin-tool"),
+            cmdline: vec![plugin.to_string_lossy().into_owned()],
+        };
+        assert!(matches!(
+            verify_live_command(&plugin_facts, &moved_plugin, "active"),
             Err(Error::InvalidData { .. })
         ));
     }

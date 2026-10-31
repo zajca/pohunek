@@ -268,6 +268,7 @@ impl Engine<'_> {
             return Err(Error::RefreshPending {
                 step: record.step.as_str(),
                 rolling_back: record.rolling_back,
+                restored: None,
             });
         }
         let journal = self.refresh_journal(&record)?.clone();
@@ -385,7 +386,19 @@ impl Engine<'_> {
         let mut late = LateGate::default();
         let result = self
             .run_refresh_steps(&mut record, target, definition, &mut late, rewrite)
-            .await;
+            .await
+            // Only a kept record is pending; a refusal before `registering`
+            // rolled the refresh back.
+            .map_err(|error| match error {
+                Error::UntrustedVersion { path, detail } if record.step >= Step::Registering => {
+                    Error::UntrustedRefreshVersion {
+                        version: record.version.clone(),
+                        path,
+                        detail,
+                    }
+                }
+                other => other,
+            });
         // A refusal never touches the running daemon. Rolling back a record at
         // `Registering` would replace it, and the replacement may not have
         // happened yet, so that record is kept for a resume instead.
@@ -571,7 +584,15 @@ impl Engine<'_> {
         let restarts = rollback_restarts_previous(record);
         let mut gated = None;
         if restarts {
-            let daemon_dir = rollback_daemon_dir(layout, &record.version)?;
+            let daemon_dir =
+                rollback_daemon_dir(layout, &record.version).map_err(|error| match error {
+                    Error::UntrustedVersion { path, detail } => Error::UntrustedRefreshVersion {
+                        version: record.version.clone(),
+                        path,
+                        detail,
+                    },
+                    other => other,
+                })?;
             let job = job_path_for(self.context, &restored, None, PathUse::Rollback).await?;
             gated = Some(
                 self.judge_rollback(layout, &record.version, &daemon_dir, &job)
