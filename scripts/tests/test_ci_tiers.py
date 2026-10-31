@@ -140,6 +140,7 @@ MACOS_PATH_OWNERSHIP = {
             ".config/nextest.toml",
             "rust-toolchain.toml",
             ".github/actions/setup-rust/**",
+            ".github/actions/setup-uv/**",
         },
         "main": {
             "Cargo.toml",
@@ -1285,8 +1286,10 @@ class SetupUvActionTests(unittest.TestCase):
 
     def test_the_download_is_verified_before_extraction_and_the_installed_uv_is_required(self):
         action = self.ACTION.read_text()
-        self.assertLess(action.index("sha256sum -c -"), action.index("tar -xzf"))
+        self.assertLess(action.index("| $check)"), action.index("tar -xzf"))
         self.assertIn("--proto '=https'", action)
+        for limit in ("--connect-timeout", "--speed-limit", "--speed-time", "--max-time", "--retry-max-time"):
+            self.assertIn(limit, action)
         self.assertIn('if [ "$UV_PATH" != "${SEEDED_DIR}/uv" ]', action)
 
     def test_the_composite_is_in_the_lane_filter(self):

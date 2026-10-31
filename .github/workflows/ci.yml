@@ -1107,6 +1107,7 @@ jobs:
               - '.config/nextest.toml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-uv/**'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
             # Covers both generators' inputs and outputs: the main protocol

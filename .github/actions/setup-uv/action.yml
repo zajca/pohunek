@@ -31,6 +31,18 @@ runs:
         # reset that plain `--retry` treats as permanent; the sha256 check
         # below still guards the bytes.
         DOWNLOAD_RETRIES: "6"
+        # Transfer limits, as in setup-mold: --retry only counts attempts that
+        # return, so a server that accepts and then stalls would hang the job
+        # without them. The archive is about 20 MB: 1 KiB/s sustained for 30 s
+        # is a stall and 120 s per attempt is far below a healthy transfer.
+        # Retries stop starting after 300 s, so the worst case is about
+        # 300 s + 120 s. curl exit 28 (timeout) is retried through
+        # --retry-all-errors.
+        DOWNLOAD_CONNECT_TIMEOUT_SECONDS: "15"
+        DOWNLOAD_STALL_BYTES_PER_SECOND: "1024"
+        DOWNLOAD_STALL_SECONDS: "30"
+        DOWNLOAD_MAX_TIME_SECONDS: "120"
+        DOWNLOAD_RETRY_MAX_TIME_SECONDS: "300"
       run: |
         set -euo pipefail
         case "$(uname -s)-$(uname -m)" in
@@ -42,24 +54,36 @@ runs:
         esac
         tool_root="${RUNNER_TOOL_CACHE:?}/uv/${UV_VERSION}"
         dest="${tool_root}/${arch}"
-        if [ ! -f "${dest}.complete" ]; then
-          mkdir -p "$tool_root"
-          stage="$(mktemp -d "${tool_root}/seed.XXXXXX")"
-          archive="uv-${target}.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
-            --output "${stage}/${archive}" \
-            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${archive}"
-          # Fails closed: extraction only runs after the hash matches.
-          if command -v sha256sum >/dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
-          (cd "$stage" && printf '%s  %s\n' "$sha" "$archive" | $check)
-          mkdir "${stage}/uv"
-          tar -xzf "${stage}/${archive}" -C "${stage}/uv" --strip-components=1
-          rm -rf "$dest"
-          mv "${stage}/uv" "$dest"
-          rm -rf "$stage"
-          touch "${dest}.complete"
+        mkdir -p "$tool_root"
+        stage="$(mktemp -d "${tool_root}/seed.XXXXXX")"
+        trap 'rm -rf "$stage"' EXIT
+        archive="uv-${target}.tar.gz"
+        # `|| rc=$?` keeps the exit status: inside `if !` the status is lost.
+        rc=0
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+          --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
+          --retry-max-time "$DOWNLOAD_RETRY_MAX_TIME_SECONDS" \
+          --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+          --speed-limit "$DOWNLOAD_STALL_BYTES_PER_SECOND" \
+          --speed-time "$DOWNLOAD_STALL_SECONDS" \
+          --max-time "$DOWNLOAD_MAX_TIME_SECONDS" \
+          --output "${stage}/${archive}" \
+          "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${archive}" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::setup-uv: download of $archive failed (curl exit $rc)" >&2
+          exit 1
         fi
+        # Fails closed: extraction only runs after the hash matches. A uv
+        # already present in the tool cache is replaced, so the job always
+        # runs the verified archive.
+        if command -v sha256sum >/dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
+        (cd "$stage" && printf '%s  %s\n' "$sha" "$archive" | $check)
+        mkdir "${stage}/uv"
+        tar -xzf "${stage}/${archive}" -C "${stage}/uv" --strip-components=1
+        rm -f "${dest}.complete"
+        rm -rf "$dest"
+        mv "${stage}/uv" "$dest"
+        touch "${dest}.complete"
         echo "version=${UV_VERSION}" >> "$GITHUB_OUTPUT"
         echo "dir=${dest}" >> "$GITHUB_OUTPUT"
 
