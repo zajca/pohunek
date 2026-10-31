@@ -8213,6 +8213,53 @@ async fn delayed_plain_input_withholds_enter_when_the_agent_turns_blocked_during
     registry.stop(&id).await.expect("stop the session");
 }
 
+/// Claude and Codex accept input while blocked, so a dialog that draws during
+/// the submit delay does not withhold Enter.
+#[tokio::test]
+async fn delayed_plain_input_submits_when_a_blocked_agent_accepts_input() {
+    let registry = delayed_submit_registry("delayed-plain-blocked-accepting");
+    for (profile, agent, marker) in [
+        ("delayed-codex", "codex", "codex-marker"),
+        ("delayed-claude", "claude", "claude-marker"),
+    ] {
+        let id = create_delayed_session(&registry, profile).await;
+        let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+        registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+        let request = tokio::spawn({
+            let registry = registry.clone();
+            let id = id.clone();
+            async move {
+                registry
+                    .input(protocol::SessionInputParams {
+                        session_id: id,
+                        text: marker.to_owned(),
+                        wait: None,
+                    })
+                    .await
+            }
+        });
+
+        reach_boundary(&delay_boundary).await;
+        assert!(
+            report_agent_activity(&registry, &id, agent, AgentActivity::Blocked, 1)
+                .await
+                .recorded,
+            "agent={agent}"
+        );
+        reach_boundary(&delay_boundary).await;
+        request
+            .await
+            .expect("input task joins")
+            .unwrap_or_else(|error| {
+                panic!("{profile}: Enter must be sent while blocked: {error:?}")
+            });
+
+        let want = format!("got:{marker}");
+        wait_for_session_output(&registry, &id, &[want.as_str()]).await;
+        registry.stop(&id).await.expect("stop the session");
+    }
+}
+
 #[tokio::test]
 async fn delayed_plain_input_succeeds_when_the_agent_exits_before_enter() {
     // The text ends with a newline, so the fake TUI reads its line and exits
