@@ -1336,8 +1336,8 @@ class SetupUvActionTests(unittest.TestCase):
 class FailFastTests(unittest.TestCase):
     """A required job that fails cancels the rest of a PR or dispatch run, and nothing else does (#1075)."""
 
-    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`).
-    EXCLUDED = {"audit", "test-selection-verdict"}
+    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run.
+    EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection"}
     REUSABLE = {
         "upgrade-test",
         "release-rehearsal-build",
@@ -1408,7 +1408,7 @@ class FailFastTests(unittest.TestCase):
                 watcher = jobs[f"cancel-after-{name}"]
                 self.assertIn(f"    needs: {name}\n", watcher)
                 self.assertIn(
-                    f"    if: ${{{{ needs.{name}.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}}}\n",
+                    f"    if: ${{{{ !cancelled() && needs.{name}.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}}}\n",
                     watcher,
                 )
                 self.assertEqual(self.permissions(watcher), {"actions": "write"})
@@ -1423,6 +1423,10 @@ class FailFastTests(unittest.TestCase):
             if FAIL_FAST_STEP in job:
                 step = job_steps(job)[FAIL_FAST_STEP]
                 self.assertNotIn("always()", step, name)
+        for name in self.REUSABLE:
+            watcher = workflow_jobs()[f"cancel-after-{name}"]
+            self.assertNotIn("always()", watcher)
+            self.assertIn("!cancelled()", watcher)
 
     def test_the_composite_cancels_the_run_and_fails_soft(self):
         action = (ROOT / ".github" / "actions" / "cancel-run" / "action.yml").read_text()

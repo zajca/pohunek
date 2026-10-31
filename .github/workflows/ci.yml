@@ -48,7 +48,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != 
 # step needs `actions: write`, granted per job and never for the workflow.
 # Push runs, scheduled runs and the advisory audit job never cancel. The failing
 # job and the run end as `cancelled`; the `::error` annotation names the job that
-# failed first and `test selection verdict` is the red check.
+# failed first. The advisory audit, the two fail-open selectors and the verdict
+# do not carry the step.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
 # drain (#1209): the running main run completes, and GitHub keeps only the
 # newest push pending behind it, replacing an older pending one. Each scheduled
@@ -710,7 +711,6 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     outputs:
@@ -827,9 +827,6 @@ jobs:
           path: ${{ runner.temp }}/test-selection/
           retention-days: 1
           if-no-files-found: error
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Compiles every workspace test binary exactly once for the fast shards, the
   # heavy job, and the relay DB job (issue #170). Designated `test-debug`
@@ -979,11 +976,11 @@ jobs:
           name: nextest-junit-${{ matrix.shard }}
           path: relocated/target/nextest/ci/junit.xml
           if-no-files-found: warn
-
-    # Determine which CI jobs the changed files require. Heavy non-default jobs
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./relocated/.github/actions/cancel-run
+
+    # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
   # drift) only run when their inputs change or on a schedule; the
   # always-critical jobs (fmt, clippy, fast tests, heavy tests, doctests,
@@ -1515,7 +1512,7 @@ jobs:
   cancel-after-upgrade-test:
     name: cancel the run after upgrade-test fails
     needs: upgrade-test
-    if: ${{ needs.upgrade-test.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && needs.upgrade-test.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -1931,7 +1928,7 @@ jobs:
   cancel-after-release-rehearsal-build:
     name: cancel the run after release-rehearsal-build fails
     needs: release-rehearsal-build
-    if: ${{ needs.release-rehearsal-build.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && needs.release-rehearsal-build.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -1965,7 +1962,7 @@ jobs:
   cancel-after-release-rehearsal-scenarios:
     name: cancel the run after release-rehearsal-scenarios fails
     needs: release-rehearsal-scenarios
-    if: ${{ needs.release-rehearsal-scenarios.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && needs.release-rehearsal-scenarios.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -2004,7 +2001,7 @@ jobs:
   cancel-after-release-rehearsal:
     name: cancel the run after release-rehearsal fails
     needs: release-rehearsal
-    if: ${{ needs.release-rehearsal.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && needs.release-rehearsal.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -2039,7 +2036,7 @@ jobs:
   cancel-after-release-gate:
     name: cancel the run after release-gate fails
     needs: release-gate
-    if: ${{ needs.release-gate.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !cancelled() && needs.release-gate.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -2446,7 +2443,6 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
-      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     outputs:
@@ -2573,9 +2569,6 @@ jobs:
               echo "${package}_baseline_digest=$digest"
             done
           } >> "$GITHUB_OUTPUT"
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Version gate of the official packages (issue #894). `cargo xtask package
   # bump` fails a pull request that changes a package's archive without a

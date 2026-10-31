@@ -285,9 +285,14 @@ the advisory `cargo-audit` job and a job that was itself cancelled never
 trigger it. Read such a run accordingly: the job that failed and the run end as
 `cancelled`, while the failed step stays red in the job log and the step's
 `::error` annotation (`Fail fast`) names the job that failed first. So a
-cancelled job in a pull request run can mean that another job failed first, and
-the `test selection verdict` check, which still runs after the cancel, is the
-red check. A fork or Dependabot pull request has a read-only token, so the
+cancelled job in a pull request run can mean that another job failed first.
+The `test selection verdict` check still runs after the cancel and is red when
+a job it waits for failed or was cancelled; for a job that decides the pull
+request outside the verdict, look for the `Fail fast` annotation. A job that
+hits its `timeout-minutes` is cancelled by GitHub and does not trigger the
+step, and the two selector jobs (`test selection`, `runtime package selection`)
+do not carry it, because a failed selection runs everything instead of
+ending the run. A fork or Dependabot pull request has a read-only token, so the
 cancel call is refused and the run keeps its real failure.
 
 **Fork heads.** This applies to every dispatch, rerun and `head_ref` rule in
