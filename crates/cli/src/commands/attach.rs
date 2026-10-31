@@ -48,8 +48,9 @@ const SHORTCUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 /// close can be read before the reply. The wait only bridges that ordering gap;
 /// when it elapses the close is handled as an ordinary stream loss.
 const MENU_TASK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Longest wait for the terminal to take queued output before the terminal
-/// leaves raw mode; a stuck terminal must not hold back a detach or stop.
+/// Longest wait for the terminal to take queued output at each exit step: before
+/// it leaves raw mode, and over the whole teardown. A stuck terminal must not
+/// hold back a detach or stop.
 const OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Selective terminal reset emitted whenever raw attach passthrough ends.
 ///
@@ -1960,9 +1961,19 @@ where
 
     // Best-effort restore; do not mask the loop's real outcome with a teardown
     // write error.
-    let _ = close_modal(&mut stdout, modal.as_mut()).await;
-    let _ = terminal_output.restore(&mut stdout).await;
-    let _ = stdout.flush().await;
+    let teardown = async {
+        let _ = close_modal(&mut stdout, modal.as_mut()).await;
+        let _ = terminal_output.restore(&mut stdout).await;
+        let _ = stdout.flush().await;
+    };
+    if time::timeout(OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT, teardown)
+        .await
+        .is_err()
+    {
+        // The terminal takes no output: skip the mode cleanup instead of
+        // repeating it as a blocking write when the guard drops.
+        terminal_output.give_up();
+    }
     shutdown_status_updates(&mut status_updates).await;
     finish_attach_outcome(&mut client, &stream_id, outcome).await
 }
@@ -2509,6 +2520,11 @@ impl TerminalOutputGuard {
         }
     }
 
+    /// Marks the cleanup as done without writing it.
+    fn give_up(&mut self) {
+        self.restored = true;
+    }
+
     async fn restore<W>(&mut self, writer: &mut W) -> Result<(), CliError>
     where
         W: AsyncWrite + Unpin,
@@ -2640,6 +2656,8 @@ mod tests {
 
     /// Ctrl-], the detach shortcut.
     const DETACH_SHORTCUT_BYTE: u8 = 0x1d;
+    /// Byte of the shortcut that opens the attach menu.
+    const MENU_SHORTCUT_BYTE: u8 = 0x1c;
 
     #[derive(Debug)]
     struct StatusConnectionControl {
@@ -2981,25 +2999,62 @@ mod tests {
         assert_eq!(input, typed_input_and_detach().0);
     }
 
-    /// A terminal that takes a few bytes and then never accepts another,
-    /// recording that a write found it full.
-    struct StalledTerminal {
+    /// Terminal bytes shared between a gated terminal and the test.
+    #[derive(Default)]
+    struct TerminalState {
+        taken: Vec<u8>,
+        /// Bytes the terminal still accepts before it stops taking output.
         room: usize,
-        full: Arc<std::sync::atomic::AtomicBool>,
+        /// A write found the terminal not taking output.
+        full: bool,
+        waker: Option<std::task::Waker>,
     }
 
-    impl AsyncWrite for StalledTerminal {
+    /// A terminal that accepts a set number of bytes and then waits for the
+    /// test to open it further.
+    #[derive(Clone)]
+    struct GatedTerminal(Arc<std::sync::Mutex<TerminalState>>);
+
+    impl GatedTerminal {
+        fn with_room(room: usize) -> Self {
+            Self(Arc::new(std::sync::Mutex::new(TerminalState {
+                room,
+                ..TerminalState::default()
+            })))
+        }
+
+        fn open_fully(&self) {
+            let mut state = self.0.lock().expect("terminal state");
+            state.room = usize::MAX;
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+
+        fn taken(&self) -> Vec<u8> {
+            self.0.lock().expect("terminal state").taken.clone()
+        }
+
+        fn is_full(&self) -> bool {
+            self.0.lock().expect("terminal state").full
+        }
+    }
+
+    impl AsyncWrite for GatedTerminal {
         fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-            if self.room == 0 {
-                self.full.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut state = self.0.lock().expect("terminal state");
+            if state.room == 0 {
+                state.full = true;
+                state.waker = Some(cx.waker().clone());
                 return std::task::Poll::Pending;
             }
-            let taken = self.room.min(buf.len());
-            self.room -= taken;
+            let taken = state.room.min(buf.len());
+            state.room -= taken;
+            state.taken.extend_from_slice(&buf[..taken]);
             std::task::Poll::Ready(Ok(taken))
         }
 
@@ -3018,24 +3073,39 @@ mod tests {
         }
     }
 
-    /// Line typed while the terminal takes no output.
-    const STALLED_KEYSTROKE: &[u8] = b"typed-while-the-terminal-is-stalled\n";
+    /// Scheduler turns that show a loop made no further progress.
+    const SCHEDULER_YIELDS: usize = 4096;
 
-    #[tokio::test]
-    async fn a_terminal_that_takes_no_output_does_not_keep_keystrokes_from_the_stream() {
-        let (stream, daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
-        let (mut daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+    async fn settle() {
+        for _ in 0..SCHEDULER_YIELDS {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn dialog_modal() -> ModalState {
+        ModalState {
+            compositor: Compositor::new(80, 24),
+            snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
+            pending_output: Vec::new(),
+            active: false,
+        }
+    }
+
+    /// Runs the attach loop on `stream` and `terminal_input` against `stdout`
+    /// next to `scenario`, which ends the run.
+    async fn run_attach_against<T>(
+        stream: DuplexStream,
+        terminal_input: DuplexStream,
+        stdout: GatedTerminal,
+        modal: Option<ModalState>,
+        scenario: impl std::future::Future<Output = T>,
+    ) -> T {
         let (client, _server, paths, _socket) = connect_stdin_test_client().await;
-        let (mut terminal, stdin) = tokio::io::duplex(STALLED_KEYSTROKE.len());
-        let full = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let attach = forward_attached_stream(
+        let mut attach = Box::pin(forward_attached_stream(
             AttachIo {
                 stream,
-                stdin,
-                stdout: StalledTerminal {
-                    room: 0,
-                    full: Arc::clone(&full),
-                },
+                stdin: terminal_input,
+                stdout,
             },
             client,
             "stream-test".to_owned(),
@@ -3044,43 +3114,154 @@ mod tests {
                 paths,
                 target: "local/s-42".parse().expect("test target"),
             },
+            modal,
             None,
             None,
-            None,
-        );
-        tokio::pin!(attach);
-        // The daemon end writes more output than the stream and the stalled
-        // terminal hold, and reads input independently of it.
-        let output = tokio::spawn(async move {
-            let _ = daemon_output
-                .write_all(&vec![b'y'; STREAM_OUTPUT_BYTES])
-                .await;
-            daemon_output
+        ));
+        tokio::select! {
+            end = &mut attach => panic!("the attach loop ended: {end:?}"),
+            out = guard("the attach scenario", scenario) => out,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_output_stops_being_read_once_the_terminal_holds_a_full_queue() {
+        const FLOOD_BYTES: usize = 1024 * 1024;
+        const WRITE_BYTES: usize = 1024;
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
+        let (_daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (_typed, terminal_input) = tokio::io::duplex(1);
+        let terminal = GatedTerminal::with_room(0);
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flooding = Arc::clone(&written);
+        let flood = tokio::spawn(async move {
+            let chunk = [b'y'; WRITE_BYTES];
+            for _ in 0..FLOOD_BYTES / WRITE_BYTES {
+                if daemon_output.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                flooding.fetch_add(WRITE_BYTES, std::sync::atomic::Ordering::SeqCst);
+            }
         });
-        let typing = async {
+
+        let probe = terminal.clone();
+        let accepted = run_attach_against(stream, terminal_input, terminal, None, async move {
             pohunek_test_support::wait::wait_until("the terminal to be full", || async {
-                full.load(std::sync::atomic::Ordering::SeqCst).then_some(())
+                probe.is_full().then_some(())
             })
             .await;
-            terminal
-                .write_all(STALLED_KEYSTROKE)
-                .await
-                .expect("type the keystroke");
-            let mut received = vec![0_u8; STALLED_KEYSTROKE.len()];
-            daemon_input
-                .read_exact(&mut received)
-                .await
-                .expect("read the forwarded keystroke");
-            received
-        };
+            settle().await;
+            written.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
 
-        let received = tokio::select! {
-            end = &mut attach => panic!("the attach loop ended: {end:?}"),
-            received = guard("the stream receives the keystroke", typing) => received,
-        };
+        // The loop holds the queue, one more read and the stream's own buffer;
+        // everything beyond stays with the stream's writer.
+        let bound = OUTPUT_QUEUE_BYTES + IO_BUFFER_BYTES + STREAM_BUFFER_BYTES + WRITE_BYTES;
+        assert!(
+            accepted <= bound,
+            "the loop kept reading stream output: {accepted} bytes read, at most {bound} expected"
+        );
+        assert!(!flood.is_finished(), "the whole flood was read");
+        flood.abort();
+    }
 
-        assert_eq!(received, STALLED_KEYSTROKE);
-        output.abort();
+    #[tokio::test]
+    async fn a_dialog_opened_over_a_partly_written_chunk_follows_the_whole_chunk() {
+        const CHUNK: &[u8] = b"agent output that the terminal takes in pieces";
+        const TAKEN_BYTES: usize = 7;
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_OUTPUT_BYTES);
+        let (_daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (mut typed, terminal_input) = tokio::io::duplex(1);
+        let terminal = GatedTerminal::with_room(TAKEN_BYTES);
+        daemon_output
+            .write_all(CHUNK)
+            .await
+            .expect("write the stream output");
+
+        let probe = terminal.clone();
+        let shown = run_attach_against(
+            stream,
+            terminal_input,
+            terminal,
+            Some(dialog_modal()),
+            async move {
+                pohunek_test_support::wait::wait_until("the terminal to be full", || async {
+                    probe.is_full().then_some(())
+                })
+                .await;
+                assert_eq!(probe.taken(), &CHUNK[..TAKEN_BYTES]);
+                typed
+                    .write_all(&[MENU_SHORTCUT_BYTE])
+                    .await
+                    .expect("type the menu shortcut");
+                // The second byte fits the one-byte input pipe only once the
+                // loop read the shortcut, with the chunk still half written.
+                typed.write_all(b"j").await.expect("type a dialog key");
+                settle().await;
+                probe.open_fully();
+                pohunek_test_support::wait::wait_until("the dialog frame", || async {
+                    (probe.taken().len() > CHUNK.len()).then(|| probe.taken())
+                })
+                .await
+            },
+        )
+        .await;
+
+        assert!(
+            shown.starts_with(CHUNK),
+            "the dialog landed inside the chunk: {:?}",
+            String::from_utf8_lossy(&shown[..CHUNK.len()])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_dialog_waits_while_the_terminal_holds_a_full_queue() {
+        const FLOOD_BYTES: usize = 256 * 1024;
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
+        let (_daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (mut typed, terminal_input) = tokio::io::duplex(1);
+        let terminal = GatedTerminal::with_room(0);
+        let flood = tokio::spawn(async move {
+            let _ = daemon_output.write_all(&vec![b'y'; FLOOD_BYTES]).await;
+        });
+
+        let probe = terminal.clone();
+        let dialog_input_waits = run_attach_against(
+            stream,
+            terminal_input,
+            terminal,
+            Some(dialog_modal()),
+            async move {
+                pohunek_test_support::wait::wait_until("the terminal to be full", || async {
+                    probe.is_full().then_some(())
+                })
+                .await;
+                // The stream is no longer read once the queue holds its bound.
+                settle().await;
+                typed
+                    .write_all(&[MENU_SHORTCUT_BYTE])
+                    .await
+                    .expect("type the menu shortcut");
+                // Each key of an open dialog queues a frame, so they wait.
+                let keys = async {
+                    for _ in 0..4 {
+                        typed.write_all(b"j").await.expect("type a dialog key");
+                    }
+                };
+                tokio::select! {
+                    () = keys => false,
+                    () = settle() => true,
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            dialog_input_waits,
+            "the dialog keys were read while the queue was full"
+        );
+        flood.abort();
     }
 
     #[tokio::test]

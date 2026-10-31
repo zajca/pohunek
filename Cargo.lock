@@ -2923,6 +2923,7 @@ dependencies = [
  "pohunek-worker-protocol",
  "portable-pty",
  "reqwest",
+ "rustix",
  "ruzstd",
  "semver",
  "serde",
