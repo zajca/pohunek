@@ -3,7 +3,9 @@
 //! The built CLI attaches to a fixture daemon whose raw attach stream does not
 //! read the client's input while it writes output, as the daemon does while a
 //! paste waits for the program to read it. The client must keep showing that
-//! output instead of waiting for its own input write to complete.
+//! output instead of waiting for its own input write to complete. The reverse
+//! holds as well: a terminal that takes no output must neither keep the client
+//! from forwarding keystrokes nor hold back a detach.
 
 #![cfg(unix)]
 
@@ -17,7 +19,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::wait::HANG_GUARD;
+use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 use protocol::{Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
@@ -41,6 +43,19 @@ const STREAM_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Line that ends the fixture's output.
 const OUTPUT_MARKER: &[u8] = b"stream-output-done";
 
+/// Line typed while the terminal reads none of the output.
+const KEYSTROKE: &[u8] = b"typed-while-the-terminal-is-stalled\n";
+
+/// Detach shortcut byte of the attach client.
+const DETACH_BYTE: u8 = 0x1d;
+
+/// Bytes per write while the fixture floods the client.
+const FLOOD_CHUNK_BYTES: usize = 4096;
+
+/// Capacity the CLI's stdout pipe is shrunk to, so that it fills at once.
+#[cfg(target_os = "linux")]
+const STDOUT_PIPE_BYTES: usize = 4096;
+
 /// Mode of the runtime directory the client expects to be owner-private.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
@@ -51,6 +66,17 @@ enum StreamEvent {
     OutputWritten,
     /// The client's input, read to its end after the output.
     InputReceived(usize),
+    /// The client forwarded the line typed while its terminal took no output.
+    KeystrokeReceived,
+}
+
+/// How the fixture's raw attach stream behaves.
+#[derive(Debug, Clone, Copy)]
+enum StreamBehavior {
+    /// Writes the whole output before it reads any input.
+    OutputThenInput,
+    /// Floods output until the client goes away while it reads input.
+    FloodWhileReading,
 }
 
 /// Kills the CLI if the scenario fails before it exits.
@@ -79,7 +105,7 @@ fn an_attach_client_keeps_showing_output_while_its_paste_is_not_read() {
     }
     let socket = root.join("run/pohunek/daemon.sock");
     let (events, observed) = mpsc::channel();
-    serve_fixture_daemon(&socket, events);
+    serve_fixture_daemon(&socket, events, StreamBehavior::OutputThenInput);
 
     let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
     command
@@ -150,21 +176,129 @@ fn an_attach_client_keeps_showing_output_while_its_paste_is_not_read() {
     assert!(status.success(), "pohunek attach failed: {errors}");
 }
 
-/// Serves `session.attach` on `socket` and one raw attach stream that writes
-/// its whole output before it reads the client's input, reporting both to
-/// `events`.
-fn serve_fixture_daemon(socket: &Path, events: mpsc::Sender<StreamEvent>) {
+/// Shrinks the CLI's stdout pipe where the platform allows it and returns the
+/// byte count that means the pipe is full.
+#[cfg(target_os = "linux")]
+fn stdout_pipe_capacity(stdout: &std::os::fd::OwnedFd) -> usize {
+    rustix::pipe::fcntl_setpipe_size(stdout, STDOUT_PIPE_BYTES).expect("shrink the stdout pipe");
+    rustix::pipe::fcntl_getpipe_size(stdout).expect("read the pipe capacity")
+}
+
+/// A pipe of another platform cannot be resized; the CLI's output fills at
+/// least this many bytes of it before the pipe is full.
+#[cfg(not(target_os = "linux"))]
+fn stdout_pipe_capacity(_stdout: &std::os::fd::OwnedFd) -> usize {
+    16 * 1024
+}
+
+/// Hermetic environment, fixture daemon and a CLI whose stdout pipe is shrunk
+/// and never read, so it is full as soon as the stream floods the client.
+struct StalledTerminal {
+    cli: CliProcess,
+    stdin: std::process::ChildStdin,
+    stdout: std::os::fd::OwnedFd,
+    observed: mpsc::Receiver<StreamEvent>,
+    _env: TestEnv,
+}
+
+fn attach_with_stalled_terminal() -> StalledTerminal {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(
+            root.join(directory),
+            fs::Permissions::from_mode(PRIVATE_DIR_MODE),
+        )
+        .expect("make the directory owner-private");
+    }
+    let socket = root.join("run/pohunek/daemon.sock");
+    let (events, observed) = mpsc::channel();
+    serve_fixture_daemon(&socket, events, StreamBehavior::FloodWhileReading);
+
+    // The pipe is shrunk before the CLI exists, so it cannot hold more than its
+    // new capacity yet.
+    let (stdout, terminal_write) = rustix::pipe::pipe().expect("create the terminal pipe");
+    let capacity = stdout_pipe_capacity(&stdout);
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command
+        .args(["attach", SESSION_ID])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(terminal_write))
+        .stderr(Stdio::null());
+    let mut cli = CliProcess(command.spawn().expect("spawn pohunek attach"));
+    let stdin = cli.0.stdin.take().expect("piped stdin");
+    drop(command);
+    // The pipe is never read: once it holds its capacity, the terminal takes
+    // no more output.
+    poll_until("the terminal pipe to fill", || {
+        let queued = rustix::io::ioctl_fionread(&stdout).expect("count the pipe bytes");
+        (queued >= capacity as u64).then_some(())
+    });
+    StalledTerminal {
+        cli,
+        stdin,
+        stdout,
+        observed,
+        _env: env,
+    }
+}
+
+#[test]
+fn an_attach_client_forwards_keystrokes_while_the_terminal_reads_no_output() {
+    let mut attach = attach_with_stalled_terminal();
+
+    attach
+        .stdin
+        .write_all(KEYSTROKE)
+        .expect("type the keystroke");
+    assert_eq!(
+        attach.observed.recv_timeout(HANG_GUARD),
+        Ok(StreamEvent::KeystrokeReceived),
+        "the keystroke reaches the stream while the terminal takes no output"
+    );
+    drop(attach.stdout);
+}
+
+#[test]
+fn an_attach_client_detaches_while_the_terminal_reads_no_output() {
+    let mut attach = attach_with_stalled_terminal();
+
+    attach
+        .stdin
+        .write_all(&[DETACH_BYTE])
+        .expect("type the detach shortcut");
+    let status = poll_until("the attach client to exit", || {
+        attach.cli.0.try_wait().expect("poll the attach client")
+    });
+    assert!(status.success(), "the detach ends the attach: {status}");
+    drop(attach.stdout);
+}
+
+/// Serves `session.attach` on `socket` and one raw attach stream that behaves
+/// as `behavior` says, reporting what it observes to `events`.
+fn serve_fixture_daemon(
+    socket: &Path,
+    events: mpsc::Sender<StreamEvent>,
+    behavior: StreamBehavior,
+) {
     let listener = UnixListener::bind(socket).expect("bind the fixture daemon");
     thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let events = events.clone();
-            thread::spawn(move || serve_connection(stream, &events));
+            thread::spawn(move || serve_connection(stream, &events, behavior));
         }
     });
 }
 
-fn serve_connection(stream: UnixStream, events: &mpsc::Sender<StreamEvent>) {
+fn serve_connection(
+    stream: UnixStream,
+    events: &mpsc::Sender<StreamEvent>,
+    behavior: StreamBehavior,
+) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -174,7 +308,10 @@ fn serve_connection(stream: UnixStream, events: &mpsc::Sender<StreamEvent>) {
         }
         let first: Value = serde_json::from_str(line.trim_end()).expect("parse a fixture line");
         if first.get("attach").and_then(Value::as_str) == Some(STREAM_ID) {
-            serve_attach_stream(reader, events);
+            match behavior {
+                StreamBehavior::OutputThenInput => serve_attach_stream(reader, events),
+                StreamBehavior::FloodWhileReading => serve_flooding_attach_stream(reader, events),
+            }
             return;
         }
         let request: Request = serde_json::from_value(first).expect("parse a request");
@@ -217,4 +354,33 @@ fn serve_attach_stream(reader: BufReader<UnixStream>, events: &mpsc::Sender<Stre
         .read_to_end(&mut input)
         .expect("read the client's input");
     let _sent = events.send(StreamEvent::InputReceived(input.len()));
+}
+
+/// Floods output until the client goes away and reads the client's input,
+/// reporting the keystroke when it arrives.
+fn serve_flooding_attach_stream(reader: BufReader<UnixStream>, events: &mpsc::Sender<StreamEvent>) {
+    let mut input = reader.buffer().to_vec();
+    let mut stream = reader.into_inner();
+    let mut flood = stream.try_clone().expect("clone the fixture stream");
+    thread::spawn(move || {
+        let chunk = [b'y'; FLOOD_CHUNK_BYTES];
+        while flood.write_all(&chunk).is_ok() {}
+    });
+    let mut buffer = [0_u8; 1024];
+    let mut reported = false;
+    loop {
+        let count = stream.read(&mut buffer).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        input.extend_from_slice(&buffer[..count]);
+        if !reported
+            && input
+                .windows(KEYSTROKE.len())
+                .any(|window| window == KEYSTROKE)
+        {
+            reported = true;
+            let _sent = events.send(StreamEvent::KeystrokeReceived);
+        }
+    }
 }

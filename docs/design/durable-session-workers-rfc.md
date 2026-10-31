@@ -568,7 +568,7 @@ bound every new queue:
 | daemon worker-connect deadline | 10 seconds (`service.toml` `worker_connect_ms`) | matches an interactive create operation without hiding a broken job; also bounds each reconciliation probe (connect, controller acquisition, and inspection together) and each reconnect attempt of a running session, so a silent socket cannot stall startup, a held lifecycle lock, or loss classification |
 | raw output history | 10,000,000 bytes | preserves the current per-session history budget |
 | one subscriber queue | 1,000,000 bytes | absorbs repaint bursts without allowing one client to consume the history budget |
-| stream writer queue | 8 events (hard maximum 1,024) | decouples the stream writer from the subscriber so a client that reads no output never blocks input forwarding; overflow is the subscriber's own gap and repaint |
+| stream writer queue | 8 events (hard maximum 1,024) | decouples the stream writer from the subscriber so a client that reads no output does not block input forwarding until `attach_ack_backlog` acknowledgements are held back; overflow is the subscriber's own gap and repaint |
 | attach acknowledgement backlog | 1,024 frames (hard maximum 65,536) | bounds queued input acknowledgements; input reading pauses at the bound until the client reads output |
 | worker data payload | 64 KiB | bounds allocation while efficiently carrying PTY and prompt fragments |
 | worker JSON header/control line | 64 KiB | private control metadata never requires prompt-sized allocation |
@@ -997,8 +997,9 @@ rather than consuming unbounded worker memory.
 
 Each data stream writes to its client from a concurrent writer fed by a short
 bounded queue that sits in front of the subscriber queue, so a client that
-reads no output never delays input forwarding; events in that queue count as
-delivered when a gap range is computed. Input acknowledgements are written
+reads no output does not delay input forwarding until `attach_ack_backlog`
+acknowledgements are held back; events in that queue count as delivered when a
+gap range is computed. Input acknowledgements are written
 ahead of queued output but wait behind an output write that is blocked, and
 the worker stops reading attach input at `attach_ack_backlog` unacknowledged
 frames until the client reads again.

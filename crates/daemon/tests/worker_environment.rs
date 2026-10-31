@@ -1077,12 +1077,19 @@ async fn a_lease_release_closes_an_attach_stream_whose_client_reads_no_output() 
                 .expect("stream stays open until its close frame");
             if let FrameKind::Close { reason } = frame.header().kind.clone() {
                 assert_eq!(reason, CloseReason::LeaseReleased);
-                return;
+                break;
             }
         }
+        assert!(
+            read_frame(&mut attach.stream)
+                .await
+                .expect("read after the close frame")
+                .is_none(),
+            "the stream ends after its close frame"
+        );
     })
     .await
-    .expect("a close frame follows the queued output");
+    .expect("a close frame follows the queued output and ends the stream");
 }
 
 #[tokio::test]

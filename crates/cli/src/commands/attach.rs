@@ -6,6 +6,7 @@
 //! Press Ctrl-] (0x1d) while attached to detach from the session without
 //! stopping the PTY process.
 
+mod buffered_output;
 mod shortcut;
 
 use std::os::fd::RawFd;
@@ -26,6 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
+use self::buffered_output::{BufferedOutput, OUTPUT_QUEUE_BYTES};
 use self::shortcut::{MenuInputMode, Shortcut, ShortcutDecoder};
 use crate::client::{Client, PinnedHost, RawStream};
 use crate::commands::{request_id, request_with_params};
@@ -46,6 +48,10 @@ const SHORTCUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 /// close can be read before the reply. The wait only bridges that ordering gap;
 /// when it elapses the close is handled as an ordinary stream loss.
 const MENU_TASK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for the terminal to take queued output at each exit step: before
+/// it leaves raw mode, and over the whole teardown. A stuck terminal must not
+/// hold back a detach or stop.
+const OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Selective terminal reset emitted whenever raw attach passthrough ends.
 ///
 /// Agent TUIs may enable these DEC modes through ordinary PTY output. Termios
@@ -1045,6 +1051,26 @@ async fn prepare_attach_terminal(
     Ok((terminal, output, winch))
 }
 
+/// Whether a dialog frame may be queued: an open dialog adds a frame per key or
+/// status event, so it waits while the terminal holds a full queue. Terminal
+/// input without a dialog is never held back.
+fn menu_may_paint<O>(modal: Option<&ModalState>, stdout: &BufferedOutput<O>) -> bool
+where
+    O: AsyncWrite + Unpin,
+{
+    stdout.queued() < OUTPUT_QUEUE_BYTES || !modal.is_some_and(|modal| modal.active)
+}
+
+/// Writes the queued output before the terminal leaves raw mode, so it is not
+/// processed by the restored line discipline. A write error surfaces on the
+/// next write.
+async fn flush_output_before_restore<W>(stdout: &mut W)
+where
+    W: AsyncWrite + Unpin,
+{
+    let _ = time::timeout(OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT, stdout.flush()).await;
+}
+
 /// Renders the active modal dialog with its session header.
 async fn paint_modal<W>(writer: &mut W, modal: &mut ModalState) -> Result<(), CliError>
 where
@@ -1058,7 +1084,6 @@ where
         .set_overlay_header(render_dialog_header(&modal.snapshot));
     let frame = modal.compositor.render();
     writer.write_all(&frame).await?;
-    writer.flush().await?;
     Ok(())
 }
 
@@ -1072,7 +1097,6 @@ where
     };
     writer.write_all(&modal.compositor.restore()).await?;
     writer.write_all(&modal.pending_output).await?;
-    writer.flush().await?;
     modal.pending_output.clear();
     modal.active = false;
     Ok(())
@@ -1158,6 +1182,7 @@ where
         time::timeout(MENU_TASK_SETTLE_TIMEOUT, wait_for_menu_task(&mut menu.task)).await
     else {
         menu.task = None;
+        flush_output_before_restore(stdout).await;
         terminal.take();
         let message = format!(
             "no reply within {}s; check the session state with `pohunek session list`",
@@ -1175,6 +1200,7 @@ where
     }) = &result
     {
         menu.task = None;
+        flush_output_before_restore(stdout).await;
         terminal.take();
         return Err(termination_failed(*action, message));
     }
@@ -1469,17 +1495,14 @@ where
                     *state = MenuState::Closed;
                 }
                 stdout.write_all(input).await?;
-                stdout.flush().await?;
             } else {
                 modal.pending_output.extend_from_slice(input);
             }
         } else {
             stdout.write_all(input).await?;
-            stdout.flush().await?;
         }
     } else {
         stdout.write_all(input).await?;
-        stdout.flush().await?;
     }
     Ok(None)
 }
@@ -1705,6 +1728,13 @@ where
         if outcome.changed {
             sync_menu_view(state, ctx.modal, ctx.stdout).await?;
         }
+        if outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, MenuEffect::RunDetach))
+        {
+            flush_output_before_restore(ctx.stdout).await;
+        }
         return handle_menu_effects(
             outcome.effects,
             MenuEffectContext {
@@ -1804,7 +1834,7 @@ where
     let (mut terminal, mut terminal_output, mut winch) =
         prepare_attach_terminal(&mut status_updates).await?;
     let (mut socket_read, mut socket_write) = tokio::io::split(io.stream);
-    let (mut stdin, mut stdout) = (io.stdin, io.stdout);
+    let (mut stdin, mut stdout) = (io.stdin, BufferedOutput::new(io.stdout));
     let (mut stdin_buf, mut socket_buf) = ([0_u8; IO_BUFFER_BYTES], [0_u8; IO_BUFFER_BYTES]);
     let mut menu = MenuRuntime::new(modal.is_some());
     let mut shortcuts = ShortcutDecoder::new();
@@ -1823,6 +1853,7 @@ where
         loop {
             if stream_input.detaching && stream_input.bytes.is_empty() {
                 socket_write.flush().await?;
+                flush_output_before_restore(&mut stdout).await;
                 return Ok(detach_stream(&mut client, &stream_id, &mut terminal).await);
             }
             if stream_input.closing && stream_input.bytes.is_empty() {
@@ -1839,12 +1870,16 @@ where
                         // ahead of the detach shortcut ends detached unless
                         // the daemon reports a stream failure.
                         if stream_input.detaching {
+                            flush_output_before_restore(&mut stdout).await;
                             return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
                         }
                         return Err(error);
                     }
                 }
-                read = socket_read.read(&mut socket_buf) => {
+                drained = stdout.drain(), if stdout.queued() > 0 => {
+                    drained?;
+                }
+                read = socket_read.read(&mut socket_buf), if stdout.queued() < OUTPUT_QUEUE_BYTES => {
                     let input = &socket_buf[..read?];
                     let args = (&control.target, &mut terminal);
                     if let Some(end) =
@@ -1854,6 +1889,7 @@ where
                         // the detach shortcut is written ends detached unless
                         // the daemon reports a stream failure.
                         if end == AttachStreamEnd::StreamClosed && stream_input.detaching {
+                            flush_output_before_restore(&mut stdout).await;
                             return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
                         }
                         return Ok(end);
@@ -1863,7 +1899,7 @@ where
                     &mut stdin,
                     &mut stdin_buf,
                     shortcut_deadline,
-                ), if stream_input.accepts_stdin() => {
+                ), if stream_input.accepts_stdin() && menu_may_paint(modal.as_ref(), &stdout) => {
                     let ctx = StdinInputContext {
                         stream_input: &mut stream_input,
                         stdout: &mut stdout,
@@ -1893,7 +1929,7 @@ where
                         &mut stdout,
                     ).await?;
                 }
-                update = recv_status_update(&mut status_updates), if status_updates.is_some() => {
+                update = recv_status_update(&mut status_updates), if status_updates.is_some() && menu_may_paint(modal.as_ref(), &stdout) => {
                     if let Some(update) = update {
                         if handle_status_update(update, &mut modal) {
                             paint_modal(
@@ -1925,8 +1961,19 @@ where
 
     // Best-effort restore; do not mask the loop's real outcome with a teardown
     // write error.
-    let _ = close_modal(&mut stdout, modal.as_mut()).await;
-    let _ = terminal_output.restore(&mut stdout).await;
+    let teardown = async {
+        let _ = close_modal(&mut stdout, modal.as_mut()).await;
+        let _ = terminal_output.restore(&mut stdout).await;
+        let _ = stdout.flush().await;
+    };
+    if time::timeout(OUTPUT_FLUSH_BEFORE_RESTORE_TIMEOUT, teardown)
+        .await
+        .is_err()
+    {
+        // The terminal takes no output: skip the mode cleanup instead of
+        // repeating it as a blocking write when the guard drops.
+        terminal_output.give_up();
+    }
     shutdown_status_updates(&mut status_updates).await;
     finish_attach_outcome(&mut client, &stream_id, outcome).await
 }
@@ -2151,6 +2198,7 @@ where
     if let Ok(outcome) = &result.outcome {
         match (result.action, outcome) {
             (MenuTaskAction::Kill, _) => {
+                flush_output_before_restore(stdout).await;
                 terminal.take();
                 return Ok(Some(AttachStreamEnd::SessionStopped));
             }
@@ -2160,6 +2208,7 @@ where
                     worktrees_failed, ..
                 },
             ) => {
+                flush_output_before_restore(stdout).await;
                 terminal.take();
                 return Ok(Some(AttachStreamEnd::SessionRemoved {
                     worktrees_failed: *worktrees_failed,
@@ -2471,6 +2520,11 @@ impl TerminalOutputGuard {
         }
     }
 
+    /// Marks the cleanup as done without writing it.
+    fn give_up(&mut self) {
+        self.restored = true;
+    }
+
     async fn restore<W>(&mut self, writer: &mut W) -> Result<(), CliError>
     where
         W: AsyncWrite + Unpin,
@@ -2602,6 +2656,8 @@ mod tests {
 
     /// Ctrl-], the detach shortcut.
     const DETACH_SHORTCUT_BYTE: u8 = 0x1d;
+    /// Byte of the shortcut that opens the attach menu.
+    const MENU_SHORTCUT_BYTE: u8 = 0x1c;
 
     #[derive(Debug)]
     struct StatusConnectionControl {
@@ -2941,6 +2997,271 @@ mod tests {
             .await
             .expect("stream test daemon");
         assert_eq!(input, typed_input_and_detach().0);
+    }
+
+    /// Terminal bytes shared between a gated terminal and the test.
+    #[derive(Default)]
+    struct TerminalState {
+        taken: Vec<u8>,
+        /// Bytes the terminal still accepts before it stops taking output.
+        room: usize,
+        /// A write found the terminal not taking output.
+        full: bool,
+        waker: Option<std::task::Waker>,
+    }
+
+    /// A terminal that accepts a set number of bytes and then waits for the
+    /// test to open it further.
+    #[derive(Clone)]
+    struct GatedTerminal(Arc<std::sync::Mutex<TerminalState>>);
+
+    impl GatedTerminal {
+        fn with_room(room: usize) -> Self {
+            Self(Arc::new(std::sync::Mutex::new(TerminalState {
+                room,
+                ..TerminalState::default()
+            })))
+        }
+
+        fn open_fully(&self) {
+            let mut state = self.0.lock().expect("terminal state");
+            state.room = usize::MAX;
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+
+        fn taken(&self) -> Vec<u8> {
+            self.0.lock().expect("terminal state").taken.clone()
+        }
+
+        fn is_full(&self) -> bool {
+            self.0.lock().expect("terminal state").full
+        }
+    }
+
+    impl AsyncWrite for GatedTerminal {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut state = self.0.lock().expect("terminal state");
+            if state.room == 0 {
+                state.full = true;
+                state.waker = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
+            let taken = state.room.min(buf.len());
+            state.room -= taken;
+            state.taken.extend_from_slice(&buf[..taken]);
+            std::task::Poll::Ready(Ok(taken))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Scheduler turns that show a loop made no further progress.
+    const SCHEDULER_YIELDS: usize = 4096;
+
+    async fn settle() {
+        for _ in 0..SCHEDULER_YIELDS {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn dialog_modal() -> ModalState {
+        ModalState {
+            compositor: Compositor::new(80, 24),
+            snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
+            pending_output: Vec::new(),
+            active: false,
+        }
+    }
+
+    /// Runs the attach loop on `stream` and `terminal_input` against `stdout`
+    /// next to `scenario`, which ends the run.
+    async fn run_attach_against<T>(
+        stream: DuplexStream,
+        terminal_input: DuplexStream,
+        stdout: GatedTerminal,
+        modal: Option<ModalState>,
+        scenario: impl std::future::Future<Output = T>,
+    ) -> T {
+        let (client, _server, paths, _socket) = connect_stdin_test_client().await;
+        let mut attach = Box::pin(forward_attached_stream(
+            AttachIo {
+                stream,
+                stdin: terminal_input,
+                stdout,
+            },
+            client,
+            "stream-test".to_owned(),
+            AttachControlContext {
+                host: PinnedHost::local(),
+                paths,
+                target: "local/s-42".parse().expect("test target"),
+            },
+            modal,
+            None,
+            None,
+        ));
+        tokio::select! {
+            end = &mut attach => panic!("the attach loop ended: {end:?}"),
+            out = guard("the attach scenario", scenario) => out,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_output_stops_being_read_once_the_terminal_holds_a_full_queue() {
+        const FLOOD_BYTES: usize = 1024 * 1024;
+        const WRITE_BYTES: usize = 1024;
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
+        let (_daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (_typed, terminal_input) = tokio::io::duplex(1);
+        let terminal = GatedTerminal::with_room(0);
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flooding = Arc::clone(&written);
+        let flood = tokio::spawn(async move {
+            let chunk = [b'y'; WRITE_BYTES];
+            for _ in 0..FLOOD_BYTES / WRITE_BYTES {
+                if daemon_output.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                flooding.fetch_add(WRITE_BYTES, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let probe = terminal.clone();
+        let accepted = run_attach_against(stream, terminal_input, terminal, None, async move {
+            pohunek_test_support::wait::wait_until("the terminal to be full", || async {
+                probe.is_full().then_some(())
+            })
+            .await;
+            settle().await;
+            written.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+
+        // The loop holds the queue, one more read and the stream's own buffer;
+        // everything beyond stays with the stream's writer.
+        let bound = OUTPUT_QUEUE_BYTES + IO_BUFFER_BYTES + STREAM_BUFFER_BYTES + WRITE_BYTES;
+        assert!(
+            accepted <= bound,
+            "the loop kept reading stream output: {accepted} bytes read, at most {bound} expected"
+        );
+        assert!(!flood.is_finished(), "the whole flood was read");
+        flood.abort();
+    }
+
+    #[tokio::test]
+    async fn a_dialog_opened_over_a_partly_written_chunk_follows_the_whole_chunk() {
+        const CHUNK: &[u8] = b"agent output that the terminal takes in pieces";
+        const TAKEN_BYTES: usize = 7;
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_OUTPUT_BYTES);
+        let (_daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (mut typed, terminal_input) = tokio::io::duplex(1);
+        let terminal = GatedTerminal::with_room(TAKEN_BYTES);
+        daemon_output
+            .write_all(CHUNK)
+            .await
+            .expect("write the stream output");
+
+        let probe = terminal.clone();
+        let shown = run_attach_against(
+            stream,
+            terminal_input,
+            terminal,
+            Some(dialog_modal()),
+            async move {
+                pohunek_test_support::wait::wait_until("the terminal to be full", || async {
+                    probe.is_full().then_some(())
+                })
+                .await;
+                assert_eq!(probe.taken(), &CHUNK[..TAKEN_BYTES]);
+                typed
+                    .write_all(&[MENU_SHORTCUT_BYTE])
+                    .await
+                    .expect("type the menu shortcut");
+                // The second byte fits the one-byte input pipe only once the
+                // loop read the shortcut, with the chunk still half written.
+                typed.write_all(b"j").await.expect("type a dialog key");
+                settle().await;
+                probe.open_fully();
+                pohunek_test_support::wait::wait_until("the dialog frame", || async {
+                    (probe.taken().len() > CHUNK.len()).then(|| probe.taken())
+                })
+                .await
+            },
+        )
+        .await;
+
+        assert!(
+            shown.starts_with(CHUNK),
+            "the dialog landed inside the chunk: {:?}",
+            String::from_utf8_lossy(&shown[..CHUNK.len()])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_dialog_waits_while_the_terminal_holds_a_full_queue() {
+        const FLOOD_BYTES: usize = 256 * 1024;
+        let (stream, daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
+        let (_daemon_input, mut daemon_output) = tokio::io::split(daemon_end);
+        let (mut typed, terminal_input) = tokio::io::duplex(1);
+        let terminal = GatedTerminal::with_room(0);
+        let flood = tokio::spawn(async move {
+            let _ = daemon_output.write_all(&vec![b'y'; FLOOD_BYTES]).await;
+        });
+
+        let probe = terminal.clone();
+        let dialog_input_waits = run_attach_against(
+            stream,
+            terminal_input,
+            terminal,
+            Some(dialog_modal()),
+            async move {
+                pohunek_test_support::wait::wait_until("the terminal to be full", || async {
+                    probe.is_full().then_some(())
+                })
+                .await;
+                // The stream is no longer read once the queue holds its bound.
+                settle().await;
+                typed
+                    .write_all(&[MENU_SHORTCUT_BYTE])
+                    .await
+                    .expect("type the menu shortcut");
+                // Each key of an open dialog queues a frame, so they wait.
+                let keys = async {
+                    for _ in 0..4 {
+                        typed.write_all(b"j").await.expect("type a dialog key");
+                    }
+                };
+                tokio::select! {
+                    () = keys => false,
+                    () = settle() => true,
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            dialog_input_waits,
+            "the dialog keys were read while the queue was full"
+        );
+        flood.abort();
     }
 
     #[tokio::test]
