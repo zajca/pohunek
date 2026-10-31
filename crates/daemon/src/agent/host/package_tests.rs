@@ -1061,28 +1061,58 @@ fn a_recovered_safe_text_runtime_keeps_its_input_safety_when_its_package_fails_v
         std::time::Duration::from_millis(5),
     ));
     assert!(!open.to_standalone_rules().is_restricted());
+}
 
-    // A runtime that only refuses input while blocked keeps that refusal
-    // without the safe-text contract.
-    let refusing = crate::store::StoredInputRules::from(
-        crate::agent::InputRules::unrestricted(true, std::time::Duration::from_millis(5))
-            .refusing_while_blocked(true),
+#[test]
+fn a_recovered_refuse_only_runtime_keeps_refusing_while_blocked_when_its_package_fails_verification(
+) {
+    let plugins = Plugins::new();
+    let built = build(
+        &descriptor("acme.agent", "1.0.0", "acme")
+            .replace(
+                "runtime_api = 1",
+                "runtime_api = 1\nrequires = [\"input-refuse-while-blocked-v1\"]",
+            )
+            .replace(
+                "text_policy = \"unrestricted\"",
+                "text_policy = \"unrestricted\"\nrefuse_while_blocked = true",
+            ),
+        "refuse",
+        identity("acme.agent", "1.0.0"),
     );
-    let standalone = refusing.to_standalone_rules();
-    assert!(!standalone.is_restricted());
-    assert!(standalone.refuses_while_blocked());
-
-    // A snapshot written before `refuse_while_blocked` existed keeps the
-    // refusal of the safe-text contract it recorded.
-    let legacy_safe_text = crate::store::StoredInputRules {
-        bracketed_paste: true,
-        submit_delay_ms: 5,
-        restricted: true,
-        refuse_while_blocked: false,
+    install(&plugins.registry(), &built, true, true);
+    let host = plugins.host();
+    let reference = RuntimeRef::from_wire("acme");
+    let pin = pin_of(&built, "acme");
+    let launched = host
+        .resolve_id(&runtime("acme"))
+        .expect("loaded")
+        .input_rules();
+    assert!(
+        !launched.is_restricted(),
+        "the runtime declares the refusal only, not safe text"
+    );
+    let stored = crate::store::StoredInputRules::from(launched);
+    let check = |rules: crate::agent::InputRules| {
+        (
+            rules.validate_text("bad\u{1b}[31m").is_err(),
+            rules
+                .validate_activity(Some(protocol::AgentActivity::Blocked))
+                .is_err(),
+        )
     };
-    assert!(legacy_safe_text
-        .to_standalone_rules()
-        .refuses_while_blocked());
+
+    // Verified: the pinned definition supplies the contract.
+    let verified = crate::agent::recovered_input_rules(&host, &reference, &pin, stored);
+    assert_eq!(check(verified), (false, true));
+
+    // Verification fails: the refusal persisted at launch still applies, and
+    // the text stays unrestricted.
+    tamper(&plugins, &built.digest, &Tamper::Append);
+    host.definition_for_pin(&reference, &pin)
+        .expect_err("the pinned package no longer verifies");
+    let degraded = crate::agent::recovered_input_rules(&host, &reference, &pin, stored);
+    assert_eq!(check(degraded), (false, true));
 }
 
 /// The fixture descriptor of runtime `acme` with an `[integration]` table.
