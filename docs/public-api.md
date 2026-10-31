@@ -4909,7 +4909,8 @@ Attach stream rules:
   forwarding output and closes the stream once the program's terminal accepted
   the last input frame it sent ("written to the program's terminal", not "read
   by the program"), or earlier when the program exits, the session stops, the
-  lease is released or an output write fails. Output still queued behind the
+  lease is released, a detach by stream id arrives, the worker reports an
+  error or an output write fails. Output still queued behind the
   last acknowledgement when the stream ends may not be shown. A client with no
   input closes at once. A client must keep reading until the daemon closes the
   stream.

@@ -5949,10 +5949,10 @@ async fn closing_the_attach_connection_releases_the_bridge_while_its_input_waits
 }
 
 /// Bytes a half-closing client writes: more than the terminal queues for a
-/// program that does not read (4 KiB), less than the buffers between the client
+/// program that does not read (`PTY_UNREAD_INPUT_CAPACITY`), less than the buffers between the client
 /// and the worker hold, so the daemon has passed all of it on when it sees the
 /// end of the client's input.
-const DRAIN_PAYLOAD_BYTES: usize = 64 * 1024;
+const DRAIN_PAYLOAD_BYTES: usize = 128 * 1024;
 
 /// Send buffer requested for the client, so the whole payload is accepted
 /// without the program reading any of it.

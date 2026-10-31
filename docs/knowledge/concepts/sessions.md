@@ -1335,8 +1335,8 @@ write is not acknowledged. When the client shuts down its write half, the
 daemon stops reading the client, keeps forwarding output and closes the stream
 once the last input frame it sent was acknowledged, or earlier when the program
 exits, the worker reports an error, the session stops, the lease is released,
-an output write to the client fails or the client closes its connection
-completely. Output still queued behind the last acknowledgement when the stream
+an output write to the client fails or the client closes a Unix socket
+connection completely. Output still queued behind the last acknowledgement when the stream
 ends may not be shown. While a paste waits for a program that does not read, the
 bridge also ends when the client closes a Unix socket connection completely (a
 hangup of the connection, not an end of the client's input). At the end of its

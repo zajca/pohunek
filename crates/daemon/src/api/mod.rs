@@ -661,7 +661,7 @@ where
                 return Ok(());
             }
             Dispatch::Attach(stream_id) => {
-                let hangup = framed.get_ref().hangup_watch();
+                let hangup = framed.get_ref().hangup_watch(&stream_id);
                 run_attach_connection(framed, state.sessions.clone(), stream_id, hangup).await?;
                 return Ok(());
             }

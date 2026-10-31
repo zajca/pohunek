@@ -30,27 +30,28 @@ impl HangupWatch {
 pub(super) trait ClientTransport {
     /// The watch for this connection, or `None` when the transport reports a
     /// peer's close only through reads and writes.
-    fn hangup_watch(&self) -> Option<HangupWatch>;
+    fn hangup_watch(&self, stream_id: &str) -> Option<HangupWatch>;
 }
 
 impl ClientTransport for UnixStream {
-    fn hangup_watch(&self) -> Option<HangupWatch> {
+    fn hangup_watch(&self, stream_id: &str) -> Option<HangupWatch> {
         let duplicate = self
             .as_fd()
             .try_clone_to_owned()
-            .inspect_err(|error| warn!(%error, "attach hangup watch not armed: descriptor duplication failed"))
+            .inspect_err(|error| warn!(%error, stream_id, "attach hangup watch not armed: descriptor duplication failed"))
             .ok()?;
         let watched = AsyncFd::with_interest(duplicate, Interest::WRITABLE)
             .inspect_err(
-                |error| warn!(%error, "attach hangup watch not armed: reactor registration failed"),
+                |error| warn!(%error, stream_id, "attach hangup watch not armed: reactor registration failed"),
             )
             .ok()?;
+        let stream_id = stream_id.to_owned();
         Some(HangupWatch(Box::pin(async move {
             loop {
                 let mut ready = match watched.ready(Interest::WRITABLE).await {
                     Ok(ready) => ready,
                     Err(error) => {
-                        warn!(%error, "attach hangup watch stopped: readiness failed");
+                        warn!(%error, stream_id, "attach hangup watch stopped: readiness failed");
                         std::future::pending::<()>().await;
                         return;
                     }
@@ -65,13 +66,13 @@ impl ClientTransport for UnixStream {
 }
 
 impl ClientTransport for TcpStream {
-    fn hangup_watch(&self) -> Option<HangupWatch> {
+    fn hangup_watch(&self, _stream_id: &str) -> Option<HangupWatch> {
         None
     }
 }
 
 impl ClientTransport for DuplexStream {
-    fn hangup_watch(&self) -> Option<HangupWatch> {
+    fn hangup_watch(&self, _stream_id: &str) -> Option<HangupWatch> {
         None
     }
 }

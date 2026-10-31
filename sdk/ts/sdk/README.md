@@ -250,7 +250,13 @@ try {
   // Closing the stream is a disconnect: wait for the output of the command
   // (or the session activity) before closing or detaching.
   const reader = raw.readable.getReader();
-  await reader.read();
+  const decoder = new TextDecoder();
+  let seen = "";
+  while (!/pwd\r?\n\//.test(seen)) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    seen += decoder.decode(value, { stream: true });
+  }
   reader.releaseLock();
 } finally {
   await raw.close();
