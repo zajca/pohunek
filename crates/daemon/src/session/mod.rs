@@ -2870,15 +2870,24 @@ impl SessionRegistry {
     /// store writes still in flight. When it returns the registry writes
     /// nothing more: a store write through it is refused with
     /// `registry_shut_down` (and aborts the process in test builds, where it is
-    /// always a defect). A task that outlived the deadline is named in the
-    /// report and logged. Daemon shutdown calls it after the tasks that drive
+    /// always a defect). The external session observer and its watcher are
+    /// stopped and awaited concurrently, within the same deadline. A task that outlived the deadline is
+    /// named in the report and logged. Daemon shutdown calls it after the tasks that drive
     /// the registry from outside have stopped; a test calls it before it opens
     /// the next registry over the same store.
     pub async fn shutdown(&self) -> ShutdownReport {
         self.begin_daemon_shutdown();
         self.drain_creates().await;
         let timeout = self.inner.config.shutdown_timeout;
-        let report = self.inner.background.shutdown(timeout).await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (observer, mut report) = tokio::join!(
+            tokio::time::timeout_at(deadline, self.inner.external.stopped()),
+            self.inner.background.shutdown(timeout),
+        );
+        if observer.is_err() {
+            report.still_running.push("external_observer");
+            report.outstanding += self.inner.external.tasks_running().max(1);
+        }
         if report.is_quiescent() {
             debug!("session registry background tasks stopped");
         } else {
@@ -2904,6 +2913,12 @@ impl SessionRegistry {
             let _ = held.await;
         }));
         release
+    }
+
+    /// The registry's external session store and observer tasks.
+    #[cfg(test)]
+    pub(crate) fn external_for_test(&self) -> &ExternalSessions {
+        &self.inner.external
     }
 
     /// Whether [`Self::shutdown`] has waited for the registry's tracked work.

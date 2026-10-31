@@ -30,7 +30,11 @@ STEPS = textwrap.dedent(
     import os, subprocess, sys
     {prelude}
     def git(*args):
-        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args], check=True, capture_output=True, text=True).stdout.strip()
+        try:
+            return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args], check=True, capture_output=True, text=True).stdout.strip()
+        except subprocess.CalledProcessError as failure:
+            sys.stderr.write("git-failed: " + args[0] + ": " + failure.stderr)
+            sys.exit(3)
 
     git("init", "-q", "repo")
     os.chdir("repo")
@@ -81,6 +85,8 @@ def hostile_environment(root):
         if not key.startswith("GIT_") and key not in ("CARGO_HOME", "RUSTUP_HOME")
     }
     environment.update(
+        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
         HOME=str(root),
         XDG_CONFIG_HOME=str(xdg),
         GIT_CONFIG_GLOBAL=str(files["global"]),
@@ -129,7 +135,11 @@ class HermeticGitTests(unittest.TestCase):
 
     def test_the_same_steps_fail_without_the_isolation(self):
         result, _ = self.run_steps("")
-        self.assertNotEqual(result.returncode, 0, "the fixture configuration is not hostile")
+        self.assertEqual(result.returncode, 3, f"a git step did not fail: {result.stderr}")
+        self.assertTrue(
+            result.stderr.startswith("git-failed: commit:"),
+            f"the hostile configuration did not stop the commit: {result.stderr}",
+        )
 
     def test_every_test_module_that_runs_git_isolates_it(self):
         for path in sorted(TESTS.glob("test_*.py")):

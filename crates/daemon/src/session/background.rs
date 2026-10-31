@@ -41,7 +41,8 @@ pub(super) enum OnShutdown {
 pub struct ShutdownReport {
     /// Names of the tasks still running when the deadline passed.
     pub still_running: Vec<&'static str>,
-    /// Tracked work (tasks and blocking store writes) still outstanding.
+    /// Tracked work (tasks and blocking store writes) still outstanding, plus
+    /// the external observer's tasks when they outlived the deadline.
     pub outstanding: usize,
 }
 

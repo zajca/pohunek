@@ -4,8 +4,6 @@
 # regenerate with the ignored `regenerate_detached_spawn_baseline` test.
 crates/daemon/src/api/mod.rs 2
 crates/daemon/src/events/mod.rs 1
-crates/daemon/src/external/mod.rs 1
-crates/daemon/src/external/watch.rs 1
 crates/daemon/src/main.rs 2
 crates/daemon/src/runtime/client.rs 1
 crates/daemon/src/runtime/launcher.rs 1

@@ -28,6 +28,7 @@ use tokio::sync::{watch, Notify};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tokio_util::time::DelayQueue;
 use tracing::{debug, info, warn};
 
@@ -436,6 +437,8 @@ struct Watcher<B, S, P> {
 
 /// Runs the first reconciliation pass and spawns the runner.
 ///
+/// The runner is spawned on `tasks`.
+///
 /// `open_error` carries the failure of opening the backend, in which case the
 /// runner starts unavailable and keeps trying to restart it while the passes
 /// continue.
@@ -444,6 +447,7 @@ pub(super) async fn start<B, S, P>(
     roots: P,
     sink: Arc<S>,
     shutdown: CancellationToken,
+    tasks: &TaskTracker,
     open_error: Option<io::Error>,
 ) -> WatcherHandle
 where
@@ -482,7 +486,7 @@ where
         watcher.schedule_restart();
     }
     watcher.reconcile().await;
-    tokio::spawn(watcher.run());
+    tasks.spawn(watcher.run());
     WatcherHandle {
         state: state_rx,
         nudge,
