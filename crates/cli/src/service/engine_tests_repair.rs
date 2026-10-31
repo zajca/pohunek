@@ -610,3 +610,40 @@ async fn a_rollback_onto_a_refused_directory_names_the_repair() {
         error.hint()
     );
 }
+
+/// A live worker that runs from a set-aside directory and is covered by no
+/// journal still counts as an unattributed worker of a legacy rollback.
+#[tokio::test]
+async fn a_worker_in_a_set_aside_directory_is_unattributed_for_the_rollback() {
+    let previous = "0.33.0";
+    let harness = Harness::new();
+    harness.install(previous).await.expect("install");
+    harness.fake.world().running = false;
+    refuse(&harness, previous);
+    let moved = repair_with(&harness, harness.engine(), previous)
+        .await
+        .expect("repair")
+        .repair
+        .and_then(|repair| repair.set_aside)
+        .expect("set aside");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    let worker = moved.join("pohunek-sessiond");
+    pohunek_test_support::hold::install_at(&worker).expect("install the holding image");
+    let mut child = spawn_tracked(&mut pohunek_test_support::hold::command_for(&worker));
+
+    let refused = harness.upgrade(previous).await;
+    child.kill().expect("kill stand-in");
+    child.wait().expect("reap stand-in");
+
+    let error = refused.expect_err("the unattributed worker needs consent");
+    assert_eq!(error.code(), "service_rollback_sessions_at_risk");
+    assert!(
+        error.to_string().contains("unattributed live worker"),
+        "{error}"
+    );
+}

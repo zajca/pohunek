@@ -671,6 +671,16 @@ pub fn version_of(layout: &InstallLayout, path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether `path` lies inside an entry a repair set aside.
+#[must_use]
+pub fn in_refused_entry(layout: &InstallLayout, path: &Path) -> bool {
+    path.strip_prefix(layout.versions_dir())
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|first| first.as_os_str().to_str())
+        .is_some_and(|name| name.starts_with(REFUSED_PREFIX))
+}
+
 /// How a release directory was vetted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Origin {

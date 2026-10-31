@@ -245,7 +245,9 @@ fn unattributed_workers(
                 });
             }
         };
-        if layout::version_of(inputs.layout, &executable).is_some() {
+        if layout::version_of(inputs.layout, &executable).is_some()
+            || layout::in_refused_entry(inputs.layout, &executable)
+        {
             sessions.push(unverified(
                 format!("pid-{}", process.pid),
                 format!(
