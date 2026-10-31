@@ -86,7 +86,7 @@ pohunek-cli = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 # `attach_stream_input.rs` shrinks the CLI's stdout pipe and counts its queued bytes.
-rustix = { workspace = true, features = ["pipe"] }
+rustix = { workspace = true, features = ["fs", "pipe"] }
 portable-pty = { workspace = true }
 overlay = { workspace = true }
 pohunek-test-support = { workspace = true, features = ["catalog"] }
