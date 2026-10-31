@@ -6022,6 +6022,25 @@ async fn write_drain_payload(raw: &UnixStream) {
     .await;
 }
 
+/// Bytes the peer of `stream` has not read yet. A client that closes only after
+/// the daemon read its whole input makes the daemon see the close while it
+/// waits for the program, not while it is still forwarding.
+#[cfg(target_os = "linux")]
+fn unread_by_peer(stream: &UnixStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut unread: libc::c_int = 0;
+    // SAFETY: the descriptor is open for the duration of the call and `unread`
+    // is a valid out-pointer for this request.
+    let status = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut unread) };
+    assert_eq!(status, 0, "query the unread bytes of the raw stream");
+    usize::try_from(unread).expect("a byte count is not negative")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unread_by_peer(_stream: &UnixStream) -> usize {
+    0
+}
+
 #[tokio::test]
 async fn a_half_closed_attach_input_is_written_to_the_terminal_before_the_stream_closes() {
     let socket = temp_socket("attach-drain-delivers");
@@ -6081,6 +6100,10 @@ async fn closing_a_half_closed_attach_connection_ends_the_wait_for_the_program()
 
     write_drain_payload(&raw).await;
     raw.shutdown().await.expect("half-close the raw stream");
+    wait_until("the daemon to have read the payload", || async {
+        (unread_by_peer(&raw) == 0).then_some(())
+    })
+    .await;
     drop(raw);
     wait_for_attach_event(&mut subscriber, event::ATTACH_CLOSED, &attach.stream_id).await;
 
