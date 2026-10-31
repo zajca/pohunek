@@ -20,11 +20,17 @@
 //! work; see [`crate::worktree`]), and a project record outlives every session.
 //!
 //! Each line is a tagged [`Record`] (`{"kind":"resume", ...}` /
-//! `{"kind":"worktree", ...}` / `{"kind":"project", ...}`). Every mutation
-//! re-reads the whole file under the write lock, edits the relevant record kind,
-//! and rewrites **all** records, preserving the other kinds untouched. The file
-//! is small (one line per resumable session, per bound worktree, and per known
-//! project) so a full rewrite per mutation is cheap. No daemon-derived secrets
+//! `{"kind":"worktree", ...}` / `{"kind":"project", ...}`). Every access reads the
+//! whole file. The decode of the bytes last read or written is kept as a snapshot
+//! and used again only when the bytes read are equal to it, so any writer, in this
+//! process or outside it, is seen whatever it does to the file's metadata. Every
+//! mutation takes the snapshot under the write lock, edits the relevant record
+//! kind, and rewrites **all** records, preserving the other kinds untouched. The
+//! rewrite serialises only the records the mutation touched and writes the cached
+//! line of each other record, which is this build's serialisation of the decoded
+//! record, never the text found in the file, so the bytes written are those of
+//! serialising every record and the allocation work of a write does not grow with
+//! the number of records. No daemon-derived secrets
 //! are ever written: a native session id, a cwd, a repository path, a branch, a
 //! worktree path, and a project's git common dir / credential-redacted origin URL
 //! are not secrets. Owner-controlled session metadata is also persisted and must
@@ -3353,6 +3359,67 @@ mod tests {
         assert_eq!(ui.custom_name.as_deref(), Some("dashboard"));
         assert_eq!(ui.source, ProjectSource::Manual);
         assert_eq!(ui.last_used_at, "2026-06-20T00:00:00Z");
+    }
+
+    /// A write that fails before the rename leaves the file, and so the next
+    /// load, as it was; the next write commits.
+    #[test]
+    fn a_write_that_fails_before_the_rename_changes_nothing() {
+        let path = temp_store_path("fail-before-rename");
+        let store = Store::new(path.clone());
+        store
+            .record_project(&project("/code/ui/.git", "/code/ui", None))
+            .expect("record ui");
+        let before = std::fs::read(&path).expect("read the store");
+        assert_eq!(store.load_projects().expect("load").len(), 1);
+
+        store.fail_next_write_before_rename();
+        store
+            .record_project(&project("/code/api/.git", "/code/api", None))
+            .expect_err("the write fails before the rename");
+        assert_eq!(std::fs::read(&path).expect("read the store"), before);
+        assert_eq!(
+            store.load_projects().expect("load").len(),
+            1,
+            "the failed write is not visible"
+        );
+
+        store
+            .record_project(&project("/code/api/.git", "/code/api", None))
+            .expect("record api");
+        assert_eq!(store.load_projects().expect("load").len(), 2);
+        assert_eq!(
+            Store::new(path).load_projects().expect("load").len(),
+            2,
+            "a fresh handle reads the same records"
+        );
+    }
+
+    /// A rename whose parent sync fails has committed: the next load returns the
+    /// new records, and they equal what a fresh handle decodes.
+    #[test]
+    fn a_write_whose_parent_sync_fails_is_visible_to_the_next_load() {
+        let path = temp_store_path("fail-parent-sync");
+        let store = Store::new(path.clone());
+        store
+            .record_project(&project("/code/ui/.git", "/code/ui", None))
+            .expect("record ui");
+
+        store.fail_next_parent_sync_after_rename();
+        let outcome = store
+            .record_project(&project("/code/api/.git", "/code/api", None))
+            .expect("the rename committed");
+        assert!(matches!(
+            outcome,
+            StoreMutation::CommittedDurabilityUncertain { .. }
+        ));
+        let loaded = store.load_projects().expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded,
+            Store::new(path).load_projects().expect("load"),
+            "the remembered records equal a fresh decode"
+        );
     }
 
     #[test]
