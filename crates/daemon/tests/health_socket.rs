@@ -11,6 +11,8 @@
 // independent of the test host's processes whose markers cannot be read.
 #[path = "health_socket/branch_source.rs"]
 mod branch_source;
+#[path = "health_socket/connection_shutdown.rs"]
+mod connection_shutdown;
 #[path = "health_socket/native_attestation.rs"]
 mod native_attestation;
 #[path = "health_socket/native_recovery.rs"]
@@ -279,9 +281,15 @@ async fn spawn_server_with_overlay(
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server
-            .serve(async move {
-                let _ = rx.await;
-            })
+            .serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = rx.await;
+                },
+            )
             .await;
     });
     (tx, handle)
@@ -769,9 +777,15 @@ async fn serve_registry(
         // Removed after the server and its registry are gone.
         let _worker_home_dir = worker_home_dir;
         server
-            .serve(async move {
-                let _ = rx.await;
-            })
+            .serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = rx.await;
+                },
+            )
             .await;
     });
     (tx, handle, worker_home)

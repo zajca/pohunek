@@ -466,9 +466,15 @@ async fn a_local_only_command_is_not_exposed_over_a_peer() {
     let port = listener.local_addr().expect("peer address").port();
     let server = pohunek_daemon::api::RemoteServer::from_listener(listener, state);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio::spawn(server.serve(async move {
-        let _ = stopped.await;
-    }));
+    let serving = tokio::spawn(server.serve(
+        pohunek_daemon::api::ConnectionTasks::new(
+            "remote_connections",
+            &tokio_util::sync::CancellationToken::new(),
+        ),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
 
     let root = harness.env.root().to_path_buf();
     let (library, capture) = connect_redirect::build(&root);

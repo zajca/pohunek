@@ -5894,9 +5894,15 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
         .await
         .expect("the daemon socket binds");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio::spawn(server.serve(async move {
-        let _ = stopped.await;
-    }));
+    let serving = tokio::spawn(server.serve(
+        crate::api::ConnectionTasks::new(
+            "control_connections",
+            &tokio_util::sync::CancellationToken::new(),
+        ),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
 

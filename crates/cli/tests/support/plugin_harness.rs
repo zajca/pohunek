@@ -384,9 +384,15 @@ impl Harness {
         };
         let _ = ready.send(started);
         server
-            .serve(async move {
-                let _ = stop.await;
-            })
+            .serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = stop.await;
+                },
+            )
             .await;
         if let Some(attention) = attention {
             attention.stop().await;

@@ -2,7 +2,6 @@
 # calls in the production code of crates/daemon and crates/session-worker, per file.
 # Format: `<workspace-relative path> <count>`. Counts may only go down;
 # regenerate with the ignored `regenerate_detached_spawn_baseline` test.
-crates/daemon/src/api/mod.rs 2
 crates/daemon/src/events/mod.rs 1
 crates/daemon/src/main.rs 2
 crates/daemon/src/runtime/client.rs 1

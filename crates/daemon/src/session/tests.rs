@@ -26974,9 +26974,15 @@ impl HookRig {
         let (shutdown, stop) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             server
-                .serve(async move {
-                    let _ = stop.await;
-                })
+                .serve(
+                    crate::api::ConnectionTasks::new(
+                        "control_connections",
+                        &tokio_util::sync::CancellationToken::new(),
+                    ),
+                    async move {
+                        let _ = stop.await;
+                    },
+                )
                 .await;
         });
         Self {
