@@ -1198,8 +1198,12 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
     // generation outlives its session's stop.
     let mut stopped_sessions = Vec::new();
     for round in 0..CYCLE_ROUNDS {
-        let stopped = fixture.new_session(&format!("stopped-{round}")).await.id.0;
-        let removed = fixture.new_session(&format!("removed-{round}")).await.id.0;
+        let (stopped_name, removed_name) = (format!("stopped-{round}"), format!("removed-{round}"));
+        let (stopped, removed) = tokio::join!(
+            fixture.new_session(&stopped_name),
+            fixture.new_session(&removed_name),
+        );
+        let (stopped, removed) = (stopped.id.0, removed.id.0);
         let resumed = fixture
             .client()
             .await
@@ -1220,17 +1224,11 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
 
         bystanders.start(&mut fixture, round).await;
 
-        let mut client = fixture.client().await;
-        for session in [&stopped, recovered] {
-            client
-                .call::<method::SessionStop>(SessionId(session.to_owned()))
-                .await
-                .unwrap_or_else(|error| panic!("stop {session}: {error}"));
-        }
-        client
-            .call::<method::SessionRemove>(SessionId(removed.clone()))
-            .await
-            .unwrap_or_else(|error| panic!("remove {removed}: {error}"));
+        tokio::join!(
+            stop_session(&fixture, &stopped),
+            stop_session(&fixture, recovered),
+            remove_session(&fixture, &removed),
+        );
         if round % 2 == 0 {
             fixture.restart_daemon().await;
         } else {
@@ -1256,18 +1254,35 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
     .await;
     assert_eq!(generations.len(), CYCLE_ROUNDS);
 
-    let mut client = fixture.client().await;
-    for session in stopped_sessions
-        .iter()
-        .map(String::as_str)
-        .chain([recovered])
-    {
-        client
-            .call::<method::SessionRemove>(SessionId(session.to_owned()))
-            .await
-            .unwrap_or_else(|error| panic!("remove {session}: {error}"));
-    }
+    futures::future::join_all(
+        stopped_sessions
+            .iter()
+            .map(String::as_str)
+            .chain([recovered])
+            .map(|session| remove_session(&fixture, session)),
+    )
+    .await;
     assert_only_current_jobs(&fixture, &namespace, std::iter::empty(), CYCLE_ROUNDS).await;
+}
+
+/// Stops `session` over its own connection, so independent sessions stop concurrently.
+async fn stop_session(fixture: &Installation, session: &str) {
+    fixture
+        .client()
+        .await
+        .call::<method::SessionStop>(SessionId(session.to_owned()))
+        .await
+        .unwrap_or_else(|error| panic!("stop {session}: {error}"));
+}
+
+/// Removes `session` over its own connection, so independent sessions are removed concurrently.
+async fn remove_session(fixture: &Installation, session: &str) {
+    fixture
+        .client()
+        .await
+        .call::<method::SessionRemove>(SessionId(session.to_owned()))
+        .await
+        .unwrap_or_else(|error| panic!("remove {session}: {error}"));
 }
 
 /// Waits until the namespace holds exactly the jobs (and, on launchd, the

@@ -1,0 +1,3 @@
+## Unreleased (2026-10-31, supervised lifecycle cycle test, #1227)
+
+- `repeated_start_stop_recover_cycles_leave_no_orphans` creates the two sessions of a round together, stops and removes the round's sessions concurrently, and removes the remaining sessions concurrently at the end, each over its own connection; the assertions and the number of rounds are unchanged. On the macOS host the test takes 22.3 s instead of 28.1 s (26.5 s to 20.8 s inside the whole file). The other long lifecycle tests are bound by policy: `late_worker_is_retired_and_every_path_converges_to_one_generation` waits out two successive 6 s worker-initialize deadlines (the late and cancelled generations overlap) and a 4 s stability window by design (#1227).
