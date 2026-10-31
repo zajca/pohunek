@@ -166,6 +166,8 @@ const UPGRADE_PREFLIGHT_ARG: &str = "upgrade-preflight";
 const PROFILES_SUBDIR: &str = "agents";
 
 fn main() -> ExitCode {
+    // Before the runtime or any other thread exists, so every thread shares the bounded arenas.
+    pohunek_daemon::malloc::bound_arenas();
     // Declared before the runtime so it drops after it, on a return and while
     // a panic unwinds out of `block_on`: the log writer flushes last.
     let _flush_logs = FlushLogs;
@@ -200,6 +202,26 @@ impl Drop for FlushLogs {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
+    }
+}
+
+/// Logs once what [`pohunek_daemon::malloc::bound_arenas`] did.
+fn log_arena_bound() {
+    use pohunek_daemon::malloc::{recorded_bound, ArenaBound};
+    match recorded_bound() {
+        Some(ArenaBound::Applied { limit }) => {
+            info!(malloc_arena_max = limit, "malloc arenas bounded");
+        }
+        Some(ArenaBound::OperatorOverride) => {
+            info!("malloc arena limit set by the operator environment; left unchanged");
+        }
+        Some(ArenaBound::Rejected { limit }) => {
+            warn!(
+                malloc_arena_max = limit,
+                "mallopt refused the malloc arena bound"
+            );
+        }
+        Some(ArenaBound::Unsupported) | None => {}
     }
 }
 
@@ -574,6 +596,7 @@ async fn run() -> Result<(), DaemonError> {
         "pohunekd starting"
     );
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
+    log_arena_bound();
 
     // 6. Build the session registry with the hook-handshake socket path, the
     //    unified metadata store (logical sessions and related bindings), the
