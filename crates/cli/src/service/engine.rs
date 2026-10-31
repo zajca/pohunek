@@ -3525,8 +3525,9 @@ pub(crate) async fn ensure_no_daemon_job(backend: &Backend) -> Result<(), Error>
 ///
 /// A resume past the daemon replacement runs only its remaining steps, so the
 /// daemon keeps running from the directory it started in, which is the moved
-/// entry when the repair set it aside (`kept`); otherwise the steps of the
-/// transaction replace the daemon itself (`none`).
+/// entry when the repair set it aside (`kept`). Otherwise the daemon is
+/// replaced by the transaction's own steps, or already runs from the directory
+/// it started in (`none`).
 fn resumed_daemon(daemon_replaced: bool, set_aside: bool) -> &'static str {
     if daemon_replaced && set_aside {
         "kept"
