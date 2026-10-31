@@ -33,6 +33,12 @@
 //! binary-wide lock and unwind-safe override for tests that must change the
 //! process environment in-process.
 //!
+//! The [`git`] module holds [`git::command`], the `git` a test runs: no global
+//! or system Git configuration, a `HOME` no account owns, a fixed identity and
+//! no prompt, so a developer's signing, hook or URL-rewrite settings cannot
+//! reach a fixture repository. [`git::command_with_inherited_environment`] is
+//! for a scenario whose subject is how `git` reacts to settings it sets itself.
+//!
 //! The [`time`] module holds [`time::AutoAdvanceInhibitor`] and
 //! [`time::TIMER_TICK`], which let a test on tokio's paused clock await real
 //! I/O without the clock racing ahead of it.
@@ -81,6 +87,7 @@ pub mod bind_redirect;
 pub mod catalog;
 pub mod env;
 pub mod fs;
+pub mod git;
 pub mod hold;
 pub mod host_lock;
 pub mod process_env;

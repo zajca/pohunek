@@ -1043,7 +1043,7 @@ async fn a_corrupt_or_unsafe_record_fails_the_load() {
 
 /// Runs `git` in `dir`, panicking when it fails.
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let output = pohunek_test_support::process_env::command("git")
+    let output = pohunek_test_support::git::command()
         .args(args)
         .current_dir(dir)
         .output()

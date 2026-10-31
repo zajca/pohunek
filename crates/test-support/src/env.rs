@@ -452,6 +452,16 @@ impl TestEnv {
         command
     }
 
+    /// Returns a `git` command in this environment, with the configuration
+    /// isolation of [`crate::git`]: no global or system Git configuration, a
+    /// fixed identity and no prompt.
+    #[must_use]
+    pub fn git_command(&self) -> std::process::Command {
+        let mut command = self.command("git");
+        crate::git::isolate(&mut command);
+        command
+    }
+
     /// Returns a [`tokio::process::Command`] configured like [`TestEnv::command`].
     #[must_use]
     pub fn tokio_command(&self, program: impl AsRef<OsStr>) -> tokio::process::Command {

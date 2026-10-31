@@ -767,7 +767,7 @@ async fn a_typed_error_on_a_previous_version_connection_is_answered_in_that_vers
 async fn a_required_hook_failure_is_answered_in_the_previous_version() {
     let repo = pohunek_test_support::env::TestEnv::new().expect("create the repository");
     let git = |args: &[&str]| {
-        let out = repo.command("git").args(args).output().expect("run git");
+        let out = repo.git_command().args(args).output().expect("run git");
         assert!(out.status.success(), "git {args:?}: {out:?}");
     };
     git(&["-c", "init.defaultBranch=main", "init", "-q"]);

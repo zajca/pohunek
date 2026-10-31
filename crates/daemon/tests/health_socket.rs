@@ -968,7 +968,7 @@ fn init_git_repo() -> TestEnv {
     let env = TestEnv::new().expect("create the repository environment");
     let git = |args: &[&str]| {
         let out = env
-            .command("git")
+            .git_command()
             .args(args)
             .output()
             .expect("run git in the repository environment");

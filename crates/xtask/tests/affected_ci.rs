@@ -209,7 +209,7 @@ impl Repo {
     fn git(&self, args: &[&str]) {
         let output = self
             .env
-            .command("git")
+            .git_command()
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1484,7 +1484,7 @@ fn sparse_checkout(repo: &Repo, packages: &[&str]) -> Output {
     if output.status.success() {
         let mut child = repo
             .env
-            .command("git")
+            .git_command()
             .args(["sparse-checkout", "set", "--no-cone", "--stdin"])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")

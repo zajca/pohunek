@@ -48,8 +48,9 @@
 //!   listener and is reported; hand the bound listener to the code under test
 //!   (`from_std`, a socket path from `TestEnv::socket_path`) instead.
 //!
-//! - `std::env::set_var` and `std::env::remove_var`, also written
-//!   `env::set_var`, a bare `set_var`/`remove_var` imported from `std::env`
+//! - `std::env::set_var`, `std::env::remove_var` and `std::env::set_current_dir`,
+//!   also written `env::set_var`, a bare `set_var`/`remove_var`/`set_current_dir`
+//!   imported from `std::env`
 //!   (by name, aliased with `as`, or through a glob), in test code outside
 //!   `crates/test-support`. The process environment is shared by every test
 //!   thread of a binary, so a test that must change it does so through
@@ -129,7 +130,9 @@ impl Rule {
             Self::TmpLiteral => "host /tmp path literal",
             Self::Tempfile => "tempfile crate fixture outside pohunek_test_support",
             Self::PortZeroBind => "TcpListener::bind(..:0) whose listener is not kept",
-            Self::EnvMutation => "std::env::set_var/remove_var outside pohunek_test_support",
+            Self::EnvMutation => {
+                "std::env::set_var/remove_var/set_current_dir outside pohunek_test_support"
+            }
         }
     }
 
@@ -155,7 +158,9 @@ impl Rule {
             Self::EnvMutation => {
                 "pass the value to the code under test, or change it through \
                  `pohunek_test_support::process_env::ProcessEnv` (`lock()`, `set`, \
-                 `remove`); no marker exempts this rule"
+                 `remove`), or the working directory through \
+                 `pohunek_test_support::process_env::set_current_dir` in a test of its \
+                 own process; no marker exempts this rule"
             }
         }
     }
@@ -330,10 +335,10 @@ fn temp_dir_candidates(skeleton: &str) -> Vec<usize> {
     found
 }
 
-/// `std::env` mutators.
-const ENV_MUTATORS: [&str; 2] = ["set_var", "remove_var"];
+/// `std::env` mutators: the environment and the working directory.
+const ENV_MUTATORS: [&str; 3] = ["set_var", "remove_var", "set_current_dir"];
 
-/// Whether a bare `set_var`/`remove_var` can denote the `std::env` function:
+/// Whether a bare `set_var`/`remove_var`/`set_current_dir` can denote the `std::env` function:
 /// imported by name, or through a glob of a path that ends in `env`.
 fn env_mutators_imported(skeleton: &str) -> bool {
     if !imported_names(skeleton, "env", &ENV_MUTATORS).is_empty() {
@@ -350,7 +355,7 @@ fn env_mutators_imported(skeleton: &str) -> bool {
     })
 }
 
-/// `env::set_var` / `env::remove_var` uses, and an `as` alias of either in an
+/// `env::set_var` / `env::remove_var` / `env::set_current_dir` uses, and an `as` alias of either in an
 /// import from `env`.
 fn env_mutation_candidates(skeleton: &str) -> Vec<usize> {
     let bytes = skeleton.as_bytes();
@@ -1605,6 +1610,10 @@ fn every_env_mutation_call_form_is_flagged() {
         "std::env :: set_var(\"K\", \"v\");",
         "unsafe { std::env::set_var(\"K\", \"v\") };",
         "let f = std::env::set_var::<&str, &str>;",
+        "std::env::set_current_dir(\"/work\").unwrap();",
+        "env::set_current_dir(dir)?;",
+        "::std::env::set_current_dir(&dir).expect(\"enter\");",
+        "let enter = std::env::set_current_dir;",
     ] {
         let found = flagged(call);
         assert_eq!(found.len(), 1, "{call}: {found:?}");
@@ -1620,6 +1629,15 @@ fn an_imported_bare_env_mutator_is_flagged_at_the_call() {
         ("use std::env::{self, set_var};", "set_var(\"K\", \"v\");"),
         ("use std::env::{remove_var, var};", "remove_var(\"K\");"),
         ("use std::env::*;", "set_var(\"K\", \"v\");"),
+        (
+            "use std::env::set_current_dir;",
+            "set_current_dir(dir).unwrap();",
+        ),
+        (
+            "use std::env::{self, set_current_dir};",
+            "set_current_dir(dir).unwrap();",
+        ),
+        ("use std::env::*;", "set_current_dir(dir).unwrap();"),
     ] {
         let text = format!("{import}\n#[test]\nfn f() {{\n    {call}\n}}\n");
         assert_eq!(
@@ -1642,6 +1660,11 @@ fn a_mutator_called_through_an_env_module_alias_is_flagged() {
         ("use std::env::{self as e};", "e::set_var(\"K\", \"v\");"),
         ("use std::env::{self as e, var};", "e::remove_var(\"K\");"),
         ("use ::std::env as e;", "e::set_var(\"K\", \"v\");"),
+        ("use std::env as e;", "e::set_current_dir(dir).unwrap();"),
+        (
+            "use std::env::{self as e};",
+            "e::set_current_dir(dir).unwrap();",
+        ),
     ] {
         let text = format!("{import}\n#[test]\nfn f() {{\n    {call}\n}}\n");
         assert_eq!(
@@ -1661,6 +1684,8 @@ fn a_mutator_called_through_an_env_module_alias_is_flagged() {
 fn an_aliased_env_mutator_import_is_flagged_at_the_import() {
     let text = "#[cfg(test)]\nmod tests {\n    use std::env::set_var as put;\n    #[test]\n    fn f() {\n        put(\"K\", \"v\");\n    }\n}\n";
     assert_eq!(rules_of(&scan_one(DEMO, text)), [(3, Rule::EnvMutation)]);
+    let cwd = "#[cfg(test)]\nmod tests {\n    use std::env::set_current_dir as enter;\n    #[test]\n    fn f() {\n        enter(dir).unwrap();\n    }\n}\n";
+    assert_eq!(rules_of(&scan_one(DEMO, cwd)), [(3, Rule::EnvMutation)]);
 }
 
 #[test]
@@ -1670,6 +1695,8 @@ fn env_mutation_lookalikes_and_the_shared_override_are_not_flagged() {
         "set_var_checked(\"K\");",
         "registry.set_var(\"K\", \"v\");",
         "other::set_var(\"K\", \"v\");",
+        "pohunek_test_support::process_env::set_current_dir(&dir);",
+        "process_env::set_current_dir(&dir);",
         "set_var(\"K\", \"v\");",
         "fn set_var() {}",
         "let remove_var = 1;",
@@ -1728,7 +1755,7 @@ fn env_mutation_guidance_names_the_shared_override_and_no_marker() {
     assert_eq!(
         evaluate(&scan),
         [format!(
-            "{DEMO}:3: std::env::set_var/remove_var outside pohunek_test_support"
+            "{DEMO}:3: std::env::set_var/remove_var/set_current_dir outside pohunek_test_support"
         )]
     );
     let advice = guidance(&scan);

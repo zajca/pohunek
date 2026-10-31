@@ -4264,7 +4264,7 @@ async fn wait_for_cwd_source(
 
 /// Run git in `dir`, asserting success (test helper for the worktree path).
 fn git_in(dir: &std::path::Path, args: &[&str]) {
-    let output = pohunek_test_support::process_env::command("git")
+    let output = pohunek_test_support::git::command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -4285,7 +4285,7 @@ fn init_git_repo(tag: &str) -> PathBuf {
         .expect("store parent")
         .join("repo");
     std::fs::create_dir_all(&dir).expect("create repo dir");
-    let init = pohunek_test_support::process_env::command("git")
+    let init = pohunek_test_support::git::command()
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&dir)
         .output()
@@ -4309,7 +4309,7 @@ fn init_bare_git_repo(tag: &str) -> PathBuf {
         .parent()
         .expect("store parent")
         .join("bare.git");
-    let clone = pohunek_test_support::process_env::command("git")
+    let clone = pohunek_test_support::git::command()
         .args(["clone", "--bare", "-q"])
         .arg(&source)
         .arg(&bare)
@@ -4991,7 +4991,7 @@ async fn failed_launch_rolls_back_the_bound_worktree() {
     );
 
     // And git no longer holds feat/x in any worktree, so a fresh bind succeeds.
-    let listing = pohunek_test_support::process_env::command("git")
+    let listing = pohunek_test_support::git::command()
         .arg("-C")
         .arg(&repo)
         .args(["worktree", "list", "--porcelain"])
@@ -5081,7 +5081,7 @@ async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effe
                 .is_empty(),
             "no logical session record for {case}"
         );
-        let worktree_listing = pohunek_test_support::process_env::command("git")
+        let worktree_listing = pohunek_test_support::git::command()
             .arg("-C")
             .arg(repo)
             .args(["worktree", "list", "--porcelain"])
@@ -5367,7 +5367,7 @@ async fn failed_initial_input_rollback_frees_the_bound_worktree() {
     );
 
     // git no longer holds feat/x in any worktree, so a fresh bind succeeds.
-    let listing = pohunek_test_support::process_env::command("git")
+    let listing = pohunek_test_support::git::command()
         .arg("-C")
         .arg(&repo)
         .args(["worktree", "list", "--porcelain"])
@@ -20904,6 +20904,19 @@ struct UnreadableCandidateHost {
 }
 
 impl UnreadableCandidateHost {
+    /// A host whose scripted candidates are live unreadable survivors, so a
+    /// sweep keeps them whether a journal of the worker bounds the runtime
+    /// (a journaled sweep) or none does (a record-only sweep). A scenario that
+    /// starts from [`record_only_session`] uses it unless it asserts that a
+    /// journaled sweep dismisses the candidate, or that a record-only sweep
+    /// refuses one that is not live (it then calls
+    /// [`RecordOnlySession::assert_record_only`] first).
+    fn live() -> Self {
+        let host = Self::default();
+        host.set_live_candidates(true);
+        host
+    }
+
     fn set_candidate(&self, present: bool) {
         self.set_candidates(usize::from(present));
     }
@@ -21280,6 +21293,9 @@ struct RecordOnlySession {
     info: SessionInfo,
     journals: PathBuf,
     deleted_at_micros: u128,
+    /// The journals the fixture deleted, with their bytes, so a scenario can
+    /// put one back as a late write of the worker would.
+    deleted: Vec<(PathBuf, Vec<u8>, u32)>,
 }
 
 impl std::ops::Deref for RecordOnlySession {
@@ -21291,6 +21307,42 @@ impl std::ops::Deref for RecordOnlySession {
 }
 
 impl RecordOnlySession {
+    /// Writes the deleted journals back, as a late write of the worker would,
+    /// which turns the next removal sweep into a journaled one. A journal that
+    /// has already reappeared is overwritten with the original bytes.
+    fn restore_journals(&self) {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        for (path, bytes, mode) in &self.deleted {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(*mode)
+                .open(path)
+                .expect("restore the worker journal");
+            std::io::Write::write_all(&mut file, bytes).expect("write the worker journal");
+            file.set_permissions(fs::Permissions::from_mode(*mode))
+                .expect("restore the journal mode");
+        }
+    }
+
+    /// Fails with [`Self::report`] when a worker journal is present, because
+    /// the next removal would then run a journaled sweep and not the
+    /// record-only sweep the scenario asserts.
+    fn assert_record_only(&self) {
+        let journaled = fs::read_dir(&self.journals).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        });
+        assert!(
+            !journaled,
+            "a worker journal reappeared, so the removal would not be record-only\n{}",
+            self.report()
+        );
+    }
+
     /// Microseconds since the Unix epoch, the clock of the file mtimes.
     fn epoch_micros(time: std::time::SystemTime) -> u128 {
         time.duration_since(std::time::UNIX_EPOCH)
@@ -21414,22 +21466,31 @@ async fn record_only_session_in(
         acknowledged.then_some(())
     })
     .await;
-    let mut removed_journals = 0;
+    let mut deleted = Vec::new();
     for journal in fs::read_dir(&journals).expect("read the session's journals") {
         let journal = journal.expect("journal entry").path();
         if journal
             .extension()
             .is_some_and(|extension| extension == "json")
         {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let bytes = fs::read(&journal).expect("read the worker journal");
+            let mode = fs::metadata(&journal)
+                .expect("worker journal metadata")
+                .permissions()
+                .mode()
+                & 0o777;
             fs::remove_file(&journal).expect("remove the worker journal");
-            removed_journals += 1;
+            deleted.push((journal, bytes, mode));
         }
     }
-    assert!(removed_journals > 0, "the worker journaled its runtime");
+    assert!(!deleted.is_empty(), "the worker journaled its runtime");
     RecordOnlySession {
         info: session,
         journals,
         deleted_at_micros: RecordOnlySession::epoch_micros(std::time::SystemTime::now()),
+        deleted,
     }
 }
 
@@ -21599,26 +21660,75 @@ async fn removal_sweeps_a_restarted_runtime_but_refuses_an_unverified_marker() {
     assert!(!own.alive(), "removal sweeps the restarted runtime");
 }
 
+/// A journal that reappears after the fixture deleted it (a late write of the
+/// worker) turns the sweep into a journaled one, which dismisses a candidate
+/// whose start is not proven later than the worker's. A live candidate is kept
+/// either way, so a scenario that opts in does not depend on the late write.
+#[tokio::test]
+async fn a_reappearing_journal_does_not_change_what_a_live_candidate_blocks() {
+    let live = Arc::new(UnreadableCandidateHost::live());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-late-journal-live",
+        Arc::clone(&live) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    session.restore_journals();
+    live.set_candidate(true);
+
+    let refused = registry
+        .remove(&session.id)
+        .await
+        .expect_err("a live candidate blocks a journaled sweep too");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+
+    let dismissing = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-late-journal-dismissed",
+        Arc::clone(&dismissing) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    session.restore_journals();
+    dismissing.set_candidate(true);
+    registry
+        .remove(&session.id)
+        .await
+        .expect("a journaled sweep dismisses a candidate that is not live");
+}
+
 /// Pins the removal of a runtime that only the record names (no worker
 /// journal, so no worker start bounds its sweep): an unreadable same-user
-/// process may carry its marker, so the removal stays refused, names the
-/// process, and completes once that process is gone. A journaled runtime
-/// dismisses the same process through its worker's start identity.
+/// process that is not live may carry its marker, so the removal stays
+/// refused, names the process, and completes once that process is gone. A
+/// journaled runtime dismisses the same process through its worker's start
+/// identity.
 #[tokio::test]
 async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process_remains() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let host = || Arc::new(UnreadableCandidateHost::default());
+
+    let dismissing = host();
+    let (journaled_registry, _journaled_data, _journaled_root) = retention_registry_over(
+        "remove-journaled",
+        Arc::clone(&dismissing) as Arc<dyn ProcessInspector>,
+    );
+    let journaled = exited_session(&journaled_registry, None).await;
+    dismissing.set_candidate(true);
+    journaled_registry
+        .remove(&journaled.id)
+        .await
+        .expect("the worker's start identity bounds a journaled runtime's sweep");
+
+    let inspector = host();
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-record-only",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
     );
-    let journaled = exited_session(&registry, None).await;
     let record_only = record_only_session(&registry).await;
     inspector.set_candidate(true);
-
-    registry
-        .remove(&journaled.id)
-        .await
-        .expect("the worker's start identity bounds a journaled runtime's sweep");
+    record_only.assert_record_only();
     let refused = registry
         .remove(&record_only.id)
         .await
@@ -21661,7 +21771,7 @@ async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process
 /// the rest.
 #[tokio::test]
 async fn removal_refusal_bounds_the_listed_unreadable_processes() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-many-unreadable",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21688,7 +21798,7 @@ async fn removal_refusal_bounds_the_listed_unreadable_processes() {
 /// and the detailed outcome reports the other blocker.
 #[tokio::test]
 async fn removal_refusal_from_a_sweep_failure_lists_no_unreadable_process() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-sweep-failure",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21741,7 +21851,7 @@ async fn removal_refusal_from_a_sweep_failure_lists_no_unreadable_process() {
 /// worktree.
 #[tokio::test]
 async fn accepted_unconfirmed_cleanup_removes_a_session_blocked_only_by_unreadable_processes() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-accept-unreadable",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21777,7 +21887,7 @@ async fn accepted_unconfirmed_cleanup_removes_a_session_blocked_only_by_unreadab
 /// and its result lists the first part and counts the rest.
 #[tokio::test]
 async fn accepted_unconfirmed_cleanup_is_bounded_before_anything_is_deleted() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-accept-bounded",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21822,7 +21932,7 @@ async fn accepted_unconfirmed_cleanup_is_bounded_before_anything_is_deleted() {
 /// A removal that accepts no more than the result lists reports no total.
 #[tokio::test]
 async fn a_removal_accepting_few_processes_reports_no_total() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-accept-listed",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21866,7 +21976,7 @@ async fn remove_over_the_wire(
 /// takes the same bare id and accepts the unreadable candidate.
 #[tokio::test]
 async fn the_remove_methods_differ_only_in_consent_to_unreadable_processes() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-methods",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21912,7 +22022,7 @@ async fn the_remove_methods_differ_only_in_consent_to_unreadable_processes() {
 async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-accept-logging",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21958,7 +22068,7 @@ async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
 async fn a_removal_that_fails_after_the_sweep_still_logs_that_it_proceeded() {
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, data_dir, _worktree_root) = retention_registry_with_unusable_log_dir(
         "remove-accept-late-failure",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -21967,9 +22077,8 @@ async fn a_removal_that_fails_after_the_sweep_still_logs_that_it_proceeded() {
     let session = record_only_session_in(&registry, Some(&repo)).await;
     let worktree = session.worktree_path.clone().expect("session worktree");
     assert!(worktree.exists(), "the session owns a checkout");
-    // The candidate is a live unreadable survivor, so the sweep keeps it
-    // whether or not a journal of the worker bounds the runtime.
-    inspector.set_live_candidates(true);
+    // The host is live: the sweep keeps the candidate whether or not a journal
+    // of the worker bounds the runtime.
     inspector.set_candidate(true);
     let proceeds_log = "removal proceeds past an unreadable-marker process";
 
@@ -22059,14 +22168,13 @@ async fn a_failed_record_delete_keeps_the_journals_until_the_replay_completes() 
 /// directory as evidence; a removal that needed no consent deletes it.
 #[tokio::test]
 async fn an_unconfirmed_cleanup_keeps_the_journal_directory() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-journal-unconfirmed",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
     );
     let session = record_only_session_in(&registry, None).await;
     let (directory, _root) = journal_directory_of(&registry, &session.id);
-    inspector.set_live_candidates(true);
     inspector.set_candidate(true);
 
     registry
@@ -22104,7 +22212,7 @@ async fn accepted_unconfirmed_cleanup_reports_nothing_when_no_process_was_accept
 /// inspect the process table stays refused and keeps the session.
 #[tokio::test]
 async fn accepted_unconfirmed_cleanup_still_refuses_another_blocker() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-accept-other-blocker",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -22130,7 +22238,7 @@ async fn accepted_unconfirmed_cleanup_still_refuses_another_blocker() {
 /// retry with consent completes it.
 #[tokio::test]
 async fn a_refused_removal_is_completed_by_a_retry_with_consent() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "remove-retry-with-consent",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
@@ -22162,7 +22270,7 @@ async fn a_refused_removal_is_completed_by_a_retry_with_consent() {
 /// an explicit consenting removal deletes it.
 #[tokio::test]
 async fn retention_sweep_never_consents_to_unconfirmed_cleanup() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let inspector = Arc::new(UnreadableCandidateHost::live());
     let (registry, _data_dir, _worktree_root) = retention_registry_over(
         "sweep-never-consents",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,

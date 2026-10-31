@@ -114,7 +114,7 @@ impl Repo {
     fn git(&self, args: &[&str]) {
         let output = self
             .env
-            .command("git")
+            .git_command()
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")

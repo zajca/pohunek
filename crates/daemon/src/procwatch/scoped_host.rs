@@ -41,11 +41,16 @@ impl ScopedHost {
     /// # Panics
     ///
     /// Panics when `directory` cannot be canonicalized, which a scenario's own
-    /// freshly created directory always can.
+    /// freshly created directory always can, and when the test process's own
+    /// working directory lies inside it: a process spawned without an explicit
+    /// `current_dir` would inherit that directory and be taken for the
+    /// scenario's own, although another test started it.
     pub(crate) fn new(directory: &Path) -> Self {
+        let scope = std::fs::canonicalize(directory).expect("canonical scenario directory");
+        refuse_inherited_scope(&scope);
         Self {
             host: HostInspector::new(),
-            scope: std::fs::canonicalize(directory).expect("canonical scenario directory"),
+            scope,
         }
     }
 
@@ -61,6 +66,28 @@ impl ScopedHost {
             cwd.starts_with(&self.scope)
         })
     }
+}
+
+/// Panics when the working directory of this process lies at or below `scope`.
+///
+/// A scenario's processes are told apart by their working directory, and a
+/// child that is spawned without `current_dir` has this process's. A test
+/// therefore never changes the process working directory (the hermetic scan
+/// refuses `set_current_dir` in test code; a test of its own process uses
+/// `pohunek_test_support::process_env::set_current_dir`).
+fn refuse_inherited_scope(scope: &Path) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    assert!(
+        !cwd.starts_with(scope),
+        "the test process's working directory {} lies inside the scenario scope {}: a process \
+         spawned without an explicit current_dir would inherit it and be taken for this \
+         scenario's own; do not change the test process's working directory",
+        cwd.display(),
+        scope.display()
+    );
 }
 
 impl ProcessInspector for ScopedHost {
@@ -158,7 +185,10 @@ impl ScopeReaper {
     /// # Panics
     ///
     /// Panics when `directory` cannot be canonicalized, which a scenario's own
-    /// freshly created directory always can.
+    /// freshly created directory always can, and when the test process's own
+    /// working directory lies inside it: a process spawned without an explicit
+    /// `current_dir` would inherit that directory and be taken for the
+    /// scenario's own, although another test started it.
     pub(crate) fn new(directory: &Path) -> Self {
         Self {
             host: ScopedHost::new(directory),
@@ -296,5 +326,38 @@ impl Drop for ScopeReaper {
         if reaped.is_err() {
             eprintln!("the scenario's processes did not exit after SIGKILL");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scope that holds the process working directory is refused and the
+    /// message names both; a scope elsewhere is accepted.
+    #[test]
+    fn a_scope_that_holds_the_process_working_directory_is_refused() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
+        let inside = pohunek_test_support::tempdir().expect("scope directory");
+        let elsewhere = pohunek_test_support::tempdir().expect("another directory");
+        let _accepted = ScopeReaper::new(inside.path());
+        pohunek_test_support::process_env::set_current_dir(inside.path());
+
+        let refused = std::panic::catch_unwind(|| ScopeReaper::new(inside.path()))
+            .expect_err("a scope holding the working directory is refused");
+        let message = refused
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("a formatted panic message");
+        let canonical = std::fs::canonicalize(inside.path()).expect("canonical scope");
+        assert!(
+            message.contains(&format!("working directory {}", canonical.display()))
+                && message.contains(&format!("scenario scope {}", canonical.display())),
+            "{message}"
+        );
+
+        let _accepted = ScopeReaper::new(elsewhere.path());
     }
 }

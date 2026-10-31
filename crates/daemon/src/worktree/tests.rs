@@ -31,7 +31,7 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 fn git_in(dir: &Path, args: &[&str]) {
-    let output = pohunek_test_support::process_env::command("git")
+    let output = pohunek_test_support::git::command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -47,7 +47,7 @@ fn git_in(dir: &Path, args: &[&str]) {
 /// Initialize a git repo on branch `main` with one commit.
 fn init_repo(tag: &str) -> PathBuf {
     let dir = unique_dir(tag);
-    let init = pohunek_test_support::process_env::command("git")
+    let init = pohunek_test_support::git::command()
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&dir)
         .output()
@@ -71,7 +71,7 @@ fn init_repo(tag: &str) -> PathBuf {
 fn init_bare_repo(tag: &str) -> PathBuf {
     let source = init_repo(&format!("{tag}-src"));
     let bare = unique_dir(&format!("{tag}-bare")).join("repo.git");
-    let clone = pohunek_test_support::process_env::command("git")
+    let clone = pohunek_test_support::git::command()
         .args(["clone", "--bare", "-q"])
         .arg(&source)
         .arg(&bare)
@@ -110,7 +110,7 @@ fn manager_with_config_dir(tag: &str, config_dir: PathBuf) -> WorktreeManager {
 
 /// Run git in `dir` and return trimmed stdout (asserting success).
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let output = pohunek_test_support::process_env::command("git")
+    let output = pohunek_test_support::git::command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -448,7 +448,7 @@ fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
     // from the fetched tip, not the stale local ref.
     let upstream = init_repo("fetch-upstream");
     let downstream = unique_dir("fetch-downstream-parent").join("clone");
-    let clone = pohunek_test_support::process_env::command("git")
+    let clone = pohunek_test_support::git::command()
         .args(["clone", "-q"])
         .arg(&upstream)
         .arg(&downstream)
@@ -502,7 +502,7 @@ fn remote_only_base_branch_is_fetched_before_default_branch_fallback() {
     git_in(&upstream, &["checkout", "-q", "main"]);
 
     let downstream = unique_dir("remote-base-downstream-parent").join("clone");
-    let clone = pohunek_test_support::process_env::command("git")
+    let clone = pohunek_test_support::git::command()
         .args(["clone", "-q"])
         .arg(&upstream)
         .arg(&downstream)
@@ -539,7 +539,7 @@ const CONCURRENT_CREATES: usize = 8;
 /// Clone `upstream` into a fresh directory configured for committing.
 fn clone_of(upstream: &Path, tag: &str) -> PathBuf {
     let downstream = unique_dir(tag).join("clone");
-    let clone = pohunek_test_support::process_env::command("git")
+    let clone = pohunek_test_support::git::command()
         .args(["clone", "-q"])
         .arg(upstream)
         .arg(&downstream)
@@ -1501,7 +1501,7 @@ fn a_local_branch_behind_its_origin_named_as_its_own_base_is_reported() {
     );
     git_in(&upstream, &["checkout", "-q", "main"]);
     let downstream = unique_dir("adopt-downstream-parent").join("clone");
-    let clone = pohunek_test_support::process_env::command("git")
+    let clone = pohunek_test_support::git::command()
         .args(["clone", "-q"])
         .arg(&upstream)
         .arg(&downstream)

@@ -186,6 +186,22 @@ fn assert_own_process() {
     );
 }
 
+/// Changes the process working directory to `dir`.
+///
+/// The working directory is process-wide and every child that is spawned
+/// without an explicit `current_dir` inherits it, so a change is allowed only
+/// in a test that runs in its own process (see [`in_own_process`]). Nothing
+/// restores it.
+///
+/// # Panics
+///
+/// Panics when the test does not run in its own process, and when `dir` cannot
+/// be entered.
+pub fn set_current_dir(dir: &std::path::Path) {
+    assert_own_process();
+    std::env::set_current_dir(dir).expect("enter the fixture directory");
+}
+
 /// Exclusive hold on the process environment with restore-on-drop overrides.
 ///
 /// See the [module documentation](self) for when to use it and why.

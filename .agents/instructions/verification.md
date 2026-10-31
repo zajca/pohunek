@@ -603,7 +603,17 @@ value to the code under test, or, where reading the process environment is the
 subject, changes it through `pohunek_test_support::process_env::ProcessEnv` (one
 binary-wide lock, restored on drop and on unwind; tests that only read
 environment-derived values hold `ProcessEnv::lock()` too, and a command that must not
-see another test's `PATH` is built with `process_env::command`).
+see another test's `PATH` is built with `process_env::command`). A test never calls
+`std::env::set_current_dir` either: the working directory is inherited by every child
+spawned without `current_dir`, and a scenario's processes are told apart by it. A test
+of its own process that must move it uses
+`pohunek_test_support::process_env::set_current_dir`, and `ScopeReaper::new` panics when
+the process working directory lies inside the scope. Every `git` in Rust test code is built with
+`pohunek_test_support::git::command()` (or `TestEnv::git_command()`): no global or
+system Git configuration, a `HOME` no account owns (a `TestEnv` keeps its private one), a
+fixed identity, no prompt; only a scenario whose subject is how `git` reacts to settings it
+puts in place uses `git::command_with_inherited_environment()`. The hermetic scan does not
+check this; review does.
 
 No test leaves a session worker running. A real daemon starts each
 `pohunek-sessiond` in its own process group and lets it outlive the daemon, and a
@@ -647,8 +657,8 @@ launch; the helper re-signs the copy ad hoc only when the kernel killed it.
 `crates/xtask/tests/hermetic_scan.rs` enforces all of this in test code with no
 baseline. A case where the host state is the subject carries
 `// hermetic-allowed: #<issue> <reason>` on or directly above its line; the
-environment-mutation rule takes no marker, because `ProcessEnv` is the one sanctioned
-mechanism.
+environment-mutation rule (`set_var`, `remove_var`, `set_current_dir`) takes no marker,
+because `ProcessEnv` and `process_env::set_current_dir` are the sanctioned mechanisms.
 
 Rust:
 
