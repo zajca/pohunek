@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -55,6 +56,14 @@ const FLOOD_CHUNK_BYTES: usize = 4096;
 /// Capacity the CLI's stdout pipe is shrunk to, so that it fills at once.
 #[cfg(target_os = "linux")]
 const STDOUT_PIPE_BYTES: usize = 4096;
+
+/// Bytes per write while the test measures a pipe.
+#[cfg(not(target_os = "linux"))]
+const PIPE_FILL_CHUNK_BYTES: usize = 1024;
+
+/// Size of the write that shows a pipe holding data does not grow.
+#[cfg(not(target_os = "linux"))]
+const PIPE_GROWTH_PROBE_BYTES: usize = 256 * 1024;
 
 /// Mode of the runtime directory the client expects to be owner-private.
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -176,19 +185,49 @@ fn an_attach_client_keeps_showing_output_while_its_paste_is_not_read() {
     assert!(status.success(), "pohunek attach failed: {errors}");
 }
 
-/// Shrinks the CLI's stdout pipe where the platform allows it and returns the
-/// byte count that means the pipe is full.
+/// Sizes the CLI's stdout pipe before the CLI exists and returns the byte count
+/// that means the pipe is full once the CLI wrote into it.
 #[cfg(target_os = "linux")]
-fn stdout_pipe_capacity(stdout: &std::os::fd::OwnedFd) -> usize {
-    rustix::pipe::fcntl_setpipe_size(stdout, STDOUT_PIPE_BYTES).expect("shrink the stdout pipe");
-    rustix::pipe::fcntl_getpipe_size(stdout).expect("read the pipe capacity")
+fn prepare_terminal_pipe(read: &OwnedFd, _write: &OwnedFd) -> u64 {
+    rustix::pipe::fcntl_setpipe_size(read, STDOUT_PIPE_BYTES).expect("shrink the stdout pipe");
+    rustix::pipe::fcntl_getpipe_size(read).expect("read the pipe capacity") as u64
 }
 
-/// A pipe of another platform cannot be resized; the CLI's output fills at
-/// least this many bytes of it before the pipe is full.
+/// A pipe of another platform cannot be resized and its capacity can differ
+/// from one pipe to the next, so it is measured: the pipe is filled until a
+/// write would block, a further write shows the pipe holding data does not
+/// grow, and a slice is read out again so that the CLI's own output is what
+/// fills the pipe. The write end is blocking again before the CLI inherits it.
 #[cfg(not(target_os = "linux"))]
-fn stdout_pipe_capacity(_stdout: &std::os::fd::OwnedFd) -> usize {
-    16 * 1024
+fn prepare_terminal_pipe(read: &OwnedFd, write: &OwnedFd) -> u64 {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+    use rustix::io::Errno;
+
+    let blocking = fcntl_getfl(write).expect("read the pipe flags");
+    fcntl_setfl(write, blocking | OFlags::NONBLOCK).expect("make the pipe write end non-blocking");
+    let fill_until_full = |chunk: &[u8]| loop {
+        match rustix::io::write(write, chunk) {
+            Ok(_) => {}
+            Err(Errno::AGAIN) => break,
+            Err(error) => panic!("fill the terminal pipe: {error}"),
+        }
+    };
+    fill_until_full(&[0_u8; PIPE_FILL_CHUNK_BYTES]);
+    let capacity = rustix::io::ioctl_fionread(read).expect("count the pipe bytes");
+    // A pipe that holds data takes no larger buffer, whatever the write size.
+    fill_until_full(&vec![0_u8; PIPE_GROWTH_PROBE_BYTES]);
+    assert_eq!(
+        rustix::io::ioctl_fionread(read).expect("count the pipe bytes"),
+        capacity,
+        "the full pipe grew"
+    );
+    // Half of the pipe, so it keeps data and cannot take a larger buffer, and
+    // the CLI has room to write into.
+    let mut slice = vec![0_u8; usize::try_from(capacity / 2).expect("pipe capacity")];
+    let taken = rustix::io::read(read, &mut slice).expect("read a slice out of the pipe");
+    assert!(taken > 0, "the full pipe held no data");
+    fcntl_setfl(write, blocking).expect("make the pipe write end blocking");
+    capacity
 }
 
 /// Hermetic environment, fixture daemon and a CLI whose stdout pipe is shrunk
@@ -196,7 +235,7 @@ fn stdout_pipe_capacity(_stdout: &std::os::fd::OwnedFd) -> usize {
 struct StalledTerminal {
     cli: CliProcess,
     stdin: std::process::ChildStdin,
-    stdout: std::os::fd::OwnedFd,
+    stdout: OwnedFd,
     observed: mpsc::Receiver<StreamEvent>,
     _env: TestEnv,
 }
@@ -221,7 +260,7 @@ fn attach_with_stalled_terminal() -> StalledTerminal {
     // The pipe is shrunk before the CLI exists, so it cannot hold more than its
     // new capacity yet.
     let (stdout, terminal_write) = rustix::pipe::pipe().expect("create the terminal pipe");
-    let capacity = stdout_pipe_capacity(&stdout);
+    let capacity = prepare_terminal_pipe(&stdout, &terminal_write);
     let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
     command
         .args(["attach", SESSION_ID])
@@ -235,7 +274,7 @@ fn attach_with_stalled_terminal() -> StalledTerminal {
     // no more output.
     poll_until("the terminal pipe to fill", || {
         let queued = rustix::io::ioctl_fionread(&stdout).expect("count the pipe bytes");
-        (queued >= capacity as u64).then_some(())
+        (queued >= capacity).then_some(())
     });
     StalledTerminal {
         cli,
