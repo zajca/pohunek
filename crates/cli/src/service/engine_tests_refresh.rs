@@ -1830,3 +1830,93 @@ async fn the_probe_gives_no_verdict_while_a_record_is_pending_or_the_file_is_unr
     .expect("write schema 6");
     assert_eq!(behind(&harness.context), None, "another schema");
 }
+
+/// A refresh rolling back over an active version directory that is refused or
+/// missing: every refusal on the way names a command that makes progress, and
+/// the two-step sequence ends with the record cleared and the daemon ready.
+#[tokio::test]
+async fn a_rolling_back_refresh_over_a_refused_or_missing_directory_is_repaired_in_two_steps() {
+    for refused in [true, false] {
+        let r = refreshable().await;
+        let harness = &r.harness;
+        let dir = harness.layout().version_dir(V1).expect("version directory");
+        // The replacement is accepted but the old process keeps answering,
+        // and the directory breaks right after it: the rollback meets it.
+        harness.fake.world().kept_process_path = Some(canonical(&r.new).display().to_string());
+        let broken = dir.clone();
+        harness.fake.world().replace_hook = Some(ReplaceHook(Arc::new(move || {
+            if refused {
+                std::fs::set_permissions(
+                    &broken,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o775),
+                )
+                .expect("loosen the version directory");
+            } else {
+                std::fs::remove_dir_all(&broken).expect("remove the version directory");
+            }
+        })));
+        let way_out = [
+            "`pohunek service upgrade --repair --from",
+            "`service_refresh_pending`",
+            "`pohunek service refresh-path`",
+        ];
+
+        let first = refresh(harness, false).await.expect_err("rollback fails");
+        assert_eq!(first.code(), "service_rollback_failed", "{first:?}");
+        assert!(
+            matches!(
+                &first,
+                Error::RollbackFailed { rollback, .. }
+                    if matches!(**rollback, Error::UntrustedRefreshVersion { .. })
+            ),
+            "{first:?}"
+        );
+        assert_steps_in_order(first.hint().expect("hint"), &way_out);
+        let pending = record_bytes(harness).expect("the record is kept");
+        assert!(harness.pending().expect("kept").rolling_back);
+        let config = config_bytes(harness);
+        let replaces_before = replaces(harness);
+
+        let again = refresh(harness, false).await.expect_err("every rerun");
+        assert_eq!(again.code(), "service_version_untrusted", "{again:?}");
+        assert_steps_in_order(again.hint().expect("hint"), &way_out);
+
+        if refused {
+            let plain = harness.upgrade(V1).await.expect_err("needs the flag");
+            assert_eq!(plain.code(), "service_version_untrusted", "{plain:?}");
+            assert_steps_in_order(plain.hint().expect("hint"), &["upgrade --repair --from"]);
+        }
+        let upgrade = harness.engine().with_repair(refused);
+        let pending_error = upgrade
+            .upgrade(&harness.staged(V1), V1)
+            .await
+            .expect_err("the pending refresh still refuses");
+        assert_eq!(
+            pending_error.code(),
+            "service_refresh_pending",
+            "{pending_error:?}"
+        );
+        assert!(
+            pending_error.to_string().contains("was restored"),
+            "{pending_error}"
+        );
+        assert_steps_in_order(
+            pending_error.hint().expect("hint"),
+            &["`pohunek service refresh-path`"],
+        );
+        assert_eq!(record_bytes(harness).as_deref(), Some(pending.as_slice()));
+        assert_eq!(config_bytes(harness), config, "service.toml is untouched");
+        assert_eq!(replaces(harness), replaces_before, "no daemon effect");
+
+        refresh(harness, false)
+            .await
+            .expect("the rollback finishes");
+        assert_eq!(harness.pending(), None);
+        assert!(
+            crate::service::layout::verify_installed(&harness.layout(), &dir).is_ok(),
+            "the version directory is trusted"
+        );
+        assert_eq!(recorded(harness), [canonical(&r.old)]);
+        assert!(harness.fake.world().running);
+    }
+}

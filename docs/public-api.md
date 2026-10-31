@@ -2834,6 +2834,7 @@ match the refresh), and `service_refresh_pending` is what `install` and
 `upgrade` return while a refresh that reached the job replacement is pending
 (`pohunek service refresh-path` without `--dry-run` resolves it), and what a
 dry run returns over any pending refresh, because a dry run never resolves one.
+While a refresh is rolling back and its active version directory is refused or missing, `refresh-path` fails with `service_version_untrusted` (inside `service_rollback_failed` on the first run), and `upgrade --repair --from <release of that version>` publishes the directory before it returns `service_refresh_pending`, whose message states that the directory was restored; the record and `service.toml` are untouched and `refresh-path` then finishes the rollback.
 A daemon job that vanished after the record exists makes the run roll back:
 before `registering` the file is restored and the record cleared and the run
 returns `service_daemon_job_missing`; from `registering` on the first run returns

@@ -463,6 +463,16 @@ refused resumes the same way with the release archive of the target version. An
 interrupted install is resumed with
 `pohunek service install --repair --from <release-dir> --prefix <prefix>`.
 
+A `refresh-path` that is rolling back (`service_rollback_failed`, or a rerun
+that reports `service_version_untrusted`) over a refused or missing active
+directory takes two steps, because `upgrade` and `install` refuse a pending
+refresh with `service_refresh_pending`: run
+`pohunek service upgrade --repair --from <release-dir>` with the release archive
+of the active version (add no flag when the directory is missing). It restores
+the directory before it refuses, restarts no daemon, runs no gate and changes
+neither `service.toml` nor the record, and the refusal states that the directory
+was restored. Then rerun `pohunek service refresh-path` to finish the rollback.
+
 The trust claim of the repair is that of `pohunek service install` with `--from`: you
 chose the release, each binary answers `--version`, and a sealed release's
 `runtime/` files are present. It does not verify a digest of the binaries.

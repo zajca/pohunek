@@ -732,7 +732,12 @@ impl<'a> Engine<'a> {
         let _transaction = self.transaction().await?;
         upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
-        let plan = upgrade_plan(self.store.load()?, version)?;
+        let pending = self.store.load()?;
+        if let Some(record) = &pending {
+            self.restore_for_refresh_rollback(record, from, version)
+                .await?;
+        }
+        let plan = upgrade_plan(pending, version)?;
         let release = self.upgrade_source(&plan, from)?;
         let (gated, job_path) = self.adoption_gate(&plan, &release, version).await?;
         // The rollback restarts the previous daemon from its version
@@ -2803,6 +2808,46 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Restores the version directory a pending search-path refresh restarts
+    /// the daemon from during its rollback, before `upgrade` refuses the
+    /// pending refresh.
+    ///
+    /// Only a refresh rolling back from `registering` on restarts a daemon,
+    /// and only `version` equal to the refresh's own version names that
+    /// directory; any other command is left to the plan's refusal. Nothing
+    /// restarts, so no gate runs, and neither `service.toml` nor the record
+    /// changes. A missing directory is published without a flag, a refused one
+    /// is set aside only with `--repair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RefreshPending`] saying whether the directory was
+    /// restored, and the release, claim, staging and publishing errors.
+    async fn restore_for_refresh_rollback(
+        &self,
+        record: &Record,
+        from: &Path,
+        version: &str,
+    ) -> Result<(), Error> {
+        if record.operation != Operation::RefreshPath
+            || !record.rolling_back
+            || !rollback_restarts_previous(record)
+            || record.version != version
+        {
+            return Ok(());
+        }
+        let layout = install_layout(&record.prefix)?;
+        let release = layout::operator_release(&layout, from)?;
+        let restore = self
+            .restore_rollback_target(record, &release, version)
+            .await?;
+        Err(Error::RefreshPending {
+            step: record.step.as_str(),
+            rolling_back: true,
+            restored: Some(restore.restored),
+        })
+    }
+
     /// Upgrades to the version that is already active: restores its directory
     /// when it is missing or refused, makes the daemon job run from it, and
     /// collects garbage.
@@ -3546,6 +3591,7 @@ fn refresh_plan(record: Record) -> Result<Plan, Error> {
         Err(Error::RefreshPending {
             step: record.step.as_str(),
             rolling_back: record.rolling_back,
+            restored: None,
         })
     } else {
         Ok(Plan::RollBack(record))
