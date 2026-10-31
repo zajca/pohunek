@@ -920,10 +920,11 @@ const UNREAD_KEYSTROKE: &str = "keystroke-while-output-unread";
 /// Line typed after the client resumed reading; its echo is live output.
 const RESYNCED_KEYSTROKE: &str = "keystroke-after-resync";
 
-/// Bytes the child prints before the client types: far more than the
-/// subscriber queue and the socket buffers between the child and the client
-/// hold, so the output path is blocked when the client types.
-const UNREAD_FLOOD_BYTES: usize = 16 * 1024 * 1024;
+/// Bytes the child prints before the client types: four times the worker's
+/// default subscriber queue (1 MB) and many times the socket and PTY buffers
+/// between the child and the client, so the output path is blocked when the
+/// client types.
+const UNREAD_FLOOD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Starts a child that floods its output, then signals through the returned
 /// `flooded` file and copies its input into the returned `typed` file.
