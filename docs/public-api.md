@@ -4906,9 +4906,12 @@ Attach stream rules:
 - While the program does not read the client's input, the daemon keeps the
   attach until the client closes the connection and the daemon can see it. On
   a Unix socket the daemon sees a connection that was closed completely, also
-  while a paste waits for the program; a client that only shut down its write
+  while a paste waits for the program. A client that only shut down its write
   half (a piped stdin that ended) keeps the attach and its pending input is
-  delivered. On a TCP connection (a remote host or the relay) the daemon sees
+  delivered, so a client that has input to finish must shut down its write half
+  and keep reading until the daemon closes the stream: closing the whole
+  connection right after writing is a disconnect, and input the daemon has not
+  yet passed to the program may be dropped. On a TCP connection (a remote host or the relay) the daemon sees
   a client's close only when it reads or writes the connection, so a client
   that disconnects while the program neither reads input nor writes output
   keeps the attach until the program reads, the session stops or the lease is

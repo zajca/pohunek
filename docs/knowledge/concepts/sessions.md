@@ -1334,10 +1334,12 @@ therefore end without the acknowledgement of a frame the terminal accepted; the
 public contract is that an attach input write is not acknowledged. While a
 paste waits for a program that does not read, the daemon's attach bridge ends
 when the client closes a Unix socket connection completely (a hangup of the
-connection, not an end of the client's input), and the CLI client reads up to
-1 MiB of typed input ahead so a detach shortcut typed behind the paste is seen;
-the detach delivers what the stream took and drops the rest, reporting the
-dropped byte count. A typed
+connection, not an end of the client's input). At the end of its stdin the CLI
+closes only its write half and shows output until the daemon has written all of
+the input to the program and closed the stream; it does not wait for the program
+to exit. The CLI client reads up to 1 MiB of typed input ahead, so a detach
+shortcut typed behind the paste is seen; the detach drops the bytes still
+queued in the client and reports their count. A typed
 worker stream failure is retained by the daemon for the attaching CLI, which
 surfaces it instead of repeatedly treating it as an ordinary reconnect.
 

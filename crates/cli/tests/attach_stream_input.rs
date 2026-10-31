@@ -69,6 +69,9 @@ const PIPE_GROWTH_PROBE_BYTES: usize = 256 * 1024;
 /// client and the stream hold, less than the client's input queue limit.
 const UNREAD_PASTE_BYTES: usize = 768 * 1024;
 
+/// Output the stream writes after it read the client's input to its end.
+const ANSWER: &[u8] = b"answer-after-the-input-was-delivered\n";
+
 /// Opened by the test once the client has exited; the stream reads no input
 /// before.
 static INPUT_GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
@@ -96,6 +99,9 @@ enum StreamBehavior {
     FloodWhileReading,
     /// Reads no input until `INPUT_GATE` opens, then reads it to its end.
     HoldInput,
+    /// Reads the input to its end, answers with `ANSWER` and closes the
+    /// stream, as the daemon does once it delivered a finished input.
+    AnswerAfterInput,
 }
 
 /// Kills the CLI if the scenario fails before it exits.
@@ -400,6 +406,55 @@ fn an_attach_client_detaches_past_an_unread_paste_and_reports_what_it_dropped() 
     );
 }
 
+#[test]
+fn a_piped_attach_shows_the_output_that_follows_its_delivered_input() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(
+            root.join(directory),
+            fs::Permissions::from_mode(PRIVATE_DIR_MODE),
+        )
+        .expect("make the directory owner-private");
+    }
+    let socket = root.join("run/pohunek/daemon.sock");
+    let (events, observed) = mpsc::channel();
+    serve_fixture_daemon(&socket, events, StreamBehavior::AnswerAfterInput);
+
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command
+        .args(["attach", SESSION_ID])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut cli = CliProcess(command.spawn().expect("spawn pohunek attach"));
+    let mut stdin = cli.0.stdin.take().expect("piped stdin");
+    let mut stdout = cli.0.stdout.take().expect("piped stdout");
+
+    // The input ends the client's stdin; the stream answers once it read the
+    // input to its end, and closes. The client keeps the connection open for
+    // that answer instead of closing it with the end of its input.
+    stdin.write_all(KEYSTROKE).expect("pipe the input");
+    drop(stdin);
+    let mut shown = Vec::new();
+    stdout.read_to_end(&mut shown).expect("read the CLI output");
+    let status = cli.0.wait().expect("wait for pohunek attach");
+
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        observed.recv_timeout(HANG_GUARD),
+        Ok(StreamEvent::InputReceived(KEYSTROKE.len()))
+    );
+    assert!(
+        shown.windows(ANSWER.len()).any(|window| window == ANSWER),
+        "the client shows what follows its delivered input: {:?}",
+        String::from_utf8_lossy(&shown)
+    );
+}
+
 /// Serves `session.attach` on `socket` and one raw attach stream that behaves
 /// as `behavior` says, reporting what it observes to `events`.
 fn serve_fixture_daemon(
@@ -435,6 +490,7 @@ fn serve_connection(
                 StreamBehavior::OutputThenInput => serve_attach_stream(reader, events),
                 StreamBehavior::FloodWhileReading => serve_flooding_attach_stream(reader, events),
                 StreamBehavior::HoldInput => serve_input_holding_attach_stream(reader, events),
+                StreamBehavior::AnswerAfterInput => serve_answering_attach_stream(reader, events),
             }
             return;
         }
@@ -527,5 +583,19 @@ fn serve_input_holding_attach_stream(
     stream
         .read_to_end(&mut input)
         .expect("read the client's input");
+    let _sent = events.send(StreamEvent::InputReceived(input.len()));
+}
+
+/// Reads the client's input to its end, answers and closes the stream.
+fn serve_answering_attach_stream(
+    reader: BufReader<UnixStream>,
+    events: &mpsc::Sender<StreamEvent>,
+) {
+    let mut input = reader.buffer().to_vec();
+    let mut stream = reader.into_inner();
+    stream
+        .read_to_end(&mut input)
+        .expect("read the client's input");
+    stream.write_all(ANSWER).expect("write the answer");
     let _sent = events.send(StreamEvent::InputReceived(input.len()));
 }

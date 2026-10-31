@@ -71,13 +71,14 @@ runtime id, root child PID, worker generation, and worker PID must be
 unchanged. An existing attach socket closes during restart; reconnecting attach
 clients open a new public stream to the same runtime.
 
-An attach whose program does not read its input (a paste waits) ends when the
-client closes a Unix socket connection completely, when the session stops or
-the lease is released, or when the program reads. On a TCP or relay connection
-the daemon sees a client's disconnect only when it reads or writes the
-connection, so a client that disconnects while the program neither reads nor
-writes keeps the attach until the program reads, the session stops or the lease
-is released. `pohunek session stop` or a detach by stream id ends it at once.
+An attach whose program does not read its input (a paste waits) continues when
+the program reads, and ends earlier when the client closes a Unix socket
+connection completely, when the session stops or when the lease is released.
+On a TCP or relay connection the daemon sees a client's disconnect only when it
+reads or writes the connection, so a client that disconnects while the program
+neither reads nor writes keeps the attach until the program reads, the session
+stops or the lease is released. `pohunek session stop` or a detach by stream id
+ends it at once.
 
 ## Diagnose Runtime State
 

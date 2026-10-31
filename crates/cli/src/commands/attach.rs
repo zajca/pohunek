@@ -389,9 +389,6 @@ struct StatusUpdates {
 
 #[derive(Debug)]
 struct MenuEffectContext<'a> {
-    client: &'a mut Client,
-    stream_id: &'a str,
-    terminal: &'a mut Option<RawTerminal>,
     menu_task: &'a mut Option<MenuTask>,
     generation: u64,
     control: &'a AttachControlContext,
@@ -410,6 +407,9 @@ struct PendingStreamInput {
     bytes: Vec<u8>,
     /// Stdin ended: the stream's write half shuts down once `bytes` is written.
     closing: bool,
+    /// The stream's write half was shut down; the attach ends when the daemon
+    /// closes the stream after delivering the input.
+    shut_down: bool,
     /// The detach shortcut was typed: the loop writes what the stream takes
     /// without waiting, drops the rest and sends the detach request.
     detaching: bool,
@@ -1763,21 +1763,21 @@ where
             .iter()
             .any(|effect| matches!(effect, MenuEffect::RunDetach))
         {
-            flush_output_before_restore(ctx.stdout).await;
+            // The loop detaches the way the shortcut does, dropping the input
+            // the stream did not take and reporting how much.
+            ctx.stream_input.detaching = true;
+            return Ok(None);
         }
-        return handle_menu_effects(
+        handle_menu_effects(
             outcome.effects,
             MenuEffectContext {
-                client: ctx.client,
-                stream_id: ctx.stream_id,
-                terminal: ctx.terminal,
                 menu_task: &mut ctx.menu.task,
                 generation: ctx.menu.generation,
                 control: ctx.control,
                 modal: ctx.modal.as_ref(),
             },
-        )
-        .await;
+        );
+        return Ok(None);
     }
 
     ctx.stream_input.bytes.extend_from_slice(input);
@@ -1890,20 +1890,24 @@ where
                 // A stream that could not take all the input ends detached
                 // unless the daemon reports a stream failure.
                 let end = if delivery.is_err() || dropped > 0 {
-                    detach_ended_stream(&mut client, &stream_id, &mut terminal).await?
+                    detach_ended_stream(&mut client, &stream_id, &mut terminal).await
                 } else {
-                    detach_stream(&mut client, &stream_id, &mut terminal).await
+                    Ok(detach_stream(&mut client, &stream_id, &mut terminal).await)
                 };
                 if dropped > 0 {
                     eprintln!(
-                        "[pohunek] detached; {dropped} bytes of typed input were not delivered to the program"
+                        "[pohunek] detached; {dropped} bytes of typed input were dropped unsent; \
+                         input the daemon had not yet passed to the program may be dropped as well"
                     );
                 }
-                return Ok(end);
+                return end;
             }
-            if stream_input.closing && stream_input.bytes.is_empty() {
+            if stream_input.closing && stream_input.bytes.is_empty() && !stream_input.shut_down {
+                // The write half closes and the connection stays open: the
+                // daemon delivers the input still buffered, then closes the
+                // stream, and the output is shown until it does.
                 socket_write.shutdown().await?;
-                return Ok(AttachStreamEnd::InputClosed);
+                stream_input.shut_down = true;
             }
             tokio::select! {
                 written = socket_write.write(&stream_input.bytes), if !stream_input.bytes.is_empty() => {
@@ -1916,7 +1920,11 @@ where
                     drained?;
                 }
                 read = socket_read.read(&mut socket_buf), if stdout.queued() < OUTPUT_QUEUE_BYTES => {
-                    let input = &socket_buf[..read?];
+                    let read = read?;
+                    if read == 0 && stream_input.shut_down {
+                        return Ok(AttachStreamEnd::InputClosed);
+                    }
+                    let input = &socket_buf[..read];
                     let args = (&control.target, &mut terminal);
                     if let Some(end) =
                         handle_socket_read(input, &mut stdout, &mut modal, &mut menu, args).await?
@@ -2139,73 +2147,71 @@ fn reconnect_decision_from_error(err: &CliError) -> AttachReconnectDecision {
     }
 }
 
-async fn handle_menu_effects(
-    effects: Vec<MenuEffect>,
-    ctx: MenuEffectContext<'_>,
-) -> Result<Option<AttachStreamEnd>, CliError> {
+fn handle_menu_effects(effects: Vec<MenuEffect>, ctx: MenuEffectContext<'_>) {
+    let MenuEffectContext {
+        menu_task,
+        generation,
+        control,
+        modal,
+    } = ctx;
     for effect in effects {
         match effect {
-            MenuEffect::RunDetach => {
-                return Ok(Some(
-                    detach_stream(ctx.client, ctx.stream_id, ctx.terminal).await,
-                ));
-            }
             MenuEffect::RunKill => {
-                if ctx.menu_task.is_none() {
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                if menu_task.is_none() {
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Kill,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Kill,
                     ));
                 }
             }
             MenuEffect::RunRemove => {
-                if ctx.menu_task.is_none() {
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                if menu_task.is_none() {
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Remove,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Remove,
                     ));
                 }
             }
             MenuEffect::RunNewSession => {
-                if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
+                if let (None, Some(modal)) = (menu_task.as_ref(), modal) {
                     let (rows, cols) = modal.compositor.grid_size();
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::NewSession,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::NewSession { cols, rows },
                     ));
                 }
             }
             MenuEffect::RunFork => {
-                if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
+                if let (None, Some(modal)) = (menu_task.as_ref(), modal) {
                     let (rows, cols) = modal.compositor.grid_size();
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Fork,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Fork { cols, rows },
                     ));
                 }
             }
             MenuEffect::RunRename(name) => {
-                if ctx.menu_task.is_none() {
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                if menu_task.is_none() {
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Rename,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Rename { name },
                     ));
                 }
             }
-            MenuEffect::Close => {}
+            // The caller turns a detach into a request of the attach loop.
+            MenuEffect::RunDetach | MenuEffect::Close => {}
         }
     }
-    Ok(None)
 }
 
 async fn handle_menu_task_result<W>(
@@ -2356,8 +2362,8 @@ async fn detach_stream(
     AttachStreamEnd::Detached
 }
 
-/// [`detach_stream`] for a stream that ended before the input typed ahead of
-/// the detach shortcut was written.
+/// [`detach_stream`] for a stream that could not take all the input typed ahead
+/// of the detach shortcut.
 ///
 /// The raw stream cannot carry a typed terminal failure, so the daemon's
 /// detach reply reports it, as [`finish_attach_outcome`] does for a closed
