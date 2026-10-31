@@ -274,14 +274,14 @@ pub enum Error {
         detail: String,
     },
 
-    /// The version directory a pending search-path refresh must restart the
-    /// daemon from, in its rollback, cannot be trusted.
+    /// The version directory a pending search-path refresh restarts the daemon
+    /// from, forward or in its rollback, cannot be trusted.
     ///
     /// Carries the code of [`Error::UntrustedVersion`]. `upgrade` and
     /// `install` refuse the pending refresh, so the way out is the two-step
     /// sequence the hint names.
     #[error(
-        "the daemon of the pending search-path refresh runs version {version}, which cannot be trusted ({}: {detail}), so the refresh cannot be rolled back",
+        "the daemon of the pending search-path refresh runs version {version}, which cannot be trusted ({}: {detail}), so the refresh can neither finish nor be rolled back",
         path.display()
     )]
     UntrustedRefreshVersion {
@@ -778,7 +778,7 @@ pub enum Error {
         "a search-path refresh is pending at step {step}{}{}",
         if *rolling_back { " (rolling back)" } else { "" },
         match restored {
-            Some(true) => "; the version directory its rollback needs was restored",
+            Some(true) => "; the version directory its daemon runs from was restored",
             Some(false) => "; its version directory is trusted, nothing was changed",
             None => "",
         }

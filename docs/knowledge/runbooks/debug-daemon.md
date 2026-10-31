@@ -471,7 +471,7 @@ refresh with `service_refresh_pending`: run
 of the active version (add no flag when the directory is missing). It restores
 the directory before it refuses, restarts no daemon, runs no gate and changes
 neither `service.toml` nor the record, and the refusal states that the directory
-was restored. Then rerun `pohunek service refresh-path` to finish the rollback.
+was restored. Then rerun `pohunek service refresh-path` to finish the refresh or its rollback.
 
 The trust claim of the repair is that of `pohunek service install` with `--from`: you
 chose the release, each binary answers `--version`, and a sealed release's

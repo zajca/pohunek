@@ -386,7 +386,15 @@ impl Engine<'_> {
         let mut late = LateGate::default();
         let result = self
             .run_refresh_steps(&mut record, target, definition, &mut late, rewrite)
-            .await;
+            .await
+            .map_err(|error| match error {
+                Error::UntrustedVersion { path, detail } => Error::UntrustedRefreshVersion {
+                    version: record.version.clone(),
+                    path,
+                    detail,
+                },
+                other => other,
+            });
         // A refusal never touches the running daemon. Rolling back a record at
         // `Registering` would replace it, and the replacement may not have
         // happened yet, so that record is kept for a resume instead.

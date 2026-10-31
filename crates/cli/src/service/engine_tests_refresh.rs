@@ -1939,7 +1939,18 @@ async fn a_resuming_refresh_over_a_refused_or_missing_directory_is_repaired_in_t
 
         let first = refresh(harness, false).await.expect_err("resume refused");
         assert_eq!(first.code(), "service_version_untrusted", "{first:?}");
-        assert_steps_in_order(first.hint().expect("hint"), &["upgrade --repair --from"]);
+        assert!(
+            matches!(first, Error::UntrustedRefreshVersion { .. }),
+            "{first:?}"
+        );
+        assert_steps_in_order(
+            first.hint().expect("hint"),
+            &[
+                "`pohunek service upgrade --repair --from",
+                "`service_refresh_pending`",
+                "`pohunek service refresh-path`",
+            ],
+        );
         let upgrade = harness.engine().with_repair(refused);
         let pending_error = upgrade
             .upgrade(&harness.staged(V1), V1)

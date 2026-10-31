@@ -734,7 +734,7 @@ impl<'a> Engine<'a> {
         let config_path = self.context.config_path();
         let pending = self.store.load()?;
         if let Some(record) = &pending {
-            self.restore_for_refresh_rollback(record, from, version)
+            self.restore_for_pending_refresh(record, from, version)
                 .await?;
         }
         let plan = upgrade_plan(pending, version)?;
@@ -2822,7 +2822,7 @@ impl<'a> Engine<'a> {
     ///
     /// Returns [`Error::RefreshPending`] saying whether the directory was
     /// restored, and the release, claim, staging and publishing errors.
-    async fn restore_for_refresh_rollback(
+    async fn restore_for_pending_refresh(
         &self,
         record: &Record,
         from: &Path,
