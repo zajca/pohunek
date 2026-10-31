@@ -3,9 +3,10 @@
 //! Binds the control socket with owner-private permissions, recovers from a
 //! stale socket left by a previous run, and serves newline-delimited JSON
 //! requests using the shared `protocol` crate. Each connection is handled on its
-//! own Tokio task so one client cannot stall another, and a panicking handler
-//! cannot take down the daemon (per `docs/architecture.md` "Concurrency and
-//! supervision").
+//! own Tokio task, tracked by a [`ConnectionTasks`] of its transport, so one
+//! client cannot stall another, a panicking handler cannot take down the daemon
+//! (per `docs/architecture.md` "Concurrency and supervision"), and the
+//! connections stop with the daemon.
 //!
 //! The same connection-serving code drives two transports: the local
 //! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over an overlay

@@ -2399,6 +2399,16 @@ from a fresh screen/tail after runtime change. A worker on the immediately prece
 private protocol remains usable for existing lifecycle and attach operations,
 but observation returns `worker_feature_unavailable`.
 
+When the daemon stops, a control or remote connection answers the request lines
+it has already read, and any line that arrives after the signal, with the
+daemon-class `daemon_shutting_down` (stamped with the connection's negotiated
+version) and then closes; the line is not dispatched. A watched wait in flight
+gets the same reply, an event subscription or attach stream ends as a normal
+close, and a mutating request already running completes and is answered before
+the connection closes. A client that cannot read the code, such as one on an
+older protocol, sees an ordinary daemon error followed by the end of the
+connection.
+
 ### Turn Waits
 
 `session.wait_turn` blocks until one of the targeted sessions records a turn

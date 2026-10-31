@@ -507,7 +507,7 @@ package command runs, the notification projector, the attention coordinator, the
 the event-log drains) belong to `DaemonShutdown`, which stops them in four ordered
 phases, each inside its own bound from `[deadlines]` in `service.toml`:
 `create_drain_ms` (creates still running commit or compensate), `driver_shutdown_ms`
-(the producers, idle stop, retention and package command runs, stop together; then the consumers of
+(the producers, idle stop, retention, package command runs and the connection tasks of the control socket and of the remote listeners stop together; then the consumers of
 the registry's events, the notification projector and the agent-state hook flush,
 so the events the producers emit while stopping are still consumed; then the
 attention coordinator, so the last defers and resolves they hand over are
@@ -546,6 +546,8 @@ while it has not returned; a blocking task outside the registry (hooks,
 notifications, package commands) is bounded but not named. A drop that reaches
 its bound logs a warning and the process exits, so the write that never returned
 is abandoned uncommitted and nothing committed is touched.
+
+Control and remote connections are tracked per transport (`crates/daemon/src/api/connections.rs`) and stop at the signal. An idle connection answers the lines it has already read with `daemon_shutting_down` and closes; no line is dispatched after the signal. A watched wait (`session.wait`, `session.output` with `wait_ms`, `session.wait_turn`, `command.run`) is answered with `daemon_shutting_down`, an event subscription closes, and an attach bridge ends as a normal close, so the CLI's reattach still treats it as a lost connection and not as a failure. A mutating request in flight runs to completion, its reply is written, and the connection then closes. A connection still running when `driver_shutdown_ms` passes is reported as `control_connections` or `remote_connections`, and the daemon logs what each open connection was doing.
 
 Each session also counts the input its watchers have been handed and not yet
 applied: a rescan request, an output chunk of the detector, a worker snapshot or loss, a

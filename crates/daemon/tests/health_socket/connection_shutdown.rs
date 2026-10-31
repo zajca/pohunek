@@ -13,8 +13,8 @@ use std::sync::Mutex;
 
 use nix::unistd::mkfifo;
 use pohunek_daemon::api::{ConnectionTasks, OverlaySource, RemoteServer};
-use pohunek_daemon::shutdown::{DaemonShutdown, ShutdownPhase, ShutdownPlan};
-use pohunek_test_support::wait::guard;
+use pohunek_daemon::shutdown::{DaemonShutdown, DaemonShutdownReport, ShutdownPhase, ShutdownPlan};
+use pohunek_test_support::wait::{guard, wait_until};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::MakeWriter;
@@ -27,11 +27,29 @@ const IDLE_SHELL: &str = "exec sleep 30";
 /// The metadata key the pipelined request tries to set.
 const PIPELINED_KEY: &str = "pipelined.key";
 
-/// How long a request must stay unanswered to count as in flight.
-const IN_FLIGHT_PROOF: Duration = Duration::from_millis(800);
+/// The log line of a `session.wait` that has taken its waiter slot.
+const WAIT_PARKED: &str = "session wait parked";
 
-/// The bound of the drivers phase in the scenario that outlives it.
-const SHORT_DRIVER_BOUND: Duration = Duration::from_millis(500);
+/// The bound of the drivers phase in the scenarios that outlive it, on the
+/// paused clock.
+const DRIVER_SHUTDOWN: Duration = Duration::from_secs(1);
+
+/// Runs the shutdown while the paused clock advances past its bounds: the
+/// request blocked on the FIFO keeps the runtime from advancing it on its own.
+async fn run_past_the_bounds(
+    tasks: &DaemonShutdown,
+    registry: &SessionRegistry,
+) -> DaemonShutdownReport {
+    let run = tasks.run(registry);
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            biased;
+            report = &mut run => return report,
+            () = tokio::time::advance(DRIVER_SHUTDOWN) => {}
+        }
+    }
+}
 
 /// The tracked server of one transport and the way to stop it.
 struct Stopping {
@@ -116,6 +134,8 @@ fn assert_shutting_down(reply: Option<Response>, what: &str) {
 /// dispatched, so its edit is not made, and the connection then ends.
 #[tokio::test]
 async fn a_request_pipelined_behind_a_wait_is_refused_when_the_daemon_stops() {
+    let captured = Captured::default();
+    let _logs = capture_logs(&captured);
     let socket = temp_socket("conn-pipelined");
     let stopping = Stopping::start(&socket, ShutdownPlan::default()).await;
     let mut control = connect(&socket).await;
@@ -145,8 +165,11 @@ async fn a_request_pipelined_behind_a_wait_is_refused_when_the_daemon_stops() {
         ),
     )
     .await;
-    // Both lines are with the connection once the wait holds the first.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The wait is parked in the daemon, and the second line is queued behind it.
+    wait_until("the wait to park in the daemon", || async {
+        captured.text().contains(WAIT_PARKED).then_some(())
+    })
+    .await;
 
     stopping.raise_signal();
 
@@ -237,9 +260,21 @@ impl<'a> MakeWriter<'a> for Captured {
     }
 }
 
-/// A repository whose configuration includes a FIFO nobody writes: `git`
-/// blocks opening it, so `project.add` on the repository stays in flight.
-fn wedged_repository(root: &Path) -> PathBuf {
+/// Routes the debug logs of this test's thread into `captured`.
+fn capture_logs(captured: &Captured) -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    )
+}
+
+/// A repository whose configuration includes a FIFO: `git` blocks opening it
+/// until the test holds the write end, so `project.add` on the repository stays
+/// in flight. Returns the repository and the FIFO.
+fn wedged_repository(root: &Path) -> (PathBuf, PathBuf) {
     let repo = root.join("wedged-repo");
     fs::create_dir(&repo).expect("create the repository directory");
     let git = |args: &[&str]| {
@@ -255,7 +290,20 @@ fn wedged_repository(root: &Path) -> PathBuf {
     let fifo = root.join("config.fifo");
     mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).expect("create the FIFO");
     git(&["config", "include.path", fifo.to_str().expect("utf-8 path")]);
-    repo
+    (repo, fifo)
+}
+
+/// Opens the write end of `fifo`, which completes once `git` has opened the read
+/// end and so is blocked on it. The returned file keeps `git` blocked.
+async fn hold_fifo_open(fifo: PathBuf) -> fs::File {
+    tokio::task::spawn_blocking(move || {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(fifo)
+            .expect("open the FIFO's write end")
+    })
+    .await
+    .expect("the FIFO opener finishes")
 }
 
 fn add_project_request(repo: &Path) -> ProtocolRequest {
@@ -268,33 +316,23 @@ fn add_project_request(repo: &Path) -> ProtocolRequest {
 
 /// A request that outlives the drivers bound is named in the report under its
 /// transport and in the log under its method, and is left running.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_request_that_outlives_the_bound_is_named_by_its_transport() {
     let captured = Captured::default();
-    let _logs = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let _logs = capture_logs(&captured);
     let socket = temp_socket("conn-straggler");
     let plan = ShutdownPlan {
-        driver_shutdown: SHORT_DRIVER_BOUND,
+        driver_shutdown: DRIVER_SHUTDOWN,
         ..ShutdownPlan::default()
     };
     let stopping = Stopping::start(&socket, plan).await;
-    let repo = wedged_repository(&socket.dir);
+    let (repo, fifo) = wedged_repository(&socket.dir);
     let mut control = connect(&socket).await;
     send(&mut control, &add_project_request(&repo)).await;
-    assert!(
-        tokio::time::timeout(IN_FLIGHT_PROOF, control.next())
-            .await
-            .is_err(),
-        "project.add is in flight"
-    );
+    let _wedge = hold_fifo_open(fifo).await;
 
     stopping.raise_signal();
-    let report = stopping.tasks.run(&stopping.registry).await;
+    let report = run_past_the_bounds(&stopping.tasks, &stopping.registry).await;
 
     assert_eq!(
         report.still_running(),
@@ -312,7 +350,7 @@ async fn a_request_that_outlives_the_bound_is_named_by_its_transport() {
 
 /// The same over a remote listener, whose connections are a tracker of their
 /// own.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_remote_request_that_outlives_the_bound_is_named_by_its_transport() {
     let socket = temp_socket("conn-remote-straggler");
     let (registry, _worker_home) = worker_backed_registry(&socket, stored_config(&socket));
@@ -330,7 +368,7 @@ async fn a_remote_request_that_outlives_the_bound_is_named_by_its_transport() {
     let remote = RemoteServer::from_listener(listener, state);
     let signal = CancellationToken::new();
     let tasks = DaemonShutdown::new(ShutdownPlan {
-        driver_shutdown: SHORT_DRIVER_BOUND,
+        driver_shutdown: DRIVER_SHUTDOWN,
         ..ShutdownPlan::default()
     });
     let connections = ConnectionTasks::new("remote_connections", &signal);
@@ -339,7 +377,7 @@ async fn a_remote_request_that_outlives_the_bound_is_named_by_its_transport() {
     let server = tokio::spawn(remote.serve(connections, async move {
         accepting.cancelled().await;
     }));
-    let repo = wedged_repository(&socket.dir);
+    let (repo, fifo) = wedged_repository(&socket.dir);
     let stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("connect to the remote listener");
@@ -348,16 +386,11 @@ async fn a_remote_request_that_outlives_the_bound_is_named_by_its_transport() {
         .send(serde_json::to_string(&add_project_request(&repo)).expect("serialize request"))
         .await
         .expect("send project.add");
-    assert!(
-        tokio::time::timeout(IN_FLIGHT_PROOF, client.next())
-            .await
-            .is_err(),
-        "project.add is in flight"
-    );
+    let _wedge = hold_fifo_open(fifo).await;
 
     registry.begin_daemon_shutdown();
     signal.cancel();
-    let report = tasks.run(&registry).await;
+    let report = run_past_the_bounds(&tasks, &registry).await;
 
     assert_eq!(
         report.still_running(),

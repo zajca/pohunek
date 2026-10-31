@@ -1,9 +1,9 @@
 //! A bounded `session.wait` or `session.output` wait that is in flight when
 //! `pohunekd` receives `SIGTERM` is answered with `daemon_shutting_down`
 //! before the process exits, instead of ending as an EOF when the runtime
-//! drops.
+//! drops. A raw attach stream open at `SIGTERM` ends and is recorded as closed.
 //!
-//! Both scenarios run the real daemon with a real session and stop it only
+//! The wait scenarios run the real daemon with a real session and stop it only
 //! after its log shows the wait parked, so the reply comes from the wait
 //! itself and not from a request that reached the daemon after the signal.
 
@@ -23,6 +23,8 @@ use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::{bin_exe, worker_binary};
 use protocol::{method, ProtocolError, Request, Response, MAX_SESSION_WAIT_MS};
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
 use tokio::process::Child;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -52,6 +54,8 @@ struct Fixture {
     pid: Pid,
     control: Control,
     session: String,
+    socket: PathBuf,
+    events: PathBuf,
     logs: PathBuf,
     _env: TestEnv,
 }
@@ -141,7 +145,9 @@ impl Fixture {
             pid,
             control,
             session,
+            socket,
             logs: state_home.join(APP_DIR).join("logs"),
+            events: data_home.join(APP_DIR).join("events"),
             _env: env,
         }
     }
@@ -282,4 +288,74 @@ async fn a_session_output_wait_in_flight_is_answered_when_the_daemon_stops() {
     fixture.stop();
 
     assert_answered_then_exited(fixture).await;
+}
+
+/// Whether the daemon's event log below `events` holds a line of `event`
+/// for the attach stream `stream_id`.
+fn attach_event_recorded(events: &Path, event: &str, stream_id: &str) -> bool {
+    fn scan(dir: &Path, event: &str, stream_id: &str) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                scan(&path, event, stream_id)
+            } else {
+                fs::read_to_string(&path).is_ok_and(|text| {
+                    text.lines()
+                        .any(|line| line.contains(event) && line.contains(stream_id))
+                })
+            }
+        })
+    }
+    scan(events, event, stream_id)
+}
+
+#[tokio::test]
+async fn an_attach_stream_open_when_the_daemon_stops_is_ended_and_recorded_as_closed() {
+    let mut fixture = Fixture::start().await;
+    let attached = call(
+        &mut fixture.control,
+        "attach",
+        method::SESSION_ATTACH,
+        json!({ "session_id": fixture.session }),
+    )
+    .await
+    .expect("session.attach opens the stream");
+    let stream_id = attached["stream_id"]
+        .as_str()
+        .expect("the attach result has a stream id")
+        .to_owned();
+    let mut raw = UnixStream::connect(&fixture.socket)
+        .await
+        .expect("connect the raw stream");
+    raw.write_all(format!("{}\n", json!({ "attach": stream_id })).as_bytes())
+        .await
+        .expect("send the attach header");
+    wait_until("the attach stream to be bound", || async {
+        attach_event_recorded(&fixture.events, "attach_opened", &stream_id).then_some(())
+    })
+    .await;
+
+    fixture.stop();
+
+    // The raw stream ends: the daemon closes the bridge itself.
+    let mut buffer = [0_u8; 4_096];
+    loop {
+        let read = guard("the attach stream to end", raw.read(&mut buffer))
+            .await
+            .unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+    }
+    let status = guard("the stopping daemon exits", fixture.daemon.wait())
+        .await
+        .expect("wait for the daemon");
+    assert!(status.success(), "the daemon exits cleanly: {status:?}");
+    assert!(
+        attach_event_recorded(&fixture.events, "attach_closed", &stream_id),
+        "the closed attach stream is recorded"
+    );
 }
