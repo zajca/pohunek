@@ -188,6 +188,9 @@ impl SessionRegistry {
             params.max_bytes(),
             wait,
         );
+        if !wait.is_zero() {
+            tracing::debug!(session_id = %params.session_id().0, "session output wait parked");
+        }
         let output = tokio::select! {
             biased;
             () = self.inner.daemon_shutdown.cancelled(), if !wait.is_zero() => {
@@ -272,6 +275,7 @@ impl SessionRegistry {
         }
         let _permit = self.acquire_waiter(params.session_id())?;
         let deadline = tokio::time::Instant::now() + timeout;
+        tracing::debug!(session_id = %params.session_id().0, "session wait parked");
 
         loop {
             let now = tokio::time::Instant::now();

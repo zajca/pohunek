@@ -2385,8 +2385,9 @@ Observation errors are stable and payload-free: `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
 `session_read_ansi_unavailable`, `session_output_limit_exceeded`,
 `session_wait_limit_exceeded`,
-`session_waiter_limit_reached`, and `worker_feature_unavailable`. Restart from a
-fresh screen/tail after runtime change. A worker on the immediately preceding
+`session_waiter_limit_reached`, `worker_feature_unavailable`, and, for a bounded
+wait that daemon shutdown ends, the daemon-class `daemon_shutting_down`. Restart
+from a fresh screen/tail after runtime change. A worker on the immediately preceding
 private protocol remains usable for existing lifecycle and attach operations,
 but observation returns `worker_feature_unavailable`.
 

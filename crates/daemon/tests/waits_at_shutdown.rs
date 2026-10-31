@@ -3,25 +3,25 @@
 //! before the process exits, instead of ending as an EOF when the runtime
 //! drops.
 //!
-//! Both scenarios run the real daemon with a real shell session, send the wait
-//! with a bound far above the test's patience, and stop the daemon while the
-//! request is in flight.
+//! Both scenarios run the real daemon with a real session and stop it only
+//! after its log shows the wait parked, so the reply comes from the wait
+//! itself and not from a request that reached the daemon after the signal.
 
 // Rust guideline compliant 2026-10-31
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use futures::{SinkExt as _, StreamExt as _};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::{bin_exe, worker_binary};
-use protocol::{method, ProtocolError, Request, Response};
+use protocol::{method, ProtocolError, Request, Response, MAX_SESSION_WAIT_MS};
 use serde_json::{json, Value};
 use tokio::net::UnixStream;
 use tokio::process::Child;
@@ -30,30 +30,50 @@ use tokio_util::codec::{Framed, LinesCodec};
 /// Directory name the daemon uses below the XDG roots.
 const APP_DIR: &str = "pohunek";
 
-/// Bound of the waits under test; the replies must come far sooner.
-const WAIT_BOUND_MS: u32 = 8_000;
+/// What the session's program prints once, before it goes quiet.
+const MARKER: &str = "session-ready";
 
-/// The longest the shutdown reply may take.
-const REPLY_CEILING: Duration = Duration::from_secs(4);
+/// The session's program: it prints [`MARKER`] and then stays silent, so the
+/// output has a known end.
+const SESSION_PROGRAM: &str = "#!/bin/sh\nprintf session-ready\nexec sleep 30\n";
 
-/// Quiet period that marks the shell's output as settled.
-const QUIET_MS: u32 = 1_500;
+/// The log line of a `session.wait` that has taken its waiter slot.
+const WAIT_PARKED: &str = "session wait parked";
+
+/// The log line of a `session.output` wait that is about to read.
+const OUTPUT_PARKED: &str = "session output wait parked";
 
 type Control = Framed<UnixStream, LinesCodec>;
 
-/// A running daemon with one shell session.
+/// A running daemon with one session.
 struct Fixture {
     // Declared before `env` so the daemon is reaped while the root still exists.
     daemon: Child,
     pid: Pid,
     control: Control,
     session: String,
+    logs: PathBuf,
     _env: TestEnv,
 }
 
 fn private_dir(path: &Path) {
     fs::create_dir_all(path).expect("create directory");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("make directory private");
+}
+
+/// Whether any file below `dir` holds `needle`.
+fn any_file_contains(dir: &Path, needle: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            any_file_contains(&path, needle)
+        } else {
+            fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        }
+    })
 }
 
 impl Fixture {
@@ -65,13 +85,21 @@ impl Fixture {
         private_dir(&data_home.join(APP_DIR));
         let work = env.root().join("work");
         private_dir(&work);
+        let program = env.root().join("session-program");
+        fs::write(&program, SESSION_PROGRAM).expect("write the session program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))
+            .expect("make the session program executable");
 
         let mut command = env.tokio_command(bin_exe("pohunekd"));
         command
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_STATE_HOME", &state_home)
             .env("XDG_DATA_HOME", &data_home)
-            .env("SHELL", "/bin/sh")
+            .env("SHELL", &program)
+            .env(
+                "RUST_LOG",
+                "pohunek_daemon::session::observation=debug,info",
+            )
             .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
             .env("POHUNEK_WORKER_BIN", worker_binary())
             .stdin(Stdio::null())
@@ -103,7 +131,7 @@ impl Fixture {
             }),
         )
         .await
-        .expect("session.new creates the shell session");
+        .expect("session.new creates the session");
         let session = created["id"]
             .as_str()
             .expect("the new session has an id")
@@ -113,8 +141,17 @@ impl Fixture {
             pid,
             control,
             session,
+            logs: state_home.join(APP_DIR).join("logs"),
             _env: env,
         }
+    }
+
+    /// Waits until the daemon's log shows `line`.
+    async fn wait_for_log(&self, line: &str) {
+        wait_until("the wait to park in the daemon", || async {
+            any_file_contains(&self.logs, line).then_some(())
+        })
+        .await;
     }
 
     /// Sends the daemon `SIGTERM`.
@@ -133,32 +170,33 @@ impl Fixture {
             .into_result()
     }
 
-    /// The identity and end offset of the session's output once it is quiet.
-    async fn settled_output(&mut self) -> (Value, Value) {
-        let mut cursor: Option<(Value, Value)> = None;
-        loop {
-            let mut params = json!({
-                "session_id": self.session,
-                "max_bytes": 65_536,
-            });
-            if let Some((runtime, offset)) = &cursor {
-                params["runtime"] = runtime.clone();
-                params["after_offset"] = offset.clone();
-                params["wait_ms"] = json!(QUIET_MS);
-            }
-            let page = call(&mut self.control, "settle", method::SESSION_OUTPUT, params)
-                .await
-                .expect("session.output reads the retained output");
-            let runtime = json!({
-                "worker_instance_id": page["worker_instance_id"],
-                "runtime_generation": page["runtime_generation"],
-            });
-            let next = page["next_offset"].clone();
-            if cursor.is_some() && page["timed_out"] == json!(true) {
-                return (runtime, next);
-            }
-            cursor = Some((runtime, next));
-        }
+    /// The runtime identity and the end offset of the session's output once it
+    /// holds [`MARKER`]; the program prints nothing after it.
+    async fn output_end(&mut self) -> (Value, Value) {
+        let session = self.session.clone();
+        let control = tokio::sync::Mutex::new(&mut self.control);
+        wait_until("the session output to hold the marker", || async {
+            let mut control = control.lock().await;
+            let page = call(
+                &mut control,
+                "tail",
+                method::SESSION_OUTPUT,
+                json!({ "session_id": session, "max_bytes": 65_536 }),
+            )
+            .await
+            .ok()?;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(page["data_base64"].as_str().expect("output data"))
+                .expect("output data is base64");
+            String::from_utf8_lossy(&data).contains(MARKER).then(|| {
+                let runtime = json!({
+                    "worker_instance_id": page["worker_instance_id"],
+                    "runtime_generation": page["runtime_generation"],
+                });
+                (runtime, page["runtime_end_offset"].clone())
+            })
+        })
+        .await
     }
 }
 
@@ -169,11 +207,7 @@ async fn call(
     method: &str,
     params: Value,
 ) -> Result<Value, ProtocolError> {
-    let request = Request::new(id, method, params).expect("valid request");
-    control
-        .send(serde_json::to_string(&request).expect("serialize request"))
-        .await
-        .expect("send request");
+    send(control, id, method, params).await;
     let line = guard("the reply", control.next())
         .await
         .expect("a reply line")
@@ -183,17 +217,22 @@ async fn call(
         .into_result()
 }
 
-/// Asserts that the in-flight wait ended with `daemon_shutting_down`, before
-/// the daemon exited and long before the wait's own bound.
-async fn assert_answered_before_exit(mut fixture: Fixture, sent_at: Instant) {
-    let outcome = fixture.reply().await;
-    let waited = sent_at.elapsed();
-    let error = outcome.expect_err("the wait ends with an error");
+async fn send(control: &mut Control, id: &str, method: &str, params: Value) {
+    let request = Request::new(id, method, params).expect("valid request");
+    control
+        .send(serde_json::to_string(&request).expect("serialize request"))
+        .await
+        .expect("send request");
+}
+
+/// Asserts that the parked wait ended with `daemon_shutting_down` and that the
+/// daemon then exited.
+async fn assert_answered_then_exited(mut fixture: Fixture) {
+    let error = fixture
+        .reply()
+        .await
+        .expect_err("the wait ends with an error");
     assert_eq!(error.code, "daemon_shutting_down", "{error:?}");
-    assert!(
-        waited < REPLY_CEILING,
-        "the reply took {waited:?}, so it is not the shutdown but the wait's own bound"
-    );
     let status = guard("the stopping daemon exits", fixture.daemon.wait())
         .await
         .expect("wait for the daemon");
@@ -203,36 +242,30 @@ async fn assert_answered_before_exit(mut fixture: Fixture, sent_at: Instant) {
 #[tokio::test]
 async fn a_session_wait_in_flight_is_answered_when_the_daemon_stops() {
     let mut fixture = Fixture::start().await;
-    let request = Request::new(
+    send(
+        &mut fixture.control,
         "wait",
         method::SESSION_WAIT,
         json!({
             "session_id": fixture.session,
             "states": ["failed"],
-            "timeout_ms": WAIT_BOUND_MS,
+            "timeout_ms": MAX_SESSION_WAIT_MS,
         }),
     )
-    .expect("valid request");
-    let sent_at = Instant::now();
-    fixture
-        .control
-        .send(serde_json::to_string(&request).expect("serialize request"))
-        .await
-        .expect("send session.wait");
-    // The wait is registered once it has taken its waiter slot, which it does
-    // before it sleeps; a short settle keeps the signal behind the request.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    .await;
+    fixture.wait_for_log(WAIT_PARKED).await;
 
     fixture.stop();
 
-    assert_answered_before_exit(fixture, sent_at).await;
+    assert_answered_then_exited(fixture).await;
 }
 
 #[tokio::test]
 async fn a_session_output_wait_in_flight_is_answered_when_the_daemon_stops() {
     let mut fixture = Fixture::start().await;
-    let (runtime, offset) = fixture.settled_output().await;
-    let request = Request::new(
+    let (runtime, offset) = fixture.output_end().await;
+    send(
+        &mut fixture.control,
         "output",
         method::SESSION_OUTPUT,
         json!({
@@ -240,19 +273,13 @@ async fn a_session_output_wait_in_flight_is_answered_when_the_daemon_stops() {
             "runtime": runtime,
             "after_offset": offset,
             "max_bytes": 4_096,
-            "wait_ms": WAIT_BOUND_MS,
+            "wait_ms": MAX_SESSION_WAIT_MS,
         }),
     )
-    .expect("valid request");
-    let sent_at = Instant::now();
-    fixture
-        .control
-        .send(serde_json::to_string(&request).expect("serialize request"))
-        .await
-        .expect("send session.output");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    .await;
+    fixture.wait_for_log(OUTPUT_PARKED).await;
 
     fixture.stop();
 
-    assert_answered_before_exit(fixture, sent_at).await;
+    assert_answered_then_exited(fixture).await;
 }
