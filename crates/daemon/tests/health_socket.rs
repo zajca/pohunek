@@ -5893,6 +5893,255 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
     let _ = handle.await;
 }
 
+/// Bytes per write while the test fills the sockets with a paste.
+const UNREAD_PASTE_CHUNK_BYTES: usize = 64 * 1024;
+
+#[tokio::test]
+async fn closing_the_attach_connection_releases_the_bridge_while_its_input_waits_for_the_program() {
+    // The program neither reads its input nor writes output (the terminal does
+    // not echo it either), so a paste leaves the bridge's send to the worker
+    // pending and the bridge reads its client no more. Only the connection's
+    // hangup shows that the client is gone.
+    let socket = temp_socket("attach-hangup-pending-send");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "stty -echo; exec sleep 600"]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = subscribe_events(&socket).await;
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control, &socket).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let raw = open_attach_stream(&socket, &attach.stream_id).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &attach.stream_id).await;
+
+    // Whole lines: the terminal queues them for the program and, once its queue
+    // is full, stops taking input instead of discarding it. A write that would
+    // block then means every buffer toward the program is full, which only
+    // happens while the bridge's send waits.
+    let chunk = b"paste line that the program never reads\n".repeat(UNREAD_PASTE_CHUNK_BYTES / 40);
+    wait::guard("the paste to fill every buffer", async {
+        loop {
+            raw.writable().await.expect("wait for the raw stream");
+            match raw.try_write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("paste into the raw stream: {error}"),
+            }
+        }
+    })
+    .await;
+
+    drop(raw);
+    wait_for_attach_event(&mut subscriber, event::ATTACH_CLOSED, &attach.stream_id).await;
+
+    let stop_req = Request::make(
+        "attach-hangup-pending-send-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Bytes a half-closing client writes: more than the terminal queues for a
+/// program that does not read (`PTY_UNREAD_INPUT_CAPACITY`), less than the buffers between the client
+/// and the worker hold, so the daemon has passed all of it on when it sees the
+/// end of the client's input.
+const DRAIN_PAYLOAD_BYTES: usize = 128 * 1024;
+
+/// Send buffer requested for the client, so the whole payload is accepted
+/// without the program reading any of it.
+const DRAIN_CLIENT_SEND_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Starts a session whose program puts the terminal in raw mode, prints
+/// `READY`, waits for a line on a fifo and then copies `DRAIN_PAYLOAD_BYTES`
+/// of its input to a file. Returns the fifo and the file.
+async fn spawn_gated_reader(
+    socket: &TestSocket,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+    PathBuf,
+) {
+    let gate = socket.dir.join("gate.fifo");
+    let copied = socket.dir.join("copied");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&gate)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "create the gate fifo");
+    let script = format!(
+        "stty raw -echo; printf 'READY\\n'; read _ < \"$1\"; head -c {DRAIN_PAYLOAD_BYTES} > \"$2\""
+    );
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c".to_owned(),
+                script,
+                "sh".to_owned(),
+                gate.display().to_string(),
+                copied.display().to_string(),
+            ],
+        ),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(socket, "0.0.0", config).await;
+    (shutdown, handle, gate, copied)
+}
+
+fn drain_payload() -> Vec<u8> {
+    (0..DRAIN_PAYLOAD_BYTES)
+        .map(|index| b'!' + u8::try_from(index % 94).expect("a residue below 94 fits a byte"))
+        .collect()
+}
+
+/// Writes the whole payload without the program reading any of it.
+async fn write_drain_payload(raw: &UnixStream) {
+    socket2::SockRef::from(raw)
+        .set_send_buffer_size(DRAIN_CLIENT_SEND_BUFFER_BYTES)
+        .expect("size the client send buffer");
+    let payload = drain_payload();
+    wait::guard("the client socket to accept the payload", async {
+        let mut written = 0;
+        while written < payload.len() {
+            raw.writable().await.expect("wait for the raw stream");
+            match raw.try_write(&payload[written..]) {
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("write the payload: {error}"),
+            }
+        }
+    })
+    .await;
+}
+
+/// Bytes the peer of `stream` has not read yet. A client that closes only after
+/// the daemon read its whole input makes the daemon see the close while it
+/// waits for the program, not while it is still forwarding.
+#[cfg(target_os = "linux")]
+fn unread_by_peer(stream: &UnixStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut unread: libc::c_int = 0;
+    // SAFETY: the descriptor is open for the duration of the call and `unread`
+    // is a valid out-pointer for this request.
+    let status = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut unread) };
+    assert_eq!(status, 0, "query the unread bytes of the raw stream");
+    usize::try_from(unread).expect("a byte count is not negative")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unread_by_peer(_stream: &UnixStream) -> usize {
+    0
+}
+
+#[tokio::test]
+async fn a_half_closed_attach_input_is_written_to_the_terminal_before_the_stream_closes() {
+    let socket = temp_socket("attach-drain-delivers");
+    let (shutdown, handle, gate, copied) = spawn_gated_reader(&socket).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control, &socket).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
+    read_until_marker(&mut raw, b"READY").await;
+
+    write_drain_payload(&raw).await;
+    raw.shutdown().await.expect("half-close the raw stream");
+
+    // The program reads only now. Every byte must still be on its way: the
+    // daemon keeps the stream open until the terminal accepted the last one.
+    let release = tokio::task::spawn_blocking(move || {
+        std::fs::write(gate, b"go\n").expect("open the gate");
+    });
+    wait::guard("the gate to open", release)
+        .await
+        .expect("join the gate writer");
+    wait::guard("the daemon to close the stream", async {
+        let mut sink = [0_u8; 1024];
+        while raw.read(&mut sink).await.expect("read the raw stream") != 0 {}
+    })
+    .await;
+    wait_until("the program to have read every byte", || async {
+        let copy = std::fs::read(&copied).ok()?;
+        (copy.len() == DRAIN_PAYLOAD_BYTES).then_some(copy)
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&copied).expect("read the copy"),
+        drain_payload(),
+        "the program must read the payload in order"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn closing_a_half_closed_attach_connection_ends_the_wait_for_the_program() {
+    // The program never reads, so the last frame is never acknowledged: only
+    // the complete close after the half-close can end the bridge.
+    let socket = temp_socket("attach-drain-hangup");
+    let (shutdown, handle, _gate, _copied) = spawn_gated_reader(&socket).await;
+
+    let mut subscriber = subscribe_events(&socket).await;
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control, &socket).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &attach.stream_id).await;
+    read_until_marker(&mut raw, b"READY").await;
+
+    write_drain_payload(&raw).await;
+    raw.shutdown().await.expect("half-close the raw stream");
+    wait_until("the daemon to have read the payload", || async {
+        (unread_by_peer(&raw) == 0).then_some(())
+    })
+    .await;
+    drop(raw);
+    wait_for_attach_event(&mut subscriber, event::ATTACH_CLOSED, &attach.stream_id).await;
+
+    // The lease is released: the session attaches again.
+    let again = attach_session(&mut control, &created.id).await;
+    let _raw = open_attach_stream(&socket, &again.stream_id).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &again.stream_id).await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn a_half_closed_attach_without_input_closes_the_stream_at_once() {
+    let socket = temp_socket("attach-drain-empty");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "stty -echo; exec sleep 600"]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control, &socket).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
+    raw.shutdown().await.expect("half-close the raw stream");
+
+    // No frame was sent, so no acknowledgement will come: the stream ends.
+    wait::guard("the daemon to close the stream", async {
+        let mut sink = [0_u8; 1024];
+        while raw.read(&mut sink).await.expect("read the raw stream") != 0 {}
+    })
+    .await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
     // Closing an attach window kills `pohunek attach`, which drops the attach

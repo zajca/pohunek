@@ -36,6 +36,10 @@ use crate::paths::Paths;
 use crate::target::Target;
 
 const IO_BUFFER_BYTES: usize = 8192;
+/// Terminal input queued for an attach stream whose program does not read. The
+/// loop reads no further stdin beyond it, so a detach shortcut typed behind
+/// more than this many unread bytes is seen only once the stream takes input.
+const PENDING_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
 /// Maximum ambiguity delay for a split terminal shortcut sequence.
 ///
 /// Physical stdin is local, so bytes from one key report normally arrive in a
@@ -385,9 +389,6 @@ struct StatusUpdates {
 
 #[derive(Debug)]
 struct MenuEffectContext<'a> {
-    client: &'a mut Client,
-    stream_id: &'a str,
-    terminal: &'a mut Option<RawTerminal>,
     menu_task: &'a mut Option<MenuTask>,
     generation: u64,
     control: &'a AttachControlContext,
@@ -397,22 +398,27 @@ struct MenuEffectContext<'a> {
 /// Terminal input routed to the attach stream and not yet written to it.
 ///
 /// The attach loop writes it from an arm of its own, so the daemon's output
-/// keeps being shown while a paste waits for the program to read it, and it
-/// reads stdin again only once the queue is empty.
+/// keeps being shown while a paste waits for the program to read it. It keeps
+/// reading stdin while the queue holds fewer than [`PENDING_STDIN_LIMIT_BYTES`],
+/// so a detach shortcut typed behind an unread paste is seen; the detach drops
+/// what the stream did not take.
 #[derive(Debug, Default)]
 struct PendingStreamInput {
     bytes: Vec<u8>,
     /// Stdin ended: the stream's write half shuts down once `bytes` is written.
     closing: bool,
-    /// The detach shortcut was typed: the detach request is sent once `bytes`
-    /// is written.
+    /// The stream's write half was shut down; the attach ends when the daemon
+    /// closes the stream after delivering the input.
+    shut_down: bool,
+    /// The detach shortcut was typed: the loop writes what the stream takes
+    /// without waiting, drops the rest and sends the detach request.
     detaching: bool,
 }
 
 impl PendingStreamInput {
     /// Whether the attach loop reads the next terminal input.
     fn accepts_stdin(&self) -> bool {
-        self.bytes.is_empty() && !self.closing && !self.detaching
+        self.bytes.len() < PENDING_STDIN_LIMIT_BYTES && !self.closing && !self.detaching
     }
 
     /// Drops the `written` bytes the attach stream took from the queue.
@@ -1061,6 +1067,30 @@ where
     stdout.queued() < OUTPUT_QUEUE_BYTES || !modal.is_some_and(|modal| modal.active)
 }
 
+/// Writes as much of `queue` to `stream` as it takes without waiting and leaves
+/// the rest in the queue.
+async fn write_available<W>(stream: &mut W, queue: &mut Vec<u8>) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    std::future::poll_fn(|cx| {
+        while !queue.is_empty() {
+            match std::pin::Pin::new(&mut *stream).poll_write(cx, queue) {
+                std::task::Poll::Pending => break,
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+                }
+                std::task::Poll::Ready(Ok(written)) => {
+                    queue.drain(..written);
+                }
+                std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Err(error)),
+            }
+        }
+        std::task::Poll::Ready(Ok(()))
+    })
+    .await
+}
+
 /// Writes the queued output before the terminal leaves raw mode, so it is not
 /// processed by the restored line discipline. A write error surfaces on the
 /// next write.
@@ -1684,10 +1714,14 @@ where
         if let Some(end) = route_stdin_input(&decoded.bytes, ctx.reborrow()).await? {
             return Ok(Some(end));
         }
+        if ctx.stream_input.detaching {
+            // A detach chosen in the menu ends the attach before the shortcut.
+            return Ok(None);
+        }
         match shortcut {
             Shortcut::Detach => {
-                // The attach loop writes the input typed before the shortcut
-                // to the stream, showing output meanwhile, and then sends the
+                // The attach loop writes what the stream takes of the input
+                // typed before the shortcut, drops the rest and sends the
                 // detach request.
                 ctx.stream_input.detaching = true;
                 return Ok(None);
@@ -1733,21 +1767,21 @@ where
             .iter()
             .any(|effect| matches!(effect, MenuEffect::RunDetach))
         {
-            flush_output_before_restore(ctx.stdout).await;
+            // The loop detaches the way the shortcut does, dropping the input
+            // the stream did not take and reporting how much.
+            ctx.stream_input.detaching = true;
+            return Ok(None);
         }
-        return handle_menu_effects(
+        handle_menu_effects(
             outcome.effects,
             MenuEffectContext {
-                client: ctx.client,
-                stream_id: ctx.stream_id,
-                terminal: ctx.terminal,
                 menu_task: &mut ctx.menu.task,
                 generation: ctx.menu.generation,
                 control: ctx.control,
                 modal: ctx.modal.as_ref(),
             },
-        )
-        .await;
+        );
+        return Ok(None);
     }
 
     ctx.stream_input.bytes.extend_from_slice(input);
@@ -1851,47 +1885,61 @@ where
     let mut stream_input = PendingStreamInput::default();
     let outcome: Result<AttachStreamEnd, CliError> = async {
         loop {
-            if stream_input.detaching && stream_input.bytes.is_empty() {
-                socket_write.flush().await?;
+            if stream_input.detaching {
+                // The detach does not wait for a program that does not read:
+                // the stream takes what it can at once and the rest is dropped.
+                let delivery = write_available(&mut socket_write, &mut stream_input.bytes).await;
+                let dropped = std::mem::take(&mut stream_input.bytes).len();
                 flush_output_before_restore(&mut stdout).await;
-                return Ok(detach_stream(&mut client, &stream_id, &mut terminal).await);
+                // A stream that could not take all the input ends detached
+                // unless the daemon reports a stream failure.
+                let end = if delivery.is_err() || dropped > 0 {
+                    detach_ended_stream(&mut client, &stream_id, &mut terminal).await
+                } else {
+                    Ok(detach_stream(&mut client, &stream_id, &mut terminal).await)
+                };
+                if dropped > 0 {
+                    eprintln!(
+                        "[pohunek] detached; {dropped} bytes of typed input were dropped unsent; \
+                         input the daemon had not yet passed to the program may be dropped as well"
+                    );
+                }
+                return end;
             }
-            if stream_input.closing && stream_input.bytes.is_empty() {
+            if stream_input.closing && stream_input.bytes.is_empty() && !stream_input.shut_down {
+                // The write half closes and the connection stays open: the
+                // daemon delivers the input still buffered, then closes the
+                // stream, and the output is shown until it does.
                 socket_write.shutdown().await?;
-                return Ok(AttachStreamEnd::InputClosed);
+                stream_input.shut_down = true;
             }
             tokio::select! {
                 written = socket_write.write(&stream_input.bytes), if !stream_input.bytes.is_empty() => {
                     let taken = written
                         .map_err(CliError::Io)
                         .and_then(|written| stream_input.take_written(written));
-                    if let Err(error) = taken {
-                        // A stream that can no longer take the input typed
-                        // ahead of the detach shortcut ends detached unless
-                        // the daemon reports a stream failure.
-                        if stream_input.detaching {
-                            flush_output_before_restore(&mut stdout).await;
-                            return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
-                        }
-                        return Err(error);
-                    }
+                    taken?;
                 }
                 drained = stdout.drain(), if stdout.queued() > 0 => {
                     drained?;
                 }
                 read = socket_read.read(&mut socket_buf), if stdout.queued() < OUTPUT_QUEUE_BYTES => {
-                    let input = &socket_buf[..read?];
+                    let read = read?;
+                    if read == 0 && stream_input.shut_down {
+                        // The raw stream cannot carry a typed failure, so the
+                        // daemon's detach reply reports one.
+                        if let Ok(detach) = send_detach(&mut client, &stream_id).await {
+                            if let Some(error) = stream_error_from_detach(detach) {
+                                return Err(error);
+                            }
+                        }
+                        return Ok(AttachStreamEnd::InputClosed);
+                    }
+                    let input = &socket_buf[..read];
                     let args = (&control.target, &mut terminal);
                     if let Some(end) =
                         handle_socket_read(input, &mut stdout, &mut modal, &mut menu, args).await?
                     {
-                        // A stream that ends before the input typed ahead of
-                        // the detach shortcut is written ends detached unless
-                        // the daemon reports a stream failure.
-                        if end == AttachStreamEnd::StreamClosed && stream_input.detaching {
-                            flush_output_before_restore(&mut stdout).await;
-                            return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
-                        }
                         return Ok(end);
                     }
                 }
@@ -2110,73 +2158,71 @@ fn reconnect_decision_from_error(err: &CliError) -> AttachReconnectDecision {
     }
 }
 
-async fn handle_menu_effects(
-    effects: Vec<MenuEffect>,
-    ctx: MenuEffectContext<'_>,
-) -> Result<Option<AttachStreamEnd>, CliError> {
+fn handle_menu_effects(effects: Vec<MenuEffect>, ctx: MenuEffectContext<'_>) {
+    let MenuEffectContext {
+        menu_task,
+        generation,
+        control,
+        modal,
+    } = ctx;
     for effect in effects {
         match effect {
-            MenuEffect::RunDetach => {
-                return Ok(Some(
-                    detach_stream(ctx.client, ctx.stream_id, ctx.terminal).await,
-                ));
-            }
             MenuEffect::RunKill => {
-                if ctx.menu_task.is_none() {
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                if menu_task.is_none() {
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Kill,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Kill,
                     ));
                 }
             }
             MenuEffect::RunRemove => {
-                if ctx.menu_task.is_none() {
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                if menu_task.is_none() {
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Remove,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Remove,
                     ));
                 }
             }
             MenuEffect::RunNewSession => {
-                if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
+                if let (None, Some(modal)) = (menu_task.as_ref(), modal) {
                     let (rows, cols) = modal.compositor.grid_size();
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::NewSession,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::NewSession { cols, rows },
                     ));
                 }
             }
             MenuEffect::RunFork => {
-                if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
+                if let (None, Some(modal)) = (menu_task.as_ref(), modal) {
                     let (rows, cols) = modal.compositor.grid_size();
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Fork,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Fork { cols, rows },
                     ));
                 }
             }
             MenuEffect::RunRename(name) => {
-                if ctx.menu_task.is_none() {
-                    *ctx.menu_task = Some(spawn_menu_task(
-                        ctx.generation,
+                if menu_task.is_none() {
+                    *menu_task = Some(spawn_menu_task(
+                        generation,
                         MenuTaskAction::Rename,
-                        ctx.control,
+                        control,
                         MenuTaskArgs::Rename { name },
                     ));
                 }
             }
-            MenuEffect::Close => {}
+            // The caller turns a detach into a request of the attach loop.
+            MenuEffect::RunDetach | MenuEffect::Close => {}
         }
     }
-    Ok(None)
 }
 
 async fn handle_menu_task_result<W>(
@@ -2327,8 +2373,8 @@ async fn detach_stream(
     AttachStreamEnd::Detached
 }
 
-/// [`detach_stream`] for a stream that ended before the input typed ahead of
-/// the detach shortcut was written.
+/// [`detach_stream`] for a stream that could not take all the input typed ahead
+/// of the detach shortcut.
 ///
 /// The raw stream cannot carry a typed terminal failure, so the daemon's
 /// detach reply reports it, as [`finish_attach_outcome`] does for a closed
@@ -2973,30 +3019,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_detach_after_unread_input_keeps_showing_output_until_the_input_is_written() {
+    async fn a_detach_after_unread_input_delivers_what_the_stream_took_and_drops_the_rest() {
         let (stream, mut daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
-        // The daemon writes output larger than the stream holds before it
-        // reads any input, as it does while the program does not read.
-        let daemon = tokio::spawn(async move {
-            daemon_end
-                .write_all(&vec![b'y'; STREAM_OUTPUT_BYTES])
-                .await
-                .expect("write the stream output");
-            let mut input = Vec::new();
-            daemon_end
-                .read_to_end(&mut input)
-                .await
-                .expect("read the client's input");
-            input
-        });
 
         let end = attach_until_detached(stream, None).await;
 
         assert!(matches!(end, Ok(AttachStreamEnd::Detached)), "{end:?}");
-        let input = guard("the daemon reads the typed input", daemon)
+        // The program reads nothing while the client detaches. What the
+        // stream took arrives in order; the remainder is dropped.
+        let mut delivered = Vec::new();
+        daemon_end
+            .read_to_end(&mut delivered)
             .await
-            .expect("stream test daemon");
-        assert_eq!(input, typed_input_and_detach().0);
+            .expect("read the client's input");
+        let typed = typed_input_and_detach().0;
+        assert_eq!(delivered.len(), STREAM_BUFFER_BYTES);
+        assert_eq!(delivered, typed[..STREAM_BUFFER_BYTES]);
     }
 
     /// Terminal bytes shared between a gated terminal and the test.

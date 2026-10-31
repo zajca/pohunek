@@ -1,0 +1,6 @@
+## Unreleased (2026-10-31, attach input ack contract and blocked-write disconnect, #1568 #1160)
+
+- The daemon uses the attach `InputAck` only to end a stream whose client finished its input; the raw public stream carries none, so an attach input write stays unacknowledged to the client. The ack means the program's terminal accepted the bytes (#1568).
+- A daemon attach bridge whose send to the program waits, or that drains a finished input, ends when the client closes a Unix socket connection completely; TCP connections (a remote host, a relay with a TCP upstream) keep the attach while the program neither reads input nor writes output, until it reads, the session stops or the lease is released (#1160).
+- The `pohunek attach` client reads up to 1 MiB of typed input ahead while the program does not read, so the detach shortcut is seen behind a paste. The detach drops the bytes still queued in the client and prints their count (#1160).
+- At the end of piped stdin the client closes only its write half and shows output until the daemon closed the stream once the terminal accepted the input; a complete close is a disconnect, so a previous-release CLI that pipes into a slow program, and the TS SDK, which cannot half-close, lose the input the terminal had not accepted at that point (#1160).

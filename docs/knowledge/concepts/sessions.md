@@ -1326,7 +1326,25 @@ Workers negotiated below private protocol v3 cannot guarantee that ordering;
 the daemon returns `attach_snapshot_unsupported`, and the session must be
 restarted on an upgraded worker or forked into a new session.
 Interactive attach input is ordered by a stream-scoped sequence and does not
-consume the worker's bounded control-input deduplication capacity. A typed
+consume the worker's bounded control-input deduplication capacity. The worker
+acknowledges each attach input frame on the private stream once the program's
+terminal accepted its bytes (not once the program read them). The daemon uses
+that acknowledgement only to end a stream whose client finished its input; the
+raw public stream carries none, so the public contract is that an attach input
+write is not acknowledged. When the client shuts down its write half, the
+daemon stops reading the client, keeps forwarding output and closes the stream
+once the last input frame it sent was acknowledged, or earlier when the program
+exits, the worker reports an error, the session stops, the lease is released,
+an output write to the client fails or the client closes a Unix socket
+connection completely. Output still queued behind the last acknowledgement when the stream
+ends may not be shown. While a paste waits for a program that does not read, the
+bridge also ends when the client closes a Unix socket connection completely (a
+hangup of the connection, not an end of the client's input). At the end of its
+stdin the CLI closes only its write half and shows output until the daemon
+closes the stream; it does not wait for the program to exit, and a typed stream
+failure at that point is reported. The CLI client reads up to 1 MiB of typed
+input ahead, so a detach shortcut typed behind the paste is seen; the detach
+drops the bytes still queued in the client and reports their count. A typed
 worker stream failure is retained by the daemon for the attaching CLI, which
 surfaces it instead of repeatedly treating it as an ordinary reconnect.
 
