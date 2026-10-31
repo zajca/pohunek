@@ -351,6 +351,13 @@ close, and a mutating request already running completes and is answered before
 the connection closes. A client that cannot read the code, such as one on an
 older protocol, sees an ordinary daemon error followed by the end of the
 connection.
+The daemon ends every line it writes with a newline, and it can stop in the
+middle of an event it is writing. A client therefore treats bytes at the end of
+the stream that have no terminating newline as a closed connection and drops
+them: they are neither an event nor a parse error. The Rust client and the
+TypeScript SDK do this; a client written by hand has to as well. A client from
+before this rule may report the fragment as an unparseable line before it sees
+the end of the stream.
 
 Raw terminal bytes are never multiplexed onto a JSON control connection. Attach
 uses a separate connection described in "Attach Stream".

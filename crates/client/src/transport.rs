@@ -25,7 +25,7 @@ use protocol::{
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
-use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
+use tokio_util::codec::{Decoder, Encoder, Framed, LinesCodec, LinesCodecError};
 
 use crate::ClientError;
 
@@ -352,9 +352,56 @@ enum SubscriptionInner {
     Remote(Conn<TcpStream>),
 }
 
+/// Newline-delimited lines in which only a terminated line is a line.
+///
+/// The daemon ends every line it writes with a newline. A fragment that the
+/// stream ends on, as when the daemon stops in the middle of an event, is a
+/// closed connection and not a line to parse.
+#[derive(Debug)]
+struct TerminatedLines(LinesCodec);
+
+impl TerminatedLines {
+    fn new(max_length: usize) -> Self {
+        Self(LinesCodec::new_with_max_length(max_length))
+    }
+}
+
+impl Decoder for TerminatedLines {
+    type Item = String;
+    type Error = LinesCodecError;
+
+    fn decode(
+        &mut self,
+        src: &mut tokio_util::bytes::BytesMut,
+    ) -> Result<Option<String>, Self::Error> {
+        self.0.decode(src)
+    }
+
+    fn decode_eof(
+        &mut self,
+        buf: &mut tokio_util::bytes::BytesMut,
+    ) -> Result<Option<String>, Self::Error> {
+        let line = self.0.decode(buf)?;
+        buf.clear();
+        Ok(line)
+    }
+}
+
+impl Encoder<String> for TerminatedLines {
+    type Error = LinesCodecError;
+
+    fn encode(
+        &mut self,
+        item: String,
+        dst: &mut tokio_util::bytes::BytesMut,
+    ) -> Result<(), Self::Error> {
+        self.0.encode(item, dst)
+    }
+}
+
 #[derive(Debug)]
 struct Conn<S> {
-    framed: Framed<S, LinesCodec>,
+    framed: Framed<S, TerminatedLines>,
     remote_host: Option<String>,
     request_timeout: Duration,
     poisoned: Option<String>,
@@ -1438,10 +1485,7 @@ where
 {
     fn new(stream: S, remote_host: Option<String>, options: ClientOptions) -> Self {
         Self {
-            framed: Framed::new(
-                stream,
-                LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES),
-            ),
+            framed: Framed::new(stream, TerminatedLines::new(MAX_CONTROL_LINE_BYTES)),
             remote_host,
             request_timeout: options.request_timeout,
             poisoned: None,
