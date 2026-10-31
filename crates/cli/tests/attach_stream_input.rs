@@ -179,7 +179,7 @@ fn an_attach_client_keeps_showing_output_while_its_paste_is_not_read() {
 /// Shrinks the CLI's stdout pipe where the platform allows it and returns the
 /// byte count that means the pipe is full.
 #[cfg(target_os = "linux")]
-fn stdout_pipe_capacity(stdout: &std::process::ChildStdout) -> usize {
+fn stdout_pipe_capacity(stdout: &std::os::fd::OwnedFd) -> usize {
     rustix::pipe::fcntl_setpipe_size(stdout, STDOUT_PIPE_BYTES).expect("shrink the stdout pipe");
     rustix::pipe::fcntl_getpipe_size(stdout).expect("read the pipe capacity")
 }
@@ -187,7 +187,7 @@ fn stdout_pipe_capacity(stdout: &std::process::ChildStdout) -> usize {
 /// A pipe of another platform cannot be resized; the CLI's output fills at
 /// least this many bytes of it before the pipe is full.
 #[cfg(not(target_os = "linux"))]
-fn stdout_pipe_capacity(_stdout: &std::process::ChildStdout) -> usize {
+fn stdout_pipe_capacity(_stdout: &std::os::fd::OwnedFd) -> usize {
     16 * 1024
 }
 
@@ -196,7 +196,7 @@ fn stdout_pipe_capacity(_stdout: &std::process::ChildStdout) -> usize {
 struct StalledTerminal {
     cli: CliProcess,
     stdin: std::process::ChildStdin,
-    stdout: std::process::ChildStdout,
+    stdout: std::os::fd::OwnedFd,
     observed: mpsc::Receiver<StreamEvent>,
     _env: TestEnv,
 }
@@ -218,16 +218,19 @@ fn attach_with_stalled_terminal() -> StalledTerminal {
     let (events, observed) = mpsc::channel();
     serve_fixture_daemon(&socket, events, StreamBehavior::FloodWhileReading);
 
+    // The pipe is shrunk before the CLI exists, so it cannot hold more than its
+    // new capacity yet.
+    let (stdout, terminal_write) = rustix::pipe::pipe().expect("create the terminal pipe");
+    let capacity = stdout_pipe_capacity(&stdout);
     let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
     command
         .args(["attach", SESSION_ID])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(terminal_write))
         .stderr(Stdio::null());
     let mut cli = CliProcess(command.spawn().expect("spawn pohunek attach"));
     let stdin = cli.0.stdin.take().expect("piped stdin");
-    let stdout = cli.0.stdout.take().expect("piped stdout");
-    let capacity = stdout_pipe_capacity(&stdout);
+    drop(command);
     // The pipe is never read: once it holds its capacity, the terminal takes
     // no more output.
     poll_until("the terminal pipe to fill", || {
@@ -274,9 +277,8 @@ fn an_attach_client_detaches_while_the_terminal_reads_no_output() {
     drop(attach.stdout);
 }
 
-/// Serves `session.attach` on `socket` and one raw attach stream that writes
-/// its whole output before it reads the client's input, reporting both to
-/// `events`.
+/// Serves `session.attach` on `socket` and one raw attach stream that behaves
+/// as `behavior` says, reporting what it observes to `events`.
 fn serve_fixture_daemon(
     socket: &Path,
     events: mpsc::Sender<StreamEvent>,
