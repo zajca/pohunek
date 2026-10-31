@@ -291,11 +291,8 @@ async fn a_subscriber_that_stopped_reading_does_not_use_up_the_drivers_bound() {
         assert!(reply.is_ok(), "{reply:?}");
     }
 
-    // The session and the flood ran on the real clock; the bounds pass on the
-    // paused one.
-    tokio::time::pause();
     stopping.raise_signal();
-    let report = run_past_the_bounds(&stopping.tasks, &stopping.registry).await;
+    let report = stopping.tasks.run(&stopping.registry).await;
 
     assert!(report.is_quiescent(), "{report:?}");
     assert!(

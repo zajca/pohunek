@@ -737,9 +737,9 @@ where
 }
 
 /// The most request lines [`refuse_buffered`] answers after the stop signal.
-/// The refusals are written without awaiting the peer, so the cap keeps a client
-/// that floods the socket from holding the connection open; no real client
-/// pipelines more than a handful of requests, and 64 is far above that.
+/// The cap bounds how many buffered lines are read and refused, so a client that
+/// floods the socket cannot keep the connection open; no real client pipelines
+/// more than a handful of requests, and 64 is far above that.
 const MAX_REFUSED_LINES: usize = 64;
 
 /// The reply to a request that arrives, or is still waiting, once the daemon is
