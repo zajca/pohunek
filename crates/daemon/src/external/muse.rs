@@ -52,11 +52,13 @@ pub(super) fn parse_session(
     let byte_limit =
         u64::try_from(TRANSCRIPT_SCAN_BYTE_LIMIT).expect("transcript byte limit fits in u64");
     for line in BufReader::new(file.take(byte_limit))
-        .lines()
+        .split(b'\n')
         .take(TRANSCRIPT_SCAN_LINE_LIMIT)
     {
         let line = line?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        // A line that is not valid UTF-8, or that the byte limit cut inside a
+        // multibyte character, is unparseable like any other bad line.
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         let Some(record) = metadata_record(&value) else {

@@ -1492,6 +1492,42 @@ async fn a_line_that_is_not_utf8_does_not_drop_the_attribution_of_the_file() {
     assert!(!indexed.contains_key(OTHER_ID), "{indexed:?}");
 }
 
+#[tokio::test]
+async fn a_session_log_line_that_is_not_utf8_does_not_drop_the_session() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &data_root_descriptor()));
+    let tree = rig.home().join(".local/share/muse/sessions");
+
+    // Invalid UTF-8 before the metadata record.
+    let bad_first = "33333333-3333-4333-8333-333333333333";
+    let path = write_session(&tree, "2026/10/08", bad_first, "");
+    let mut bytes = b"{\"note\":\"\xff\xfe\"}\n".to_vec();
+    bytes.extend_from_slice(session_fixture("bare", bad_first, "/work").as_bytes());
+    fs::write(&path, bytes).expect("write the session log");
+
+    // The scan limit cuts a line inside a multibyte character before any
+    // metadata record: no session, and no failure.
+    let cut = "44444444-4444-4444-8444-444444444444";
+    let cut_path = write_session(&tree, "2026/10/08", cut, "");
+    let mut bytes = b"{\"note\":\"".to_vec();
+    let room = super::TRANSCRIPT_SCAN_BYTE_LIMIT - bytes.len();
+    bytes.extend(std::iter::repeat_n(b'a', room - 1));
+    bytes.push(0xC3); // first byte of a two-byte character, cut by the limit
+    bytes.extend_from_slice(&[0xA9, b'"', b'}', b'\n']);
+    fs::write(&cut_path, bytes).expect("write the session log");
+    let parsed = super::muse::parse_session(RuntimeRef::from_wire(ACME_RUNTIME), &tree, &cut_path)
+        .expect("a cut line is no failure");
+    assert!(parsed.is_none(), "{parsed:?}");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get(bad_first),
+        Some(&Some(PathBuf::from("/work"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key(cut), "{indexed:?}");
+}
+
 /// The session ids, with their working directories, a full pass over the data
 /// root of `rig` indexes.
 async fn indexed_sessions(rig: &Rig) -> std::collections::BTreeMap<String, Option<PathBuf>> {
