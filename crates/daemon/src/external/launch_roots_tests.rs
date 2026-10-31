@@ -1443,6 +1443,91 @@ async fn without_declared_paths_a_nested_rollout_head_is_not_attributed() {
     assert!(indexed_sessions(&rig).await.is_empty());
 }
 
+#[tokio::test]
+async fn a_line_that_is_not_utf8_does_not_drop_the_attribution_of_the_file() {
+    let rig = Rig::with_packages(|plugins| {
+        install_acme(plugins, &head_paths_descriptor(HEAD_PATHS_TABLE));
+    });
+    let tree = rig.home().join(".acme/sessions/2026/10/31");
+    fs::create_dir_all(&tree).expect("rollout directory");
+
+    // A good head, then a line of invalid UTF-8.
+    let mut bytes = format!("{}\n", rollout_head(ROLLOUT_ID, "/work")).into_bytes();
+    bytes.extend_from_slice(b"{\"payload\":\"\xff\xfe\"}\n");
+    bytes.extend_from_slice(format!("{}\n", rollout_item(OTHER_ID, "/elsewhere")).as_bytes());
+    fs::write(tree.join("rollout-bad-line.jsonl"), bytes).expect("write the rollout");
+
+    // A top-level id in a record after an invalid line is still read.
+    let mut bytes = b"\xff\xfe\n".to_vec();
+    bytes.extend_from_slice(b"{\"sessionId\":\"after-bad\",\"cwd\":\"/after\"}\n");
+    fs::write(tree.join("rollout-bad-first.jsonl"), bytes).expect("write the rollout");
+
+    // The scan limit cuts the last line inside a multibyte character.
+    let head = rollout_head("cut-limit", "/cut");
+    let filler = "{\"note\":\"".to_owned();
+    let mut cut = format!("{head}\n{filler}").into_bytes();
+    let room = super::TRANSCRIPT_SCAN_BYTE_LIMIT - cut.len();
+    cut.extend(std::iter::repeat_n(b'a', room - 1));
+    cut.push(0xC3); // first byte of a two-byte character, cut by the limit
+    cut.extend_from_slice(&[0xA9, b'"', b'}', b'\n']);
+    fs::write(tree.join("rollout-cut.jsonl"), cut).expect("write the rollout");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get(ROLLOUT_ID),
+        Some(&Some(PathBuf::from("/work"))),
+        "{indexed:?}"
+    );
+    assert_eq!(
+        indexed.get("after-bad"),
+        Some(&Some(PathBuf::from("/after"))),
+        "{indexed:?}"
+    );
+    assert_eq!(
+        indexed.get("cut-limit"),
+        Some(&Some(PathBuf::from("/cut"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key(OTHER_ID), "{indexed:?}");
+}
+
+#[tokio::test]
+async fn a_session_log_line_that_is_not_utf8_does_not_drop_the_session() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &data_root_descriptor()));
+    let tree = rig.home().join(".local/share/muse/sessions");
+
+    // Invalid UTF-8 before the metadata record.
+    let bad_first = "33333333-3333-4333-8333-333333333333";
+    let path = write_session(&tree, "2026/10/08", bad_first, "");
+    let mut bytes = b"{\"note\":\"\xff\xfe\"}\n".to_vec();
+    bytes.extend_from_slice(session_fixture("bare", bad_first, "/work").as_bytes());
+    fs::write(&path, bytes).expect("write the session log");
+
+    // The scan limit cuts a line inside a multibyte character before any
+    // metadata record: no session, and no failure.
+    let cut = "44444444-4444-4444-8444-444444444444";
+    let cut_path = write_session(&tree, "2026/10/08", cut, "");
+    let mut bytes = b"{\"note\":\"".to_vec();
+    let room = super::TRANSCRIPT_SCAN_BYTE_LIMIT - bytes.len();
+    bytes.extend(std::iter::repeat_n(b'a', room - 1));
+    bytes.push(0xC3); // first byte of a two-byte character, cut by the limit
+    bytes.extend_from_slice(&[0xA9, b'"', b'}', b'\n']);
+    fs::write(&cut_path, bytes).expect("write the session log");
+    let parsed = super::muse::parse_session(RuntimeRef::from_wire(ACME_RUNTIME), &tree, &cut_path)
+        .expect("a cut line is no failure");
+    assert!(parsed.is_none(), "{parsed:?}");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get(bad_first),
+        Some(&Some(PathBuf::from("/work"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key(cut), "{indexed:?}");
+}
+
 /// The session ids, with their working directories, a full pass over the data
 /// root of `rig` indexes.
 async fn indexed_sessions(rig: &Rig) -> std::collections::BTreeMap<String, Option<PathBuf>> {

@@ -201,7 +201,8 @@ dir = "sessions"           # transcript tree below [config_home]
 ```
 
 `parser` names a parser compiled into core: `jsonl-head-v1`, or `muse-session-v1` (below). It
-reads at most the first 32 records (64 KiB) of each `*.jsonl` file and takes the
+reads at most the first 32 records (64 KiB) of each `*.jsonl` file (a line that
+is not JSON, invalid UTF-8 included, is skipped and never fails the file) and takes the
 first `session_id`, `sessionId`, `conversation_id` or `conversationId` (in that
 order within the first record that has one), `transcript_path` or
 `transcriptPath`, and an absolute `cwd`, `working_directory` or
@@ -275,7 +276,8 @@ never walked below its session directories (level 4), whatever `max_depth` says.
 
 `muse-session-v1` reads a session log at exactly
 `YYYY/MM/DD/<uuid>/session.jsonl` below `dir`. A line is a framed transaction
-(`children[].record_json`) or a bare record; within the first 32 lines (64 KiB)
+(`children[].record_json`) or a bare record, and a line that is not JSON
+(invalid UTF-8 included) is skipped; within the first 32 lines (64 KiB)
 the first record whose `payload_type` is `runtime.session.metadata` gives the
 session id (`stream.id`, which must equal the `<uuid>` directory name) and the
 working directory (`payload.record.workspace_root`, used only when absolute).

@@ -1226,7 +1226,7 @@ dir = "sessions"
 
 `parser` is a closed set compiled into core (`jsonl-head-v1`: the first session
 id, transcript path and absolute working directory in the first 32 records or
-64 KiB, with `session_id` before `sessionId`, `conversation_id` and
+64 KiB, skipping a line that is not JSON or not UTF-8, with `session_id` before `sessionId`, `conversation_id` and
 `conversationId`). `dir` follows the `[config_home]` `default` rule (relative,
 plain components, no `.` or `..`, no empty segment, bounded). The table requires
 `[config_home]`; an unknown parser, an unsafe `dir`, a missing or unknown key,
