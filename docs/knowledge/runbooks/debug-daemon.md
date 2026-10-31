@@ -463,8 +463,8 @@ refused resumes the same way with the release archive of the target version. An
 interrupted install is resumed with
 `pohunek service install --repair --from <release-dir> --prefix <prefix>`.
 
-A `refresh-path` that is rolling back (`service_rollback_failed`, or a rerun
-that reports `service_version_untrusted`) over a refused or missing active
+A `refresh-path` that is pending past `registering`, or rolling back
+(`service_rollback_failed`, or a rerun that reports `service_version_untrusted`), over a refused or missing active
 directory takes two steps, because `upgrade` and `install` refuse a pending
 refresh with `service_refresh_pending`: run
 `pohunek service upgrade --repair --from <release-dir>` with the release archive

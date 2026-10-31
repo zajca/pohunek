@@ -1920,3 +1920,40 @@ async fn a_rolling_back_refresh_over_a_refused_or_missing_directory_is_repaired_
         assert!(harness.fake.world().running);
     }
 }
+
+/// A refresh that stopped at `registering` and did not roll back runs into the
+/// same directory when it resumes: the first step of the sequence restores it.
+#[tokio::test]
+async fn a_resuming_refresh_over_a_refused_or_missing_directory_is_repaired_in_two_steps() {
+    for refused in [true, false] {
+        let r = refreshable().await;
+        let harness = &r.harness;
+        interrupt_after(harness, Step::Registering).await;
+        let dir = harness.layout().version_dir(V1).expect("version directory");
+        if refused {
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o775))
+                .expect("loosen the version directory");
+        } else {
+            std::fs::remove_dir_all(&dir).expect("remove the version directory");
+        }
+
+        let first = refresh(harness, false).await.expect_err("resume refused");
+        assert_eq!(first.code(), "service_version_untrusted", "{first:?}");
+        assert_steps_in_order(first.hint().expect("hint"), &["upgrade --repair --from"]);
+        let upgrade = harness.engine().with_repair(refused);
+        let pending_error = upgrade
+            .upgrade(&harness.staged(V1), V1)
+            .await
+            .expect_err("the pending refresh still refuses");
+        assert_eq!(pending_error.code(), "service_refresh_pending");
+        assert!(
+            pending_error.to_string().contains("was restored"),
+            "{pending_error}"
+        );
+
+        refresh(harness, false).await.expect("the refresh resumes");
+        assert_eq!(harness.pending(), None);
+        crate::service::layout::verify_installed(&harness.layout(), &dir)
+            .expect("the version directory is trusted");
+    }
+}

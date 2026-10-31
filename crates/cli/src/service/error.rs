@@ -275,7 +275,7 @@ pub enum Error {
     },
 
     /// The version directory a pending search-path refresh must restart the
-    /// daemon from cannot be trusted.
+    /// daemon from, in its rollback, cannot be trusted.
     ///
     /// Carries the code of [`Error::UntrustedVersion`]. `upgrade` and
     /// `install` refuse the pending refresh, so the way out is the two-step
@@ -933,12 +933,12 @@ const DAEMON_JOB_MISSING_HINT: &str = "`pohunek service uninstall` (it removes t
 /// that take a release with `--from`.
 pub(crate) const UNTRUSTED_VERSION_HINT: &str = "make sure nothing runs from that version directory, then run `pohunek service upgrade --repair --from <unpacked release archive of the version the path names>` (`pohunek service install --repair` while an install is interrupted): it moves the directory aside, publishes the release's copy, and keeps service.toml and the live sessions";
 
+/// The way out of a pending search-path refresh whose daemon replacement or
+/// rollback needs a version directory that cannot be trusted.
+const UNTRUSTED_REFRESH_VERSION_HINT: &str = "`pohunek service upgrade` and `install` refuse a pending refresh, so restore the directory in two steps: run `pohunek service upgrade --repair --from <unpacked release archive of the version the path names>` (it restores that directory, changes no daemon and no setting, and ends with `service_refresh_pending`), then rerun `pohunek service refresh-path` to finish the refresh or its rollback";
+
 /// The way out of an uninstall refused because the active version directory
 /// cannot be trusted while worker jobs are live.
-/// The way out of a pending search-path refresh whose rollback needs a version
-/// directory that cannot be trusted.
-const UNTRUSTED_REFRESH_VERSION_HINT: &str = "`pohunek service upgrade` and `install` refuse a pending refresh, so restore the directory in two steps: run `pohunek service upgrade --repair --from <unpacked release archive of the version the path names>` (it restores that directory, changes no daemon and no setting, and ends with `service_refresh_pending`), then rerun `pohunek service refresh-path` to finish the rollback";
-
 const UNTRUSTED_ACTIVE_VERSION_HINT: &str = "live worker jobs can be stopped only through the daemon, and the active version's daemon is refused: restore its directory with `pohunek service upgrade --repair --from <unpacked release archive of that version>`, then rerun `pohunek service uninstall --stop-sessions`";
 
 impl Error {

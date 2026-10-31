@@ -2808,16 +2808,15 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// Restores the version directory a pending search-path refresh restarts
-    /// the daemon from during its rollback, before `upgrade` refuses the
-    /// pending refresh.
+    /// Restores the version directory a pending search-path refresh runs its
+    /// daemon from, before `upgrade` refuses the pending refresh.
     ///
-    /// Only a refresh rolling back from `registering` on restarts a daemon,
-    /// and only `version` equal to the refresh's own version names that
-    /// directory; any other command is left to the plan's refusal. Nothing
-    /// restarts, so no gate runs, and neither `service.toml` nor the record
-    /// changes. A missing directory is published without a flag, a refused one
-    /// is set aside only with `--repair`.
+    /// Only a refresh that reached `registering` replaces the daemon, forward
+    /// or in its rollback, and only `version` equal to the refresh's own
+    /// version names that directory; any other command is left to the plan's
+    /// refusal. Nothing restarts, so no gate runs, and neither `service.toml`
+    /// nor the record changes. A missing directory is published without a
+    /// flag, a refused one is set aside only with `--repair`.
     ///
     /// # Errors
     ///
@@ -2830,7 +2829,6 @@ impl<'a> Engine<'a> {
         version: &str,
     ) -> Result<(), Error> {
         if record.operation != Operation::RefreshPath
-            || !record.rolling_back
             || !rollback_restarts_previous(record)
             || record.version != version
         {
@@ -2843,7 +2841,7 @@ impl<'a> Engine<'a> {
             .await?;
         Err(Error::RefreshPending {
             step: record.step.as_str(),
-            rolling_back: true,
+            rolling_back: record.rolling_back,
             restored: Some(restore.restored),
         })
     }
