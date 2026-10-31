@@ -626,6 +626,54 @@ pub fn valid_install_version(version: &str) -> Option<&str> {
     .then_some(version)
 }
 
+/// Name prefix of a version directory a repair moved aside.
+///
+/// `_` is not allowed in a version, so the name never parses as one.
+pub const SET_ASIDE_VERSION_PREFIX: &str = ".pohunek_refused-";
+
+/// Hexadecimal characters of the random suffix of a set-aside entry's name.
+pub const SET_ASIDE_SUFFIX_CHARS: usize = 16;
+
+/// Whether `live` is the file `original` named, in the directory a repair
+/// moved aside.
+///
+/// A process that started from `<versions>/<version>/<rest>` reports
+/// `<versions>/.pohunek_refused-<version>-<suffix>/<rest>` once the repair
+/// renamed its directory, while its unit still names the original path. The
+/// relation is read from the two paths alone, so it proves nothing about the
+/// moved tree and executes nothing from it: both paths must be the same
+/// absolute path except for one component, the version directory and its
+/// renamed entry.
+#[must_use]
+pub fn is_set_aside_copy(original: &Path, live: &Path) -> bool {
+    let (mut original, mut live) = (original.components(), live.components());
+    loop {
+        match (original.next(), live.next()) {
+            (Some(left), Some(right)) if left == right => {}
+            (Some(Component::Normal(version)), Some(Component::Normal(aside))) => {
+                let named = version.to_str().and_then(valid_install_version).zip(
+                    aside
+                        .to_str()
+                        .and_then(|aside| aside.strip_prefix(SET_ASIDE_VERSION_PREFIX)),
+                );
+                let Some((version, rest)) = named else {
+                    return false;
+                };
+                let Some(suffix) = rest
+                    .strip_prefix(version)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                else {
+                    return false;
+                };
+                return suffix.len() == SET_ASIDE_SUFFIX_CHARS
+                    && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && original.eq(live);
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Resolves the platform application runtime root.
 ///
 /// # Errors

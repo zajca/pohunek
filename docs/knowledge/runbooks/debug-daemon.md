@@ -463,8 +463,8 @@ refused resumes the same way with the release archive of the target version. An
 interrupted install is resumed with
 `pohunek service install --repair --from <release-dir> --prefix <prefix>`.
 
-A `refresh-path` that is pending past `registering`, or rolling back
-(`service_rollback_failed`, or a rerun that reports `service_version_untrusted`), over a refused or missing active
+A `refresh-path` that is stopped at `registering`, or rolling back from
+`registering` on (`service_rollback_failed`, or a rerun that reports `service_version_untrusted`), over a refused or missing active
 directory takes two steps, because `upgrade` and `install` refuse a pending
 refresh with `service_refresh_pending`: run
 `pohunek service upgrade --repair --from <release-dir>` with the release archive
@@ -483,6 +483,8 @@ refused directory. Once the daemon is reachable again,
 for one session, is the answer to suspected tampering; the repair does not
 decide that for you.
 
+On macOS a directory the owner has no permissions on (mode 000, for example)
+cannot be renamed: run `chmod u+rwx` on that one directory yourself, then repair.
 The `.pohunek_refused-*` entries stay in the versions directory. They are never
 swept or collected and are not versions; `pohunek service upgrade` and
 `pohunek service uninstall` list them. They are the only evidence of what ran, so

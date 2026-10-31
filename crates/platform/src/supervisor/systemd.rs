@@ -1641,8 +1641,10 @@ fn before_exec(source: &ProcessError, activating: bool) -> bool {
 ///
 /// Returns whether the process is bound to the unit. The executable is
 /// compared after resolving symlinks in the recorded path, because
-/// `/proc/<pid>/exe` is always canonical. Empty arguments are skipped on both
-/// sides since the process inspector omits them. While a unit is
+/// `/proc/<pid>/exe` is always canonical. A worker whose version directory a
+/// repair moved aside still reports the moved path, which counts as the
+/// recorded executable ([`pohunek_paths::is_set_aside_copy`]). Empty arguments
+/// are skipped on both sides since the process inspector omits them. While a unit is
 /// `activating`, the main process may not run `ExecStart` yet, so a mismatch
 /// then leaves it unbound rather than being invalid data.
 fn verify_live_command(
@@ -1650,8 +1652,9 @@ fn verify_live_command(
     live: &LiveCommand,
     active_state: &str,
 ) -> Result<bool, Error> {
-    let executable_matches = std::fs::canonicalize(&definition.executable)
-        .is_ok_and(|expected| expected == live.executable);
+    let executable_matches = std::fs::canonicalize(&definition.executable).is_ok_and(|expected| {
+        expected == live.executable || pohunek_paths::is_set_aside_copy(&expected, &live.executable)
+    });
     let expected: Vec<String> =
         std::iter::once(definition.executable.to_string_lossy().into_owned())
             .chain(definition.arguments.iter().cloned())
@@ -2361,6 +2364,43 @@ mod tests {
             verify_live_command(&missing, &other_executable, "active"),
             Err(Error::InvalidData { .. })
         ));
+    }
+
+    /// A worker whose version directory a repair moved aside keeps running
+    /// the image it started with: the recorded path names the republished
+    /// directory and the process reports the moved one.
+    #[test]
+    fn a_live_command_in_a_set_aside_version_directory_matches_exec_start() {
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let versions = std::fs::canonicalize(root.path()).expect("canonical root");
+        let image = versions.join("1.0.0/pohunek-sessiond");
+        std::fs::create_dir_all(image.parent().expect("parent")).expect("version directory");
+        std::fs::write(&image, b"").expect("republished image");
+        let facts = DefinitionFacts {
+            executable: image.clone(),
+            arguments: Vec::new(),
+        };
+        let live = |executable: PathBuf| LiveCommand {
+            executable,
+            cmdline: vec![image.to_string_lossy().into_owned()],
+        };
+
+        let aside = versions.join(".pohunek_refused-1.0.0-0123456789abcdef/pohunek-sessiond");
+        assert!(verify_live_command(&facts, &live(aside), "active").expect("moved image"));
+        for other in [
+            ".pohunek_refused-2.0.0-0123456789abcdef/pohunek-sessiond",
+            ".pohunek_refused-1.0.0-0123456789abcde/pohunek-sessiond",
+            ".pohunek_refused-1.0.0-0123456789abcdef/other",
+            "1.0.1/pohunek-sessiond",
+        ] {
+            assert!(
+                matches!(
+                    verify_live_command(&facts, &live(versions.join(other)), "active"),
+                    Err(Error::InvalidData { .. })
+                ),
+                "{other}"
+            );
+        }
     }
 
     #[test]

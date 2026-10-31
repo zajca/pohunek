@@ -109,7 +109,7 @@ const REMOVAL_PREFIX: &str = ".pohunek-removed-";
 /// release lists, collects and refuses it as a non-version, and neither
 /// [`sweep`] nor [`is_scratch`] matches it. The entry is the only evidence of
 /// what ran from the refused directory, so only the operator deletes it.
-pub const REFUSED_PREFIX: &str = ".pohunek_refused-";
+pub const REFUSED_PREFIX: &str = pohunek_paths::SET_ASIDE_VERSION_PREFIX;
 
 /// How many random names [`set_aside_refused`] draws before it gives up.
 ///
@@ -118,7 +118,7 @@ pub const REFUSED_PREFIX: &str = ".pohunek_refused-";
 const ASIDE_ATTEMPTS: usize = 4;
 
 /// Random bytes in the name of a set-aside entry.
-const ASIDE_RANDOM_BYTES: usize = 8;
+const ASIDE_RANDOM_BYTES: usize = pohunek_paths::SET_ASIDE_SUFFIX_CHARS / 2;
 
 /// Name of the prefix ownership record inside the versions directory.
 ///

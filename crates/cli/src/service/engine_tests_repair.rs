@@ -509,7 +509,9 @@ async fn upgrade_registers_a_missing_daemon_job_again_and_restarts_nothing_else(
 }
 
 /// A directory the owner cannot even open is refused and moved aside by the
-/// rename in its parent.
+/// rename in its parent. macOS refuses to rename a directory its owner has no
+/// permissions on, so the operator makes it accessible first.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn repair_sets_aside_a_directory_the_owner_cannot_open() {
     let harness = Harness::new();
