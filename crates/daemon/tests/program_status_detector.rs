@@ -696,6 +696,38 @@ fn a_working_record_beats_a_screen_blocker_that_is_not_visible() {
     assert_eq!(harness.activity(), WORKING);
 }
 
+#[test]
+fn a_background_footer_reads_idle_beside_a_weak_blocker_only_with_a_working_record() {
+    let footer = "  1 background terminal running · /ps to view · /stop to close";
+    let screen = frame(
+        Some("cx"),
+        &[
+            "  Run it? [y/n]",
+            "",
+            "\u{203a} Ask Codex to do anything",
+            "",
+            footer,
+        ],
+    );
+
+    let mut without_record = Harness::codex();
+    without_record.feed(&screen);
+    assert_eq!(
+        without_record.activity(),
+        Some((AgentActivity::Blocked, StateSource::Screen)),
+        "no record: the weak blocker reads, as without the override rule"
+    );
+
+    let mut with_record = Harness::codex();
+    with_record.feed(&record(&format!("state=working:app={CODEX_APP}")));
+    with_record.feed(&screen);
+    assert_eq!(
+        with_record.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "a working record: the background footer outranks the weak blocker"
+    );
+}
+
 /// A manifest with one program-status override rule over a Claude-shaped idle
 /// editor, to exercise the override flag without a pin move.
 const OVERRIDE_MANIFEST: &str = r#"
@@ -755,6 +787,103 @@ fn an_override_rule_beats_a_working_record_unless_a_stronger_rule_wins() {
     assert_eq!(plain.activity(), WORKING);
 }
 
+/// An override rule that outranks a weak blocker and a screen it sits below.
+const OVERRIDE_OVER_WEAK_MANIFEST: &str = r#"
+[program_status]
+app = "probe"
+
+[[rules]]
+id = "turn_title"
+state = "working"
+priority = 1300
+region = "osc_title"
+contains = ["RUNNING"]
+
+[[rules]]
+id = "background_only"
+state = "idle"
+priority = 650
+region = "whole_recent"
+contains = ["BACKGROUND-ONLY"]
+overrides_program_status = true
+
+[[rules]]
+id = "weak"
+state = "blocked"
+priority = 600
+region = "whole_recent"
+contains = ["[y/n]"]
+
+[[rules]]
+id = "plain_idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+contains = ["idle"]
+"#;
+
+fn override_over_weak() -> Harness {
+    Harness::new(config(
+        OVERRIDE_OVER_WEAK_MANIFEST,
+        InputReadiness::ScreenIdle,
+    ))
+}
+
+#[test]
+fn an_override_rule_beats_a_weak_blocker_only_while_a_record_is_held() {
+    let screen = frame(Some("idle"), &["BACKGROUND-ONLY", "Run it? [y/n]"]);
+
+    // No record held: the override rule is skipped and the weak blocker reads.
+    let mut without_record = override_over_weak();
+    without_record.feed(&screen);
+    assert_eq!(
+        without_record.activity(),
+        Some((AgentActivity::Blocked, StateSource::Screen))
+    );
+
+    // A working record held: the override rule outranks the weak blocker.
+    let mut with_record = override_over_weak();
+    with_record.feed(&record("state=working:app=probe"));
+    with_record.feed(&screen);
+    assert_eq!(
+        with_record.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen))
+    );
+
+    // The record is dropped by a reconfigure: the weak blocker reads again.
+    with_record.detector.reconfigure(
+        with_record.now,
+        config(OVERRIDE_OVER_WEAK_MANIFEST, InputReadiness::ScreenIdle),
+    );
+    with_record.feed(&screen);
+    assert_eq!(
+        with_record.activity(),
+        Some((AgentActivity::Blocked, StateSource::Screen))
+    );
+}
+
+#[test]
+fn a_turn_title_still_outranks_the_override_rule_over_a_weak_blocker() {
+    let mut harness = override_over_weak();
+    harness.feed(&record("state=working:app=probe"));
+    harness.feed(&frame(
+        Some("RUNNING"),
+        &["BACKGROUND-ONLY", "Run it? [y/n]"],
+    ));
+    assert_eq!(harness.activity(), WORKING);
+}
+
+#[test]
+fn an_override_rule_never_releases_the_initial_input() {
+    let mut harness = pending(config(
+        OVERRIDE_OVER_WEAK_MANIFEST,
+        InputReadiness::ScreenIdle,
+    ));
+    harness.feed(&record("state=working:app=probe"));
+    harness.feed(&frame(Some("x"), &["BACKGROUND-ONLY"]));
+    assert!(!harness.detector.input_ready());
+}
+
 #[test]
 fn a_manifest_without_the_table_ignores_records_while_they_arrive() {
     let shell = || {
@@ -787,7 +916,14 @@ fn no_record_means_every_captured_screen_reads_as_without_the_opt_in(
 ) {
     let directory = workspace_root().join(format!("compat/{runtime}/screens"));
     let mut names = Vec::new();
-    for sub in ["", "widths", "n-1", "n-1/widths"] {
+    for sub in [
+        "",
+        "widths",
+        "n-1",
+        "n-1/widths",
+        "background",
+        "background/widths",
+    ] {
         let Ok(entries) = fs::read_dir(directory.join(sub)) else {
             continue;
         };
@@ -1061,18 +1197,19 @@ fn an_override_repaint_with_a_working_record_adds_no_working_edge() {
 fn an_override_rule_keeps_the_working_latch_without_a_working_record() {
     let latched = |prefix: &[u8], record_after: &[u8]| {
         let mut harness = override_harness();
-        harness.feed(&frame(Some("idle"), &["BACKGROUND-ONLY"]));
+        harness.feed(&frame(Some("idle"), &["BACKGROUND-ONLY", "READY"]));
         let chunk = [
             prefix,
             &frame(Some("RUNNING"), &["BACKGROUND-ONLY"]),
             record_after,
-            &frame(Some("idle"), &["BACKGROUND-ONLY"]),
+            &frame(Some("idle"), &["BACKGROUND-ONLY", "READY"]),
         ]
         .concat();
         harness.feed_raw(&chunk)
     };
 
-    // No record at all: an older program that never reports.
+    // No record at all: an older program that never reports. The override
+    // rule is skipped, so the chunk ends idle through the plain idle rule.
     let without_record = latched(b"", b"");
     assert!(
         without_record

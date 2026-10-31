@@ -24,7 +24,7 @@ use super::{
     MAX_PENDING_TRANSCRIPT_PATHS, RECONCILE_INTERVAL, RESCAN_MIN_INTERVAL, RETRY_BACKOFF_MAX,
     RETRY_BACKOFF_MIN, TRANSCRIPT_WRITE_DEBOUNCE,
 };
-use crate::agent::host::TranscriptParser;
+use crate::agent::host::{HeadPaths, TranscriptParser};
 use crate::external::TranscriptRoot;
 
 /// Scheduler yields that let every runnable task make progress between steps.
@@ -281,6 +281,7 @@ impl Harness {
 fn claude_root(path: &Path) -> TranscriptRoot {
     TranscriptRoot {
         parser: TranscriptParser::JsonlHeadV1,
+        head_paths: HeadPaths::default(),
         agent_base: RuntimeRef::claude(),
         path: path.to_path_buf(),
         private: false,
@@ -528,6 +529,7 @@ async fn a_hint_under_a_symlinked_nested_root_is_owned_by_the_nested_provider() 
         claude_root(&claude_dir),
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::codex(),
             path: link,
             private: false,
@@ -746,6 +748,7 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
         claude_root(&outer),
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
             private: false,
@@ -753,6 +756,7 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
         },
         TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
+            head_paths: HeadPaths::default(),
             agent_base: RuntimeRef::codex(),
             path: outer.clone(),
             private: false,

@@ -27,8 +27,8 @@ use super::{
     TranscriptRoot, WatcherHandle,
 };
 use crate::agent::host::fixture::{install_official_packages, official_host, pin_official_base};
-use crate::agent::host::TranscriptParser;
 use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
+use crate::agent::host::{HeadPaths, TranscriptParser};
 use crate::agent::ProfileRegistry;
 use crate::integration::ConfigHomes;
 use crate::runtime::environment::{base_environment, EnvironmentSource};
@@ -598,6 +598,7 @@ fn fact() -> crate::procwatch::ProcessFact {
 fn plain_root(agent: &RuntimeRef, path: &Path, private: bool) -> TranscriptRoot {
     TranscriptRoot {
         parser: TranscriptParser::JsonlHeadV1,
+        head_paths: HeadPaths::default(),
         agent_base: agent.clone(),
         path: path.to_path_buf(),
         private,
@@ -1259,6 +1260,134 @@ async fn a_runtime_that_keeps_session_logs_in_the_data_root_is_attributed_by_the
         .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
         .is_none());
     watched.sessions.shutdown();
+}
+
+/// Feature that lets a descriptor name the head key paths of its transcripts.
+const HEAD_PATHS_FEATURE: &str = "transcripts-head-paths-v1";
+
+/// The `[transcripts]` table of a runtime whose rollouts nest the session id and
+/// the working directory below `payload`.
+const HEAD_PATHS_TABLE: &str = "\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"sessions\"\n\
+     id_path = [\"payload\", \"id\"]\ncwd_path = [\"payload\", \"cwd\"]\n";
+
+/// The descriptor of [`ACME_RUNTIME`] with a transcript table that needs the
+/// head-paths feature.
+fn head_paths_descriptor(table: &str) -> String {
+    acme_descriptor(table).replace(
+        "runtime_api = 1\n",
+        &format!("runtime_api = 1\nrequires = [\"{HEAD_PATHS_FEATURE}\"]\n"),
+    )
+}
+
+/// The head of a Codex rollout: the keys of a real `session_meta` record, with
+/// synthetic values and no transcript content.
+fn rollout_head(id: &str, cwd: &str) -> String {
+    serde_json::json!({
+        "timestamp": "2026-10-31T10:00:00.000Z",
+        "type": "session_meta",
+        "payload": {
+            "id": id,
+            "timestamp": "2026-10-31T10:00:00.000Z",
+            "cwd": cwd,
+            "originator": "codex_cli_rs",
+            "cli_version": "0.0.0",
+            "source": "cli",
+            "thread_source": "user",
+            "model_provider": "stub",
+            "base_instructions": {"text": "synthetic"},
+            "git": {},
+        },
+    })
+    .to_string()
+}
+
+/// A later record of a rollout, whose payload carries an id of its own.
+fn rollout_item(id: &str, cwd: &str) -> String {
+    serde_json::json!({
+        "timestamp": "2026-10-31T10:00:01.000Z",
+        "type": "turn_context",
+        "payload": {"id": id, "cwd": cwd},
+    })
+    .to_string()
+}
+
+const ROLLOUT_ID: &str = "019a0000-0000-7000-8000-000000000001";
+const OTHER_ID: &str = "019a0000-0000-7000-8000-000000000002";
+
+#[tokio::test]
+async fn a_rollout_head_is_attributed_by_the_declared_nested_id_and_cwd() {
+    let rig = Rig::with_packages(|plugins| {
+        install_acme(plugins, &head_paths_descriptor(HEAD_PATHS_TABLE));
+    });
+    let path = rig.home().join(".acme/sessions/2026/10/31/rollout-a.jsonl");
+    fs::create_dir_all(path.parent().expect("rollout directory")).expect("rollout directory");
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            rollout_head(ROLLOUT_ID, "/work"),
+            rollout_item(OTHER_ID, "/elsewhere")
+        ),
+    )
+    .expect("write the rollout");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get(ROLLOUT_ID),
+        Some(&Some(PathBuf::from("/work"))),
+        "{indexed:?}"
+    );
+    assert!(!indexed.contains_key(OTHER_ID), "{indexed:?}");
+}
+
+#[tokio::test]
+async fn a_nested_path_reads_only_the_first_record_and_a_top_level_key_wins() {
+    let rig = Rig::with_packages(|plugins| {
+        install_acme(plugins, &head_paths_descriptor(HEAD_PATHS_TABLE));
+    });
+    let tree = rig.home().join(".acme/sessions/2026/10/31");
+    fs::create_dir_all(&tree).expect("rollout directory");
+    // The head is not JSON: a later record's payload never stands in for it.
+    fs::write(
+        tree.join("rollout-torn.jsonl"),
+        format!("{{\"truncated\n{}\n", rollout_item(OTHER_ID, "/elsewhere")),
+    )
+    .expect("write the torn rollout");
+    // A top-level `sessionId` and `cwd` beat the nested values.
+    let top = serde_json::json!({
+        "sessionId": "top-level",
+        "cwd": "/top",
+        "payload": {"id": ROLLOUT_ID, "cwd": "/work"},
+    });
+    fs::write(tree.join("rollout-top.jsonl"), format!("{top}\n")).expect("write the rollout");
+    // A non-string value and a relative cwd are ignored.
+    let odd = serde_json::json!({"payload": {"id": 7, "cwd": "relative/dir"}});
+    fs::write(tree.join("rollout-odd.jsonl"), format!("{odd}\n")).expect("write the rollout");
+
+    let indexed = indexed_sessions(&rig).await;
+
+    assert_eq!(
+        indexed.get("top-level"),
+        Some(&Some(PathBuf::from("/top"))),
+        "{indexed:?}"
+    );
+    assert_eq!(indexed.len(), 1, "{indexed:?}");
+}
+
+#[tokio::test]
+async fn without_declared_paths_a_nested_rollout_head_is_not_attributed() {
+    let rig = Rig::with_packages(|plugins| {
+        install_acme(
+            plugins,
+            &acme_descriptor("\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"sessions\"\n"),
+        );
+    });
+    let path = rig.home().join(".acme/sessions/2026/10/31/rollout-a.jsonl");
+    fs::create_dir_all(path.parent().expect("rollout directory")).expect("rollout directory");
+    fs::write(&path, format!("{}\n", rollout_head(ROLLOUT_ID, "/work"))).expect("write");
+
+    assert!(indexed_sessions(&rig).await.is_empty());
 }
 
 /// The session ids, with their working directories, a full pass over the data

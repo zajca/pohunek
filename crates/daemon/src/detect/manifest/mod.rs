@@ -116,6 +116,10 @@ impl Manifest {
         let mut best_match = None;
 
         for rule in &self.rules {
+            if rule.overrides_program_status && !context.program_status_held {
+                continue;
+            }
+
             if !evaluation.has_region_text(&rule.region) {
                 continue;
             }
@@ -287,7 +291,8 @@ pub struct ManifestMatch {
     pub priority: i32,
     pub region: ManifestRegion,
     pub visible_blocker: bool,
-    /// The rule, as the screen winner, beats a non-blocked program-status record.
+    /// The rule beats a non-blocked program-status record; it is evaluated
+    /// only while a record is held.
     pub overrides_program_status: bool,
 }
 
@@ -388,12 +393,24 @@ fn parse_region_count(value: &str, name: &str) -> Option<usize> {
 #[derive(Debug, Default)]
 pub struct MatchContext {
     regions: HashMap<ManifestRegion, String>,
+    /// A program-status record is held. Rules that override a record apply
+    /// only then; without one they are skipped, so the screen reads as it
+    /// would without the override.
+    program_status_held: bool,
 }
 
 impl MatchContext {
     #[must_use]
     pub fn with_region_text(mut self, region: ManifestRegion, text: impl Into<String>) -> Self {
         self.regions.insert(region, text.into());
+        self
+    }
+
+    /// Marks whether a program-status record is held, which enables the rules
+    /// with `overrides_program_status`.
+    #[must_use]
+    pub fn with_program_status_held(mut self, held: bool) -> Self {
+        self.program_status_held = held;
         self
     }
 

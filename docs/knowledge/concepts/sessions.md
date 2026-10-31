@@ -1265,7 +1265,9 @@ transcript trees runtime descriptors declare in `[transcripts]` (Claude
 `projects`, Codex `sessions`) below the config homes the host launches those
 agents with (each runtime's own home and the home of every host profile,
 re-read on every pass), never their parents or `$HOME`, and reads each with the
-parser the descriptor names. A runtime without the declaration contributes no
+parser the descriptor names (a descriptor may also name the key paths of the
+native session id and working directory in a transcript's first line, which is
+how a Codex rollout, whose head nests them under `payload`, is attributed). A runtime without the declaration contributes no
 root, and a runtime that is not installed contributes nothing: a host without
 the official Codex or Claude Code package observes no transcript tree of that
 agent and does not recognize a `codex` or `claude` process outside pohunek or

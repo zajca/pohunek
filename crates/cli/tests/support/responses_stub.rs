@@ -37,6 +37,11 @@ pub(crate) const SECOND_CHUNK: &str = " done";
 /// Prompt text that makes the stub hold the reply until the gate opens.
 pub(crate) const HOLD_MARKER: &str = "[hold]";
 
+/// Prompt text that makes the stub hold the response before its first event
+/// (`response.created`) until the gate opens, so the agent has sent the turn
+/// and the server has not acknowledged it.
+pub(crate) const PRE_ACK_HOLD_MARKER: &str = "[preack]";
+
 /// Prompt text that makes the stub answer with a command that needs approval.
 pub(crate) const APPROVAL_MARKER: &str = "[approval]";
 
@@ -208,6 +213,9 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
     writer.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
     )?;
+    if request.body.contains(PRE_ACK_HOLD_MARKER) {
+        wait_for_gate(state);
+    }
     send_event(
         &mut writer,
         "response.created",
@@ -251,6 +259,14 @@ fn keep_body(state: &State, body: &str) {
     bodies.push(body.to_owned());
 }
 
+/// Blocks until the gate is open.
+fn wait_for_gate(state: &State) {
+    let mut open = state.gate_open.lock().expect("gate lock");
+    while !*open {
+        open = state.gate_changed.wait(open).expect("gate wait");
+    }
+}
+
 /// Streams a text reply; a held reply waits for the gate after its first chunk.
 fn send_text(writer: &mut TcpStream, state: &State, held: bool) -> io::Result<()> {
     let item = |text: &str| {
@@ -272,10 +288,7 @@ fn send_text(writer: &mut TcpStream, state: &State, held: bool) -> io::Result<()
     )?;
     send_delta(writer, FIRST_CHUNK)?;
     if held {
-        let mut open = state.gate_open.lock().expect("gate lock");
-        while !*open {
-            open = state.gate_changed.wait(open).expect("gate wait");
-        }
+        wait_for_gate(state);
     }
     send_delta(writer, SECOND_CHUNK)?;
     send_event(

@@ -171,7 +171,7 @@ any = [
 [[rules]]
 id = "background_terminals_idle"
 state = "idle"
-priority = 550
+priority = 650
 region = "bottom_non_empty_lines(8)"
 overrides_program_status = true
 line_regex = ['^\s*\d+ background term']

@@ -29,8 +29,8 @@ use nix::unistd::Pid;
 use package::directory::build_directory_archive;
 use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
-    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, InputReadiness,
-    LaunchProgram, ProbeVersion, RuntimeDefinition, TranscriptParser,
+    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, HeadKeyPath,
+    InputReadiness, LaunchProgram, ProbeVersion, RuntimeDefinition, TranscriptParser,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.3.0";
+const PACKAGE_VERSION: &str = "1.4.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -294,6 +294,17 @@ fn the_descriptor_declares_the_verified_codex_launch_contract() {
         transcripts.dir(),
         "sessions",
         "Codex keeps its rollouts below `sessions`"
+    );
+    let head = transcripts.head_paths();
+    assert_eq!(
+        head.id().map(HeadKeyPath::keys),
+        Some(&["payload".to_owned(), "id".to_owned()][..]),
+        "a rollout head keeps the session id at `payload.id`"
+    );
+    assert_eq!(
+        head.cwd().map(HeadKeyPath::keys),
+        Some(&["payload".to_owned(), "cwd".to_owned()][..]),
+        "a rollout head keeps the working directory at `payload.cwd`"
     );
 }
 
@@ -1001,8 +1012,8 @@ fn a_tool_approval_or_question_is_blocked_from_the_screen_alone_when_its_line_is
 const SCREEN_BLOCKER_MIN_COLUMNS: u16 = 30;
 
 /// Width of the newest release's approval capture whose question and
-/// confirmation lines are scrolled out of the 24 rows (the screen ends in a
-/// `↓` marker), so only the title speaks.
+/// confirmation line are wrapped over several rows (`approval_w30.txt`), so no
+/// single-line screen phrase matches and only the title speaks.
 const SCREEN_BLOCKER_GAP_COLUMNS: [u16; 1] = [30];
 
 #[test]
@@ -2465,7 +2476,14 @@ impl Fixture {
                 "sandbox_mode = \"read-only\"",
                 "sandbox_mode = \"danger-full-access\"",
             );
-        assert_ne!(relaxed, config, "the policy keys are in the config");
+        assert!(
+            config.contains("approval_policy = \"on-request\""),
+            "the approval policy key is in the config"
+        );
+        assert!(
+            config.contains("sandbox_mode = \"read-only\""),
+            "the sandbox mode key is in the config"
+        );
         fs::write(path, relaxed).expect("write config.toml");
     }
 
@@ -4472,6 +4490,25 @@ fn a_program_status_golden_is_written_one_record_per_line() {
     assert_eq!(text, "app=codex:state=idle\n");
 }
 
+/// File of the screens directory that records whether Codex entered the
+/// alternate screen during the capture run (`true` or `false`). The extension
+/// keeps it out of the screen fixtures, which are the `.txt` files.
+const ALTERNATE_SCREEN_FACT: &str = "alternate-screen.fact";
+
+#[test]
+fn codex_enters_the_alternate_screen() {
+    let fact = fs::read_to_string(
+        workspace_root()
+            .join(SCREENS_DIR)
+            .join(ALTERNATE_SCREEN_FACT),
+    )
+    .expect("read the alternate-screen fact");
+    assert_eq!(
+        fact, "true\n",
+        "the capture run saw Codex enter the alternate screen"
+    );
+}
+
 /// Variable naming the directory the capture test writes to.
 const CAPTURE_VARIABLE: &str = "POHUNEK_CODEX_CAPTURE_DIR";
 
@@ -4681,7 +4718,7 @@ async fn capture_the_real_codex_screens() {
 
     let raw = fixture.raw_output(&id).await;
     fs::write(
-        directory.join("alternate-screen.txt"),
+        directory.join(ALTERNATE_SCREEN_FACT),
         format!(
             "{}\n",
             raw.windows(8).any(|window| window == b"\x1b[?1049h")
@@ -4701,6 +4738,9 @@ async fn capture_the_real_codex_background_terminal_screens() {
     let Some(directory) = capture_directory() else {
         return;
     };
+    // The screens go to `background/`; the program-status sequence stays beside
+    // the other sequences, where the scenarios read it.
+    let screens = directory.join(BACKGROUND_SUBDIR);
     let recording = capture::RecordingRoot::new("codex");
     let fixture = Fixture::start().await;
     fixture.install_integration().await;
@@ -4720,15 +4760,13 @@ async fn capture_the_real_codex_background_terminal_screens() {
     fixture.wait_activity(&id, "working").await;
     fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
     fixture
-        .capture(&directory, &id, "background_terminal_early")
+        .capture(&screens, &id, "background_terminal_early")
         .await;
     fixture.wait_activity(&id, "idle").await;
     fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    fixture.capture(&screens, &id, "background_terminal").await;
     fixture
-        .capture(&directory, &id, "background_terminal")
-        .await;
-    fixture
-        .capture_widths(&directory, &id, "background_terminal", true)
+        .capture_widths(&screens, &id, "background_terminal", true)
         .await;
     fixture
         .capture_program_status(&directory, &id, "background_terminal")
@@ -4736,6 +4774,9 @@ async fn capture_the_real_codex_background_terminal_screens() {
     fixture.stop(&id).await;
     fixture.finish().await;
 }
+
+/// Subdirectory of the screens that holds the background-terminal captures.
+const BACKGROUND_SUBDIR: &str = "background";
 
 /// Text of the footer Codex shows while a background terminal runs.
 const BACKGROUND_FOOTER_MARK: &str = "background terminal";
@@ -5131,9 +5172,53 @@ async fn a_real_codex_is_read_through_program_status() {
         Some(&"app=codex:state=working".to_owned()),
         "the record still says working with the background terminal running: {idle}"
     );
+    assert_eq!(
+        idle["activity"], "idle",
+        "the session reads idle before the stop: {idle}"
+    );
     fixture.stop(&id).await;
-    let stopped = fixture.harness.json(&["session", "inspect", &id]).await.1;
-    assert_ne!(stopped["ok"]["activity"], "working", "{stopped}");
+    fixture.finish().await;
+}
+
+/// R-row: Enter is sent, the turn is on its way, and the server has not
+/// acknowledged it yet (the stub holds the response before `response.created`).
+/// The session reads working from the first moment and returns to idle once
+/// the reply completes.
+#[tokio::test]
+#[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
+async fn a_real_codex_reads_working_before_the_server_acknowledges_the_turn() {
+    require_real_codex();
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+    let id = fixture.new_session("preack").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+
+    let before = fixture.stub.started();
+    input_until(
+        &fixture,
+        &id,
+        &format!("{} go", responses_stub::PRE_ACK_HOLD_MARKER),
+        "working",
+    )
+    .await;
+    wait_until("the held request to reach the stub", || async {
+        (fixture.stub.started() > before).then_some(())
+    })
+    .await;
+    assert_eq!(
+        fixture.stub.finished(),
+        before,
+        "the response is held before its first event"
+    );
+    let held = fixture.wait_activity(&id, "working").await;
+    assert_eq!(held["activity"], "working", "{held}");
+
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    fixture.stop(&id).await;
     fixture.finish().await;
 }
 

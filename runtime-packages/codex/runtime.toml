@@ -7,8 +7,9 @@
 
 schema = 1
 id = "pohunek.runtime.codex"
-version = "1.3.0"
+version = "1.4.0"
 runtime_api = 1
+requires = ["transcripts-head-paths-v1"]
 
 [runtime]
 id = "codex"
@@ -60,6 +61,10 @@ default = ".codex"
 
 # Codex writes one JSON Lines rollout per conversation below `sessions` in its
 # config home; the external observer reads the head of each with this parser.
+# The first record is `{"type", "timestamp", "payload": {...}}`: the native
+# session id is `payload.id` and the working directory `payload.cwd`.
 [transcripts]
 parser = "jsonl-head-v1"
 dir = "sessions"
+id_path = ["payload", "id"]
+cwd_path = ["payload", "cwd"]

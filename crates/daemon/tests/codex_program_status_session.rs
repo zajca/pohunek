@@ -18,17 +18,20 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pohunek_daemon::notifications::{spawn_projector, AttentionCoordinator, NotificationService};
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_daemon::shutdown::{DaemonShutdown, DriverHandle};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use protocol::{
     AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputWait, SessionNewParams,
+    SessionTurnCursor, SessionTurnEventKind, SessionWaitTurnParams, SessionWaitTurnReason,
     StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
@@ -36,6 +39,10 @@ const TEST_COLS: u16 = 100;
 const TEST_ROWS: u16 = 24;
 /// The `app` Codex's records carry.
 const APP: &str = "codex";
+/// Turn waits: a turn event follows the attention debounce (5 seconds by
+/// default), so the absence of one is only proved by a wait that outlasts it.
+// timing-allowed: #1548 no later event marks the end of the debounce window; the wait is the only evidence of an absent turn event
+const NO_TURN_WAIT_MS: u32 = 8_000;
 /// The first two bytes of a probe reply, as hex: `ESC ]`. Typed input starts
 /// with `ESC [` (bracketed paste).
 const REPLY_PREFIX_HEX: &str = "1b5d";
@@ -129,6 +136,10 @@ struct Fixture {
     env: TestEnv,
     registry: SessionRegistry,
     scratch: PathBuf,
+    /// The notification projector and attention coordinator that turn a
+    /// `working` to `idle` change of an armed turn into `turn_completed`;
+    /// present after [`Fixture::enable_turn_events`].
+    turn_events: Option<(DriverHandle, DriverHandle)>,
 }
 
 impl Fixture {
@@ -227,6 +238,49 @@ impl Fixture {
             env,
             registry,
             scratch,
+            turn_events: None,
+        }
+    }
+
+    /// Starts the projector behind `session.wait_turn`.
+    fn enable_turn_events(&mut self) {
+        let notifications = NotificationService::open(&self.env.root().join("daemon-data"))
+            .expect("open the notification inbox");
+        let tasks = DaemonShutdown::default();
+        let (coordinator, attention) =
+            AttentionCoordinator::spawn(&tasks, notifications.clone(), &self.registry);
+        let projector = spawn_projector(&tasks, &self.registry, notifications, coordinator);
+        self.registry.spawn_agent_state_hooks();
+        self.turn_events = Some((projector, attention));
+    }
+
+    /// Waits up to `timeout_ms` for a `turn_completed` event of `id` newer than
+    /// `after` and returns the reason with the cursor for the next call.
+    async fn wait_turn(
+        &self,
+        id: &SessionId,
+        timeout_ms: u32,
+        after: Option<SessionTurnCursor>,
+    ) -> (SessionWaitTurnReason, SessionTurnCursor) {
+        let params = SessionWaitTurnParams::new(
+            vec![id.clone()],
+            vec![SessionTurnEventKind::TurnCompleted],
+            after,
+            Some(timeout_ms),
+        )
+        .expect("valid turn wait");
+        let result = self
+            .registry
+            .wait_turn(&params)
+            .await
+            .expect("session.wait_turn");
+        (result.reason, result.cursor)
+    }
+
+    /// Stops the turn-event drivers, when they run.
+    async fn end(self) {
+        if let Some((projector, _attention)) = self.turn_events {
+            projector.stop().await;
         }
     }
 
@@ -318,9 +372,11 @@ async fn codex_reports_turns_through_program_status() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
-    let fixture = Fixture::with_agent_profiles().await;
+    let mut fixture = Fixture::with_agent_profiles().await;
+    fixture.enable_turn_events();
     let created = fixture.start("fake-codex-stdin").await;
     fixture.wait_activity(&created.id, IDLE).await;
+    let (_, cursor) = fixture.wait_turn(&created.id, 100, None).await;
 
     let working = fixture
         .input(&created.id, "t", AgentActivity::Working)
@@ -331,6 +387,18 @@ async fn codex_reports_turns_through_program_status() {
     command(&fixture, b'd');
     fixture.wait_activity(&created.id, IDLE).await;
 
+    // The armed turn completes once through the records.
+    let (reason, cursor) = fixture.wait_turn(&created.id, WAIT_MS, Some(cursor)).await;
+    assert_eq!(reason, SessionWaitTurnReason::Event);
+    let (reason, _) = fixture
+        .wait_turn(&created.id, NO_TURN_WAIT_MS, Some(cursor))
+        .await;
+    assert_eq!(
+        reason,
+        SessionWaitTurnReason::Timeout,
+        "one turn, one event"
+    );
+
     let release = async {
         fixture.wait_activity(&created.id, WORKING).await;
         command(&fixture, b'd');
@@ -340,11 +408,13 @@ async fn codex_reports_turns_through_program_status() {
     let idle = idle.expect("input until idle");
     assert_eq!(idle.activity, Some(AgentActivity::Idle));
     assert_eq!(idle.activity_source, Some(StateSource::OscProgress));
+
     fixture
         .registry
         .stop(&created.id)
         .await
         .expect("stop the session");
+    fixture.end().await;
 }
 
 /// L1p: a turn whose working and done records arrive in one chunk is still a
@@ -354,9 +424,11 @@ async fn a_working_record_followed_by_done_in_one_chunk_satisfies_a_working_wait
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
-    let fixture = Fixture::with_agent_profiles().await;
+    let mut fixture = Fixture::with_agent_profiles().await;
+    fixture.enable_turn_events();
     let created = fixture.start("fake-codex-stdin").await;
     fixture.wait_activity(&created.id, IDLE).await;
+    let (_, cursor) = fixture.wait_turn(&created.id, 100, None).await;
 
     let working = fixture
         .input(&created.id, "s", AgentActivity::Working)
@@ -364,11 +436,24 @@ async fn a_working_record_followed_by_done_in_one_chunk_satisfies_a_working_wait
         .expect("input until working");
     assert_eq!(working.activity, Some(AgentActivity::Working));
     fixture.wait_activity(&created.id, IDLE).await;
+
+    // The single turn completes once.
+    let (reason, cursor) = fixture.wait_turn(&created.id, WAIT_MS, Some(cursor)).await;
+    assert_eq!(reason, SessionWaitTurnReason::Event);
+    let (reason, _) = fixture
+        .wait_turn(&created.id, NO_TURN_WAIT_MS, Some(cursor))
+        .await;
+    assert_eq!(
+        reason,
+        SessionWaitTurnReason::Timeout,
+        "one turn, one event"
+    );
     fixture
         .registry
         .stop(&created.id)
         .await
         .expect("stop the session");
+    fixture.end().await;
 }
 
 /// A record with no input changes the activity.

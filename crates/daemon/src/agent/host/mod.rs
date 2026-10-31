@@ -61,8 +61,9 @@ pub use registry::{
 pub use source::{LaunchSource, ProfileRevision};
 pub(crate) use source::{ProfileInputs, RevisionKeys};
 pub use transcripts::{
-    TranscriptParser, Transcripts, JSONL_HEAD_V1_PARSER_ID, MAX_TRANSCRIPT_DEPTH,
-    MAX_TRANSCRIPT_DIR_BYTES, MAX_TRANSCRIPT_DIR_COMPONENTS, MUSE_SESSION_PARSER_ID,
+    HeadKeyPath, HeadPaths, TranscriptParser, Transcripts, JSONL_HEAD_V1_PARSER_ID,
+    MAX_HEAD_PATH_KEYS, MAX_HEAD_PATH_KEY_BYTES, MAX_TRANSCRIPT_DEPTH, MAX_TRANSCRIPT_DIR_BYTES,
+    MAX_TRANSCRIPT_DIR_COMPONENTS, MUSE_SESSION_PARSER_ID,
 };
 
 #[cfg(test)]

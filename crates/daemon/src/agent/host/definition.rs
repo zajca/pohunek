@@ -1411,6 +1411,12 @@ struct RawTranscripts {
     /// Directory levels below `dir` the observer lists.
     #[serde(default)]
     max_depth: Option<u64>,
+    /// Object keys that lead to the native session id in the first record.
+    #[serde(default)]
+    id_path: Option<Vec<String>>,
+    /// Object keys that lead to the working directory in the first record.
+    #[serde(default)]
+    cwd_path: Option<Vec<String>>,
 }
 
 impl RawTranscripts {
@@ -1435,6 +1441,10 @@ impl RawTranscripts {
         }
         if let Some(depth) = self.max_depth {
             transcripts = transcripts.with_max_depth(depth)?;
+        }
+        if self.id_path.is_some() || self.cwd_path.is_some() {
+            transcripts =
+                transcripts.with_head_paths(self.id_path.as_deref(), self.cwd_path.as_deref())?;
         }
         Ok(transcripts)
     }
