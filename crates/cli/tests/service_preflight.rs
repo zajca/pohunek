@@ -675,7 +675,8 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     assert_eq!(stopped_sessions, std::slice::from_ref(&stopped));
     let message = error.to_string();
     assert!(
-        message.contains("0 live session(s), 1 stopped session(s)"),
+        message.contains("refused: 1 stopped session(s) have unverified runtime or recovery")
+            && !message.contains("0 live"),
         "{message}"
     );
     assert!(

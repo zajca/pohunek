@@ -632,26 +632,6 @@ fn print_human(report: &Report) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_login_path_agents_check_names_the_programs_and_the_dry_run() {
-        let ok = login_path_agents_verdict(&[]);
-        assert_eq!(ok.status, Status::Ok);
-
-        let warn = login_path_agents_verdict(&[LoginPathOnlyAgent {
-            name: "claude",
-            found: PathBuf::from("/nix/profile/bin/claude"),
-        }]);
-        assert_eq!(warn.status, Status::Warn);
-        assert!(
-            warn.detail.contains("claude (/nix/profile/bin/claude)")
-                && warn
-                    .detail
-                    .contains("pohunek service refresh-path --dry-run"),
-            "{}",
-            warn.detail
-        );
-    }
-
     use super::*;
 
     /// A private fixture directory guard and a not-yet-created child path of

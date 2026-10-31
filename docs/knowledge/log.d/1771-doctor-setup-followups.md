@@ -1,0 +1,6 @@
+## Unreleased (2026-10-31, doctor and setup follow-ups, #1771 #1159)
+
+- The agent programs doctor probes by name are one list (`hostcheck::AGENT_PROGRAMS`); the macOS and Linux probe lists and the CLI's `service_search_path_agents` check read it. The check is covered by a scenario that runs the built `pohunek doctor --json` over a hermetic installation with a fixture login shell: on macOS it reports the finding, the clean verdict and, for a failing shell, nothing; elsewhere it adds no check.
+- A release directory with neither `MANIFEST` nor `packaging/` (a development build, or Homebrew's layout) is not verified by `pohunek setup`, and docs/cli.md and the setup guide say so: the download's attestation or the package manager's checksum is what rules out tampering. Setup keeps accepting it (#1159 item 4, ruled: a flag every Homebrew user must pass protects nothing); tap issue #1775 asks the formula to ship `MANIFEST` so a later refusal becomes possible.
+- The update runbook has a section for installs under an isolated HOME on macOS: set `XDG_RUNTIME_DIR` to a private directory and check that the daemon job carries it before creating sessions (#1159 item 5).
+- The at-risk refusal counts only the groups that are present: a stopped-only refusal reads "N stopped session(s) have unverified runtime or recovery" (#1159 item 6).

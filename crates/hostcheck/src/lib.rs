@@ -41,6 +41,12 @@ pub use macos::{
 };
 pub use overlay_checks::{OverlayChecks, ReportedOverlay};
 pub use pohunek_paths::Platform;
+
+/// The agent programs the standard checks probe by name, in report order.
+///
+/// The CLI's login-shell path check reads the same list, so a program added
+/// here is probed there too.
+pub const AGENT_PROGRAMS: [&str; 2] = ["codex", "claude"];
 pub use worker_probe::WORKER_PROBE_DEADLINE;
 
 /// Name prefix of the writability probe file.
@@ -132,10 +138,9 @@ pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
 /// The Linux probe list: agents, directories, and the configured overlays.
 #[must_use]
 pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
-    let mut checks = vec![
-        binary("git", true),
-        binary("codex", false),
-        binary("claude", false),
+    let mut checks = vec![binary("git", true)];
+    checks.extend(AGENT_PROGRAMS.iter().map(|name| binary(name, false)));
+    checks.extend([
         dir_writable(
             "socket_dir_writable",
             inputs.socket_dir,
@@ -147,7 +152,7 @@ pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
             "state data directory",
         ),
         dir_writable("log_dir_writable", inputs.log_dir, "log directory"),
-    ];
+    ]);
     checks.extend(overlay_checks::cli_checks(inputs.overlays));
     checks.push(DoctorCheck::new(
         "schema_version",
