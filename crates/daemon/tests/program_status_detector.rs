@@ -233,48 +233,78 @@ const WORKING: Observed = Some((AgentActivity::Working, StateSource::OscProgress
 const IDLE: Observed = Some((AgentActivity::Idle, StateSource::OscProgress));
 const BLOCKED: Observed = Some((AgentActivity::Blocked, StateSource::OscProgress));
 
-#[test]
-fn every_record_state_is_held_whatever_the_terminator_and_the_chunking() {
-    let cases: [(&str, Observed, &str); 7] = [
-        ("working", WORKING, "app=claude-code:state=working"),
-        ("blocked", BLOCKED, "app=claude-code:state=blocked"),
-        (
-            "blocked:kind=permission",
-            BLOCKED,
-            "app=claude-code:state=blocked:kind=permission",
-        ),
-        (
-            "blocked:kind=question",
-            BLOCKED,
-            "app=claude-code:state=blocked:kind=question",
-        ),
-        (
-            "blocked:kind=auth",
-            BLOCKED,
-            "app=claude-code:state=blocked:kind=auth",
-        ),
-        ("done", IDLE, "app=claude-code:state=done"),
-        ("error", IDLE, "app=claude-code:state=error"),
-    ];
-    for (state, expected, canonical) in cases {
-        for terminator in ["\x1b\\", "\x07"] {
-            let bytes =
-                format!("\x1b]7501;state={state}:app={CLAUDE_APP}{terminator}").into_bytes();
-            for split in 0..=bytes.len() {
-                let mut harness = Harness::claude();
-                harness.feed(&captured("claude", "idle"));
-                harness.feed(&bytes[..split]);
-                harness.feed(&bytes[split..]);
+/// The record states and the canonical form each reports.
+const RECORD_STATES: [(&str, Observed, &str); 7] = [
+    ("working", WORKING, "app=claude-code:state=working"),
+    ("blocked", BLOCKED, "app=claude-code:state=blocked"),
+    (
+        "blocked:kind=permission",
+        BLOCKED,
+        "app=claude-code:state=blocked:kind=permission",
+    ),
+    (
+        "blocked:kind=question",
+        BLOCKED,
+        "app=claude-code:state=blocked:kind=question",
+    ),
+    (
+        "blocked:kind=auth",
+        BLOCKED,
+        "app=claude-code:state=blocked:kind=auth",
+    ),
+    ("done", IDLE, "app=claude-code:state=done"),
+    ("error", IDLE, "app=claude-code:state=error"),
+];
 
-                assert_eq!(
-                    harness.activity(),
-                    expected,
-                    "{state} split at {split} with {terminator:?}"
-                );
-                assert_eq!(harness.record_preview().as_deref(), Some(canonical));
-            }
+/// A record state is held whatever the terminator and wherever the report is
+/// split into two chunks.
+fn a_record_state_is_held_whatever_the_terminator_and_the_chunking(case: usize) {
+    let (state, expected, canonical) = RECORD_STATES[case];
+    for terminator in ["\x1b\\", "\x07"] {
+        let bytes = format!("\x1b]7501;state={state}:app={CLAUDE_APP}{terminator}").into_bytes();
+        for split in 0..=bytes.len() {
+            let mut harness = Harness::claude();
+            harness.feed(&captured("claude", "idle"));
+            harness.feed(&bytes[..split]);
+            harness.feed(&bytes[split..]);
+
+            assert_eq!(
+                harness.activity(),
+                expected,
+                "{state} split at {split} with {terminator:?}"
+            );
+            assert_eq!(harness.record_preview().as_deref(), Some(canonical));
         }
     }
+}
+
+/// One test per `RECORD_STATES` row; `RECORD_STATE_CASES` lists the rows tested.
+macro_rules! record_state_tests {
+    ($($name:ident: $case:expr),+ $(,)?) => {
+        const RECORD_STATE_CASES: &[usize] = &[$($case),+];
+        $(
+            #[test]
+            fn $name() {
+                a_record_state_is_held_whatever_the_terminator_and_the_chunking($case);
+            }
+        )+
+    };
+}
+
+record_state_tests!(
+    a_working_record_is_held_whatever_the_terminator_and_the_chunking: 0,
+    a_blocked_record_is_held_whatever_the_terminator_and_the_chunking: 1,
+    a_blocked_permission_record_is_held_whatever_the_terminator_and_the_chunking: 2,
+    a_blocked_question_record_is_held_whatever_the_terminator_and_the_chunking: 3,
+    a_blocked_auth_record_is_held_whatever_the_terminator_and_the_chunking: 4,
+    a_done_record_is_held_whatever_the_terminator_and_the_chunking: 5,
+    an_error_record_is_held_whatever_the_terminator_and_the_chunking: 6,
+);
+
+#[test]
+fn every_record_state_has_a_test() {
+    let every_row: Vec<usize> = (0..RECORD_STATES.len()).collect();
+    assert_eq!(RECORD_STATE_CASES.to_vec(), every_row);
 }
 
 #[test]
@@ -748,50 +778,76 @@ fn a_manifest_without_the_table_ignores_records_while_they_arrive() {
     assert_eq!(bytes(true), bytes(false));
 }
 
-#[test]
-fn no_record_means_every_captured_screen_reads_exactly_as_without_the_opt_in() {
-    for (runtime, app, readiness) in [
-        ("claude", CLAUDE_APP, InputReadiness::ScreenIdle),
-        ("codex", CODEX_APP, InputReadiness::ManifestIdle),
-        ("pi", "pi", InputReadiness::ScreenIdle),
-    ] {
-        let directory = workspace_root().join(format!("compat/{runtime}/screens"));
-        let mut names = Vec::new();
-        for sub in ["", "widths", "n-1", "n-1/widths"] {
-            let Ok(entries) = fs::read_dir(directory.join(sub)) else {
-                continue;
-            };
-            for entry in entries.map(|entry| entry.expect("directory entry").path()) {
-                if entry
-                    .extension()
-                    .is_some_and(|extension| extension == "txt")
-                {
-                    let stem = entry.file_stem().expect("file stem").to_string_lossy();
-                    names.push(if sub.is_empty() {
-                        stem.into_owned()
-                    } else {
-                        format!("{sub}/{stem}")
-                    });
-                }
+/// No record means every captured screen of `runtime` reads exactly as
+/// without the opt-in.
+fn no_record_means_every_captured_screen_reads_as_without_the_opt_in(
+    runtime: &str,
+    app: &str,
+    readiness: InputReadiness,
+) {
+    let directory = workspace_root().join(format!("compat/{runtime}/screens"));
+    let mut names = Vec::new();
+    for sub in ["", "widths", "n-1", "n-1/widths"] {
+        let Ok(entries) = fs::read_dir(directory.join(sub)) else {
+            continue;
+        };
+        for entry in entries.map(|entry| entry.expect("directory entry").path()) {
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "txt")
+            {
+                let stem = entry.file_stem().expect("file stem").to_string_lossy();
+                names.push(if sub.is_empty() {
+                    stem.into_owned()
+                } else {
+                    format!("{sub}/{stem}")
+                });
             }
         }
-        names.sort();
-        assert!(!names.is_empty(), "{runtime} has captured screens");
-        for name in names {
-            let bytes = captured(runtime, &name);
-            let mut plain = Harness::new(config(&plain_source(runtime), readiness));
-            let mut opted = Harness::new(config(&opted_in_source(runtime, app, true), readiness));
-            plain.feed(&bytes);
-            opted.feed(&bytes);
-
-            assert_eq!(plain.transitions, opted.transitions, "{runtime}/{name}");
-            assert_eq!(
-                plain.detector.input_ready(),
-                opted.detector.input_ready(),
-                "{runtime}/{name}"
-            );
-        }
     }
+    names.sort();
+    assert!(!names.is_empty(), "{runtime} has captured screens");
+    for name in names {
+        let bytes = captured(runtime, &name);
+        let mut plain = Harness::new(config(&plain_source(runtime), readiness));
+        let mut opted = Harness::new(config(&opted_in_source(runtime, app, true), readiness));
+        plain.feed(&bytes);
+        opted.feed(&bytes);
+
+        assert_eq!(plain.transitions, opted.transitions, "{runtime}/{name}");
+        assert_eq!(
+            plain.detector.input_ready(),
+            opted.detector.input_ready(),
+            "{runtime}/{name}"
+        );
+    }
+}
+
+#[test]
+fn no_record_means_every_captured_claude_screen_reads_exactly_as_without_the_opt_in() {
+    no_record_means_every_captured_screen_reads_as_without_the_opt_in(
+        "claude",
+        CLAUDE_APP,
+        InputReadiness::ScreenIdle,
+    );
+}
+
+#[test]
+fn no_record_means_every_captured_codex_screen_reads_exactly_as_without_the_opt_in() {
+    no_record_means_every_captured_screen_reads_as_without_the_opt_in(
+        "codex",
+        CODEX_APP,
+        InputReadiness::ManifestIdle,
+    );
+}
+
+#[test]
+fn no_record_means_every_captured_pi_screen_reads_exactly_as_without_the_opt_in() {
+    no_record_means_every_captured_screen_reads_as_without_the_opt_in(
+        "pi",
+        "pi",
+        InputReadiness::ScreenIdle,
+    );
 }
 
 /// A harness whose initial-input wait is still pending, as at session start.

@@ -826,6 +826,55 @@ fn forged_borders() -> Vec<String> {
     ]
 }
 
+/// The share of one hostile-text sweep a test runs.
+///
+/// A sweep visits thousands of (screen, row, text) combinations in order. The
+/// combinations are dealt out round-robin to `of` tests, so the shards run in
+/// parallel and every combination belongs to exactly one shard. A dry sweep
+/// ([`Sweep::counting`]) visits them all and classifies none.
+#[derive(Debug)]
+struct Sweep {
+    index: usize,
+    of: usize,
+    classify: bool,
+    visited: usize,
+    taken: usize,
+}
+
+impl Sweep {
+    fn shard(index: usize, of: usize) -> Self {
+        assert!(index < of, "shard {index} of {of}");
+        Self {
+            index,
+            of,
+            classify: true,
+            visited: 0,
+            taken: 0,
+        }
+    }
+
+    fn counting() -> Self {
+        Self {
+            classify: false,
+            ..Self::shard(0, 1)
+        }
+    }
+
+    fn classifies(&self) -> bool {
+        self.classify
+    }
+
+    /// Whether the next combination belongs to this shard.
+    fn takes(&mut self) -> bool {
+        let mine = self.visited % self.of == self.index;
+        self.visited += 1;
+        if mine {
+            self.taken += 1;
+        }
+        mine && self.classify
+    }
+}
+
 /// Replaces every transcript and draft row of `rows`, one at a time, with
 /// hostile text and returns how many substitutions kept the classification.
 fn sweep_hostile_rows(
@@ -834,14 +883,16 @@ fn sweep_hostile_rows(
     rows: &[String],
     columns: u16,
     expected: AgentActivity,
-) -> usize {
-    assert_eq!(
-        activity_at(definition, rows, columns),
-        Some(expected),
-        "{name} unmodified"
-    );
+    sweep: &mut Sweep,
+) {
+    if sweep.classifies() {
+        assert_eq!(
+            activity_at(definition, rows, columns),
+            Some(expected),
+            "{name} unmodified"
+        );
+    }
     let (upper, lower) = frame_borders(rows);
-    let mut checked = 0;
     for row in (0..lower).filter(|row| *row != upper) {
         let mut hostile: Vec<String> = HOSTILE_TEXT.iter().map(|text| (*text).to_owned()).collect();
         if row < upper {
@@ -849,6 +900,9 @@ fn sweep_hostile_rows(
             hostile.extend(forged_borders());
         }
         for text in hostile {
+            if !sweep.takes() {
+                continue;
+            }
             let mut changed = rows.to_vec();
             changed[row].clone_from(&text);
             assert_eq!(
@@ -856,10 +910,8 @@ fn sweep_hostile_rows(
                 Some(expected),
                 "{name} row {row} replaced by {text:?}"
             );
-            checked += 1;
         }
     }
-    checked
 }
 
 /// A captured screen of `compat/pi/screens/widths/`: its name, terminal width
@@ -1007,26 +1059,64 @@ fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
     }
 }
 
+/// Generates one test per shard index and records the indexes in `$indexes`, so a
+/// coverage test can prove every shard of [`SWEEP_SHARDS`] exists.
+macro_rules! sweep_shards {
+    ($indexes:ident, $sweep:ident, $set:expr, $($name:ident: $index:expr),+ $(,)?) => {
+        const $indexes: &[usize] = &[$($index),+];
+        $(
+            #[test]
+            fn $name() {
+                $sweep($set, &mut Sweep::shard($index, SWEEP_SHARDS));
+            }
+        )+
+    };
+}
+
+/// Parts each hostile-text sweep is split into.
+const SWEEP_SHARDS: usize = 6;
+
+sweep_shards!(
+    HOSTILE_TEXT_SHARDS,
+    hostile_text_never_changes_the_classification_of,
+    SCREEN_SETS[0],
+    hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_0: 0,
+    hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_1: 1,
+    hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_2: 2,
+    hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_3: 3,
+    hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_4: 4,
+    hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_5: 5,
+);
+
+sweep_shards!(
+    HOSTILE_TEXT_PREVIOUS_SHARDS,
+    hostile_text_never_changes_the_classification_of,
+    SCREEN_SETS[1],
+    hostile_text_never_changes_the_classification_of_the_previous_release_part_0: 0,
+    hostile_text_never_changes_the_classification_of_the_previous_release_part_1: 1,
+    hostile_text_never_changes_the_classification_of_the_previous_release_part_2: 2,
+    hostile_text_never_changes_the_classification_of_the_previous_release_part_3: 3,
+    hostile_text_never_changes_the_classification_of_the_previous_release_part_4: 4,
+    hostile_text_never_changes_the_classification_of_the_previous_release_part_5: 5,
+);
+
 /// Border-like text (rules, scroll markers, status lookalikes) in the
 /// transcript or the draft never changes the classification of a captured
 /// editor screen. Text that starts like a selector line is the documented
 /// exception: see [`a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint`].
-#[test]
-fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification() {
-    hostile_text_never_changes_the_classification_of(SCREEN_SETS[0]);
-}
-
-#[test]
-fn hostile_text_never_changes_the_classification_of_the_previous_release() {
-    hostile_text_never_changes_the_classification_of(SCREEN_SETS[1]);
-}
-
-/// The body of the hostile-text sweep over the screens of the set `set`.
-fn hostile_text_never_changes_the_classification_of(set: &str) {
+///
+/// Only the share `sweep` selects is classified; sibling tests run the rest.
+fn hostile_text_never_changes_the_classification_of(set: &str, sweep: &mut Sweep) {
     let definition = installed_definition();
-    let mut checked = 0_usize;
     for (screen, expected) in captured_screens_of(set) {
-        checked += sweep_hostile_rows(&definition, &screen, &screen_rows(&screen), 100, expected);
+        sweep_hostile_rows(
+            &definition,
+            &screen,
+            &screen_rows(&screen),
+            100,
+            expected,
+            sweep,
+        );
     }
     // The narrowest terminal, one whose busy borders close with one rule, and
     // the transcript-rule screens at 24 columns.
@@ -1035,18 +1125,53 @@ fn hostile_text_never_changes_the_classification_of(set: &str) {
             || (fixture.columns == 36 && fixture.name.starts_with("compaction"))
             || (fixture.columns == 24 && fixture.name.starts_with("rule_"))
     }) {
-        checked += sweep_hostile_rows(
+        sweep_hostile_rows(
             &definition,
             &fixture.name,
             &fixture.rows,
             fixture.columns,
             fixture.expected,
+            sweep,
         );
     }
-    assert!(
-        checked > 3500 / SCREEN_SETS.len(),
-        "the sweep covers every row of {set:?}: {checked}"
+}
+
+/// The shards together cover every row of every screen: a dry sweep visits
+/// each combination once, and the shards split exactly those combinations.
+#[test]
+fn the_hostile_text_shards_cover_every_row_of_every_screen_set() {
+    let every_shard: Vec<usize> = (0..SWEEP_SHARDS).collect();
+    assert_eq!(
+        HOSTILE_TEXT_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
     );
+    assert_eq!(
+        HOSTILE_TEXT_PREVIOUS_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
+    );
+    for set in SCREEN_SETS {
+        let mut dry = Sweep::counting();
+        hostile_text_never_changes_the_classification_of(set, &mut dry);
+        assert!(
+            dry.visited > 3500 / SCREEN_SETS.len(),
+            "the sweep covers every row of {set:?}: {}",
+            dry.visited
+        );
+        let shares: usize = (0..SWEEP_SHARDS)
+            .map(|index| {
+                let mut share = Sweep::shard(index, SWEEP_SHARDS);
+                share.classify = false;
+                hostile_text_never_changes_the_classification_of(set, &mut share);
+                share.taken
+            })
+            .sum();
+        assert_eq!(
+            shares, dry.visited,
+            "the shards of {set:?} partition the sweep"
+        );
+    }
 }
 
 /// What an overlay screen of `compat/pi/screens/overlays/` waits for.
@@ -1240,20 +1365,34 @@ fn a_dialog_opened_from_the_idle_editor_is_published_as_blocked_and_closes_to_id
     }
 }
 
-#[test]
-fn transcript_text_never_changes_a_dialog_or_a_selector() {
-    transcript_text_never_changes_an_overlay_of(SCREEN_SETS[0]);
-}
+sweep_shards!(
+    OVERLAY_SHARDS,
+    transcript_text_never_changes_an_overlay_of,
+    SCREEN_SETS[0],
+    transcript_text_never_changes_a_dialog_or_a_selector_part_0: 0,
+    transcript_text_never_changes_a_dialog_or_a_selector_part_1: 1,
+    transcript_text_never_changes_a_dialog_or_a_selector_part_2: 2,
+    transcript_text_never_changes_a_dialog_or_a_selector_part_3: 3,
+    transcript_text_never_changes_a_dialog_or_a_selector_part_4: 4,
+    transcript_text_never_changes_a_dialog_or_a_selector_part_5: 5,
+);
 
-#[test]
-fn transcript_text_never_changes_an_overlay_of_the_previous_release() {
-    transcript_text_never_changes_an_overlay_of(SCREEN_SETS[1]);
-}
+sweep_shards!(
+    OVERLAY_PREVIOUS_SHARDS,
+    transcript_text_never_changes_an_overlay_of,
+    SCREEN_SETS[1],
+    transcript_text_never_changes_an_overlay_of_the_previous_release_part_0: 0,
+    transcript_text_never_changes_an_overlay_of_the_previous_release_part_1: 1,
+    transcript_text_never_changes_an_overlay_of_the_previous_release_part_2: 2,
+    transcript_text_never_changes_an_overlay_of_the_previous_release_part_3: 3,
+    transcript_text_never_changes_an_overlay_of_the_previous_release_part_4: 4,
+    transcript_text_never_changes_an_overlay_of_the_previous_release_part_5: 5,
+);
 
-/// The body of the transcript sweep over the overlays of the set `set`.
-fn transcript_text_never_changes_an_overlay_of(set: &str) {
+/// The transcript sweep over the overlays of the set `set`, for the share
+/// `sweep` selects.
+fn transcript_text_never_changes_an_overlay_of(set: &str, sweep: &mut Sweep) {
     let definition = installed_definition();
-    let mut checked = 0_usize;
     // Screens whose frame shows both borders; a taller overlay has no
     // transcript rows above it.
     let framed = |fixture: &&OverlayFixture| {
@@ -1269,7 +1408,6 @@ fn transcript_text_never_changes_an_overlay_of(set: &str) {
         .filter(|fixture| fixture.columns == 100)
         .filter(framed)
     {
-        let expected = activity_at(&definition, &fixture.rows, fixture.columns);
         let (upper, _) = frame_borders(&fixture.rows);
         let mut hostile: Vec<String> = HOSTILE_TEXT.iter().map(|text| (*text).to_owned()).collect();
         hostile.extend(STATUS_LOOKALIKES.iter().map(|text| (*text).to_owned()));
@@ -1282,24 +1420,62 @@ fn transcript_text_never_changes_an_overlay_of(set: &str) {
             ]
             .map(str::to_owned),
         );
+        let expected = sweep
+            .classifies()
+            .then(|| activity_at(&definition, &fixture.rows, fixture.columns));
         for row in 0..upper {
             for text in &hostile {
+                if !sweep.takes() {
+                    continue;
+                }
                 let mut changed = fixture.rows.clone();
                 changed[row].clone_from(text);
                 assert_eq!(
-                    activity_at(&definition, &changed, fixture.columns),
+                    Some(activity_at(&definition, &changed, fixture.columns)),
                     expected,
                     "{} row {row} replaced by {text:?}",
                     fixture.name
                 );
-                checked += 1;
             }
         }
     }
-    assert!(
-        checked > 2000 / SCREEN_SETS.len(),
-        "the sweep covers every transcript row of {set:?}: {checked}"
+}
+
+/// The overlay shards cover every transcript row of every screen set.
+#[test]
+fn the_overlay_shards_cover_every_transcript_row_of_every_screen_set() {
+    let every_shard: Vec<usize> = (0..SWEEP_SHARDS).collect();
+    assert_eq!(
+        OVERLAY_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
     );
+    assert_eq!(
+        OVERLAY_PREVIOUS_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
+    );
+    for set in SCREEN_SETS {
+        let mut dry = Sweep::counting();
+        transcript_text_never_changes_an_overlay_of(set, &mut dry);
+        assert!(
+            dry.visited > 2000 / SCREEN_SETS.len(),
+            "the sweep covers every transcript row of {set:?}: {}",
+            dry.visited
+        );
+        let shares: usize = (0..SWEEP_SHARDS)
+            .map(|index| {
+                let mut share = Sweep::shard(index, SWEEP_SHARDS);
+                share.classify = false;
+                transcript_text_never_changes_an_overlay_of(set, &mut share);
+                share.taken
+            })
+            .sum();
+        assert_eq!(
+            shares, dry.visited,
+            "the shards of {set:?} partition the sweep"
+        );
+    }
 }
 
 /// `rows` with the first draft line of its editor frame replaced by `text`.

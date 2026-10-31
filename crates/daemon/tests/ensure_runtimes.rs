@@ -4541,11 +4541,12 @@ const MATRIX: &[MatrixRow] = &[
 /// registry stays as staged and the profile is pinned only in the kept rows.
 async fn assert_matrix(
     runtimes: &[&str],
+    shard: usize,
     without_detect: fn(&MatrixRow) -> &'static str,
     with_detect: fn(&MatrixRow) -> &'static str,
 ) {
     for runtime in runtimes {
-        for row in MATRIX {
+        for row in MATRIX.iter().skip(shard).step_by(MATRIX_SHARDS) {
             let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
             let version = match row.order {
                 Order::Older => "1.0.1",
@@ -4635,31 +4636,56 @@ async fn assert_matrix(
     }
 }
 
-/// The case table of the reserved runtime `claude`, whose profile uses it:
-/// what the plan, the apply and the `--detect` plan say for each state of the
-/// selected package beside the release's disabled one.
-#[tokio::test]
-async fn claude_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["claude"], |row| row.reserved, |row| row.reserved_detect).await;
+/// Parts each runtime's case table is split into; every row builds its own host.
+const MATRIX_SHARDS: usize = 3;
+
+/// One test per runtime and shard of the case table, and `MATRIX_TESTED`
+/// listing the (runtime, shard) pairs tested.
+macro_rules! matrix_tests {
+    ($($name:ident: $runtime:literal, $shard:literal, $judged:ident, $detected:ident;)+) => {
+        const MATRIX_TESTED: &[(&str, usize)] = &[$(($runtime, $shard)),+];
+        $(
+            #[tokio::test]
+            async fn $name() {
+                assert_matrix(&[$runtime], $shard, |row| row.$judged, |row| row.$detected).await;
+            }
+        )+
+    };
 }
 
-/// The case table of the reserved runtime `codex`.
-#[tokio::test]
-async fn codex_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["codex"], |row| row.reserved, |row| row.reserved_detect).await;
+// The case table of each reserved runtime (claude, codex, hermes) says what
+// the plan, the apply and the `--detect` plan report for each state of the
+// selected package beside the release's disabled one; Pi is planned only
+// while an enabled selection serves it or `--detect` lists it.
+matrix_tests! {
+    claude_judges_the_disabled_release_package_by_the_selection_state_part_0: "claude", 0, reserved, reserved_detect;
+    claude_judges_the_disabled_release_package_by_the_selection_state_part_1: "claude", 1, reserved, reserved_detect;
+    claude_judges_the_disabled_release_package_by_the_selection_state_part_2: "claude", 2, reserved, reserved_detect;
+    codex_judges_the_disabled_release_package_by_the_selection_state_part_0: "codex", 0, reserved, reserved_detect;
+    codex_judges_the_disabled_release_package_by_the_selection_state_part_1: "codex", 1, reserved, reserved_detect;
+    codex_judges_the_disabled_release_package_by_the_selection_state_part_2: "codex", 2, reserved, reserved_detect;
+    hermes_judges_the_disabled_release_package_by_the_selection_state_part_0: "hermes", 0, reserved, reserved_detect;
+    hermes_judges_the_disabled_release_package_by_the_selection_state_part_1: "hermes", 1, reserved, reserved_detect;
+    hermes_judges_the_disabled_release_package_by_the_selection_state_part_2: "hermes", 2, reserved, reserved_detect;
+    pi_judges_the_disabled_release_package_by_the_selection_state_part_0: "pi", 0, pi, pi_detect;
+    pi_judges_the_disabled_release_package_by_the_selection_state_part_1: "pi", 1, pi, pi_detect;
+    pi_judges_the_disabled_release_package_by_the_selection_state_part_2: "pi", 2, pi, pi_detect;
 }
 
-/// The case table of the reserved runtime `hermes`.
-#[tokio::test]
-async fn hermes_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["hermes"], |row| row.reserved, |row| row.reserved_detect).await;
-}
-
-/// The case table of Pi, which the upgrade plans only while an enabled
-/// selection serves it or `--detect` lists it.
-#[tokio::test]
-async fn pi_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["pi"], |row| row.pi, |row| row.pi_detect).await;
+/// Every runtime has a test for every shard, and every shard has rows.
+#[test]
+fn the_case_table_shards_cover_every_row_of_every_runtime() {
+    assert!(MATRIX.len() >= MATRIX_SHARDS, "every shard has a row");
+    let mut expected = Vec::new();
+    for runtime in ["claude", "codex", "hermes", "pi"] {
+        for shard in 0..MATRIX_SHARDS {
+            expected.push((runtime, shard));
+        }
+    }
+    let mut tested = MATRIX_TESTED.to_vec();
+    tested.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(tested, expected);
 }
 
 /// Detail of the claim refusal of a disabled package the upgrade cannot enable.
@@ -6523,24 +6549,59 @@ async fn run_cell(cell: &Cell, runtime: &str) {
     }
 }
 
-/// Every cell of the holder contract table that applies to the reserved runtimes.
-#[tokio::test]
-async fn the_holder_contract_table_holds_for_the_reserved_runtimes() {
-    for cell in CELLS {
-        for runtime in cell.runtimes.iter().filter(|runtime| **runtime != "pi") {
+/// The cells of the holder contract table that apply to `runtime`, every
+/// second one starting at `half`. Each cell builds its own host, so the
+/// runtimes and the two halves run as separate tests.
+async fn the_holder_contract_table_holds_for(runtime: &str, half: usize) {
+    let mut ran = 0_usize;
+    for (index, cell) in CELLS
+        .iter()
+        .filter(|cell| cell.runtimes.contains(&runtime))
+        .enumerate()
+    {
+        if index % 2 == half {
             run_cell(cell, runtime).await;
+            ran += 1;
         }
     }
+    assert!(ran > 0, "the table has cells for {runtime} in half {half}");
 }
 
-/// Every cell of the holder contract table that applies to Pi.
-#[tokio::test]
-async fn the_holder_contract_table_holds_for_pi() {
-    for cell in CELLS {
-        if cell.runtimes.contains(&"pi") {
-            run_cell(cell, "pi").await;
-        }
-    }
+/// Two tests per runtime; `HOLDER_TESTED` lists the runtimes tested.
+macro_rules! holder_table_tests {
+    ($($first:ident, $second:ident: $runtime:literal;)+) => {
+        const HOLDER_TESTED: &[&str] = &[$($runtime),+];
+        $(
+            #[tokio::test]
+            async fn $first() {
+                the_holder_contract_table_holds_for($runtime, 0).await;
+            }
+
+            #[tokio::test]
+            async fn $second() {
+                the_holder_contract_table_holds_for($runtime, 1).await;
+            }
+        )+
+    };
+}
+
+holder_table_tests! {
+    the_holder_contract_table_holds_for_claude_first_half, the_holder_contract_table_holds_for_claude_second_half: "claude";
+    the_holder_contract_table_holds_for_codex_first_half, the_holder_contract_table_holds_for_codex_second_half: "codex";
+    the_holder_contract_table_holds_for_hermes_first_half, the_holder_contract_table_holds_for_hermes_second_half: "hermes";
+    the_holder_contract_table_holds_for_pi_first_half, the_holder_contract_table_holds_for_pi_second_half: "pi";
+}
+
+/// The runtimes the table is split over are exactly the runtimes it names, each once.
+#[test]
+fn the_holder_contract_table_names_only_runtimes_that_have_a_test() {
+    let named: std::collections::BTreeSet<&str> = CELLS
+        .iter()
+        .flat_map(|cell| cell.runtimes.iter().copied())
+        .collect();
+    let mut tested = HOLDER_TESTED.to_vec();
+    tested.sort_unstable();
+    assert_eq!(tested, named.into_iter().collect::<Vec<_>>());
 }
 
 /// An unmanaged Pi whose unselected holder is altered: plan and apply report the

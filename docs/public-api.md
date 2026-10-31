@@ -3133,10 +3133,9 @@ A profile that pins another installed version P keeps the command: the uninstall
 with P retained, and the next apply installs the release's archive and repins the profile
 from P.
 
-The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_state`,
-`codex_judges_the_disabled_release_package_by_the_selection_state`,
-`hermes_judges_the_disabled_release_package_by_the_selection_state` and
-`pi_judges_the_disabled_release_package_by_the_selection_state` (rows 1-23; plan,
+The scenarios are the twelve
+`<runtime>_judges_the_disabled_release_package_by_the_selection_state_part_<0-2>` tests
+(claude, codex, hermes and pi; rows 1-23 are split over the three parts; plan,
 `--detect` plan and apply, registry unchanged, profile pinned only in the kept rows),
 `a_disabled_release_package_that_another_package_serves_is_refused_beside_an_unloadable_selection`
 (the claim), `a_disabled_pi_selection_beside_a_third_party_server_is_a_gap_without_detect`
@@ -3144,8 +3143,8 @@ and `a_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed`
 S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
 `install_refuses_an_identity_installed_from_another_archive` in
 `crates/package/tests/registry.rs`. The holder cells are rows of one table in the same file,
-run by `the_holder_contract_table_holds_for_the_reserved_runtimes` and
-`the_holder_contract_table_holds_for_pi`: each row runs plan, apply and `--detect`, counts
+run by the eight `the_holder_contract_table_holds_for_<runtime>_<first|second>_half`
+tests (claude, codex, hermes and pi, one half of the rows each): each row runs plan, apply and `--detect`, counts
 that the hint names exactly the commands the row lists, in order, runs every one of them as
 the CLI sends it (the registry refuses the removal while the pin stands and accepts it after
 the pin is released), and ends with the release installed and the profile bound (reserved),

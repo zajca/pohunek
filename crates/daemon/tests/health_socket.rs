@@ -3860,74 +3860,42 @@ async fn codex_captured_startup_dialog(
     let _ = handle.await;
 }
 
-#[tokio::test]
-async fn codex_captured_login_80_holds_initial_input() {
-    codex_captured_startup_dialog("login", 80, true, false).await;
-    codex_captured_startup_dialog("login", 80, false, false).await;
-    codex_captured_startup_dialog("login", 80, true, true).await;
+/// One test per captured dialog, width and way out of it: a dialog that holds
+/// the input for the whole grace (with and without the stale title) refuses
+/// the session, and a dismissed one delivers the input once. Each case waits
+/// out its own grace, so the cases run as separate tests in parallel.
+macro_rules! codex_captured_dialog_tests {
+    ($($surface:literal, $columns:literal: $stale:ident, $fresh:ident, $dismissed:ident;)+) => {
+        $(
+            #[tokio::test]
+            async fn $stale() {
+                codex_captured_startup_dialog($surface, $columns, true, false).await;
+            }
+
+            #[tokio::test]
+            async fn $fresh() {
+                codex_captured_startup_dialog($surface, $columns, false, false).await;
+            }
+
+            #[tokio::test]
+            async fn $dismissed() {
+                codex_captured_startup_dialog($surface, $columns, true, true).await;
+            }
+        )+
+    };
 }
 
-#[tokio::test]
-async fn codex_captured_login_160_holds_initial_input() {
-    codex_captured_startup_dialog("login", 160, true, false).await;
-    codex_captured_startup_dialog("login", 160, false, false).await;
-    codex_captured_startup_dialog("login", 160, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_api_entry_80_holds_initial_input() {
-    codex_captured_startup_dialog("api-entry", 80, true, false).await;
-    codex_captured_startup_dialog("api-entry", 80, false, false).await;
-    codex_captured_startup_dialog("api-entry", 80, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_api_entry_160_holds_initial_input() {
-    codex_captured_startup_dialog("api-entry", 160, true, false).await;
-    codex_captured_startup_dialog("api-entry", 160, false, false).await;
-    codex_captured_startup_dialog("api-entry", 160, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_settings_80_holds_initial_input() {
-    codex_captured_startup_dialog("settings", 80, true, false).await;
-    codex_captured_startup_dialog("settings", 80, false, false).await;
-    codex_captured_startup_dialog("settings", 80, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_settings_160_holds_initial_input() {
-    codex_captured_startup_dialog("settings", 160, true, false).await;
-    codex_captured_startup_dialog("settings", 160, false, false).await;
-    codex_captured_startup_dialog("settings", 160, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_trust_20_holds_initial_input() {
-    codex_captured_startup_dialog("trust", 20, true, false).await;
-    codex_captured_startup_dialog("trust", 20, false, false).await;
-    codex_captured_startup_dialog("trust", 20, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_trust_30_holds_initial_input() {
-    codex_captured_startup_dialog("trust", 30, true, false).await;
-    codex_captured_startup_dialog("trust", 30, false, false).await;
-    codex_captured_startup_dialog("trust", 30, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_trust_80_holds_initial_input() {
-    codex_captured_startup_dialog("trust", 80, true, false).await;
-    codex_captured_startup_dialog("trust", 80, false, false).await;
-    codex_captured_startup_dialog("trust", 80, true, true).await;
-}
-
-#[tokio::test]
-async fn codex_captured_trust_160_holds_initial_input() {
-    codex_captured_startup_dialog("trust", 160, true, false).await;
-    codex_captured_startup_dialog("trust", 160, false, false).await;
-    codex_captured_startup_dialog("trust", 160, true, true).await;
+codex_captured_dialog_tests! {
+    "login", 80: codex_captured_login_80_holds_initial_input_under_a_stale_title, codex_captured_login_80_holds_initial_input_without_a_stale_title, codex_captured_login_80_delivers_initial_input_once_after_dismissal;
+    "login", 160: codex_captured_login_160_holds_initial_input_under_a_stale_title, codex_captured_login_160_holds_initial_input_without_a_stale_title, codex_captured_login_160_delivers_initial_input_once_after_dismissal;
+    "api-entry", 80: codex_captured_api_entry_80_holds_initial_input_under_a_stale_title, codex_captured_api_entry_80_holds_initial_input_without_a_stale_title, codex_captured_api_entry_80_delivers_initial_input_once_after_dismissal;
+    "api-entry", 160: codex_captured_api_entry_160_holds_initial_input_under_a_stale_title, codex_captured_api_entry_160_holds_initial_input_without_a_stale_title, codex_captured_api_entry_160_delivers_initial_input_once_after_dismissal;
+    "settings", 80: codex_captured_settings_80_holds_initial_input_under_a_stale_title, codex_captured_settings_80_holds_initial_input_without_a_stale_title, codex_captured_settings_80_delivers_initial_input_once_after_dismissal;
+    "settings", 160: codex_captured_settings_160_holds_initial_input_under_a_stale_title, codex_captured_settings_160_holds_initial_input_without_a_stale_title, codex_captured_settings_160_delivers_initial_input_once_after_dismissal;
+    "trust", 20: codex_captured_trust_20_holds_initial_input_under_a_stale_title, codex_captured_trust_20_holds_initial_input_without_a_stale_title, codex_captured_trust_20_delivers_initial_input_once_after_dismissal;
+    "trust", 30: codex_captured_trust_30_holds_initial_input_under_a_stale_title, codex_captured_trust_30_holds_initial_input_without_a_stale_title, codex_captured_trust_30_delivers_initial_input_once_after_dismissal;
+    "trust", 80: codex_captured_trust_80_holds_initial_input_under_a_stale_title, codex_captured_trust_80_holds_initial_input_without_a_stale_title, codex_captured_trust_80_delivers_initial_input_once_after_dismissal;
+    "trust", 160: codex_captured_trust_160_holds_initial_input_under_a_stale_title, codex_captured_trust_160_holds_initial_input_without_a_stale_title, codex_captured_trust_160_delivers_initial_input_once_after_dismissal;
 }
 
 /// Writes a host profile `name` over the pinned official Claude package whose
