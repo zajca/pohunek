@@ -301,6 +301,7 @@ pub async fn gate_refresh(
             stopped_sessions,
             acceptance,
             warnings,
+            ..
         } => Error::RefreshAtRisk {
             sessions,
             stopped_sessions,
@@ -511,6 +512,7 @@ pub fn decide(
                 stopped_sessions: stopped.into_iter().map(|(_, verdict)| verdict).collect(),
                 acceptance: Box::new(groups),
                 warnings,
+                resumed: false,
             });
         }
         for (list, verdict) in live.iter().chain(&stopped) {

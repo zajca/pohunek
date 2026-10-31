@@ -373,6 +373,9 @@ pub struct PendingReport {
     pub operation: &'static str,
     /// The version it was installing.
     pub version: String,
+    /// The version an upgrade started from; omitted for the other operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
     /// The last completed step.
     pub step: &'static str,
     /// Whether its rollback has begun; shown only when it has.

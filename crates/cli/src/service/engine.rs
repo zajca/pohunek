@@ -747,7 +747,16 @@ impl<'a> Engine<'a> {
         }
         let plan = upgrade_plan(pending, version)?;
         let release = self.upgrade_source(&plan, from)?;
-        let (gated, job_path) = self.adoption_gate(&plan, &release, version).await?;
+        let (gated, job_path) =
+            self.adoption_gate(&plan, &release, version)
+                .await
+                .map_err(|error| {
+                    if matches!(plan, Plan::Resume(_)) {
+                        error.resumed()
+                    } else {
+                        error
+                    }
+                })?;
         // The rollback restarts the previous daemon from its version
         // directory, so a missing or refused one is restored before it runs.
         let rollback_restore = match &plan {
@@ -846,7 +855,8 @@ impl<'a> Engine<'a> {
         let mut late = LateGate::default();
         let result = self
             .run_steps(&mut record, &layout, staged, &target, &mut late)
-            .await;
+            .await
+            .map_err(|error| if resumed { error.resumed() } else { error });
         // A refusal never touches the running daemon. Rolling back a record
         // at `Registering` would replace it, and the replacement may not have
         // happened yet, so that record is kept for a resume instead.
@@ -3205,6 +3215,9 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
     PendingReport {
         operation: record.operation.as_str(),
         version: record.version.clone(),
+        previous_version: (record.operation == Operation::Upgrade)
+            .then(|| record.previous_version.clone())
+            .flatten(),
         step: record.step.as_str(),
         rolling_back: record.rolling_back,
         preflight: None,

@@ -710,6 +710,7 @@ mod tests {
         pending.pending_transaction = Some(crate::service::report::PendingReport {
             operation: "upgrade",
             version: "1.0.0".to_owned(),
+            previous_version: None,
             step: "bootstrap",
             rolling_back: false,
             preflight: None,
@@ -780,6 +781,7 @@ mod tests {
         let pending = || crate::service::report::PendingReport {
             operation: "upgrade",
             version: "1.0.0".to_owned(),
+            previous_version: None,
             step: "bootstrap",
             rolling_back: false,
             preflight: None,

@@ -134,7 +134,7 @@ impl Engine<'_> {
         };
         match result {
             Err(error) if error.is_job_missing() => {
-                Err(match self.job_missing_effects(&start, dry_run) {
+                Err(match self.job_missing_effects(&start, dry_run).await {
                     Some(effects) => error.with_job_missing_effects(effects),
                     None => error,
                 })
@@ -148,7 +148,11 @@ impl Engine<'_> {
     /// then claims nothing.
     ///
     /// A dry run never writes, so its effects are stated without a re-read.
-    fn job_missing_effects(&self, start: &RunStart, dry_run: bool) -> Option<JobMissingEffects> {
+    async fn job_missing_effects(
+        &self,
+        start: &RunStart,
+        dry_run: bool,
+    ) -> Option<JobMissingEffects> {
         if dry_run {
             return Some(JobMissingEffects {
                 file: FileEffect::Untouched,
@@ -157,6 +161,7 @@ impl Engine<'_> {
                 } else {
                     RecordEffect::Absent
                 },
+                job_registered: false,
             });
         }
         let record = match self.store.load().ok()? {
@@ -176,7 +181,16 @@ impl Engine<'_> {
         } else {
             return None;
         };
-        Some(JobMissingEffects { file, record })
+        let job_registered = match self.backend.daemon().inspect().await {
+            Ok(_) => true,
+            Err(supervisor::Error::NotFound(_)) => false,
+            Err(_) => return None,
+        };
+        Some(JobMissingEffects {
+            file,
+            record,
+            job_registered,
+        })
     }
 
     /// Starts a refresh, or reports that nothing needs one.
@@ -546,7 +560,8 @@ impl Engine<'_> {
     }
 
     /// Undoes a refresh: restores the previous path and, once the job may
-    /// have been replaced, replaces it again with the previous definition.
+    /// have been replaced, replaces it again with the previous definition, or
+    /// registers it again when it vanished.
     ///
     /// The record is marked `rolling_back` before the first effect, so a
     /// refused gate leaves a record that only a rerun of `refresh-path` (or the
@@ -557,9 +572,8 @@ impl Engine<'_> {
     ///
     /// Returns [`Error::RefreshConfigChanged`] for a file the journal does not
     /// account for, [`Error::RefreshConfigSchema`] for a file of another
-    /// schema, the rollback gate's refusals, [`Error::DaemonJobMissing`] when the
-    /// job vanished, and the service-manager and readiness errors of the
-    /// restoring replacement.
+    /// schema, the rollback gate's refusals, and the service-manager and
+    /// readiness errors of the restoring replacement or installation.
     pub(super) async fn rollback_refresh(
         &self,
         record: &Record,
@@ -623,18 +637,22 @@ impl Engine<'_> {
                 Err(supervisor::Error::NotFound(_)) => None,
                 Err(source) => return Err(supervisor_error("inspect daemon", source)),
             };
-            // A job that vanished after the record exists cannot be restored by
-            // a replacement, and no rerun can change that; the typed error
-            // carries the way out.
-            self.backend
-                .daemon()
-                .replace(&definition)
-                .await
-                .map_err(|source| match source {
-                    supervisor::Error::NotFound(_) => Error::DaemonJobMissing { effects: None },
-                    source => supervisor_error("restore daemon", source),
-                })?;
-            self.wait_restarted(&record.version, replaced).await?;
+            // The rollback gate has passed, so a job that vanished after the
+            // record exists is registered again from the restored file, as the
+            // upgrade rollback restarts its previous daemon.
+            match self.backend.daemon().replace(&definition).await {
+                Ok(()) => self.wait_restarted(&record.version, replaced).await?,
+                Err(supervisor::Error::NotFound(_)) => {
+                    self.prepare_definition(&restored, &definition).await?;
+                    self.backend
+                        .daemon()
+                        .install(&definition)
+                        .await
+                        .map_err(|source| supervisor_error("restore daemon", source))?;
+                    self.wait_restarted(&record.version, None).await?;
+                }
+                Err(source) => return Err(supervisor_error("restore daemon", source)),
+            }
         }
         Ok(gated)
     }

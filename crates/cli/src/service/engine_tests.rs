@@ -63,6 +63,9 @@ mod unit_environment;
 #[path = "engine_tests_refresh.rs"]
 mod refresh_path;
 
+#[path = "engine_tests_pending.rs"]
+mod pending;
+
 #[path = "engine_tests_repair.rs"]
 mod repair;
 
@@ -1576,9 +1579,12 @@ async fn refresh_path_refuses_an_unmanaged_host_a_missing_installation_and_a_pen
             "then rerun `pohunek service refresh-path`",
             "the record keeps blocking refresh-path",
             "do not accept the runtime loss unless you intend to lose it",
-            "see https://github.com/zajca/pohunek/issues/1763",
+            "To abandon a pending upgrade instead",
+            "`pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>`",
+            "shows that version as `from`",
         ],
     );
+    assert!(!hint.contains("issues/1763"), "{hint}");
 
     harness.install(V1).await.expect("finish the install");
     harness.context = harness
