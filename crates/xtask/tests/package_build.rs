@@ -182,7 +182,7 @@ impl Repo {
     fn git_in(&self, dir: &Path, args: &[&str]) -> String {
         let output = self
             .env
-            .command("git")
+            .git_command()
             .current_dir(dir)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

@@ -296,7 +296,7 @@ fn an_implicit_start_inside_a_work_tree_sends_the_checkout_root() {
     let nested = repo.join("nested");
     fs::create_dir_all(&nested).expect("create the nested directory");
     let init = env
-        .command("git")
+        .git_command()
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&repo)
         .output()
@@ -321,7 +321,7 @@ fn an_implicit_start_ignores_git_redirection_variables() {
     fs::create_dir_all(&nested).expect("create the nested directory");
     fs::create_dir_all(&other).expect("create the other directory");
     let init = env
-        .command("git")
+        .git_command()
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&repo)
         .output()
@@ -365,7 +365,7 @@ fn an_implicit_start_warns_when_the_work_tree_root_cannot_be_found() {
     fs::create_dir_all(&nested).expect("create the nested directory");
     fs::create_dir_all(&no_git).expect("create the empty PATH directory");
     let init = env
-        .command("git")
+        .git_command()
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&repo)
         .output()

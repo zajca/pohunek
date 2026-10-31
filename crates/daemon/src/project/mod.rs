@@ -530,7 +530,7 @@ mod tests {
     }
 
     fn git_in(dir: &Path, args: &[&str]) {
-        let output = pohunek_test_support::process_env::command("git")
+        let output = pohunek_test_support::git::command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -546,7 +546,7 @@ mod tests {
     /// Init a repo on `main` with one commit, returning its dir.
     fn init_repo(tag: &str) -> PathBuf {
         let dir = unique_dir(tag).join("repo");
-        let init = pohunek_test_support::process_env::command("git")
+        let init = pohunek_test_support::git::command()
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .arg(&dir)
             .output()
@@ -758,7 +758,7 @@ mod tests {
         let a = unique_dir("amb-a").join("shared");
         let b = unique_dir("amb-b").join("shared");
         for dir in [&a, &b] {
-            let init = pohunek_test_support::process_env::command("git")
+            let init = pohunek_test_support::git::command()
                 .args(["-c", "init.defaultBranch=main", "init", "-q"])
                 .arg(dir)
                 .output()

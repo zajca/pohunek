@@ -2104,7 +2104,7 @@ mod tests {
     /// developer's identity, hooks and signing settings never apply.
     fn git(env: &TestEnv, args: &[&str]) {
         let output = env
-            .command("git")
+            .git_command()
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")

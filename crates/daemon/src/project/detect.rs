@@ -406,7 +406,7 @@ mod tests {
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
-        let output = pohunek_test_support::process_env::command("git")
+        let output = pohunek_test_support::git::command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -420,7 +420,7 @@ mod tests {
     }
 
     fn git_stdout(dir: &Path, args: &[&str]) -> String {
-        let output = pohunek_test_support::process_env::command("git")
+        let output = pohunek_test_support::git::command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -433,7 +433,7 @@ mod tests {
     /// Init a repo on branch `main` with one commit, returning its dir.
     fn init_repo(tag: &str) -> PathBuf {
         let dir = unique_dir(tag);
-        let init = pohunek_test_support::process_env::command("git")
+        let init = pohunek_test_support::git::command()
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .arg(&dir)
             .output()
@@ -541,7 +541,7 @@ mod tests {
     fn detects_bare_repository() {
         let parent = unique_dir("bare");
         let bare = parent.join("repo.git");
-        let init = pohunek_test_support::process_env::command("git")
+        let init = pohunek_test_support::git::command()
             .args(["-c", "init.defaultBranch=main", "init", "--bare", "-q"])
             .arg(&bare)
             .output()

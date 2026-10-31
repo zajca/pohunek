@@ -72,7 +72,7 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
     let repo: PathBuf = env.root().join("repo");
     fs::create_dir(&repo).expect("create repository directory");
     let init = env
-        .command("git")
+        .git_command()
         .args(["-C"])
         .arg(&repo)
         .args(["init", "-q"])
@@ -82,7 +82,7 @@ async fn a_wedged_blocking_task_does_not_keep_a_stopping_daemon_alive() {
     let fifo = env.root().join("config.fifo");
     mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).expect("create fifo");
     let configured = env
-        .command("git")
+        .git_command()
         .args(["-C"])
         .arg(&repo)
         .args(["config", "include.path"])

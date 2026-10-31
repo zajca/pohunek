@@ -110,7 +110,7 @@ impl Rig {
     fn git_in(&self, dir: &Path, args: &[&str]) -> String {
         let out = self
             .repo
-            .command("git")
+            .git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -132,7 +132,7 @@ impl Rig {
     fn rev(&self, name: &str) -> Option<String> {
         let out = self
             .repo
-            .command("git")
+            .git_command()
             .arg("-C")
             .arg(self.repo.cwd())
             .args([
@@ -164,7 +164,7 @@ impl Rig {
         let start = format!("origin/{branch}");
         let base = if self
             .repo
-            .command("git")
+            .git_command()
             .arg("-C")
             .arg(&dir)
             .args(["rev-parse", "--verify", "--quiet", &start])
@@ -1047,7 +1047,7 @@ fn begin_conflicting_rebase(rig: &Rig) -> (String, TestDir) {
     let tip = rig.git_in(&dir, &["rev-parse", "HEAD"]);
     let rebase = rig
         .repo
-        .command("git")
+        .git_command()
         .arg("-C")
         .arg(&dir)
         .args(["rebase", "main"])

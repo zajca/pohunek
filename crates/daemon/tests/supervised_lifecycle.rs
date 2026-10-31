@@ -1645,7 +1645,7 @@ fn init_git_repo(env: &pohunek_test_support::env::TestEnv, dir: &std::path::Path
     std::fs::create_dir_all(dir).expect("repository directory");
     let git = |args: &[&str]| {
         let out = env
-            .command("git")
+            .git_command()
             .current_dir(dir)
             .args(args)
             .output()

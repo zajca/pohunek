@@ -114,7 +114,7 @@ impl Rig {
         ] {
             let out = self
                 .repo
-                .command("git")
+                .git_command()
                 .arg("-C")
                 .arg(self.repo.cwd())
                 .args(&args)
@@ -147,7 +147,7 @@ impl Rig {
     fn git(&self, args: &[&str]) -> String {
         let out = self
             .repo
-            .command("git")
+            .git_command()
             .arg("-C")
             .arg(self.repo.cwd())
             .args(args)

@@ -552,15 +552,6 @@ mod tests {
         }
     }
 
-    /// Panics unless the calling test runs [`in_own_process`], the only place
-    /// a test may change the working directory.
-    fn assert_own_process() {
-        assert!(
-            pohunek_test_support::process_env::runs_in_own_process(),
-            "a test changes the working directory only in_own_process"
-        );
-    }
-
     fn write_executable(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write executable fixture");
@@ -643,8 +634,7 @@ mod tests {
             fs::create_dir(&relative_dir).expect("create relative bin");
             write_executable(&relative_dir, "hermes");
             write_executable(&cwd, "hermes");
-            assert_own_process();
-            std::env::set_current_dir(&cwd).expect("enter the fixture directory");
+            pohunek_test_support::process_env::set_current_dir(&cwd);
             let results = [
                 // A relative entry, an empty entry (the working directory), and `.`
                 // are never searched; neither is a relative program path.
@@ -845,8 +835,7 @@ mod tests {
             fs::create_dir(&relative_dir).expect("create bin");
             write_executable(&relative_dir, "agent");
             write_executable(&cwd, "agent");
-            assert_own_process();
-            std::env::set_current_dir(&cwd).expect("enter the fixture directory");
+            pohunek_test_support::process_env::set_current_dir(&cwd);
             let refused = [
                 ("bin", "agent"),
                 ("", "agent"),

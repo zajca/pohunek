@@ -892,7 +892,7 @@ mod tests {
 
         let repo = pohunek_test_support::tempdir().expect("create a repository");
         let git = |args: &[&str]| {
-            pohunek_test_support::process_env::command("git")
+            pohunek_test_support::git::command()
                 .arg("-C")
                 .arg(repo.path())
                 .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
