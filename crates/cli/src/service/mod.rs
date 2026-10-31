@@ -42,7 +42,7 @@ pub mod manager_env;
 pub mod preflight;
 mod process_group;
 pub mod record;
-mod refresh;
+pub(crate) mod refresh;
 pub mod report;
 mod rollback;
 pub mod runtimes;

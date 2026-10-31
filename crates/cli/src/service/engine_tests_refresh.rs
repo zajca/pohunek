@@ -1732,3 +1732,101 @@ async fn a_record_of_another_schema_names_the_pohunek_that_started_the_transacti
         ],
     );
 }
+
+fn put_agent(dir: &Path, name: &str) {
+    pohunek_test_support::fs::write_executable(dir.join(name), "#!/bin/sh\nexit 0\n")
+        .expect("write agent");
+}
+
+fn behind(context: &Context) -> Option<Vec<(&'static str, PathBuf)>> {
+    crate::service::refresh::agents_behind_recorded_path(context).map(|agents| {
+        agents
+            .into_iter()
+            .map(|agent| (agent.name, agent.found))
+            .collect()
+    })
+}
+
+#[tokio::test]
+async fn an_agent_only_the_login_shell_path_resolves_is_reported() {
+    let r = refreshable().await;
+    put_agent(&r.old, "claude");
+    put_agent(&r.new, "claude");
+    put_agent(&r.new, "codex");
+
+    assert_eq!(
+        behind(&r.harness.context),
+        Some(vec![("codex", canonical(&r.new).join("codex"))]),
+        "claude resolves through the recorded path too"
+    );
+    assert_eq!(r.harness.pending(), None, "the probe writes no record");
+}
+
+#[tokio::test]
+async fn an_agent_both_paths_resolve_is_not_reported() {
+    let r = refreshable().await;
+    for dir in [&r.old, &r.new] {
+        put_agent(dir, "claude");
+        put_agent(dir, "codex");
+    }
+
+    assert_eq!(behind(&r.harness.context), Some(Vec::new()));
+
+    let only_recorded = refreshable().await;
+    put_agent(&only_recorded.old, "claude");
+    assert_eq!(
+        behind(&only_recorded.harness.context),
+        Some(Vec::new()),
+        "a program only the recorded path resolves is not the finding"
+    );
+}
+
+#[tokio::test]
+async fn the_probe_is_silent_without_a_verdict() {
+    let r = refreshable().await;
+    put_agent(&r.new, "claude");
+    let harness = &r.harness;
+
+    let failing = scripted_discovery(
+        &harness.context,
+        &harness.root,
+        "exit 1",
+        pohunek_test_support::wait::HANG_GUARD,
+        &r.old,
+    );
+    assert_eq!(behind(&failing), None, "a failed login shell");
+
+    let unmanaged = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    assert_eq!(behind(&unmanaged), None, "a host that records no path");
+
+    let fresh = Harness::new();
+    assert_eq!(behind(&fresh.context), None, "no installation");
+}
+
+#[tokio::test]
+async fn the_probe_gives_no_verdict_while_a_record_is_pending_or_the_file_is_unreadable() {
+    let r = refreshable().await;
+    put_agent(&r.new, "claude");
+    let harness = &r.harness;
+    assert_eq!(behind(&harness.context).map(|a| a.len()), Some(1));
+
+    interrupt_after(harness, Step::Config).await;
+    assert_eq!(
+        behind(&harness.context),
+        None,
+        "a refresh record is pending"
+    );
+
+    let engine = harness.engine();
+    engine.store.clear().expect("clear the record");
+    let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    std::fs::write(
+        harness.context.config_path(),
+        text.replacen("schema_version = 7", "schema_version = 6", 1),
+    )
+    .expect("write schema 6");
+    assert_eq!(behind(&harness.context), None, "another schema");
+}

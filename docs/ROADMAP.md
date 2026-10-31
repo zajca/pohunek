@@ -198,7 +198,7 @@ ad-hoc signed archives with a Homebrew tap (#481). Open:
   5/9; implementation is on `main`, the manual logout/login and reboot lifetime
   evidence is still missing (open: #186, #187, #189, #194).
 - CLI setup and diagnostics [#102](https://github.com/zajca/pohunek/issues/102)
-  — 2/4 (open: #332, #333; follow-ups #1758, #1761).
+  — 2/4 (open: #332, #333; follow-up #1761).
 - owner WebUI and direct-overlay workflows
   [#103](https://github.com/zajca/pohunek/issues/103) — its only sub-issue is
   closed; the issue is open.

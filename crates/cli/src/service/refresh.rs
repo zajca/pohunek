@@ -17,7 +17,10 @@
 
 // Rust guideline compliant 2026-06-26
 
-use pohunek_platform::shell_env::SearchPath;
+use std::ffi::OsStr;
+use std::path::PathBuf;
+
+use pohunek_platform::shell_env::{resolve_executable, SearchPath};
 use pohunek_service_config::{ConfigError, ServiceConfig, SCHEMA_VERSION};
 
 use super::context::Context;
@@ -116,4 +119,60 @@ pub(crate) fn load_installed_config(context: &Context) -> Result<(ServiceConfig,
         &context.paths().runtime_dir,
     )?;
     Ok((source.config, bytes))
+}
+
+/// The agent programs `pohunek doctor` probes by name.
+pub(crate) const PROBED_AGENTS: [&str; 2] = ["claude", "codex"];
+
+/// An agent program only the login shell's search path resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginPathOnlyAgent {
+    /// The program name.
+    pub(crate) name: &'static str,
+    /// Where the login shell's path finds it.
+    pub(crate) found: PathBuf,
+}
+
+/// The agent programs the login shell's path resolves and the recorded
+/// search path does not.
+///
+/// `None` is no verdict: a host that records no path, no installation or one
+/// `service.toml` cannot describe (including a runtime root that does not exist
+/// yet), a transaction record that is pending (the file and the daemon job may
+/// then disagree), an empty recorded path, or a login shell that fails or
+/// hangs. `Some` lists the programs only the login shell reaches, empty when
+/// every program it reaches resolves through the recorded path too.
+/// Runs the bounded discovery without a lock and contacts no service manager.
+pub(crate) fn agents_behind_recorded_path(context: &Context) -> Option<Vec<LoginPathOnlyAgent>> {
+    if !context.records_search_path() {
+        return None;
+    }
+    let (config, _) = load_installed_config(context).ok()?;
+    if !matches!(
+        super::record::Store::new(context.paths().state_dir.clone()).load(),
+        Ok(None)
+    ) {
+        return None;
+    }
+    if config.search_path().entries().is_empty() {
+        return None;
+    }
+    let discovered = discover(context).ok()?;
+    Some(agents_only_in(
+        config.search_path(),
+        &discovered.search_path,
+    ))
+}
+
+fn agents_only_in(recorded: &SearchPath, login: &SearchPath) -> Vec<LoginPathOnlyAgent> {
+    PROBED_AGENTS
+        .into_iter()
+        .filter_map(|name| {
+            if resolve_executable(OsStr::new(name), recorded).is_ok() {
+                return None;
+            }
+            let found = resolve_executable(OsStr::new(name), login).ok()?;
+            Some(LoginPathOnlyAgent { name, found })
+        })
+        .collect()
 }

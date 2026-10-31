@@ -27,6 +27,7 @@ use crate::client::Client;
 use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
+use crate::service::refresh::LoginPathOnlyAgent;
 use crate::service::report::StatusReport;
 
 // Rust guideline compliant 2026-09-30
@@ -45,6 +46,9 @@ const JOB_FAILED: &str = "failed";
 
 /// Name of the check that reports `service.toml` keys this version does not know.
 const SERVICE_CONFIG_UNKNOWN_KEYS_CHECK: &str = "service_config_unknown_keys";
+
+/// Name of the check that reports agent programs only the login shell's path resolves.
+const LOGIN_PATH_AGENTS_CHECK: &str = "service_search_path_agents";
 
 /// Name of the check that reports shutdown bounds that do not fit the exit timeout.
 const SHUTDOWN_BUDGET_CHECK: &str = "service_config_shutdown_budget";
@@ -119,6 +123,9 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
     checks.extend(working_directory_check(platform, &working_dir));
     checks.extend(service_config_unknown_keys_check(&paths.config_dir));
     checks.extend(shutdown_budget_check(&paths.config_dir));
+    if platform == Platform::MacOs {
+        checks.extend(login_path_agents_check().await);
+    }
     let job_status = if platform == Platform::MacOs {
         Some(crate::service::status().await)
     } else {
@@ -309,6 +316,48 @@ fn service_config_unknown_keys_check(config_dir: &Path) -> Option<DoctorCheck> {
                 "service.toml holds no keys this version does not know",
             ),
         },
+    )
+}
+
+/// Reports agent programs that resolve through the login shell's search path
+/// but not through the one `service.toml` records.
+///
+/// The probe runs the bounded login-shell discovery without a transaction lock,
+/// on a blocking thread; doctor waits for it (at most the login-shell timeout)
+/// before it probes the daemon. Nothing is reported on a host that records no
+/// path, without a verifiable installation, while a transaction record is
+/// pending, and when the login shell fails or hangs; `pohunek service
+/// refresh-path --dry-run` reports the discovery failures.
+async fn login_path_agents_check() -> Option<DoctorCheck> {
+    let agents = tokio::task::spawn_blocking(|| {
+        let context = crate::service::Context::resolve().ok()?;
+        crate::service::refresh::agents_behind_recorded_path(&context)
+    })
+    .await
+    .ok()??;
+    Some(login_path_agents_verdict(&agents))
+}
+
+/// The check for the agent programs only the login shell's path resolves.
+fn login_path_agents_verdict(agents: &[LoginPathOnlyAgent]) -> DoctorCheck {
+    if agents.is_empty() {
+        return DoctorCheck::new(
+            LOGIN_PATH_AGENTS_CHECK,
+            Status::Ok,
+            "every agent program your login shell resolves also resolves through the search path recorded in service.toml",
+        );
+    }
+    let found = agents
+        .iter()
+        .map(|agent| format!("{} ({})", agent.name, agent.found.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    DoctorCheck::new(
+        LOGIN_PATH_AGENTS_CHECK,
+        Status::Warn,
+        format!(
+            "{found} resolves only through your login shell's search path, not the one recorded in service.toml, so the daemon does not find it (unless an agent profile sets an absolute 'program'); compare with 'pohunek service refresh-path --dry-run', then record the current path with 'pohunek service refresh-path' (it restarts the daemon with that path)"
+        ),
     )
 }
 
@@ -583,6 +632,26 @@ fn print_human(report: &Report) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_login_path_agents_check_names_the_programs_and_the_dry_run() {
+        let ok = login_path_agents_verdict(&[]);
+        assert_eq!(ok.status, Status::Ok);
+
+        let warn = login_path_agents_verdict(&[LoginPathOnlyAgent {
+            name: "claude",
+            found: PathBuf::from("/nix/profile/bin/claude"),
+        }]);
+        assert_eq!(warn.status, Status::Warn);
+        assert!(
+            warn.detail.contains("claude (/nix/profile/bin/claude)")
+                && warn
+                    .detail
+                    .contains("pohunek service refresh-path --dry-run"),
+            "{}",
+            warn.detail
+        );
+    }
+
     use super::*;
 
     /// A private fixture directory guard and a not-yet-created child path of
