@@ -633,9 +633,12 @@ keeps the host's grace (`screen_idle` and `manifest_idle`) or the 500 ms
 silent-reader bound.
 
 The `[input]` table may also declare `refuse_while_blocked = true`
-(`requires = ["input-refuse-while-blocked-v1"]`). `session.input` then fails
-with `session_input_blocked` while the session reads `blocked`, and the error's
-hint names `session.attach` as the way to answer the dialog. Declare it for a
+(`requires = ["input-refuse-while-blocked-v1"]`). Fire-and-forget
+`session.input` then fails with `session_input_blocked` while the session reads
+`blocked`, and the error's hint names `session.attach` as the way to answer the
+dialog (input with `wait` is refused for every runtime with
+`session_agent_blocked`). A runtime with `text_policy = "hermes_safe_text"`
+always refuses; `refuse_while_blocked = false` does not lift that. Declare it for a
 runtime whose `blocked` rules are dialog-exact and whose dialogs take the place
 of its prompt, so plain text cannot answer a dialog the operator never saw. The
 Pi package does; Claude and Codex keep delivering text while `blocked`, because

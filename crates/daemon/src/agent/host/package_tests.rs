@@ -1071,6 +1071,18 @@ fn a_recovered_safe_text_runtime_keeps_its_input_safety_when_its_package_fails_v
     let standalone = refusing.to_standalone_rules();
     assert!(!standalone.is_restricted());
     assert!(standalone.refuses_while_blocked());
+
+    // A snapshot written before `refuse_while_blocked` existed keeps the
+    // refusal of the safe-text contract it recorded.
+    let legacy_safe_text = crate::store::StoredInputRules {
+        bracketed_paste: true,
+        submit_delay_ms: 5,
+        restricted: true,
+        refuse_while_blocked: false,
+    };
+    assert!(legacy_safe_text
+        .to_standalone_rules()
+        .refuses_while_blocked());
 }
 
 /// The fixture descriptor of runtime `acme` with an `[integration]` table.

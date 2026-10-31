@@ -1434,9 +1434,10 @@ resume command: `bracketed_paste`, `submit_delay_ms`, `text_policy`
 (`unrestricted` or `hermes_safe_text`), the optional
 `submit_delay_configurable`, which lets a submit delay configured on the daemon
 for that runtime replace the declared one, the optional `refuse_while_blocked`
-(feature `input-refuse-while-blocked-v1`), which makes `session.input` fail with
+(feature `input-refuse-while-blocked-v1`), which makes fire-and-forget `session.input` fail with
 `session_input_blocked` and a hint to `session.attach` while the session reads
-`blocked` (the Pi package sets it: its dialogs replace the editor, so plain text
+`blocked` (input with `wait` is refused for every runtime with
+`session_agent_blocked`) (the Pi package sets it: its dialogs replace the editor, so plain text
 could answer one the operator never saw; Claude and Codex do not, because their
 `blocked` rules include text matches that are not dialog-exact), the optional `ready`
 (`bracketed_paste`, `screen_idle` or `manifest_idle`) that says which signal
