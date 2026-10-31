@@ -36,6 +36,10 @@ use crate::paths::Paths;
 use crate::target::Target;
 
 const IO_BUFFER_BYTES: usize = 8192;
+/// Terminal input queued for an attach stream whose program does not read. The
+/// loop reads no further stdin beyond it, so a detach shortcut typed behind
+/// more than this many unread bytes is seen only once the stream takes input.
+const PENDING_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
 /// Maximum ambiguity delay for a split terminal shortcut sequence.
 ///
 /// Physical stdin is local, so bytes from one key report normally arrive in a
@@ -397,22 +401,24 @@ struct MenuEffectContext<'a> {
 /// Terminal input routed to the attach stream and not yet written to it.
 ///
 /// The attach loop writes it from an arm of its own, so the daemon's output
-/// keeps being shown while a paste waits for the program to read it, and it
-/// reads stdin again only once the queue is empty.
+/// keeps being shown while a paste waits for the program to read it. It keeps
+/// reading stdin while the queue holds fewer than [`PENDING_STDIN_LIMIT_BYTES`],
+/// so a detach shortcut typed behind an unread paste is seen; the detach drops
+/// what the stream did not take.
 #[derive(Debug, Default)]
 struct PendingStreamInput {
     bytes: Vec<u8>,
     /// Stdin ended: the stream's write half shuts down once `bytes` is written.
     closing: bool,
-    /// The detach shortcut was typed: the detach request is sent once `bytes`
-    /// is written.
+    /// The detach shortcut was typed: the loop writes what the stream takes
+    /// without waiting, drops the rest and sends the detach request.
     detaching: bool,
 }
 
 impl PendingStreamInput {
     /// Whether the attach loop reads the next terminal input.
     fn accepts_stdin(&self) -> bool {
-        self.bytes.is_empty() && !self.closing && !self.detaching
+        self.bytes.len() < PENDING_STDIN_LIMIT_BYTES && !self.closing && !self.detaching
     }
 
     /// Drops the `written` bytes the attach stream took from the queue.
@@ -1061,6 +1067,30 @@ where
     stdout.queued() < OUTPUT_QUEUE_BYTES || !modal.is_some_and(|modal| modal.active)
 }
 
+/// Writes as much of `queue` to `stream` as it takes without waiting and leaves
+/// the rest in the queue.
+async fn write_available<W>(stream: &mut W, queue: &mut Vec<u8>) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    std::future::poll_fn(|cx| {
+        while !queue.is_empty() {
+            match std::pin::Pin::new(&mut *stream).poll_write(cx, queue) {
+                std::task::Poll::Pending => break,
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+                }
+                std::task::Poll::Ready(Ok(written)) => {
+                    queue.drain(..written);
+                }
+                std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Err(error)),
+            }
+        }
+        std::task::Poll::Ready(Ok(()))
+    })
+    .await
+}
+
 /// Writes the queued output before the terminal leaves raw mode, so it is not
 /// processed by the restored line discipline. A write error surfaces on the
 /// next write.
@@ -1686,8 +1716,8 @@ where
         }
         match shortcut {
             Shortcut::Detach => {
-                // The attach loop writes the input typed before the shortcut
-                // to the stream, showing output meanwhile, and then sends the
+                // The attach loop writes what the stream takes of the input
+                // typed before the shortcut, drops the rest and sends the
                 // detach request.
                 ctx.stream_input.detaching = true;
                 return Ok(None);
@@ -1851,10 +1881,25 @@ where
     let mut stream_input = PendingStreamInput::default();
     let outcome: Result<AttachStreamEnd, CliError> = async {
         loop {
-            if stream_input.detaching && stream_input.bytes.is_empty() {
-                socket_write.flush().await?;
+            if stream_input.detaching {
+                // The detach does not wait for a program that does not read:
+                // the stream takes what it can at once and the rest is dropped.
+                let delivery = write_available(&mut socket_write, &mut stream_input.bytes).await;
+                let dropped = std::mem::take(&mut stream_input.bytes).len();
                 flush_output_before_restore(&mut stdout).await;
-                return Ok(detach_stream(&mut client, &stream_id, &mut terminal).await);
+                // A stream that could not take all the input ends detached
+                // unless the daemon reports a stream failure.
+                let end = if delivery.is_err() || dropped > 0 {
+                    detach_ended_stream(&mut client, &stream_id, &mut terminal).await?
+                } else {
+                    detach_stream(&mut client, &stream_id, &mut terminal).await
+                };
+                if dropped > 0 {
+                    eprintln!(
+                        "[pohunek] detached; {dropped} bytes of typed input were not delivered to the program"
+                    );
+                }
+                return Ok(end);
             }
             if stream_input.closing && stream_input.bytes.is_empty() {
                 socket_write.shutdown().await?;
@@ -1865,16 +1910,7 @@ where
                     let taken = written
                         .map_err(CliError::Io)
                         .and_then(|written| stream_input.take_written(written));
-                    if let Err(error) = taken {
-                        // A stream that can no longer take the input typed
-                        // ahead of the detach shortcut ends detached unless
-                        // the daemon reports a stream failure.
-                        if stream_input.detaching {
-                            flush_output_before_restore(&mut stdout).await;
-                            return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
-                        }
-                        return Err(error);
-                    }
+                    taken?;
                 }
                 drained = stdout.drain(), if stdout.queued() > 0 => {
                     drained?;
@@ -1885,13 +1921,6 @@ where
                     if let Some(end) =
                         handle_socket_read(input, &mut stdout, &mut modal, &mut menu, args).await?
                     {
-                        // A stream that ends before the input typed ahead of
-                        // the detach shortcut is written ends detached unless
-                        // the daemon reports a stream failure.
-                        if end == AttachStreamEnd::StreamClosed && stream_input.detaching {
-                            flush_output_before_restore(&mut stdout).await;
-                            return detach_ended_stream(&mut client, &stream_id, &mut terminal).await;
-                        }
                         return Ok(end);
                     }
                 }
@@ -2973,30 +3002,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_detach_after_unread_input_keeps_showing_output_until_the_input_is_written() {
+    async fn a_detach_after_unread_input_delivers_what_the_stream_took_and_drops_the_rest() {
         let (stream, mut daemon_end) = tokio::io::duplex(STREAM_BUFFER_BYTES);
-        // The daemon writes output larger than the stream holds before it
-        // reads any input, as it does while the program does not read.
-        let daemon = tokio::spawn(async move {
-            daemon_end
-                .write_all(&vec![b'y'; STREAM_OUTPUT_BYTES])
-                .await
-                .expect("write the stream output");
-            let mut input = Vec::new();
-            daemon_end
-                .read_to_end(&mut input)
-                .await
-                .expect("read the client's input");
-            input
-        });
 
         let end = attach_until_detached(stream, None).await;
 
         assert!(matches!(end, Ok(AttachStreamEnd::Detached)), "{end:?}");
-        let input = guard("the daemon reads the typed input", daemon)
+        // The program reads nothing while the client detaches. What the
+        // stream took arrives in order; the remainder is dropped.
+        let mut delivered = Vec::new();
+        daemon_end
+            .read_to_end(&mut delivered)
             .await
-            .expect("stream test daemon");
-        assert_eq!(input, typed_input_and_detach().0);
+            .expect("read the client's input");
+        let typed = typed_input_and_detach().0;
+        assert_eq!(delivered.len(), STREAM_BUFFER_BYTES);
+        assert_eq!(delivered, typed[..STREAM_BUFFER_BYTES]);
     }
 
     /// Terminal bytes shared between a gated terminal and the test.

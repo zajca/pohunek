@@ -1326,7 +1326,18 @@ Workers negotiated below private protocol v3 cannot guarantee that ordering;
 the daemon returns `attach_snapshot_unsupported`, and the session must be
 restarted on an upgraded worker or forked into a new session.
 Interactive attach input is ordered by a stream-scoped sequence and does not
-consume the worker's bounded control-input deduplication capacity. A typed
+consume the worker's bounded control-input deduplication capacity. The worker
+acknowledges each attach input frame on the private stream, but no daemon or
+public client relies on that acknowledgement: the raw public stream carries
+none, and the daemon ignores it. Once the program has exited, the stream can
+therefore end without the acknowledgement of a frame the terminal accepted; the
+public contract is that an attach input write is not acknowledged. While a
+paste waits for a program that does not read, the daemon's attach bridge ends
+when the client closes a Unix socket connection completely (a hangup of the
+connection, not an end of the client's input), and the CLI client reads up to
+1 MiB of typed input ahead so a detach shortcut typed behind the paste is seen;
+the detach delivers what the stream took and drops the rest, reporting the
+dropped byte count. A typed
 worker stream failure is retained by the daemon for the attaching CLI, which
 surfaces it instead of repeatedly treating it as an ordinary reconnect.
 

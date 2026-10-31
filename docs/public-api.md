@@ -4900,6 +4900,19 @@ Attach stream rules:
 - On the WebSocket relay transport, the attach prelude is
   sent as the first bytes on the `/daemon/<host>/attach` binary WebSocket. After
   redemption, every binary frame remains opaque PTY data.
+- The raw stream carries no acknowledgement of the input a client writes. A
+  client that needs to know the program read its input observes the terminal
+  output or the session activity instead.
+- While the program does not read the client's input, the daemon keeps the
+  attach until the client closes the connection and the daemon can see it. On
+  a Unix socket the daemon sees a connection that was closed completely, also
+  while a paste waits for the program; a client that only shut down its write
+  half (a piped stdin that ended) keeps the attach and its pending input is
+  delivered. On a TCP connection (a remote host or the relay) the daemon sees
+  a client's close only when it reads or writes the connection, so a client
+  that disconnects while the program neither reads input nor writes output
+  keeps the attach until the program reads, the session stops or the lease is
+  released.
 
 Rust SDK helpers:
 

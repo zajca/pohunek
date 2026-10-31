@@ -23,7 +23,10 @@
 //! prelude, then the connection switches from newline JSON to raw PTY bytes.
 
 mod handler;
+mod hangup;
 mod keepalive;
+
+use self::hangup::{ClientTransport, HangupWatch};
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -580,7 +583,7 @@ const CANCEL_ON_HANGUP: &[&str] = &[
 /// and is consumed there until the client disconnects.
 async fn serve_connection<S>(stream: S, state: DaemonState) -> Result<(), io::Error>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + ClientTransport + Unpin + Send,
 {
     let codec = LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
@@ -658,7 +661,8 @@ where
                 return Ok(());
             }
             Dispatch::Attach(stream_id) => {
-                run_attach_connection(framed, state.sessions.clone(), stream_id).await?;
+                let hangup = framed.get_ref().hangup_watch();
+                run_attach_connection(framed, state.sessions.clone(), stream_id, hangup).await?;
                 return Ok(());
             }
         }
@@ -816,6 +820,7 @@ async fn run_attach_connection<S>(
     mut framed: Framed<S, LinesCodec>,
     registry: SessionRegistry,
     stream_id: String,
+    hangup: Option<HangupWatch>,
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -839,11 +844,15 @@ where
     let parts = framed.into_parts();
     let mut stream = parts.io;
     let submitted = attach.session_id.clone();
-    let bridge_result =
-        run_attach_bridge(&mut stream, &mut attach, parts.read_buf.to_vec(), &|| {
+    let bridge_result = run_attach_bridge(
+        &mut stream,
+        &mut attach,
+        (parts.read_buf.to_vec(), hangup),
+        &|| {
             registry.note_input(&submitted);
-        })
-        .await;
+        },
+    )
+    .await;
     let failure = bridge_result
         .as_ref()
         .err()
@@ -855,7 +864,7 @@ where
 async fn run_attach_bridge<S>(
     stream: &mut S,
     attach: &mut RedeemedAttach,
-    initial_input: Vec<u8>,
+    (initial_input, hangup): (Vec<u8>, Option<HangupWatch>),
     on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
@@ -870,10 +879,13 @@ where
                 stream,
                 &attach_stream_id,
                 &session_id,
-                &cancel,
+                AttachControl {
+                    cancel: &cancel,
+                    on_submit,
+                    hangup,
+                },
                 data,
                 initial_input,
-                on_submit,
             )
             .await
         }
@@ -884,10 +896,9 @@ async fn run_worker_attach_bridge<S>(
     stream: &mut S,
     attach_stream_id: &str,
     session_id: &protocol::SessionId,
-    cancel: &tokio_util::sync::CancellationToken,
+    control: AttachControl<'_>,
     data: &mut crate::runtime::DataStream,
     initial_input: Vec<u8>,
-    on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -903,7 +914,7 @@ where
         &identity,
         attach_stream_id,
         session_id,
-        &AttachControl { cancel, on_submit },
+        control,
         initial_input,
     )
     .await
@@ -913,6 +924,9 @@ where
 struct AttachControl<'a> {
     cancel: &'a tokio_util::sync::CancellationToken,
     on_submit: &'a (dyn Fn() + Sync),
+    /// Resolves when the client closed its connection completely; absent for
+    /// transports that report a peer's close only through reads and writes.
+    hangup: Option<HangupWatch>,
 }
 
 /// Frame identity every frame of one worker attach stream carries.
@@ -944,7 +958,7 @@ async fn bridge_worker_frames<S, W>(
     identity: &WorkerFrameIdentity,
     attach_stream_id: &str,
     session_id: &protocol::SessionId,
-    control: &AttachControl<'_>,
+    mut control: AttachControl<'_>,
     initial_input: Vec<u8>,
 ) -> Result<(), AttachBridgeError>
 where
@@ -1062,6 +1076,12 @@ where
                     input[..count].to_vec(),
                 )));
             }
+            () = async {
+                match control.hangup.as_mut() {
+                    Some(hangup) => hangup.closed().await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_send.is_some() => break,
             () = control.cancel.cancelled() => break,
         }
     }
@@ -1568,10 +1588,13 @@ mod tests {
             &mut public_stream,
             "a-typed-error",
             &protocol::SessionId("s-typed-error".to_owned()),
-            &CancellationToken::new(),
+            AttachControl {
+                cancel: &CancellationToken::new(),
+                on_submit: &|| {},
+                hangup: None,
+            },
             &mut data,
             Vec::new(),
-            &|| {},
         )
         .await
         .expect_err("worker error frame must fail the raw bridge");
@@ -1601,10 +1624,13 @@ mod tests {
             &mut public_stream,
             "a-frame-error",
             &protocol::SessionId("s-frame-error".to_owned()),
-            &CancellationToken::new(),
+            AttachControl {
+                cancel: &CancellationToken::new(),
+                on_submit: &|| {},
+                hangup: None,
+            },
             &mut data,
             Vec::new(),
-            &|| {},
         )
         .await
         .expect_err("partial worker frame must fail the raw bridge");
@@ -1687,9 +1713,10 @@ mod tests {
                 &identity,
                 "a-partial",
                 &protocol::SessionId("s-partial".to_owned()),
-                &AttachControl {
+                AttachControl {
                     cancel: &CancellationToken::new(),
                     on_submit: &|| {},
+                    hangup: None,
                 },
                 Vec::new(),
             )
@@ -1767,11 +1794,12 @@ mod tests {
                     &identity,
                     "a-submit",
                     &protocol::SessionId("s-submit".to_owned()),
-                    &AttachControl {
+                    AttachControl {
                         cancel: &CancellationToken::new(),
                         on_submit: &|| {
                             submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         },
+                        hangup: None,
                     },
                     Vec::new(),
                 )
@@ -1847,10 +1875,13 @@ mod tests {
             &mut public_stream,
             "a-replay",
             &protocol::SessionId("s-replay".to_owned()),
-            &CancellationToken::new(),
+            AttachControl {
+                cancel: &CancellationToken::new(),
+                on_submit: &|| {},
+                hangup: None,
+            },
             &mut data,
             Vec::new(),
-            &|| {},
         )
         .await
         .expect_err("fresh attach must reject retained history replay");

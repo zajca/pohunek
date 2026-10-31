@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Condvar, Mutex};
 use std::thread;
 
 use pohunek_test_support::env::TestEnv;
@@ -65,6 +65,14 @@ const PIPE_FILL_CHUNK_BYTES: usize = 1024;
 #[cfg(not(target_os = "linux"))]
 const PIPE_GROWTH_PROBE_BYTES: usize = 256 * 1024;
 
+/// Bytes pasted before the detach shortcut: more than the sockets between the
+/// client and the stream hold, less than the client's input queue limit.
+const UNREAD_PASTE_BYTES: usize = 768 * 1024;
+
+/// Opened by the test once the client has exited; the stream reads no input
+/// before.
+static INPUT_GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
 /// Mode of the runtime directory the client expects to be owner-private.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
@@ -86,6 +94,8 @@ enum StreamBehavior {
     OutputThenInput,
     /// Floods output until the client goes away while it reads input.
     FloodWhileReading,
+    /// Reads no input until `INPUT_GATE` opens, then reads it to its end.
+    HoldInput,
 }
 
 /// Kills the CLI if the scenario fails before it exits.
@@ -134,6 +144,7 @@ fn an_attach_client_keeps_showing_output_while_its_paste_is_not_read() {
     let paste = line.repeat(PASTE_BYTES / PASTE_LINE_BYTES);
     let pasting = thread::spawn(move || {
         stdin.write_all(&paste).expect("write the paste");
+        stdin
     });
     let (shown, shown_rx) = mpsc::channel();
     let reading = thread::spawn(move || {
@@ -170,12 +181,14 @@ fn an_attach_client_keeps_showing_output_while_its_paste_is_not_read() {
     shown_rx
         .recv_timeout(HANG_GUARD)
         .expect("the client shows the stream's output");
+    // Stdin stays open until the output was shown, so the client does not end
+    // before it.
+    drop(pasting.join().expect("paste thread"));
     assert_eq!(
         observed.recv_timeout(HANG_GUARD),
         Ok(StreamEvent::InputReceived(PASTE_BYTES)),
         "the whole paste reaches the stream once it is read"
     );
-    pasting.join().expect("paste thread");
     let status = cli.0.wait().expect("wait for pohunek attach");
     reading.join().expect("output thread");
     let mut errors = String::new();
@@ -317,6 +330,76 @@ fn an_attach_client_detaches_while_the_terminal_reads_no_output() {
     drop(attach.stdout);
 }
 
+#[test]
+fn an_attach_client_detaches_past_an_unread_paste_and_reports_what_it_dropped() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(
+            root.join(directory),
+            fs::Permissions::from_mode(PRIVATE_DIR_MODE),
+        )
+        .expect("make the directory owner-private");
+    }
+    let socket = root.join("run/pohunek/daemon.sock");
+    let (events, observed) = mpsc::channel();
+    serve_fixture_daemon(&socket, events, StreamBehavior::HoldInput);
+
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command
+        .args(["attach", SESSION_ID])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut cli = CliProcess(command.spawn().expect("spawn pohunek attach"));
+    let mut stdin = cli.0.stdin.take().expect("piped stdin");
+    let mut stdout = cli.0.stdout.take().expect("piped stdout");
+    let mut stderr = cli.0.stderr.take().expect("piped stderr");
+    let showing = thread::spawn(move || {
+        let _count = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+
+    // The stream reads none of the paste, then the detach shortcut follows it.
+    let mut typed = vec![b'x'; UNREAD_PASTE_BYTES];
+    typed.push(DETACH_BYTE);
+    let typing = thread::spawn(move || {
+        let _written = stdin.write_all(&typed);
+        stdin
+    });
+    let status = poll_until("the attach client to detach", || {
+        cli.0.try_wait().expect("poll the attach client")
+    });
+    assert!(status.success(), "the detach ends the attach: {status}");
+    showing.join().expect("output thread");
+    drop(typing.join().expect("typing thread"));
+
+    let (opened, wake) = &INPUT_GATE;
+    *opened.lock().expect("input gate") = true;
+    wake.notify_all();
+    let Ok(StreamEvent::InputReceived(delivered)) = observed.recv_timeout(HANG_GUARD) else {
+        panic!("the stream reports the input it received");
+    };
+    let mut errors = String::new();
+    stderr
+        .read_to_string(&mut errors)
+        .expect("read the CLI errors");
+    let dropped: usize = errors
+        .split("detached; ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("the client reports the dropped bytes: {errors:?}"));
+    assert!(dropped > 0, "{errors:?}");
+    assert_eq!(
+        delivered + dropped,
+        UNREAD_PASTE_BYTES,
+        "every pasted byte was delivered in order or reported as dropped"
+    );
+}
+
 /// Serves `session.attach` on `socket` and one raw attach stream that behaves
 /// as `behavior` says, reporting what it observes to `events`.
 fn serve_fixture_daemon(
@@ -351,6 +434,7 @@ fn serve_connection(
             match behavior {
                 StreamBehavior::OutputThenInput => serve_attach_stream(reader, events),
                 StreamBehavior::FloodWhileReading => serve_flooding_attach_stream(reader, events),
+                StreamBehavior::HoldInput => serve_input_holding_attach_stream(reader, events),
             }
             return;
         }
@@ -423,4 +507,25 @@ fn serve_flooding_attach_stream(reader: BufReader<UnixStream>, events: &mpsc::Se
             let _sent = events.send(StreamEvent::KeystrokeReceived);
         }
     }
+}
+
+/// Holds the stream's input unread until `INPUT_GATE` opens, then reports how
+/// many bytes the client had delivered.
+fn serve_input_holding_attach_stream(
+    reader: BufReader<UnixStream>,
+    events: &mpsc::Sender<StreamEvent>,
+) {
+    let mut input = reader.buffer().to_vec();
+    let mut stream = reader.into_inner();
+    {
+        let (opened, wake) = &INPUT_GATE;
+        let mut open = opened.lock().expect("input gate");
+        while !*open {
+            open = wake.wait(open).expect("input gate");
+        }
+    }
+    stream
+        .read_to_end(&mut input)
+        .expect("read the client's input");
+    let _sent = events.send(StreamEvent::InputReceived(input.len()));
 }

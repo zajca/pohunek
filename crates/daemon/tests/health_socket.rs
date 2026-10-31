@@ -5893,6 +5893,61 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
     let _ = handle.await;
 }
 
+/// Bytes per write while the test fills the sockets with a paste.
+const UNREAD_PASTE_CHUNK_BYTES: usize = 64 * 1024;
+
+#[tokio::test]
+async fn closing_the_attach_connection_releases_the_bridge_while_its_input_waits_for_the_program() {
+    // The program neither reads its input nor writes output (the terminal does
+    // not echo it either), so a paste leaves the bridge's send to the worker
+    // pending and the bridge reads its client no more. Only the connection's
+    // hangup shows that the client is gone.
+    let socket = temp_socket("attach-hangup-pending-send");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "stty -echo; exec sleep 600"]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = subscribe_events(&socket).await;
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control, &socket).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let raw = open_attach_stream(&socket, &attach.stream_id).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &attach.stream_id).await;
+
+    // Whole lines: the terminal queues them for the program and, once its queue
+    // is full, stops taking input instead of discarding it. A write that would
+    // block then means every buffer toward the program is full, which only
+    // happens while the bridge's send waits.
+    let chunk = b"paste line that the program never reads\n".repeat(UNREAD_PASTE_CHUNK_BYTES / 40);
+    wait::guard("the paste to fill every buffer", async {
+        loop {
+            raw.writable().await.expect("wait for the raw stream");
+            match raw.try_write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("paste into the raw stream: {error}"),
+            }
+        }
+    })
+    .await;
+
+    drop(raw);
+    wait_for_attach_event(&mut subscriber, event::ATTACH_CLOSED, &attach.stream_id).await;
+
+    let stop_req = Request::make(
+        "attach-hangup-pending-send-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
     // Closing an attach window kills `pohunek attach`, which drops the attach
