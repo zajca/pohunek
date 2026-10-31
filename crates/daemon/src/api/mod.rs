@@ -971,7 +971,16 @@ where
     let mut pending_output: Option<PendingClientWrite<'_, S>> = None;
     let mut worker_write = Some(worker_write);
     let mut write_sequence = 1_u64;
+    // The id of the last input frame handed to the worker, and whether the
+    // worker has acknowledged it. Once the client finished its input, the
+    // acknowledgement of that frame ends the stream.
+    let mut last_input_id: Option<WriteId> = None;
+    let mut last_input_acked = false;
+    let mut input_ended = false;
     if !initial_input.is_empty() {
+        last_input_id = Some(
+            attach_write_id(identity, write_sequence).map_err(AttachBridgeError::worker_stream)?,
+        );
         let writer = worker_write.as_mut().expect("the worker writer is idle");
         send_worker_attach_input(
             writer,
@@ -990,6 +999,9 @@ where
     tokio::pin!(next_frame);
 
     loop {
+        if input_ended && pending_send.is_none() && (last_input_id.is_none() || last_input_acked) {
+            break;
+        }
         tokio::select! {
             (worker_read, frame) = &mut next_frame, if pending_output.is_none() => {
                 next_frame.set(read_owned_frame(worker_read));
@@ -1028,7 +1040,11 @@ where
                         pending_output = Some(Box::pin(write_owned_client_output(writer, payload)));
                     }
                     FrameKind::Gap { .. } => snapshot_started = false,
-                    FrameKind::InputAck { .. } => {}
+                    FrameKind::InputAck { write_id, .. } => {
+                        if last_input_id.as_ref() == Some(&write_id) {
+                            last_input_acked = true;
+                        }
+                    }
                     FrameKind::Exit { .. } | FrameKind::Close { .. } => break,
                     FrameKind::Error { error } => {
                         warn!(
@@ -1063,11 +1079,19 @@ where
                 sent.map_err(AttachBridgeError::worker_stream)?;
                 write_sequence = next_attach_sequence(write_sequence)?;
             }
-            read = client_read.read(&mut input), if pending_send.is_none() => {
+            read = client_read.read(&mut input), if pending_send.is_none() && !input_ended => {
                 let count = read.map_err(AttachBridgeError::client_io)?;
                 if count == 0 {
-                    break;
+                    // The client finished its input: output keeps flowing
+                    // until the worker acknowledged the last frame.
+                    input_ended = true;
+                    continue;
                 }
+                last_input_id = Some(
+                    attach_write_id(identity, write_sequence)
+                        .map_err(AttachBridgeError::worker_stream)?,
+                );
+                last_input_acked = false;
                 let writer = worker_write.take().expect("the worker writer is idle");
                 pending_send = Some(Box::pin(send_owned_attach_input(
                     writer,
@@ -1081,7 +1105,7 @@ where
                     Some(hangup) => hangup.closed().await,
                     None => std::future::pending().await,
                 }
-            }, if pending_send.is_some() => break,
+            }, if pending_send.is_some() || input_ended => break,
             () = control.cancel.cancelled() => break,
         }
     }
@@ -1227,6 +1251,11 @@ where
     (writer, sent)
 }
 
+fn attach_write_id(identity: &WorkerFrameIdentity, sequence: u64) -> Result<WriteId, io::Error> {
+    WriteId::new(format!("attach-{}-{sequence}", identity.stream_id))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
 async fn send_worker_attach_input<W>(
     writer: &mut W,
     identity: &WorkerFrameIdentity,
@@ -1242,8 +1271,7 @@ where
     // concurrent attach to the same session reuses `attach-1` with different
     // content, and the worker's per-runtime input dedup rejects it as a reused
     // write id with conflicting content, closing the stream.
-    let write_id = WriteId::new(format!("attach-{}-{sequence}", identity.stream_id))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let write_id = attach_write_id(identity, sequence)?;
     let frame = DataFrame::new(
         FrameHeader {
             version: identity.version,
