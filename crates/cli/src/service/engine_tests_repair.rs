@@ -649,3 +649,40 @@ async fn a_worker_in_a_set_aside_directory_is_unattributed_for_the_rollback() {
         "{error}"
     );
 }
+
+/// A resume past the daemon replacement only runs its remaining steps, so the
+/// daemon keeps running from the moved entry; the report says so and a second
+/// repair from the release restarts it.
+#[tokio::test]
+async fn a_resume_past_the_replacement_keeps_the_daemon_until_a_second_repair() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut interrupted = harness.engine();
+    interrupted.interrupt_after = Some(Step::Registered);
+    interrupted
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the replacement");
+    refuse(&harness, V2);
+    let starts = harness.fake.world().restarts;
+
+    let report = repair_with(&harness, harness.engine(), V2)
+        .await
+        .expect("resume with the repair");
+
+    let repair = report.repair.expect("the repair block");
+    assert!(repair.set_aside.is_some());
+    assert_eq!(repair.daemon, "kept");
+    assert_eq!(harness.pending(), None);
+    assert_eq!(
+        harness.fake.world().restarts,
+        starts,
+        "the resume did not restart the daemon"
+    );
+
+    let second = repair_with(&harness, harness.engine(), V2)
+        .await
+        .expect("second repair");
+    assert_eq!(second.repair.expect("repair").daemon, "restarted");
+    assert_eq!(harness.fake.world().restarts, starts + 1);
+}

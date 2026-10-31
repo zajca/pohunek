@@ -59,7 +59,9 @@ pub struct RepairReport {
     /// delete; `null` when none existed.
     pub set_aside: Option<PathBuf>,
     /// What happened to the daemon job: `none`, `installed` (the job was
-    /// missing), `started` (it was stopped) or `restarted` (it was running).
+    /// missing), `started` (it was stopped), `restarted` (it was running) or
+    /// `kept` (a resumed transaction had already replaced the daemon, which
+    /// still runs from the entry that was moved aside).
     pub daemon: &'static str,
 }
 

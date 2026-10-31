@@ -643,7 +643,9 @@ pub const SET_ASIDE_SUFFIX_CHARS: usize = 16;
 /// relation is read from the two paths alone, so it proves nothing about the
 /// moved tree and executes nothing from it: both paths must be the same
 /// absolute path except for one component, the version directory and its
-/// renamed entry, and exactly one component (the binary) follows it.
+/// renamed entry, and the one component below it is the daemon or worker
+/// binary ([`DAEMON_EXECUTABLE_NAME`], [`WORKER_EXECUTABLE_NAME`]); no other
+/// image is accepted.
 #[must_use]
 pub fn is_set_aside_copy(original: &Path, live: &Path) -> bool {
     let (mut original, mut live) = (original.components(), live.components());
@@ -668,6 +670,10 @@ pub fn is_set_aside_copy(original: &Path, live: &Path) -> bool {
                 return suffix.len() == SET_ASIDE_SUFFIX_CHARS
                     && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
                     && original.clone().count() == 1
+                    && original.clone().all(|name| {
+                        name.as_os_str() == DAEMON_EXECUTABLE_NAME
+                            || name.as_os_str() == WORKER_EXECUTABLE_NAME
+                    })
                     && original.eq(live);
             }
             _ => return false,

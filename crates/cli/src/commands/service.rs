@@ -364,6 +364,9 @@ fn render_repair(text: &mut String, repair: &report::RepairReport) {
         "installed" => "the daemon job was missing and was registered again",
         "started" => "the daemon job was stopped and was started",
         "restarted" => "the daemon was restarted; worker jobs keep running",
+        "kept" => {
+            "the resumed transaction had already replaced the daemon, which still runs from the moved entry: once the record is cleared, rerun `pohunek service upgrade --repair --from <release of this version>` to restart it behind the adoption gate"
+        }
         _ => "the daemon job was not touched",
     };
     let _ = writeln!(text, "           {daemon}");
@@ -1877,6 +1880,27 @@ mod tests {
             "{untouched}"
         );
         assert!(!untouched.contains("unchanged"), "{untouched}");
+    }
+
+    #[test]
+    fn a_kept_daemon_names_the_second_repair() {
+        let mut text = String::new();
+        render_repair(
+            &mut text,
+            &report::RepairReport {
+                version: "1.0.0".to_owned(),
+                restored: true,
+                set_aside: None,
+                daemon: "kept",
+            },
+        );
+        assert!(
+            text.contains("still runs from the moved entry")
+                && text.contains(
+                    "`pohunek service upgrade --repair --from <release of this version>`"
+                ),
+            "{text}"
+        );
     }
 
     #[test]

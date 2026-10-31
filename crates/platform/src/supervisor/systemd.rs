@@ -2427,6 +2427,22 @@ mod tests {
                 "{other}"
             );
         }
+        // Only the daemon and worker images are accepted: another binary in
+        // the same layout is a different unit's image.
+        let plugin = versions.join("1.0.0/plugin-tool");
+        std::fs::write(&plugin, b"").expect("plugin image");
+        let plugin_facts = DefinitionFacts {
+            executable: plugin.clone(),
+            arguments: Vec::new(),
+        };
+        let moved_plugin = LiveCommand {
+            executable: versions.join(".pohunek_refused-1.0.0-0123456789abcdef/plugin-tool"),
+            cmdline: vec![plugin.to_string_lossy().into_owned()],
+        };
+        assert!(matches!(
+            verify_live_command(&plugin_facts, &moved_plugin, "active"),
+            Err(Error::InvalidData { .. })
+        ));
     }
 
     #[test]

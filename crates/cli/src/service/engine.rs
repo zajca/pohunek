@@ -595,6 +595,9 @@ impl<'a> Engine<'a> {
         let namespace = config.namespace();
         let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();
+        let daemon_replaced = resume
+            .as_ref()
+            .is_some_and(|record| record.step >= Step::Registered);
         // Only `--repair` sets a refused directory of this version aside, and the
         // claim above is verified before anything moves. A resume looks at the
         // directory even without the flag, so its refusal names the flag instead
@@ -660,7 +663,12 @@ impl<'a> Engine<'a> {
             rolled_back,
             search_path: search_path_report,
             runtimes: late.runtimes,
-            repair: self.repair_report(version, set_aside.clone(), set_aside.is_some(), "none"),
+            repair: self.repair_report(
+                version,
+                set_aside.clone(),
+                set_aside.is_some(),
+                resumed_daemon(daemon_replaced, set_aside.is_some()),
+            ),
         })
     }
 
@@ -778,6 +786,9 @@ impl<'a> Engine<'a> {
         layout::claim_prefix(&layout, &config.namespace())?;
         let state = self.checked_version_state(&layout, version)?;
         let resumed = resume.is_some();
+        let daemon_replaced = resume
+            .as_ref()
+            .is_some_and(|record| record.step >= Step::Registered);
         let from_version = resume
             .as_ref()
             .and_then(|record| record.previous_version.clone())
@@ -891,7 +902,7 @@ impl<'a> Engine<'a> {
                 version,
                 set_aside.clone().or(rollback_restore.set_aside),
                 rollback_restore.restored || set_aside.is_some(),
-                "none",
+                resumed_daemon(daemon_replaced, set_aside.is_some()),
             ),
             refused_entries: layout::refused_entries(&layout)?,
         })
@@ -3507,6 +3518,20 @@ pub(crate) async fn ensure_no_daemon_job(backend: &Backend) -> Result<(), Error>
             id: observation.id.to_string(),
         }),
         Err(source) => Err(supervisor_error("inspect daemon", source)),
+    }
+}
+
+/// What a resumed transaction's repair reports for the daemon job.
+///
+/// A resume past the daemon replacement runs only its remaining steps, so the
+/// daemon keeps running from the directory it started in, which is the moved
+/// entry when the repair set it aside (`kept`); otherwise the steps of the
+/// transaction replace the daemon itself (`none`).
+fn resumed_daemon(daemon_replaced: bool, set_aside: bool) -> &'static str {
+    if daemon_replaced && set_aside {
+        "kept"
+    } else {
+        "none"
     }
 }
 
