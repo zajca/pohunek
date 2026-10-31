@@ -1044,6 +1044,7 @@ jobs:
               - 'scripts/test-partitions'
               - '.config/nextest.toml'
               - '.github/actions/hermes-test-python/**'
+              - '.github/actions/setup-uv/**'
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
               - 'Cargo.lock'
@@ -1180,6 +1181,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
+              - '.github/actions/setup-uv/**'
             # The release gate's test steps (gate-tests.yml) run on a pull
             # request that changes what they run or how: the two workflows,
             # the nextest profiles and shard filters, and the partition and
@@ -1918,9 +1920,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
-          version: "0.9.28"
           enable-cache: true
 
       # Cache the staged pinned Hermes runtime. Inputs that drive staging:
@@ -2939,9 +2940,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
-          version: "0.9.28"
           enable-cache: true
 
       # The runtime is provisioned by scripts/provision-hermes-compat, which

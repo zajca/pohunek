@@ -114,9 +114,8 @@ jobs:
 
       - name: Install uv for Hermes release verification
         if: ${{ inputs.mode == 'release' && contains(matrix.components, 'daemon') }}
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
-          version: "0.9.28"
           enable-cache: true
 
       - name: Install musl toolchain

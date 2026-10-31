@@ -1,0 +1,85 @@
+name: Setup uv
+description: >-
+  Install the pinned uv release without fetching a version manifest. The pinned
+  archive is downloaded from the uv GitHub release, verified against a sha256
+  committed here, and placed in the runner tool cache. `astral-sh/setup-uv` then
+  finds that exact version in the tool cache, so it neither resolves nor
+  downloads anything over the network, and still provides the uv cache and the
+  environment. The step fails if setup-uv would use any other uv.
+
+inputs:
+  enable-cache:
+    description: Whether setup-uv saves and restores the uv cache ("true" or "false").
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Seed the runner tool cache with the pinned uv
+      id: seed
+      shell: bash
+      env:
+        UV_VERSION: "0.9.28"
+        # sha256 of uv-<target>.tar.gz of release UV_VERSION, the values of
+        # https://github.com/astral-sh/uv/releases/download/0.9.28/uv-<target>.tar.gz.sha256
+        # that the setup-uv table of known checksums repeats.
+        UV_SHA256_X86_64_LINUX: 66ad1822dd9cf96694b95c24f25bc05cff417a65351464da01682a91796d1f2b
+        UV_SHA256_AARCH64_LINUX: 382c342735ff29f8ba4574d88e39bca798bcbac50bff6742710ca9cd8143e7d2
+        UV_SHA256_AARCH64_DARWIN: 12163fe09eb292d3ad1ea0f132a84485c902e2ff360d57562bf676e6615fcba0
+        UV_SHA256_X86_64_DARWIN: 3a8030881d13b824e5168f5e4d060e715e40753249766bda3d52d6771d93b169
+        # `--retry-all-errors` retries every failure, including a connection
+        # reset that plain `--retry` treats as permanent; the sha256 check
+        # below still guards the bytes.
+        DOWNLOAD_RETRIES: "6"
+      run: |
+        set -euo pipefail
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)  arch=x86_64;  target=x86_64-unknown-linux-gnu;  sha="$UV_SHA256_X86_64_LINUX" ;;
+          Linux-aarch64) arch=aarch64; target=aarch64-unknown-linux-gnu; sha="$UV_SHA256_AARCH64_LINUX" ;;
+          Darwin-arm64)  arch=aarch64; target=aarch64-apple-darwin;      sha="$UV_SHA256_AARCH64_DARWIN" ;;
+          Darwin-x86_64) arch=x86_64;  target=x86_64-apple-darwin;       sha="$UV_SHA256_X86_64_DARWIN" ;;
+          *) echo "::error::setup-uv: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+        esac
+        tool_root="${RUNNER_TOOL_CACHE:?}/uv/${UV_VERSION}"
+        dest="${tool_root}/${arch}"
+        if [ ! -f "${dest}.complete" ]; then
+          mkdir -p "$tool_root"
+          stage="$(mktemp -d "${tool_root}/seed.XXXXXX")"
+          archive="uv-${target}.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
+            --output "${stage}/${archive}" \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${archive}"
+          # Fails closed: extraction only runs after the hash matches.
+          if command -v sha256sum >/dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
+          (cd "$stage" && printf '%s  %s\n' "$sha" "$archive" | $check)
+          mkdir "${stage}/uv"
+          tar -xzf "${stage}/${archive}" -C "${stage}/uv" --strip-components=1
+          rm -rf "$dest"
+          mv "${stage}/uv" "$dest"
+          rm -rf "$stage"
+          touch "${dest}.complete"
+        fi
+        echo "version=${UV_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "dir=${dest}" >> "$GITHUB_OUTPUT"
+
+    - name: Install uv
+      id: uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        version: ${{ steps.seed.outputs.version }}
+        enable-cache: ${{ inputs.enable-cache }}
+
+    - name: Require the seeded uv
+      shell: bash
+      env:
+        SEEDED_DIR: ${{ steps.seed.outputs.dir }}
+        UV_PATH: ${{ steps.uv.outputs.uv-path }}
+        UV_VERSION: ${{ steps.seed.outputs.version }}
+      run: |
+        set -euo pipefail
+        if [ "$UV_PATH" != "${SEEDED_DIR}/uv" ]; then
+          echo "::error::setup-uv installed ${UV_PATH}, not the seeded ${SEEDED_DIR}/uv" >&2
+          exit 1
+        fi
+        test "$(uv --version | cut -d' ' -f2)" = "$UV_VERSION"

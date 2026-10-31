@@ -213,6 +213,13 @@ mirroring the CI step in `.github/workflows/ci.yml`, that install a private
 CPython 3.12 with PyYAML and the `export POHUNEK_PYTHON_BIN=...` line to keep in
 your shell profile.
 
+CI installs uv only through `.github/actions/setup-uv`. The composite downloads
+the pinned uv release archive from its GitHub release, checks it against the
+SHA-256 committed in the action before extracting, and puts it in the runner
+tool cache; `astral-sh/setup-uv` then finds that exact version there, so no job
+fetches the uv version manifest. Raising the pin means changing `UV_VERSION`
+and the four checksums of `uv-<target>.tar.gz.sha256` together.
+
 CI runs four fast matrix shards and separate heavy jobs without waiting for
 Clippy or release builds. Heavy uses four test processes and the real worker
 binary. Relay heavy tests (the only PostgreSQL fixture consumers) run in a
