@@ -4541,11 +4541,12 @@ const MATRIX: &[MatrixRow] = &[
 /// registry stays as staged and the profile is pinned only in the kept rows.
 async fn assert_matrix(
     runtimes: &[&str],
+    shard: usize,
     without_detect: fn(&MatrixRow) -> &'static str,
     with_detect: fn(&MatrixRow) -> &'static str,
 ) {
     for runtime in runtimes {
-        for row in MATRIX {
+        for row in MATRIX.iter().skip(shard).step_by(MATRIX_SHARDS) {
             let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
             let version = match row.order {
                 Order::Older => "1.0.1",
@@ -4635,31 +4636,56 @@ async fn assert_matrix(
     }
 }
 
-/// The case table of the reserved runtime `claude`, whose profile uses it:
-/// what the plan, the apply and the `--detect` plan say for each state of the
-/// selected package beside the release's disabled one.
-#[tokio::test]
-async fn claude_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["claude"], |row| row.reserved, |row| row.reserved_detect).await;
+/// Parts each runtime's case table is split into; every row builds its own host.
+const MATRIX_SHARDS: usize = 3;
+
+/// One test per runtime and shard of the case table, and `MATRIX_TESTED`
+/// listing the (runtime, shard) pairs tested.
+macro_rules! matrix_tests {
+    ($($name:ident: $runtime:literal, $shard:literal, $judged:ident, $detected:ident;)+) => {
+        const MATRIX_TESTED: &[(&str, usize)] = &[$(($runtime, $shard)),+];
+        $(
+            #[tokio::test]
+            async fn $name() {
+                assert_matrix(&[$runtime], $shard, |row| row.$judged, |row| row.$detected).await;
+            }
+        )+
+    };
 }
 
-/// The case table of the reserved runtime `codex`.
-#[tokio::test]
-async fn codex_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["codex"], |row| row.reserved, |row| row.reserved_detect).await;
+// The case table of each reserved runtime (claude, codex, hermes) says what
+// the plan, the apply and the `--detect` plan report for each state of the
+// selected package beside the release's disabled one; Pi is planned only
+// while an enabled selection serves it or `--detect` lists it.
+matrix_tests! {
+    claude_judges_the_disabled_release_package_by_the_selection_state_part_0: "claude", 0, reserved, reserved_detect;
+    claude_judges_the_disabled_release_package_by_the_selection_state_part_1: "claude", 1, reserved, reserved_detect;
+    claude_judges_the_disabled_release_package_by_the_selection_state_part_2: "claude", 2, reserved, reserved_detect;
+    codex_judges_the_disabled_release_package_by_the_selection_state_part_0: "codex", 0, reserved, reserved_detect;
+    codex_judges_the_disabled_release_package_by_the_selection_state_part_1: "codex", 1, reserved, reserved_detect;
+    codex_judges_the_disabled_release_package_by_the_selection_state_part_2: "codex", 2, reserved, reserved_detect;
+    hermes_judges_the_disabled_release_package_by_the_selection_state_part_0: "hermes", 0, reserved, reserved_detect;
+    hermes_judges_the_disabled_release_package_by_the_selection_state_part_1: "hermes", 1, reserved, reserved_detect;
+    hermes_judges_the_disabled_release_package_by_the_selection_state_part_2: "hermes", 2, reserved, reserved_detect;
+    pi_judges_the_disabled_release_package_by_the_selection_state_part_0: "pi", 0, pi, pi_detect;
+    pi_judges_the_disabled_release_package_by_the_selection_state_part_1: "pi", 1, pi, pi_detect;
+    pi_judges_the_disabled_release_package_by_the_selection_state_part_2: "pi", 2, pi, pi_detect;
 }
 
-/// The case table of the reserved runtime `hermes`.
-#[tokio::test]
-async fn hermes_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["hermes"], |row| row.reserved, |row| row.reserved_detect).await;
-}
-
-/// The case table of Pi, which the upgrade plans only while an enabled
-/// selection serves it or `--detect` lists it.
-#[tokio::test]
-async fn pi_judges_the_disabled_release_package_by_the_selection_state() {
-    assert_matrix(&["pi"], |row| row.pi, |row| row.pi_detect).await;
+/// Every runtime has a test for every shard, and every shard has rows.
+#[test]
+fn the_case_table_shards_cover_every_row_of_every_runtime() {
+    assert!(MATRIX.len() >= MATRIX_SHARDS, "every shard has a row");
+    let mut expected = Vec::new();
+    for runtime in ["claude", "codex", "hermes", "pi"] {
+        for shard in 0..MATRIX_SHARDS {
+            expected.push((runtime, shard));
+        }
+    }
+    let mut tested = MATRIX_TESTED.to_vec();
+    tested.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(tested, expected);
 }
 
 /// Detail of the claim refusal of a disabled package the upgrade cannot enable.
