@@ -183,15 +183,28 @@ impl SessionRegistry {
         } else {
             Some(self.acquire_waiter(params.session_id())?)
         };
-        let output = managed
-            .worker
-            .read_output(
-                params.after_offset().map(OutputOffset::get),
-                params.max_bytes(),
-                wait,
-            )
-            .await
-            .map_err(observation_worker_error)?;
+        let read = managed.worker.read_output(
+            params.after_offset().map(OutputOffset::get),
+            params.max_bytes(),
+            wait,
+        );
+        let output = tokio::select! {
+            biased;
+            () = self.inner.daemon_shutdown.cancelled(), if !wait.is_zero() => {
+                tracing::warn!(
+                    session_id = %params.session_id().0,
+                    duration_ms = started.elapsed().as_millis(),
+                    "daemon shutdown cancelled a session output wait"
+                );
+                return Err(ProtocolError::new(
+                    ErrorClass::Daemon,
+                    "daemon_shutting_down",
+                    "daemon shutdown cancelled the bounded session output wait",
+                    None,
+                ));
+            }
+            output = read => output.map_err(observation_worker_error)?,
+        };
         if output.worker_instance_id.as_str() != managed.worker_instance_id {
             return Err(ProtocolError::session_runtime_changed());
         }
@@ -272,7 +285,7 @@ impl SessionRegistry {
             let output_wait = self.wait_for_output(params.session_id(), output_cursor, remaining);
             tokio::select! {
                 biased;
-                () = self.inner.event_log_shutdown.cancelled() => {
+                () = self.inner.daemon_shutdown.cancelled() => {
                     tracing::warn!(
                         session_id = %params.session_id().0,
                         duration_ms = started.elapsed().as_millis(),
