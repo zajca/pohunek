@@ -353,7 +353,11 @@ directory that already exists is reused only when it and its binaries are
 owned by you, mode `0755`, free of symbolic links, and single-linked;
 otherwise the command fails with `service_version_untrusted` naming the
 offending entry, and it does so again before a later command runs a binary from
-the installed directory. Make sure nothing runs from it, remove it, and rerun. The
+the installed directory. Make sure nothing runs from it, then rerun the command
+with `--repair` and `--from` the unpacked release archive of the version the path
+names: it moves the directory aside, publishes the release's copy and keeps
+`service.toml` and the live sessions (see the
+[debug daemon runbook](debug-daemon.md#active-version-directory-refused)). The
 installer counts the daemon as ready only when `daemon.health`
 reports the new version on a connection whose kernel peer credentials name the
 daemon job's running main process, as the service manager reports it. A

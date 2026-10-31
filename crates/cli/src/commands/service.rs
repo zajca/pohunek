@@ -44,6 +44,14 @@ pub(crate) enum Action {
         /// Absolute installation prefix [default: `$HOME/.local`].
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         prefix: Option<PathBuf>,
+        /// Move a refused version directory of this version aside and publish
+        /// the release's copy in its place.
+        ///
+        /// The refused entry is renamed to `.pohunek-refused-<version>-<random>`
+        /// in the versions directory and kept for you to inspect and delete;
+        /// nothing in it is run, probed or copied.
+        #[arg(long)]
+        repair: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -70,6 +78,18 @@ pub(crate) enum Action {
         /// the next upgrade; it changes no session.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Replace a refused or missing version directory of this version with
+        /// the release's copy, and restart the daemon from it.
+        ///
+        /// Use it with `--from` the unpacked release archive of the version
+        /// the refusal names. A refused directory is renamed to
+        /// `.pohunek-refused-<version>-<random>` in the versions directory and
+        /// kept for you to inspect and delete; nothing in it is run, probed or
+        /// copied. A running daemon of the active version is judged by the
+        /// adoption preflight first (`--accept-runtime-loss` applies), then
+        /// restarted; worker jobs and `service.toml` are never touched.
+        #[arg(long)]
+        repair: bool,
         /// Probe budget, in seconds, of the preflight that judges live and
         /// stopped sessions: version probes and native reference checks run
         /// within it. The default is 20; the installer's deadline grows with it.
@@ -221,18 +241,24 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             let status = service::lock(program, arguments).await?;
             return Ok(ExitCode::from(service::exit_code(status)));
         }
-        Action::Install { from, prefix, json } => {
-            let report = service::install(from, prefix).await?;
+        Action::Install {
+            from,
+            prefix,
+            repair,
+            json,
+        } => {
+            let report = service::install(from, prefix, repair).await?;
             emit(json, &report, render_install)
         }
         Action::Upgrade {
             from,
             accept_runtime_loss,
+            repair,
             preflight_budget,
             json,
         } => {
             let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
-            let report = service::upgrade(from, accept_runtime_loss, budget).await?;
+            let report = service::upgrade(from, accept_runtime_loss, budget, repair).await?;
             emit(json, &report, render_upgrade)
         }
         Action::RefreshPath {
@@ -302,6 +328,9 @@ fn render_install(report: &report::InstallReport) -> String {
     let _ = writeln!(text, "config     {}", report.config_path.display());
     let _ = writeln!(text, "daemon     {}", report.daemon_executable.display());
     render_search_path(&mut text, &report.search_path);
+    if let Some(repair) = &report.repair {
+        render_repair(&mut text, repair);
+    }
     if let Some(runtimes) = &report.runtimes {
         render_install_runtimes(&mut text, runtimes);
     } else if report.resumed {
@@ -310,6 +339,34 @@ fn render_install(report: &report::InstallReport) -> String {
         let _ = writeln!(text, "runtimes   completed by the interrupted run");
     }
     text
+}
+
+/// Appends what `--repair` did to the version directory and the daemon job.
+fn render_repair(text: &mut String, repair: &report::RepairReport) {
+    let directory = if repair.restored {
+        "restored from the release"
+    } else {
+        "left as it was"
+    };
+    let _ = writeln!(
+        text,
+        "repair     version {} directory {directory}",
+        repair.version
+    );
+    if let Some(path) = &repair.set_aside {
+        let _ = writeln!(
+            text,
+            "           the refused entry was moved to {}; inspect it and delete it yourself",
+            path.display()
+        );
+    }
+    let daemon = match repair.daemon {
+        "installed" => "the daemon job was missing and was registered again",
+        "started" => "the daemon job was stopped and was started",
+        "restarted" => "the daemon was restarted; worker jobs keep running",
+        _ => "the daemon job was not touched",
+    };
+    let _ = writeln!(text, "           {daemon}");
 }
 
 /// Appends the official runtime step the install ran: the catalog trust
@@ -717,6 +774,16 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
             if report.resumed { ", resumed" } else { "" }
         );
     }
+    if let Some(repair) = &report.repair {
+        render_repair(&mut text, repair);
+    }
+    for path in &report.refused_entries {
+        let _ = writeln!(
+            text,
+            "kept {} (set aside by a repair; delete it when you no longer need it)",
+            report::escaped_purge_path(path)
+        );
+    }
     for version in &report.removed_versions {
         let _ = writeln!(text, "removed version {version}");
     }
@@ -896,6 +963,13 @@ fn render_uninstall(report: &report::UninstallReport) -> String {
     }
     for kept in &report.kept_versions {
         let _ = writeln!(text, "kept version {}: {}", kept.version, kept.reason);
+    }
+    for path in &report.refused_entries {
+        let _ = writeln!(
+            text,
+            "kept {} (set aside by a repair; delete it when you no longer need it)",
+            report::escaped_purge_path(path)
+        );
     }
     let _ = writeln!(
         text,
@@ -1126,6 +1200,7 @@ mod tests {
             rolled_back: None,
             search_path,
             runtimes: None,
+            repair: None,
         }
     }
 
@@ -1256,7 +1331,7 @@ mod tests {
     fn every_subcommand_and_flag_parses() {
         assert!(matches!(
             parse(&["install", "--from", "/a", "--prefix", "/p", "--json"]),
-            Action::Install { from: Some(from), prefix: Some(prefix), json: true }
+            Action::Install { from: Some(from), prefix: Some(prefix), repair: false, json: true }
                 if from == Path::new("/a") && prefix == Path::new("/p")
         ));
         assert!(matches!(
@@ -1264,6 +1339,7 @@ mod tests {
             Action::Upgrade {
                 from: Some(_),
                 accept_runtime_loss: false,
+                repair: false,
                 preflight_budget: None,
                 json: false
             }
@@ -1273,6 +1349,7 @@ mod tests {
             Action::Upgrade {
                 from: None,
                 accept_runtime_loss: true,
+                repair: false,
                 preflight_budget: None,
                 json: true
             }
@@ -1859,6 +1936,8 @@ mod tests {
             config_schema_migration: None,
             runtimes: None,
             integrations: Vec::new(),
+            repair: None,
+            refused_entries: Vec::new(),
         });
         assert!(text.contains("pohunek 2.0.0 is already active"), "{text}");
         assert!(!text.contains("upgraded"), "{text}");

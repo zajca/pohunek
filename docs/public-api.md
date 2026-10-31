@@ -2867,6 +2867,38 @@ running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.
 
+`pohunek service install --repair` and `pohunek service upgrade --repair` are the
+supported recovery for a refused (`service_version_untrusted`) or missing version
+directory. The flag acts only on the directory of the version the run installs: a
+refused entry is renamed to `.pohunek-refused-<version>-<random>` in the versions
+directory (a rename that never follows a link and moves any entry type), the
+staged and probed release copy is published with the no-replace move, and
+`service.toml` is never rewritten. The renamed-aside entry is kept: it is not a
+version, is never swept or collected and is never a `--from` source; the upgrade
+and uninstall reports list the entries as `refused_entries` (omitted when none
+exists). A missing directory is published without the flag; a refused one
+without it fails with the same code and changes nothing. A directory that passes
+the installed-directory check is never replaced, and one that differs from the
+release still fails with `service_version_conflict`. An upgrade whose `--from`
+probes as the active version then makes the daemon job run from the restored
+directory (a missing job is registered again, a stopped one started, a running
+one restarted as a new process when the directory was restored or `--repair` was
+given, after the adoption preflight judged the release; `service_upgrade_sessions_at_risk`
+and `--accept-runtime-loss` apply and a refusal changes nothing), and never
+stops or retires worker jobs. The success reports of `install` and `upgrade` carry an additive `repair`
+object (`version`, `restored`, `set_aside`, `daemon` as `none`, `installed`,
+`started` or `restarted`; `null` without the flag and when nothing was repaired).
+`UpgradeReport.unchanged` states that the active version did not change; a
+repair of it can still restart the daemon. The trust claim is that of `service install --from`
+(the operator chose the release, each binary answers `--version`, a sealed
+release's `runtime/` files are present) and no digest of the binaries is
+verified; running processes are not attested. When an `uninstall` finds live
+worker jobs and an untrusted or missing active version directory it fails with
+`service_version_untrusted`, a message naming the active version and a hint with
+the `service upgrade --repair` command; no new error code exists. The
+[debug daemon runbook](knowledge/runbooks/debug-daemon.md#active-version-directory-refused)
+is the procedure.
+
 `pohunekd ensure-official-runtimes` is the offline runtime step of the release;
 `--dry-run` computes its plan without changing anything. `--dry-run --detect` also
 plans every runtime of the release catalog for this platform whose program is on

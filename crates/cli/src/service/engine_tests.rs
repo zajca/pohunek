@@ -63,6 +63,9 @@ mod unit_environment;
 #[path = "engine_tests_refresh.rs"]
 mod refresh_path;
 
+#[path = "engine_tests_repair.rs"]
+mod repair;
+
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
 /// A supervised version older than and unrelated to the installed one.

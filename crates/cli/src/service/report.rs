@@ -40,6 +40,26 @@ pub struct InstallReport {
     /// else.
     #[serde(default)]
     pub runtimes: Option<EnsureReport>,
+    /// What `--repair` did to the version directory; `null` without it.
+    #[serde(default)]
+    pub repair: Option<RepairReport>,
+}
+
+/// What `--repair` did to the version directory of the release it installs,
+/// and to the daemon job running from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepairReport {
+    /// The version whose directory was repaired.
+    pub version: String,
+    /// Whether the release's copy was published because the directory was
+    /// missing or refused.
+    pub restored: bool,
+    /// Where the refused entry was moved, kept for the operator to inspect and
+    /// delete; `null` when none existed.
+    pub set_aside: Option<PathBuf>,
+    /// What happened to the daemon job: `none`, `installed` (the job was
+    /// missing), `started` (it was stopped) or `restarted` (it was running).
+    pub daemon: &'static str,
 }
 
 /// Result of `pohunek service refresh-path`.
@@ -141,7 +161,9 @@ pub struct UpgradeReport {
     pub from_version: String,
     /// The version active after the upgrade.
     pub to_version: String,
-    /// Whether the requested version was already active, so nothing restarted.
+    /// Whether the requested version was already active, so the active version
+    /// did not change. Only `--repair` or a restored directory restarts the
+    /// daemon then.
     pub unchanged: bool,
     /// Whether an interrupted upgrade to the same version was resumed.
     pub resumed: bool,
@@ -176,6 +198,20 @@ pub struct UpgradeReport {
     /// failure is reported here and never rolls the upgrade back.
     #[serde(default)]
     pub integrations: Vec<IntegrationReinstall>,
+    /// What `--repair` did to the version directory and the daemon job;
+    /// `null` without it.
+    #[serde(default)]
+    pub repair: Option<RepairReport>,
+    /// Entries earlier repairs moved aside; only the operator deletes them.
+    ///
+    /// Serialized as byte-escaped display strings, as the retained purge
+    /// entries are.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_purge_paths"
+    )]
+    pub refused_entries: Vec<PathBuf>,
 }
 
 /// One integration hook reinstalled after an upgrade.
@@ -217,6 +253,17 @@ pub struct UninstallReport {
     pub started_daemon: bool,
     /// An interrupted transaction that was rolled back first.
     pub rolled_back: Option<PendingReport>,
+    /// Entries earlier repairs moved aside and the uninstall left in place;
+    /// only the operator deletes them.
+    ///
+    /// Serialized as byte-escaped display strings, as the retained purge
+    /// entries are.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_purge_paths"
+    )]
+    pub refused_entries: Vec<PathBuf>,
 }
 
 /// Display a retained path without losing invalid UTF-8 bytes or emitting controls.
