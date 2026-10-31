@@ -47,7 +47,7 @@ pub(crate) enum Action {
         /// Move a refused version directory of this version aside and publish
         /// the release's copy in its place.
         ///
-        /// The refused entry is renamed to `.pohunek-refused-<version>-<random>`
+        /// The refused entry is renamed to `.pohunek_refused-<version>-<random>`
         /// in the versions directory and kept for you to inspect and delete;
         /// nothing in it is run, probed or copied.
         #[arg(long)]
@@ -83,7 +83,7 @@ pub(crate) enum Action {
         ///
         /// Use it with `--from` the unpacked release archive of the version
         /// the refusal names. A refused directory is renamed to
-        /// `.pohunek-refused-<version>-<random>` in the versions directory and
+        /// `.pohunek_refused-<version>-<random>` in the versions directory and
         /// kept for you to inspect and delete; nothing in it is run, probed or
         /// copied. A running daemon of the active version is judged by the
         /// adoption preflight first (`--accept-runtime-loss` applies), then

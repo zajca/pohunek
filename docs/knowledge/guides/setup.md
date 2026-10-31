@@ -171,7 +171,7 @@ runtime steps, and `pohunek setup` on an installed host). It covers the binaries
 the catalog trust anchor and the `runtime/` tree, so a directory that became
 group-writable after the install is refused instead of run;
 `pohunek service upgrade --repair --from <release archive>` is the recovery (it
-renames the refused directory aside as `.pohunek-refused-<version>-<random>`,
+renames the refused directory aside as `.pohunek_refused-<version>-<random>`,
 publishes the release's copy and restarts only the daemon). On macOS the install also
 resolves the daemon's `PATH` (login-shell discovery plus a trusted fallback
 directory list) and prints a `path` line, with a `warning:` line for a failed

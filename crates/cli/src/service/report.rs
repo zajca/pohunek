@@ -40,7 +40,8 @@ pub struct InstallReport {
     /// else.
     #[serde(default)]
     pub runtimes: Option<EnsureReport>,
-    /// What `--repair` did to the version directory; `null` without it.
+    /// What the run did to the version directory; `null` when `--repair` was
+    /// not given and nothing was restored.
     #[serde(default)]
     pub repair: Option<RepairReport>,
 }
@@ -198,8 +199,8 @@ pub struct UpgradeReport {
     /// failure is reported here and never rolls the upgrade back.
     #[serde(default)]
     pub integrations: Vec<IntegrationReinstall>,
-    /// What `--repair` did to the version directory and the daemon job;
-    /// `null` without it.
+    /// What the run did to the version directory and the daemon job; `null`
+    /// when `--repair` was not given and nothing was restored or registered.
     #[serde(default)]
     pub repair: Option<RepairReport>,
     /// Entries earlier repairs moved aside; only the operator deletes them.

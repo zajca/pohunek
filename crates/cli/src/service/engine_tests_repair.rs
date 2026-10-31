@@ -7,6 +7,8 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 
+use pohunek_paths::valid_install_version;
+
 use super::*;
 
 /// The version directory of `version`.
@@ -98,7 +100,7 @@ async fn repair_replaces_a_refused_active_directory_and_keeps_the_worker_and_the
         moved
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".pohunek-refused-1.0.0-")),
+            .is_some_and(|name| name.starts_with(".pohunek_refused-1.0.0-")),
         "{moved:?}"
     );
     assert_eq!(refused_entries(&harness), std::slice::from_ref(&moved));
@@ -529,4 +531,82 @@ async fn repair_sets_aside_a_directory_the_owner_cannot_open() {
         std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755))
             .expect("reopen the set-aside entry for cleanup");
     }
+}
+
+/// The set-aside name never parses as a version, so every release lists,
+/// collects and refuses it as a non-version.
+#[tokio::test]
+async fn a_set_aside_name_is_not_a_version() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.world().running = false;
+    refuse(&harness, V1);
+
+    let report = repair_with(&harness, harness.engine(), V1)
+        .await
+        .expect("repair");
+
+    let moved = report
+        .repair
+        .and_then(|repair| repair.set_aside)
+        .expect("the refused entry is set aside");
+    let name = moved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("name");
+    assert_eq!(valid_install_version(name), None, "{name}");
+    assert_eq!(
+        layout::installed_versions(&harness.layout()).expect("versions"),
+        [V1]
+    );
+}
+
+/// Readiness names the process the replacement must retire: a daemon that
+/// keeps its main process after `replace` is not ready.
+#[tokio::test]
+async fn repair_rejects_a_daemon_that_keeps_its_old_process() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    refuse(&harness, V1);
+    harness.fake.world().keeps_process = true;
+
+    let error = repair_with(&harness, harness.engine(), V1)
+        .await
+        .expect_err("the old process still answers");
+
+    assert!(matches!(error, Error::DaemonNotReady { .. }), "{error:?}");
+}
+
+/// An automatic rollback that meets a refused previous directory carries the
+/// `--repair` hint of the inner refusal.
+#[tokio::test]
+async fn a_rollback_onto_a_refused_directory_names_the_repair() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let dir = version_dir(&harness, V1);
+    {
+        let mut world = harness.fake.world();
+        world.silent_version = Some(V2.to_owned());
+        world.replace_hook = Some(ReplaceHook(Arc::new(move || {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775))
+                .expect("loosen the previous version directory");
+        })));
+    };
+
+    let error = harness.upgrade(V2).await.expect_err("not ready");
+
+    let Error::RollbackFailed { rollback, .. } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert!(
+        matches!(&**rollback, Error::UntrustedVersion { .. }),
+        "{rollback:?}"
+    );
+    assert!(
+        error
+            .hint()
+            .is_some_and(|hint| hint.contains("upgrade --repair")),
+        "{:?}",
+        error.hint()
+    );
 }

@@ -488,6 +488,10 @@ impl std::fmt::Debug for ReplaceHook {
 }
 
 #[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent switches of the fake service manager"
+)]
 struct World {
     registered: Option<JobDefinition>,
     running: bool,
@@ -514,6 +518,8 @@ struct World {
     /// `PATH` whose definition `replace` accepts without restarting the
     /// daemon process: the old process keeps running and answering.
     kept_process_path: Option<String>,
+    /// Every `replace` leaves the old daemon process running and answering.
+    keeps_process: bool,
     /// Runs once, when the next `replace` succeeds: the old daemon having
     /// accepted work meanwhile.
     replace_hook: Option<ReplaceHook>,
@@ -627,7 +633,7 @@ impl DaemonSupervisor for Fake {
             }
             world.registered = Some(definition.clone());
             world.running = true;
-            if path.is_none() || world.kept_process_path != path {
+            if !world.keeps_process && (path.is_none() || world.kept_process_path != path) {
                 world.restarts += 1;
             }
             if let Some(hook) = world.replace_hook.take() {

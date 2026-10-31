@@ -432,7 +432,7 @@ of that release archive, so the version it reports is the one being restored.
      destroyed; a **refused** one needs the flag, and without it the command
      refuses with the same code and changes nothing.
    - The refused entry (a directory, or a link itself, never followed) is renamed
-     to `.pohunek-refused-<version>-<random>` in the same versions directory.
+     to `.pohunek_refused-<version>-<random>` in the same versions directory.
      Nothing from it is executed, probed or copied: the release archive is staged
      and probed first, and the replacement is a no-replace move of that staged
      copy.
@@ -473,7 +473,7 @@ refused directory. Once the daemon is reachable again,
 for one session, is the answer to suspected tampering; the repair does not
 decide that for you.
 
-The `.pohunek-refused-*` entries stay in the versions directory. They are never
+The `.pohunek_refused-*` entries stay in the versions directory. They are never
 swept or collected and are not versions; `pohunek service upgrade` and
 `pohunek service uninstall` list them. They are the only evidence of what ran, so
 inspect them if you suspect tampering, then delete them yourself (a tree with

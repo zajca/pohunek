@@ -105,11 +105,11 @@ const REMOVAL_PREFIX: &str = ".pohunek-removed-";
 
 /// Name prefix of version directories a repair moved aside.
 ///
-/// The name is spelled like a version, so [`installed_versions`] skips it and
-/// [`verify_installed`] refuses it; neither [`sweep`] nor [`is_scratch`]
-/// matches it. The entry is the only evidence of what ran from the refused
-/// directory, so only the operator deletes it.
-pub const REFUSED_PREFIX: &str = ".pohunek-refused-";
+/// `_` is not allowed in a version, so the name never parses as one: every
+/// release lists, collects and refuses it as a non-version, and neither
+/// [`sweep`] nor [`is_scratch`] matches it. The entry is the only evidence of
+/// what ran from the refused directory, so only the operator deletes it.
+pub const REFUSED_PREFIX: &str = ".pohunek_refused-";
 
 /// How many random names [`set_aside_refused`] draws before it gives up.
 ///
@@ -536,7 +536,7 @@ fn is_access_denied(error: &Error) -> bool {
     )
 }
 
-/// Renames the entry of `version` aside as `.pohunek-refused-<version>-<random>`.
+/// Renames the entry of `version` aside as `.pohunek_refused-<version>-<random>`.
 ///
 /// The rename is a descriptor-relative no-replace move, so a link, a foreign
 /// directory or any other entry type moves as itself and nothing it points to
@@ -635,9 +635,6 @@ pub fn installed_versions(layout: &InstallLayout) -> Result<Vec<String>, Error> 
         let Some(name) = name.to_str().and_then(valid_install_version) else {
             continue;
         };
-        if name.starts_with(REFUSED_PREFIX) {
-            continue;
-        }
         if versions
             .entry_identity(name, EntryKind::Directory)
             .map_err(|source| version_error(versions.path().join(name), source))?
@@ -773,9 +770,6 @@ pub fn verify_installed(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVe
         version_of(layout, dir).ok_or_else(|| untrusted("it is not a version directory"))?;
     if layout.version_dir(&version).as_deref() != Some(dir) {
         return Err(untrusted("it is not a version directory"));
-    }
-    if version.starts_with(REFUSED_PREFIX) {
-        return Err(untrusted("it is a version directory a repair set aside"));
     }
     let versions = open_existing_owner_dir(&layout.versions_dir())?
         .ok_or_else(|| untrusted("the versions directory does not exist"))?;

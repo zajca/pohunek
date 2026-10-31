@@ -921,6 +921,16 @@ impl Error {
         }
     }
 
+    /// Whether `self` is, or its rollback failure wraps, a refused version
+    /// directory.
+    fn is_refused_directory(&self) -> bool {
+        match self {
+            Self::UntrustedVersion { .. } | Self::UntrustedActiveVersion { .. } => true,
+            Self::RollbackFailed { rollback, .. } => rollback.is_refused_directory(),
+            _ => false,
+        }
+    }
+
     /// Whether `self` is, or wraps, a missing-job refusal.
     pub(crate) fn is_job_missing(&self) -> bool {
         match self {
@@ -1176,6 +1186,9 @@ impl Error {
                 if matches!(**rollback, Self::DaemonJobMissing { .. }) =>
             {
                 Some(DAEMON_JOB_MISSING_HINT)
+            }
+            Self::RollbackFailed { rollback, .. } if rollback.is_refused_directory() => {
+                rollback.hint()
             }
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")

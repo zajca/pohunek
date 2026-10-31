@@ -2870,7 +2870,7 @@ session gets a new worker generation.
 `pohunek service install --repair` and `pohunek service upgrade --repair` are the
 supported recovery for a refused (`service_version_untrusted`) or missing version
 directory. The flag acts only on the directory of the version the run installs: a
-refused entry is renamed to `.pohunek-refused-<version>-<random>` in the versions
+refused entry is renamed to `.pohunek_refused-<version>-<random>` in the versions
 directory (a rename that never follows a link and moves any entry type), the
 staged and probed release copy is published with the no-replace move, and
 `service.toml` is never rewritten. The renamed-aside entry is kept: it is not a
