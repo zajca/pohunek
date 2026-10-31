@@ -278,8 +278,10 @@ fn a_record_state_is_held_whatever_the_terminator_and_the_chunking(case: usize) 
     }
 }
 
+/// One test per `RECORD_STATES` row; `RECORD_STATE_CASES` lists the rows tested.
 macro_rules! record_state_tests {
     ($($name:ident: $case:expr),+ $(,)?) => {
+        const RECORD_STATE_CASES: &[usize] = &[$($case),+];
         $(
             #[test]
             fn $name() {
@@ -298,6 +300,12 @@ record_state_tests!(
     a_done_record_is_held_whatever_the_terminator_and_the_chunking: 5,
     an_error_record_is_held_whatever_the_terminator_and_the_chunking: 6,
 );
+
+#[test]
+fn every_record_state_has_a_test() {
+    let every_row: Vec<usize> = (0..RECORD_STATES.len()).collect();
+    assert_eq!(RECORD_STATE_CASES.to_vec(), every_row);
+}
 
 #[test]
 fn an_idle_record_is_held_like_the_other_states() {
@@ -777,43 +785,41 @@ fn no_record_means_every_captured_screen_reads_as_without_the_opt_in(
     app: &str,
     readiness: InputReadiness,
 ) {
-    {
-        let directory = workspace_root().join(format!("compat/{runtime}/screens"));
-        let mut names = Vec::new();
-        for sub in ["", "widths", "n-1", "n-1/widths"] {
-            let Ok(entries) = fs::read_dir(directory.join(sub)) else {
-                continue;
-            };
-            for entry in entries.map(|entry| entry.expect("directory entry").path()) {
-                if entry
-                    .extension()
-                    .is_some_and(|extension| extension == "txt")
-                {
-                    let stem = entry.file_stem().expect("file stem").to_string_lossy();
-                    names.push(if sub.is_empty() {
-                        stem.into_owned()
-                    } else {
-                        format!("{sub}/{stem}")
-                    });
-                }
+    let directory = workspace_root().join(format!("compat/{runtime}/screens"));
+    let mut names = Vec::new();
+    for sub in ["", "widths", "n-1", "n-1/widths"] {
+        let Ok(entries) = fs::read_dir(directory.join(sub)) else {
+            continue;
+        };
+        for entry in entries.map(|entry| entry.expect("directory entry").path()) {
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "txt")
+            {
+                let stem = entry.file_stem().expect("file stem").to_string_lossy();
+                names.push(if sub.is_empty() {
+                    stem.into_owned()
+                } else {
+                    format!("{sub}/{stem}")
+                });
             }
         }
-        names.sort();
-        assert!(!names.is_empty(), "{runtime} has captured screens");
-        for name in names {
-            let bytes = captured(runtime, &name);
-            let mut plain = Harness::new(config(&plain_source(runtime), readiness));
-            let mut opted = Harness::new(config(&opted_in_source(runtime, app, true), readiness));
-            plain.feed(&bytes);
-            opted.feed(&bytes);
+    }
+    names.sort();
+    assert!(!names.is_empty(), "{runtime} has captured screens");
+    for name in names {
+        let bytes = captured(runtime, &name);
+        let mut plain = Harness::new(config(&plain_source(runtime), readiness));
+        let mut opted = Harness::new(config(&opted_in_source(runtime, app, true), readiness));
+        plain.feed(&bytes);
+        opted.feed(&bytes);
 
-            assert_eq!(plain.transitions, opted.transitions, "{runtime}/{name}");
-            assert_eq!(
-                plain.detector.input_ready(),
-                opted.detector.input_ready(),
-                "{runtime}/{name}"
-            );
-        }
+        assert_eq!(plain.transitions, opted.transitions, "{runtime}/{name}");
+        assert_eq!(
+            plain.detector.input_ready(),
+            opted.detector.input_ready(),
+            "{runtime}/{name}"
+        );
     }
 }
 

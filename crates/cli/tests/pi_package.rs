@@ -1059,15 +1059,11 @@ fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
     }
 }
 
-/// Border-like text (rules, scroll markers, status lookalikes) in the
-/// transcript or the draft never changes the classification of a captured
-/// editor screen. Text that starts like a selector line is the documented
-/// exception: see [`a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint`].
-///
-/// The sweep of each screen set is split into [`SWEEP_SHARDS`] tests, so the
-/// combinations are classified in parallel.
+/// Generates one test per shard index and records the indexes in `$indexes`, so a
+/// coverage test can prove every shard of [`SWEEP_SHARDS`] exists.
 macro_rules! sweep_shards {
-    ($sweep:ident, $set:expr, $($name:ident: $index:expr),+ $(,)?) => {
+    ($indexes:ident, $sweep:ident, $set:expr, $($name:ident: $index:expr),+ $(,)?) => {
+        const $indexes: &[usize] = &[$($index),+];
         $(
             #[test]
             fn $name() {
@@ -1081,6 +1077,7 @@ macro_rules! sweep_shards {
 const SWEEP_SHARDS: usize = 6;
 
 sweep_shards!(
+    HOSTILE_TEXT_SHARDS,
     hostile_text_never_changes_the_classification_of,
     SCREEN_SETS[0],
     hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification_part_0: 0,
@@ -1092,6 +1089,7 @@ sweep_shards!(
 );
 
 sweep_shards!(
+    HOSTILE_TEXT_PREVIOUS_SHARDS,
     hostile_text_never_changes_the_classification_of,
     SCREEN_SETS[1],
     hostile_text_never_changes_the_classification_of_the_previous_release_part_0: 0,
@@ -1102,8 +1100,12 @@ sweep_shards!(
     hostile_text_never_changes_the_classification_of_the_previous_release_part_5: 5,
 );
 
-/// The hostile-text sweep over the screens of the set `set`, for the share
-/// `sweep` selects.
+/// Border-like text (rules, scroll markers, status lookalikes) in the
+/// transcript or the draft never changes the classification of a captured
+/// editor screen. Text that starts like a selector line is the documented
+/// exception: see [`a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint`].
+///
+/// Only the share `sweep` selects is classified; sibling tests run the rest.
 fn hostile_text_never_changes_the_classification_of(set: &str, sweep: &mut Sweep) {
     let definition = installed_definition();
     for (screen, expected) in captured_screens_of(set) {
@@ -1138,6 +1140,17 @@ fn hostile_text_never_changes_the_classification_of(set: &str, sweep: &mut Sweep
 /// each combination once, and the shards split exactly those combinations.
 #[test]
 fn the_hostile_text_shards_cover_every_row_of_every_screen_set() {
+    let every_shard: Vec<usize> = (0..SWEEP_SHARDS).collect();
+    assert_eq!(
+        HOSTILE_TEXT_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
+    );
+    assert_eq!(
+        HOSTILE_TEXT_PREVIOUS_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
+    );
     for set in SCREEN_SETS {
         let mut dry = Sweep::counting();
         hostile_text_never_changes_the_classification_of(set, &mut dry);
@@ -1353,6 +1366,7 @@ fn a_dialog_opened_from_the_idle_editor_is_published_as_blocked_and_closes_to_id
 }
 
 sweep_shards!(
+    OVERLAY_SHARDS,
     transcript_text_never_changes_an_overlay_of,
     SCREEN_SETS[0],
     transcript_text_never_changes_a_dialog_or_a_selector_part_0: 0,
@@ -1364,6 +1378,7 @@ sweep_shards!(
 );
 
 sweep_shards!(
+    OVERLAY_PREVIOUS_SHARDS,
     transcript_text_never_changes_an_overlay_of,
     SCREEN_SETS[1],
     transcript_text_never_changes_an_overlay_of_the_previous_release_part_0: 0,
@@ -1429,6 +1444,17 @@ fn transcript_text_never_changes_an_overlay_of(set: &str, sweep: &mut Sweep) {
 /// The overlay shards cover every transcript row of every screen set.
 #[test]
 fn the_overlay_shards_cover_every_transcript_row_of_every_screen_set() {
+    let every_shard: Vec<usize> = (0..SWEEP_SHARDS).collect();
+    assert_eq!(
+        OVERLAY_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
+    );
+    assert_eq!(
+        OVERLAY_PREVIOUS_SHARDS.to_vec(),
+        every_shard,
+        "a test exists for every shard"
+    );
     for set in SCREEN_SETS {
         let mut dry = Sweep::counting();
         transcript_text_never_changes_an_overlay_of(set, &mut dry);

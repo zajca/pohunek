@@ -3144,8 +3144,8 @@ and `a_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed`
 S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
 `install_refuses_an_identity_installed_from_another_archive` in
 `crates/package/tests/registry.rs`. The holder cells are rows of one table in the same file,
-run by `the_holder_contract_table_holds_for_the_reserved_runtimes` and
-`the_holder_contract_table_holds_for_pi`: each row runs plan, apply and `--detect`, counts
+run by the eight `the_holder_contract_table_holds_for_<runtime>_<first|second>_half`
+tests (claude, codex, hermes and pi, one half of the rows each): each row runs plan, apply and `--detect`, counts
 that the hint names exactly the commands the row lists, in order, runs every one of them as
 the CLI sends it (the registry refuses the removal while the pin stands and accepts it after
 the pin is released), and ends with the release installed and the profile bound (reserved),
