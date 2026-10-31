@@ -164,8 +164,11 @@ maintainer-approved, read-only `pull_request` run, your fork head is never
 dispatched, run through a ref such as `refs/pull/<N>/head`, or rerun by an
 agent in this repository. For a pull request that needs `tier=main` or release
 evidence, the maintainer reviews the full diff, workflow files included, and
-re-creates the change on a maintainer branch or relies on the post-merge
-`main` run.
+re-creates the change on a maintainer branch and dispatches it, or relies on a
+later run on `main`: the post-merge run covers the main tier, while the
+release rehearsal and the other nightly-only jobs get evidence only from the
+scheduled nightly run or a `tier=nightly` dispatch (Fork heads in
+`.agents/instructions/verification.md`).
 
 For a handoff, record the issue/spec revision, current reservation and
 identity generation when applicable, exact branch/commit/PR, actual checks,

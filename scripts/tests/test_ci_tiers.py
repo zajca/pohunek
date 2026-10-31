@@ -1246,6 +1246,35 @@ class HermesTestInterpreterActionTests(unittest.TestCase):
         self.assertIn(".github/actions/hermes-test-python/**", MACOS_PATH_OWNERSHIP["platform-contracts"]["pr"])
 
 
+class OutsidePullRequestEvidenceWordingTests(unittest.TestCase):
+    """Every instruction that sends a maintainer to a later `main` run names the run that produces the evidence."""
+
+    FILES = (
+        "docs/development.md",
+        ".agents/instructions/verification.md",
+        ".agents/skills/contribute/SKILL.md",
+        ".agents/skills/deliver-issue/SKILL.md",
+        ".agents/skills/coordinate/SKILL.md",
+        ".github/agent-workflow.json",
+    )
+
+    def test_no_place_relies_on_the_post_merge_main_run_for_the_rehearsal(self):
+        for name in self.FILES:
+            with self.subTest(file=name):
+                text = " ".join((ROOT / name).read_text().split())
+                self.assertNotRegex(text, r"relies on the post-merge .?main.? run")
+                self.assertIn("later run on", text)
+                self.assertIn("tier=nightly", text)
+                self.assertRegex(text, r"(?i)nightly-only jobs|nightly-only")
+
+    def test_the_fork_head_rule_stays(self):
+        for name in ("docs/development.md", ".agents/instructions/verification.md", ".github/agent-workflow.json"):
+            with self.subTest(file=name):
+                text = " ".join((ROOT / name).read_text().split())
+                self.assertIn("refs/pull/<N>/head", text)
+                self.assertRegex(text, r"(?i)never dispatched|never run through|is never dispatched")
+
+
 class SetupUvActionTests(unittest.TestCase):
     """uv is installed from one pinned, checksummed composite, never from a version manifest."""
 

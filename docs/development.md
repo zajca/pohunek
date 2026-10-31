@@ -148,8 +148,14 @@ passed, and a failing, cancelled or still pending check does not.
   or through `pull_request_target` or `workflow_run`, or rerun by an agent in
   this repository. The maintainer reviews the full diff, workflow files
   included, then re-creates the change on a maintainer branch and runs the
-  release evidence there, or relies on the post-merge `main` run before any
-  release.
+  release evidence there (a `tier=nightly` dispatch for the release rehearsal),
+  or relies on a later run on `main`: the post-merge `main` run is the main
+  tier, while the release rehearsal, the release gate and the other
+  nightly-only jobs (`test selection audit (G3)`, `tests (relay DB,
+  PostgreSQL)`) get their evidence only from the scheduled nightly run or a
+  `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
+  `scripts/release` requires that evidence on the release commit and, when it
+  pushes the candidate, dispatches the missing tier itself.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

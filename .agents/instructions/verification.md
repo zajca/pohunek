@@ -280,8 +280,14 @@ this repository's agent instructions. A fork head is never dispatched, never run
 through a ref such as `refs/pull/<N>/head`, and its jobs are never rerun by an
 agent. For an outside pull request the maintainer reviews the full diff,
 workflow files included, then re-creates the change on a maintainer branch and
-dispatches that branch, or relies on the post-merge `main` run before any
-release. Fork-provided workflow YAML runs only in the approved, read-only
+dispatches that branch (`tier=nightly` for the release rehearsal and the other
+nightly-only jobs, `tier=main` for the rest), or relies on a later run on
+`main`. The post-merge `main` run is the main tier and includes `cargo-udeps`;
+the release rehearsal, the release gate, `test selection audit (G3)` and
+`tests (relay DB, PostgreSQL)` get their evidence only from the scheduled
+nightly run or a `tier=nightly` dispatch of `main` or of a maintainer branch.
+`scripts/release` requires that evidence on the release commit and, when it
+pushes the candidate, dispatches the missing tier itself. Fork-provided workflow YAML runs only in the approved, read-only
 `pull_request` run.
 
 The automatic red-main issue reporter remains pending under #477 S3. The S4
