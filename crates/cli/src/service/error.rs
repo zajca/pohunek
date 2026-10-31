@@ -964,8 +964,7 @@ macro_rules! at_risk_plain {
 
 const AT_RISK_RESTORED_PATH_HINT: &str = at_risk_restored_path!();
 const AT_RISK_STALE_PATH_HINT: &str = at_risk_stale_path!();
-const AT_RISK_STALE_PATH_RESUMED_HINT: &str =
-    concat!(at_risk_stale_path!(), abandon_pending_upgrade!());
+const AT_RISK_STALE_PATH_RESUMED_HINT: &str = "if the runtime moved since the search path was recorded, do not accept the loss for that cause: `pohunek service refresh-path` is refused while this upgrade is pending, so first roll the pending upgrade back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>` (`pohunek service status` shows that version as `from`; the previous daemon's adoption verdict is taken again before it is restored), then with the `pohunek` of the release you are installing (`./pohunek` in its unpacked archive) run `pohunek service refresh-path --dry-run` and `pohunek service refresh-path` (it restarts the daemon with the new path), then rerun the upgrade; otherwise preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed";
 const AT_RISK_HINT: &str = at_risk_plain!();
 const AT_RISK_RESUMED_HINT: &str = concat!(at_risk_plain!(), abandon_pending_upgrade!());
 

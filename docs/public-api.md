@@ -2897,8 +2897,8 @@ and `--accept-runtime-loss` apply and a refusal changes nothing), and never
 stops or retires worker jobs. The success reports of `install` and `upgrade` carry an additive `repair`
 object (`version`, `restored`, `set_aside`, `daemon` as `none`, `installed`,
 `started`, `restarted` or `kept`, a resumed transaction that had already replaced the
-daemon, which still runs from the moved entry until `upgrade --repair --from` is rerun
-once the record is cleared; `null` without the flag and when nothing was repaired).
+daemon, which still runs from the moved entry until `upgrade --repair --from` is
+rerun; `null` without the flag and when nothing was repaired).
 `UpgradeReport.unchanged` states that the active version did not change; a
 repair of it can still restart the daemon. The trust claim is that of `service install --from`
 (the operator chose the release, each binary answers `--version`, a sealed

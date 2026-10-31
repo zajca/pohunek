@@ -139,3 +139,29 @@ async fn the_rollback_to_the_previous_version_judges_its_adoption_again() {
     assert_eq!(harness.config().expect("config").active_version(), V1);
     assert_eq!(harness.pending(), None);
 }
+
+/// A resumed upgrade refused with the stale-path warning names the rollback
+/// first, because `refresh-path` is refused while the upgrade is pending.
+#[test]
+fn the_resumed_stale_path_hint_names_the_rollback_before_refresh_path() {
+    let refused = Error::UpgradeAtRisk {
+        sessions: Vec::new(),
+        stopped_sessions: vec![risk_a()],
+        acceptance: Box::default(),
+        warnings: vec![format!(
+            "{} /old",
+            super::super::preflight::STALE_PATH_WARNING
+        )],
+        resumed: true,
+    };
+
+    assert_steps_in_order(
+        refused.hint().expect("hint"),
+        &[
+            "first roll the pending upgrade back with `pohunek service upgrade --from <prefix>/libexec/pohunek/<previous version>`",
+            "`pohunek service refresh-path --dry-run`",
+            "`pohunek service refresh-path`",
+            "then rerun the upgrade",
+        ],
+    );
+}
