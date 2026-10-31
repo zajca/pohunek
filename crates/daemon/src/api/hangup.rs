@@ -15,6 +15,7 @@ use std::pin::Pin;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{DuplexStream, Interest};
 use tokio::net::{TcpStream, UnixStream};
+use tracing::warn;
 
 /// Resolves when the client's connection was closed completely.
 pub(super) struct HangupWatch(Pin<Box<dyn Future<Output = ()> + Send>>);
@@ -34,13 +35,25 @@ pub(super) trait ClientTransport {
 
 impl ClientTransport for UnixStream {
     fn hangup_watch(&self) -> Option<HangupWatch> {
-        let duplicate = self.as_fd().try_clone_to_owned().ok()?;
-        let watched = AsyncFd::with_interest(duplicate, Interest::WRITABLE).ok()?;
+        let duplicate = self
+            .as_fd()
+            .try_clone_to_owned()
+            .inspect_err(|error| warn!(%error, "attach hangup watch not armed: descriptor duplication failed"))
+            .ok()?;
+        let watched = AsyncFd::with_interest(duplicate, Interest::WRITABLE)
+            .inspect_err(
+                |error| warn!(%error, "attach hangup watch not armed: reactor registration failed"),
+            )
+            .ok()?;
         Some(HangupWatch(Box::pin(async move {
             loop {
-                let Ok(mut ready) = watched.ready(Interest::WRITABLE).await else {
-                    std::future::pending::<()>().await;
-                    return;
+                let mut ready = match watched.ready(Interest::WRITABLE).await {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        warn!(%error, "attach hangup watch stopped: readiness failed");
+                        std::future::pending::<()>().await;
+                        return;
+                    }
                 };
                 if ready.ready().is_write_closed() {
                     return;
