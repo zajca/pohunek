@@ -359,6 +359,12 @@ impl SessionRegistry {
                             debug!(error = %error, "Enter skipped: the runtime ended after the text was delivered");
                             Ok(())
                         }
+                        Err(DelayedInputFailure::Refused(_))
+                            if registry.input_runtime_ended(&session_id).await =>
+                        {
+                            debug!("Enter withheld: the runtime ended after the text was delivered");
+                            Ok(())
+                        }
                         Err(DelayedInputFailure::Refused(error)) => Err(error),
                         Err(
                             DelayedInputFailure::Text(error) | DelayedInputFailure::Enter(error),
@@ -1350,21 +1356,37 @@ async fn write_delayed_input(
         .await
         .map_err(DelayedInputFailure::Enter)?;
     let sessions = registry.inner.sessions.lock().await;
-    if let Some(entry) = sessions.get(session_id) {
-        if entry
-            .input_rules
-            .validate_activity(entry.info.activity)
-            .is_err()
-        {
-            return Err(DelayedInputFailure::Refused(
-                ProtocolError::session_input_not_submitted(InputNotSubmittedReason::AgentBlocked),
-            ));
+    // Only a runtime that refuses input while blocked needs the activity to
+    // stay fixed until Enter's send starts; any other runtime sends without
+    // holding the session registry.
+    let guarded = sessions
+        .get(session_id)
+        .is_some_and(|entry| entry.input_rules.refuses_while_blocked());
+    if guarded {
+        if let Some(entry) = sessions.get(session_id) {
+            if entry
+                .input_rules
+                .validate_activity(entry.info.activity)
+                .is_err()
+            {
+                return Err(DelayedInputFailure::Refused(
+                    ProtocolError::session_input_not_submitted(
+                        InputNotSubmittedReason::AgentBlocked,
+                    ),
+                ));
+            }
         }
+        reservation
+            .commit(move || drop(sessions))
+            .await
+            .map_err(DelayedInputFailure::Enter)?;
+    } else {
+        drop(sessions);
+        reservation
+            .commit(|| {})
+            .await
+            .map_err(DelayedInputFailure::Enter)?;
     }
-    reservation
-        .commit(move || drop(sessions))
-        .await
-        .map_err(DelayedInputFailure::Enter)?;
     Ok(())
 }
 

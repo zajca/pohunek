@@ -4118,7 +4118,7 @@ async fn wait_for_any_agent_state(
 
 /// Writes a Claude stub that draws the recorded folder-trust dialog, logs what
 /// it sees to `log` in order (`dialog`, `gate`, `box`, `input:<bytes>`), waits
-/// for a write to the fifo `gate`, then draws the prompt box.
+/// for the file `gate` to exist, then draws the prompt box.
 fn write_claude_trust_stub(script: &Path, log: &Path, gate: &Path) {
     let trust = std::fs::read_to_string(
         pohunek_test_support::workspace_root().join("compat/claude/screens/trust.txt"),
@@ -4141,7 +4141,6 @@ import tty
 
 tty.setraw(0, termios.TCSANOW)
 log = open({log:?}, "ab", buffering=0)
-gate = os.open({gate:?}, os.O_RDONLY | os.O_NONBLOCK)
 
 def note(text):
     log.write(text + b"\n")
@@ -4149,14 +4148,10 @@ def note(text):
 os.write(1, b"\x1b[?2004h")
 os.write(1, b"{trust}")
 note(b"dialog")
-released = False
-while not released:
-    ready, _, _ = select.select([0, gate], [], [])
-    if 0 in ready:
+while not os.path.exists({gate:?}):
+    ready, _, _ = select.select([0], [], [], 0.05)
+    if ready:
         note(b"input:" + os.read(0, 4096))
-    if gate in ready:
-        os.read(gate, 16)
-        released = True
 note(b"gate")
 os.write(1, b"{prompt}")
 note(b"box")
@@ -4177,24 +4172,16 @@ while True:
 
 /// A session whose Claude stub first draws the recorded folder-trust dialog
 /// (`compat/claude/screens/trust.txt`) reads `blocked`, and its initial input
-/// is not written before the prompt box renders: the stub logs what it does in
-/// order, and the input follows the box. `idle` then means the prompt box is
-/// ready for input.
+/// is not written while the dialog is up: the stub logs what it does in order,
+/// and the input follows the box. `idle` then means the prompt box is ready for
+/// input.
 #[tokio::test]
 async fn claude_initial_input_waits_behind_the_trust_dialog_until_the_prompt_box_renders() {
     let socket = temp_socket("claude-trust");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
     let log = socket.dir.join("stub.log");
-    let gate = socket.dir.join("gate.fifo");
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(&gate)
-            .status()
-            .expect("run mkfifo")
-            .success(),
-        "create the gate fifo"
-    );
+    let gate = socket.dir.join("gate");
     let script = socket.dir.join("claude-trust.py");
     write_claude_trust_stub(&script, &log, &gate);
     write_claude_profile(&agents_dir, "claudetrust", &script);
@@ -4226,9 +4213,7 @@ async fn claude_initial_input_waits_behind_the_trust_dialog_until_the_prompt_box
     let id = wait_for_any_agent_state(&mut subscriber, AgentActivity::Blocked, StateSource::Screen)
         .await;
     assert!(!create.is_finished(), "the input waits behind the dialog");
-    tokio::task::spawn_blocking(move || std::fs::write(&gate, b"go").expect("open the gate"))
-        .await
-        .expect("join the gate writer");
+    std::fs::write(&gate, b"go").expect("open the gate");
     wait_for_agent_state_event(
         &mut subscriber,
         &id,

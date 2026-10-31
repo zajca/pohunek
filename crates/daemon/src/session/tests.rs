@@ -8201,7 +8201,7 @@ async fn delayed_plain_input_withholds_enter_when_the_agent_turns_blocked_during
         })
         .await
         .expect("input after the dialog cleared");
-    let output = wait_for_session_output(&registry, &id, &["second-marker"]).await;
+    let output = wait_for_session_output(&registry, &id, &["got:"]).await;
     let answer = output
         .lines()
         .find(|line| line.contains("got:"))
