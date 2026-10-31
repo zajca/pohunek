@@ -474,8 +474,32 @@ pub struct PackageBindProfileParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub digest: Option<PackageDigest>,
+    /// The pin the caller expects the profile to hold now. When the profile's
+    /// current pin differs, the bind is refused with
+    /// `package_profile_pin_changed` and nothing is written, a dry run
+    /// included. Absent means no condition. A client sends it only when
+    /// `host.inspect` reports `HostCapabilities::package_bind_profile_expected_supported`;
+    /// an older daemon rejects the unknown parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub expected_previous: Option<ExpectedPin>,
     /// Validate and report without changing the profile.
     pub dry_run: bool,
+}
+
+/// The pin a profile bind expects to replace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ExpectedPin.ts"))]
+pub enum ExpectedPin {
+    /// The profile pins no package.
+    Unpinned,
+    /// The profile pins the package with this digest.
+    Pinned {
+        /// The digest of the pinned package.
+        digest: PackageDigest,
+    },
 }
 
 /// What a profile bind did to the profile file.
@@ -722,6 +746,9 @@ pub enum PackageErrorKind {
     ProfileTargetInvalid,
     /// The profile changed while it was being rewritten and was left as found.
     ProfileChanged,
+    /// The profile's current pin is not the one the request expected to
+    /// replace; nothing was changed.
+    ProfilePinChanged,
     /// The package's integration handler or hook schema is not compatible with
     /// a version of the same package that is retained by a session or profile
     /// pin, or that is selected; nothing was changed.
@@ -766,6 +793,7 @@ impl PackageErrorKind {
             Self::ProfileBaseBuiltin => "package_profile_base_builtin",
             Self::ProfileTargetInvalid => "package_profile_target_invalid",
             Self::ProfileChanged => "package_profile_changed",
+            Self::ProfilePinChanged => "package_profile_pin_changed",
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
@@ -822,6 +850,9 @@ impl PackageErrorKind {
             Self::ProfileChanged => {
                 "the agent profile changed while it was being rewritten and was left as found"
             }
+            Self::ProfilePinChanged => {
+                "the agent profile pins another package than the request expected to replace, and was left as found"
+            }
             Self::IntegrationIncompatible => {
                 "the package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected"
             }
@@ -871,7 +902,9 @@ impl PackageErrorKind {
             Self::ProfileTargetInvalid => {
                 "install, enable and select a package that serves the base runtime, or pass the digest of one"
             }
-            Self::ProfileChanged => "run the command again to review the profile as it is now",
+            Self::ProfileChanged | Self::ProfilePinChanged => {
+                "run the command again to review the profile as it is now"
+            }
             Self::IntegrationIncompatible => {
                 "stop or remove the sessions and unpin the profiles that use the other version, or uninstall it, then retry"
             }
@@ -1006,6 +1039,7 @@ mod tests {
             PackageErrorKind::ProfileBaseBuiltin,
             PackageErrorKind::ProfileTargetInvalid,
             PackageErrorKind::ProfileChanged,
+            PackageErrorKind::ProfilePinChanged,
             PackageErrorKind::IntegrationIncompatible,
             PackageErrorKind::RuntimeFeatureUnsupported,
             PackageErrorKind::CommandsClientUnsupported,

@@ -180,6 +180,7 @@ async fn install(fixture: &Fixture, kind: &Kind, package: &Package, version: &st
 async fn pin_profile(registry: &SessionRegistry, digest: &PackageDigest) {
     let bound = registry
         .package_bind_profile(PackageBindProfileParams {
+            expected_previous: None,
             profile: PROFILE.to_owned(),
             digest: Some(digest.clone()),
             dry_run: false,
@@ -932,6 +933,7 @@ fn apply_release_step(
         dry_run: false,
         daemon_version: crate::DAEMON_VERSION.to_owned(),
         environment: Ok(test_launch_environment()),
+        accepted_gaps: Vec::new(),
     })
     .expect("the release step applies")
 }
@@ -1120,6 +1122,7 @@ async fn assert_release_record(tag: &str, source: package::registry::PackageSour
         dry_run: false,
         daemon_version: crate::DAEMON_VERSION.to_owned(),
         environment: Ok(test_launch_environment()),
+        accepted_gaps: Vec::new(),
     });
     let restarted = restart(&session.fixture).await;
     let resumed = restarted

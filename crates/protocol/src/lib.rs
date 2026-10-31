@@ -125,7 +125,7 @@ pub use notification::{
 };
 #[doc(inline)]
 pub use package::{
-    CommandExposure, CommandInfo, PackageBindProfileParams, PackageBindProfileResult,
+    CommandExposure, CommandInfo, ExpectedPin, PackageBindProfileParams, PackageBindProfileResult,
     PackageBindStatus, PackageChangeResult, PackageDoctorParams, PackageDoctorResult,
     PackageErrorKind, PackageFault, PackageFinding, PackageFindingKind, PackageInfo,
     PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,

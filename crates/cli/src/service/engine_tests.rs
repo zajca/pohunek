@@ -293,6 +293,8 @@ struct RuntimeScript {
     calls: Vec<String>,
     /// The `PATH` each call ran with, in call order.
     search_paths: Vec<String>,
+    /// The accepted gaps each call ran with, in call order.
+    accepted: Vec<Vec<AcceptedGap>>,
     /// The daemon job removals made before each dry run, in order.
     removals_at_plan: Vec<usize>,
 }
@@ -396,9 +398,11 @@ impl RuntimeStep for RuntimeFake {
         dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
+        accepted: &'a [AcceptedGap],
     ) -> Running<'a> {
         Box::pin(async move {
             self.script().search_paths.push(search_path.to_owned());
+            self.script().accepted.push(accepted.to_vec());
             if dry_run {
                 let removals = self.1.world().uninstalls;
                 let mut script = self.script();
@@ -3042,6 +3046,39 @@ fn runtime_state(harness: &Harness) -> (Option<String>, String) {
     )
     .expect("profile");
     (registry, profile)
+}
+
+/// The install hands the gaps it was given to the runtime step for the plan and
+/// for the apply; an install given none hands it none, so every refusal of the
+/// step still rolls the install back.
+#[tokio::test]
+async fn an_install_hands_its_accepted_gaps_to_the_runtime_step_and_nothing_else() {
+    let accepted = AcceptedGap {
+        runtime: "claude".to_owned(),
+        code: CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM.to_owned(),
+    };
+    let accepting = Harness::new();
+    accepting.runtimes.plan(installing_plan());
+    let plain = Harness::new();
+    plain.runtimes.plan(installing_plan());
+
+    accepting
+        .engine()
+        .with_accepted_gaps(vec![accepted.clone()])
+        .install(&accepting.staged(V1), &accepting.prefix(), V1)
+        .await
+        .expect("install");
+    plain.install(V1).await.expect("install");
+
+    assert_eq!(
+        accepting.runtimes.script().accepted,
+        vec![vec![accepted.clone()]; 2],
+        "the plan and the apply both carry the accepted gap"
+    );
+    assert_eq!(
+        plain.runtimes.script().accepted,
+        vec![Vec::<AcceptedGap>::new(); 2]
+    );
 }
 
 #[tokio::test]

@@ -925,7 +925,12 @@ one selected, enabled package serving the base; none or several is an error,
 never a guess. The command first asks the daemon for a dry run, prints the
 profile, base, package version, digest, and current pin, and changes nothing
 until repeated with `--yes` (`consent_required` otherwise); the consented call
-names the digest the preview showed. A base served by a built-in (`shell`) is
+names the digest and the current pin the preview showed. A profile pinned
+differently since is refused (`package_profile_pin_changed`, nothing written) and
+the command is run again to review it. A daemon that predates this check
+(`package_bind_profile_expected_supported`) is not sent the pin: the bind is
+unconditional, as before, and the command prints a note on stderr that a pin
+made since the preview is overwritten. A base served by a built-in (`shell`) is
 refused (`package_profile_base_builtin`), as are a missing profile
 (`package_profile_not_found`), one the daemon cannot accept as a profile file
 (`package_profile_unusable`: symlink, hard link, wrong owner, group- or

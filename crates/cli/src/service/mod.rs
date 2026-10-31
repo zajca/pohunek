@@ -27,6 +27,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use pohunek_platform::supervisor::Namespace;
+use pohunek_service_config::runtimes::AcceptedGap;
 use pohunek_service_config::{ServiceConfig, UpgradeSource};
 
 pub mod backend;
@@ -78,7 +79,7 @@ pub async fn install(
     prefix: Option<PathBuf>,
     repair: bool,
 ) -> Result<report::InstallReport, Error> {
-    install_in(&Context::resolve()?, from, prefix, repair).await
+    install_in(&Context::resolve()?, from, prefix, repair, Vec::new()).await
 }
 
 /// Installs this CLI's version as [`install`] does, for the installation
@@ -87,11 +88,15 @@ pub async fn install(
 /// # Errors
 ///
 /// Returns the errors of [`install`].
+///
+/// The runtime step reports `accepted_gaps` as gaps instead of refusing them,
+/// so the install goes on and the runtime stays a gap.
 pub async fn install_in(
     context: &Context,
     from: Option<PathBuf>,
     prefix: Option<PathBuf>,
     repair: bool,
+    accepted_gaps: Vec<AcceptedGap>,
 ) -> Result<report::InstallReport, Error> {
     let inherited = inherited_lock(context)?;
     let from = staged_dir(context, from)?;
@@ -103,6 +108,7 @@ pub async fn install_in(
     let backend = Backend::connect(context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
     engine(context, &backend, inherited)
         .with_repair(repair)
+        .with_accepted_gaps(accepted_gaps)
         .install(&from, &prefix, VERSION)
         .await
 }

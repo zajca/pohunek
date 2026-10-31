@@ -91,7 +91,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek store rejected list [--json]` | List the `metadata.jsonl` lines the daemon cannot load: line number, kind, whether the line may pin a runtime package, whether it may belong to a live runtime, why it was rejected, and its content hash (at most 100; `total` counts all). While such a line may pin a package, package removal and selection fail closed (`package_retention_uncertain`); `pohunek doctor` reports the count as `metadata_store_rejected_lines`. Local daemon only; `--host` is rejected. |
 | `pohunek store rejected set-aside <content-hash> [--accept-pin-loss] [--json]` | Move every rejected line with this hash into `metadata.rejected.jsonl` next to the store, with an audit record; the daemon never deletes that file. A line that may belong to a session with a live runtime, or a `resume` line whose pin cannot be read, is refused (`store_rejected_line_live`) unless `--accept-pin-loss` states that no runtime depends on its package pin. A daemon that predates the command answers `method_not_found`; the runtime package recovery runbook has the manual remedy for it. |
 | `pohunek plugin profile list [--json]` | List host agent profiles (`agents/*.toml`) with base runtime, pinned package and digest, and a state: `builtin` (the base is the built-in `shell`), `pinned`, `needs_migration` (an installed package serves the base but the profile pins none), `package_not_installed` (the base is not built in and no installed package serves it, so the profile cannot launch; the detail names the package install, the official one for `codex`, `claude` and `hermes`, then the migration), `package_unavailable` (the pinned digest is installed but cannot be loaded, or no installed package serves the base but one that may serve it cannot be loaded; the detail names `pohunek plugin doctor`, which reports the fault and its repair, and for an unpinned profile the migration after it), `pin_not_installed`, or `unreadable`. Reports parse errors by line only; never prints file content. |
-| `pohunek plugin profile migrate <name> [--digest <d>] [--yes]` | Pin a profile to an installed package; the daemon rewrites only its `package` and `digest` keys (every other byte, including `[env]`, is preserved) under the package lifecycle authority with an atomic rename, so the profile never goes missing. Without `--digest` it uses the selected, enabled package serving the base runtime. Previews first and needs `--yes`; a profile never changes digest through `plugin update` or `select`. `service upgrade` repins a profile pinned to an older version of the release's official package and keeps every other pin. |
+| `pohunek plugin profile migrate <name> [--digest <d>] [--yes]` | Pin a profile to an installed package; the daemon rewrites only its `package` and `digest` keys (every other byte, including `[env]`, is preserved) under the package lifecycle authority with an atomic rename, so the profile never goes missing. Without `--digest` it uses the selected, enabled package serving the base runtime. Previews first and needs `--yes`, which binds only if the profile still holds the pin the preview showed (`package_profile_pin_changed` otherwise; a daemon that cannot check this gets the plain bind and a note on stderr); a profile never changes digest through `plugin update` or `select`. `service upgrade` repins a profile pinned to an older version of the release's official package and keeps every other pin. |
 | `pohunek workflow install <archive> --sha256 <digest> [--no-enable] [--yes]` | Verify a workflow plugin archive against the digest you supply, validate its `workflow.toml`, and print its id, version, digest and every action's, job's, service's and reaction's argv with resolved absolute paths; installs into this user's workflow store only after repeating the command with `--yes` (`consent_required` until then). A plugin with jobs, services or reactions is enabled like `workflow enable` does; without a `pohunek service` installation of this pohunek version an enabling install fails with `workflow_service_not_installed` before any effect, every refusal of an enabling install (including `workflow_store_busy` while another unit command holds `units.lock`) comes before the plugin is recorded, and when reaching the service manager, marking the plugin enabled (for example `workflow_store_busy` while another workflow command holds the store lock) or installing a unit fails afterwards, the command fails with `workflow_installed_disabled` (the failure's code as `cause`): the plugin stays installed disabled with no units (fix the cause, run `workflow enable`), or, when undoing the failed step failed too (a unit install, or clearing a flag that may have been written), the message says it may remain enabled or keep units (run `workflow disable`, then `workflow enable`). Installing a recorded archive again never touches its units. Never contacts a daemon; see the [workflow plugins guide](knowledge/guides/workflow-plugins.md). |
 | `pohunek workflow list / inspect <id>` | List installed workflow plugins, or show one plugin's actions, jobs, services, reactions, files, state and config directories after re-verifying its files (`workflow_root_invalid` when they changed). |
 | `pohunek workflow status [<id>] [--json]` | Show each recorded job and service of the installed plugins (every plugin with units, or the named one): its native state from the service manager (`running`, `stopped`, `failed`, or `unknown` with the reason), its last run record, its consecutive failures and, for a service, the restart delay its next start waits. Local and read-only; see the [workflow plugins guide](knowledge/guides/workflow-plugins.md#status). |
@@ -269,8 +269,8 @@ upgrade of the release files. It runs in this order:
 6. Verdict: the plan is read again. Every runtime the preview planned must be
    present in it, it must carry no refusal, and it must not list a runtime the
    preview did not show. Every profile pin the preview showed must be done. No
-   hook may have failed. Then the daemon's health and `doctor` run. Hook gaps
-   are listed, not failed.
+   hook may have failed. Then the daemon's health and `doctor` run; a failed
+   check is named in the output. Hook gaps are listed, not failed.
 
 If the plan read after the service install differs from the preview in any way
 the install engine does not account for, setup stops there. The output names the
@@ -279,13 +279,23 @@ changed nothing else. Fix the cause the output names and run `pohunek setup`
 again: it plans from the installed service and converges without reinstalling
 it.
 
-On a host without the service, a gap that the install's own runtime step would
-refuse stops setup before any change: a runtime a profile, session or
-integration uses that has no package for this platform. Remove or repin that
-profile, then run `pohunek setup` again. On a host with the service, setup reads
-the plan again after you confirm; if the host changed while you read the
-preview, for example a profile was pinned meanwhile, it stops before any change
-and asks for a new run.
+On a host without the service, a runtime a profile, session or integration
+uses that has no package for this platform is a gap in the preview, and the
+install goes on: the preview says that no package is installed for it, the
+install's own runtime step reports exactly that gap instead of refusing it, and
+the service, the config and the other runtimes are installed. A runtime the
+release catalog lists more than once for this platform, which a profile,
+session or integration uses, is a malformed release: setup stops before any
+change; use a release whose catalog lists it once, or remove or repin the
+profile, then run `pohunek setup` again. A runtime only the detection found and
+the catalog lists more than once is a gap that blocks nothing. On a host with
+the service, setup reads the plan again after you confirm; if the host changed
+while you read the preview, for example a profile was pinned meanwhile, it stops
+before any change and asks for a new run. Each profile pin is then made only if
+the profile still holds the pin the plan showed, so a pin made after that read
+is refused (`package_profile_pin_changed`) instead of overwritten; against a
+daemon that cannot check this, setup prints a note and the overwrite race
+remains for that run.
 
 The run is refused when it cannot ask: without a terminal and without `--yes`,
 or with `--json` and no `--yes`. The refusal changes nothing, and its hint

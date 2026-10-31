@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use pohunek_test_support::env::TestEnv;
-use protocol::{Request, Response, PROTOCOL_VERSION};
+use protocol::{ErrorClass, ProtocolError, Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
 /// Mode of every private fixture directory.
@@ -154,7 +154,15 @@ fn serve_connection(stream: UnixStream, reply: fn(&str, &Value) -> Value, record
                 .push((request.method().to_owned(), request.params().clone()));
             result
         };
-        let response = Response::ok(PROTOCOL_VERSION, request.id(), result).expect("response");
+        let response = match result["__refused"].as_str() {
+            Some(code) => Response::err(
+                PROTOCOL_VERSION,
+                request.id(),
+                ProtocolError::new(ErrorClass::Runtime, code, "refused by the fixture", None),
+            ),
+            None => Response::ok(PROTOCOL_VERSION, request.id(), result),
+        }
+        .expect("response");
         writeln!(
             reader.get_mut(),
             "{}",
@@ -206,6 +214,16 @@ fn capabilities(commands: bool) -> Value {
     });
     if commands {
         value["package_install_commands_supported"] = json!(true);
+    }
+    value
+}
+
+/// The host capabilities of a daemon that checks the previous pin of a profile
+/// bind, or one that predates the check.
+fn capabilities_checking_pins(checks: bool) -> Value {
+    let mut value = capabilities(true);
+    if checks {
+        value["package_bind_profile_expected_supported"] = json!(true);
     }
     value
 }
@@ -827,6 +845,7 @@ fn daemon_serving_pi(method: &str, params: &Value) -> Value {
             "generation": 2,
             "packages": [package("acme.pi", "1.0.0", DIGEST_NEW, true)]
         }),
+        "host.inspect" => capabilities_checking_pins(true),
         "package.bind_profile" => bind_result(
             if params["dry_run"] == true {
                 "preview"
@@ -836,6 +855,28 @@ fn daemon_serving_pi(method: &str, params: &Value) -> Value {
             params,
         ),
         other => panic!("unexpected method {other}"),
+    }
+}
+
+/// A daemon that predates the previous-pin check of a profile bind.
+fn daemon_without_the_pin_check(method: &str, params: &Value) -> Value {
+    match method {
+        "host.inspect" => capabilities_checking_pins(false),
+        _ => daemon_serving_pi(method, params),
+    }
+}
+
+/// A daemon whose profile pins an older package: the preview names it, and the
+/// bind is refused when the caller expected another pin.
+fn daemon_with_an_older_pin(method: &str, params: &Value) -> Value {
+    match method {
+        "package.bind_profile" if params["dry_run"] == true => {
+            let mut result = bind_result("preview", params);
+            result["previous"] = json!(DIGEST_OLD);
+            result
+        }
+        "package.bind_profile" => json!({ "__refused": "package_profile_pin_changed" }),
+        _ => daemon_serving_pi(method, params),
     }
 }
 
@@ -1010,18 +1051,93 @@ fn profile_migrate_with_yes_binds_through_the_daemon_and_never_writes_the_file()
         methods(&recorded),
         [
             "package.bind_profile",
+            "host.inspect",
             "package.bind_profile",
             "package.bind_profile",
+            "host.inspect",
             "package.bind_profile"
         ]
     );
     // The consented call names the digest the preview announced.
-    for pair in recorded.chunks(2) {
+    for pair in recorded
+        .iter()
+        .filter(|(method, _)| method == "package.bind_profile")
+        .collect::<Vec<_>>()
+        .chunks(2)
+    {
         assert_eq!(pair[0].1["dry_run"], true);
         assert_eq!(pair[1].1["dry_run"], false);
         assert_eq!(pair[1].1["digest"], DIGEST_NEW);
         assert_eq!(pair[1].1["profile"], "work");
     }
+}
+
+/// The consented migration names the pin the preview showed to a daemon that
+/// checks it: none for an unpinned profile.
+#[test]
+fn profile_migrate_names_an_unpinned_profile_to_a_daemon_that_checks_the_pin() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &profile_text(), 0o600);
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--yes"]);
+
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(!stderr_text(&output).contains("cannot check"));
+    let recorded = daemon.finish();
+    let bind = recorded.last().expect("the consented bind");
+    assert_eq!(bind.1["expected_previous"], "unpinned", "{}", bind.1);
+}
+
+/// The pin the preview showed is the one the consented bind expects, and a
+/// daemon that finds another pin refuses with `package_profile_pin_changed`.
+#[test]
+fn profile_migrate_stops_when_the_daemon_finds_another_pin_than_the_preview_showed() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &pinned_text(DIGEST_OLD), 0o600);
+    let daemon = fixture.serve(daemon_with_an_older_pin);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--yes", "--json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "package_profile_pin_changed"
+    );
+    let recorded = daemon.finish();
+    let bind = recorded.last().expect("the consented bind");
+    assert_eq!(
+        bind.1["expected_previous"],
+        json!({"pinned": {"digest": DIGEST_OLD}}),
+        "{}",
+        bind.1
+    );
+}
+
+/// A daemon that predates the check gets the plain bind, and the output says
+/// the overwrite race remains.
+#[test]
+fn profile_migrate_against_a_daemon_that_cannot_check_the_pin_binds_plainly_and_says_so() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &profile_text(), 0o600);
+    let daemon = fixture.serve(daemon_without_the_pin_check);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--yes"]);
+
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(
+        stderr_text(&output).contains("this daemon cannot check the pin"),
+        "{}",
+        stderr_text(&output)
+    );
+    let recorded = daemon.finish();
+    let bind = recorded.last().expect("the consented bind");
+    assert_eq!(bind.1["dry_run"], false);
+    assert!(
+        bind.1.get("expected_previous").is_none(),
+        "an older daemon would reject the parameter: {}",
+        bind.1
+    );
 }
 
 #[test]
@@ -1089,15 +1205,17 @@ fn profile_migrate_passes_a_full_digest_and_resolves_a_prefix_through_the_packag
         methods(&recorded),
         [
             "package.bind_profile",
+            "host.inspect",
             "package.bind_profile",
             "package.list",
             "package.bind_profile",
+            "host.inspect",
             "package.bind_profile",
             "package.list",
         ]
     );
     assert_eq!(recorded[0].1["digest"], DIGEST_NEW);
-    assert_eq!(recorded[3].1["digest"], DIGEST_NEW);
+    assert_eq!(recorded[4].1["digest"], DIGEST_NEW);
 }
 
 #[test]

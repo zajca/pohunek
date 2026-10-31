@@ -11,8 +11,8 @@
 use package::registry::{RegistryState, RetainedDigests};
 use package::PackageDigest;
 use protocol::{
-    PackageBindProfileParams, PackageBindProfileResult, PackageBindStatus, PackageErrorKind,
-    PackageRuntimeInfo, RuntimeId,
+    ExpectedPin, PackageBindProfileParams, PackageBindProfileResult, PackageBindStatus,
+    PackageErrorKind, PackageRuntimeInfo, RuntimeId,
 };
 use tracing::warn;
 
@@ -188,6 +188,18 @@ pub(super) fn bind_profile(
     }
     let file = dir.read(name).map_err(|error| bind_kind(name, error))?;
     let head = parse_head(file.text()).map_err(|detail| unusable(name, &detail))?;
+    // Compared with the pin of the text this call read; the publish below
+    // leaves a profile edited after that read as found, so the comparison and
+    // the write see the same file.
+    if let Some(expected) = &params.expected_previous {
+        let holds = match expected {
+            ExpectedPin::Unpinned => head.pin().is_none(),
+            ExpectedPin::Pinned { digest } => head.pin().is_some_and(|pin| &pin.digest == digest),
+        };
+        if !holds {
+            return Err(PackageErrorKind::ProfilePinChanged);
+        }
+    }
     let target = resolve_target(context, &head.base, params.digest.as_ref(), retained)?;
     let pin = Pin {
         package: target.inspected.info.package.id.clone(),
@@ -200,7 +212,7 @@ pub(super) fn bind_profile(
             status,
             profile: name.to_owned(),
             base: head.base.clone(),
-            previous: head.digest.clone(),
+            previous: head.pin().map(|pin| pin.digest),
             package,
             runtime: target.runtime.clone(),
             reloaded,

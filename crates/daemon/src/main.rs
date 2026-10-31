@@ -77,8 +77,8 @@ use pohunek_service_config::preflight::{
     RELEASE_PLAN_FLAG,
 };
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DETECT_FLAG, DRY_RUN_FLAG,
-    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    AcceptedGap, CatalogStatus, EnsureReport, Refusal, ACCEPT_GAP_FLAG, CODE_DAEMON_RUNNING,
+    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming, RUNTIME_DROP_BOUND};
 
@@ -228,13 +228,24 @@ async fn daemon_main() -> ExitCode {
         .skip(1)
         .eq([OsString::from(ENSURE_RUNTIMES_ARG)])
     {
-        return print_ensure_runtimes(false);
+        return print_ensure_runtimes(false, Vec::new());
+    }
+    if arguments.first() == Some(&OsString::from(ENSURE_RUNTIMES_ARG))
+        && arguments[1..].contains(&OsString::from(ACCEPT_GAP_FLAG))
+    {
+        return match parse_accepted_gaps(&arguments[1..]) {
+            Ok((dry_run, accepted)) => print_ensure_runtimes(dry_run, accepted),
+            Err(error) => {
+                eprintln!("pohunekd: {ENSURE_RUNTIMES_ARG}: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if std::env::args_os().skip(1).eq([
         OsString::from(ENSURE_RUNTIMES_ARG),
         OsString::from(DRY_RUN_FLAG),
     ]) {
-        return print_ensure_runtimes(true);
+        return print_ensure_runtimes(true, Vec::new());
     }
     if std::env::args_os().skip(1).eq([
         OsString::from(ENSURE_RUNTIMES_ARG),
@@ -378,14 +389,44 @@ fn release_runtime_dir() -> Result<PathBuf, String> {
 }
 
 /// Prints the offline runtime step's report as JSON, or its failure on stderr.
-fn print_ensure_runtimes(dry_run: bool) -> ExitCode {
-    print_ensure_report(ensure_runtimes(dry_run, false))
+fn print_ensure_runtimes(dry_run: bool, accepted_gaps: Vec<AcceptedGap>) -> ExitCode {
+    print_ensure_report(ensure_runtimes(dry_run, false, accepted_gaps))
+}
+
+/// Parses the arguments after `ensure-official-runtimes` of a run that
+/// accepts gaps: an optional [`DRY_RUN_FLAG`], then [`ACCEPT_GAP_FLAG`] with a
+/// `<runtime>:<code>` value, repeated. Returns whether the run is a dry run
+/// and the accepted gaps. Anything else is an error, so a mistyped flag never
+/// starts the daemon.
+fn parse_accepted_gaps(arguments: &[OsString]) -> Result<(bool, Vec<AcceptedGap>), String> {
+    let mut accepted = Vec::new();
+    let dry_run = arguments.first().map(OsString::as_os_str) == Some(OsStr::new(DRY_RUN_FLAG));
+    let mut rest = arguments[usize::from(dry_run)..].iter();
+    while let Some(flag) = rest.next() {
+        if flag.as_os_str() != OsStr::new(ACCEPT_GAP_FLAG) {
+            return Err(format!(
+                "{ACCEPT_GAP_FLAG} <runtime>:<code> is the only argument a run takes with it, \
+                 after an optional {DRY_RUN_FLAG}, not {}",
+                flag.to_string_lossy()
+            ));
+        }
+        let value = rest
+            .next()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("{ACCEPT_GAP_FLAG} needs a <runtime>:<code> value"))?;
+        accepted.push(
+            AcceptedGap::from_arg(value).ok_or_else(|| {
+                format!("{ACCEPT_GAP_FLAG} takes <runtime>:<code>, not `{value}`")
+            })?,
+        );
+    }
+    Ok((dry_run, accepted))
 }
 
 /// Prints the detection plan of the runtime step as JSON, or its failure on
 /// stderr. The plan changes nothing.
 fn print_ensure_runtimes_detect() -> ExitCode {
-    print_ensure_report(ensure_runtimes(true, true))
+    print_ensure_report(ensure_runtimes(true, true, Vec::new()))
 }
 
 fn print_ensure_report(report: Result<EnsureReport, String>) -> ExitCode {
@@ -410,7 +451,11 @@ fn print_ensure_report(report: Result<EnsureReport, String>) -> ExitCode {
 /// authority and the instance locks until it ends, so a daemon cannot start
 /// underneath it; a held lock is a refusal, because the running daemon owns
 /// the state and nothing may change.
-fn ensure_runtimes(dry_run: bool, detect: bool) -> Result<EnsureReport, String> {
+fn ensure_runtimes(
+    dry_run: bool,
+    detect: bool,
+    accepted_gaps: Vec<AcceptedGap>,
+) -> Result<EnsureReport, String> {
     let paths = Paths::resolve().map_err(|error| error.to_string())?;
     let release_dir = release_runtime_dir()?;
     let inputs = EnsureInputs {
@@ -422,6 +467,7 @@ fn ensure_runtimes(dry_run: bool, detect: bool) -> Result<EnsureReport, String> 
         dry_run,
         daemon_version: DAEMON_VERSION.to_owned(),
         environment: launch_environment(&paths, detect),
+        accepted_gaps,
     };
     if detect {
         return detect_official_runtimes(&inputs)

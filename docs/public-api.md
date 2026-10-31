@@ -547,12 +547,12 @@ daemon method in this API version. It returns `daemon/method_not_found`.
 `session_wait_turn_supported`, `session_new_cwd_supported`,
 `session_new_branch_source_supported`,
 `session_new_input_ack_supported`,
-`session_new_secret_env_supported`, `session_idle_stop_supported`, and
-`package_install_commands_supported` independently. Clients must check the relevant
+`session_new_secret_env_supported`, `session_idle_stop_supported`,
+`package_install_commands_supported`, and `package_bind_profile_expected_supported` independently. Clients must check the relevant
 flag instead of assuming that a reachable daemon or an attach-capable session
 supports every observation method. A daemon that predates `session.wait_turn`
 omits `session_wait_turn_supported`, which decodes as `false`; it answers the
-method itself with `daemon/method_not_found` when it speaks protocol 4. A daemon that predates the `cwd` behavior of `session.new` omits `session_new_cwd_supported`, which decodes as `false`; a daemon that predates `branch_source` and `on_diverged` omits `session_new_branch_source_supported` likewise; a daemon that predates `input_ack_timeout_ms` omits `session_new_input_ack_supported` likewise; a daemon that predates `secret_env` omits `session_new_secret_env_supported` likewise; a daemon that predates package commands omits `package_install_commands_supported` likewise and rejects `accept_commands`. Its `runtimes` entries
+method itself with `daemon/method_not_found` when it speaks protocol 4. A daemon that predates the `cwd` behavior of `session.new` omits `session_new_cwd_supported`, which decodes as `false`; a daemon that predates `branch_source` and `on_diverged` omits `session_new_branch_source_supported` likewise; a daemon that predates `input_ack_timeout_ms` omits `session_new_input_ack_supported` likewise; a daemon that predates `secret_env` omits `session_new_secret_env_supported` likewise; a daemon that predates package commands omits `package_install_commands_supported` likewise and rejects `accept_commands`; a daemon that predates the expected pin of `package.bind_profile` omits `package_bind_profile_expected_supported` likewise and rejects `expected_previous`. Its `runtimes` entries
 are live host-local probes: `agent` is the selected profile or base name and
 optional `agent_base` is the `RuntimeRef` of the runtime behind it. Optional
 `version` and `supported` are a provider policy, not generic availability:
@@ -664,7 +664,7 @@ Shared payloads:
 | `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
 | `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. Refused with `package_integration_incompatible` while a retained reference uses a version of the same package whose integration differs; nothing changes. |
 | `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest, and with `package_retention_uncertain` while a `metadata.jsonl` line that may pin a package cannot be read (the line is kept; list it with `store.rejected_list` and move it with `store.rejected_set_aside`). `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
-| `package.bind_profile` | `{profile, digest?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. A pin of a version whose integration differs from the selected version of its package, or from another referenced version (a session or another profile's pin; the pin being replaced does not count), is refused with `package_integration_incompatible`, because the pin would be a retained reference that coexists with an incompatible selected version. |
+| `package.bind_profile` | `{profile, digest?, expected_previous?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. `expected_previous` is the pin the caller expects the profile to hold now: `"unpinned"` or `{"pinned": {"digest": "sha256:..."}}`. When the profile's current pin differs (a profile with only one of its `package` and `digest` keys holds no pin), the call is refused with `package_profile_pin_changed` before the target is resolved and nothing is written, a dry run included; absent means no condition. Send it only when `host.inspect` reports `package_bind_profile_expected_supported`; an older daemon rejects the unknown parameter. The comparison reads the same file text the write replaces, so a pin made between the caller's read and the write is refused, not overwritten. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. A pin of a version whose integration differs from the selected version of its package, or from another referenced version (a session or another profile's pin; the pin being replaced does not count), is refused with `package_integration_incompatible`, because the pin would be a retained reference that coexists with an incompatible selected version. |
 
 Compatibility-gated selection. An integration handler owns one active asset set
 per runtime, and sessions launched from an older version keep reporting through
@@ -834,6 +834,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_profile_base_builtin` | `runtime` | The profile's base runtime is the built-in `shell`, so there is no package to pin. |
 | `package_profile_target_invalid` | `runtime` | The package is not installed, is faulted, does not serve the base runtime, or is not the unique selected package. |
 | `package_profile_changed` | `runtime` | The profile changed while it was being rewritten and was left as found. |
+| `package_profile_pin_changed` | `runtime` | The profile's current pin is not the one `expected_previous` named; nothing was written. |
 | `package_integration_incompatible` | `runtime` | The package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected, or that an unreadable `metadata.jsonl` line may reference; nothing changed. |
 | `runtime_feature_unsupported` | `runtime` | The descriptor's `requires` names a runtime feature this core does not implement, or the descriptor uses a key or compiled parser or handler id of a feature it does not list in `requires`; nothing was recorded. |
 
@@ -2937,7 +2938,7 @@ cannot serve, which `integration.install` would reject), `runtime_served_by_othe
 the runtime id; it is left untouched), `official_package_unavailable_for_platform`
 (the release catalog lists no package for this platform; a refusal without
 `--detect`, except for an installed official package of a runtime that is not
-reserved, such as Pi, where it is a gap in every mode), and
+reserved, such as Pi, where it is a gap in every mode, and a gap `--accept-gap` names), and
 `official_package_not_serving` (an official package of such a runtime is
 installed but not selected, so the step leaves it, or the selected package is disabled
 (whatever its version order against the release's, the release's own package
@@ -2971,7 +2972,7 @@ every other state it names no command: the selected package keeps serving, and t
 release that gives the package a new version. For Pi the detail adds that the upgrade does
 not install a Pi package again once none is installed.) The first two of these four name the command
 that updates or repairs the package by hand. A gap never blocks an apply, and `gaps` is empty
-without `--detect` except for those four. The step also keeps an installed official package of a runtime that is
+without `--detect` except for those four and the gaps `--accept-gap` names. The step also keeps an installed official package of a runtime that is
 not reserved (Pi) current: when one is installed from the official catalog,
 selected and enabled, and the release lists a package of the same id, the plan
 installs and selects the release's version (reason `installed`) and the profiles
@@ -2989,7 +2990,18 @@ for an official version of the same package. `integrations` lists the config hom
 into: without `--detect`, the homes that already hold hooks; with `--detect`, each
 existing home of a planned runtime whose hooks the setup installs, whether or not
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
-values are `profile`, `session`, `integration`, `detected` and `installed`. The report layout
+values are `profile`, `session`, `integration`, `detected` and `installed`. Two codes name a
+runtime the catalog lists more than once for this platform: `official_package_listed_more_than_once`
+(a profile, a session or an integration uses the runtime, so the
+plan without `--detect` refuses it with this code and `--detect` lists it as a gap) and
+`catalog_lists_runtime_more_than_once` (only the detection found the runtime, so
+no apply plans anything for it and nothing is refused). `--accept-gap <runtime>:<code>`,
+repeatable after an optional `--dry-run` and a usage error with `--detect`, where `<code>` is the
+refusal's code (the `code` of an entry of `refusals`, not of a gap), reports exactly that
+refusal as the gap the detection reports for that condition instead, and every other refusal still fails the step; `pohunek setup`
+passes the `official_package_unavailable_for_platform` gaps its preview showed this way when it
+installs the service, so the service installs and the runtime stays a gap, while a used
+runtime the catalog lists more than once still stops setup before any change. The report layout
 stays at `report_version` 1.
 
 <a id="disabled-release-package-case-table"></a>

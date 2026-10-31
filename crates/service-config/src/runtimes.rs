@@ -29,6 +29,44 @@ pub const DRY_RUN_FLAG: &str = "--dry-run";
 /// usage error.
 pub const DETECT_FLAG: &str = "--detect";
 
+/// Flag after [`ENSURE_RUNTIMES_ARG`] and an optional [`DRY_RUN_FLAG`] whose
+/// value is an [`AcceptedGap`]: the runtime and the refusal code. The plan and
+/// the apply then report that condition as the gap the detection reports for
+/// it instead of refusing it; every other refusal stays a refusal. The flag repeats once per accepted gap and is a usage error with
+/// [`DETECT_FLAG`], whose plan reports every such condition as a gap already.
+pub const ACCEPT_GAP_FLAG: &str = "--accept-gap";
+
+/// A condition the plan and the apply report as a gap instead of refusing it:
+/// the refusal the step would report for one runtime. The code is the
+/// refusal's, which differs from the code of the gap the condition becomes
+/// where the two are not the same string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedGap {
+    /// The runtime the refusal names.
+    pub runtime: String,
+    /// The code of the refusal.
+    pub code: String,
+}
+
+impl AcceptedGap {
+    /// The value [`ACCEPT_GAP_FLAG`] takes: `<runtime>:<code>`.
+    #[must_use]
+    pub fn to_arg(&self) -> String {
+        format!("{}:{}", self.runtime, self.code)
+    }
+
+    /// Reads a value of [`ACCEPT_GAP_FLAG`]. `None` for a value that is not
+    /// `<runtime>:<code>` with both parts non-empty.
+    #[must_use]
+    pub fn from_arg(value: &str) -> Option<Self> {
+        let (runtime, code) = value.split_once(':')?;
+        (!runtime.is_empty() && !code.is_empty() && !code.contains(':')).then(|| Self {
+            runtime: runtime.to_owned(),
+            code: code.to_owned(),
+        })
+    }
+}
+
 /// The release directory below the version directory that holds the catalog
 /// and the official package archives.
 pub const RELEASE_RUNTIME_DIR: &str = "runtime";
@@ -39,6 +77,10 @@ pub const CODE_RELEASE_CATALOG_UNAVAILABLE: &str = "release_runtime_catalog_unav
 /// The release catalog lists no package of a runtime the host uses for this
 /// platform.
 pub const CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM: &str = "official_package_unavailable_for_platform";
+/// The release catalog lists more than one package of a runtime that a
+/// profile, a session or an integration uses for this platform. The release is
+/// malformed, so the apply refuses it.
+pub const CODE_PACKAGE_LISTED_MORE_THAN_ONCE: &str = "official_package_listed_more_than_once";
 /// A listed package archive is missing from the release or fails its checks.
 pub const CODE_PACKAGE_ARCHIVE_INVALID: &str = "official_package_archive_invalid";
 /// A host profile over an official runtime cannot be pinned to its package.
@@ -88,6 +130,9 @@ pub const CODE_GAP_CONFIG_HOME_MISSING: &str = "config_home_missing";
 /// A runtime's declared config home is a symlink. The installer writes hooks
 /// only into a real directory, so no integration is planned for it.
 pub const CODE_GAP_CONFIG_HOME_SYMLINK: &str = "config_home_is_symlink";
+/// The release catalog lists more than one package of a runtime that only the
+/// detection found. Nothing uses the runtime, so the apply plans nothing for it.
+pub const CODE_GAP_LISTED_MORE_THAN_ONCE: &str = "catalog_lists_runtime_more_than_once";
 /// Another package already serves the runtime id. It is left untouched.
 pub const CODE_GAP_SERVED_BY_OTHER_PACKAGE: &str = "runtime_served_by_other_package";
 /// An official package is installed but the step does not serve its runtime

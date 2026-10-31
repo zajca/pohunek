@@ -604,6 +604,7 @@ async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selec
             v.fixture
                 .registry
                 .package_bind_profile(PackageBindProfileParams {
+                    expected_previous: None,
                     profile: "work".to_owned(),
                     digest: Some(new.digest.clone()),
                     dry_run,
@@ -618,6 +619,7 @@ async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selec
     v.fixture
         .registry
         .package_bind_profile(PackageBindProfileParams {
+            expected_previous: None,
             profile: "work".to_owned(),
             digest: Some(v.old.digest.clone()),
             dry_run: false,
@@ -628,6 +630,7 @@ async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selec
 
 fn bind_to(profile: &str, digest: &PackageDigest) -> PackageBindProfileParams {
     PackageBindProfileParams {
+        expected_previous: None,
         profile: profile.to_owned(),
         digest: Some(digest.clone()),
         dry_run: false,

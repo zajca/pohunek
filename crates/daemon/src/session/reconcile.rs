@@ -25469,6 +25469,7 @@ generation "$1"
                     dry_run: false,
                     daemon_version: crate::DAEMON_VERSION.to_owned(),
                     environment: Ok(launch.clone()),
+                    accepted_gaps: Vec::new(),
                 }) {
                     assert!(
                         applied.refusals.is_empty(),

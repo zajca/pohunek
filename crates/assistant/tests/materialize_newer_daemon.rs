@@ -47,6 +47,7 @@ fn capabilities() -> Value {
         session_new_secret_env_supported: true,
         session_idle_stop_supported: true,
         package_install_commands_supported: true,
+        package_bind_profile_expected_supported: true,
         session_new_branch_source_supported: true,
     })
     .expect("serialize the capability snapshot")

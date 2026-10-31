@@ -9,7 +9,8 @@ use std::path::Path;
 
 use package::PackageDigest;
 use protocol::{
-    PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageUninstallParams,
+    ExpectedPin, PackageBindProfileParams, PackageBindStatus, PackageErrorKind,
+    PackageUninstallParams,
 };
 
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
@@ -28,6 +29,7 @@ const RACE_ROUNDS: usize = 8;
 
 fn bind(profile: &str, digest: Option<&PackageDigest>, dry_run: bool) -> PackageBindProfileParams {
     PackageBindProfileParams {
+        expected_previous: None,
         profile: profile.to_owned(),
         digest: digest.cloned(),
         dry_run,
@@ -751,4 +753,129 @@ async fn a_non_regular_manifest_override_is_refused_without_blocking() {
         );
         assert_eq!(state_of(&path), before, "the profile is untouched");
     }
+}
+
+fn bind_expecting(
+    digest: &PackageDigest,
+    expected: ExpectedPin,
+    dry_run: bool,
+) -> PackageBindProfileParams {
+    PackageBindProfileParams {
+        expected_previous: Some(expected),
+        ..bind(PROFILE, Some(digest), dry_run)
+    }
+}
+
+/// A bind that names a pin the profile does not hold is refused before
+/// anything is read of the target or written, a preview included.
+#[tokio::test]
+async fn a_bind_that_expects_another_pin_is_refused_and_writes_nothing() {
+    let fixture = Fixture::new("bind-expects-other-pin");
+    let first = Package::pi();
+    let second = second_version();
+    install(&fixture, &first).await;
+    install_with(&fixture, &second, true, false).await;
+    let path = fixture.write_profile(PROFILE, &pinned(&first.digest));
+    let before = state_of(&path);
+
+    for expected in [
+        ExpectedPin::Pinned {
+            digest: second.digest.clone(),
+        },
+        ExpectedPin::Unpinned,
+    ] {
+        for dry_run in [true, false] {
+            let error = fixture
+                .registry
+                .package_bind_profile(bind_expecting(&second.digest, expected.clone(), dry_run))
+                .await
+                .expect_err("the pin is not the expected one");
+
+            assert_eq!(error, PackageErrorKind::ProfilePinChanged, "{dry_run}");
+            assert_eq!(state_of(&path), before, "{dry_run}");
+        }
+    }
+    let unpinned_path = fixture.write_profile("other", &unpinned());
+    let before_unpinned = state_of(&unpinned_path);
+    let error = fixture
+        .registry
+        .package_bind_profile(PackageBindProfileParams {
+            profile: "other".to_owned(),
+            ..bind_expecting(
+                &first.digest,
+                ExpectedPin::Pinned {
+                    digest: first.digest.clone(),
+                },
+                false,
+            )
+        })
+        .await
+        .expect_err("an unpinned profile holds no pin");
+    assert_eq!(error, PackageErrorKind::ProfilePinChanged);
+    assert_eq!(state_of(&unpinned_path), before_unpinned);
+}
+
+/// A bind that names the pin the profile holds proceeds as an unconditional
+/// bind does.
+#[tokio::test]
+async fn a_bind_that_expects_the_current_pin_goes_through() {
+    let fixture = Fixture::new("bind-expects-current-pin");
+    let first = Package::pi();
+    let second = second_version();
+    install(&fixture, &first).await;
+    install_with(&fixture, &second, true, false).await;
+    fixture.write_profile(PROFILE, &pinned(&first.digest));
+    fixture.write_profile("fresh", &unpinned());
+
+    let repinned = fixture
+        .registry
+        .package_bind_profile(bind_expecting(
+            &second.digest,
+            ExpectedPin::Pinned {
+                digest: first.digest.clone(),
+            },
+            false,
+        ))
+        .await
+        .expect("the expected pin is the current one");
+    let bound = fixture
+        .registry
+        .package_bind_profile(PackageBindProfileParams {
+            profile: "fresh".to_owned(),
+            ..bind_expecting(&first.digest, ExpectedPin::Unpinned, false)
+        })
+        .await
+        .expect("the profile holds no pin, as expected");
+
+    assert_eq!(repinned.status, PackageBindStatus::Bound);
+    assert_eq!(repinned.previous.as_ref(), Some(&first.digest));
+    assert_eq!(pin_of(&fixture, PROFILE), Some(second.digest.to_string()));
+    assert_eq!(bound.status, PackageBindStatus::Bound);
+    assert_eq!(pin_of(&fixture, "fresh"), Some(first.digest.to_string()));
+}
+
+/// A profile with a `digest` key and no `package` key holds no pin: a preview
+/// reports no previous pin, so a bind that expects it unpinned goes through.
+#[tokio::test]
+async fn a_profile_with_only_a_digest_key_is_previewed_and_bound_as_unpinned() {
+    let fixture = Fixture::new("bind-digest-only-profile");
+    let first = Package::pi();
+    install(&fixture, &first).await;
+    let half_pinned = format!("digest = \"{}\"\n{}", first.digest, unpinned());
+    fixture.write_profile(PROFILE, &half_pinned);
+
+    let preview = fixture
+        .registry
+        .package_bind_profile(bind_expecting(&first.digest, ExpectedPin::Unpinned, true))
+        .await
+        .expect("the preview of a profile that holds no pin");
+    let bound = fixture
+        .registry
+        .package_bind_profile(bind_expecting(&first.digest, ExpectedPin::Unpinned, false))
+        .await
+        .expect("the profile holds no pin, as the preview reported");
+
+    assert_eq!(preview.previous, None);
+    assert_eq!(bound.status, PackageBindStatus::Bound);
+    assert_eq!(pin_of(&fixture, PROFILE), Some(first.digest.to_string()));
 }

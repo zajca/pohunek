@@ -459,6 +459,7 @@ fn release_plan(
         dry_run: true,
         daemon_version: crate::DAEMON_VERSION.to_owned(),
         environment: options.launch.clone(),
+        accepted_gaps: Vec::new(),
     };
     match plan_official_runtimes(&ensure) {
         Ok(OfficialPlan {

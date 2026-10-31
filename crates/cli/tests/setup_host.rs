@@ -727,7 +727,11 @@ fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
     let env = TestEnv::new().expect("private environment");
     let release = env.root().join(RELEASE_DIR);
     setup_release::stage_binaries(&release);
-    setup_release::sign(&release, &pohunek_test_support::catalog::test_key());
+    setup_release::sign_runtimes(
+        &release,
+        &pohunek_test_support::catalog::test_key(),
+        &setup_release::RELEASE_RUNTIMES,
+    );
     setup_release::seal(&release);
     let binary = release.join("pohunek");
     // A state directory without a service, as a removed installation or
