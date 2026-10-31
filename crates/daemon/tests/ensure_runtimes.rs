@@ -6567,8 +6567,10 @@ async fn the_holder_contract_table_holds_for(runtime: &str, half: usize) {
     assert!(ran > 0, "the table has cells for {runtime} in half {half}");
 }
 
+/// Two tests per runtime; `HOLDER_TESTED` lists the runtimes tested.
 macro_rules! holder_table_tests {
     ($($first:ident, $second:ident: $runtime:literal;)+) => {
+        const HOLDER_TESTED: &[&str] = &[$($runtime),+];
         $(
             #[tokio::test]
             async fn $first() {
@@ -6590,17 +6592,16 @@ holder_table_tests! {
     the_holder_contract_table_holds_for_pi_first_half, the_holder_contract_table_holds_for_pi_second_half: "pi";
 }
 
-/// The runtimes the table is split over are exactly the runtimes it names.
+/// The runtimes the table is split over are exactly the runtimes it names, each once.
 #[test]
 fn the_holder_contract_table_names_only_runtimes_that_have_a_test() {
     let named: std::collections::BTreeSet<&str> = CELLS
         .iter()
         .flat_map(|cell| cell.runtimes.iter().copied())
         .collect();
-    assert_eq!(
-        named,
-        std::collections::BTreeSet::from(["claude", "codex", "hermes", "pi"])
-    );
+    let mut tested = HOLDER_TESTED.to_vec();
+    tested.sort_unstable();
+    assert_eq!(tested, named.into_iter().collect::<Vec<_>>());
 }
 
 /// An unmanaged Pi whose unselected holder is altered: plan and apply report the

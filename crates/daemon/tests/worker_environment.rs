@@ -12,7 +12,8 @@
 //! pohunek-sessiond`.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::DirBuilderExt;
+use std::io::Write as _;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -927,13 +928,19 @@ const RESYNCED_KEYSTROKE: &str = "keystroke-after-resync";
 const UNREAD_FLOOD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Releases the flooding child, once the attach stream is open, so the stream
-/// is subscribed before the child prints its first byte.
+/// is subscribed before the child prints its first byte. A non-blocking open
+/// of a FIFO fails with `ENXIO` until the child reads it, so the wait for the
+/// child is bounded by the hang guard.
 async fn start_flooding(start: &Path) {
-    let start = start.to_owned();
-    tokio::task::spawn_blocking(move || std::fs::write(start, b"go\n"))
-        .await
-        .expect("join the start writer")
-        .expect("release the flooding child");
+    let mut fifo = wait_until("the child to wait for the start line", || async {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(start)
+            .ok()
+    })
+    .await;
+    fifo.write_all(b"go\n").expect("release the flooding child");
 }
 
 /// Starts a child that waits for the returned `start` FIFO to be written,

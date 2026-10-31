@@ -3133,10 +3133,9 @@ A profile that pins another installed version P keeps the command: the uninstall
 with P retained, and the next apply installs the release's archive and repins the profile
 from P.
 
-The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_state`,
-`codex_judges_the_disabled_release_package_by_the_selection_state`,
-`hermes_judges_the_disabled_release_package_by_the_selection_state` and
-`pi_judges_the_disabled_release_package_by_the_selection_state` (rows 1-23; plan,
+The scenarios are the twelve
+`<runtime>_judges_the_disabled_release_package_by_the_selection_state_part_<0-2>` tests
+(claude, codex, hermes and pi; rows 1-23 are split over the three parts; plan,
 `--detect` plan and apply, registry unchanged, profile pinned only in the kept rows),
 `a_disabled_release_package_that_another_package_serves_is_refused_beside_an_unloadable_selection`
 (the claim), `a_disabled_pi_selection_beside_a_third_party_server_is_a_gap_without_detect`
