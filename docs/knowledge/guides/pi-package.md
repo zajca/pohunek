@@ -72,8 +72,13 @@ reserved, so either way of installing serves it.
   A visible dialog the screen rules see still wins over a non-blocked record:
   Pi's project-trust question is recorded on 1.4.0 and reads `blocked`. The
   other own confirms (missing cwd, session import) are covered by screens from
-  earlier releases only; a confirm no rule matches reads as Pi's record says. Pi 1.0.x prints no probe and is read from the screen alone.
-  Known limits: a dialog drawn with `ctx.ui.custom()` has no screen rule and
+  earlier releases only; a confirm no rule matches reads as Pi's record says. Pi 1.0.x prints no probe
+  and is read from the screen alone.
+- Blocked input: fire-and-forget `session.input` is refused with
+  `session_input_blocked` while Pi reads `blocked` (`refuse_while_blocked = true`
+  in the descriptor), so plain text cannot answer a dialog the operator never
+  saw; answer it in an attached terminal (`pohunek attach`).
+- Known limits: a dialog drawn with `ctx.ui.custom()` has no screen rule and
   reads as Pi's record says (working during a run); the branch-summary busy
   border reads `idle`, as Pi declares it; `error` reads as `idle`; a Pi nested
   under a shell session gets no probe reply and stays screen-only; a profile

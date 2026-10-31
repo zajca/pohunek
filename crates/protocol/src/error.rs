@@ -386,9 +386,15 @@ impl ProtocolError {
     /// The canonical rejection for input while an agent awaits owner action.
     #[must_use]
     pub fn session_input_blocked() -> Self {
-        Self::observation(
+        Self::new(
+            ErrorClass::Runtime,
             "session_input_blocked",
             "programmatic input is disabled while the agent awaits owner action",
+            Some(
+                "answer the dialog in an interactive terminal with session.attach (pohunek attach), \
+                 then retry"
+                    .to_owned(),
+            ),
         )
     }
 

@@ -110,6 +110,7 @@ The features this core implements:
 | `transcripts-data-root-v1` | 0.38.0 | `[transcripts] root_env`, `root_home`, `max_depth`; `parser = "muse-session-v1"`; `[native_reference.existence] dir_name` |
 | `integration-muse-hook-v1` | 0.38.0 | `integration.handler = "muse-hook-v1"` |
 | `package-commands-v1` | 0.38.0 | `[commands.<name>]` |
+| `input-refuse-while-blocked-v1` | 0.39.0 | `[input] refuse_while_blocked` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -630,6 +631,19 @@ upper bound, not a delay: the input is written as soon as readiness shows, and
 the full wait passes only when it never does. A client without that option
 keeps the host's grace (`screen_idle` and `manifest_idle`) or the 500 ms
 silent-reader bound.
+
+The `[input]` table may also declare `refuse_while_blocked = true`
+(`requires = ["input-refuse-while-blocked-v1"]`). Fire-and-forget
+`session.input` then fails with `session_input_blocked` while the session reads
+`blocked`, and the error's hint names `session.attach` as the way to answer the
+dialog (input with `wait` is refused for every runtime with
+`session_agent_blocked`). A runtime with `text_policy = "hermes_safe_text"`
+always refuses; `refuse_while_blocked = false` does not lift that. Declare it for a
+runtime whose `blocked` rules are dialog-exact and whose dialogs take the place
+of its prompt, so plain text cannot answer a dialog the operator never saw. The
+Pi package does; Claude and Codex keep delivering text while `blocked`, because
+Claude's `legacy_no_prompt_blocker` and Codex's `weak_blocker` match text
+anywhere in the recent screen and can read `blocked` outside a dialog.
 
 The official packages declare:
 

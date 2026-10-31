@@ -119,7 +119,7 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
     match &definition.binding().provenance {
         BindingProvenance::Package { package, .. } => {
             assert_eq!(package.id.as_str(), PACKAGE_ID);
-            assert_eq!(package.version.as_str(), "1.0.4");
+            assert_eq!(package.version.as_str(), "1.0.5");
         }
         other @ BindingProvenance::Builtin { .. } => {
             panic!("a package-served runtime, got {other:?}")

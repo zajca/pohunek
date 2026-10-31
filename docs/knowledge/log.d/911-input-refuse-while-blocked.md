@@ -1,0 +1,5 @@
+## Unreleased (2026-10-31, runtime input policy can refuse plain text while blocked, #911)
+
+- A runtime descriptor declares `[input] refuse_while_blocked = true` (feature `input-refuse-while-blocked-v1`, since 0.39.0). Fire-and-forget `session.input` then returns `session_input_blocked` while the session reads `blocked`, and the error's `recover` hint names `session.attach`; there is no caller option that targets a dialog.
+- The Pi package (1.0.5) declares it. Claude and Codex do not: their blocked rules (`legacy_no_prompt_blocker`, `weak_blocker`) match text anywhere in the recent screen, so a refusal could block legitimate input outside a dialog.
+- Store schema 12, a no-op migration from 11: a recovery snapshot's `input_rules` gains `refuse_while_blocked` (default false), so a session whose runtime definition cannot be resolved keeps the refusal. A release that predates schema 12 refuses the newer store; roll back with the `metadata.jsonl.pre-schema-11` backup the migration takes (sessions created since are lost) or keep the newer release.

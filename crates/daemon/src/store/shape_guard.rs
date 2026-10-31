@@ -73,6 +73,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (9, include_str!("fixtures/shape/schema-9.txt")),
     (10, include_str!("fixtures/shape/schema-10.txt")),
     (11, include_str!("fixtures/shape/schema-11.txt")),
+    (12, include_str!("fixtures/shape/schema-12.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -98,7 +99,7 @@ fn resume_builtin_json() -> Value {
         "metadata": {"key": "value"},
         "program": "claude",
         "args": ["--flag"],
-        "input_rules": {"bracketed_paste": true, "submit_delay_ms": 5, "restricted": true},
+        "input_rules": {"bracketed_paste": true, "submit_delay_ms": 5, "restricted": true, "refuse_while_blocked": true},
         "native_launch_unresolved": true,
         "native_launch": {
             "reference_kind": "id",
@@ -336,6 +337,7 @@ fn assert_every_field_is_reviewed(
             bracketed_paste: _,
             submit_delay_ms: _,
             restricted: _,
+            refuse_while_blocked: _,
         } = input_rules;
     }
     let WorktreeBinding {

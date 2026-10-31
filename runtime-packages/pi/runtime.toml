@@ -6,8 +6,9 @@
 
 schema = 1
 id = "pohunek.runtime.pi"
-version = "1.0.4"
+version = "1.0.5"
 runtime_api = 1
+requires = ["input-refuse-while-blocked-v1"]
 
 [runtime]
 id = "pi"
@@ -26,6 +27,10 @@ version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", bel
 bracketed_paste = true
 submit_delay_ms = 150
 text_policy = "unrestricted"
+# Pi draws extension confirms, permission prompts and login steps in place of
+# its editor, so plain text sent while the session reads blocked could answer a
+# dialog the operator never saw. The dialog is answered in an attached terminal.
+refuse_while_blocked = true
 # Pi enables bracketed paste as soon as it starts, before it draws any screen,
 # so the enable signal is not readiness: only the idle editor frame (detect rule
 # `idle_editor_rule`) shows that its editor reads input.

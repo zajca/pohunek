@@ -575,6 +575,52 @@ async fn a_pi_confirm_record_is_blocked_and_pis_own_confirm_stays_blocked_by_scr
 }
 
 #[tokio::test]
+async fn a_blocked_pi_refuses_session_input_until_its_dialog_clears() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new().await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture.wait_activity(&created.id, IDLE).await;
+    let plain_text = || SessionInputParams {
+        session_id: created.id.clone(),
+        text: "yes".to_owned(),
+        wait: None,
+    };
+
+    // Pi draws a dialog in place of its editor: text sent now could answer it.
+    command(&fixture, b'b');
+    fixture.wait_activity(&created.id, BLOCKED).await;
+    let refused = fixture
+        .registry
+        .input(plain_text())
+        .await
+        .expect_err("plain text must be refused while Pi reads blocked");
+    assert_eq!(refused.code, "session_input_blocked");
+    assert!(
+        refused
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("attach")),
+        "the refusal names the interactive way to answer: {refused:?}"
+    );
+
+    command(&fixture, b'd');
+    fixture.wait_activity(&created.id, IDLE).await;
+    fixture
+        .registry
+        .input(plain_text())
+        .await
+        .expect("plain text is accepted again once the dialog is gone");
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    fixture.end().await;
+}
+
+#[tokio::test]
 async fn a_pi_busy_border_with_an_idle_record_stays_idle() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;

@@ -1957,7 +1957,7 @@ mod tests {
         assert!(!input_rules.bracketed_paste);
         assert_eq!(input_rules.submit_delay, Duration::from_millis(25));
         assert!(input_rules.validate_text("unsafe\u{1b}[201~").is_err());
-        assert!(!input_rules.allows_while_blocked());
+        assert!(input_rules.refuses_while_blocked());
         assert_eq!(
             profile.native,
             served_native_launch(&protocol::RuntimeId::hermes())

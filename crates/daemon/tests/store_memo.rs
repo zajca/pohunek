@@ -16,11 +16,14 @@ use pohunek_daemon::store::{
 
 const SCHEMA_10: &str = include_str!("../src/store/fixtures/schema-10/metadata.jsonl");
 
-/// Output of the daemon built before the store snapshot (main `4c7d2e9b8`) after
-/// the first step of [`golden_steps`].
+/// The bytes the daemon built before the store snapshot (main `4c7d2e9b8`) wrote
+/// after the first step of [`golden_steps`], with only the schema 12 changes
+/// applied (`schema_version` 12 and `refuse_while_blocked` in the rewritten
+/// session's `input_rules`).
 const GOLDEN_AFTER_SESSION: &str = include_str!("fixtures/store-memo/after-session.jsonl");
 
-/// Output of the same daemon after the second step of [`golden_steps`].
+/// The same bytes after the second step of [`golden_steps`], with the same
+/// schema 12 changes.
 const GOLDEN_AFTER_PROJECT: &str = include_str!("fixtures/store-memo/after-project.jsonl");
 
 /// Session recorded in the fixture.
