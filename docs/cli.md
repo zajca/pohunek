@@ -270,11 +270,7 @@ upgrade of the release files. It runs in this order:
    present in it, it must carry no refusal, and it must not list a runtime the
    preview did not show. Every profile pin the preview showed must be done. No
    hook may have failed. Then the daemon's health and `doctor` run; a failed
-   check is named in the output, and when the preview left a runtime without a
-   package (a platform gap the preview showed), the output also names that
-   runtime, because a profile over it stays unusable until a release lists its
-   package; update to such a release and run `pohunek setup` again. Hook gaps
-   are listed, not failed.
+   check is named in the output. Hook gaps are listed, not failed.
 
 If the plan read after the service install differs from the preview in any way
 the install engine does not account for, setup stops there. The output names the

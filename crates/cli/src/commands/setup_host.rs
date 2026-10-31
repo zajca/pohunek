@@ -1327,7 +1327,7 @@ async fn verdict(
         health: health.status,
         doctor: diagnosis.overall.as_str().to_owned(),
     };
-    let doctor_failures = failed_doctor_checks(&diagnosis, previewed);
+    let doctor_failures = failed_doctor_checks(&diagnosis);
     let problems = verdict_problems(
         &verdict,
         catalog_recorded_by_install && after.catalog == CatalogStatus::Record,
@@ -1392,30 +1392,14 @@ fn verdict_problems(
     problems
 }
 
-/// The failed doctor checks as `name: detail`. When the preview left a runtime
-/// as an accepted gap, the list ends with the runtimes that have no package, so
-/// a profile over one of them is traced to its cause and the next step.
-fn failed_doctor_checks(diagnosis: &DoctorReport, previewed: &EnsureReport) -> Vec<String> {
-    let mut failures: Vec<String> = diagnosis
+/// The failed doctor checks as `name: detail`.
+fn failed_doctor_checks(diagnosis: &DoctorReport) -> Vec<String> {
+    diagnosis
         .checks
         .iter()
         .filter(|check| check.status == DoctorStatus::Fail)
         .map(|check| format!("{}: {}", check.name, check.detail))
-        .collect();
-    let left: Vec<&str> = previewed
-        .gaps
-        .iter()
-        .filter(|gap| ACCEPTED_GAPS.contains(&gap.code.as_str()))
-        .map(|gap| gap.runtime.as_str())
-        .collect();
-    if !failures.is_empty() && !left.is_empty() {
-        failures.push(format!(
-            "setup installed no package for {}, so a profile over it stays unusable until the \
-             release lists one: update to a release that does, then run `pohunek setup` again",
-            left.join(", ")
-        ));
-    }
-    failures
+        .collect()
 }
 
 /// The hook lines of `hooks` with `status`, as `integration: detail`.

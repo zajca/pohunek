@@ -686,12 +686,12 @@ async fn a_platform_gap_the_owner_saw_does_not_stop_the_install() {
     assert_eq!(error.code(), "setup_incomplete");
     let message = error.to_string();
     assert!(
-        message.contains("doctor reports a failed check: agent_profile_work")
-            && message.contains("setup installed no package for claude")
-            && message.contains("run `pohunek setup` again")
-            && !message.contains("runtimes not present")
-            && !message.contains("refuse"),
+        message.starts_with("setup did not complete: doctor reports a failed check: "),
         "the doctor check is the only problem: {message}"
+    );
+    assert!(
+        message.contains("agent_profile_work"),
+        "the failed profile is named: {message}"
     );
     assert!(
         message.contains("package codex: installed") && !message.contains("package claude"),
