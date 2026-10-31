@@ -8120,7 +8120,7 @@ async fn an_upgrade_refuses_live_sessions_whose_records_cannot_be_migrated_and_t
     );
     assert!(!message.contains(THIRD_SESSION), "{message}");
     assert!(
-        message.contains("2 live session(s), 0 stopped session(s)"),
+        message.contains("refused: 2 live session(s) have unverified runtime or recovery"),
         "{message}"
     );
     assert!(message.contains(&format!("live {SESSION}:")), "{message}");

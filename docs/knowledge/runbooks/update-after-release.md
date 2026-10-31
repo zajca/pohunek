@@ -540,6 +540,32 @@ When the assistant feature is available, its update intent should use bundle
 version metadata and `changed_in` frontmatter to explain version-specific
 changes before recommending edits.
 
+## Testing an install or upgrade with an isolated HOME (macOS)
+
+An install under a throwaway `HOME` still shares the real installation's runtime
+directory unless `XDG_RUNTIME_DIR` is set. Without it macOS resolves the runtime
+directory to `/private/tmp/pohunek-<uid>`, one per user id, so the throwaway
+daemon's socket directory is the one the real daemon uses, and sessions created
+against it can reach or disturb the real installation.
+
+Before the test installation starts a daemon or creates any session:
+
+1. Create a private runtime directory with a short path (the socket path limit
+   is 103 bytes), mode `0700`, outside the real installation, and export it as
+   `XDG_RUNTIME_DIR` together with the throwaway `HOME` in the shell that runs
+   `pohunek setup` or `pohunek service install`. Check `echo
+   "$XDG_RUNTIME_DIR"` in that shell first; a fresh shell without it installs
+   against the shared directory.
+2. After the install, check that the daemon job carries it: `launchctl print
+   gui/$(id -u)/<label>` lists the job's environment (`launchctl list` shows
+   the label, `io.github.zajca.pohunek.<namespace>.daemon`), and
+   `XDG_RUNTIME_DIR => <your private directory>` must be there. If the entry is
+   missing, the install ran without the variable and its daemon shares the real
+   installation's socket directory: do not create sessions and do not use
+   `--stop-sessions`. Uninstall with the environment the install used (the same
+   `HOME`, and no `XDG_RUNTIME_DIR`), `pohunek service uninstall --purge`, and
+   start again from step 1.
+
 ## Roll back after a completed 0.36 upgrade
 
 Rolling back from a completed 0.36 upgrade to 0.35.2 is not supported (the

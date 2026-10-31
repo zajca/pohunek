@@ -219,7 +219,11 @@ upgrade of the release files. It runs in this order:
    archive is refused or incomplete; nothing from the archive runs before
    that. The check covers the archive's integrity and structure against its
    `MANIFEST`; whether the archive is an authentic release is what
-   `gh attestation verify` of the download establishes. The install itself applies the runtime packages
+   `gh attestation verify` of the download establishes. A directory with neither
+   (a development build, or a package manager's layout such as Homebrew's) is
+   not verified by setup, and it cannot be told from an archive stripped of
+   both; what rules out tampering there is the download's attestation or the
+   package manager's checksum. The install itself applies the runtime packages
    and profile pins that the host's profiles, sessions and integrations need;
    it reports them. An installed service of the same version is kept.
    An installed service of another version is a gap: run

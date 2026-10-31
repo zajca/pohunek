@@ -392,10 +392,13 @@ impl MacosFacts {
 #[must_use]
 pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> Vec<DoctorCheck> {
     let state_root = state_root(inputs.log_dir);
-    let mut checks = vec![
-        binary_with_path("git", true, facts.path_var.as_deref(), ""),
-        agent_binary("codex", facts),
-        agent_binary("claude", facts),
+    let mut checks = vec![binary_with_path("git", true, facts.path_var.as_deref(), "")];
+    checks.extend(
+        crate::AGENT_PROGRAMS
+            .iter()
+            .map(|name| agent_binary(name, facts)),
+    );
+    checks.extend([
         check_runtime_dir_private(inputs.socket_dir),
         check_socket_path_length(inputs.socket_dir),
         check_private_dir(
@@ -420,7 +423,7 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
             &state_root.join(WORKERS_SUBDIR),
         ),
         check_filesystem_access(inputs),
-    ];
+    ]);
     checks.extend(overlay_checks::cli_checks(inputs.overlays));
     checks.extend([
         DoctorCheck::new(

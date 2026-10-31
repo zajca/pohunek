@@ -122,7 +122,7 @@ pub(crate) fn load_installed_config(context: &Context) -> Result<(ServiceConfig,
 }
 
 /// The agent programs `pohunek doctor` probes by name.
-pub(crate) const PROBED_AGENTS: [&str; 2] = ["claude", "codex"];
+pub(crate) const PROBED_AGENTS: [&str; 2] = hostcheck::AGENT_PROGRAMS;
 
 /// An agent program only the login shell's search path resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1217,10 +1217,17 @@ fn at_risk_summary(
     acceptance: &AcceptanceGroups,
     warnings: &[String],
 ) -> String {
+    let counted: Vec<String> = [
+        ("live", sessions.len()),
+        ("stopped", stopped_sessions.len()),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(kind, count)| format!("{count} {kind} session(s)"))
+    .collect();
     let mut text = format!(
-        "{action} refused: {} live session(s), {} stopped session(s) have unverified runtime or recovery",
-        sessions.len(),
-        stopped_sessions.len()
+        "{action} refused: {} have unverified runtime or recovery",
+        counted.join(", ")
     );
     for (kind, session) in sessions
         .iter()

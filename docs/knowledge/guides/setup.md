@@ -231,7 +231,11 @@ and gaps of this host, asks once (`--yes` applies unattended; without a
 terminal and without `--yes`, or with `--json` and no `--yes`, it refuses;
 `--dry-run` prints the plan and changes nothing), and then installs the service and
 the packages, pins the profiles, installs the hooks of the homes that exist, and
-writes the missing config files. It never upgrades an installed service: a
+writes the missing config files. A fresh install from a directory without a
+`MANIFEST` and without `packaging/` (a development build, or Homebrew's
+layout) is not verified by setup: such a directory cannot be told from an
+archive stripped of both, and the download's attestation or the package
+manager's checksum is what rules out tampering. It never upgrades an installed service: a
 different installed version is a gap, and `pohunek service upgrade` runs first.
 Every Hermes home the run acts on is listed in the preview. A marked home
 whose plugin is already current is kept as it is, and setup runs the

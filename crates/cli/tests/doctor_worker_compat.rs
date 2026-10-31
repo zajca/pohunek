@@ -193,3 +193,151 @@ async fn doctor_warns_when_shutdown_bounds_exceed_the_exit_timeout_through_cli()
     );
     harness.stop().await;
 }
+
+/// Writes a `service.toml` that describes the hermetic installation of `harness`
+/// and records `search_path`.
+fn install_recording_service_toml(harness: &Harness, search_path: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let env = &harness.env;
+    let state_root = env.state_home().join("pohunek");
+    let runtime_root = env.runtime_dir().join("pohunek");
+    for root in [&state_root, &runtime_root] {
+        fs::create_dir_all(root).expect("create a namespace root");
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).expect("chmod the root");
+    }
+    let canonical = |path: &std::path::Path| fs::canonicalize(path).expect("canonical path");
+    let uid = fs::metadata(env.root()).expect("root metadata").uid();
+    let text = SERVICE_TOML
+        .replace("EXIT_TIMEOUT_MS", "30000")
+        .replace(
+            "/home/u/.local\"\nactive",
+            &format!("{}\"\nactive", env.root().join("prefix").display()),
+        )
+        .replace("uid = 1000", &format!("uid = {uid}"))
+        .replace(
+            "state_root = \"/home/u/.local/state/pohunek\"",
+            &format!("state_root = \"{}\"", canonical(&state_root).display()),
+        )
+        .replace(
+            "runtime_root = \"/run/user/1000/pohunek\"",
+            &format!("runtime_root = \"{}\"", canonical(&runtime_root).display()),
+        )
+        .replace(
+            "search_path = []",
+            &format!("search_path = [\"{}\"]", canonical(search_path).display()),
+        );
+    let dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&dir).expect("create the config directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod config directory");
+    let file = dir.join("service.toml");
+    fs::write(&file, text).expect("write service.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("chmod service.toml");
+}
+
+/// A login shell that reports `path` as the whole `PATH` and then runs the
+/// command it is given, or exits with failure when `path` is `None`.
+fn login_shell(
+    harness: &Harness,
+    name: &str,
+    path: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let shell = harness.env.root().join(name);
+    let body = match path {
+        Some(path) => format!(
+            "#!/bin/sh\nPATH='{}'; export PATH\nexec /bin/sh -c \"$3\"\n",
+            path.display()
+        ),
+        None => "#!/bin/sh\nexit 1\n".to_owned(),
+    };
+    write_executable(&shell, body).expect("write the login shell");
+    shell
+}
+
+async fn doctor_with_shell(harness: &Harness, shell: &std::path::Path) -> Value {
+    let mut command = harness
+        .env
+        .tokio_command(pohunek_test_support::bin_exe("pohunek"));
+    command.args(["doctor", "--json"]).env("SHELL", shell);
+    let output = pohunek_test_support::wait::guard("the doctor run to finish", command.output())
+        .await
+        .expect("run the pohunek binary");
+    serde_json::from_slice(&output.stdout).expect("doctor JSON")
+}
+
+fn login_path_check(document: &Value) -> Option<&Value> {
+    document["ok"]["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("doctor checks: {document}"))
+        .iter()
+        .find(|check| check["name"] == "service_search_path_agents")
+}
+
+/// `pohunek doctor` reports an agent program only the login shell's path
+/// resolves on macOS, where `service.toml` records a search path, and adds no
+/// such check elsewhere or when the login shell gives no answer. The
+/// installation, the login shell and the programs are below the hermetic
+/// root. The platform gate and the probe's own macOS-only discovery back each
+/// other up, so removing only the gate is not observable on Linux; the macOS
+/// lane fails when the check call or the gate is removed.
+#[tokio::test]
+async fn doctor_reports_agents_only_the_login_shell_path_resolves_through_cli() {
+    let harness = Harness::start().await;
+    let root = harness.env.root();
+    let recorded = root.join("recorded-bin");
+    let login = root.join("login-bin");
+    for dir in [&recorded, &login] {
+        fs::create_dir_all(dir).expect("create a program directory");
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).expect("chmod directory");
+    }
+    // The login path gains the host's fallback directories, so the verdict
+    // names only programs this fixture controls: `codex` resolves through both
+    // paths, `claude` only through the login shell's directory, which comes first.
+    for (dir, name) in [(&login, "claude"), (&login, "codex"), (&recorded, "codex")] {
+        write_executable(dir.join(name), "#!/bin/sh\nexit 0\n").expect("write a program");
+    }
+    install_recording_service_toml(&harness, &recorded);
+    let macos = cfg!(target_os = "macos");
+
+    let behind = login_shell(&harness, "login-shell", Some(&login));
+    let document = doctor_with_shell(&harness, &behind).await;
+    if macos {
+        let finding = login_path_check(&document).expect("macOS reports the finding");
+        assert_eq!(finding["status"], "warn", "{finding}");
+        let detail = finding["detail"].as_str().unwrap_or_default();
+        let claude = fs::canonicalize(&login)
+            .expect("canonical login dir")
+            .join("claude");
+        assert!(
+            detail.contains(&format!("claude ({})", claude.display()))
+                && !detail.contains("codex")
+                && detail.contains("pohunek service refresh-path --dry-run"),
+            "{detail}"
+        );
+    } else {
+        assert!(
+            login_path_check(&document).is_none(),
+            "only macOS records a path and probes the login shell: {document}"
+        );
+    }
+
+    for name in ["claude", "codex"] {
+        write_executable(recorded.join(name), "#!/bin/sh\nexit 0\n").expect("write a program");
+    }
+    let same = login_shell(&harness, "same-shell", Some(&recorded));
+    let document = doctor_with_shell(&harness, &same).await;
+    if macos {
+        let finding = login_path_check(&document).expect("macOS reports the clean verdict");
+        assert_eq!(finding["status"], "ok", "{finding}");
+    } else {
+        assert!(login_path_check(&document).is_none(), "{document}");
+    }
+
+    let failing = login_shell(&harness, "failing-shell", None);
+    let document = doctor_with_shell(&harness, &failing).await;
+    assert!(
+        login_path_check(&document).is_none(),
+        "a failed login shell gives no verdict: {document}"
+    );
+    harness.stop().await;
+}
