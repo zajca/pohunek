@@ -23,6 +23,7 @@ pub mod governance;
 pub mod host_state;
 pub mod lock;
 pub mod logging;
+pub mod malloc;
 pub mod paths;
 
 pub mod api;
