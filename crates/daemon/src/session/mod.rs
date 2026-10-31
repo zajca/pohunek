@@ -2034,26 +2034,20 @@ impl SessionRegistry {
             return Ok(None);
         };
         let session_id = id.0.clone();
-        tokio::task::spawn_blocking(move || {
-            store.load_sessions().map(|sessions| {
-                sessions
-                    .into_iter()
-                    .find(|record| record.session_id == session_id)
+        tokio::task::spawn_blocking(move || store.load_session(&session_id))
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("session record read task panicked for {}", id.0),
+                )
+            })?
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to read session record {}: {error}", id.0),
+                )
             })
-        })
-        .await
-        .map_err(|_join_error| {
-            runtime_error(
-                "session_store_failed",
-                format!("session record read task panicked for {}", id.0),
-            )
-        })?
-        .map_err(|error| {
-            runtime_error(
-                "session_store_failed",
-                format!("failed to read session record {}: {error}", id.0),
-            )
-        })
     }
 
     async fn delete_session_record(&self, id: &SessionId) -> Result<(), ProtocolError> {
