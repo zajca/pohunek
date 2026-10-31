@@ -20,11 +20,17 @@
 //! work; see [`crate::worktree`]), and a project record outlives every session.
 //!
 //! Each line is a tagged [`Record`] (`{"kind":"resume", ...}` /
-//! `{"kind":"worktree", ...}` / `{"kind":"project", ...}`). Every mutation
-//! re-reads the whole file under the write lock, edits the relevant record kind,
-//! and rewrites **all** records, preserving the other kinds untouched. The file
-//! is small (one line per resumable session, per bound worktree, and per known
-//! project) so a full rewrite per mutation is cheap. No daemon-derived secrets
+//! `{"kind":"worktree", ...}` / `{"kind":"project", ...}`). Every access reads the
+//! whole file. The decode of the bytes last read or written is kept as a snapshot
+//! and used again only when the bytes read are equal to it, so any writer, in this
+//! process or outside it, is seen whatever it does to the file's metadata. Every
+//! mutation takes the snapshot under the write lock, edits the relevant record
+//! kind, and rewrites **all** records, preserving the other kinds untouched. The
+//! rewrite serialises only the records the mutation touched and writes the cached
+//! line of each other record, which is this build's serialisation of the decoded
+//! record, never the text found in the file, so the bytes written are those of
+//! serialising every record and the allocation work of a write does not grow with
+//! the number of records. No daemon-derived secrets
 //! are ever written: a native session id, a cwd, a repository path, a branch, a
 //! worktree path, and a project's git common dir / credential-redacted origin URL
 //! are not secrets. Owner-controlled session metadata is also persisted and must
@@ -54,7 +60,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
@@ -87,6 +93,9 @@ const OWNER_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// Upper bound for the line-oriented daemon metadata store.
 const MAX_METADATA_STORE_BYTES: usize = 16 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Room a rewrite reserves beyond the size of the store it replaces, so a
+/// record that grew does not reallocate the body.
+const BODY_CAPACITY_SLACK: usize = 4096;
 
 /// One session's native resume and fork recovery binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -825,6 +834,99 @@ impl<T> StoreMutation<T> {
     }
 }
 
+/// One record of the store and the line this build writes for it.
+#[derive(Debug)]
+struct Entry<T> {
+    record: Arc<T>,
+    /// This build's serialisation of `record`, without the line terminator.
+    /// `None` until the record has been serialised.
+    line: Option<Arc<str>>,
+    /// Whether `line` was serialised from a record a decode of that line has
+    /// not yet confirmed.
+    pending: bool,
+}
+
+impl<T> Clone for Entry<T> {
+    fn clone(&self) -> Self {
+        Self {
+            record: Arc::clone(&self.record),
+            line: self.line.clone(),
+            pending: self.pending,
+        }
+    }
+}
+
+impl<T: Clone> Entry<T> {
+    /// An entry that has not been serialised.
+    fn new(record: T) -> Self {
+        Self {
+            record: Arc::new(record),
+            line: None,
+            pending: false,
+        }
+    }
+
+    /// Replaces the record; the cached line no longer describes it.
+    fn replace(&mut self, record: T) {
+        *self = Self::new(record);
+    }
+
+    /// The record for editing; the cached line no longer describes it.
+    fn edit(&mut self) -> &mut T {
+        self.line = None;
+        self.pending = false;
+        Arc::make_mut(&mut self.record)
+    }
+}
+
+/// The records of every kind, in file order within a kind.
+#[derive(Debug, Clone, Default)]
+struct Records {
+    resume: Vec<Entry<ResumeBinding>>,
+    worktrees: Vec<Entry<WorktreeBinding>>,
+    projects: Vec<Entry<ProjectRecord>>,
+    sessions: Vec<Entry<SessionRecord>>,
+}
+
+impl Records {
+    fn from_store_records((resume, worktrees, projects, sessions): StoreRecords) -> Self {
+        Self {
+            resume: resume.into_iter().map(Entry::new).collect(),
+            worktrees: worktrees.into_iter().map(Entry::new).collect(),
+            projects: projects.into_iter().map(Entry::new).collect(),
+            sessions: sessions.into_iter().map(Entry::new).collect(),
+        }
+    }
+}
+
+/// The decoded content of the store file, valid for exactly the bytes in
+/// `content`: a decode is a function of the bytes, so a snapshot stays
+/// correct for any writer, in this process or outside it.
+#[derive(Debug)]
+struct Snapshot {
+    content: String,
+    records: Records,
+    /// The lines no loader accepts, in file order.
+    rejected: Arc<Vec<RejectedLine>>,
+}
+
+impl Snapshot {
+    fn empty() -> Self {
+        Self {
+            content: String::new(),
+            records: Records::default(),
+            rejected: Arc::new(Vec::new()),
+        }
+    }
+}
+
+/// What a rewrite put on disk.
+struct Emitted {
+    outcome: MetadataWriteOutcome,
+    body: String,
+    records: Records,
+}
+
 /// File-backed unified metadata store.
 ///
 /// A single internal lock is the **one writer-serialization point** for the
@@ -834,6 +936,9 @@ impl<T> StoreMutation<T> {
 pub struct Store {
     path: PathBuf,
     write_lock: Mutex<()>,
+    /// The decode of the file bytes last read or written by this handle. It is
+    /// only used for an access whose bytes equal the snapshot's.
+    memo: Mutex<Option<Arc<Snapshot>>>,
     /// Rejected lines already warned about, so a line that stays in the store
     /// warns once per process rather than on every read.
     warned_rejected: Mutex<std::collections::HashSet<String>>,
@@ -854,6 +959,7 @@ impl Store {
         Self {
             path,
             write_lock: Mutex::new(()),
+            memo: Mutex::new(None),
             warned_rejected: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
@@ -930,22 +1036,34 @@ impl Store {
 
     /// All resume bindings. A missing file yields an empty list.
     pub fn load_resume(&self) -> io::Result<Vec<ResumeBinding>> {
-        Ok(self.read_all()?.0)
+        Ok(owned(&self.snapshot()?.records.resume))
     }
 
     /// All worktree bindings. A missing file yields an empty list.
     pub fn load_worktrees(&self) -> io::Result<Vec<WorktreeBinding>> {
-        Ok(self.read_all()?.1)
+        Ok(owned(&self.snapshot()?.records.worktrees))
     }
 
     /// All project records. A missing file yields an empty list.
     pub fn load_projects(&self) -> io::Result<Vec<ProjectRecord>> {
-        Ok(self.read_all()?.2)
+        Ok(owned(&self.snapshot()?.records.projects))
     }
 
     /// Loads every durable logical session.
     pub fn load_sessions(&self) -> io::Result<Vec<SessionRecord>> {
-        Ok(self.read_all()?.3)
+        Ok(owned(&self.snapshot()?.records.sessions))
+    }
+
+    /// The durable record of one session, or `None` when the store holds no
+    /// such session. Only that record is copied out of the store.
+    pub fn load_session(&self, session_id: &str) -> io::Result<Option<SessionRecord>> {
+        Ok(self
+            .snapshot()?
+            .records
+            .sessions
+            .iter()
+            .find(|entry| entry.record.session_id == session_id)
+            .map(|entry| (*entry.record).clone()))
     }
 
     /// Read notification sources without treating rejected records as absence.
@@ -993,23 +1111,25 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, mut sessions) = self.read_all()?;
-        if let Some(existing) = sessions
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        if let Some(existing) = records
+            .sessions
             .iter_mut()
-            .find(|existing| existing.session_id == record.session_id)
+            .find(|existing| existing.record.session_id == record.session_id)
         {
-            if stale_runtime_snapshot(existing, record) {
+            if stale_runtime_snapshot(&existing.record, record) {
                 return Ok(SessionWriteOutcome::StaleRuntime);
             }
             let mut replacement = record.clone();
-            preserve_newer_native_identity(existing, &mut replacement);
-            keep_initial_input_settled(existing, &mut replacement);
-            *existing = replacement;
+            preserve_newer_native_identity(&existing.record, &mut replacement);
+            keep_initial_input_settled(&existing.record, &mut replacement);
+            existing.replace(replacement);
         } else {
-            sessions.push(record.clone());
+            records.sessions.push(Entry::new(record.clone()));
         }
-        drop_resume_of_terminal_session(&mut resume, record);
-        match self.write_all(&resume, &worktrees, &projects, &sessions)? {
+        drop_resume_of_terminal_session(&mut records.resume, record);
+        match self.write_entries(records, &snapshot)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
             MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
                 Ok(SessionWriteOutcome::AppliedDurabilityUncertain {
@@ -1042,25 +1162,27 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, mut sessions) = self.read_all()?;
-        let Some(existing) = sessions
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(existing) = records
+            .sessions
             .iter_mut()
-            .find(|existing| existing.session_id == record.session_id)
+            .find(|existing| existing.record.session_id == record.session_id)
         else {
             return Ok(SessionWriteOutcome::StaleSnapshot);
         };
-        if stale_runtime_snapshot(existing, record) {
+        if stale_runtime_snapshot(&existing.record, record) {
             return Ok(SessionWriteOutcome::StaleRuntime);
         }
-        if existing != expected {
+        if *existing.record != *expected {
             return Ok(SessionWriteOutcome::StaleSnapshot);
         }
         let mut replacement = record.clone();
-        preserve_newer_native_identity(existing, &mut replacement);
-        keep_initial_input_settled(existing, &mut replacement);
-        *existing = replacement;
-        drop_resume_of_terminal_session(&mut resume, record);
-        match self.write_all(&resume, &worktrees, &projects, &sessions)? {
+        preserve_newer_native_identity(&existing.record, &mut replacement);
+        keep_initial_input_settled(&existing.record, &mut replacement);
+        existing.replace(replacement);
+        drop_resume_of_terminal_session(&mut records.resume, record);
+        match self.write_entries(records, &snapshot)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
             MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
                 Ok(SessionWriteOutcome::AppliedDurabilityUncertain {
@@ -1081,20 +1203,20 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
-        let Some(record) = sessions.iter_mut().find(|record| {
-            record.session_id == session_id
-                && record
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records.sessions.iter_mut().find(|entry| {
+            entry.record.session_id == session_id
+                && entry
+                    .record
                     .transaction
                     .as_ref()
                     .is_some_and(SessionTransaction::is_initial_input)
         }) else {
             return Ok(StoreMutation::Synced(false));
         };
-        record.transaction = None;
-        Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
-            .with_value(true))
+        entry.edit().transaction = None;
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
     }
 
     /// Replaces the owner metadata of one session's current record, in the
@@ -1114,21 +1236,22 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
-        let Some(record) = sessions
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records
+            .sessions
             .iter_mut()
-            .find(|record| record.session_id == session_id)
+            .find(|entry| entry.record.session_id == session_id)
         else {
             return Ok(StoreMutation::Synced(false));
         };
+        let record = entry.edit();
         record.info.metadata.clone_from(metadata);
         updated_at.clone_into(&mut record.info.updated_at);
         if let Some(recovery) = record.recovery.as_mut() {
             recovery.metadata.clone_from(metadata);
         }
-        Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
-            .with_value(true))
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
     }
 
     /// Removes one logical session and preserves every other record kind.
@@ -1137,14 +1260,14 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
-        let before = sessions.len();
-        sessions.retain(|record| record.session_id != session_id);
-        let removed = before != sessions.len();
-        if removed {
-            return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
-                .with_value(true));
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let before = records.sessions.len();
+        records
+            .sessions
+            .retain(|entry| entry.record.session_id != session_id);
+        if records.sessions.len() != before {
+            return Ok(self.write_entries(records, &snapshot)?.with_value(true));
         }
         Ok(StoreMutation::Synced(false))
     }
@@ -1156,12 +1279,14 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, sessions) = self.read_all()?;
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
         let mut replacement = binding.clone();
-        if let Some(authoritative) = sessions
+        if let Some(authoritative) = records
+            .sessions
             .iter()
-            .find(|record| record.session_id == binding.session_id)
-            .and_then(|record| record.recovery.as_ref())
+            .find(|entry| entry.record.session_id == binding.session_id)
+            .and_then(|entry| entry.record.recovery.as_ref())
             .filter(|recovery| {
                 recovery.native_session_id.is_some() || recovery.native_session_path.is_some()
             })
@@ -1174,17 +1299,16 @@ impl Store {
                 .clone_from(&authoritative.native_session_path);
             replacement.native_reference_provenance = authoritative.native_reference_provenance;
         }
-        if let Some(existing) = resume
+        if let Some(existing) = records
+            .resume
             .iter_mut()
-            .find(|existing| existing.session_id == binding.session_id)
+            .find(|existing| existing.record.session_id == binding.session_id)
         {
-            *existing = replacement;
+            existing.replace(replacement);
         } else {
-            resume.push(replacement);
+            records.resume.push(Entry::new(replacement));
         }
-        Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
-            .with_value(()))
+        Ok(self.write_entries(records, &snapshot)?.with_value(()))
     }
 
     /// Remove a resume binding by session id, preserving every worktree record. A
@@ -1194,15 +1318,16 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects, sessions) = self.read_all()?;
-        let before = resume.len();
-        resume.retain(|binding| binding.session_id != session_id);
-        if resume.len() == before {
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let before = records.resume.len();
+        records
+            .resume
+            .retain(|entry| entry.record.session_id != session_id);
+        if records.resume.len() == before {
             return Ok(StoreMutation::Synced(()));
         }
-        Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
-            .with_value(()))
+        Ok(self.write_entries(records, &snapshot)?.with_value(()))
     }
 
     /// Find the active worktree binding for a `(session_id, repository,
@@ -1243,19 +1368,18 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
-        if let Some(existing) = worktrees.iter_mut().find(|existing| {
-            existing.session_id == binding.session_id
-                && existing.repository == binding.repository
-                && existing.branch_slug == binding.branch_slug
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        if let Some(existing) = records.worktrees.iter_mut().find(|existing| {
+            existing.record.session_id == binding.session_id
+                && existing.record.repository == binding.repository
+                && existing.record.branch_slug == binding.branch_slug
         }) {
-            *existing = binding.clone();
+            existing.replace(binding.clone());
         } else {
-            worktrees.push(binding.clone());
+            records.worktrees.push(Entry::new(binding.clone()));
         }
-        Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
-            .with_value(()))
+        Ok(self.write_entries(records, &snapshot)?.with_value(()))
     }
 
     /// Remove every worktree binding owned by `session_id`, preserving every
@@ -1265,14 +1389,15 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
-        let before = worktrees.len();
-        worktrees.retain(|binding| binding.session_id != session_id);
-        let removed = before - worktrees.len();
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let before = records.worktrees.len();
+        records
+            .worktrees
+            .retain(|entry| entry.record.session_id != session_id);
+        let removed = before - records.worktrees.len();
         if removed > 0 {
-            return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
-                .with_value(removed));
+            return Ok(self.write_entries(records, &snapshot)?.with_value(removed));
         }
         Ok(StoreMutation::Synced(0))
     }
@@ -1297,17 +1422,16 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
-        let before = worktrees.len();
-        worktrees.retain(|existing| {
-            existing.session_id != binding.session_id
-                || existing.repository != binding.repository
-                || existing.branch_slug != binding.branch_slug
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let before = records.worktrees.len();
+        records.worktrees.retain(|entry| {
+            entry.record.session_id != binding.session_id
+                || entry.record.repository != binding.repository
+                || entry.record.branch_slug != binding.branch_slug
         });
-        if worktrees.len() != before {
-            return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
-                .with_value(true));
+        if records.worktrees.len() != before {
+            return Ok(self.write_entries(records, &snapshot)?.with_value(true));
         }
         Ok(StoreMutation::Synced(false))
     }
@@ -1338,20 +1462,22 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
-        let pos = projects
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let pos = records
+            .projects
             .iter()
-            .position(|existing| existing.git_common_dir == git_common_dir);
-        let current = pos.map(|index| projects[index].clone());
+            .position(|existing| existing.record.git_common_dir == git_common_dir);
+        let current = pos.map(|index| (*records.projects[index].record).clone());
         let Some(updated) = mutate(current) else {
             return Ok(StoreMutation::Synced(None));
         };
         match pos {
-            Some(index) => projects[index] = updated.clone(),
-            None => projects.push(updated.clone()),
+            Some(index) => records.projects[index].replace(updated.clone()),
+            None => records.projects.push(Entry::new(updated.clone())),
         }
         Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .write_entries(records, &snapshot)?
             .with_value(Some(updated)))
     }
 
@@ -1371,18 +1497,18 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
-        if let Some(existing) = projects
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        if let Some(existing) = records
+            .projects
             .iter_mut()
-            .find(|existing| existing.git_common_dir == record.git_common_dir)
+            .find(|existing| existing.record.git_common_dir == record.git_common_dir)
         {
-            *existing = record.clone();
+            existing.replace(record.clone());
         } else {
-            projects.push(record.clone());
+            records.projects.push(Entry::new(record.clone()));
         }
-        Ok(self
-            .write_all(&resume, &worktrees, &projects, &sessions)?
-            .with_value(()))
+        Ok(self.write_entries(records, &snapshot)?.with_value(()))
     }
 
     /// Remove the project keyed by `git_common_dir`, preserving every resume and
@@ -1394,14 +1520,14 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
-        let before = projects.len();
-        projects.retain(|project| project.git_common_dir != git_common_dir);
-        let removed = projects.len() != before;
-        if removed {
-            return Ok(self
-                .write_all(&resume, &worktrees, &projects, &sessions)?
-                .with_value(true));
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let before = records.projects.len();
+        records
+            .projects
+            .retain(|entry| entry.record.git_common_dir != git_common_dir);
+        if records.projects.len() != before {
+            return Ok(self.write_entries(records, &snapshot)?.with_value(true));
         }
         Ok(StoreMutation::Synced(false))
     }
@@ -1500,20 +1626,57 @@ impl Store {
         Ok(lines)
     }
 
-    /// Read and partition every record. A missing file yields four empty lists;
-    /// unparseable lines are skipped (a corrupt line must not block loading the
-    /// rest).
+    /// The decoded store as of the bytes in the file now. A missing file yields
+    /// an empty snapshot; unparseable lines are skipped (a corrupt line must not
+    /// block loading the rest).
+    ///
+    /// The file is read on every call. When its bytes equal those the last
+    /// snapshot was decoded from, that snapshot is returned; otherwise the file
+    /// is decoded. File metadata never proves that the bytes are unchanged.
     ///
     /// The schema version of every line is checked first: a store newer than
     /// this daemon, older without a kept migration, or not yet migrated is
     /// refused with a [`StoreSchemaError`], so no mutation can rewrite records it
     /// does not understand.
-    fn read_all(&self) -> io::Result<StoreRecords> {
+    fn snapshot(&self) -> io::Result<Arc<Snapshot>> {
+        // Cloned before the read: a writer that installs its snapshot between
+        // the two makes the stale decode below lose the `ptr_eq` check.
+        let remembered = self
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let Some(content) = self.read_content()? else {
-            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            return Ok(Arc::new(Snapshot::empty()));
         };
+        if let Some(snapshot) = remembered
+            .as_ref()
+            .filter(|snapshot| snapshot.content == content)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
         let lines = self.checked_lines(&content)?;
-        Ok(self.partition_logged(lines).0)
+        let (records, rejected) = self.partition_logged(lines);
+        let snapshot = Arc::new(Snapshot {
+            content,
+            records: Records::from_store_records(records),
+            rejected: Arc::new(rejected),
+        });
+        // A snapshot a writer installed while this one was decoded carries
+        // cached lines and stays.
+        let mut memo = self
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unchanged = match (&*memo, &remembered) {
+            (Some(current), Some(read)) => Arc::ptr_eq(current, read),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            *memo = Some(Arc::clone(&snapshot));
+        }
+        Ok(snapshot)
     }
 
     /// [`partition_lines_logged`] that warns about each distinct rejected line
@@ -1535,18 +1698,30 @@ impl Store {
         partitioned
     }
 
-    /// The raw text of every line no loader accepts, in file order. A missing
-    /// file yields an empty list. Nothing is logged: the loaders already warn.
-    fn rejected_line_texts(&self) -> io::Result<Vec<String>> {
-        let Some(content) = self.read_content()? else {
-            return Ok(Vec::new());
-        };
-        let lines = self.checked_lines(&content)?;
-        Ok(partition_lines(lines)
-            .1
-            .into_iter()
-            .map(|line| line.text)
-            .collect())
+    /// Rewrites the store from `records` and the lines `snapshot` could not
+    /// load, and remembers what was written as the new snapshot.
+    ///
+    /// `snapshot.rejected` is the text of every line no loader accepts, from the
+    /// decode that produced the records, so a rewrite never drops a line this
+    /// build cannot parse: it may be a record a newer daemon wrote, or evidence
+    /// of a runtime upgrade preflight must still count.
+    fn write_entries(
+        &self,
+        records: Records,
+        snapshot: &Snapshot,
+    ) -> io::Result<MetadataWriteOutcome> {
+        let rejected: Vec<&str> = snapshot
+            .rejected
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        let Emitted {
+            outcome,
+            body,
+            records,
+        } = self.emit(records, &rejected, snapshot.content.len())?;
+        self.remember(body, records, Arc::clone(&snapshot.rejected));
+        Ok(outcome)
     }
 
     /// Serialize all records (resume, then worktree, then project, then session)
@@ -1554,38 +1729,19 @@ impl Store {
     /// in `\n`, whatever terminator it had), to a temp
     /// file and rename it over the store path. One `rename(2)` commits all kinds.
     ///
-    /// The rejected lines are read again here, under the write lock every caller
-    /// holds, so a rewrite never drops a line this build cannot parse: it may be
-    /// a record a newer daemon wrote, or evidence of a runtime upgrade preflight
-    /// must still count.
-    fn write_all(
-        &self,
-        resume: &[ResumeBinding],
-        worktrees: &[WorktreeBinding],
-        projects: &[ProjectRecord],
-        sessions: &[SessionRecord],
-    ) -> io::Result<MetadataWriteOutcome> {
-        let rejected = self.rejected_line_texts()?;
-        self.write_records(resume, worktrees, projects, sessions, &rejected)
-    }
-
-    /// [`Self::write_all`] with the rejected lines named by the caller, in file
-    /// order. A caller that drops one of them takes responsibility for keeping
-    /// its text elsewhere.
-    fn write_records(
-        &self,
-        resume: &[ResumeBinding],
-        worktrees: &[WorktreeBinding],
-        projects: &[ProjectRecord],
-        sessions: &[SessionRecord],
-        rejected: &[String],
-    ) -> io::Result<MetadataWriteOutcome> {
-        if resume
+    /// An entry that carries a line is written from that line; the others are
+    /// serialised. The bytes written are those of serialising every record. A
+    /// caller that drops a rejected line takes responsibility for keeping its
+    /// text elsewhere. `capacity` is the expected size of the body.
+    fn emit(&self, records: Records, rejected: &[&str], capacity: usize) -> io::Result<Emitted> {
+        if records
+            .resume
             .iter()
-            .any(|binding| !kind_is_persistable(&binding.agent_base))
-            || sessions
+            .any(|entry| !kind_is_persistable(&entry.record.agent_base))
+            || records
+                .sessions
                 .iter()
-                .any(|record| !record_agents_are_persistable(record))
+                .any(|entry| !record_agents_are_persistable(&entry.record))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1596,24 +1752,89 @@ impl Store {
             TrustedDir::open_or_create_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
                 .map_err(fs_error_to_io)?;
         }
-        let mut body = String::new();
-        for binding in resume {
-            append_line(&mut body, &Record::Resume(binding.clone()))?;
-        }
-        for binding in worktrees {
-            append_line(&mut body, &Record::Worktree(binding.clone()))?;
-        }
-        for record in projects {
-            append_line(&mut body, &Record::Project(record.clone()))?;
-        }
-        for record in sessions {
-            append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
-        }
+        let mut body = String::with_capacity(capacity + BODY_CAPACITY_SLACK);
+        let records = Records {
+            resume: emit_kind(&mut body, records.resume, Record::Resume)?,
+            worktrees: emit_kind(&mut body, records.worktrees, Record::Worktree)?,
+            projects: emit_kind(&mut body, records.projects, Record::Project)?,
+            sessions: emit_kind(&mut body, records.sessions, |record| {
+                Record::Session(Box::new(record))
+            })?,
+        };
         for text in rejected {
             body.push_str(text);
             body.push('\n');
         }
-        self.commit_body(&body)
+        let outcome = self.commit_body(&body)?;
+        Ok(Emitted {
+            outcome,
+            body,
+            records,
+        })
+    }
+
+    /// Makes `body`, which was renamed over the store, the snapshot.
+    ///
+    /// Each record serialised for this body is replaced by its decode, the
+    /// record a later read of the file produces, and keeps the serialisation of
+    /// that decode as its line. If a line does not decode to one record of its
+    /// kind, nothing is remembered and the next access decodes the file.
+    fn remember(&self, body: String, mut records: Records, rejected: Arc<Vec<RejectedLine>>) {
+        let settled = settle(&self.path, &mut records.resume, Record::Resume, |stored| {
+            let (mut resume, worktrees, projects, sessions) = stored;
+            (worktrees.is_empty()
+                && projects.is_empty()
+                && sessions.is_empty()
+                && resume.len() == 1)
+                .then(|| resume.remove(0))
+        }) && settle(
+            &self.path,
+            &mut records.worktrees,
+            Record::Worktree,
+            |stored| {
+                let (resume, mut worktrees, projects, sessions) = stored;
+                (resume.is_empty()
+                    && projects.is_empty()
+                    && sessions.is_empty()
+                    && worktrees.len() == 1)
+                    .then(|| worktrees.remove(0))
+            },
+        ) && settle(
+            &self.path,
+            &mut records.projects,
+            Record::Project,
+            |stored| {
+                let (resume, worktrees, mut projects, sessions) = stored;
+                (resume.is_empty()
+                    && worktrees.is_empty()
+                    && sessions.is_empty()
+                    && projects.len() == 1)
+                    .then(|| projects.remove(0))
+            },
+        ) && settle(
+            &self.path,
+            &mut records.sessions,
+            |record| Record::Session(Box::new(record)),
+            |stored| {
+                let (resume, worktrees, projects, mut sessions) = stored;
+                (resume.is_empty()
+                    && worktrees.is_empty()
+                    && projects.is_empty()
+                    && sessions.len() == 1)
+                    .then(|| sessions.remove(0))
+            },
+        );
+        let snapshot = settled.then(|| {
+            Arc::new(Snapshot {
+                content: body,
+                records,
+                rejected,
+            })
+        });
+        *self
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
     }
 
     /// Atomically replaces the store file with `body`.
@@ -1700,9 +1921,9 @@ impl Store {
 /// removed with the same rewrite that stores the terminal record, so no
 /// reader or concurrent writer ever sees a terminal record next to the
 /// binding of a run that has ended.
-fn drop_resume_of_terminal_session(resume: &mut Vec<ResumeBinding>, record: &SessionRecord) {
+fn drop_resume_of_terminal_session(resume: &mut Vec<Entry<ResumeBinding>>, record: &SessionRecord) {
     if record.info.state.is_terminal() {
-        resume.retain(|binding| binding.session_id != record.session_id);
+        resume.retain(|entry| entry.record.session_id != record.session_id);
     }
 }
 
@@ -2140,17 +2361,88 @@ fn record_agents_are_persistable(record: &SessionRecord) -> bool {
             .is_none_or(|binding| kind_is_persistable(&binding.agent_base))
 }
 
-/// Serialize one record onto `body` as a single JSON line. Our own types
-/// serialize infallibly; any error is mapped to io for the caller.
-fn append_line(body: &mut String, record: &Record) -> io::Result<()> {
+/// Serialize one record as a single JSON line without its terminator. Our own
+/// types serialize infallibly; any error is mapped to io for the caller.
+fn serialize_line(record: &Record) -> io::Result<String> {
     let mut value = serde_json::to_value(record)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     schema::stamp_current_schema(&mut value)?;
-    let line = serde_json::to_string(&value)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    body.push_str(&line);
+    serde_json::to_string(&value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Appends one record to `body` as a single JSON line.
+#[cfg(test)]
+fn append_line(body: &mut String, record: &Record) -> io::Result<()> {
+    body.push_str(&serialize_line(record)?);
     body.push('\n');
     Ok(())
+}
+
+/// Appends the line of every entry to `body`, serialising the entries that have
+/// none, and returns the entries with their lines.
+fn emit_kind<T: Clone>(
+    body: &mut String,
+    entries: Vec<Entry<T>>,
+    wrap: fn(T) -> Record,
+) -> io::Result<Vec<Entry<T>>> {
+    let mut written = Vec::with_capacity(entries.len());
+    for mut entry in entries {
+        let line = if let Some(line) = entry.line.clone() {
+            line
+        } else {
+            let line: Arc<str> = Arc::from(serialize_line(&wrap((*entry.record).clone()))?);
+            entry.line = Some(Arc::clone(&line));
+            entry.pending = true;
+            line
+        };
+        body.push_str(&line);
+        body.push('\n');
+        written.push(entry);
+    }
+    Ok(written)
+}
+
+/// Replaces each pending entry's record with the decode of its line and caches
+/// the serialisation of that decode. `false` when a line does not decode to
+/// exactly one record of the entry's kind.
+fn settle<T: Clone>(
+    path: &Path,
+    entries: &mut [Entry<T>],
+    wrap: fn(T) -> Record,
+    pick: fn(StoreRecords) -> Option<T>,
+) -> bool {
+    for entry in entries.iter_mut().filter(|entry| entry.pending) {
+        let Some(line) = entry.line.clone() else {
+            return false;
+        };
+        let Ok(parsed) = schema::parse_lines(path, &line) else {
+            return false;
+        };
+        let (stored, rejected) = partition_lines(parsed);
+        if !rejected.is_empty() {
+            return false;
+        }
+        let Some(decoded) = pick(stored) else {
+            return false;
+        };
+        let Ok(serialised) = serialize_line(&wrap(decoded.clone())) else {
+            return false;
+        };
+        entry.record = Arc::new(decoded);
+        if *serialised != *line {
+            entry.line = Some(Arc::from(serialised));
+        }
+        entry.pending = false;
+    }
+    true
+}
+
+/// Copies the records out of `entries`.
+fn owned<T: Clone>(entries: &[Entry<T>]) -> Vec<T> {
+    entries
+        .iter()
+        .map(|entry| (*entry.record).clone())
+        .collect()
 }
 
 /// Write a file with owner-only permissions (`0600`).
@@ -3067,6 +3359,67 @@ mod tests {
         assert_eq!(ui.custom_name.as_deref(), Some("dashboard"));
         assert_eq!(ui.source, ProjectSource::Manual);
         assert_eq!(ui.last_used_at, "2026-06-20T00:00:00Z");
+    }
+
+    /// A write that fails before the rename leaves the file, and so the next
+    /// load, as it was; the next write commits.
+    #[test]
+    fn a_write_that_fails_before_the_rename_changes_nothing() {
+        let path = temp_store_path("fail-before-rename");
+        let store = Store::new(path.clone());
+        store
+            .record_project(&project("/code/ui/.git", "/code/ui", None))
+            .expect("record ui");
+        let before = std::fs::read(&path).expect("read the store");
+        assert_eq!(store.load_projects().expect("load").len(), 1);
+
+        store.fail_next_write_before_rename();
+        store
+            .record_project(&project("/code/api/.git", "/code/api", None))
+            .expect_err("the write fails before the rename");
+        assert_eq!(std::fs::read(&path).expect("read the store"), before);
+        assert_eq!(
+            store.load_projects().expect("load").len(),
+            1,
+            "the failed write is not visible"
+        );
+
+        store
+            .record_project(&project("/code/api/.git", "/code/api", None))
+            .expect("record api");
+        assert_eq!(store.load_projects().expect("load").len(), 2);
+        assert_eq!(
+            Store::new(path).load_projects().expect("load").len(),
+            2,
+            "a fresh handle reads the same records"
+        );
+    }
+
+    /// A rename whose parent sync fails has committed: the next load returns the
+    /// new records, and they equal what a fresh handle decodes.
+    #[test]
+    fn a_write_whose_parent_sync_fails_is_visible_to_the_next_load() {
+        let path = temp_store_path("fail-parent-sync");
+        let store = Store::new(path.clone());
+        store
+            .record_project(&project("/code/ui/.git", "/code/ui", None))
+            .expect("record ui");
+
+        store.fail_next_parent_sync_after_rename();
+        let outcome = store
+            .record_project(&project("/code/api/.git", "/code/api", None))
+            .expect("the rename committed");
+        assert!(matches!(
+            outcome,
+            StoreMutation::CommittedDurabilityUncertain { .. }
+        ));
+        let loaded = store.load_projects().expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded,
+            Store::new(path).load_projects().expect("load"),
+            "the remembered records equal a fresh decode"
+        );
     }
 
     #[test]

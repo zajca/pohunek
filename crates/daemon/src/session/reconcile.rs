@@ -25825,8 +25825,11 @@ generation "$1"
     /// The worker records the exit of its PTY root from tasks that outlive the
     /// worker's `serve` task, so aborting that task leaves them able to write the
     /// terminal journal later; one that runs after the fixture directory was
-    /// removed recreates the directory. Ending the root first and waiting for the
-    /// terminal record leaves no writer behind.
+    /// removed recreates the directory. Waiting for the terminal record settles
+    /// that write only. The terminal acknowledgement writes the journal again
+    /// after `Exited`, so a case that drops its fixture root afterwards also
+    /// ends the worker with [`WorkerTask::finish`] and, when a registry
+    /// watches it, shuts the registry down first.
     ///
     /// The worker reaps the root before it persists the terminal journal and
     /// reports the `Exited` phase only after that write. A journal a finished
@@ -25864,8 +25867,9 @@ generation "$1"
     }
 
     /// Yields once the worker on `socket` reports an ended runtime, which it
-    /// does after its final journal write. A worker that no longer serves
-    /// has no writer left either.
+    /// does after the terminal journal write. The acknowledgement write that
+    /// follows is ended by [`WorkerTask::finish`]. A worker that no longer
+    /// serves has no writer left either.
     async fn worker_reports_end(socket: &Path, session_id: &str) -> Option<()> {
         match crate::runtime::Worker::connect(socket, session_id, "journal-end-probe").await {
             Ok(worker) => {
