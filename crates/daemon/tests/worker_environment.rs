@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -920,33 +920,57 @@ const UNREAD_KEYSTROKE: &str = "keystroke-while-output-unread";
 /// Line typed after the client resumed reading; its echo is live output.
 const RESYNCED_KEYSTROKE: &str = "keystroke-after-resync";
 
-/// Bytes the child prints before the client types: four times the worker's
-/// default subscriber queue (1 MB) and many times the socket and PTY buffers
+/// Bytes the child prints once told to start: four times the subscriber queue
+/// the fixture grants (1 MiB) and many times the socket and PTY buffers
 /// between the child and the client, so the output path is blocked when the
 /// client types.
 const UNREAD_FLOOD_BYTES: usize = 4 * 1024 * 1024;
 
-/// Starts a child that floods its output, then signals through the returned
-/// `flooded` file and copies its input into the returned `typed` file.
-async fn initialize_flooding_child(fixture: &Fixture, worker: &Worker) -> (PathBuf, PathBuf) {
+/// Releases the flooding child, once the attach stream is open, so the stream
+/// is subscribed before the child prints its first byte.
+async fn start_flooding(start: &Path) {
+    let start = start.to_owned();
+    tokio::task::spawn_blocking(move || std::fs::write(start, b"go\n"))
+        .await
+        .expect("join the start writer")
+        .expect("release the flooding child");
+}
+
+/// Starts a child that waits for the returned `start` FIFO to be written,
+/// floods its output, signals through the returned `flooded` file and copies
+/// its input into the returned `typed` file.
+async fn initialize_flooding_child(
+    fixture: &Fixture,
+    worker: &Worker,
+) -> (PathBuf, PathBuf, PathBuf) {
     let sink = fixture.root.join("typed");
     let flooded = fixture.root.join("flooded");
+    let start = fixture.root.join("start");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&start)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "create the start FIFO"
+    );
     let mut initialize = fixture.initialize(worker.worker_id().await);
     initialize.executable = PathBuf::from("/bin/sh");
     initialize.arguments = vec![
         "-c".to_owned(),
         format!(
-            "{{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > \"$2\"; }} & exec cat > \"$1\""
+            "read _ < \"$3\"; {{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > \"$2\"; }} & exec cat > \"$1\""
         ),
         "sh".to_owned(),
         sink.to_str().expect("UTF-8 fixture path").to_owned(),
         flooded.to_str().expect("UTF-8 fixture path").to_owned(),
+        start.to_str().expect("UTF-8 fixture path").to_owned(),
     ];
     worker
         .initialize(initialize)
         .await
         .expect("initialize the flooding child");
-    (sink, flooded)
+    (sink, flooded, start)
 }
 
 fn attach_input_frame(attach: &DataStream, sequence: u32, text: &str) -> DataFrame {
@@ -969,7 +993,7 @@ fn attach_input_frame(attach: &DataStream, sequence: u32, text: &str) -> DataFra
 async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_resyncs_after() {
     let mut fixture = Fixture::start();
     let worker = fixture.connect(CURRENT_VERSION).await;
-    let (sink, flooded) = initialize_flooding_child(&fixture, &worker).await;
+    let (sink, flooded, start) = initialize_flooding_child(&fixture, &worker).await;
 
     let mut attach = worker
         .open_attach(
@@ -978,6 +1002,7 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
         )
         .await
         .expect("open attach stream");
+    start_flooding(&start).await;
 
     // The client reads nothing, so every buffer between the child and it fills
     // while the child prints.
@@ -1050,7 +1075,7 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
 async fn a_lease_release_closes_an_attach_stream_whose_client_reads_no_output() {
     let mut fixture = Fixture::start();
     let worker = fixture.connect(CURRENT_VERSION).await;
-    let (_sink, flooded) = initialize_flooding_child(&fixture, &worker).await;
+    let (_sink, flooded, start) = initialize_flooding_child(&fixture, &worker).await;
 
     let mut attach = worker
         .open_attach(
@@ -1059,6 +1084,7 @@ async fn a_lease_release_closes_an_attach_stream_whose_client_reads_no_output() 
         )
         .await
         .expect("open attach stream");
+    start_flooding(&start).await;
     wait_until("the child to finish its output", || async {
         flooded.exists().then_some(())
     })
