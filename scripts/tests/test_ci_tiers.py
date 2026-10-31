@@ -1385,7 +1385,7 @@ class FailFastTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertEqual("uses: ./relocated/" in last, relocated)
 
-    def test_the_advisory_audit_and_the_verdict_do_not_carry_the_step_or_the_scope(self):
+    def test_the_advisory_audit_the_verdict_and_the_fail_open_selectors_do_not_carry_the_step_or_the_scope(self):
         jobs = workflow_jobs()
         for name in self.EXCLUDED:
             with self.subTest(job=name):
