@@ -1637,6 +1637,25 @@ fn before_exec(source: &ProcessError, activating: bool) -> bool {
     activating && matches!(source, ProcessError::PermissionDenied { .. })
 }
 
+/// The path of a live process image, without the ` (deleted)` the kernel
+/// appends to `/proc/<pid>/exe` once the file was unlinked, unless a file of
+/// that literal name exists.
+///
+/// A directory that was removed and published again leaves its running
+/// workers on an unlinked image; the main process and its command line still
+/// bind them to the unit.
+fn live_image_path(executable: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const SUFFIX: &[u8] = b" (deleted)";
+    match executable.as_os_str().as_bytes().strip_suffix(SUFFIX) {
+        Some(stripped) if !executable.exists() => {
+            std::borrow::Cow::Owned(PathBuf::from(std::ffi::OsStr::from_bytes(stripped)))
+        }
+        _ => std::borrow::Cow::Borrowed(executable),
+    }
+}
+
 /// Checks that the main process runs the command systemd recorded.
 ///
 /// Returns whether the process is bound to the unit. The executable is
@@ -1652,8 +1671,9 @@ fn verify_live_command(
     live: &LiveCommand,
     active_state: &str,
 ) -> Result<bool, Error> {
+    let image = live_image_path(&live.executable);
     let executable_matches = std::fs::canonicalize(&definition.executable).is_ok_and(|expected| {
-        expected == live.executable || pohunek_paths::is_set_aside_copy(&expected, &live.executable)
+        expected == *image || pohunek_paths::is_set_aside_copy(&expected, &image)
     });
     let expected: Vec<String> =
         std::iter::once(definition.executable.to_string_lossy().into_owned())
@@ -2385,6 +2405,11 @@ mod tests {
             cmdline: vec![image.to_string_lossy().into_owned()],
         };
 
+        let unlinked = PathBuf::from(format!("{} (deleted)", image.display()));
+        assert!(
+            verify_live_command(&facts, &live(unlinked), "active").expect("unlinked image"),
+            "a republished directory leaves the worker on an unlinked image"
+        );
         let aside = versions.join(".pohunek_refused-1.0.0-0123456789abcdef/pohunek-sessiond");
         assert!(verify_live_command(&facts, &live(aside), "active").expect("moved image"));
         for other in [
@@ -2392,6 +2417,7 @@ mod tests {
             ".pohunek_refused-1.0.0-0123456789abcde/pohunek-sessiond",
             ".pohunek_refused-1.0.0-0123456789abcdef/other",
             "1.0.1/pohunek-sessiond",
+            ".pohunek_refused-1.0.0-0123456789abcdef/nested/pohunek-sessiond",
         ] {
             assert!(
                 matches!(

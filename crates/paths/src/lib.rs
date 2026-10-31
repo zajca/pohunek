@@ -643,7 +643,7 @@ pub const SET_ASIDE_SUFFIX_CHARS: usize = 16;
 /// relation is read from the two paths alone, so it proves nothing about the
 /// moved tree and executes nothing from it: both paths must be the same
 /// absolute path except for one component, the version directory and its
-/// renamed entry.
+/// renamed entry, and exactly one component (the binary) follows it.
 #[must_use]
 pub fn is_set_aside_copy(original: &Path, live: &Path) -> bool {
     let (mut original, mut live) = (original.components(), live.components());
@@ -667,6 +667,7 @@ pub fn is_set_aside_copy(original: &Path, live: &Path) -> bool {
                 };
                 return suffix.len() == SET_ASIDE_SUFFIX_CHARS
                     && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && original.clone().count() == 1
                     && original.eq(live);
             }
             _ => return false,
