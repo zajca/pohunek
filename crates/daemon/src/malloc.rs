@@ -3,11 +3,12 @@
 //! The daemon's tokio blocking pool and worker threads allocate and free on
 //! many threads, and glibc gives each busy thread its own arena (up to eight
 //! per core). Under the allocation churn of a daemon with hundreds of live
-//! sessions the arenas fragment and keep their pages: 400 live workers held
-//! 650-740 MB of RSS against a ~110 MB peak live heap, and 183 MB with two
-//! arenas (<https://github.com/zajca/pohunek/issues/1672>). The bound is set
-//! once, before any thread exists, so every later thread shares the capped
-//! set of arenas.
+//! sessions the arenas fragment and keep their pages: with the store churn
+//! removed, 400 live workers still ended at 327 MB of RSS against a 97 MB peak
+//! live heap, and at 97 MB with two arenas
+//! (<https://github.com/zajca/pohunek/issues/1672>). The bound is set once,
+//! before any thread exists, so every later thread shares the capped set of
+//! arenas.
 //!
 //! Only glibc has `mallopt` and arenas: musl's allocator has none and macOS
 //! libmalloc has no such knob, so the bound is compiled out there.
@@ -32,9 +33,10 @@ const ARENA_TUNABLE: &str = "glibc.malloc.arena_max";
 /// What [`bound_arenas`] did at process start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaBound {
-    /// `mallopt(M_ARENA_MAX, limit)` succeeded.
-    Applied { limit: i32 },
-    /// The operator set the limit through the environment; it is left alone.
+    /// `mallopt(M_ARENA_MAX, limit)` succeeded while `threads` threads existed
+    /// (`None` when the count is unreadable).
+    Applied { limit: i32, threads: Option<usize> },
+    /// The operator's environment names the limit; `mallopt` is not called.
     OperatorOverride,
     /// `mallopt` refused the value; glibc keeps its default.
     Rejected { limit: i32 },
@@ -44,28 +46,29 @@ pub enum ArenaBound {
 
 static OUTCOME: OnceLock<ArenaBound> = OnceLock::new();
 
-/// Bounds the glibc malloc arenas unless the operator already chose a limit.
+/// Bounds the glibc malloc arenas unless the operator's environment names the limit.
 ///
-/// Must be the first call of `main`, before the async runtime or any other
-/// thread exists: arenas already handed to running threads stay in use.
-pub fn bound_arenas() -> ArenaBound {
+/// The presence of `MALLOC_ARENA_MAX`, or of `glibc.malloc.arena_max` in
+/// `GLIBC_TUNABLES`, is taken as the operator's intent; the value is not parsed,
+/// so glibc alone decides whether it takes effect.
+///
+/// # Safety
+///
+/// No other thread may exist: `mallopt` is MT-Unsafe in glibc, and arenas
+/// already handed to running threads stay in use. Call it as the first
+/// statement of `main`, before the async runtime is built.
+#[expect(
+    unsafe_code,
+    reason = "the allocator call needs a single-threaded process"
+)]
+pub unsafe fn bound_arenas() -> ArenaBound {
     *OUTCOME.get_or_init(|| {
         apply(
-            std::env::var_os(OPERATOR_ARENA_VARIABLE)
-                .is_some_and(|value| is_positive_integer(&value)),
+            std::env::var_os(OPERATOR_ARENA_VARIABLE).is_some(),
             std::env::var_os(GLIBC_TUNABLES_VARIABLE)
                 .is_some_and(|tunables| tunables.to_string_lossy().contains(ARENA_TUNABLE)),
         )
     })
-}
-
-/// Whether glibc takes `value` as an arena limit: it ignores an empty,
-/// non-numeric or zero `MALLOC_ARENA_MAX`.
-fn is_positive_integer(value: &std::ffi::OsStr) -> bool {
-    value
-        .to_str()
-        .and_then(|text| text.parse::<u32>().ok())
-        .is_some_and(|limit| limit > 0)
 }
 
 /// The outcome recorded by [`bound_arenas`], for the startup log line.
@@ -78,14 +81,17 @@ fn apply(operator_variable: bool, operator_tunable: bool) -> ArenaBound {
     if operator_variable || operator_tunable {
         return ArenaBound::OperatorOverride;
     }
-    // SAFETY: `mallopt` is MT-safe and only stores a tunable in the allocator.
-    // Running before any other thread exists is what makes the limit apply to
-    // every thread.
+    // SAFETY: `mallopt` takes integers only, and the caller of `bound_arenas`
+    // guarantees that no other thread allocates or reads the allocator
+    // parameters concurrently.
     #[expect(unsafe_code, reason = "glibc mallopt FFI")]
     let accepted = unsafe { libc::mallopt(libc::M_ARENA_MAX, MALLOC_ARENA_MAX) } == 1;
     if accepted {
         ArenaBound::Applied {
             limit: MALLOC_ARENA_MAX,
+            threads: std::fs::read_dir("/proc/self/task")
+                .ok()
+                .map(Iterator::count),
         }
     } else {
         ArenaBound::Rejected {

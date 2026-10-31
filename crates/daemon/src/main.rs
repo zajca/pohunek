@@ -167,7 +167,8 @@ const PROFILES_SUBDIR: &str = "agents";
 
 fn main() -> ExitCode {
     // Before the runtime or any other thread exists, so every thread shares the bounded arenas.
-    pohunek_daemon::malloc::bound_arenas();
+    // SAFETY: first statement of `main`; no other thread exists.
+    let _ = unsafe { pohunek_daemon::malloc::bound_arenas() };
     // Declared before the runtime so it drops after it, on a return and while
     // a panic unwinds out of `block_on`: the log writer flushes last.
     let _flush_logs = FlushLogs;
@@ -209,11 +210,15 @@ impl Drop for FlushLogs {
 fn log_arena_bound() {
     use pohunek_daemon::malloc::{recorded_bound, ArenaBound};
     match recorded_bound() {
-        Some(ArenaBound::Applied { limit }) => {
-            info!(malloc_arena_max = limit, "malloc arenas bounded");
+        Some(ArenaBound::Applied { limit, threads }) => {
+            info!(
+                malloc_arena_max = limit,
+                threads_at_bound = threads,
+                "malloc arenas bounded"
+            );
         }
         Some(ArenaBound::OperatorOverride) => {
-            info!("malloc arena limit set by the operator environment; left unchanged");
+            info!("malloc arena limit named by the operator environment; mallopt not called");
         }
         Some(ArenaBound::Rejected { limit }) => {
             warn!(
