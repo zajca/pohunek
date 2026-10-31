@@ -90,6 +90,36 @@ pub fn isolate(command: &mut Command) -> &mut Command {
         .env("GIT_COMMITTER_EMAIL", IDENTITY_EMAIL)
 }
 
+/// Makes the repository at `repository` run the hooks in its own `.git/hooks`,
+/// whatever `core.hooksPath` the developer's global or system configuration
+/// sets. A value injected through `-c` or the `GIT_CONFIG_*` variables still
+/// outranks the pin.
+///
+/// For a test that installs a native hook and then runs `git` through product
+/// code, which inherits the process's Git configuration; a repository-local
+/// setting outranks the global one.
+///
+/// # Panics
+///
+/// Panics when `git config` fails, which a repository the test just created
+/// never does.
+pub fn pin_hooks(repository: &std::path::Path) {
+    let hooks = repository.join(".git").join("hooks");
+    let output = command()
+        .arg("-C")
+        .arg(repository)
+        .args(["config", "core.hooksPath"])
+        .arg(&hooks)
+        .output()
+        .expect("run git config");
+    assert!(
+        output.status.success(),
+        "pinning the hooks of {} failed: {}",
+        repository.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -209,6 +239,99 @@ mod tests {
             ok && text.starts_with(&format!("{IDENTITY_NAME} <{IDENTITY_EMAIL}>")),
             "the identity is fixed: {text}"
         );
+        drop(env);
+    }
+
+    /// A native hook a test installs in its repository runs under a developer
+    /// configuration whose global `core.hooksPath` names a failing hook, when
+    /// the repository is pinned; the unpinned control is stopped by the global
+    /// hook, which shows the configuration is hostile.
+    #[test]
+    fn a_pinned_repository_runs_its_own_hook_under_a_hostile_global_hooks_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !in_own_process() {
+            return;
+        }
+        let write_hook = |path: &Path, body: &str| {
+            fs::create_dir_all(path.parent().expect("hooks dir")).expect("create hooks dir");
+            fs::write(path, body).expect("write the hook");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable hook");
+        };
+        let home = crate::tempdir().expect("hostile home");
+        let global_marker = home.path().join("global-hook-ran");
+        write_hook(
+            &home.path().join("hooks").join("pre-commit"),
+            &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", global_marker.display()),
+        );
+        let global = home.path().join("gitconfig");
+        fs::write(
+            &global,
+            format!(
+                "[core]\n\thooksPath = {}\n",
+                home.path().join("hooks").display()
+            ),
+        )
+        .expect("write the hostile configuration");
+
+        let own_marker = home.path().join("own-hook-ran");
+        let mut repositories = Vec::new();
+        for name in ["pinned", "unpinned"] {
+            let repository = home.path().join(name);
+            fs::create_dir(&repository).expect("create the repository");
+            assert!(output(command(), &repository, &["init", "-q", "-b", "main"]).0);
+            write_hook(
+                &repository.join(".git/hooks/pre-commit"),
+                &format!(
+                    "#!/bin/sh\ntouch '{}-{name}'\nexit 0\n",
+                    own_marker.display()
+                ),
+            );
+            fs::write(repository.join("file"), "x").expect("write a file");
+            assert!(output(command(), &repository, &["add", "file"]).0);
+            repositories.push(repository);
+        }
+        pin_hooks(&repositories[0]);
+        let mut inherited: Vec<Command> =
+            (0..2).map(|_| crate::process_env::command("git")).collect();
+
+        let mut env = ProcessEnv::lock();
+        env.set("GIT_CONFIG_GLOBAL", &global);
+        env.set("GIT_CONFIG_NOSYSTEM", "1");
+        for variable in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ] {
+            env.set(variable, "t");
+        }
+        let (ok, text) = output(
+            inherited.pop().expect("command"),
+            &repositories[1],
+            &["commit", "-q", "-m", "unpinned"],
+        );
+        assert!(
+            !ok,
+            "the unpinned control is stopped by the global hook: {text}"
+        );
+        assert!(
+            global_marker.exists(),
+            "the global hook ran for the control"
+        );
+        fs::remove_file(&global_marker).expect("reset the global marker");
+
+        let (ok, text) = output(
+            inherited.pop().expect("command"),
+            &repositories[0],
+            &["commit", "-q", "-m", "pinned"],
+        );
+        assert!(ok, "the pinned repository commits: {text}");
+        assert!(
+            home.path().join("own-hook-ran-pinned").exists(),
+            "the repository's own hook ran"
+        );
+        assert!(!global_marker.exists(), "the global hook did not run");
         drop(env);
     }
 }

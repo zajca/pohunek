@@ -21,6 +21,8 @@ import tempfile
 import textwrap
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 ACCEPTANCE = Path(__file__).resolve().parents[1] / "acceptance"
 DRIVER = ACCEPTANCE / "tailscale-overlay"
 HELPER = ACCEPTANCE / "overlay_evidence.py"

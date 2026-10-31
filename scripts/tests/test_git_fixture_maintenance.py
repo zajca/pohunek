@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import unittest
 
+import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+
 TESTS = Path(__file__).resolve().parent
 # The settings a fixture turns off, as configuration keys, -c options or
 # `git config` arguments; the first scenario shows they stop the maintenance.

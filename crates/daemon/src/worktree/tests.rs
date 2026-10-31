@@ -63,6 +63,7 @@ fn init_repo(tag: &str) -> PathBuf {
     fs::write(dir.join("README.md"), "init\n").expect("write README");
     git_in(&dir, &["add", "."]);
     git_in(&dir, &["commit", "-q", "-m", "init"]);
+    pohunek_test_support::git::pin_hooks(&dir);
     dir
 }
 
@@ -553,6 +554,7 @@ fn clone_of(upstream: &Path, tag: &str) -> PathBuf {
     git_in(&downstream, &["config", "user.email", "test@example.com"]);
     git_in(&downstream, &["config", "user.name", "Test"]);
     git_in(&downstream, &["config", "commit.gpgsign", "false"]);
+    pohunek_test_support::git::pin_hooks(&downstream);
     downstream
 }
 
