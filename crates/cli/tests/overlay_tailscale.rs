@@ -655,23 +655,26 @@ fn install_hanging_cli(fixture: &Fixture) -> PathBuf {
     pid
 }
 
-/// Asserts that the process whose pid `file` records is gone or only a zombie
+/// Waits until the process whose pid `file` records is gone or only a zombie
 /// awaiting its reaper.
+///
+/// `SIGKILL` is delivered asynchronously: the supervisor is reaped as soon as
+/// it dies, while another member of its process group can still be on its way
+/// out, so the end of the process is awaited rather than read once.
 fn assert_not_running(file: &std::path::Path) {
     let recorded = fs::read_to_string(file).expect("the fake recorded its pid");
-    let stat = fs::read_to_string(
-        std::path::Path::new("/proc")
-            .join(recorded.trim())
-            .join("stat"),
-    );
-    let state = stat
-        .ok()
-        .and_then(|text| text.rsplit(')').next().map(str::to_owned))
-        .and_then(|rest| rest.split_whitespace().next().map(str::to_owned));
-    assert!(
-        state.is_none_or(|state| state == "Z"),
-        "{}: the process of the hung CLI is still running",
-        file.display()
+    let stat_path = std::path::Path::new("/proc")
+        .join(recorded.trim())
+        .join("stat");
+    pohunek_test_support::wait::poll_until(
+        &format!("the process of {} to end", file.display()),
+        || {
+            let state = fs::read_to_string(&stat_path)
+                .ok()
+                .and_then(|text| text.rsplit(')').next().map(str::to_owned))
+                .and_then(|rest| rest.split_whitespace().next().map(str::to_owned));
+            state.is_none_or(|state| state == "Z").then_some(())
+        },
     );
 }
 

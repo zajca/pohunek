@@ -4458,7 +4458,100 @@ for claim in plan:
                 journal < u64::try_from(JOURNAL_BOUND).expect("the bound fits u64"),
                 "{journal} journal bytes"
             );
+
+            assert_daemon_imports_the_largest_state(&root, snapshot, &inspect_line).await;
             run.finish().await;
+        }
+
+        /// The serialized name of an enum value, which the worker and public
+        /// protocols spell alike.
+        fn wire_name<T: serde::Serialize>(value: &T) -> Value {
+            serde_json::to_value(value).expect("the value serializes")
+        }
+
+        /// The daemon's side of the largest state: a restart reads the journal in
+        /// `root`, and a live import takes the inspect `snapshot` as it travels
+        /// the control line (`inspect_line`). Both keep every row and the whole
+        /// background.
+        async fn assert_daemon_imports_the_largest_state(
+            root: &Path,
+            snapshot: &pohunek_worker_protocol::InspectSnapshot,
+            inspect_line: &[u8],
+        ) {
+            /// Most background items one snapshot carries.
+            const BACKGROUND_ITEMS: usize = 64;
+
+            let journal_bytes =
+                std::fs::read(root.join("journal/worker.json")).expect("read the worker journal");
+            let restarted = crate::session::worker_import_probe::journal_subagents(
+                &journal_bytes,
+                &root.join("daemon-scan"),
+                crate::integration::worker_hook_tests::SESSION_ID,
+                crate::integration::worker_hook_tests::WORKER_ID,
+            )
+            .unwrap_or_else(|reason| panic!("the daemon's journal read rejected it: {reason}"));
+            let on_the_wire: pohunek_worker_protocol::InspectSnapshot =
+                serde_json::from_slice(inspect_line).expect("the inspect line parses");
+            let inspected = Box::pin(crate::session::worker_import_probe::inspected_after_import(
+                &on_the_wire,
+            ))
+            .await;
+            let imported_background = inspected
+                .background
+                .as_ref()
+                .expect("the background snapshot arrives");
+            assert_eq!(imported_background.items.len(), BACKGROUND_ITEMS);
+            let worker_background = background_of(snapshot);
+            assert_eq!(
+                imported_background.revision.get(),
+                worker_background.revision
+            );
+            assert_eq!(
+                imported_background.observed_at_ms,
+                worker_background.observed_at_ms
+            );
+            for item in &worker_background.items {
+                let arrived = imported_background
+                    .items
+                    .iter()
+                    .find(|arrived| arrived.id == item.id)
+                    .unwrap_or_else(|| panic!("background item {} is missing", item.id));
+                assert_eq!(arrived.label, item.label);
+                assert_eq!(arrived.agent_type, item.agent_type);
+                assert_eq!(arrived.first_seen_ms, item.first_seen_ms);
+                assert_eq!(arrived.last_seen_ms, item.last_seen_ms);
+                assert_eq!(arrived.program, item.program);
+                assert_eq!(arrived.provider_kind, item.provider_kind);
+                assert_eq!(wire_name(&arrived.kind), wire_name(&item.kind));
+                assert_eq!(wire_name(&arrived.status), wire_name(&item.status));
+            }
+            for (what, imported) in [
+                ("the journal read of a restart", &restarted),
+                ("the live import through inspect", &inspected.subagents),
+            ] {
+                assert_eq!(imported.len(), snapshot.subagents.len(), "{what}");
+                for row in &snapshot.subagents {
+                    let arrived = imported
+                        .iter()
+                        .find(|arrived| {
+                            arrived.id == row.id
+                                && arrived.provider
+                                    == protocol::RuntimeRef::from_wire(&row.provider)
+                        })
+                        .unwrap_or_else(|| panic!("{what}: row {} is missing", row.id));
+                    assert_eq!(arrived.parent_id, row.parent_id, "{what}");
+                    assert_eq!(arrived.agent_type, row.agent_type, "{what}");
+                    assert_eq!(arrived.revision.get(), row.revision, "{what}");
+                    assert_eq!(arrived.started_at_ms, row.started_at_ms, "{what}");
+                    assert_eq!(arrived.updated_at_ms, row.updated_at_ms, "{what}");
+                    assert_eq!(arrived.finished_at_ms, row.finished_at_ms, "{what}");
+                    assert_eq!(
+                        wire_name(&arrived.lifecycle),
+                        wire_name(&row.phase),
+                        "{what}"
+                    );
+                }
+            }
         }
 
         /// `count` distinct subagent ids that start with `prefix`.
