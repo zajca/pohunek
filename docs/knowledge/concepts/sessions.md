@@ -1285,9 +1285,10 @@ transcripts), registers
 them with the watcher, and scans them, dropping indexed transcripts it no longer
 sees. On macOS a root whose registration is unchanged keeps its FSEvents stream
 across passes: the stream is recreated only when the root set or a root's
-canonical path changes, so live events keep flowing right after a pass. On
-Linux every pass rebuilds the inotify watches from the filesystem. A pass that could not finish drops nothing. The watcher only reduces
-latency: a file notification is a hint that schedules one debounced, bounded
+canonical path changes or the backend reports an error or lost events, so live
+events keep flowing right after a pass. On Linux every pass rebuilds the
+inotify watches from the filesystem. A pass that could not finish drops
+nothing. The watcher only reduces latency: a file notification is a hint that schedules one debounced, bounded
 parse of that transcript, its failure is only logged because the next pass
 repairs it, and process-backed identity checks are unchanged. A stream that
 silently stopped delivering therefore delays enrichment by at most one pass.

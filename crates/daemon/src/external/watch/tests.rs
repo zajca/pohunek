@@ -54,8 +54,6 @@ struct FakeShared {
     streams: Mutex<HashSet<PathBuf>>,
     /// Streams created over the backend's lifetime.
     streams_started: AtomicUsize,
-    /// Whether `retain_roots` keeps the streams of the roots that stay.
-    keeps_streams: AtomicBool,
 }
 
 struct FakeBackend {
@@ -123,15 +121,11 @@ impl WatchBackend for FakeBackend {
     }
 
     fn retain_roots(&mut self, roots: &[PathBuf]) {
-        if self.shared.keeps_streams.load(Ordering::SeqCst) {
-            self.shared
-                .streams
-                .lock()
-                .expect("streams")
-                .retain(|root| roots.contains(root));
-        } else {
-            self.unregister_all();
-        }
+        self.shared
+            .streams
+            .lock()
+            .expect("streams")
+            .retain(|root| roots.contains(root));
     }
 
     async fn next_events(&mut self, out: &mut Vec<WatchEvent>) -> io::Result<()> {
@@ -442,7 +436,7 @@ async fn lost_state_hints_coalesce_into_one_rate_limited_pass() {
     assert_eq!(harness.reconciles(), 1);
     advance(RESCAN_MIN_INTERVAL).await;
     assert_eq!(harness.reconciles(), 2);
-    assert_eq!(harness.shared.unregister_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.handle.passes(), 2);
     assert_eq!(harness.shared.register_calls.load(Ordering::SeqCst), 2);
 
     harness.send(vec![WatchEvent::Rescan]);
@@ -900,7 +894,6 @@ impl StreamHarness {
             std::fs::create_dir(base.path().join(name)).expect("root directory");
         }
         let shared = Arc::new(FakeShared::default());
-        shared.keeps_streams.store(true, Ordering::SeqCst);
         let (input, receiver) = mpsc::unbounded_channel();
         let backend = FakeBackend {
             input: receiver,
@@ -1023,20 +1016,60 @@ async fn a_removed_root_drops_only_its_own_stream() {
     assert_eq!(harness.streams(), BTreeSet::from([harness.root("a")]));
 }
 
+/// A backend that keeps the trait's default `retain_roots`, like inotify.
+struct RebuildingBackend(FakeBackend);
+
+impl WatchBackend for RebuildingBackend {
+    const OFFLOAD_REGISTRATION: bool = false;
+
+    fn register_root(&mut self, root: &Path, cancel: &CancellationToken) -> RootRegistration {
+        self.0.register_root(root, cancel)
+    }
+
+    fn restart(&mut self) -> io::Result<()> {
+        self.0.restart()
+    }
+
+    fn unregister_all(&mut self) {
+        self.0.unregister_all();
+    }
+
+    fn next_events(
+        &mut self,
+        out: &mut Vec<WatchEvent>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        self.0.next_events(out)
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_backend_without_stream_retention_rebuilds_every_registration_per_pass() {
-    let harness = StreamHarness::start(&["a"]).await;
-    harness.shared.keeps_streams.store(false, Ordering::SeqCst);
-    let unregistered = harness.shared.unregister_calls.load(Ordering::SeqCst);
+async fn a_backend_with_the_default_retention_rebuilds_every_registration_per_pass() {
+    let base = pohunek_test_support::tempdir().expect("base");
+    let shared = Arc::new(FakeShared::default());
+    let (_input, receiver) = mpsc::unbounded_channel();
+    let backend = RebuildingBackend(FakeBackend {
+        input: receiver,
+        shared: Arc::clone(&shared),
+    });
+    start(
+        backend,
+        vec![claude_root(base.path())],
+        Arc::new(FakeSink::default()),
+        CancellationToken::new(),
+        &TaskTracker::new(),
+        None,
+    )
+    .await;
+    let unregistered = shared.unregister_calls.load(Ordering::SeqCst);
 
     advance(RECONCILE_INTERVAL).await;
 
     assert_eq!(
-        harness.shared.unregister_calls.load(Ordering::SeqCst),
+        shared.unregister_calls.load(Ordering::SeqCst),
         unregistered + 1,
-        "the default retain_roots unregisters everything before the pass registers it again"
+        "the default unregisters everything before the pass registers it again"
     );
-    assert_eq!(harness.started(), 2);
+    assert_eq!(shared.streams_started.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(start_paused = true)]

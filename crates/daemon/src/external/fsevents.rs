@@ -50,7 +50,9 @@ struct Registered {
 ///
 /// The locked `notify` crate discards errors from starting the stream, so a
 /// stream that silently failed to start delivers nothing. That only costs
-/// latency: the periodic reconciliation pass keeps the index current.
+/// latency: the periodic reconciliation pass keeps the index current. A callback
+/// error or a full event queue marks every stream suspect, so the next pass
+/// recreates them instead of keeping a stream that may be dead.
 #[derive(Debug)]
 pub(super) struct FsEventsBackend {
     watcher: RecommendedWatcher,
@@ -58,6 +60,9 @@ pub(super) struct FsEventsBackend {
     lost: Arc<AtomicBool>,
     lost_wake: Arc<Notify>,
     registered: Vec<Registered>,
+    /// Set when a callback error or a lost event suggests a stream stopped
+    /// delivering; the next `retain_roots` drops every registration.
+    suspect: bool,
 }
 
 impl FsEventsBackend {
@@ -88,6 +93,7 @@ impl FsEventsBackend {
             lost,
             lost_wake,
             registered: Vec::new(),
+            suspect: false,
         })
     }
 
@@ -104,9 +110,12 @@ impl FsEventsBackend {
         }
     }
 
-    fn translate(&self, signal: RawSignal, out: &mut Vec<WatchEvent>) {
+    fn translate(&mut self, signal: RawSignal, out: &mut Vec<WatchEvent>) {
         match signal {
-            RawSignal::Error => out.push(WatchEvent::Rescan),
+            RawSignal::Error => {
+                self.suspect = true;
+                out.push(WatchEvent::Rescan);
+            }
             RawSignal::Event(event) => translate_event(&self.registered, event, out),
         }
     }
@@ -202,6 +211,7 @@ impl WatchBackend for FsEventsBackend {
         }
         // The `FSEvents` binding converts paths with `to_str().unwrap()`.
         if canonical.to_str().is_none() {
+            self.forget_root(root);
             return RootRegistration::Failed(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "transcript root path is not valid UTF-8",
@@ -254,6 +264,11 @@ impl WatchBackend for FsEventsBackend {
     /// stops and recreates the `FSEvents` stream, and events are not delivered
     /// until the new stream runs.
     fn retain_roots(&mut self, roots: &[PathBuf]) {
+        if self.suspect {
+            self.suspect = false;
+            self.unregister_all();
+            return;
+        }
         let watcher = &mut self.watcher;
         self.registered.retain(|entry| {
             let keep = roots.contains(&entry.configured);
@@ -284,6 +299,7 @@ impl WatchBackend for FsEventsBackend {
             self.translate(signal, out);
         }
         if self.lost.swap(false, Ordering::AcqRel) {
+            self.suspect = true;
             out.push(WatchEvent::Rescan);
         }
         Ok(())
@@ -497,5 +513,28 @@ mod tests {
         backend.register_root(&root, &cancel);
 
         assert!(configured(&backend).is_empty());
+    }
+
+    #[test]
+    fn a_callback_error_makes_the_next_pass_recreate_every_stream() {
+        let base = pohunek_test_support::tempdir().expect("base");
+        let root = base.path().join("projects");
+        fs::create_dir(&root).expect("root");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut backend = super::FsEventsBackend::open().expect("backend");
+        backend.register_root(&root, &cancel);
+
+        let mut out = Vec::new();
+        backend.translate(super::RawSignal::Error, &mut out);
+        backend.retain_roots(std::slice::from_ref(&root));
+
+        assert_eq!(out, vec![WatchEvent::Rescan]);
+        assert!(
+            configured(&backend).is_empty(),
+            "the suspect stream is dropped"
+        );
+        backend.register_root(&root, &cancel);
+        backend.retain_roots(std::slice::from_ref(&root));
+        assert_eq!(configured(&backend), vec![root], "and later passes keep it");
     }
 }
