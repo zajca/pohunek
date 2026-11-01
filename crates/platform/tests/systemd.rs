@@ -278,12 +278,16 @@ fn notify_ready() {
 /// Stops, resets, disables, and removes everything a test created.
 struct Cleanup {
     patterns: Vec<String>,
+    /// Sessions slice whose runtime drop-ins (resource-control properties a
+    /// scenario set on it) are removed.
+    slice: String,
     unit_dir: Option<(PathBuf, Vec<String>)>,
 }
 
 impl Cleanup {
     fn new(namespace: &Namespace) -> Self {
         Self {
+            slice: namespace.sessions_slice(),
             // Children first: the sessions slice nests under the implicit
             // `pohunek-<ns>.slice`, which lingers once created.
             patterns: vec![
@@ -301,6 +305,7 @@ impl Drop for Cleanup {
             systemctl(&["stop", pattern]);
             systemctl(&["reset-failed", pattern]);
         }
+        systemctl(&["revert", &self.slice]);
         if let Some((directory, units)) = &self.unit_dir {
             for unit in units {
                 systemctl(&["disable", unit]);
@@ -931,10 +936,10 @@ async fn a_worker_that_never_becomes_ready_reports_a_timeout() {
     assert_eq!(evidence.result(), "timeout");
 }
 
-/// Fails with a stated precondition unless the unit's cgroup enforces a
-/// memory limit, which needs the memory controller delegated to the user
-/// manager.
-fn require_memory_controller(unit: &str) {
+/// Fails with a stated precondition unless the unit's cgroup enforces the
+/// memory limit `file` (`memory.max` or `memory.high`), which needs the memory
+/// controller delegated to the user manager.
+fn require_memory_controller(unit: &str, file: &str) {
     let properties = show(unit, &["ControlGroup"]);
     let group = properties
         .get("ControlGroup")
@@ -942,11 +947,11 @@ fn require_memory_controller(unit: &str) {
         .unwrap_or_else(|| panic!("precondition: {unit} has no control group"));
     let limit = Path::new("/sys/fs/cgroup")
         .join(group.trim_start_matches('/'))
-        .join("memory.max");
+        .join(file);
     let value = std::fs::read_to_string(&limit).unwrap_or_default();
     assert!(
         value.trim() != "" && value.trim() != "max",
-        "precondition: the systemd user manager does not enforce MemoryMax for {unit}; \
+        "precondition: the systemd user manager does not enforce {file} for {unit}; \
          delegate the memory controller to the user manager (Delegate=memory on \
          user@.service) before running this scenario"
     );
@@ -980,7 +985,7 @@ async fn a_worker_under_memory_pressure_reports_an_oom_kill() {
         &format!("MemoryMax={OOM_MEMORY_MAX}"),
         "MemorySwapMax=0",
     ]);
-    require_memory_controller(&unit);
+    require_memory_controller(&unit, "memory.max");
     std::fs::write(&trigger, b"go").expect("trigger the allocation");
 
     let evidence = failed_evidence(&supervisor, &id).await;
@@ -1064,9 +1069,8 @@ async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
         "--runtime",
         &unit,
         &format!("MemoryHigh={OOMD_MEMORY_HIGH}"),
-        "MemorySwapMax=0",
     ]);
-    require_memory_controller(&unit);
+    require_memory_controller(&unit, "memory.high");
     std::fs::write(&trigger, b"go").expect("trigger the allocation");
 
     let evidence = failed_evidence_within(&supervisor, &id, OOMD_TIMEOUT).await;
