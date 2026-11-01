@@ -1,0 +1,3 @@
+## Unreleased (2026-11-01, fail-fast cancel independent of the job lookup, #1831)
+
+- #1831: `cancel-run.sh` guarded `JOB_ID` (`job.check_run_id`, documented only for the workflow `job` context) and ran its jobs API lookup without a time bound, so an empty id aborted the script before `gh run cancel` and a hanging call delayed the cancel until the job timeout. The script now requires only `GH_TOKEN`, `RUN_ID`, `REPOSITORY` and `FAILED_JOB`; an empty `JOB_ID` skips the lookup and the `/job/` link, and the lookup is cut off after `LOOKUP_TIMEOUT_SECONDS` by a bash watchdog (no GNU `timeout` on the macOS callers) and falls back like an API error. Pinned by `scripts/tests/test_ci_step_bounds.py`; documented in `docs/development.md`.
