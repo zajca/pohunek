@@ -645,10 +645,7 @@ mod subagent_sequences {
     use tokio::net::UnixListener;
     use tracing_subscriber::layer::SubscriberExt;
 
-    use super::{
-        initialize, start_worker_initialized, start_worker_with_schema, state_asset, DaemonStub,
-        SESSION_ID,
-    };
+    use super::{initialize, start_worker_initialized, state_asset, DaemonStub, SESSION_ID};
     use crate::runtime::Worker;
 
     /// Claude Code subagent hook sequences recorded on #883.
@@ -1447,7 +1444,7 @@ mod subagent_sequences {
     /// of the child, so its row takes a new revision and finish time (#916 D1).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_codex_followup_turn_is_recorded_as_another_completed_turn() {
-        for name in ["followup_v1", "followup_v2"] {
+        for name in ["followup_v1", "followup_v2", "resume_after_close"] {
             a_second_codex_stop_is_another_completed_turn(name, "claude").await;
         }
     }
