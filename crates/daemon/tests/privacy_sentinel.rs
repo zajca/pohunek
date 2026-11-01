@@ -355,9 +355,15 @@ async fn spawn_worker_backed_server_with(
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server
-            .serve(async move {
-                let _ = rx.await;
-            })
+            .serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = rx.await;
+                },
+            )
             .await;
     });
     (tx, handle, worker_home_dir)

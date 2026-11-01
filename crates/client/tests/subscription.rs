@@ -284,6 +284,47 @@ async fn subscription_next_event_decodes_notification_created() {
         .expect("subscription daemon task completed");
 }
 
+/// A fragment the stream ends on, as when the daemon stops in the middle of an
+/// event, is a closed connection and not an event or a parse error.
+#[tokio::test]
+async fn subscription_ends_cleanly_on_an_unterminated_fragment() {
+    let request = subscribe_request("subscribe-cut");
+    let complete = serde_json::to_string(
+        &json!({"v": 4, "event": "agent_state", "session_id": "s-1", "activity": "working"}),
+    )
+    .expect("serialize event");
+    let daemon = spawn_unix_subscription_daemon_with_tail(
+        response_ok_line_for(&request, json!({"subscribed": true})),
+        vec![complete],
+        Some("{\"v\":4,\"event\":\"session_updated\",\"sess".to_owned()),
+    );
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
+        .await
+        .expect("connect local subscription test daemon");
+    let mut subscription = client
+        .subscribe(&request)
+        .await
+        .expect("subscribe succeeds");
+
+    let first = subscription
+        .next_event()
+        .await
+        .expect("the complete event decodes");
+    assert!(first.is_some());
+    assert!(
+        subscription
+            .next_event()
+            .await
+            .expect("the fragment is not an error")
+            .is_none(),
+        "the fragment ends the stream"
+    );
+    daemon
+        .task
+        .await
+        .expect("subscription daemon task completed");
+}
+
 #[tokio::test]
 async fn subscription_next_event_malformed_json_returns_typed_error() {
     let request = subscribe_request("subscribe-notification-malformed");
@@ -402,6 +443,16 @@ fn spawn_unix_subscription_daemon(
     ack_line: String,
     event_lines: Vec<String>,
 ) -> UnixSubscriptionDaemon {
+    spawn_unix_subscription_daemon_with_tail(ack_line, event_lines, None)
+}
+
+/// Like [`spawn_unix_subscription_daemon`], and writes `tail` after the events
+/// with no line terminator before it closes.
+fn spawn_unix_subscription_daemon_with_tail(
+    ack_line: String,
+    event_lines: Vec<String>,
+    tail: Option<String>,
+) -> UnixSubscriptionDaemon {
     let socket_file = SocketFile::new();
     let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix subscription test daemon");
@@ -409,7 +460,7 @@ fn spawn_unix_subscription_daemon(
 
     let task = tokio::spawn(async move {
         let (stream, _addr) = listener.accept().await.expect("accept unix client");
-        handle_subscription_connection(stream, request_tx, ack_line, event_lines).await;
+        handle_subscription_connection(stream, request_tx, ack_line, (event_lines, tail)).await;
     });
 
     UnixSubscriptionDaemon {
@@ -434,7 +485,7 @@ async fn spawn_tcp_subscription_daemon(
 
     let task = tokio::spawn(async move {
         let (stream, _addr) = listener.accept().await.expect("accept tcp client");
-        handle_subscription_connection(stream, request_tx, ack_line, event_lines).await;
+        handle_subscription_connection(stream, request_tx, ack_line, (event_lines, None)).await;
     });
 
     TcpSubscriptionDaemon {
@@ -448,7 +499,7 @@ async fn handle_subscription_connection<S>(
     stream: S,
     request_tx: oneshot::Sender<String>,
     ack_line: String,
-    event_lines: Vec<String>,
+    (event_lines, tail): (Vec<String>, Option<String>),
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -481,6 +532,12 @@ async fn handle_subscription_connection<S>(
             .write_all(b"\n")
             .await
             .expect("write subscription event newline");
+    }
+    if let Some(tail) = tail {
+        stream
+            .write_all(tail.as_bytes())
+            .await
+            .expect("write the unterminated tail");
     }
     stream.shutdown().await.expect("close subscription stream");
 }

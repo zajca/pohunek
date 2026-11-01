@@ -42,7 +42,8 @@ use tracing::{debug, error, info, warn};
 
 use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
 use pohunek_daemon::api::{
-    ControlServer, DaemonState, HealthInfo, OpenedListener, OverlaySource, RemoteServer,
+    ConnectionTasks, ControlServer, DaemonState, HealthInfo, OpenedListener, OverlaySource,
+    RemoteServer,
 };
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::discovery::DiscoveryCache;
@@ -753,12 +754,19 @@ async fn run() -> Result<(), DaemonError> {
     let shutdown_token = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        shutdown_sessions.begin_daemon_shutdown();
+        // The connections stop first: a line pipelined behind a wait that the
+        // registry answers must not be dispatched in the gap before they do.
         shutdown_token.cancel();
+        shutdown_sessions.begin_daemon_shutdown();
     });
 
+    let control_connections = ConnectionTasks::new("control_connections", &shutdown);
+    control_connections.register_shutdown_step(&tasks);
+    let remote_connections = ConnectionTasks::new("remote_connections", &shutdown);
+    remote_connections.register_shutdown_step(&tasks);
+
     let unix_shutdown = shutdown.clone();
-    let unix_serve = server.serve(async move {
+    let unix_serve = server.serve(control_connections, async move {
         unix_shutdown.cancelled().await;
     });
     let remote_shutdown_sessions = sessions.clone();
@@ -767,9 +775,15 @@ async fn run() -> Result<(), DaemonError> {
     } else {
         MissingCli::Disable
     };
-    let remote_serve = serve_remote(remote_state, &registry, missing_cli, shutdown, move || {
-        remote_shutdown_sessions.begin_daemon_shutdown();
-    });
+    let remote_serve = serve_remote(
+        remote_state,
+        &registry,
+        missing_cli,
+        (shutdown, remote_connections),
+        move || {
+            remote_shutdown_sessions.begin_daemon_shutdown();
+        },
+    );
     let ((), remote_result) = tokio::join!(unix_serve, remote_serve);
 
     // 11. Stop the daemon's tasks in ordered phases, each inside its own bound
@@ -779,9 +793,9 @@ async fn run() -> Result<(), DaemonError> {
     //     their events (notification projector, hook flush), and the attention
     //     coordinator last so any last defers/resolves they hand over are
     //     accepted, the registry stops its own background work and
-    //     refuses a store write after that (a control connection still
-    //     finishing an operation sees `registry_shut_down`, which is how a
-    //     daemon that is exiting ends it), and the append-only event log
+    //     refuses a store write after that (a control connection that
+    //     outlived the drivers bound and still finishes an operation sees
+    //     `registry_shut_down`, which is how a daemon that is exiting ends it), and the append-only event log
     //     flushes last so events buffered at shutdown are not lost. The report
     //     is logged by the run.
     drop(tasks.run(&sessions).await);
@@ -1208,7 +1222,7 @@ fn spawn_event_logs(
 /// dropped, while unavailable provider state drops it fail-closed and retries.
 async fn serve_remote_with_retry<F, Fut>(
     mut bind: F,
-    shutdown: CancellationToken,
+    (shutdown, connections): (CancellationToken, ConnectionTasks),
     initial_retry_interval: Duration,
     reconcile_interval: Duration,
 ) where
@@ -1221,7 +1235,7 @@ async fn serve_remote_with_retry<F, Fut>(
         if let Some(remote) = active.take() {
             let current_addr = remote.local_addr();
             let remote_shutdown = shutdown.clone();
-            let mut serving = Box::pin(remote.serve(async move {
+            let mut serving = Box::pin(remote.serve(connections.clone(), async move {
                 remote_shutdown.cancelled().await;
             }));
             let transition = loop {
@@ -1301,7 +1315,7 @@ async fn serve_remote<F>(
     state: DaemonState,
     registry: &OverlayRegistry,
     missing_cli: MissingCli,
-    shutdown: CancellationToken,
+    (shutdown, connections): (CancellationToken, ConnectionTasks),
     begin_daemon_shutdown: F,
 ) -> Result<(), DaemonError>
 where
@@ -1313,6 +1327,7 @@ where
         let overlay_id = configured.id().clone();
         let state = state.clone();
         let shutdown = shutdown.clone();
+        let connections = connections.clone();
         let task = tokio::spawn(async move {
             serve_remote_with_retry(
                 |current_addr| {
@@ -1328,7 +1343,7 @@ where
                         },
                     )
                 },
-                shutdown,
+                (shutdown, connections),
                 REMOTE_BIND_INITIAL_RETRY_INTERVAL,
                 REMOTE_LISTENER_RECONCILE_INTERVAL,
             )
@@ -1381,8 +1396,8 @@ where
             let begin_daemon_shutdown = begin_daemon_shutdown
                 .take()
                 .expect("daemon shutdown callback is available for the first failure");
-            begin_daemon_shutdown();
             shutdown.cancel();
+            begin_daemon_shutdown();
         }
     }
 
@@ -1542,7 +1557,9 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::sync::CancellationToken;
 
-    use pohunek_daemon::api::{DaemonState, HealthInfo, OpenedListener, RemoteServer};
+    use pohunek_daemon::api::{
+        ConnectionTasks, DaemonState, HealthInfo, OpenedListener, RemoteServer,
+    };
     use pohunek_daemon::governance::HostGovernanceService;
     use pohunek_daemon::session::SessionRegistry;
     use pohunek_daemon::DaemonError;
@@ -1553,6 +1570,11 @@ mod tests {
         bind_remote_server, next_retry_interval, serve_remote_with_retry, supervise_remote_tasks,
         MissingCli, RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
+
+    /// The connection tasks of a remote listener that stops with `shutdown`.
+    fn remote_connections(shutdown: &CancellationToken) -> ConnectionTasks {
+        ConnectionTasks::new("remote_connections", shutdown)
+    }
 
     /// A `NetBird` registry on the default port that reads no configuration file
     /// and no environment variable.
@@ -1621,7 +1643,7 @@ mod tests {
                 };
                 std::future::ready(result)
             },
-            supervisor_shutdown,
+            (supervisor_shutdown, remote_connections(&shutdown)),
             retry_interval,
             Duration::from_secs(30),
         ));
@@ -1935,7 +1957,7 @@ mod tests {
                     },
                 )
             },
-            supervisor_shutdown,
+            (supervisor_shutdown, remote_connections(&shutdown)),
             Duration::from_secs(1),
             reconcile_interval,
         ));

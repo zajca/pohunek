@@ -15668,7 +15668,13 @@ generation "$1"
             let server = crate::api::ControlServer::bind_with_state(&socket, state)
                 .await
                 .expect("bind the control socket");
-            tokio::spawn(server.serve(std::future::pending()));
+            tokio::spawn(server.serve(
+                crate::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                std::future::pending(),
+            ));
             pohunek_client::Client::connect_local_with_options(&socket, options)
                 .await
                 .expect("connect the control client")

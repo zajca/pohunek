@@ -196,12 +196,24 @@ impl Daemon {
                 let _ = unix_tx.send(());
                 let _ = remote_tx.send(());
             };
-            let unix_serve = unix.serve(async move {
-                let _ = unix_rx.await;
-            });
-            let remote_serve = remote.serve(async move {
-                let _ = remote_rx.await;
-            });
+            let unix_serve = unix.serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = unix_rx.await;
+                },
+            );
+            let remote_serve = remote.serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "remote_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = remote_rx.await;
+                },
+            );
             tokio::join!(fanout, unix_serve, remote_serve);
         });
         Self {

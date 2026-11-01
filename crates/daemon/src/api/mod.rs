@@ -3,9 +3,10 @@
 //! Binds the control socket with owner-private permissions, recovers from a
 //! stale socket left by a previous run, and serves newline-delimited JSON
 //! requests using the shared `protocol` crate. Each connection is handled on its
-//! own Tokio task so one client cannot stall another, and a panicking handler
-//! cannot take down the daemon (per `docs/architecture.md` "Concurrency and
-//! supervision").
+//! own Tokio task, tracked by a [`ConnectionTasks`] of its transport, so one
+//! client cannot stall another, a panicking handler cannot take down the daemon
+//! (per `docs/architecture.md` "Concurrency and supervision"), and the
+//! connections stop with the daemon.
 //!
 //! The same connection-serving code drives two transports: the local
 //! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over an overlay
@@ -22,10 +23,13 @@
 //! Attach streaming uses a separate connection: the first line carries an attach
 //! prelude, then the connection switches from newline JSON to raw PTY bytes.
 
+mod connections;
 mod handler;
 mod hangup;
 mod keepalive;
 
+pub use self::connections::ConnectionTasks;
+use self::connections::{Connection, ConnectionState};
 use self::hangup::{ClientTransport, HangupWatch};
 
 use std::ffi::{OsStr, OsString};
@@ -37,7 +41,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt as _, SinkExt, StreamExt};
 use pohunek_worker_protocol::{
     read_frame, write_frame, ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, WriteId,
 };
@@ -49,6 +53,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use overlay::OverlayTransport;
@@ -260,10 +265,14 @@ impl ControlServer {
 
     /// Run the accept loop until `shutdown` resolves.
     ///
-    /// Each accepted connection is served on its own task. The loop itself never
-    /// returns an error for a single bad connection; transient accept errors are
-    /// logged and the loop continues.
-    pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) {
+    /// Each accepted connection is served on a task of `connections`. The loop
+    /// itself never returns an error for a single bad connection; transient
+    /// accept errors are logged and the loop continues.
+    pub async fn serve(
+        self,
+        connections: ConnectionTasks,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
         tokio::pin!(shutdown);
         let state = self.state.clone();
         loop {
@@ -276,12 +285,14 @@ impl ControlServer {
                     match accepted {
                         Ok((stream, _addr)) => {
                             let state = state.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(None, |connection| async move {
                                 // The peer is read from the accepted socket before any request
                                 // byte is parsed, so it names the process that connected.
                                 let peer = ControlPeer::capture(&stream).map(Arc::new);
                                 let state = state.with_control_peer(peer);
-                                if let Err(err) = Box::pin(serve_connection(stream, state)).await {
+                                if let Err(err) =
+                                    Box::pin(serve_connection(stream, state, connection)).await
+                                {
                                     warn!(error = %err, "control connection ended with error");
                                 }
                             });
@@ -503,7 +514,7 @@ impl RemoteServer {
 
     /// Run the accept loop until `shutdown` resolves.
     ///
-    /// Each accepted connection is served on its own task via the same
+    /// Each accepted connection is served on a task of `connections` via the same
     /// [`serve_connection`] used by the Unix server. The loop never returns an
     /// error for a single bad connection; transient accept errors are logged and
     /// the loop continues. The peer address is logged at info on each accept.
@@ -511,7 +522,11 @@ impl RemoteServer {
     /// [`SessionRegistry::remote_keepalive`](crate::session::SessionRegistry::remote_keepalive),
     /// so a peer that vanishes without closing the connection fails its read
     /// and releases the slot of an in-flight wait.
-    pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) {
+    pub async fn serve(
+        self,
+        connections: ConnectionTasks,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
         tokio::pin!(shutdown);
         let state = self.state.clone();
         let keepalive = state.sessions.remote_keepalive();
@@ -527,8 +542,10 @@ impl RemoteServer {
                             info!(peer = %peer, "remote control connection accepted");
                             keepalive::apply(&stream, peer, keepalive);
                             let state = state.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = Box::pin(serve_connection(stream, state)).await {
+                            connections.spawn(Some(peer.to_string()), |connection| async move {
+                                if let Err(err) =
+                                    Box::pin(serve_connection(stream, state, connection)).await
+                                {
                                     warn!(error = %err, "remote control connection ended with error");
                                 }
                             });
@@ -578,10 +595,19 @@ const CANCEL_ON_HANGUP: &[&str] = &[
 /// cancels the wait and ends the connection, and a pipelined line is held and
 /// answered after the wait's reply.
 ///
+/// When the daemon starts stopping (the connection's token), an idle connection
+/// closes, a request in flight finishes and is answered, and every request line
+/// the connection already holds is answered with `daemon_shutting_down` and not
+/// dispatched; no line is dispatched after the signal.
+///
 /// A `subscribe` request is the exception: after its OK ack the connection turns
 /// into a one-way stream of session lifecycle events ([`run_event_subscription`])
-/// and is consumed there until the client disconnects.
-async fn serve_connection<S>(stream: S, state: DaemonState) -> Result<(), io::Error>
+/// and is consumed there until the client disconnects or the daemon stops.
+async fn serve_connection<S>(
+    stream: S,
+    state: DaemonState,
+    connection: Connection,
+) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + ClientTransport + Unpin + Send,
 {
@@ -591,12 +617,23 @@ where
     let mut pending = None;
 
     loop {
-        let line = match pending.take() {
-            Some(line) => line,
-            None => match read_control_line(framed.next().await)? {
+        if connection.token().is_cancelled() {
+            refuse_buffered(&mut framed, pending.take(), negotiated_version).await?;
+            return Ok(());
+        }
+        let line = if let Some(line) = pending.take() {
+            line
+        } else {
+            connection.set_state(ConnectionState::Idle);
+            let next = tokio::select! {
+                biased;
+                () = connection.token().cancelled() => continue,
+                next = framed.next() => next,
+            };
+            match read_control_line(next)? {
                 Some(line) => line,
                 None => break,
-            },
+            }
         };
 
         let mut watched_request = None;
@@ -611,6 +648,14 @@ where
                 framed.send(response).await.map_err(codec_to_io)?;
                 continue;
             }
+            if let (true, Some(version)) = (connection.token().is_cancelled(), negotiated_version) {
+                framed
+                    .send(shutting_down_reply(&request, version))
+                    .await
+                    .map_err(codec_to_io)?;
+                continue;
+            }
+            connection.set_state(ConnectionState::Request(request.method().to_owned()));
             if CANCEL_ON_HANGUP.contains(&request.method()) {
                 watched_request = Some(request);
             }
@@ -624,7 +669,7 @@ where
                     dispatch,
                     &mut framed,
                     &mut pending,
-                    request,
+                    (request, connection.token(), negotiated_version),
                 ))
                 .await?
                 {
@@ -639,32 +684,107 @@ where
                 framed.send(response_line).await.map_err(codec_to_io)?;
             }
             Dispatch::Subscribe(ack_line, version) => {
-                // Subscribe BEFORE sending the ack so no event emitted between
-                // the ack and the recv loop is missed.
-                let mut session_events = state.sessions.subscribe();
-                let (_notification_sender, mut notification_events) =
-                    if let Some(notifications) = &state.notifications {
-                        (None, notifications.subscribe())
-                    } else {
-                        let (sender, receiver) = broadcast::channel(1);
-                        (Some(sender), receiver)
-                    };
-                framed.send(ack_line).await.map_err(codec_to_io)?;
-                run_event_subscription(
-                    &mut framed,
-                    &mut session_events,
-                    &mut notification_events,
-                    version,
-                )
-                .await?;
+                serve_subscription(&mut framed, &state, (ack_line, version), &connection).await?;
                 // The connection is consumed by the subscription stream.
                 return Ok(());
             }
             Dispatch::Attach(stream_id) => {
                 let hangup = framed.get_ref().hangup_watch(&stream_id);
-                run_attach_connection(framed, state.sessions.clone(), stream_id, hangup).await?;
+                run_attach_connection(
+                    framed,
+                    state.sessions.clone(),
+                    stream_id,
+                    (hangup, &connection),
+                )
+                .await?;
                 return Ok(());
             }
+        }
+    }
+    Ok(())
+}
+
+/// Acknowledges a `subscribe` request and streams events on the connection
+/// until the client disconnects or the daemon stops.
+async fn serve_subscription<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    state: &DaemonState,
+    (ack_line, version): (String, ProtocolVersion),
+    connection: &Connection,
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Subscribe BEFORE sending the ack so no event emitted between the ack and
+    // the recv loop is missed.
+    let mut session_events = state.sessions.subscribe();
+    let (_notification_sender, mut notification_events) =
+        if let Some(notifications) = &state.notifications {
+            (None, notifications.subscribe())
+        } else {
+            let (sender, receiver) = broadcast::channel(1);
+            (Some(sender), receiver)
+        };
+    framed.send(ack_line).await.map_err(codec_to_io)?;
+    connection.set_state(ConnectionState::Subscription);
+    run_event_subscription(
+        framed,
+        (&mut session_events, &mut notification_events),
+        version,
+        connection.token(),
+    )
+    .await
+}
+
+/// The most request lines [`refuse_buffered`] answers after the stop signal.
+/// The cap bounds how many buffered lines are read and refused, so a client that
+/// floods the socket cannot keep the connection open; no real client pipelines
+/// more than a handful of requests, and 64 is far above that.
+const MAX_REFUSED_LINES: usize = 64;
+
+/// The reply to a request that arrives, or is still waiting, once the daemon is
+/// stopping: a definite "did not complete" in the connection's protocol version.
+fn shutting_down_reply(request: &Request, version: ProtocolVersion) -> String {
+    let error = ProtocolError::new(
+        ErrorClass::Daemon,
+        "daemon_shutting_down",
+        "the daemon is shutting down",
+        None,
+    );
+    let response = Response::err(version, request.id(), error)
+        .expect("deserialized request ids satisfy response validation");
+    handler::serialize_response(&response)
+}
+
+/// Answers every request line the connection already holds, `pending` first and
+/// then the lines its codec buffered, with `daemon_shutting_down`. Nothing is
+/// awaited from the peer, and no line is dispatched.
+async fn refuse_buffered<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    pending: Option<String>,
+    version: Option<ProtocolVersion>,
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut lines: Vec<String> = pending.into_iter().collect();
+    while lines.len() < MAX_REFUSED_LINES {
+        let Some(Some(Ok(line))) = framed.next().now_or_never() else {
+            break;
+        };
+        lines.push(line);
+    }
+    for line in lines {
+        let Ok(request) = serde_json::from_str::<Request>(&line) else {
+            continue;
+        };
+        let version = version
+            .or_else(|| negotiate(request.version_range(), SUPPORTED_PROTOCOL_VERSIONS).ok());
+        if let Some(version) = version {
+            framed
+                .send(shutting_down_reply(&request, version))
+                .await
+                .map_err(codec_to_io)?;
         }
     }
     Ok(())
@@ -733,6 +853,10 @@ fn read_control_line(
 /// Dropping `framed.next()` when `dispatch` wins is cancel-safe: the codec
 /// keeps every byte it has read in its own buffer.
 ///
+/// When `stopping` is cancelled first, `dispatch` is dropped like on a hangup
+/// and the reply is `daemon_shutting_down`. Every method of
+/// [`CANCEL_ON_HANGUP`] is safe to drop, which is why only they get this arm.
+///
 /// # Errors
 ///
 /// Returns the transport error of a failed read after cancelling `dispatch`.
@@ -740,7 +864,7 @@ async fn dispatch_until_hangup<S>(
     dispatch: impl Future<Output = Dispatch>,
     framed: &mut Framed<S, LinesCodec>,
     pending: &mut Option<String>,
-    request: &Request,
+    (request, stopping, version): (&Request, &CancellationToken, Option<ProtocolVersion>),
 ) -> Result<Option<Dispatch>, io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -751,6 +875,16 @@ where
         tokio::select! {
             biased;
             dispatched = &mut dispatch => return Ok(Some(dispatched)),
+            () = stopping.cancelled() => {
+                let version = version.unwrap_or(protocol::PROTOCOL_VERSION);
+                debug!(
+                    method = %request.method(),
+                    id = %request.id(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "daemon shutdown cancelled the in-flight wait"
+                );
+                return Ok(Some(Dispatch::Reply(shutting_down_reply(request, version))));
+            }
             incoming = framed.next(), if pending.is_none() => match read_control_line(incoming) {
                 Ok(Some(line)) => *pending = Some(line),
                 Ok(None) => {
@@ -820,11 +954,12 @@ async fn run_attach_connection<S>(
     mut framed: Framed<S, LinesCodec>,
     registry: SessionRegistry,
     stream_id: String,
-    hangup: Option<HangupWatch>,
+    (hangup, connection): (Option<HangupWatch>, &Connection),
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let stopping = connection.token();
     let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
@@ -841,13 +976,14 @@ where
         }
     };
 
+    connection.set_state(ConnectionState::Attach(attach.session_id.clone()));
     let parts = framed.into_parts();
     let mut stream = parts.io;
     let submitted = attach.session_id.clone();
     let bridge_result = run_attach_bridge(
         &mut stream,
         &mut attach,
-        (parts.read_buf.to_vec(), hangup),
+        (parts.read_buf.to_vec(), hangup, stopping),
         &|| {
             registry.note_input(&submitted);
         },
@@ -864,7 +1000,7 @@ where
 async fn run_attach_bridge<S>(
     stream: &mut S,
     attach: &mut RedeemedAttach,
-    (initial_input, hangup): (Vec<u8>, Option<HangupWatch>),
+    (initial_input, hangup, stopping): (Vec<u8>, Option<HangupWatch>, &CancellationToken),
     on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
@@ -881,6 +1017,7 @@ where
                 &session_id,
                 AttachControl {
                     cancel: &cancel,
+                    stopping,
                     on_submit,
                     hangup,
                 },
@@ -923,6 +1060,10 @@ where
 /// What ends an attach bridge and what it reports about the client's input.
 struct AttachControl<'a> {
     cancel: &'a tokio_util::sync::CancellationToken,
+    /// Cancelled when the daemon is stopping. The bridge ends without a
+    /// failure, like a detach, so the attach is recorded as closed and a client
+    /// reconnects to the restarted daemon.
+    stopping: &'a tokio_util::sync::CancellationToken,
     on_submit: &'a (dyn Fn() + Sync),
     /// Resolves when the client closed its connection completely; absent for
     /// transports that report a peer's close only through reads and writes.
@@ -1107,6 +1248,7 @@ where
                 }
             }, if pending_send.is_some() || input_ended => break,
             () = control.cancel.cancelled() => break,
+            () = control.stopping.cancelled() => break,
         }
     }
     Ok(())
@@ -1295,15 +1437,20 @@ where
 /// the oldest events with a warning rather than tearing down the connection.
 async fn run_event_subscription<S>(
     framed: &mut Framed<S, LinesCodec>,
-    session_events: &mut broadcast::Receiver<Event>,
-    notification_events: &mut broadcast::Receiver<Event>,
+    (session_events, notification_events): (
+        &mut broadcast::Receiver<Event>,
+        &mut broadcast::Receiver<Event>,
+    ),
     version: protocol::ProtocolVersion,
+    stopping: &CancellationToken,
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
         tokio::select! {
+            biased;
+            () = stopping.cancelled() => break,
             incoming = framed.next() => match incoming {
                 // Client closed the connection or sent an unframeable line.
                 None | Some(Err(_)) => break,
@@ -1311,14 +1458,22 @@ where
                 Some(Ok(_)) => {}
             },
             evt = session_events.recv() => match evt {
-                Ok(event) => forward_event(framed, event, version).await?,
+                Ok(event) => {
+                    if !forward_until_stopped(framed, event, version, stopping).await? {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             evt = notification_events.recv() => match evt {
-                Ok(event) => forward_event(framed, event, version).await?,
+                Ok(event) => {
+                    if !forward_until_stopped(framed, event, version, stopping).await? {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
                 }
@@ -1327,6 +1482,25 @@ where
         }
     }
     Ok(())
+}
+
+/// Forwards `event` unless `stopping` is cancelled first; returns whether the
+/// subscription goes on. A subscriber that has stopped reading holds the write
+/// open, so the stop signal has to end it.
+async fn forward_until_stopped<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    event: Event,
+    version: protocol::ProtocolVersion,
+    stopping: &CancellationToken,
+) -> Result<bool, io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        () = stopping.cancelled() => Ok(false),
+        sent = forward_event(framed, event, version) => sent.map(|()| true),
+    }
 }
 
 /// Writes `event` in the shape of the connection's negotiated `version`.
@@ -1618,6 +1792,7 @@ mod tests {
             &protocol::SessionId("s-typed-error".to_owned()),
             AttachControl {
                 cancel: &CancellationToken::new(),
+                stopping: &CancellationToken::new(),
                 on_submit: &|| {},
                 hangup: None,
             },
@@ -1654,6 +1829,7 @@ mod tests {
             &protocol::SessionId("s-frame-error".to_owned()),
             AttachControl {
                 cancel: &CancellationToken::new(),
+                stopping: &CancellationToken::new(),
                 on_submit: &|| {},
                 hangup: None,
             },
@@ -1743,6 +1919,7 @@ mod tests {
                 &protocol::SessionId("s-partial".to_owned()),
                 AttachControl {
                     cancel: &CancellationToken::new(),
+                    stopping: &CancellationToken::new(),
                     on_submit: &|| {},
                     hangup: None,
                 },
@@ -1824,6 +2001,7 @@ mod tests {
                     &protocol::SessionId("s-submit".to_owned()),
                     AttachControl {
                         cancel: &CancellationToken::new(),
+                        stopping: &CancellationToken::new(),
                         on_submit: &|| {
                             submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         },
@@ -1905,6 +2083,7 @@ mod tests {
             &protocol::SessionId("s-replay".to_owned()),
             AttachControl {
                 cancel: &CancellationToken::new(),
+                stopping: &CancellationToken::new(),
                 on_submit: &|| {},
                 hangup: None,
             },

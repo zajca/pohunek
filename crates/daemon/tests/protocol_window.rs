@@ -244,9 +244,15 @@ async fn spawn_server(
         // Removed after the server and its registry are gone.
         let _worker_home = worker_home_dir;
         server
-            .serve(async move {
-                let _ = rx.await;
-            })
+            .serve(
+                pohunek_daemon::api::ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = rx.await;
+                },
+            )
             .await;
     });
     (tx, handle, daemon_instance_id)

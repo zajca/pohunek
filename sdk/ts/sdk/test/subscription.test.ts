@@ -155,6 +155,35 @@ describe("Subscription", () => {
     }
   });
 
+  test("a fragment the stream ends on is a closed connection, not an event or an error", async () => {
+    const request = subscribeRequest("subscribe-cut");
+    const complete = JSON.stringify({
+      v: PROTOCOL_VERSION,
+      event: "agent_state",
+      session_id: "s-test-1",
+      activity: "blocked",
+      source: "report",
+    });
+    const daemon = await startUnixDaemon([
+      {
+        kind: "subscription",
+        ack: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { subscribed: true }),
+        events: [complete],
+        unterminatedTail: '{"v":4,"event":"session_updated","session":{"id":"s-te',
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+      const subscription = await client.subscribe(request);
+
+      const first = await subscription.nextEvent();
+      expect((first as ProtocolEvent | null)?.event).toBe("agent_state");
+      expect(await subscription.nextEvent()).toBeNull();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("malformed event JSON maps to json_error", async () => {
     const request = subscribeRequest("subscribe-malformed");
     const daemon = await startUnixDaemon([

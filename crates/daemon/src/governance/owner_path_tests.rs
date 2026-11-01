@@ -213,8 +213,14 @@ async fn start_servers(condition: GovernanceCondition) -> Servers {
     let tcp_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
         tokio::join!(
-            unix.serve(async move { unix_shutdown.cancelled().await }),
-            remote.serve(async move { tcp_shutdown.cancelled().await }),
+            unix.serve(
+                crate::api::ConnectionTasks::new("control_connections", &unix_shutdown),
+                async move { unix_shutdown.cancelled().await },
+            ),
+            remote.serve(
+                crate::api::ConnectionTasks::new("remote_connections", &tcp_shutdown),
+                async move { tcp_shutdown.cancelled().await },
+            ),
         );
     });
 

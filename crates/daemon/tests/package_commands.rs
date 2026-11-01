@@ -232,10 +232,10 @@ async fn spawn_servers(tag: &str) -> Servers {
         let _ = remote_tx.send(());
     });
     let task = tokio::spawn(async move {
-        let unix_serve = unix.serve(async move {
+        let unix_serve = unix.serve(untracked("control_connections"), async move {
             let _ = unix_rx.await;
         });
-        let remote_serve = remote.serve(async move {
+        let remote_serve = remote.serve(untracked("remote_connections"), async move {
             let _ = remote_rx.await;
         });
         tokio::join!(unix_serve, remote_serve);
@@ -1132,4 +1132,9 @@ async fn a_caller_that_hangs_up_stops_the_run_and_frees_its_slot() {
 
     drop(local);
     servers.stop().await;
+}
+
+/// Connection tasks whose shutdown token nothing cancels.
+fn untracked(name: &'static str) -> pohunek_daemon::api::ConnectionTasks {
+    pohunek_daemon::api::ConnectionTasks::new(name, &tokio_util::sync::CancellationToken::new())
 }

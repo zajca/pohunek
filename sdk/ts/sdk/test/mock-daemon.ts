@@ -18,7 +18,13 @@ export type ScriptStep =
   | { kind: "delay"; ms: number; line: string | ((requestLine: string) => string) }
   | { kind: "gate"; ready: Promise<void>; line: string | ((requestLine: string) => string) }
   | { kind: "silent" }
-  | { kind: "subscription"; ack: string | ((requestLine: string) => string); events: string[] }
+  | {
+      kind: "subscription";
+      ack: string | ((requestLine: string) => string);
+      events: string[];
+      /** Bytes written after the events with no line terminator, before the close. */
+      unterminatedTail?: string;
+    }
   | { kind: "attachSuccess"; emit?: Uint8Array[]; echo?: boolean; readDelayMs?: number }
   | { kind: "attachFailed"; line: string | ((preludeLine: string) => string) };
 
@@ -607,6 +613,9 @@ async function applyStep(socket: Socket, requestLine: string, step: ScriptStep):
       await writeLine(socket, resolveLine(step.ack, requestLine));
       for (const event of step.events) {
         await writeLine(socket, event);
+      }
+      if (step.unterminatedTail !== undefined) {
+        await writeBytes(socket, new TextEncoder().encode(step.unterminatedTail));
       }
       socket.end();
       return;

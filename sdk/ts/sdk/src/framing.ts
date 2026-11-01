@@ -32,9 +32,8 @@ export async function* readControlLines(chunks: AsyncIterable<Uint8Array>): Asyn
     }
   }
 
-  if (pending.length > 0) {
-    yield decodeLine(pending);
-  }
+  // A fragment the stream ends on is a closed connection, not a line: the
+  // daemon terminates every line it writes, and it can stop in the middle of one.
 }
 
 function decodeLine(bytes: number[]): string {

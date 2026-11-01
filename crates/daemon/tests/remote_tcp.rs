@@ -203,12 +203,24 @@ async fn spawn_dual_servers_with(
     let handle = tokio::spawn(async move {
         // Removed after both servers and the registry are gone.
         let _fixture_dirs = (socket_dir, worker_home_dir);
-        let unix_serve = unix.serve(async move {
-            let _ = unix_rx.await;
-        });
-        let remote_serve = remote.serve(async move {
-            let _ = remote_rx.await;
-        });
+        let unix_serve = unix.serve(
+            pohunek_daemon::api::ConnectionTasks::new(
+                "control_connections",
+                &tokio_util::sync::CancellationToken::new(),
+            ),
+            async move {
+                let _ = unix_rx.await;
+            },
+        );
+        let remote_serve = remote.serve(
+            pohunek_daemon::api::ConnectionTasks::new(
+                "remote_connections",
+                &tokio_util::sync::CancellationToken::new(),
+            ),
+            async move {
+                let _ = remote_rx.await;
+            },
+        );
         tokio::join!(unix_serve, remote_serve);
     });
     (addr, socket, tx, handle)
