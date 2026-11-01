@@ -589,8 +589,9 @@ impl NotificationService {
         policy: NotificationPolicy,
     ) -> Result<Self, NotificationError> {
         let store = NotificationStore::open(data_dir)?;
-        let policy = store.load_policy(policy)?;
+        let mut policy = store.load_policy(policy)?;
         validate_policy(&policy)?;
+        complete_kind_flags(&mut policy);
         let (events, _) = broadcast::channel(NOTIFICATION_EVENT_CAPACITY);
         Ok(Self {
             inner: Arc::new(NotificationServiceInner {

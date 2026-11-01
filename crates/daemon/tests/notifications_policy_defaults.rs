@@ -43,6 +43,21 @@ fn assert_defaults_except(
     }
 }
 
+/// Asserts the service holds a flag for every known kind of the base policy
+/// and of each provider override.
+fn assert_policy_complete(service: &NotificationService) {
+    let policy = service.policy();
+    for flags in std::iter::once(&policy.enabled).chain(policy.providers.values()) {
+        for kind in NotificationKind::KNOWN {
+            assert!(
+                flags.get(kind).is_some(),
+                "the policy is complete: {}",
+                kind.as_str()
+            );
+        }
+    }
+}
+
 #[test]
 fn a_kind_missing_from_policy_json_takes_the_daemon_default() {
     let root = pohunek_test_support::tempdir().expect("private data root");
@@ -60,6 +75,7 @@ fn a_kind_missing_from_policy_json_takes_the_daemon_default() {
 
     let service = NotificationService::open(&data_dir).expect("reopen the service");
 
+    assert_policy_complete(&service);
     let base = [
         (NotificationKind::TurnCompleted, true),
         (NotificationKind::Error, false),
@@ -86,16 +102,7 @@ fn a_kind_missing_from_policy_params_takes_the_daemon_default() {
         .set_policy(params.policy)
         .expect("persist the policy");
 
-    let stored = service.policy();
-    for flags in std::iter::once(&stored.enabled).chain(stored.providers.values()) {
-        for kind in NotificationKind::KNOWN {
-            assert!(
-                flags.get(kind).is_some(),
-                "a stored policy is complete: {}",
-                kind.as_str()
-            );
-        }
-    }
+    assert_policy_complete(&service);
 
     assert_defaults_except(&service, "claude", &[(NotificationKind::System, true)]);
     assert_defaults_except(
