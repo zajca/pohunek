@@ -60,26 +60,43 @@ pub fn policy_enables_kind(
     kind_enabled(kinds, kind)
 }
 
-fn default_enabled_kinds() -> NotificationKindPolicy {
-    NotificationKindPolicy {
-        agent_blocked: true,
-        approval_required: true,
-        turn_completed: false,
-        session_finished: false,
-        error: true,
-        system: false,
+/// The daemon's default flag for `kind`. The unknown kind is never enabled; the
+/// daemon never holds it.
+const fn default_kind_enabled(kind: NotificationKind) -> bool {
+    match kind {
+        NotificationKind::AgentBlocked
+        | NotificationKind::ApprovalRequired
+        | NotificationKind::Error => true,
+        NotificationKind::TurnCompleted
+        | NotificationKind::SessionFinished
+        | NotificationKind::System
+        | NotificationKind::Unknown => false,
     }
 }
 
-fn kind_enabled(policy: &NotificationKindPolicy, kind: NotificationKind) -> bool {
-    match kind {
-        NotificationKind::AgentBlocked => policy.agent_blocked,
-        NotificationKind::ApprovalRequired => policy.approval_required,
-        NotificationKind::TurnCompleted => policy.turn_completed,
-        NotificationKind::SessionFinished => policy.session_finished,
-        NotificationKind::Error => policy.error,
-        NotificationKind::System => policy.system,
+fn default_enabled_kinds() -> NotificationKindPolicy {
+    NotificationKindPolicy::from_fn(default_kind_enabled)
+}
+
+/// Gives every known kind of the base policy and of each provider override a
+/// flag, the daemon's default where the document has none. A policy is stored
+/// and returned complete, so a reader of the earlier release, which requires
+/// every flag, decodes what this daemon wrote.
+pub(crate) fn complete_kind_flags(policy: &mut NotificationPolicy) {
+    let overrides = policy.providers.values_mut();
+    for flags in std::iter::once(&mut policy.enabled).chain(overrides) {
+        for kind in NotificationKind::KNOWN {
+            if flags.get(kind).is_none() {
+                flags.set(kind, default_kind_enabled(kind));
+            }
+        }
     }
+}
+
+/// The flag `policy` holds for `kind`, or the daemon's default for a kind the
+/// document leaves out.
+fn kind_enabled(policy: &NotificationKindPolicy, kind: NotificationKind) -> bool {
+    policy.get(kind).unwrap_or(default_kind_enabled(kind))
 }
 
 pub(crate) fn records_matching_retention(

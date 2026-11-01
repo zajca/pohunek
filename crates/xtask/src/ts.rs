@@ -695,29 +695,25 @@ fn model_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskErro
 }
 
 fn notification_policy() -> NotificationPolicy {
-    let enabled = NotificationKindPolicy {
-        agent_blocked: true,
-        approval_required: true,
-        turn_completed: true,
-        session_finished: true,
-        error: true,
-        system: true,
-    };
+    let enabled = NotificationKindPolicy::from_flags([
+        (protocol::NotificationKind::AgentBlocked, true),
+        (protocol::NotificationKind::ApprovalRequired, true),
+        (protocol::NotificationKind::TurnCompleted, true),
+        (protocol::NotificationKind::SessionFinished, true),
+        (protocol::NotificationKind::Error, true),
+        (protocol::NotificationKind::System, true),
+    ]);
     let mut providers = BTreeMap::new();
-    providers.insert(
-        "codex".to_owned(),
-        NotificationKindPolicy {
-            turn_completed: false,
-            ..enabled.clone()
-        },
-    );
-    providers.insert(
-        "future-agent".to_owned(),
-        NotificationKindPolicy {
-            system: false,
-            ..enabled.clone()
-        },
-    );
+    providers.insert("codex".to_owned(), {
+        let mut policy = enabled.clone();
+        policy.set(protocol::NotificationKind::TurnCompleted, false);
+        policy
+    });
+    providers.insert("future-agent".to_owned(), {
+        let mut policy = enabled.clone();
+        policy.set(protocol::NotificationKind::System, false);
+        policy
+    });
     NotificationPolicy {
         attention_dedupe_window_secs: 30,
         attention_debounce_secs: 5,

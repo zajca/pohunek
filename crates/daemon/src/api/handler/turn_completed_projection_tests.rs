@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use pohunek_test_support::time::AutoAdvanceInhibitor;
 use pohunek_test_support::wait::guard;
-use protocol::{method, AgentActivity, NotificationKindPolicy, SessionId};
+use protocol::{method, AgentActivity, SessionId};
 use serde_json::{json, Value};
 
 use super::turn_wait_tests::{
@@ -27,9 +27,10 @@ const HOOK_LEAD: Duration = Duration::from_millis(500);
 fn enabled_fixture() -> Fixture {
     Fixture::with_policy(
         SessionRegistryConfig::default(),
-        Some(every_provider(NotificationKindPolicy {
-            turn_completed: true,
-            ..default_policy().enabled
+        Some(every_provider({
+            let mut policy = default_policy().enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
         })),
     )
 }
@@ -489,9 +490,10 @@ async fn enabling_the_kind_between_two_turns_gives_a_record_only_for_the_second(
 
     fixture
         .notifications()
-        .set_policy(every_provider(NotificationKindPolicy {
-            turn_completed: true,
-            ..default_policy().enabled
+        .set_policy(every_provider({
+            let mut policy = default_policy().enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
         }))
         .expect("set policy");
     turn(&fixture, &session, Duration::from_secs(2)).await;
@@ -732,9 +734,10 @@ async fn a_hook_report_of_a_turn_is_dropped_when_its_agent_is_released() {
 
 #[tokio::test]
 async fn a_held_hook_report_does_not_spin_without_a_settle_window() {
-    let mut policy = every_provider(NotificationKindPolicy {
-        turn_completed: true,
-        ..default_policy().enabled
+    let mut policy = every_provider({
+        let mut policy = default_policy().enabled;
+        policy.set(protocol::NotificationKind::TurnCompleted, true);
+        policy
     });
     policy.attention_debounce_secs = 0;
     let fixture = Fixture::with_policy(SessionRegistryConfig::default(), Some(policy));
@@ -1181,17 +1184,16 @@ async fn a_replacement_agent_cannot_resume_the_settling_turn_of_the_one_it_repla
 async fn a_hook_reported_before_the_idle_edge_does_not_surface_before_a_resumed_turn_ends() {
     // Only the provider keeps turn_completed in the inbox; the projector's
     // report is dropped by the policy but still signals the turn.
-    let mut policy = every_provider(NotificationKindPolicy {
-        turn_completed: false,
-        ..default_policy().enabled
+    let mut policy = every_provider({
+        let mut policy = default_policy().enabled;
+        policy.set(protocol::NotificationKind::TurnCompleted, false);
+        policy
     });
-    policy.providers.insert(
-        "claude".to_owned(),
-        NotificationKindPolicy {
-            turn_completed: true,
-            ..default_policy().enabled
-        },
-    );
+    policy.providers.insert("claude".to_owned(), {
+        let mut policy = default_policy().enabled;
+        policy.set(protocol::NotificationKind::TurnCompleted, true);
+        policy
+    });
     let fixture = Fixture::with_policy(SessionRegistryConfig::default(), Some(policy));
     let session = fixture.session("hook-then-flap").await;
     fixture.activity(&session, "idle").await;

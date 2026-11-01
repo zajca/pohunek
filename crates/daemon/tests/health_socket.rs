@@ -1236,14 +1236,14 @@ fn all_enabled_notification_policy() -> NotificationPolicy {
     NotificationPolicy {
         attention_dedupe_window_secs: 42,
         attention_debounce_secs: 5,
-        enabled: NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: true,
-            session_finished: true,
-            error: true,
-            system: true,
-        },
+        enabled: NotificationKindPolicy::from_flags([
+            (protocol::NotificationKind::AgentBlocked, true),
+            (protocol::NotificationKind::ApprovalRequired, true),
+            (protocol::NotificationKind::TurnCompleted, true),
+            (protocol::NotificationKind::SessionFinished, true),
+            (protocol::NotificationKind::Error, true),
+            (protocol::NotificationKind::System, true),
+        ]),
         providers: BTreeMap::new(),
         retention: protocol::NotificationRetentionPolicy::default(),
         unknown_fields: protocol::tolerant::UnknownFields::default(),
@@ -5341,7 +5341,13 @@ async fn notification_api_crud_policy_methods_work() {
     assert!(read.record.read_at.is_some());
 
     let got_policy = get_notification_policy(&mut control).await;
-    assert!(got_policy.policy.enabled.agent_blocked);
+    assert_eq!(
+        got_policy
+            .policy
+            .enabled
+            .get(protocol::NotificationKind::AgentBlocked),
+        Some(true)
+    );
 
     let replacement_policy = all_enabled_notification_policy();
     let set_policy = set_notification_policy(&mut control, replacement_policy.clone()).await;

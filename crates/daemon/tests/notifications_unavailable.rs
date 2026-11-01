@@ -204,6 +204,20 @@ fn unavailable_cases() -> Vec<UnavailableCase> {
                 b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"approval_required\":true,\"turn_completed\":true,\"session_finished\":true,\"error\":true,\"system\":true},\"retention\":{\"sweep_interval_secs\":60,\"info_ttl_secs\":1,\"warning_ttl_secs\":1,\"resolved_attention_ttl_secs\":1,\"resolved_error_ttl_secs\":1,\"archived_ttl_secs\":1,\"compaction_min_actions\":1,\"a_key_from_a_newer_daemon\":1}}\n",
             )],
         ),
+        (
+            "valid policy with a kind this build does not know",
+            vec![(
+                "policy.json",
+                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"a_kind_from_a_newer_daemon\":true}}\n",
+            )],
+        ),
+        (
+            "valid policy with a provider override of a kind this build does not know",
+            vec![(
+                "policy.json",
+                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true},\"providers\":{\"codex\":{\"a_kind_from_a_newer_daemon\":false}}}\n",
+            )],
+        ),
     ]
 }
 

@@ -30,6 +30,7 @@ use crate::session::{rfc3339_from_nanos, TurnId, TurnSnapshot};
 #[doc(inline)]
 pub use coordinator::AttentionCoordinator;
 pub(crate) use coordinator::ResolveAsOf;
+pub(crate) use policy::complete_kind_flags;
 #[doc(inline)]
 pub use policy::{
     default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEBOUNCE_SECS,
@@ -890,8 +891,9 @@ impl NotificationService {
     }
 
     /// Replace the notification policy.
-    pub fn set_policy(&self, policy: NotificationPolicy) -> Result<(), NotificationError> {
+    pub fn set_policy(&self, mut policy: NotificationPolicy) -> Result<(), NotificationError> {
         validate_policy(&policy)?;
+        complete_kind_flags(&mut policy);
         let mut guard = self
             .inner
             .policy
@@ -1668,20 +1670,21 @@ mod tests {
     }
 
     fn all_kinds_enabled_policy() -> NotificationKindPolicy {
-        NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: true,
-            session_finished: true,
-            error: true,
-            system: true,
-        }
+        NotificationKindPolicy::from_flags([
+            (protocol::NotificationKind::AgentBlocked, true),
+            (protocol::NotificationKind::ApprovalRequired, true),
+            (protocol::NotificationKind::TurnCompleted, true),
+            (protocol::NotificationKind::SessionFinished, true),
+            (protocol::NotificationKind::Error, true),
+            (protocol::NotificationKind::System, true),
+        ])
     }
 
     fn only_turn_completed_disabled_policy() -> NotificationKindPolicy {
-        NotificationKindPolicy {
-            turn_completed: false,
-            ..all_kinds_enabled_policy()
+        {
+            let mut policy = all_kinds_enabled_policy();
+            policy.set(protocol::NotificationKind::TurnCompleted, false);
+            policy
         }
     }
 
@@ -2530,14 +2533,14 @@ mod tests {
         let policy = protocol::NotificationPolicy {
             attention_dedupe_window_secs: 42,
             attention_debounce_secs: 3,
-            enabled: NotificationKindPolicy {
-                agent_blocked: true,
-                approval_required: true,
-                turn_completed: true,
-                session_finished: true,
-                error: true,
-                system: true,
-            },
+            enabled: NotificationKindPolicy::from_flags([
+                (protocol::NotificationKind::AgentBlocked, true),
+                (protocol::NotificationKind::ApprovalRequired, true),
+                (protocol::NotificationKind::TurnCompleted, true),
+                (protocol::NotificationKind::SessionFinished, true),
+                (protocol::NotificationKind::Error, true),
+                (protocol::NotificationKind::System, true),
+            ]),
             providers: BTreeMap::new(),
             retention: protocol::NotificationRetentionPolicy::default(),
             unknown_fields: protocol::tolerant::UnknownFields::default(),

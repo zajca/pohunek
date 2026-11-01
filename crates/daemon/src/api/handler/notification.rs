@@ -358,7 +358,8 @@ pub(super) async fn handle_notification_policy_set(
         Ok(notifications) => notifications,
         Err(resp) => return resp,
     };
-    let policy = params.policy;
+    let mut policy = params.policy;
+    crate::notifications::complete_kind_flags(&mut policy);
     run_notification_blocking(request, move || {
         notifications
             .set_policy(policy.clone())

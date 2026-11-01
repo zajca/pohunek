@@ -71,7 +71,8 @@ rule. The current state of each place is stated separately.
   An unknown key in a daemon result, event or error is ignored by the client
   for the types that are only ever decoded by clients; the strict
   params, governance state and the envelope carry `deny_unknown_fields`, and a
-  dual-use type (session capabilities, the session and notification policies)
+  dual-use type (session capabilities, the session and notification policies and
+  their per-kind notification flags)
   refuses an unknown key in the daemon's store, policy files and params but
   keeps it for a client, which writes a policy back; most params are lenient
   and ignore an unknown key. A field is

@@ -2278,11 +2278,11 @@ never `unreachable!()`.
 | `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | done |
 | `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | `ProviderKind::Unknown` is never the `none` kind; an unknown `ConceptType` reaches the typed `assistant_bundle_mismatch` error | done |
 | `NotificationStatus` | safe | never matches `--unread` or `--status` filters | done |
+| `NotificationKind` | safe | a record of an unknown kind is listed as `unknown` and never matches `--kind`; a policy key of an unknown kind keeps its raw string ([#1332](https://github.com/zajca/pohunek/issues/1332)) | done |
 | `ConceptIntent` | drop | an unknown element is dropped from `intents` | done |
 | `SessionWarningKind` | drop | own mechanism | done |
 | `SessionState` | bump-only | drives live and terminal decisions; no safe default | |
 | `SessionTurnEventKind` | bump-only | the daemon emits only the kinds the client asked for | |
-| `NotificationKind` | bump-only | a field of the `deny_unknown_fields` struct `NotificationKindPolicy` ([#1332](https://github.com/zajca/pohunek/issues/1332)) | |
 | `EnrollmentStatus`, `HostOwner` | bump-only | cross-validated with quarantine; an identity coordinate covered by a signed outcome | |
 | `ConceptDeprecation` | bump-only | untagged; any new version string already decodes | |
 | `HostOwnerKind`, `ShareSuspensionIntent`, `TransferOutcomeError`, `PackageTrust`, `BindingProvenance`, `HostClass` | n/a | not decoded from the daemon wire by the Rust client; must stay strict | |
@@ -2294,7 +2294,7 @@ decodes tolerantly in both the Rust client and the TypeScript SDK
 is still strict for an enum whose tolerance ships in 0.38, and the 0.37
 TypeScript SDK checks `StateSource` against a closed set, so a new value of
 either needs a protocol bump and an N-1 adapter. A new value of a bump-only
-enum (`SessionState`, `SessionTurnEventKind`, `NotificationKind`) needs a
+enum (`SessionState`, `SessionTurnEventKind`) needs a
 protocol bump too, so a release that makes no protocol bump adds no value to
 those.
 
@@ -2320,12 +2320,11 @@ Each protocol type has one field policy, kept in the table of
   a protocol bump), signed, cross-validated and identity documents (governance
   status, transfer outcomes, `PackageIdentity`, `LaunchBinding`), the client
   params that deny unknown keys (including the `runtime` identity nested in
-  `session.output` and `session.wait` params, which has its own strict decode),
-  and `NotificationKindPolicy`, which the daemon also persists and accepts as
-  params and which has no scoped decode yet.
+  `session.output` and `session.wait` params, which has its own strict decode).
 - **scoped**: a type the daemon persists or accepts as params and a client
   reads (and, for the policies, sends back) (`SessionCapabilities`, `SessionRetentionPolicy`,
-  `NotificationPolicy`, `NotificationRetentionPolicy`). It carries one hidden
+  `NotificationPolicy`, `NotificationRetentionPolicy`, `NotificationKindPolicy`).
+  It carries one hidden
   `UnknownFields` member (`protocol::tolerant::UnknownFields`, skipped in the
   generated TypeScript). A plain decode, which is the daemon's, refuses an
   unknown key as strictly as `deny_unknown_fields`, so the store, the policy
@@ -2334,7 +2333,18 @@ Each protocol type has one field policy, kept in the table of
   `session policy set` return every key they decoded and never reset a
   setting they do not know. An empty member serializes nothing, so the store
   shape, `policy.json` and every recorded document keep their bytes. `--json`
-  prints the kept keys of a scoped type.
+  prints the kept keys of a scoped type. `NotificationKindPolicy` is a map from
+  the wire name of a `NotificationKind` to a boolean, not a struct: the keys it
+  keeps are the kinds this build does not know. A kind the document leaves out
+  stays out on the client round trip, and the daemon applies its default for
+  that kind when it reads such a document; `notification.policy.set` stores and
+  returns the policy complete, with that default filled in, so a daemon of the
+  earlier release, which requires every flag, reads what this one wrote. The six current kinds serialize in declaration order, exactly
+  the bytes of the struct it replaces, so neither the notification format nor
+  the protocol changes. A new `NotificationKind` value changes the persisted
+  policy shape, so the format guard fails until notification format 2 exists,
+  and it needs the same release rule as any new enum value: a client of an
+  earlier release is strict for it.
 - **lenient**: the type carries no `deny_unknown_fields` and no hand-written
   refusal, so both decodes ignore an unknown key. Most param, result and event
   types are lenient; a daemon does not refuse a key of that kind in params, so

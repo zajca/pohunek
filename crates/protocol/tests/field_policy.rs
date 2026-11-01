@@ -270,6 +270,20 @@ fn notification_policy_bases() -> Vec<Value> {
     vec![notification_policy_document()]
 }
 
+fn notification_kind_policy_bases() -> Vec<Value> {
+    vec![
+        json!({
+            "agent_blocked": true,
+            "approval_required": true,
+            "turn_completed": false,
+            "session_finished": false,
+            "error": true,
+            "system": false,
+        }),
+        json!({"turn_completed": true}),
+    ]
+}
+
 fn notification_retention_policy_bases() -> Vec<Value> {
     vec![
         serde_json::to_value(protocol::NotificationRetentionPolicy::default())
@@ -449,7 +463,13 @@ const ROWS: &[Row] = &[
         Probe::Documents(notification_retention_policy_bases),
         DUAL_USE
     ),
-    row!(NotificationKindPolicy, Strict, DUAL_USE),
+    row!(
+        NotificationKindPolicy,
+        Scoped,
+        [],
+        Probe::Documents(notification_kind_policy_bases),
+        DUAL_USE
+    ),
     // Strict: signed, cross-validated or identity documents.
     row!(HostGovernanceStatus, Strict, SIGNED),
     row!(
@@ -741,6 +761,44 @@ fn a_scoped_type_writes_back_the_keys_it_kept() {
             );
         }
     }
+}
+
+/// The per-kind policy is a map: a flag must be a boolean and a kind may
+/// appear once, in both decodes, and a kind the document leaves out stays out.
+#[test]
+fn a_notification_kind_policy_keeps_a_map_shape() {
+    for text in [
+        r#"{"agent_blocked": "yes"}"#,
+        r#"{"agent_blocked": 1}"#,
+        r#"{"agent_blocked": true, "agent_blocked": false}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<protocol::NotificationKindPolicy>(text).is_err(),
+            "plain decode must refuse {text}"
+        );
+        assert!(
+            protocol::tolerant::from_str::<protocol::NotificationKindPolicy>(text).is_err(),
+            "tolerant decode must refuse {text}"
+        );
+    }
+    let text = r#"{"system":true,"error":false}"#;
+    let policy: protocol::NotificationKindPolicy =
+        serde_json::from_str(text).expect("a document may leave kinds out");
+    assert_eq!(policy.get(protocol::NotificationKind::Error), Some(false));
+    assert_eq!(policy.get(protocol::NotificationKind::AgentBlocked), None);
+    assert_eq!(
+        serde_json::to_string(&policy).expect("serialize"),
+        r#"{"error":false,"system":true}"#,
+        "known kinds serialize in declaration order and absent ones stay absent"
+    );
+    let kept: protocol::NotificationKindPolicy =
+        protocol::tolerant::from_str(r#"{"zzz_future": true, "error": true, "aaa_future": 2}"#)
+            .expect("tolerant decode keeps unknown kinds");
+    assert_eq!(
+        serde_json::to_string(&kept).expect("serialize"),
+        r#"{"error":true,"aaa_future":2,"zzz_future":true}"#,
+        "unknown kinds follow the known ones in key order"
+    );
 }
 
 #[test]

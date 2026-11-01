@@ -5871,7 +5871,7 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     let notifications = crate::notifications::NotificationService::open(&dir.join("data"))
         .expect("notification service");
     let mut policy = crate::notifications::default_policy();
-    policy.enabled.system = true;
+    policy.enabled.set(protocol::NotificationKind::System, true);
     policy.providers.clear();
     notifications
         .set_policy(policy)

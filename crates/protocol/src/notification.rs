@@ -19,10 +19,12 @@ use crate::{session::SessionId, RuntimeRef};
 pub struct NotificationId(pub String);
 
 /// High-level notification category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// Declaration order is the order policy documents list the kinds; the derived
+// `Ord` follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationKind.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum NotificationKind {
     /// An agent is waiting for owner attention.
     AgentBlocked,
@@ -36,9 +38,28 @@ pub enum NotificationKind {
     Error,
     /// A system-level informational notification.
     System,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
 
+crate::tolerant_enum!(NotificationKind);
+
 impl NotificationKind {
+    /// Every kind this build knows, in declaration order.
+    pub const KNOWN: [Self; 6] = [
+        Self::AgentBlocked,
+        Self::ApprovalRequired,
+        Self::TurnCompleted,
+        Self::SessionFinished,
+        Self::Error,
+        Self::System,
+    ];
+
     /// Returns the stable wire string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -49,7 +70,13 @@ impl NotificationKind {
             Self::SessionFinished => "session_finished",
             Self::Error => "error",
             Self::System => "system",
+            Self::Unknown => "unknown",
         }
+    }
+
+    /// The known kind with wire string `value`.
+    fn from_wire(value: &str) -> Option<Self> {
+        Self::KNOWN.into_iter().find(|kind| kind.as_str() == value)
     }
 }
 
@@ -436,28 +463,129 @@ pub struct NotificationDeleteResult {
     pub deleted: bool,
 }
 
-/// Per-kind policy flags.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "wire policy intentionally exposes one enable flag per notification kind"
-)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-kind policy flags: a JSON object from the wire name of a kind to a
+/// boolean.
+///
+/// A kind that is absent has no flag in this document; the daemon applies its
+/// default for that kind. The daemon refuses a key that is not a kind it knows;
+/// a client keeps such a key it reads from a newer daemon and sends it back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationKindPolicy.ts"))]
-#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", ts(as = "BTreeMap<NotificationKind, bool>"))]
 pub struct NotificationKindPolicy {
-    /// Whether `agent_blocked` notifications are enabled.
-    pub agent_blocked: bool,
-    /// Whether `approval_required` notifications are enabled.
-    pub approval_required: bool,
-    /// Whether `turn_completed` notifications are enabled.
-    pub turn_completed: bool,
-    /// Whether `session_finished` notifications are enabled.
-    pub session_finished: bool,
-    /// Whether `error` notifications are enabled.
-    pub error: bool,
-    /// Whether `system` notifications are enabled.
-    pub system: bool,
+    known: BTreeMap<NotificationKind, bool>,
+    /// Kinds of a newer daemon this build does not know; refused outside
+    /// `protocol::tolerant`.
+    unknown_fields: crate::tolerant::UnknownFields,
+}
+
+impl NotificationKindPolicy {
+    /// A policy with exactly the flags in `flags`; a kind that repeats keeps its
+    /// last flag and the unknown kind has none.
+    #[must_use]
+    pub fn from_flags(flags: impl IntoIterator<Item = (NotificationKind, bool)>) -> Self {
+        let mut policy = Self::default();
+        for (kind, enabled) in flags {
+            policy.set(kind, enabled);
+        }
+        policy
+    }
+
+    /// A policy with a flag for every known kind, taken from `flag`.
+    #[must_use]
+    pub fn from_fn(mut flag: impl FnMut(NotificationKind) -> bool) -> Self {
+        Self {
+            known: NotificationKind::KNOWN
+                .into_iter()
+                .map(|kind| (kind, flag(kind)))
+                .collect(),
+            unknown_fields: crate::tolerant::UnknownFields::default(),
+        }
+    }
+
+    /// The flag of `kind`, or `None` when the document has none.
+    #[must_use]
+    pub fn get(&self, kind: NotificationKind) -> Option<bool> {
+        self.known.get(&kind).copied()
+    }
+
+    /// Sets the flag of `kind`. A kind this build does not know has no flag to
+    /// set and is ignored.
+    pub fn set(&mut self, kind: NotificationKind, enabled: bool) {
+        if kind != NotificationKind::Unknown {
+            self.known.insert(kind, enabled);
+        }
+    }
+
+    /// The unknown kinds a newer daemon sent with their raw values, in key
+    /// order.
+    pub fn unknown_flags(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.unknown_fields.iter()
+    }
+}
+
+impl Serialize for NotificationKindPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap as _;
+
+        let mut map = serializer.serialize_map(None)?;
+        for (kind, enabled) in &self.known {
+            map.serialize_entry(kind.as_str(), enabled)?;
+        }
+        for (key, value) in self.unknown_fields.iter() {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for NotificationKindPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PolicyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PolicyVisitor {
+            type Value = NotificationKindPolicy;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map from notification kind to a boolean")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+
+                let mut policy = NotificationKindPolicy::default();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if let Some(kind) = NotificationKind::from_wire(&key) {
+                        let Some(enabled) = value.as_bool() else {
+                            return Err(A::Error::custom(format!(
+                                "invalid type for `{key}`: expected a boolean"
+                            )));
+                        };
+                        if policy.known.insert(kind, enabled).is_some() {
+                            return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                        }
+                    } else if !crate::tolerant::is_active() {
+                        return Err(A::Error::custom(format!("unknown field `{key}`")));
+                    } else if policy.unknown_fields.insert(key.clone(), value) {
+                        return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                }
+                Ok(policy)
+            }
+        }
+
+        deserializer.deserialize_map(PolicyVisitor)
+    }
 }
 
 /// Default for [`NotificationPolicy::attention_debounce_secs`] when a persisted
