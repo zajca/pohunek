@@ -374,7 +374,10 @@ async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
             .expect("worker starts");
         wait_for(|| fixture.supervisor.inspect(&id), running).await;
 
-        let inspecting = async {
+        // Concurrent inspections keep several `launchctl print` children in
+        // flight, so one of them samples the loaded job and reports it after
+        // the retirement has booted the job out and removed its definition.
+        let inspecting = || async {
             loop {
                 match fixture.supervisor.inspect(&id).await {
                     Ok(_) | Err(Error::Race { .. }) => {}
@@ -387,7 +390,7 @@ async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
             }
         };
         // A failed retire panics inside the join instead of leaving the
-        // inspection loop waiting for a job that never goes away.
+        // inspection loops waiting for a job that never goes away.
         let retiring = async {
             fixture
                 .supervisor
@@ -395,7 +398,15 @@ async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
                 .await
                 .expect("worker retires");
         };
-        tokio::join!(retiring, inspecting);
+        tokio::join!(
+            retiring,
+            inspecting(),
+            inspecting(),
+            inspecting(),
+            inspecting(),
+            inspecting(),
+            inspecting(),
+        );
     }
 }
 
