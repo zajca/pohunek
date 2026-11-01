@@ -172,8 +172,9 @@ run page) and give the job's display name (for example `tests (cli, fast)`), its
 job id, a link by check run id and the step that failed. The name and step come
 from the jobs API on a best-effort basis, bounded to 20 seconds
 (`LOOKUP_TIMEOUT_SECONDS`, enforced by a bash watchdog because the macOS callers
-have no GNU `timeout`); without them, or with an empty `job.check_run_id`, the
-message falls back to the job id and the run link and the cancel still happens. The jobs with a sparse or relocated checkout copy
+have no GNU `timeout`); without them the message falls back to the job id and
+the link, and with an empty `job.check_run_id` the lookup and the job link are
+skipped (the run link stays). The cancel happens in every case. The jobs with a sparse or relocated checkout copy
 the `cancel-run` action out of the checkout first, so every job uses the same
 script (`.github/actions/cancel-run/cancel-run.sh`). So a
 cancelled job in a pull request run can mean that another job failed first:
