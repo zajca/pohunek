@@ -117,8 +117,8 @@ The assistant must:
   `session.report_native_id` are deliberately allowed to target their own
   session; hooks require that path. The owner-private worker claim is the only
   route for a Hermes hook's native reference: the public native-id report
-  accepts only the PTY root of a schema that admits it, which the Hermes
-  reporter does not call.
+  accepts only the PTY root and refuses `identity-v1` sessions altogether, and
+  the Hermes reporter never sends it.
 - The Rust SDK inherits that origin from the calling process by default
   (`OriginSource::Environment`, which reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID`). `OriginSource::Omitted` makes a connection attach no

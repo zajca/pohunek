@@ -92,7 +92,7 @@ outcome of a report. Identity goes to the session worker only, with no public
 native-ID fallback; a report the worker received is applied whether or not its
 reply arrives in time, and a missing reply is not counted as a failure. They
 never start a subprocess, use a network, or access a Hermes database. Hook
-failures other than that are swallowed and counted; process/screen detection
+failures other than a missing worker reply are swallowed and counted; process/screen detection
 remains available. Do not treat
 `on_session_end` as a process exit.
 
