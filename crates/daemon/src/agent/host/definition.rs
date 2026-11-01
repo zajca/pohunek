@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use super::config_home::ConfigHome;
 use super::features::{check_gates, check_requires, FeatureTables};
 use super::launch_env::DescriptorLaunchEnv;
+use super::naming::{NamingLaunchArgs, SESSION_NAME_PLACEHOLDER};
 use super::transcripts::Transcripts;
 use crate::agent::{
     AssignedReference, ExistenceDecl, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
@@ -419,6 +420,9 @@ pub struct RuntimeDefinition {
     /// The literal environment pairs every launch and version probe of the
     /// runtime gets, from `[launch_env]`.
     launch_env: DescriptorLaunchEnv,
+    /// The arguments that hand the session name to the agent, from
+    /// `[naming] launch_args`; empty for a runtime that declares none.
+    naming: NamingLaunchArgs,
     config_home: Option<ConfigHome>,
     /// Where below the config home the agent writes transcripts and which
     /// compiled parser reads them; `None` for a runtime that declares none.
@@ -456,6 +460,20 @@ impl RuntimeDefinition {
     pub fn new_with_env(
         parts: DefinitionParts,
         launch_env: DescriptorLaunchEnv,
+    ) -> Result<Self, DefinitionError> {
+        Self::new_declared(parts, launch_env, NamingLaunchArgs::default())
+    }
+
+    /// [`Self::new_with_env`] with the validated `[naming]` arguments the
+    /// runtime's launches get.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub(super) fn new_declared(
+        parts: DefinitionParts,
+        launch_env: DescriptorLaunchEnv,
+        naming: NamingLaunchArgs,
     ) -> Result<Self, DefinitionError> {
         let DefinitionParts {
             runtime_id,
@@ -497,9 +515,7 @@ impl RuntimeDefinition {
                 reason: "has too many arguments",
             });
         }
-        for arg in &default_args {
-            validate_token(arg, "runtime.args")?;
-        }
+        validate_default_args(&default_args)?;
         let provenance = match origin {
             DefinitionOrigin::Builtin { package } => {
                 let digest = descriptor_digest(&DescriptorFacts {
@@ -520,6 +536,7 @@ impl RuntimeDefinition {
                     prompt_arg,
                     native: native.as_ref(),
                     launch_env: launch_env.as_slice(),
+                    naming: naming.as_slice(),
                 });
                 BindingProvenance::Builtin {
                     package,
@@ -549,6 +566,7 @@ impl RuntimeDefinition {
             version_probe_policy,
             integration,
             launch_env,
+            naming,
             config_home: None,
             transcripts: None,
             hook_existence: None,
@@ -703,7 +721,8 @@ impl RuntimeDefinition {
             .map(RawTranscripts::validated)
             .transpose()?;
         let launch_env = raw.validated_launch_env(config_home.as_ref())?;
-        let definition = Self::new_with_env(
+        let naming = raw.validated_naming()?;
+        let definition = Self::new_declared(
             DefinitionParts {
                 runtime_id,
                 origin: origin(package),
@@ -729,20 +748,10 @@ impl RuntimeDefinition {
                     .map(VersionProbeDeclaration::policy)
                     .transpose()?
                     .flatten(),
-                integration: raw
-                    .integration
-                    .map(|integration| {
-                        Integration::new(
-                            Some(HandlerId::parse(
-                                &integration.handler,
-                                "integration.handler",
-                            )?),
-                            &integration.hook_schema,
-                        )
-                    })
-                    .transpose()?,
+                integration: validated_integration(raw.integration)?,
             },
             launch_env,
+            naming,
         )?;
         let definition = match hook_existence {
             Some(existence) => definition.with_hook_existence(existence),
@@ -876,6 +885,13 @@ impl RuntimeDefinition {
         self.launch_env.as_slice()
     }
 
+    /// The arguments that hand a session named `name` to the agent, from
+    /// `[naming] launch_args`; empty for a runtime that declares none.
+    #[must_use]
+    pub fn naming_args(&self, name: &str) -> Vec<String> {
+        self.naming.render(name)
+    }
+
     /// Where the agent writes transcripts below its config home and which
     /// compiled parser reads them, when the descriptor declares it.
     #[must_use]
@@ -1003,6 +1019,37 @@ fn validate_version_probe(
     }
 }
 
+/// The runtime's lifecycle-hook integration, when the descriptor declares one.
+fn validated_integration(
+    raw: Option<RawIntegration>,
+) -> Result<Option<Integration>, DefinitionError> {
+    raw.map(|integration| {
+        Integration::new(
+            Some(HandlerId::parse(
+                &integration.handler,
+                "integration.handler",
+            )?),
+            &integration.hook_schema,
+        )
+    })
+    .transpose()
+}
+
+/// Checks the fixed launch arguments: each is a valid token and none holds the
+/// `[naming]` placeholder, which only `[naming] launch_args` may carry.
+fn validate_default_args(args: &[String]) -> Result<(), DefinitionError> {
+    for arg in args {
+        validate_token(arg, "runtime.args")?;
+        if arg.contains(SESSION_NAME_PLACEHOLDER) {
+            return Err(DefinitionError::Field {
+                field: "runtime.args",
+                reason: "must not hold the {session_name} placeholder",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_label(value: &str, field: &'static str) -> Result<(), DefinitionError> {
     if value.is_empty() || value.len() > MAX_LABEL_BYTES || value.chars().any(char::is_control) {
         return Err(DefinitionError::Field {
@@ -1128,6 +1175,10 @@ struct DescriptorFacts<'a> {
     /// the value persisted sessions record.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     launch_env: &'a [(String, String)],
+    /// Omitted while empty, so a descriptor without `[naming]` hashes to the
+    /// value persisted sessions record.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    naming: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -1205,9 +1256,17 @@ struct RawDefinition {
     #[serde(default)]
     launch_env: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    naming: Option<RawNaming>,
+    #[serde(default)]
     config_home: Option<RawConfigHome>,
     #[serde(default)]
     transcripts: Option<RawTranscripts>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNaming {
+    launch_args: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1273,6 +1332,15 @@ pub(super) fn malformed_at(source: &str, error: &toml::de::Error) -> DefinitionE
 }
 
 impl RawDefinition {
+    /// The `[naming] launch_args`, empty when the table is absent.
+    fn validated_naming(&self) -> Result<NamingLaunchArgs, DefinitionError> {
+        self.naming
+            .as_ref()
+            .map(|naming| NamingLaunchArgs::new(naming.launch_args.clone()))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
     /// The `[launch_env]` pairs, refused when one names a variable this
     /// descriptor reads its config home or conversation root from.
     fn validated_launch_env(

@@ -114,6 +114,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "transcripts-head-paths-v1",
         since: "0.39.0",
     },
+    RuntimeFeature {
+        id: "naming-launch-args-v1",
+        since: "0.39.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -172,6 +176,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "input-refuse-while-blocked-v1",
         rule: GateRule::Key("input.refuse_while_blocked"),
+    },
+    FeatureGate {
+        feature: "naming-launch-args-v1",
+        rule: GateRule::Key("naming"),
     },
 ];
 

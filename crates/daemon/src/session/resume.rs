@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
+use super::launch_input::LaunchSubject;
 use crate::agent::host::{LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
     InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, Pin, ProfilePin, ProfileRegistry,
@@ -908,13 +909,17 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
+        let name = validate_session_name(params.name.as_deref())?;
         let inputs = self.launch_inputs(
             &relaunch.definition,
             &env,
             binding.agent_base.clone(),
             &id,
-            LaunchKind::Fork,
-            &binding.args,
+            LaunchSubject {
+                kind: LaunchKind::Fork,
+                frozen_args: &binding.args,
+                name: name.as_deref(),
+            },
         )?;
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
@@ -952,7 +957,7 @@ impl SessionRegistry {
                 PtySessionSpec {
                     id,
                     registration: super::target::PtyRegistration::Create,
-                    name: validate_session_name(params.name.as_deref())?,
+                    name,
                     agent: binding.agent,
                     agent_base: binding.agent_base.clone(),
                     input_rules,
@@ -1294,8 +1299,11 @@ impl SessionRegistry {
             &env,
             binding.agent_base.clone(),
             &id,
-            LaunchKind::Resume,
-            &binding.args,
+            LaunchSubject {
+                kind: LaunchKind::Resume,
+                frozen_args: &binding.args,
+                name: binding.name.as_deref(),
+            },
         )?;
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),

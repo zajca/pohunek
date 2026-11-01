@@ -1200,6 +1200,31 @@ environment; a profile entry reaches the launch only. A program the user starts
 by hand inside a shell session gets no descriptor environment. A built-in
 descriptor digest covers the table only while it holds a pair.
 
+### Session name arguments
+
+A runtime may hand the session name to its agent at launch (runtime feature
+`naming-launch-args-v1`, listed in `requires`; `runtime_api` stays 1):
+
+```toml
+requires = ["naming-launch-args-v1"]
+
+[naming]
+launch_args = ["--name={session_name}"]
+```
+
+The table holds 1 to 8 tokens, each at most 1024 bytes without control
+characters. Exactly one token holds `{session_name}` once, as the end of a
+`-<flag>=` token, so the name is one joined argv element and a dash-leading name
+is never an option. Every other brace, a bare or space-separated placeholder, text
+after it, and the placeholder in `runtime.args` are refused at install
+(`descriptor_invalid`, naming the field and never a token). The arguments are
+rendered per launch from the name that launch uses (`session.new` `name`; the
+current name on resume; `session.fork` `name`, not the source's), after the
+frozen and contributor arguments and before the native reference and prompt
+arguments, and are never persisted: no store or protocol change. No name, or a
+stored name that fails the session-name rule, omits them. A descriptor without
+`[naming]` keeps its digest.
+
 ### Secret session environment
 
 A host profile can declare variables whose values come from the `session.new`

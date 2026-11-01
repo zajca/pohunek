@@ -1898,8 +1898,21 @@ async fn start_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    start_named_session(framed, agent, cwd, None).await
+}
+
+/// Starts a session of `agent` named `name` and returns its id.
+async fn start_named_session<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    agent: &str,
+    cwd: &Path,
+    name: Option<&str>,
+) -> protocol::SessionId
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let params = protocol::SessionNewParams {
-        name: None,
+        name: name.map(str::to_owned),
         agent: agent.to_owned(),
         cwd: Some(cwd.to_path_buf()),
         cols: 80,
@@ -2455,4 +2468,387 @@ async fn a_removal_refused_for_an_unreadable_line_proceeds_once_the_line_is_set_
 /// Connection tasks whose shutdown token nothing cancels.
 fn untracked(name: &'static str) -> pohunek_daemon::api::ConnectionTasks {
     pohunek_daemon::api::ConnectionTasks::new(name, &tokio_util::sync::CancellationToken::new())
+}
+
+const NAMING_FEATURE: &str = "\"naming-launch-args-v1\"";
+
+/// A `[naming]` table declaring `tokens` as `launch_args`.
+fn naming_table(tokens: &[&str]) -> String {
+    let quoted: Vec<String> = tokens.iter().map(|token| format!("\"{token}\"")).collect();
+    format!("\n[naming]\nlaunch_args = [{}]\n", quoted.join(", "))
+}
+
+/// A program that prints each argument on a line of its own, then a marker.
+fn argv_program(plugins: &Path) -> PathBuf {
+    write_program(
+        plugins,
+        "agent-argv",
+        "#!/bin/sh\nfor a in \"$@\"; do printf 'ARG<%s>\\n' \"$a\"; done\nprintf 'ARGV_END\\n'\nexec sleep 600\n",
+    )
+}
+
+/// The `fixture` descriptor launching the argv-printing `program`.
+fn naming_descriptor(program: &Path, version: &str, naming: &str) -> String {
+    let requires = if naming.is_empty() {
+        ""
+    } else {
+        NAMING_FEATURE
+    };
+    descriptor_requiring(requires, naming)
+        .replace(
+            "program = \"/bin/sh\"",
+            &format!("program = \"{}\"", program.display()),
+        )
+        .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
+}
+
+/// The arguments the session's agent printed.
+async fn printed_argv<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+) -> Vec<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let text = wait_for_text(framed, id, "ARGV_END").await;
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            line.strip_prefix("ARG<")?
+                .strip_suffix('>')
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// `argv` with the generated native reference value dropped: the argument
+/// after the first of `flags`.
+fn without_reference(argv: &[String], flags: &[&str]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut skip = false;
+    for arg in argv {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        skip = flags.contains(&arg.as_str());
+        kept.push(arg.clone());
+    }
+    kept
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+#[tokio::test]
+async fn naming_args_follow_the_name_each_launch_uses() {
+    let servers = spawn_servers_over("pkg-naming-launch", Some("")).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = argv_program(&servers.plugins);
+    let document = naming_descriptor(&program, "1.0.0", &naming_table(&["--name={session_name}"]));
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-naming",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    let create_flags = ["--session-id"];
+
+    // The name sits between the frozen arguments and the native reference.
+    let named = start_named_session(&mut local, RUNTIME, &cwd, Some("Alpha")).await;
+    let argv = printed_argv(&mut local, &named).await;
+    assert_eq!(
+        without_reference(&argv, &create_flags),
+        strings(&["--model", "fast", "--name=Alpha", "--session-id"])
+    );
+
+    // An unnamed session and a whitespace-only name get no group.
+    for name in [None, Some("   ")] {
+        let id = start_named_session(&mut local, RUNTIME, &cwd, name).await;
+        let argv = printed_argv(&mut local, &id).await;
+        assert_eq!(
+            without_reference(&argv, &create_flags),
+            strings(&["--model", "fast", "--session-id"]),
+            "{name:?}"
+        );
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+
+    // A dash-leading name stays one element of the joined form.
+    let dashed = start_named_session(&mut local, RUNTIME, &cwd, Some("--help")).await;
+    let argv = printed_argv(&mut local, &dashed).await;
+    assert_eq!(
+        without_reference(&argv, &create_flags),
+        strings(&["--model", "fast", "--name=--help", "--session-id"])
+    );
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(dashed)).await;
+
+    // A resume carries the name the record holds now.
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(named)).await;
+    let _: protocol::SessionRenameResult = call(
+        &mut local,
+        method::SESSION_RENAME,
+        json!({ "session_id": named, "name": "Beta" }),
+    )
+    .await;
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(named)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert_eq!(
+        without_reference(&argv, &["--session"]),
+        strings(&["--model", "fast", "--name=Beta", "--session"])
+    );
+
+    // A fork carries its own name, never the source's, and none without one.
+    for (fork_name, expected) in [
+        (
+            Some("Gamma"),
+            strings(&["--model", "fast", "--name=Gamma", "--fork"]),
+        ),
+        (None, strings(&["--model", "fast", "--fork"])),
+    ] {
+        let forked: protocol::SessionForkResult = call(
+            &mut local,
+            method::SESSION_FORK,
+            json!({ "session_id": resumed.session.id, "name": fork_name, "cols": 80, "rows": 24 }),
+        )
+        .await;
+        let argv = printed_argv(&mut local, &forked.session.id).await;
+        assert_eq!(
+            without_reference(&argv, &["--fork"]),
+            expected,
+            "{fork_name:?}"
+        );
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(forked.session.id)).await;
+    }
+
+    // The persisted resume snapshot never holds a naming token.
+    let store = store_text(&servers);
+    assert!(store.contains("Beta"), "the record holds the current name");
+    assert!(
+        !store.contains("--name"),
+        "the store holds no naming argument"
+    );
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_profile_backed_launch_gets_the_naming_args() {
+    let servers = spawn_servers("pkg-naming-profile").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = argv_program(&servers.plugins);
+    let document = naming_descriptor(&program, "1.0.0", &naming_table(&["--name={session_name}"]));
+    let (digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-naming",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    std::fs::write(
+        servers.agents.join("profiled.toml"),
+        format!(
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\nprogram = \"{}\"\nargs = [\"--from-profile\"]\n",
+            digest.as_str(),
+            program.display()
+        ),
+    )
+    .expect("write the profile");
+
+    let id = start_named_session(&mut local, "profiled", &cwd, Some("Prof")).await;
+    let argv = printed_argv(&mut local, &id).await;
+    assert_eq!(
+        without_reference(&argv, &["--session-id"]),
+        strings(&["--from-profile", "--name=Prof", "--session-id"])
+    );
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+/// `[naming]` tables the grammar refuses, next to the valid `valid` table.
+fn refused_naming_tables(valid: &str) -> Vec<(&'static str, String)> {
+    let nine = [
+        "--a",
+        "--b",
+        "--c",
+        "--d",
+        "--e",
+        "--f",
+        "--g",
+        "--h",
+        "--n={session_name}",
+    ];
+    vec![
+        ("bare", naming_table(&["{session_name}"])),
+        (
+            "space-separated",
+            naming_table(&["--name", "{session_name}"]),
+        ),
+        (
+            "two",
+            naming_table(&["--name={session_name}", "--also={session_name}"]),
+        ),
+        ("none", naming_table(&["--name"])),
+        (
+            "text-after",
+            naming_table(&["--marker-flag={session_name}tail"]),
+        ),
+        ("no-dash", naming_table(&["name={session_name}"])),
+        ("no-equals", naming_table(&["-n{session_name}"])),
+        (
+            "reference",
+            naming_table(&["--name={session_name}", "{reference}"]),
+        ),
+        (
+            "other-brace",
+            naming_table(&["--name={session_name}", "{x}"]),
+        ),
+        ("empty-list", naming_table(&[])),
+        ("empty-token", naming_table(&["--name={session_name}", ""])),
+        ("nine", naming_table(&nine)),
+        (
+            "long-prefix",
+            naming_table(&[&format!("--{}={{session_name}}", "p".repeat(1000))]),
+        ),
+        ("unknown-key", format!("{valid}other = 1\n")),
+    ]
+}
+
+#[tokio::test]
+async fn naming_args_install_only_with_their_feature_and_in_the_joined_form() {
+    let servers = spawn_servers("pkg-naming-install").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let valid = naming_table(&["--name={session_name}"]);
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "without-requires",
+        &descriptor_requiring("", &valid),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a gated table without requires").code,
+        "runtime_feature_unsupported"
+    );
+
+    let cases = refused_naming_tables(&valid);
+    for (name, tables) in &cases {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(NAMING_FEATURE, tables),
+            false,
+        )
+        .await;
+        let error = result.expect_err(name);
+        assert_eq!(error.code, "package_descriptor_invalid", "{name}");
+        assert!(!error.msg.contains("marker-flag"), "{name}: {}", error.msg);
+    }
+
+    // The placeholder is not a launch argument of the runtime itself.
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "in-args",
+        &descriptor("/bin/sh").replace(
+            "args = [\"--model\", \"fast\"]",
+            "args = [\"--model\", \"--name={session_name}\"]",
+        ),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a placeholder in runtime.args").code,
+        "package_descriptor_invalid"
+    );
+
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "valid",
+        &descriptor_requiring(NAMING_FEATURE, &valid),
+        false,
+    )
+    .await;
+    result.expect("the joined form installs with its feature");
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_pinned_before_naming_args_resumes_without_the_name() {
+    let servers = spawn_servers("pkg-naming-pinned").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = argv_program(&servers.plugins);
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-plain",
+        &naming_descriptor(&program, "1.0.0", ""),
+        false,
+    )
+    .await;
+    installed.expect("the plain package installs");
+    let id = start_named_session(&mut local, RUNTIME, &cwd, Some("Delta")).await;
+    let _ = printed_argv(&mut local, &id).await;
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-naming",
+        &naming_descriptor(&program, "1.0.1", &naming_table(&["--name={session_name}"])),
+        false,
+    )
+    .await;
+    installed.expect("the naming package installs");
+
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(id)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert_eq!(
+        without_reference(&argv, &["--session"]),
+        strings(&["--model", "fast", "--session"])
+    );
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+    drop(local);
+    servers.stop().await;
 }
