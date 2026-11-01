@@ -275,9 +275,29 @@ struct Scenario {
     withheld: Arc<AtomicU32>,
     /// Whether the holder hides its markers.
     hides_markers: bool,
+    /// The worker journal's path, resolved by the first read.
+    journal_path: std::sync::OnceLock<PathBuf>,
     /// Keeps other test runs' unreadable holders from overlapping this
     /// scenario's sweeps; declared last, so it is released last.
     _host_lock: HostLock,
+}
+
+/// The journal a directory entry names: the journal itself, or the temporary
+/// file `<journal>.<pid>.<sequence>.tmp` the worker renames over it.
+fn journal_destination(entry: &Path) -> Option<PathBuf> {
+    let is_journal = |path: &Path| {
+        path.extension()
+            .is_some_and(|extension| extension == "json")
+    };
+    if is_journal(entry) {
+        return Some(entry.to_path_buf());
+    }
+    let name = entry.file_name()?.to_str()?;
+    let temporary = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (rest, _sequence) = temporary.rsplit_once('.')?;
+    let (journal, _pid) = rest.rsplit_once('.')?;
+    let destination = entry.with_file_name(journal);
+    is_journal(&destination).then_some(destination)
 }
 
 impl Scenario {
@@ -365,6 +385,7 @@ impl Scenario {
             withheld: Arc::new(AtomicU32::new(0)),
             hides_markers: matches!(holder, Holder::NonDumpable),
             _host_lock: host_lock,
+            journal_path: std::sync::OnceLock::new(),
         }
     }
 
@@ -458,31 +479,24 @@ impl Scenario {
     }
 
     /// The single worker journal of this scenario.
+    ///
+    /// The worker replaces the journal by renaming a temporary file over it,
+    /// and a directory listing taken during a rename may omit the destination.
+    /// The path is therefore taken from a listing once, from the journal or
+    /// from the temporary name, which encodes it, and every later read opens
+    /// that path directly, which always sees the old or the new journal.
     fn worker_journal(&self) -> serde_json::Value {
-        let state_root = self.env.state_home().join("pohunek/workers");
-        let session = std::fs::read_dir(state_root)
-            .expect("worker state root")
-            .next()
-            .expect("one session directory")
-            .expect("session directory entry")
-            .path();
-        let journal = std::fs::read_dir(&session)
-            .expect("session journal directory")
-            .map(|entry| entry.expect("journal entry").path())
-            .find(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
+        let path = self.journal_path.get_or_init(|| {
+            poll_until("the worker's journal file", || {
+                let state_root = self.env.state_home().join("pohunek/workers");
+                let session = std::fs::read_dir(state_root).ok()?.next()?.ok()?.path();
+                std::fs::read_dir(session)
+                    .ok()?
+                    .filter_map(|entry| Some(entry.ok()?.path()))
+                    .find_map(|path| journal_destination(&path))
             })
-            .unwrap_or_else(|| {
-                panic!(
-                    "a worker journal in {}: {:?}",
-                    session.display(),
-                    std::fs::read_dir(&session).map(|entries| entries
-                        .map(|entry| entry.map(|entry| entry.file_name()))
-                        .collect::<Vec<_>>())
-                )
-            });
-        serde_json::from_slice(&std::fs::read(journal).expect("read the journal"))
+        });
+        serde_json::from_slice(&std::fs::read(path).expect("read the journal"))
             .expect("the journal is JSON")
     }
 
