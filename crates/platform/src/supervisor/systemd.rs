@@ -93,10 +93,18 @@
 //! `failed` with `Result=oom-kill`, and `ExecMainStatus` then shows the signal
 //! that stopped the main process, not the OOM, which is why the verdict comes
 //! from `Result`.
+//!
+//! The same read, inside the `InvocationID` bracket, adds optional detail from
+//! the service interface: `OOMKills` and `ManagedOOMKills` (systemd 259+;
+//! processes the kernel and `systemd-oomd` killed), `MemoryPeak` (systemd 255+),
+//! and `ExecMainExitTimestamp`. Each is read on its own: an unknown property
+//! or the manager's `UINT64_MAX` "not available" leaves it absent without
+//! losing the verdict. The counters and the peak live in the unit's runtime
+//! record, so they are readable only until the failed unit is reset.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use zbus::proxy::CacheProperties;
 use zbus::{OwnedObjectPath, Variant};
@@ -195,6 +203,7 @@ const MAIN_DUMPED: i32 = 3;
 
 const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 const UNIT_EXISTS: &str = "org.freedesktop.systemd1.UnitExists";
+const UNKNOWN_PROPERTY: &str = "org.freedesktop.DBus.Error.UnknownProperty";
 const UNKNOWN_OBJECT: &str = "org.freedesktop.DBus.Error.UnknownObject";
 const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 const NAME_HAS_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
@@ -1289,16 +1298,24 @@ impl Bus {
             .get_property("ExecMainStatus")
             .await
             .map_err(|source| unit_error(OPERATION, id, source))?;
+        // Optional detail: a manager that lacks a property still yields the
+        // verdict above.
+        let oom_kills = optional_counter(&service, "OOMKills", id).await?;
+        let managed_oom_kills = optional_counter(&service, "ManagedOOMKills", id).await?;
+        let memory_peak = optional_counter(&service, "MemoryPeak", id).await?;
+        let exited_at = optional_counter(&service, "ExecMainExitTimestamp", id).await?;
         let after = read_invocation(&unit, id, false).await?;
         if before != after {
             return Err(Error::Race {
                 operation: OPERATION,
             });
         }
-        Ok(Some(ExitEvidence::new(
-            decode_result(result)?,
-            decode_exit(code, status),
-        )))
+        Ok(Some(
+            ExitEvidence::new(decode_result(result)?, decode_exit(code, status))
+                .with_oom_kills(oom_kills, managed_oom_kills)
+                .with_memory_peak(memory_peak)
+                .with_exited_at(exited_at.and_then(decode_timestamp)),
+        ))
     }
 
     /// Stops a unit and waits until its control group is proven empty.
@@ -1753,6 +1770,44 @@ async fn read_invocation(
             invocation_id,
         })
     }
+}
+
+/// Reads one optional `t` property of the service interface.
+async fn optional_counter(
+    service: &zbus::Proxy<'_>,
+    property: &'static str,
+    id: &ServiceId,
+) -> Result<Option<u64>, Error> {
+    decode_counter(service.get_property::<u64>(property).await, id)
+}
+
+/// Decodes an optional counter: `UINT64_MAX` is the manager's "not available"
+/// (the control group was never realized), and a manager that predates the
+/// property reports `UnknownProperty`. Both are absent, never zero. Any other
+/// failure keeps its mapping, so a vanished unit is still [`Error::NotFound`].
+fn decode_counter(outcome: zbus::Result<u64>, id: &ServiceId) -> Result<Option<u64>, Error> {
+    match outcome {
+        Ok(u64::MAX) => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(source) if is_unknown_property(&source) => Ok(None),
+        Err(source) => Err(unit_error("exit_evidence", id, source)),
+    }
+}
+
+fn is_unknown_property(source: &zbus::Error) -> bool {
+    match source {
+        zbus::Error::MethodError(name, _, _) => name.as_str() == UNKNOWN_PROPERTY,
+        zbus::Error::FDO(error) => {
+            zbus::DBusError::name(error.as_ref()).as_str() == UNKNOWN_PROPERTY
+        }
+        _ => false,
+    }
+}
+
+/// Decodes a realtime timestamp in microseconds since the Unix epoch; 0 means
+/// the event never happened.
+fn decode_timestamp(micros: u64) -> Option<SystemTime> {
+    (micros != 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_micros(micros))
 }
 
 /// Accepts the manager's `Result` string when it is a short token.
@@ -2494,6 +2549,39 @@ mod tests {
         assert_eq!(decode_exit(MAIN_DUMPED, 11), Some(JobExit::Signal(11)));
         assert_eq!(decode_exit(0, 0), None, "no main process ended");
         assert_eq!(decode_exit(42, 1), None, "an unknown code is not guessed");
+    }
+
+    #[test]
+    fn optional_counters_are_absent_never_zero() {
+        let id = key().service_id();
+        assert_eq!(decode_counter(Ok(0), &id).ok(), Some(Some(0)));
+        assert_eq!(decode_counter(Ok(4_096), &id).ok(), Some(Some(4_096)));
+        assert_eq!(
+            decode_counter(Ok(u64::MAX), &id).ok(),
+            Some(None),
+            "the manager's `not available` is absent"
+        );
+        assert_eq!(
+            decode_counter(Err(method_error(UNKNOWN_PROPERTY)), &id).ok(),
+            Some(None),
+            "a manager without the property still yields the verdict"
+        );
+        assert!(
+            matches!(
+                decode_counter(Err(method_error(UNKNOWN_OBJECT)), &id),
+                Err(Error::NotFound(_))
+            ),
+            "a vanished unit is not an absent property"
+        );
+        assert!(matches!(
+            decode_counter(Err(method_error(NO_REPLY)), &id),
+            Err(Error::Timeout { .. })
+        ));
+        assert_eq!(decode_timestamp(0), None);
+        assert_eq!(
+            decode_timestamp(1_500_000),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_500))
+        );
     }
 
     #[test]
