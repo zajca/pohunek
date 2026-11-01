@@ -713,14 +713,14 @@ fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     assert_eq!(error_code(&output), "tailscale_state_unavailable");
     assert_not_running(&helper);
 
-    // One `--host` command probes the provider once, so it waits for one
-    // status deadline.
+    // A `--host` command probes the provider to learn whether the name is this
+    // machine and again to resolve the peer: two probes, never more.
     let before = fs::read_to_string(&runs).expect("runs so far").len();
     let (output, targets) = fixture.dial("alpha");
     assert_eq!(error_code(&output), "tailscale_state_unavailable");
     assert!(targets.is_empty(), "{targets:?}");
     let after = fs::read_to_string(&runs).expect("runs so far").len();
-    assert_eq!(after - before, 1, "the status probe ran once per command");
+    assert_eq!(after - before, 2, "the status probe ran twice per command");
 }
 
 /// The deadline is a strict, range-checked `overlays.toml` key.

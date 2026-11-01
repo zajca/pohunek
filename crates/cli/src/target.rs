@@ -47,8 +47,7 @@ pub(crate) fn is_local_host(host: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] for an ambiguous or invalid host, and for a name no
-/// provider could look up because its status probe failed.
+/// Returns [`CliError`] for an ambiguous or invalid host.
 pub(crate) async fn prime_local_aliases<'a>(
     hosts: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), CliError> {
