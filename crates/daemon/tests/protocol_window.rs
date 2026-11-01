@@ -1469,3 +1469,115 @@ async fn a_previous_release_reads_and_rewrites_the_retention_policy_beside_an_id
     );
     daemon.stop().await;
 }
+
+/// A `runtime` object of observation params, with a key the daemon does not
+/// know when `with_unknown_key` is set.
+fn nested_runtime(with_unknown_key: bool) -> Value {
+    let mut runtime = json!({"worker_instance_id": "runtime-1", "runtime_generation": "1"});
+    if with_unknown_key {
+        runtime["key_from_a_newer_client"] = json!(1);
+    }
+    runtime
+}
+
+/// Params with a key the daemon does not know stay refused: tolerance of
+/// unknown keys applies to what a client decodes, never to what the daemon
+/// decodes.
+#[tokio::test]
+async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
+    let daemon = Daemon::start("window-params-unknown-key").await;
+    let mut client = daemon.connect().await;
+
+    for (id, method_name, params) in [
+        (
+            "read-extra",
+            method::SESSION_READ,
+            json!({"session_id": "s-1", "key_from_a_newer_client": 1}),
+        ),
+        (
+            "output-runtime-extra",
+            method::SESSION_OUTPUT,
+            json!({
+                "session_id": "s-1",
+                "runtime": nested_runtime(true),
+                "after_offset": "0",
+                "max_bytes": 4096,
+            }),
+        ),
+        (
+            "wait-runtime-extra",
+            method::SESSION_WAIT,
+            json!({
+                "session_id": "s-1",
+                "runtime": nested_runtime(true),
+                "states": ["running"],
+                "timeout_ms": 1000,
+            }),
+        ),
+        (
+            "command-extra",
+            method::COMMAND_RUN,
+            json!({
+                "package": "acme.fleet-state",
+                "command": "host-state",
+                "key_from_a_newer_client": 1,
+            }),
+        ),
+    ] {
+        let request = Request::new(id, method_name, params).expect("valid request");
+        let response = exchange(
+            &mut client,
+            &serde_json::to_value(&request).expect("serialize request"),
+        )
+        .await;
+        assert_eq!(
+            response["err"]["code"], "bad_request",
+            "{method_name}: {response}"
+        );
+        assert!(
+            response["err"]["msg"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("unknown field")),
+            "{method_name}: {response}"
+        );
+    }
+
+    // The same params without the extra key pass decoding: whatever the daemon
+    // answers is not a params refusal.
+    for (id, method_name, params) in [
+        (
+            "output-runtime-control",
+            method::SESSION_OUTPUT,
+            json!({
+                "session_id": "s-1",
+                "runtime": nested_runtime(false),
+                "after_offset": "0",
+                "max_bytes": 4096,
+            }),
+        ),
+        (
+            "wait-runtime-control",
+            method::SESSION_WAIT,
+            json!({
+                "session_id": "s-1",
+                "runtime": nested_runtime(false),
+                "states": ["running"],
+                "timeout_ms": 1000,
+            }),
+        ),
+    ] {
+        let request = Request::new(id, method_name, params).expect("valid request");
+        let response = exchange(
+            &mut client,
+            &serde_json::to_value(&request).expect("serialize request"),
+        )
+        .await;
+        assert!(
+            !response["err"]["msg"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("invalid params")),
+            "{method_name}: {response}"
+        );
+    }
+    daemon.stop().await;
+}

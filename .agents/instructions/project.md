@@ -68,6 +68,14 @@ rule. The current state of each place is stated separately.
   (`protocol::tolerant`, hidden `Unknown` variant); each enum's policy, and the
   bump-only ones, are in `docs/architecture.md` "Unknown enum values from a
   newer daemon".
+  An unknown key in a daemon result, event or error is ignored by the client
+  for the types that are only ever decoded by clients; the types that
+  carry `deny_unknown_fields` (the strict params, persisted capabilities and
+  policies, governance state, the envelope) keep refusing them; most params are
+  lenient and ignore an unknown key. A field is
+  added to such a relaxed type only after the next protocol bump or when only
+  clients of the shipping release can receive it ("Unknown fields from a newer
+  daemon" in `docs/architecture.md`).
 - **Accepted upgrade risk.** Contract: the CLI remembers which at-risk verdicts
   an upgrade accepted, and the next gate treats a verdict as previously
   accepted only when the daemon of the release being installed reproduces the

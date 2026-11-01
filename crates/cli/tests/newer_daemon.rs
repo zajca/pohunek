@@ -960,3 +960,49 @@ fn a_read_source_from_a_newer_daemon_shows_unknown() {
     );
     assert_eq!(human.status.code(), Some(0), "{human:?}");
 }
+
+#[test]
+fn a_turn_wait_result_with_keys_from_a_newer_daemon_exits_zero_without_printing_them() {
+    let output = run_against_scripted_daemon(
+        &["session", "wait", "s-1", "--json"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_WAIT_TURN,
+                json!({
+                    "reason": "event",
+                    "event": {
+                        "session_id": "s-1",
+                        "kind": "turn_completed",
+                        "at": "2026-06-17T10:02:00Z",
+                        "a_key_from_a_newer_daemon": 1,
+                    },
+                    "cursor": "cursor-after-newer-keys",
+                    "progress": [{
+                        "session_id": "s-1",
+                        "state": "running",
+                        "output_advanced": true,
+                        "a_key_from_a_newer_daemon": {"nested": true},
+                    }],
+                    "a_key_from_a_newer_daemon": "x",
+                }),
+            ),
+        ]),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(document["ok"]["reason"], "event", "{document}");
+    assert_eq!(
+        document["ok"]["event"]["kind"], "turn_completed",
+        "{document}"
+    );
+    assert_eq!(
+        document["ok"]["cursor"], "cursor-after-newer-keys",
+        "{document}"
+    );
+    assert!(
+        !document.to_string().contains("a_key_from_a_newer_daemon"),
+        "the CLI prints only the fields it decoded: {document}"
+    );
+}

@@ -1041,7 +1041,6 @@ impl DetectionRegionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "DetectionRegionPreview.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct DetectionRegionPreview {
     /// Region kind independent of any parameterized count.
     pub kind: DetectionRegionKind,
@@ -1092,7 +1091,6 @@ impl SessionDetectionParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionDetectionResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionDetectionResult {
     /// Logical session whose detector supplied the previews.
     pub session_id: SessionId,
@@ -1266,7 +1264,6 @@ impl<'de> Deserialize<'de> for SessionReadParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionReadResult {
     /// Captured terminal text in the requested format.
     pub text: String,
@@ -1292,7 +1289,6 @@ pub struct SessionReadResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "TerminalCursor.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct TerminalCursor {
     /// Zero-based visible row.
     pub row: u16,
@@ -1319,13 +1315,35 @@ impl<'de> Deserialize<'de> for SessionRuntimeIdentity {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct WireIdentity {
             worker_instance_id: String,
             runtime_generation: RuntimeGeneration,
         }
         let wire = WireIdentity::deserialize(deserializer)?;
         Self::new(wire.worker_instance_id, wire.runtime_generation)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Runtime identity nested in strict params: the daemon decodes it, so a key it
+/// does not know stays refused, unlike the identity a client reads from a
+/// result.
+struct StrictRuntimeIdentity(SessionRuntimeIdentity);
+
+impl<'de> Deserialize<'de> for StrictRuntimeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictWireIdentity {
+            worker_instance_id: String,
+            runtime_generation: RuntimeGeneration,
+        }
+        let wire = StrictWireIdentity::deserialize(deserializer)?;
+        SessionRuntimeIdentity::new(wire.worker_instance_id, wire.runtime_generation)
+            .map(Self)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -1370,7 +1388,6 @@ impl SessionRuntimeIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionScreenResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionScreenResult {
     /// Logical session that owns the terminal.
     pub session_id: SessionId,
@@ -1515,7 +1532,7 @@ impl<'de> Deserialize<'de> for SessionOutputParams {
         struct WireParams {
             session_id: SessionId,
             #[serde(default)]
-            runtime: Option<SessionRuntimeIdentity>,
+            runtime: Option<StrictRuntimeIdentity>,
             #[serde(default)]
             after_offset: Option<OutputOffset>,
             max_bytes: u32,
@@ -1525,7 +1542,7 @@ impl<'de> Deserialize<'de> for SessionOutputParams {
         let wire = WireParams::deserialize(deserializer)?;
         Self::new(
             wire.session_id,
-            wire.runtime,
+            wire.runtime.map(|runtime| runtime.0),
             wire.after_offset,
             wire.max_bytes,
             wire.wait_ms,
@@ -1585,7 +1602,6 @@ impl<'de> Deserialize<'de> for SessionOutputGap {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct WireGap {
             start_offset: OutputOffset,
             end_offset: OutputOffset,
@@ -1768,7 +1784,6 @@ impl<'de> Deserialize<'de> for SessionOutputResult {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct WireResult {
             session_id: SessionId,
             worker_instance_id: String,
@@ -1970,7 +1985,7 @@ impl<'de> Deserialize<'de> for SessionWaitParams {
         struct WireParams {
             session_id: SessionId,
             #[serde(default)]
-            runtime: Option<SessionRuntimeIdentity>,
+            runtime: Option<StrictRuntimeIdentity>,
             #[serde(default)]
             after_updated_at: Option<String>,
             #[serde(default)]
@@ -1986,7 +2001,7 @@ impl<'de> Deserialize<'de> for SessionWaitParams {
         let wire = WireParams::deserialize(deserializer)?;
         Self::new(
             wire.session_id,
-            wire.runtime,
+            wire.runtime.map(|runtime| runtime.0),
             wire.after_updated_at,
             wire.after_terminal_watermark,
             wire.after_output_offset,
@@ -2033,7 +2048,6 @@ crate::tolerant_enum!(SessionWaitReason);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionWaitResult {
     /// Condition that completed the wait.
     pub reason: SessionWaitReason,
@@ -2280,7 +2294,6 @@ impl std::fmt::Debug for SessionReportNativeIdParams {
     feature = "ts",
     ts(export, export_to = "SessionReportNativeIdResult.ts")
 )]
-#[serde(deny_unknown_fields)]
 pub struct SessionReportNativeIdResult {
     /// Whether the daemon recorded the report as a resume binding.
     pub recorded: bool,
@@ -3240,7 +3253,6 @@ pub struct SessionResumeResult {
 /// process. Carries the process identity and kernel command name only, never
 /// its environment or command line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "UnconfirmedProcess.ts"))]
 pub struct UnconfirmedProcess {
@@ -3553,7 +3565,6 @@ pub struct SessionPolicyParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionPolicyResult {
     /// Current session retention policy.
     pub retention: SessionRetentionPolicy,

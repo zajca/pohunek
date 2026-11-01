@@ -588,7 +588,6 @@ pub struct NotificationPolicyParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicyResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct NotificationPolicyResult {
     /// Current notification policy.
     pub policy: NotificationPolicy,

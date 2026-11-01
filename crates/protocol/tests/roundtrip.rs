@@ -2981,7 +2981,7 @@ fn session_wait_contract_covers_predicates_reasons_and_validation() {
 }
 
 #[test]
-fn native_report_and_error_payloads_reject_unknown_or_invalid_fields() {
+fn native_report_rejects_unknown_or_invalid_fields_and_error_payloads_ignore_unknown() {
     let valid = json!({
         "session_id": "s-42",
         "worker_instance_id": "runtime-42",
@@ -3003,13 +3003,19 @@ fn native_report_and_error_payloads_reject_unknown_or_invalid_fields() {
     serde_json::from_value::<SessionReportNativeIdParams>(invalid_time)
         .expect_err("invalid native report timestamp must fail");
 
-    serde_json::from_value::<ProtocolError>(json!({
+    let tolerated = serde_json::from_value::<ProtocolError>(json!({
         "class": "runtime",
         "code": "session_runtime_changed",
         "msg": "redacted",
-        "terminal_content": "must not enter errors"
+        "terminal_content": "from a newer daemon"
     }))
-    .expect_err("unknown error payload field must fail");
+    .expect("an error payload field this build does not know is ignored");
+    assert_eq!(tolerated.code, "session_runtime_changed");
+    assert_eq!(
+        serde_json::to_value(&tolerated).expect("serialize"),
+        json!({"class": "runtime", "code": "session_runtime_changed", "msg": "redacted"}),
+        "an ignored field is not echoed back"
+    );
     serde_json::from_value::<Response>(json!({
         "v": 4,
         "id": "req-1",

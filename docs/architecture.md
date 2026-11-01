@@ -2298,6 +2298,56 @@ enum (`SessionState`, `SessionTurnEventKind`, `NotificationKind`) needs a
 protocol bump too, so a release that makes no protocol bump adds no value to
 those.
 
+### Unknown fields from a newer daemon
+
+A client decodes a daemon result, event or error with `protocol::tolerant`, and
+a key a newer daemon added to a result type must not fail the call. The
+daemon-side types that carry `deny_unknown_fields` stay strict: the strict
+params, the capabilities inside the session store, the notification policy
+file and governance state refuse a key they do not know.
+Each protocol type has one field policy, kept in the table of
+`crates/protocol/tests/field_policy.rs`:
+
+- **relax**: the type carries no `deny_unknown_fields`; every decode ignores
+  an unknown key. Only types the daemon never decodes from a peer or from disk
+  qualify: the results and events a client reads, and the `ProtocolError` of
+  every error response. The
+  CLI `--json` output prints the decoded value, so a key the CLI does not know
+  is absent from it.
+- **strict**: both decodes refuse an unknown key. This covers the envelope
+  framing (`Request`, `Response`, `ProtocolVersionRange`: a new envelope key is
+  a protocol bump), signed, cross-validated and identity documents (governance
+  status, transfer outcomes, `PackageIdentity`, `LaunchBinding`), the client
+  params that deny unknown keys (including the `runtime` identity nested in
+  `session.output` and `session.wait` params, which has its own strict decode),
+  and the types the daemon also persists or accepts as params until they gain a
+  scoped decode.
+- **lenient**: the type carries no `deny_unknown_fields` and no hand-written
+  refusal, so both decodes ignore an unknown key. Most param, result and event
+  types are lenient; a daemon does not refuse a key of that kind in params, so
+  a newer client cannot rely on an older daemon to reject an optional param.
+
+The table also feeds a ratchet: every `deny_unknown_fields` site, every
+hand-written refusal of an unknown key and every public `*Params`, `*Result`
+and `*Event` type that implements `Deserialize` must have a row, so a new
+strict type or a new result type cannot appear without a classification.
+
+Relaxing a type protects only clients of the release that ships it: a client
+of an earlier release is still strict for it, and no client advertises
+capabilities in the request envelope, so there is nothing to negotiate and no
+protocol bump. A field may therefore be added to a relaxed type only when one
+of two cases holds:
+
+- after the next `PROTOCOL_VERSION` bump, where the previous-version adapter's
+  downgrade strips the field for N-1 peers, which include the strict clients;
+- when only clients of the shipping release or later can receive it, as with
+  `ProtocolError.details`, which only `command_failed` sends and only a
+  `command.run` caller receives.
+
+A release adds no field to a type whose tolerance ships in the same release,
+the same shape as the 0.38 rule above. A new field must also be safe to ignore;
+a field whose absence changes the meaning is a semantic change.
+
 ## Testing Strategy
 
 Tests protect externally meaningful behavior by driving cooperating
