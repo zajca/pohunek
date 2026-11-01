@@ -162,6 +162,19 @@ The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the
 boundaries in [secrets](secrets.md) and [repo `.pohunek/`](repo-pohunek.md).
 
+## Executable lookup on macOS
+
+Programs the daemon runs as the owner (agent CLIs, overlay CLIs, `git`) are
+looked up only in directories no untrusted account can write. On macOS this
+trust boundary includes the `admin` group (gid 80) for directories the user
+owns, the shape of a stock Homebrew prefix. A process running as another admin
+account can therefore swap entries that the user or root owns there, and
+Pohunek runs them as the user; entries that account creates stay refused
+because of their owner. A host with several admins removes the exposure with
+`chmod g-w` on the Homebrew directories. Root-owned directories, other groups,
+and world write stay refused; see
+[environment resolution](../guides/environment-resolution.md).
+
 ## Accepted team-relay boundary
 
 The [optional team relay](../concepts/team-relay.md) has an implemented reduced

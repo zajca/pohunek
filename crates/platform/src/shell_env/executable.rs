@@ -17,6 +17,22 @@ const DARWIN_NETBIRD_PATH: &str = "/run/current-system/sw/bin/netbird";
 /// macOS reserves gids 0 (wheel) and 1 (daemon) for system accounts.
 const DARWIN_SYSTEM_GROUPS: [u32; 2] = [0, 1];
 
+/// macOS reserves gid 80 for the `admin` group, the group of a stock
+/// Homebrew prefix's `bin` and `Cellar`.
+const DARWIN_ADMIN_GROUP: u32 = 80;
+
+/// The group whose write access to a user-owned lookup directory is accepted.
+///
+/// Only macOS names one; on other platforms a group-writable directory stays
+/// untrusted.
+pub(super) const fn lookup_admin_group() -> Option<u32> {
+    if cfg!(target_os = "macos") {
+        Some(DARWIN_ADMIN_GROUP)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DarwinRunProfile<'a> {
     candidate: &'a Path,
@@ -267,14 +283,18 @@ impl Owners {
 /// target is validated. An untrusted candidate is skipped, like one the shell
 /// cannot execute. An executable the user cannot read cannot be opened and is
 /// skipped as well. Ordinarily the path is returned as found, so a
-/// multi-call binary keeps the name it was invoked by; group-writable
-/// executables (an admin-group Intel Homebrew) are out of scope.
+/// multi-call binary keeps the name it was invoked by, and the file itself
+/// stays strict on every platform: a group-writable executable is refused.
 ///
 /// A path-based exec cannot be made atomic with the check, so the directories
 /// the lookup passes through must also be owner-controlled
-/// ([`lookup_chain_is_owner_controlled`]). The macOS nix-darwin `NetBird` path
-/// crosses a system-group-writable directory; its canonical target is checked
-/// and returned so a later symlink replacement cannot change what runs.
+/// ([`lookup_chain_is_owner_controlled`]). On macOS that includes a user-owned
+/// directory the `admin` group (gid 80) can write, the shape of a stock
+/// Homebrew `bin` and `Cellar`; the target is not pinned because the keg path
+/// crosses `Cellar`, which the group can write as well. The macOS nix-darwin
+/// `NetBird` path crosses a system-group-writable directory; its canonical
+/// target is checked and returned so a later symlink replacement cannot change
+/// what runs.
 pub(super) fn is_executable_file(path: &Path) -> bool {
     is_trusted_executable(path, Owners::current())
 }
@@ -295,15 +315,19 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
 /// The path is resolved component by component, and each directory searched on
 /// the way (the canonical directory holding the next entry, including the final
 /// file's directory) must pass the platform's trusted-ancestor policy
-/// ([`TrustedDir::open_absolute_ancestor`](crate::filesystem::TrustedDir)):
-/// effective-user-owned components are not group- or world-writable and
-/// root-owned ones are non-writable or sticky, so no other account can rename
-/// an entry on either the lexical or the canonical chain.
+/// ([`TrustedDir::open_absolute_lookup_ancestor`](crate::filesystem::TrustedDir)):
+/// effective-user-owned components are not world-writable and not
+/// group-writable (on macOS, except for the `admin` group), and root-owned ones
+/// are non-writable or sticky, so no account outside that trust boundary can
+/// rename an entry on either the lexical or the canonical chain.
 ///
 /// Every symlink on the chain must be owned by `owners`, and a directory that
 /// others can write (a sticky `/tmp`) may hold a chain entry only when that
 /// entry is owned by `owners` too: sticky protects an entry from everyone but
 /// its owner, so an entry another account created there is the attack itself.
+/// A directory whose group write is accepted needs no such exception: the
+/// symlink owner rule and the ancestor policy already refuse an entry another
+/// account created.
 fn lookup_chain_is_owner_controlled(
     path: &Path,
     owners: Owners,
@@ -367,10 +391,11 @@ fn lookup_chain_is_owner_controlled(
         if darwin_run_entry {
             trusted_darwin_run = true;
         }
-        if holder_mode & WRITABLE_BY_OTHERS != 0
-            && !(holder_mode & STICKY != 0 && owned)
-            && !darwin_run_entry
-        {
+        let admin_group_directory = owned
+            && is_admin_group_directory(holder.uid(), holder.gid(), holder_mode, owners.effective);
+        let shared_directory_accepted =
+            (holder_mode & STICKY != 0 && owned) || admin_group_directory || darwin_run_entry;
+        if holder_mode & WRITABLE_BY_OTHERS != 0 && !shared_directory_accepted {
             return Err(Refusal::ChainSharedDirectory {
                 dir: directory,
                 owner: metadata.uid(),
@@ -409,6 +434,19 @@ fn lookup_chain_is_owner_controlled(
     Ok(trusted_darwin_run)
 }
 
+/// Whether a lookup directory is owned by the effective user, belongs to the
+/// accepted admin group, and is not writable by others.
+///
+/// The one definition of the macOS admin-group exception for the holder check
+/// and the final search directory; the ancestor walk applies the same rule
+/// through [`lookup_admin_group`].
+pub(super) fn is_admin_group_directory(uid: u32, gid: u32, mode: u32, effective: u32) -> bool {
+    /// The other-write permission bit.
+    const WRITABLE_BY_OTHERS: u32 = 0o002;
+
+    lookup_admin_group() == Some(gid) && uid == effective && mode & WRITABLE_BY_OTHERS == 0
+}
+
 fn validate_lookup_directories(
     searched: &[PathBuf],
     trusted_run_directory: Option<&Path>,
@@ -424,12 +462,11 @@ fn validate_lookup_directories(
             // policy cannot accept macOS's non-sticky root:daemon run directory.
             continue;
         }
-        crate::filesystem::TrustedDir::open_absolute_ancestor(dir).map_err(|error| {
-            Refusal::ChainDirectory {
+        crate::filesystem::TrustedDir::open_absolute_lookup_ancestor(dir, lookup_admin_group())
+            .map_err(|error| Refusal::ChainDirectory {
                 dir: dir.clone(),
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
     }
     Ok(())
 }

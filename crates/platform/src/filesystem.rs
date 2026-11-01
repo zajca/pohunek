@@ -583,6 +583,7 @@ impl TrustedDir {
                 0o700,
                 effective_uid,
                 system_uid,
+                None,
             )?;
         }
         let stat = fs::fstat(&directory.file)
@@ -614,7 +615,31 @@ impl TrustedDir {
     ///
     /// Returns [`FsError`] when the path is invalid, missing, or unsafe.
     pub fn open_absolute_ancestor(path: impl AsRef<Path>) -> FsResult<Self> {
-        let components = absolute_components(path.as_ref())?;
+        Self::open_absolute_ancestor_inner(path.as_ref(), None)
+    }
+
+    /// Validates an executable-lookup directory like [`Self::open_absolute_ancestor`],
+    /// except that an effective-user-owned component may be group-writable when
+    /// its group is `admin_group`.
+    ///
+    /// Only the executable-lookup policy of `shell_env` calls this: the group
+    /// write is accepted for the one group the caller names (macOS `admin`, gid
+    /// 80), never for another group, never for others, and never for a
+    /// system-owned component. Every other caller keeps the strict policy of
+    /// [`Self::open_absolute_ancestor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] when the path is invalid, missing, or unsafe.
+    pub fn open_absolute_lookup_ancestor(
+        path: impl AsRef<Path>,
+        admin_group: Option<u32>,
+    ) -> FsResult<Self> {
+        Self::open_absolute_ancestor_inner(path.as_ref(), admin_group)
+    }
+
+    fn open_absolute_ancestor_inner(path: &Path, admin_group: Option<u32>) -> FsResult<Self> {
+        let components = absolute_components(path)?;
         let root_fd = fs::open(
             Path::new("/"),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
@@ -637,6 +662,7 @@ impl TrustedDir {
                 0o700,
                 effective_uid,
                 system_uid,
+                admin_group,
             )?;
         }
         Ok(directory)
@@ -2145,6 +2171,7 @@ impl TrustedDir {
                     mode,
                     effective_uid,
                     system_uid,
+                    None,
                 )?;
             }
         }
@@ -2288,6 +2315,7 @@ fn validate_ancestor(
     private_mode: u32,
     effective_uid: u32,
     system_uid: u32,
+    admin_group: Option<u32>,
 ) -> FsResult<()> {
     let stat =
         fs::fstat(file).map_err(|source| io_error("inspect trusted ancestor", path, source))?;
@@ -2298,7 +2326,9 @@ fn validate_ancestor(
         return Ok(());
     }
     if owner == effective_uid {
-        if mode & 0o022 != 0 {
+        let group_write_allowed = admin_group == Some(stat_gid(&stat));
+        let forbidden = if group_write_allowed { 0o002 } else { 0o022 };
+        if mode & forbidden != 0 {
             return Err(FsError::UnsafeMode {
                 path: path.to_path_buf(),
                 actual: mode,
@@ -3479,6 +3509,18 @@ fn identity_from_stat(stat: &Stat, kind: EntryKind) -> EntryIdentity {
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn stat_uid(stat: &Stat) -> u32 {
     stat.st_uid
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn stat_gid(stat: &Stat) -> u32 {
+    stat.st_gid
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn stat_gid(stat: &Stat) -> u32 {
+    stat.st_gid
+        .try_into()
+        .expect("native gid fits the portable identity type")
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]

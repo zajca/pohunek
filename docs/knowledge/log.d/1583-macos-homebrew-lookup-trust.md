@@ -1,0 +1,4 @@
+## Unreleased (2026-11-01, stock Homebrew directories are trusted on macOS, #1583)
+
+- On macOS the executable lookup (service `PATH`, agent and overlay CLIs, `git`, the doctor probes) accepts a directory that the user owns, that belongs to the `admin` group (gid 80), and that others cannot write, so the stock `/opt/homebrew/bin` and `Cellar` are no longer refused. Root-owned directories, other groups, world write and group-writable executable files stay refused. A second admin account can swap entries the user owns there; `chmod g-w` on the Homebrew directories removes the exposure (see the environment resolution guide).
+- An existing service keeps its recorded `PATH` until `pohunek service refresh-path` runs. After that, a Homebrew `git` earlier in the `PATH` shadows `/usr/bin/git`, as in the shell.

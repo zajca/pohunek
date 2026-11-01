@@ -66,16 +66,40 @@ cannot execute. The path is returned as found, not canonicalized, so a
 multi-call binary (`sh` linked to `bash` or `busybox`) keeps the name it was
 started by. The directories the lookup passes through must also be
 owner-controlled, on the lexical chain and on the canonical chain of a symlink
-target: every component passes the platform's trusted-ancestor policy (user-owned
+target: every component passes the executable-lookup ancestor policy (user-owned
 components not group- or world-writable, root-owned ones non-writable or
-sticky), every symlink on the chain is owned by the user or root, and a
+sticky; the macOS admin-group exception below), every symlink on the chain is owned by the user or root, and a
 directory others can write (a sticky `/tmp`) may hold a chain entry only when
 the entry is ours or root's, so no other account can rename or retarget an
 entry after the check. A
 path-based exec cannot be made atomic with the check; the chain check removes
 the attacker's ability to change what the path names. A private 0700 directory
-below the sticky root-owned `/tmp` passes. Group-writable executables or
-directories, such as an admin-group Intel Homebrew, are out of scope. A refused configured
+below the sticky root-owned `/tmp` passes. The executable file itself is never
+accepted when group- or world-writable.
+
+**macOS admin-group exception.** A lookup directory may be group-writable on
+macOS when it is owned by the user, its group is `admin` (gid 80), it is not
+writable by others, and it has no allow ACL. This is the shape of a stock
+Homebrew `bin` and `Cellar` (`user:admin 775`). Root-owned directories that
+the admin group can write (`/Applications`, an MDM-managed Homebrew) stay
+refused, as does any other group, so the app-bundle command-line tools stay
+unsupported. The rule lives only in the executable lookup; every other trusted
+directory check (stores, locks, package roots) keeps the strict policy. The
+canonical target of a Homebrew link is not pinned, because the keg path crosses
+`Cellar`, which the group can write as well. Intel Homebrew (`/usr/local/bin`
+owned by the user, group `admin`) follows the same rule but is not verified:
+Intel Macs are outside the release scope.
+
+*Residual risk.* A process running as another admin account of the same Mac can
+rename or swap entries that the user or root owns in the user's Homebrew
+directories, and Pohunek then runs them as the user; no password is needed.
+Entries that account creates are owned by it and stay refused. On a Mac where
+the user is the only admin this adds no principal. A host with several admins
+removes the exposure with `chmod g-w` on the Homebrew directories (`bin`,
+`sbin`, `Cellar` and the others the prefix lists as group-writable): the strict
+rule then accepts them and Homebrew works as a single-user install.
+
+A refused configured
 executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
 untrusted chain directory, or the errno of the open or execute check) so a
 rejection is diagnosable. On macOS an ACL counts only when an allow entry
@@ -88,14 +112,17 @@ is kept only when it is trusted: symlinks are resolved, every component of the
 canonical path is owned by the user or root and not writable by others (the
 platform's trusted-ancestor rules), and the directory itself is not writable
 by group or others. `/tmp`, other sticky world-writable directories, anything
-below a writable ancestor, and group-writable directories (such as an
-admin-group Intel `/usr/local/bin`, which is out of scope) are refused,
-because another local account could plant an agent executable there. Each kept entry is recorded as its validated canonical path, so validation
+below a writable ancestor, and group-writable directories (except the macOS
+admin-group exception above) are refused, because another local account could
+plant an agent executable there. Each kept entry is recorded as its validated canonical path, so validation
 and recording cover the same directory and nothing can be retargeted after the
 check. The trade-off: a profile symlink that later points elsewhere (nix
 generations, a dotfile manager) keeps the recorded target until the path is
 recorded again with `pohunek service refresh-path`, which also restarts the
-daemon with it. An upgrade refused as at risk
+daemon with it. An install made before the admin-group exception keeps a
+recorded `PATH` without `/opt/homebrew/bin` until that command runs; Homebrew
+`git` then also shadows `/usr/bin/git` when it comes first, as in the user's
+shell. An upgrade refused as at risk
 points to it (see the
 [upgrade runbook](../runbooks/update-after-release.md#a-recorded-search-path-that-no-longer-matches-your-profile)). Empty, relative, `.`-style, duplicate, and
 missing entries are ignored; a `PATH` containing a control character is
