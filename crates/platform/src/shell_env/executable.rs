@@ -262,7 +262,7 @@ fn resolve_in_with_profile<'a>(
     for candidate in directories.map(|directory| directory.join(program)) {
         match inspect_executable_with_profile(&candidate, owners, profile) {
             Ok(found) => return Ok(found),
-            Err(refusal) if is_absent(&refusal) => {}
+            Err(refusal) if refusal.is_absent() => {}
             Err(refusal) => {
                 first_refusal.get_or_insert((candidate, refusal));
             }
@@ -275,18 +275,22 @@ fn resolve_in_with_profile<'a>(
     )
 }
 
-/// Whether a refusal only says the candidate does not exist or is no file at
-/// all (a directory named like the program), so it is not worth reporting.
-const fn is_absent(refusal: &Refusal) -> bool {
-    /// `ENOENT`: no such file or directory.
-    const NO_ENTRY: i32 = 2;
-    /// `ENOTDIR`: a path component is not a directory.
-    const NOT_A_DIRECTORY: i32 = 20;
+impl Refusal {
+    /// Whether the refusal only says the candidate does not exist or is no
+    /// file at all (a directory named like the program), so it is not worth
+    /// reporting as a refused candidate.
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        /// `ENOENT`: no such file or directory.
+        const NO_ENTRY: i32 = 2;
+        /// `ENOTDIR`: a path component is not a directory.
+        const NOT_A_DIRECTORY: i32 = 20;
 
-    matches!(
-        refusal,
-        Refusal::Unresolvable(NO_ENTRY | NOT_A_DIRECTORY) | Refusal::NotRegular
-    )
+        matches!(
+            self,
+            Self::Unresolvable(NO_ENTRY | NOT_A_DIRECTORY) | Self::NotRegular
+        )
+    }
 }
 
 /// Users whose files may be executed: the effective user and root.

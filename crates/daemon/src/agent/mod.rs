@@ -480,7 +480,7 @@ pub(crate) fn executable_refusal(program: &str) -> Option<String> {
         executable_search_path().as_deref(),
     ) {
         Err(error @ shell_env::ExecutableError::Refused { .. }) => Some(error.to_string()),
-        Err(shell_env::ExecutableError::NotExecutable(refusal)) => {
+        Err(shell_env::ExecutableError::NotExecutable(refusal)) if !refusal.is_absent() => {
             Some(format!("found {program} but not trusted: {refusal}"))
         }
         _ => None,

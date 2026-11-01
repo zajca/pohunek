@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use pohunek_platform::bounded_command::BoundedError;
 use pohunek_platform::shell_env::{
-    fallback_search_path, resolve_executable, resolve_executable_in_path_value, ExecutableError,
-    DARWIN_FALLBACK_DIRECTORIES,
+    fallback_search_path, resolve_executable, resolve_executable_in_path_value,
+    untrusted_candidate, ExecutableError, SearchPathError, DARWIN_FALLBACK_DIRECTORIES,
 };
 use serde::de::Deserializer;
 use serde::Deserialize;
@@ -352,13 +352,21 @@ fn resolve_program(
         Ok(found) => return Ok(found),
         Err(error) => refused_detail(&error),
     };
-    let search = fallback_search_path(fallback, home)
-        .map_err(|_unresolved| NetbirdError::CliMissing {
-            refused: path_refusal.clone(),
-        })?
-        .path;
+    let (search, dropped) = match fallback_search_path(fallback, home) {
+        Ok(sanitized) => (Some(sanitized.path), sanitized.untrusted),
+        Err(SearchPathError::AllUntrusted { untrusted }) => (None, untrusted),
+        Err(_unresolved) => (None, Vec::new()),
+    };
+    let dropped_detail = untrusted_candidate(program, &dropped);
+    let Some(search) = search else {
+        return Err(NetbirdError::CliMissing {
+            refused: path_refusal.or(dropped_detail),
+        });
+    };
     resolve_executable(program, &search).map_err(|error| NetbirdError::CliMissing {
-        refused: path_refusal.or_else(|| refused_detail(&error)),
+        refused: path_refusal
+            .or_else(|| refused_detail(&error))
+            .or(dropped_detail),
     })
 }
 

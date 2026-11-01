@@ -180,6 +180,22 @@ pub fn trusted_directory(entry: &Path) -> Result<PathBuf, TrustError> {
     Ok(canonical)
 }
 
+/// Names the first refused directory that holds `program`, as the detail of a
+/// candidate that exists but was dropped as untrusted.
+#[must_use]
+pub fn untrusted_candidate(program: &std::ffi::OsStr, dropped: &[DroppedEntry]) -> Option<String> {
+    dropped.iter().find_map(|entry| {
+        let candidate = Path::new(&entry.entry).join(program);
+        std::fs::symlink_metadata(&candidate).ok()?;
+        Some(format!(
+            "found {} but not trusted: directory {} is {}; see the environment resolution guide",
+            candidate.display(),
+            entry.entry,
+            entry.reason
+        ))
+    })
+}
+
 /// The reason a group- or other-writable directory is refused.
 ///
 /// macOS accepts the user's `admin`-group directories, so it names which write
@@ -194,7 +210,7 @@ fn write_refusal_reason(mode: u32, gid: u32) -> &'static str {
     if mode & WRITABLE_BY_OTHERS != 0 {
         "writable by others"
     } else if gid == DARWIN_ADMIN_GROUP {
-        "writable by the admin group (gid 80), trusted only in a directory the user owns"
+        "writable by the admin group (gid 80), trusted only in a directory a non-root user owns"
     } else {
         "writable by a group other than admin (gid 80)"
     }
