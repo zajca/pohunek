@@ -8378,12 +8378,17 @@ fn with_hook_stderr_tails(mut info: SessionInfo, tails: Vec<HookStderrTail>) -> 
 ///
 /// Trims surrounding whitespace, treats an all-whitespace name as unset
 /// (`None`), and rejects a name that exceeds [`MAX_SESSION_NAME_BYTES`] or
-/// carries control characters (which would corrupt a single-line table/row).
+/// carries a control, separator or format character (the label rule of
+/// [`pohunek_worker_protocol::is_hidden_or_separator`]), so a client is never
+/// shown a name that hides or reorders other text.
+///
+/// Only input is validated. A name already persisted under a weaker rule is
+/// loaded, listed and served unchanged, and a rename replaces it.
 ///
 /// # Errors
 ///
 /// Returns a `bad_request` [`ProtocolError`] when the trimmed name is too long
-/// or contains a control character.
+/// or contains a control, separator or format character.
 fn validate_session_name(name: Option<&str>) -> Result<Option<String>, ProtocolError> {
     let Some(name) = name else {
         return Ok(None);
@@ -8397,9 +8402,12 @@ fn validate_session_name(name: Option<&str>) -> Result<Option<String>, ProtocolE
             "session name exceeds {MAX_SESSION_NAME_BYTES} bytes"
         )));
     }
-    if trimmed.chars().any(char::is_control) {
+    if trimmed
+        .chars()
+        .any(pohunek_worker_protocol::is_hidden_or_separator)
+    {
         return Err(ProtocolError::bad_request(
-            "session name must not contain control characters",
+            "session name must not contain control, separator, or format characters",
         ));
     }
     Ok(Some(trimmed.to_owned()))

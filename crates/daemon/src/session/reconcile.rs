@@ -4763,6 +4763,10 @@ pub(super) fn import_worker_subagents(
 /// Maps journaled subagents to public state, admitting only the providers,
 /// claim fields and outcomes the session's hook schema lets report subagents.
 ///
+/// An agent type that fails the shared agent-type rule is dropped from the
+/// record while the subagent itself is kept, so a journal written under a
+/// weaker rule never makes the whole snapshot unimportable.
+///
 /// A schema that declares no subagent sequence rule admits no subagent record.
 fn map_worker_subagents(
     subagents: &[pohunek_worker_protocol::SubagentSnapshot],
@@ -4801,7 +4805,11 @@ fn map_worker_subagents(
                 id: subagent.id.clone(),
                 parent_id: subagent.parent_id.clone(),
                 provider,
-                agent_type: subagent.agent_type.clone(),
+                agent_type: subagent
+                    .agent_type
+                    .as_ref()
+                    .filter(|value| pohunek_worker_protocol::is_valid_agent_type(value))
+                    .cloned(),
                 lifecycle,
                 activity: (lifecycle == SubagentLifecycle::Running)
                     .then_some(AgentActivity::Working),
@@ -12148,6 +12156,43 @@ while os.getppid() == parent:
         assert_eq!(mapped[0].provider, RuntimeRef::claude());
         assert_eq!(mapped[0].activity, Some(AgentActivity::Working));
         assert_eq!(mapped[0].revision, protocol::SubagentRevision::new(7));
+    }
+
+    /// A journaled agent type that the label rule refuses is dropped on import
+    /// while the subagent is kept, so an older journal never makes the whole
+    /// snapshot unimportable.
+    #[test]
+    fn a_journaled_bidi_agent_type_is_dropped_and_its_subagent_kept() {
+        let mut snapshot = identity_snapshot("launch-native");
+        for (id, agent_type) in [
+            ("child-bidi", "Explore\u{202E}evil"),
+            ("child-ok", "Explore"),
+        ] {
+            snapshot.subagents.push(SubagentSnapshot {
+                id: id.to_owned(),
+                parent_id: None,
+                provider: "claude".to_owned(),
+                agent_type: Some(agent_type.to_owned()),
+                phase: SubagentPhase::Running,
+                revision: 1,
+                started_at_ms: 100,
+                updated_at_ms: 110,
+                finished_at_ms: None,
+            });
+        }
+
+        let mapped = import_worker_subagents(&snapshot).expect("valid subagent snapshot");
+
+        let agent_type = |id: &str| {
+            mapped
+                .iter()
+                .find(|subagent| subagent.id == id)
+                .expect("subagent imported")
+                .agent_type
+                .as_deref()
+        };
+        assert_eq!(agent_type("child-bidi"), None);
+        assert_eq!(agent_type("child-ok"), Some("Explore"));
     }
 
     /// Installs a package whose descriptor names only `[integration] handler`

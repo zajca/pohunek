@@ -4845,6 +4845,111 @@ async fn rename_rejects_overlong_and_control_character_names() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
+/// A name holding a separator or format character (a bidi override, a line
+/// separator, a zero-width space) is refused on create and rename like a
+/// control character, so a client is never shown text that reorders other text.
+#[tokio::test]
+async fn session_names_with_format_or_separator_characters_are_refused() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    for hostile in ["safe\u{202E}evil", "two\u{2028}lines", "zero\u{200B}width"] {
+        let renamed = registry
+            .rename(&created.id, Some(hostile.to_owned()))
+            .await
+            .expect_err("a format or separator character must fail");
+        assert_eq!(renamed.code, "bad_request", "{hostile:?}");
+        let new = registry
+            .create(SessionNewParams {
+                name: Some(hostile.to_owned()),
+                ..params()
+            })
+            .await
+            .expect_err("create must refuse the same name");
+        assert_eq!(new.code, "bad_request", "{hostile:?}");
+    }
+    assert_eq!(
+        registry.inspect(&created.id).await.expect("inspect").name,
+        None
+    );
+
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// A name persisted under the weaker control-only rule still loads from the
+/// store and is served unchanged; a rename (or a clear) replaces it, and only
+/// the new input is validated.
+#[tokio::test]
+async fn a_persisted_name_the_rule_refuses_loads_and_can_be_renamed() {
+    const LEGACY: &str = "safe\u{202E}evil";
+    let store_path = temp_store_path("legacy-session-name");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let store = crate::store::Store::new(store_path);
+    let mut record = store
+        .load_session(&created.id.0)
+        .expect("read the durable record")
+        .expect("the session has a durable record");
+    record.info.name = Some(LEGACY.to_owned());
+    store
+        .record_session(&record)
+        .expect("write the legacy name");
+    let loaded = store
+        .load_session(&created.id.0)
+        .expect("a legacy name never makes the store unreadable")
+        .expect("the record is still there");
+    assert_eq!(loaded.info.name.as_deref(), Some(LEGACY));
+
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("registered session")
+        .info
+        .name = Some(LEGACY.to_owned());
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .name
+            .as_deref(),
+        Some(LEGACY)
+    );
+    assert_eq!(
+        registry
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.id == created.id)
+            .and_then(|info| info.name)
+            .as_deref(),
+        Some(LEGACY)
+    );
+
+    registry
+        .rename(&created.id, Some(LEGACY.to_owned()))
+        .await
+        .expect_err("the refused name is not accepted as new input");
+    let renamed = registry
+        .rename(&created.id, Some("clean name".to_owned()))
+        .await
+        .expect("a rename replaces the refused name");
+    assert_eq!(renamed.session.name.as_deref(), Some("clean name"));
+
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
 #[tokio::test]
 async fn invalid_metadata_rejected_for_create_or_set_and_set_leaves_session_unchanged() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
