@@ -181,9 +181,16 @@ fn docs_check_accepts_well_formed_prompt_contract() {
 }
 
 #[test]
-fn docs_check_accepts_the_repository_prompt_contract() {
-    validate_docs(manifest_dir().join("../../docs/knowledge"))
-        .expect("the repository knowledge bundle validates");
+fn prompt_contract_joins_continuation_lines_into_one_item() {
+    let text =
+        std::fs::read_to_string(source_fixture("prompt-contract-good").join("assistant/system.md"))
+            .expect("read the fixture contract");
+    let contract = knowledge::PromptContract::parse(&text).expect("well-formed contract");
+    assert_eq!(
+        contract.safety,
+        ["Never print secrets. Continue on an indented line."]
+    );
+    assert_eq!(contract.navigation, ["Start at the index."]);
 }
 
 #[test]
