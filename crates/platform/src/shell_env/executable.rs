@@ -23,12 +23,14 @@ const DARWIN_ADMIN_GROUP: u32 = 80;
 
 /// The group whose write access to a user-owned lookup directory is accepted.
 ///
-/// Only macOS names one, and never for root: a root process that trusted a
+/// Only macOS names one, and never for a process whose effective or real user
+/// is root (a child could regain root through its real uid): a root process that trusted a
 /// group-writable directory would let any admin plant a binary that root runs.
 /// On other platforms, and for root, a group-writable directory stays untrusted.
 pub(super) fn lookup_admin_group() -> Option<u32> {
-    (cfg!(target_os = "macos") && rustix::process::geteuid().as_raw() != 0)
-        .then_some(DARWIN_ADMIN_GROUP)
+    let root_involved =
+        rustix::process::geteuid().as_raw() == 0 || rustix::process::getuid().as_raw() == 0;
+    (cfg!(target_os = "macos") && !root_involved).then_some(DARWIN_ADMIN_GROUP)
 }
 
 #[derive(Clone, Copy)]
@@ -323,8 +325,9 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
 /// others can write (a sticky `/tmp`) may hold a chain entry only when that
 /// entry is owned by `owners` too: sticky protects an entry from everyone but
 /// its owner, so an entry another account created there is the attack itself.
-/// A directory whose group write is accepted (the macOS admin exception) holds
-/// a chain entry only when that entry is owned by `owners` as well.
+/// A directory whose group write is accepted (the macOS admin exception, never
+/// for a root process) holds a chain entry only when that entry is owned by
+/// `owners` as well.
 fn lookup_chain_is_owner_controlled(
     path: &Path,
     owners: Owners,

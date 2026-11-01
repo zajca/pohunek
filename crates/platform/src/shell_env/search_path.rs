@@ -136,7 +136,7 @@ pub enum TrustError {
 /// must not be writable by group or others, which also refuses sticky
 /// world-writable directories such as `/tmp`.
 ///
-/// On macOS, a directory owned by the effective user may be writable by the
+/// On macOS, for a process that is not root, a directory owned by the effective user may be writable by the
 /// `admin` group (gid 80), the shape of a stock Homebrew `bin`. Its members are
 /// inside the owner's executable trust boundary (see `environment-resolution`),
 /// so the group write is accepted there; a root-owned directory, another group,

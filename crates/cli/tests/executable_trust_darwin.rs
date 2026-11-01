@@ -159,6 +159,10 @@ fn assert_resolved(fixture: &Fixture, path: &str) {
         records.iter().any(|record| record["name"] == "alpha"),
         "the fake's peer is listed: {records:?}"
     );
+    assert!(
+        fixture.fake.invocations() >= 1,
+        "the fake served the listing"
+    );
     let detail = fixture.doctor_cli_detail(path);
     assert!(
         !detail.contains("not installed or not trusted"),
