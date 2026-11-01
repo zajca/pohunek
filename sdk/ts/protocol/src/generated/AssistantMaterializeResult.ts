@@ -11,7 +11,7 @@ export type AssistantMaterializeResult = {
    */
   bundle_path: string;
   /**
-   * Host-local path to the persisted redacted snapshot.
+   * Host-local path to the persisted launch-metadata snapshot.
    */
   snapshot_path: string;
   /**

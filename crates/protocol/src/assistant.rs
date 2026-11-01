@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
     ts(export, export_to = "AssistantMaterializeParams.ts")
 )]
 pub struct AssistantMaterializeParams {
-    /// Redacted live snapshot JSON to persist beside the materialized bundle.
+    /// Launch-metadata snapshot JSON to persist beside the materialized bundle.
     pub snapshot: String,
 }
 
@@ -24,7 +24,7 @@ pub struct AssistantMaterializeParams {
 pub struct AssistantMaterializeResult {
     /// Host-local path to the materialized assistant knowledge bundle.
     pub bundle_path: String,
-    /// Host-local path to the persisted redacted snapshot.
+    /// Host-local path to the persisted launch-metadata snapshot.
     pub snapshot_path: String,
     /// Pohunek version that produced the embedded bundle.
     pub version: String,

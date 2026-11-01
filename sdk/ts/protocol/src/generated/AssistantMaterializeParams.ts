@@ -5,7 +5,7 @@
  */
 export type AssistantMaterializeParams = {
   /**
-   * Redacted live snapshot JSON to persist beside the materialized bundle.
+   * Launch-metadata snapshot JSON to persist beside the materialized bundle.
    */
   snapshot: string;
 };
