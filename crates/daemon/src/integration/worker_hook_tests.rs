@@ -2030,8 +2030,9 @@ mod subagent_sequences {
         let root = crate::test_support::scoped_dir("ph-hook-marker-");
         let (mut hook, held) =
             hook_with_blocked_interpreter(&root, "killed", &super::hook_trace_path(&root));
-        pohunek_test_support::wait::wait_until("the start marker", || async {
-            (!start_markers(&root).is_empty()).then_some(())
+        // The stand-in runs once the shell is done with the marker.
+        pohunek_test_support::wait::wait_until("the interpreter stand-in", || async {
+            root.join("killed.started").exists().then_some(())
         })
         .await;
         kill_hook_group(&mut hook).await;
@@ -2104,7 +2105,8 @@ mod subagent_sequences {
     }
 
     /// Names planted beside the trace, a FIFO and symlinks (one to a device,
-    /// one dangling), neither block the hook nor receive the marker.
+    /// one dangling), neither block the hook nor receive anything: the marker
+    /// is a new file under a name the shell does not choose.
     #[tokio::test(flavor = "multi_thread")]
     async fn names_planted_beside_the_trace_do_not_receive_the_start_marker() {
         let root = crate::test_support::scoped_dir("ph-hook-marker-planted-");
@@ -2250,7 +2252,7 @@ mod subagent_sequences {
             concat!(
                 "set -m; ",
                 "/bin/sh -c '/bin/sh {asset} session; true' < '{gate}' & hook=$!; ",
-                "while [ ! -e '{trace}' ]; do sleep 0.02; done; ",
+                "until grep -q hook_started '{trace}' 2>/dev/null; do sleep 0.02; done; ",
                 "kill -9 -- -$hook; : > '{killed}'; ",
                 "{wait_first}{first}; : > '{first_done}'; ",
                 "{wait_second}{second}; : > '{second_done}'; ",
