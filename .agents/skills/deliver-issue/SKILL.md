@@ -247,7 +247,9 @@ window also needs one green `tier=main` dispatch at the final head, started
 after PR CI and the marker are green (`gh workflow run ci.yml --ref <branch>
 -f tier=main`). A fork head is never dispatched in this repository: the
 maintainer re-creates the change on its own branch and dispatches that, or
-relies on the post-merge `main` run (Fork heads in
+relies on a later run on `main` (the post-merge run for the main tier; the
+scheduled nightly run or a `tier=nightly` dispatch for the release rehearsal
+and the other nightly-only jobs; Fork heads in
 `.agents/instructions/verification.md`).
 
 If the operator asked for **merge on green CI** in the invocation, merge as

@@ -275,13 +275,40 @@ sources, which the filter leaves out, surfaces in the nightly tier. Ordinary
 worker, PTY, hook, daemon, and CLI changes need no dispatch: pull-request CI
 already runs the macOS lanes.
 
+**Fail fast.** When a required job of a pull request run or a
+`workflow_dispatch` run of `ci.yml` fails, its last step (`Cancel the run (fail
+fast)`, the composite `.github/actions/cancel-run`) cancels the run, so the jobs
+that are still running free their runners for other work. The five jobs that
+call a reusable workflow have a `cancel-after-<job>` job instead, which cancels
+when the called workflow ends red. Push runs (`main` drains), scheduled runs,
+the advisory `cargo-audit` job and a job that was itself cancelled never
+trigger it. Read such a run accordingly: the job that failed and the run end as
+`cancelled`, while the failed step stays red in the job log and the step's
+`::error` annotation (`Fail fast`) names the job that failed first. So a
+cancelled job in a pull request run can mean that another job failed first.
+The `test selection verdict` check still runs after the cancel and is red when
+a job it waits for failed or was cancelled; for a job that decides the pull
+request outside the verdict, look for the `Fail fast` annotation. A job that
+hits its `timeout-minutes` is cancelled by GitHub and does not trigger the
+step (a called workflow's watcher fires only when the call ends as failed, which
+a timeout inside it does not guarantee), and the two selector jobs (`test selection`, `runtime package selection`)
+do not carry it, because a failed selection runs everything instead of
+ending the run. A fork or Dependabot pull request has a read-only token, so the
+cancel call is refused and the run keeps its real failure.
+
 **Fork heads.** This applies to every dispatch, rerun and `head_ref` rule in
 this repository's agent instructions. A fork head is never dispatched, never run
 through a ref such as `refs/pull/<N>/head`, and its jobs are never rerun by an
 agent. For an outside pull request the maintainer reviews the full diff,
 workflow files included, then re-creates the change on a maintainer branch and
-dispatches that branch, or relies on the post-merge `main` run before any
-release. Fork-provided workflow YAML runs only in the approved, read-only
+dispatches that branch (`tier=nightly` for the release rehearsal and the other
+nightly-only jobs, `tier=main` for the rest), or relies on a later run on
+`main`. The post-merge `main` run is the main tier and includes `cargo-udeps`;
+the release rehearsal, the release gate, `test selection audit (G3)` and
+`tests (relay DB, PostgreSQL)` get their evidence only from the scheduled
+nightly run or a `tier=nightly` dispatch of `main` or of a maintainer branch.
+`scripts/release` requires that evidence on the release commit and, when it
+pushes the candidate, dispatches the missing tier itself. Fork-provided workflow YAML runs only in the approved, read-only
 `pull_request` run.
 
 The automatic red-main issue reporter remains pending under #477 S3. The S4

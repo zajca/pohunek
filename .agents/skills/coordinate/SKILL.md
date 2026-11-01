@@ -102,8 +102,10 @@ PR. Move anything else to the next milestone with a one-line reason.
   `zajca` names that head with `high=0` and `medium=0`, and the tier=main dispatch is green where the dispatch rules require
   one (release workflows, packaging, SDK, dependencies, protocol window). A
   fork head is never dispatched; the maintainer re-creates the change on its
-  own branch and dispatches that, or relies on the post-merge `main` run
-  (Fork heads in `.agents/instructions/verification.md`).
+  own branch and dispatches that, or relies on a later run on `main` (the
+  post-merge run for the main tier; the scheduled nightly run or a
+  `tier=nightly` dispatch for the release rehearsal and the other nightly-only
+  jobs; Fork heads in `.agents/instructions/verification.md`).
 - **Semantic check:** if `main` moved since the PR's CI base, `cargo check
   --workspace --all-targets --all-features` plus fmt on the PR merged with
   `main` before merging.

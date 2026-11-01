@@ -148,8 +148,35 @@ passed, and a failing, cancelled or still pending check does not.
   or through `pull_request_target` or `workflow_run`, or rerun by an agent in
   this repository. The maintainer reviews the full diff, workflow files
   included, then re-creates the change on a maintainer branch and runs the
-  release evidence there, or relies on the post-merge `main` run before any
-  release.
+  release evidence there (a `tier=nightly` dispatch for the release rehearsal),
+  or relies on a later run on `main`: the post-merge `main` run is the main
+  tier, while the release rehearsal, the release gate and the other
+  nightly-only jobs (`test selection audit (G3)`, `tests (relay DB,
+  PostgreSQL)`) get their evidence only from the scheduled nightly run or a
+  `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
+  `scripts/release` requires that evidence on the release commit and, when it
+  pushes the candidate, dispatches the missing tier itself.
+
+**Fail fast.** When a required job of a pull request run or a
+`workflow_dispatch` run of `ci.yml` fails, its last step (`Cancel the run (fail
+fast)`, the composite `.github/actions/cancel-run`) cancels the run, so the jobs
+that are still running free their runners for other work. The five jobs that
+call a reusable workflow have a `cancel-after-<job>` job instead, which cancels
+when the called workflow ends red. Push runs (`main` drains), scheduled runs,
+the advisory `cargo-audit` job and a job that was itself cancelled never
+trigger it. Read such a run accordingly: the job that failed and the run end as
+`cancelled`, while the failed step stays red in the job log and the step's
+`::error` annotation (`Fail fast`) names the job that failed first. So a
+cancelled job in a pull request run can mean that another job failed first.
+The `test selection verdict` check still runs after the cancel and is red when
+a job it waits for failed or was cancelled; for a job that decides the pull
+request outside the verdict, look for the `Fail fast` annotation. A job that
+hits its `timeout-minutes` is cancelled by GitHub and does not trigger the
+step (a called workflow's watcher fires only when the call ends as failed, which
+a timeout inside it does not guarantee), and the two selector jobs (`test selection`, `runtime package selection`)
+do not carry it, because a failed selection runs everything instead of
+ending the run. A fork or Dependabot pull request has a read-only token, so the
+cancel call is refused and the run keeps its real failure.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

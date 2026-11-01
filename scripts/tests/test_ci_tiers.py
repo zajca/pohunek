@@ -246,6 +246,13 @@ def block(text: str, name: str, indent: int = 2) -> str:
     return match.group(1)
 
 
+# The step that ends a PR or dispatch run when a required job fails (#1075).
+FAIL_FAST_STEP = "Cancel the run (fail fast)"
+FAIL_FAST_CONDITION = (
+    "failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')"
+)
+
+
 def workflow_jobs(workflow: str = CI) -> dict[str, str]:
     jobs_text = workflow.split("jobs:\n", 1)[1]
     matches = list(re.finditer(r"(?m)^  ([a-z][a-z0-9-]*):\n", jobs_text))
@@ -1246,6 +1253,35 @@ class HermesTestInterpreterActionTests(unittest.TestCase):
         self.assertIn(".github/actions/hermes-test-python/**", MACOS_PATH_OWNERSHIP["platform-contracts"]["pr"])
 
 
+class OutsidePullRequestEvidenceWordingTests(unittest.TestCase):
+    """Every instruction that sends a maintainer to a later `main` run names the run that produces the evidence."""
+
+    FILES = (
+        "docs/development.md",
+        ".agents/instructions/verification.md",
+        ".agents/skills/contribute/SKILL.md",
+        ".agents/skills/deliver-issue/SKILL.md",
+        ".agents/skills/coordinate/SKILL.md",
+        ".github/agent-workflow.json",
+    )
+
+    def test_no_place_relies_on_the_post_merge_main_run_for_the_rehearsal(self):
+        for name in self.FILES:
+            with self.subTest(file=name):
+                text = " ".join((ROOT / name).read_text().split())
+                self.assertNotRegex(text, r"relies on the post-merge .?main.? run")
+                self.assertIn("later run on", text)
+                self.assertIn("tier=nightly", text)
+                self.assertRegex(text, r"(?i)nightly-only jobs|nightly-only")
+
+    def test_the_fork_head_rule_stays(self):
+        for name in ("docs/development.md", ".agents/instructions/verification.md", ".github/agent-workflow.json"):
+            with self.subTest(file=name):
+                text = " ".join((ROOT / name).read_text().split())
+                self.assertIn("refs/pull/<N>/head", text)
+                self.assertRegex(text, r"(?i)never dispatched|never run through|is never dispatched")
+
+
 class SetupUvActionTests(unittest.TestCase):
     """uv is installed from one pinned, checksummed composite, never from a version manifest."""
 
@@ -1295,6 +1331,130 @@ class SetupUvActionTests(unittest.TestCase):
     def test_the_composite_is_in_the_lane_filter(self):
         self.assertIn(".github/actions/setup-uv/**", filter_paths("macos"))
         self.assertIn(".github/actions/setup-uv/**", MACOS_PATH_OWNERSHIP["platform-contracts"]["pr"])
+
+
+class FailFastTests(unittest.TestCase):
+    """A required job that fails cancels the rest of a PR or dispatch run, and nothing else does (#1075)."""
+
+    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run.
+    EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection"}
+    REUSABLE = {
+        "upgrade-test",
+        "release-rehearsal-build",
+        "release-rehearsal-scenarios",
+        "release-rehearsal",
+        "release-gate",
+    }
+
+    @staticmethod
+    def permissions(job: str) -> dict[str, str]:
+        match = re.search(r"(?m)^    permissions:\n((?:      \S.*\n)+)", job)
+        if match is None:
+            return {}
+        return dict(re.findall(r"(?m)^      ([a-z-]+): (\S+)$", match.group(1)))
+
+    def direct_jobs(self) -> dict[str, str]:
+        return {
+            name: job
+            for name, job in workflow_jobs().items()
+            if "\n    steps:\n" in job and name not in self.EXCLUDED and not name.startswith("cancel-after-")
+        }
+
+    def test_no_workflow_level_actions_write_exists(self):
+        header = CI.split("\njobs:\n", 1)[0]
+        self.assertNotIn("actions:", header.split("permissions:", 1)[1].split("\n\n", 1)[0])
+
+    def test_every_required_job_ends_with_the_step_and_its_exact_condition(self):
+        direct = self.direct_jobs()
+        self.assertGreater(len(direct), 30)
+        for name, job in direct.items():
+            with self.subTest(job=name):
+                steps = list(job_steps(job).items())
+                last_name, last = steps[-1]
+                self.assertEqual(last_name, FAIL_FAST_STEP)
+                self.assertEqual([n for n, _ in steps].count(FAIL_FAST_STEP), 1)
+                self.assertIn(f"        if: {FAIL_FAST_CONDITION}\n", last)
+                self.assertEqual(self.permissions(job).get("actions"), "write")
+                self.assertNotRegex(job, r"(?m)^    continue-on-error:")
+
+    def test_a_job_with_a_sparse_or_relocated_tree_cancels_inline_and_the_others_use_the_action(self):
+        # A sparse or relocated checkout holds no .github/actions at its root, so such a job cannot use the local action.
+        sparse_capable = set()
+        for name, job in self.direct_jobs().items():
+            if re.search(r"(?m)^ +sparse-checkout:|^ +path: relocated$", job):
+                sparse_capable.add(name)
+        self.assertGreaterEqual(sparse_capable, {"fast-tests", "integration", "integration-relay", "test-selection-check", "test-duplicates"})
+        for name, job in self.direct_jobs().items():
+            last = list(job_steps(job).values())[-1]
+            with self.subTest(job=name):
+                if name in sparse_capable:
+                    self.assertNotIn(".github/actions/cancel-run", last)
+                    self.assertIn("        continue-on-error: true\n", last)
+                    self.assertIn('gh run cancel "$RUN_ID" --repo "$REPOSITORY"', last)
+                    self.assertIn("::error title=Fail fast::", last)
+                else:
+                    self.assertRegex(last, r"(?m)^        uses: \./\.github/actions/cancel-run$")
+                    self.assertNotIn("relocated", last)
+
+    def test_every_checkout_of_a_job_with_actions_write_drops_the_persisted_token(self):
+        # The token stays out of git config, so later build scripts and tests cannot read it from there.
+        for name, job in workflow_jobs().items():
+            if self.permissions(job).get("actions") != "write":
+                continue
+            with self.subTest(job=name):
+                checkouts = len(re.findall(r"uses: actions/checkout@", job))
+                self.assertEqual(checkouts, len(re.findall(r"(?m)^          persist-credentials: false$", job)))
+
+    def test_the_advisory_audit_the_verdict_and_the_fail_open_selectors_do_not_carry_the_step_or_the_scope(self):
+        jobs = workflow_jobs()
+        for name in self.EXCLUDED:
+            with self.subTest(job=name):
+                self.assertNotIn(FAIL_FAST_STEP, jobs[name])
+                self.assertNotIn("actions", self.permissions(jobs[name]))
+
+    def test_actions_write_is_granted_only_to_jobs_that_carry_the_step_or_watch_a_called_workflow(self):
+        direct = set(self.direct_jobs())
+        watchers = {f"cancel-after-{name}" for name in self.REUSABLE}
+        for name, job in workflow_jobs().items():
+            with self.subTest(job=name):
+                self.assertEqual("actions" in self.permissions(job), name in direct | watchers)
+
+    def test_each_called_workflow_has_a_watcher_that_fires_only_on_its_failure(self):
+        jobs = workflow_jobs()
+        called = {name for name, job in jobs.items() if re.search(r"(?m)^    uses: \./\.github/workflows/", job)}
+        self.assertEqual(called, self.REUSABLE)
+        for name in self.REUSABLE:
+            with self.subTest(call=name):
+                watcher = jobs[f"cancel-after-{name}"]
+                self.assertIn(f"    needs: {name}\n", watcher)
+                self.assertIn(
+                    f"    if: ${{{{ !cancelled() && needs.{name}.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}}}\n",
+                    watcher,
+                )
+                self.assertEqual(self.permissions(watcher), {"actions": "write"})
+                (step,) = job_steps(watcher).values()
+                self.assertIn("        continue-on-error: true\n", step)
+                self.assertIn('gh run cancel "$RUN_ID"', step)
+
+    def test_the_condition_never_becomes_always_cancelled_or_push_and_schedule_safe(self):
+        for word in ("always()", "cancelled()", "push", "schedule"):
+            self.assertNotIn(word, FAIL_FAST_CONDITION)
+        for name, job in workflow_jobs().items():
+            if FAIL_FAST_STEP in job:
+                step = job_steps(job)[FAIL_FAST_STEP]
+                self.assertNotIn("always()", step, name)
+        for name in self.REUSABLE:
+            watcher = workflow_jobs()[f"cancel-after-{name}"]
+            self.assertNotIn("always()", watcher)
+            self.assertIn("!cancelled()", watcher)
+
+    def test_the_composite_cancels_the_run_and_fails_soft(self):
+        action = (ROOT / ".github" / "actions" / "cancel-run" / "action.yml").read_text()
+        self.assertIn("      continue-on-error: true\n", action)
+        self.assertIn('gh run cancel "$RUN_ID"', action)
+        self.assertIn("::error title=Fail fast::", action)
+        self.assertIn("RUN_ID: ${{ github.run_id }}", action)
+        self.assertEqual(action.count("- name:"), 1)
 
 
 class RuntimePackageSelectionTests(unittest.TestCase):
@@ -1687,7 +1847,7 @@ class SelectorRun:
     def run(self) -> str:
         selector = workflow_jobs()[PACKAGE_SELECTOR]
         steps = job_steps(selector)
-        names = list(steps)
+        names = [name for name in steps if name != FAIL_FAST_STEP]
         if tuple(names[-len(SELECTOR_STEPS):]) != SELECTOR_STEPS:
             raise AssertionError(f"selector steps changed: {names}")
         for name in SELECTOR_STEPS:
