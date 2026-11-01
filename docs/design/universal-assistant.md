@@ -21,7 +21,10 @@ Not shipped, and not planned: collecting live state (doctor output, host
 capabilities, project and session state, config scan) into the snapshot,
 redacting it, and quarantining proposed hooks in non-interactive contexts. The
 owner dropped these promises on 2026-10-26 (issue #1296). A later issue may
-propose a live snapshot with evidence of need. `docs/knowledge/assistant/system.md`
+propose a live snapshot with evidence of need. Likewise the `since`,
+`changed_in` and `deprecated` frontmatter is not used by the shipped navigation
+(no page sets `changed_in` or `deprecated`, and the table of contents prints
+none of them). `docs/knowledge/assistant/system.md`
 and the status table of the [implementation plan](universal-assistant-plan.md)
 hold what is implemented.
 
@@ -160,8 +163,10 @@ With no `--intent` and no positional request, the default intent is `help`: the
 prompt offers the root `index.md` without an aggressive filter, so the assistant
 orients rather than assuming a setup task.
 
-`--no-snapshot` skips snapshot collection: the snapshot file then records only
-that collection was skipped. The prompt no longer carries bulk knowledge, so it
+`--no-snapshot` marks the launch snapshot as not collected
+(`snapshot_collected=false` and a warning). The file still holds the same launch
+metadata, including the request verbatim, so the flag is not a privacy control.
+The prompt no longer carries bulk knowledge, so it
 cannot overflow from snapshot data.
 
 `--degraded` is the only sanctioned way to launch without a readable knowledge
@@ -384,7 +389,9 @@ Recommended fields:
   URLs supporting important claims.
 
 `since` / `changed_in` / `deprecated` exist because the assistant must never give
-version-inaccurate advice. The materialized bundle matches the binary that
+version-inaccurate advice. (Target design: the shipped navigation does not use
+them, because no page sets `changed_in` or `deprecated` and the table of
+contents prints none of them; see Implementation Status.) The materialized bundle matches the binary that
 launched it, but the source tree the agent can also read (via the source map) may
 be a different version; these fields let the agent reason about that skew.
 
@@ -837,9 +844,11 @@ user wants project-level configuration.
 ### Update
 
 The assistant helps reconcile installed setup assets, host config, project
-definitions, and docs after a source or binary update. The bundle's `changed_in`
-and `deprecated` frontmatter is the primary signal for what changed between
-versions.
+definitions, and docs after a source or binary update. As shipped, it compares
+the bundle version in the launch snapshot with the installed binary's version
+and checks behavior against that binary. The target design also used the
+bundle's `changed_in` and `deprecated` frontmatter as the signal for what
+changed between versions; no page sets them yet.
 
 It must avoid clobbering edited files. It should show diffs or explain file
 changes before applying them.
