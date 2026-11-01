@@ -85,6 +85,7 @@ mod input;
 mod journal_gc;
 mod lag;
 mod launch_input;
+use launch_input::LaunchSubject;
 mod native_attestation;
 mod native_repair;
 mod observation;
@@ -312,7 +313,7 @@ const MAX_SESSION_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 /// human label (it renders in a single client row and one CLI table cell) while
 /// bounding the per-session state the daemon stores and persists in the resume
 /// binding. A name is cosmetic, so the limit can change freely.
-const MAX_SESSION_NAME_BYTES: usize = 128;
+pub(crate) const MAX_SESSION_NAME_BYTES: usize = 128;
 
 /// Shell command configuration used for the shell runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4253,6 +4254,7 @@ impl SessionRegistry {
             .profile
             .as_ref()
             .and_then(|profile| profile.manifest.clone());
+        let name = validate_session_name(params.name.as_deref())?;
         let inputs = self.launch_inputs(
             &resolved.definition,
             resolved
@@ -4261,8 +4263,11 @@ impl SessionRegistry {
                 .map_or(&[][..], |profile| profile.env.as_slice()),
             base.clone(),
             id,
-            LaunchKind::Create,
-            &snapshot.args,
+            LaunchSubject {
+                kind: LaunchKind::Create,
+                frozen_args: &snapshot.args,
+                name: name.as_deref(),
+            },
         )?;
         // A slot never replaces a variable an earlier layer (descriptor,
         // `TMPDIR`, profile, contributor, handshake) already set.
@@ -4294,7 +4299,7 @@ impl SessionRegistry {
         let spec = PtySessionSpec {
             id: id.clone(),
             registration: target::PtyRegistration::Create,
-            name: validate_session_name(params.name.as_deref())?,
+            name,
             agent: resolved.name.clone(),
             agent_base: base,
             input_rules,

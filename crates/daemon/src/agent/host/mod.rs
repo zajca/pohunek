@@ -18,6 +18,7 @@ pub(crate) mod fixture;
 mod handle;
 mod launch;
 mod launch_env;
+mod naming;
 mod package;
 mod registry;
 mod source;
@@ -49,6 +50,7 @@ pub use launch_env::{
     DescriptorLaunchEnv, GLUED_ENDINGS, LAUNCH_ENV_VALUES, LOCATION_WORDS, MAX_LAUNCH_ENV_ENTRIES,
     REFUSED_NAMESPACES, SECRET_WORDS,
 };
+pub use naming::{NamingLaunchArgs, MAX_NAMING_TOKENS, SESSION_NAME_PLACEHOLDER};
 pub(crate) use package::may_serve_reserved;
 pub use package::{
     definition_from_archive, descriptor_from_archive, PackageLoad, PackageRejection, PackageSource,

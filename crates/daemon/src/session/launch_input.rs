@@ -8,8 +8,9 @@
 // Rust guideline compliant 2026-10-27
 
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
+use tracing::warn;
 
-use super::SessionRegistry;
+use super::{validate_session_name, SessionRegistry};
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::LaunchEnv;
 use crate::integration::launch_input::{
@@ -17,13 +18,26 @@ use crate::integration::launch_input::{
 };
 use crate::runtime::environment::effective_variable;
 
+/// What a launch of one session runs: its kind, the arguments it would
+/// otherwise run with and the session name it uses.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LaunchSubject<'a> {
+    /// Create, resume or fork.
+    pub(super) kind: LaunchKind,
+    /// The arguments the launch would otherwise run with; they are only read.
+    pub(super) frozen_args: &'a [String],
+    /// The session name this launch uses, if any.
+    pub(super) name: Option<&'a str>,
+}
+
 /// The environment and root-position arguments of one launch.
 #[derive(Debug)]
 pub(super) struct LaunchInputs {
     /// The full launch environment, contribution included.
     pub(super) env: LaunchEnv,
     /// Arguments that follow the frozen arguments and precede the native
-    /// session arguments; empty for a runtime without a contributor.
+    /// session arguments: the contributor's, then the runtime's `[naming]`
+    /// arguments; empty for a runtime with neither.
     pub(super) root_args: Vec<String>,
 }
 
@@ -31,8 +45,11 @@ impl SessionRegistry {
     /// Composes the environment and root arguments of a launch of `id`.
     ///
     /// A runtime whose handler has no contributor gets exactly
-    /// [`Self::launch_env`] and no arguments. `frozen_args` are the arguments
-    /// the launch would otherwise run with; they are only read.
+    /// [`Self::launch_env`] and no contributor arguments. `frozen_args` are
+    /// the arguments the launch would otherwise run with; they are only read.
+    /// A runtime that declares `[naming] launch_args` gets them after the
+    /// contributor's arguments, and none while the subject's name is absent
+    /// or fails the session-name rule.
     ///
     /// # Errors
     ///
@@ -48,24 +65,31 @@ impl SessionRegistry {
         profile_env: &[(String, String)],
         agent: RuntimeRef,
         id: &SessionId,
-        kind: LaunchKind,
-        frozen_args: &[String],
+        subject: LaunchSubject<'_>,
     ) -> Result<LaunchInputs, ProtocolError> {
+        let LaunchSubject {
+            kind,
+            frozen_args,
+            name,
+        } = subject;
         let base = self.launch_env(definition, profile_env, agent.clone(), id);
+        let naming_args = naming_args(definition, name, id);
         let Some(contribution) = self.contribution(definition, &base, id, kind, frozen_args)?
         else {
             return Ok(LaunchInputs {
                 env: base,
-                root_args: Vec::new(),
+                root_args: naming_args,
             });
         };
         let Some(state_root) = self.inner.config.worker_state_root.as_deref() else {
             return Err(unavailable_state_root());
         };
         let placed = place(&contribution, state_root, id)?;
+        let mut root_args = placed.root_args;
+        root_args.extend(naming_args);
         Ok(LaunchInputs {
             env: self.launch_env_with(definition, profile_env, &placed.env, agent, id),
-            root_args: placed.root_args,
+            root_args,
         })
     }
 
@@ -139,6 +163,28 @@ impl SessionRegistry {
                 private_dir: &state_root.join(&id.0),
             })
             .map(Some)
+    }
+}
+
+/// The `[naming]` arguments of a launch of `id` under `name`.
+///
+/// A stored name that no longer passes the session-name rule omits the group:
+/// a record written before the rule existed must still launch.
+fn naming_args(definition: &RuntimeDefinition, name: Option<&str>, id: &SessionId) -> Vec<String> {
+    let Some(name) = name else {
+        return Vec::new();
+    };
+    match validate_session_name(Some(name)) {
+        Ok(Some(name)) => definition.naming_args(&name),
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            warn!(
+                session_id = %id.0,
+                error = %error.msg,
+                "the session name is not valid for the agent's naming arguments; launching without them"
+            );
+            Vec::new()
+        }
     }
 }
 

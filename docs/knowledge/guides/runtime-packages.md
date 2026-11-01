@@ -112,6 +112,7 @@ The features this core implements:
 | `package-commands-v1` | 0.38.0 | `[commands.<name>]` |
 | `input-refuse-while-blocked-v1` | 0.39.0 | `[input] refuse_while_blocked` |
 | `transcripts-head-paths-v1` | 0.39.0 | `[transcripts] id_path`, `cwd_path` |
+| `naming-launch-args-v1` | 0.39.0 | `[naming]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -186,6 +187,42 @@ vocabulary) are
 refused at install (`descriptor_invalid`). A host profile's `[env]` entry of the same name overrides a declared
 pair on a launch. A program the user starts by hand inside a shell session
 gets no descriptor environment, so it keeps its own defaults.
+
+## Session name arguments
+
+A runtime whose agent takes a session name on its command line hands it the
+pohunek session name with `[naming] launch_args` (`requires =
+["naming-launch-args-v1"]`):
+
+```toml
+requires = ["naming-launch-args-v1"]
+
+[naming]
+launch_args = ["--name={session_name}"]
+```
+
+The table holds 1 to 8 tokens. Exactly one token holds the `{session_name}`
+placeholder, and it ends a `-<flag>=` token (`--name={session_name}`): the name
+is joined into that one element, so a name that starts with a dash is never
+parsed as an option. A bare `{session_name}`, the space-separated form, text
+after the placeholder, a second placeholder, `{reference}` and any other brace
+are `descriptor_invalid`, as is the placeholder in `runtime.args` or the resume
+and fork templates. The diagnostic never reflects a token.
+
+The arguments are rendered at every launch from the name that launch uses and
+are never frozen into the resume snapshot: a new session uses its `name`, a
+resume the name the session has now (a `session.rename` since the last launch
+shows), and a fork its own `name`, never the source's. They follow the frozen
+arguments and the runtime contributor's arguments, and precede the native
+reference arguments and the prompt argument. A session without a name, or with a
+stored name that fails the session-name rule, launches without the group. A
+host-profile launch gets the group too, so a profile must not pass the same flag.
+
+The table joins the digest of a built-in descriptor, so the package that adopts
+it changes its digest. A session pinned to the earlier digest resumes and forks
+without the name until it is adopted. A core older than 0.39 refuses the
+descriptor with `runtime_feature_unsupported` (0.38) or `descriptor_invalid`
+(0.37).
 
 ## Transcripts
 
@@ -591,8 +628,8 @@ expose = "peers"              # "local" (default) or "peers"
   CLI sends the opt-in when the host advertises
   `package_install_commands_supported`; an older CLI does not send it and gets
   the refusal, and an older daemon never sees the field.
-- A runtime-only table (`[integration]`, `[launch_env]`, `[config_home]`,
-  `[transcripts]`) next to commands without the runtime group is
+- A runtime-only table (`[integration]`, `[launch_env]`, `[naming]`,
+  `[config_home]`, `[transcripts]`) next to commands without the runtime group is
   `descriptor_invalid`.
 
 ## Declaring a version probe

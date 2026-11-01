@@ -105,7 +105,7 @@ pub(super) enum Exports {
 /// The keys of a command-only descriptor.
 ///
 /// Anything else, including the optional runtime tables (`[integration]`,
-/// `[launch_env]`, `[config_home]`, `[transcripts]`), is refused: those belong
+/// `[launch_env]`, `[naming]`, `[config_home]`, `[transcripts]`), is refused: those belong
 /// to a runtime export.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
