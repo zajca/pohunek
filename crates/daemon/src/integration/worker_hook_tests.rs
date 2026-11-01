@@ -645,7 +645,10 @@ mod subagent_sequences {
     use tokio::net::UnixListener;
     use tracing_subscriber::layer::SubscriberExt;
 
-    use super::{start_worker_with_schema, state_asset, DaemonStub, SESSION_ID};
+    use super::{
+        initialize, start_worker_initialized, start_worker_with_schema, state_asset, DaemonStub,
+        SESSION_ID,
+    };
     use crate::runtime::Worker;
 
     /// Claude Code subagent hook sequences recorded on #883.
@@ -1714,6 +1717,14 @@ mod subagent_sequences {
     /// claim and the stub daemon socket. Returns the raw claim lines the
     /// worker socket received and the daemon stub.
     async fn stop_hook_claims(input: &Value) -> (Vec<String>, DaemonStub) {
+        stop_hook_claims_with(input, &[]).await
+    }
+
+    /// [`stop_hook_claims`] with `extra_env` added to the hook's environment.
+    async fn stop_hook_claims_with(
+        input: &Value,
+        extra_env: &[(&str, &str)],
+    ) -> (Vec<String>, DaemonStub) {
         let root = crate::test_support::scoped_dir("ph-snapshot-claim-");
         let notifications = crate::test_support::scoped_dir("ph-snapshot-claim-data-");
         let daemon = DaemonStub::spawn(&root, &notifications);
@@ -1754,6 +1765,7 @@ mod subagent_sequences {
                 "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
                 pohunek_worker_protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string(),
             )
+            .envs(extra_env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("run the state hook");
@@ -1767,6 +1779,601 @@ mod subagent_sequences {
         assert!(status.success(), "the hook exits 0: {status}");
         let claims = claims.lock().expect("claims lock").clone();
         (claims, daemon)
+    }
+
+    /// Environment that makes the hook name the provider session id as the
+    /// native reference, as a Claude launch does.
+    const ID_REFERENCE: [(&str, &str); 1] = [("POHUNEK_NATIVE_REFERENCE_KIND", "id")];
+
+    fn claim_types(claims: &[String]) -> Vec<String> {
+        claims
+            .iter()
+            .map(|line| {
+                let claim: Value = serde_json::from_str(line).expect("a JSON claim");
+                claim["type"].as_str().expect("a claim type").to_owned()
+            })
+            .collect()
+    }
+
+    /// The end of a turn repeats the identity report before its snapshot, from
+    /// the session id and transcript path of the Stop input, so a `SessionStart`
+    /// report the agent killed is recovered by the next turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_stop_hook_reports_the_identity_before_the_snapshot() {
+        let input = json!({
+            "hook_event_name": "Stop",
+            "session_id": "native-recovered",
+            "transcript_path": "/work/transcript.jsonl",
+            "background_tasks": [],
+        });
+        let (claims, _daemon) = stop_hook_claims_with(&input, &ID_REFERENCE).await;
+
+        assert_eq!(
+            claim_types(&claims),
+            ["identity_report", "subagent_snapshot"],
+            "{claims:?}"
+        );
+        let report: Value = serde_json::from_str(&claims[0]).expect("the identity claim");
+        assert_eq!(report["reference_kind"], "id", "{report}");
+        assert_eq!(report["native_reference"], "native-recovered", "{report}");
+        assert_eq!(report["provider"], "claude", "{report}");
+        assert!(report.get("session_source").is_none(), "{report}");
+        // The snapshot is ordered after the identity report, whose acceptance
+        // clears the snapshot of a previous owner at the worker's clock.
+        let snapshot: Value = serde_json::from_str(&claims[1]).expect("the snapshot claim");
+        assert!(
+            snapshot["sequence"].as_u64() > report["sequence"].as_u64(),
+            "{report} {snapshot}"
+        );
+    }
+
+    /// A Stop whose task list cannot be used still reports the identity, and a
+    /// Stop without a session id sends the snapshot alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_stop_identity_report_does_not_depend_on_the_snapshot() {
+        let unusable = json!({
+            "hook_event_name": "Stop",
+            "session_id": "native-recovered",
+            "background_tasks": "not a list",
+        });
+        let (claims, _daemon) = stop_hook_claims_with(&unusable, &ID_REFERENCE).await;
+        assert_eq!(claim_types(&claims), ["identity_report"], "{claims:?}");
+
+        let anonymous = json!({"hook_event_name": "Stop", "background_tasks": []});
+        let (claims, _daemon) = stop_hook_claims_with(&anonymous, &ID_REFERENCE).await;
+        assert_eq!(claim_types(&claims), ["subagent_snapshot"], "{claims:?}");
+    }
+
+    /// The `SessionStart` hook with the worker socket absent and the hook trace
+    /// under `root`, reading its input from `stdin`.
+    fn session_hook_command(root: &Path, stdin: std::fs::File) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg(state_asset(CLAUDE))
+            .arg("session")
+            .env_clear()
+            .env("PATH", crate::integration::tests::inherited_path())
+            .env("TMPDIR", root)
+            .env("POHUNEK_ENV", "1")
+            .env("POHUNEK_SESSION_ID", SESSION_ID)
+            .env(
+                "POHUNEK_WORKER_SOCKET_PATH",
+                root.join("absent-worker.sock"),
+            )
+            .env("POHUNEK_WORKER_INSTANCE_ID", SCRIPTED_INSTANCE)
+            .env("POHUNEK_HOOK_TRACE_PATH", super::hook_trace_path(root))
+            .env("POHUNEK_HOOK_TRACE_MAX_BYTES", "65536")
+            .stdin(stdin)
+            .process_group(0)
+            .kill_on_drop(true);
+        command
+    }
+
+    /// The reasons of the `SessionStart` trace lines under `root`, in order.
+    fn trace_reasons(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(super::hook_trace_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let entry: Value = serde_json::from_str(line).expect("a JSON trace line");
+                assert_eq!(entry["action"], "session", "{entry}");
+                entry["reason"].as_str().expect("a reason").to_owned()
+            })
+            .collect()
+    }
+
+    /// A `SessionStart` run leaves `hook_started` before it reads its input and
+    /// `hook_finished` after every other reason of the run, so a run the agent
+    /// kills while it works shows as started without a finish.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_start_hook_traces_its_start_and_its_finish() {
+        let root = crate::test_support::scoped_dir("ph-hook-started-");
+
+        // A run that ends normally.
+        let input = root.join("session-start.json");
+        std::fs::write(
+            &input,
+            json!({"hook_event_name": "SessionStart", "session_id": "native-1"}).to_string(),
+        )
+        .expect("write the SessionStart input");
+        let status = session_hook_command(&root, std::fs::File::open(&input).expect("input"))
+            .status()
+            .await
+            .expect("run the SessionStart hook");
+        assert!(status.success(), "{status}");
+        let reasons = trace_reasons(&root);
+        assert_eq!(
+            reasons.first().map(String::as_str),
+            Some("hook_started"),
+            "{reasons:?}"
+        );
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some("hook_finished"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.len() > 2,
+            "the undelivered report is traced between: {reasons:?}"
+        );
+
+        // A run that blocks on its input and is killed there.
+        std::fs::remove_file(super::hook_trace_path(&root)).expect("reset the trace");
+        let gate = root.join("input.fifo");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the input pipe");
+        // Opened read-write, so the hook's read blocks instead of ending.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .expect("hold the input pipe");
+        let mut hook = session_hook_command(&root, held.try_clone().expect("share the pipe"))
+            .spawn()
+            .expect("start the SessionStart hook");
+        pohunek_test_support::wait::wait_until("the hook's start line", || async {
+            (trace_reasons(&root) == ["hook_started"]).then_some(())
+        })
+        .await;
+        // The interpreter is a child of the hook's shell, so the whole group goes.
+        let group = nix::unistd::Pid::from_raw(
+            i32::try_from(hook.id().expect("the hook's pid")).expect("a pid"),
+        );
+        nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
+            .expect("kill the SessionStart hook");
+        hook.wait().await.expect("reap the SessionStart hook");
+        assert_eq!(
+            trace_reasons(&root),
+            ["hook_started"],
+            "a killed run has a start and no finish"
+        );
+    }
+
+    /// The start markers the `SessionStart` hook left beside the trace under `root`.
+    fn start_markers(root: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.start.", pohunek_logging::config::HOOK_TRACE_FILE_NAME);
+        let mut markers: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the trace directory")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        markers.sort();
+        markers
+    }
+
+    /// Starts the `SessionStart` hook with a `python3` stand-in that records
+    /// `<name>.started` under `root` and then blocks on a pipe, so the
+    /// interpreter never runs the hook. The returned file holds the pipe open.
+    fn hook_with_blocked_interpreter(
+        root: &Path,
+        name: &str,
+        trace_path: &Path,
+    ) -> (tokio::process::Child, std::fs::File) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let gate = root.join(format!("{name}.fifo"));
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the pipe");
+        // Opened read-write, so the stand-in's read blocks instead of ending.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .expect("hold the pipe");
+        let shim = root.join(format!("{name}-shim"));
+        std::fs::create_dir(&shim).expect("create the shim directory");
+        std::fs::write(
+            shim.join("python3"),
+            format!(
+                "#!/bin/sh\n: > '{}'\nread -r _ < '{}'\n",
+                root.join(format!("{name}.started")).display(),
+                gate.display()
+            ),
+        )
+        .expect("write the interpreter stand-in");
+        std::fs::set_permissions(shim.join("python3"), std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            crate::integration::tests::inherited_path()
+        );
+        let hook = session_hook_command(root, std::fs::File::open("/dev/null").expect("null"))
+            .env("PATH", &path)
+            .env("POHUNEK_HOOK_TRACE_PATH", trace_path)
+            .spawn()
+            .expect("start the SessionStart hook");
+        (hook, held)
+    }
+
+    /// Kills the hook's whole process group: the interpreter is a child of the
+    /// hook's shell.
+    async fn kill_hook_group(hook: &mut tokio::process::Child) {
+        let group = nix::unistd::Pid::from_raw(
+            i32::try_from(hook.id().expect("the hook's pid")).expect("a pid"),
+        );
+        nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
+            .expect("kill the SessionStart hook");
+        hook.wait().await.expect("reap the SessionStart hook");
+    }
+
+    /// A `SessionStart` run killed while its interpreter is still starting
+    /// leaves an owner-private start marker, because the shell creates it
+    /// before the interpreter starts; a run whose interpreter runs removes its
+    /// marker and the markers older than an hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_start_hook_killed_before_its_interpreter_runs_leaves_a_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::test_support::scoped_dir("ph-hook-marker-");
+        let (mut hook, held) =
+            hook_with_blocked_interpreter(&root, "killed", &super::hook_trace_path(&root));
+        // The stand-in runs once the shell is done with the marker.
+        pohunek_test_support::wait::wait_until("the interpreter stand-in", || async {
+            root.join("killed.started").exists().then_some(())
+        })
+        .await;
+        kill_hook_group(&mut hook).await;
+        drop(held);
+
+        let markers = start_markers(&root);
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert_eq!(
+            std::fs::read_to_string(&markers[0]).expect("read the marker"),
+            format!("{SESSION_ID}\n")
+        );
+        let mode = std::fs::metadata(&markers[0])
+            .expect("marker metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert!(trace_reasons(&root).is_empty(), "the interpreter never ran");
+
+        // A run whose interpreter runs removes its own marker and an hour-old
+        // one, and keeps a recent one.
+        let stale = root.join(format!(
+            "{}.start.stale",
+            pohunek_logging::config::HOOK_TRACE_FILE_NAME
+        ));
+        std::fs::write(&stale, "s-old\n").expect("write the stale marker");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open the stale marker")
+            .set_modified(SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("age the stale marker");
+        let status = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+            .status()
+            .await
+            .expect("run the SessionStart hook");
+        assert!(status.success(), "{status}");
+        assert_eq!(
+            start_markers(&root),
+            markers,
+            "only the recent marker stays"
+        );
+    }
+
+    /// The shell stops creating markers at 16, so a host whose interpreter never
+    /// starts does not fill the log directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_start_markers_are_bounded() {
+        let root = crate::test_support::scoped_dir("ph-hook-marker-cap-");
+        for index in 0..16 {
+            std::fs::write(
+                root.join(format!(
+                    "{}.start.{index}",
+                    pohunek_logging::config::HOOK_TRACE_FILE_NAME
+                )),
+                "s-1\n",
+            )
+            .expect("write a marker");
+        }
+        let before = start_markers(&root);
+        let (mut hook, held) =
+            hook_with_blocked_interpreter(&root, "marker-cap", &super::hook_trace_path(&root));
+        // The shell ran ahead of the interpreter once the stand-in is waiting.
+        pohunek_test_support::wait::wait_until("the interpreter stand-in", || async {
+            root.join("marker-cap.started").exists().then_some(())
+        })
+        .await;
+        kill_hook_group(&mut hook).await;
+        drop(held);
+        assert_eq!(start_markers(&root), before, "a 17th marker is not created");
+    }
+
+    /// Names planted beside the trace, a FIFO and symlinks (one to a device,
+    /// one dangling), neither block the hook nor receive anything: the marker
+    /// is a new file under a name the shell does not choose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn names_planted_beside_the_trace_do_not_receive_the_start_marker() {
+        let root = crate::test_support::scoped_dir("ph-hook-marker-planted-");
+        let trace = super::hook_trace_path(&root);
+        let planted = |suffix: &str| {
+            let mut name = trace.clone().into_os_string();
+            name.push(format!(".start.{suffix}"));
+            PathBuf::from(name)
+        };
+        nix::unistd::mkfifo(&planted("fifo"), nix::sys::stat::Mode::S_IRWXU).expect("plant a FIFO");
+        std::os::unix::fs::symlink("/dev/null", planted("null")).expect("plant a device link");
+        let victim = root.join("victim");
+        std::os::unix::fs::symlink(&victim, planted("dangling")).expect("plant a dangling link");
+
+        let (mut hook, held) = hook_with_blocked_interpreter(&root, "planted", &trace);
+        pohunek_test_support::wait::wait_until("the interpreter stand-in", || async {
+            root.join("planted.started").exists().then_some(())
+        })
+        .await;
+        kill_hook_group(&mut hook).await;
+        drop(held);
+
+        assert!(!victim.exists(), "the dangling link was written through");
+        let markers = start_markers(&root);
+        assert_eq!(
+            markers.len(),
+            4,
+            "three planted names and one marker: {markers:?}"
+        );
+        let fresh: Vec<_> = markers
+            .iter()
+            .filter(|path| {
+                !path.to_string_lossy().contains(".start.fifo")
+                    && !path.to_string_lossy().contains(".start.null")
+                    && !path.to_string_lossy().contains(".start.dangling")
+            })
+            .collect();
+        assert_eq!(fresh.len(), 1, "{markers:?}");
+        assert_eq!(
+            std::fs::read_to_string(fresh[0]).expect("read the marker"),
+            format!("{SESSION_ID}\n")
+        );
+    }
+
+    /// A trace in a directory the user does not own gets no marker, whatever
+    /// the directory's permissions allow.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trace_in_a_directory_of_another_owner_gets_no_start_marker() {
+        let root = crate::test_support::scoped_dir("ph-hook-marker-foreign-");
+        let trace = PathBuf::from(format!(
+            "/dev/shm/ph-hook-foreign-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock")
+                .as_nanos()
+        ));
+        let (mut hook, held) = hook_with_blocked_interpreter(&root, "foreign", &trace);
+        pohunek_test_support::wait::wait_until("the interpreter stand-in", || async {
+            root.join("foreign.started").exists().then_some(())
+        })
+        .await;
+        kill_hook_group(&mut hook).await;
+        drop(held);
+
+        let prefix = format!(
+            "{}.start.",
+            trace
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a name")
+        );
+        let leftovers: Vec<_> = std::fs::read_dir("/dev/shm")
+            .expect("read /dev/shm")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect();
+        for leftover in &leftovers {
+            let _ = std::fs::remove_file(leftover);
+        }
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A run with an invalid size bound still removes its marker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_without_a_trace_bound_removes_its_start_marker() {
+        let root = crate::test_support::scoped_dir("ph-hook-marker-nobound-");
+        let status = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+            .env("POHUNEK_HOOK_TRACE_MAX_BYTES", "0")
+            .status()
+            .await
+            .expect("run the SessionStart hook");
+        assert!(status.success(), "{status}");
+        assert!(start_markers(&root).is_empty());
+    }
+
+    /// The native session id the worker holds as the session's active identity.
+    async fn recorded_reference(worker: &Worker) -> Option<(String, u64)> {
+        worker
+            .inspect()
+            .await
+            .expect("inspect the worker")
+            .active_identity
+            .and_then(|claim| claim.native_reference.map(|id| (id, claim.sequence)))
+    }
+
+    /// Runs the real `Stop` hook with a main-agent turn end naming `session_id`.
+    fn stop_with_session(asset: &Path, session_id: &str) -> String {
+        format!(
+            "printf '{{\"session_id\":\"{session_id}\",\"transcript_path\":\"/work/t.jsonl\",\"background_tasks\":[]}}' \
+             | /bin/sh -c '/bin/sh {} stop; true'",
+            asset.display()
+        )
+    }
+
+    /// The #1194 scenario through a real worker and the real hook: a
+    /// `SessionStart` hook the agent killed before it reported leaves the
+    /// session without a native reference; the next `Stop` gives it one; a later
+    /// `Stop` of the same id leaves the reference as it is and a `Stop` after a
+    /// conversation switch (`/clear`) moves it to the new id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_hook_gives_a_session_the_reference_its_killed_start_hook_never_reported() {
+        let root = crate::test_support::scoped_dir("ph-stop-recover-");
+        let asset = state_asset(CLAUDE);
+        let gate = root.join("start.fifo");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the pipe");
+        // Opened read-write, so the killed hook's input read blocks.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .expect("hold the pipe");
+        let flag = |name: &str| root.join(name);
+        let wait_for = |name: &str| {
+            format!(
+                "while [ ! -e '{}' ]; do sleep 0.02; done; ",
+                flag(name).display()
+            )
+        };
+        let script = format!(
+            concat!(
+                "set -m; ",
+                "/bin/sh -c '/bin/sh {asset} session; true' < '{gate}' & hook=$!; ",
+                "until grep -q hook_started '{trace}' 2>/dev/null; do sleep 0.02; done; ",
+                "kill -9 -- -$hook; : > '{killed}'; ",
+                "{wait_first}{first}; : > '{first_done}'; ",
+                "{wait_second}{second}; : > '{second_done}'; ",
+                "{wait_third}{third}; : > '{third_done}'; ",
+                "sleep 30"
+            ),
+            asset = asset.display(),
+            gate = gate.display(),
+            trace = super::hook_trace_path(&root).display(),
+            killed = flag("killed").display(),
+            wait_first = wait_for("go-first"),
+            first = stop_with_session(&asset, "native-recovered"),
+            first_done = flag("first-done").display(),
+            wait_second = wait_for("go-second"),
+            second = stop_with_session(&asset, "native-recovered"),
+            second_done = flag("second-done").display(),
+            wait_third = wait_for("go-third"),
+            third = stop_with_session(&asset, "native-cleared"),
+            third_done = flag("third-done").display(),
+        );
+        let mut start = initialize(
+            &root,
+            &script,
+            protocol::PROTOCOL_VERSION.get(),
+            "identity-subagent-v1",
+        );
+        start.launch.reference_kind = Some("id".to_owned());
+        let (worker, task, _socket) = start_worker_initialized(&root, start).await;
+        let release = |name: &str| std::fs::write(flag(name), b"").expect("release a step");
+
+        // Row 2: the start hook died before it reported, so there is no reference.
+        wait_until("the killed start hook", || async {
+            flag("killed").exists().then_some(())
+        })
+        .await;
+        assert_eq!(recorded_reference(&worker).await, None);
+        assert_eq!(
+            trace_reasons(&root),
+            ["hook_started"],
+            "a start without a finish"
+        );
+
+        // The next Stop gives the session its reference.
+        release("go-first");
+        let (reference, first_sequence) = wait_until("the recovered reference", || async {
+            recorded_reference(&worker).await
+        })
+        .await;
+        assert_eq!(reference, "native-recovered");
+
+        // Row 1: a repeated Stop of the same id is accepted and changes nothing else.
+        wait_until("the first Stop", || async {
+            flag("first-done").exists().then_some(())
+        })
+        .await;
+        release("go-second");
+        wait_until("the repeated Stop", || async {
+            flag("second-done").exists().then_some(())
+        })
+        .await;
+        let (reference, second_sequence) = recorded_reference(&worker)
+            .await
+            .expect("the reference stays");
+        assert_eq!(reference, "native-recovered");
+        assert!(
+            second_sequence > first_sequence,
+            "the repeat is accepted as newer"
+        );
+
+        // Row 5: a Stop after a conversation switch reports the new id.
+        release("go-third");
+        let (reference, third_sequence) = wait_until("the switched reference", || async {
+            recorded_reference(&worker)
+                .await
+                .filter(|(id, _)| id == "native-cleared")
+        })
+        .await;
+        assert_eq!(reference, "native-cleared");
+        assert!(third_sequence > second_sequence);
+
+        worker
+            .stop(TransactionId::new("transaction-stop-recover").expect("transaction id"))
+            .await
+            .expect("stop the retained PTY");
+        drop(worker);
+        task.abort();
+    }
+
+    /// Row 6: a `Stop` whose worker socket is missing is traced, sends nothing
+    /// and exits 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_hook_without_a_worker_is_traced_and_exits_cleanly() {
+        let root = crate::test_support::scoped_dir("ph-stop-no-worker-");
+        let mut input = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "printf '%s' '{{\"session_id\":\"native-1\",\"background_tasks\":[]}}' | /bin/sh {} stop",
+                state_asset(CLAUDE).display()
+            ))
+            .env_clear()
+            .env("PATH", crate::integration::tests::inherited_path())
+            .env("TMPDIR", &*root)
+            .env("POHUNEK_ENV", "1")
+            .env("POHUNEK_SESSION_ID", SESSION_ID)
+            .env("POHUNEK_WORKER_SOCKET_PATH", root.join("absent-worker.sock"))
+            .env("POHUNEK_WORKER_INSTANCE_ID", SCRIPTED_INSTANCE)
+            .env("POHUNEK_HOOK_TRACE_PATH", super::hook_trace_path(&root))
+            .env("POHUNEK_HOOK_TRACE_MAX_BYTES", "65536")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the Stop hook");
+        let status = input.wait().expect("wait for the Stop hook");
+        assert!(status.success(), "{status}");
+        let output = std::fs::read_to_string(super::hook_trace_path(&root)).expect("the trace");
+        assert!(output.contains("\"action\":\"stop\""), "{output}");
+        assert_eq!(
+            output.matches("worker_socket_missing").count(),
+            2,
+            "the identity report and the snapshot are each traced: {output}"
+        );
     }
 
     /// Secret-shaped command of a background shell: a secret after a variable

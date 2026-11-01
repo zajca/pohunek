@@ -53,6 +53,7 @@ mod uninstall;
 pub use doctor::doctor;
 #[cfg(unix)]
 pub use doctor::doctor_in;
+pub(crate) use doctor::doctor_in_noted;
 #[cfg(unix)]
 pub(crate) use doctor::is_ambiguous_owner;
 pub(crate) use handler::{hook_runtime_ids, launch_contributor};
@@ -3444,7 +3445,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Version header every managed state hook asset carries.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=15";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=16";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4356,8 +4357,14 @@ mod tests {
                 asset.contains("python3 -I - 3<&0 <<'PY' || exit 0"),
                 "the python heredoc must be guarded with `|| exit 0`"
             );
+            // The only temporary file a hook creates is the `SessionStart` start
+            // marker, which holds the pohunek session id and nothing from the input.
             assert!(
-                !asset.contains("mktemp") && !asset.contains("POHUNEK_HOOK_INPUT_FILE"),
+                asset
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#') && line.contains("mktemp"))
+                    .all(|line| line.contains("marker_file=") && !line.contains("input"))
+                    && !asset.contains("POHUNEK_HOOK_INPUT_FILE"),
                 "{agent} state hook must not persist provider payloads"
             );
         }
@@ -4856,7 +4863,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_removal_cover_the_claude_prompt_submit_hook_and_version_fifteen() {
+    fn status_and_removal_cover_the_claude_prompt_submit_hook_and_the_current_version() {
         if !pohunek_test_support::process_env::in_own_process() {
             return;
         }
@@ -4864,7 +4871,10 @@ mod tests {
         install_claude(&claude).expect("install Claude fixture");
         let installed = explicit_status(&claude, RuntimeRef::claude());
         assert_eq!(installed.state, protocol::IntegrationInstallState::Current);
-        assert_eq!(installed.installed_version, Some(15));
+        assert_eq!(
+            installed.installed_version,
+            Some(protocol::EXPECTED_INTEGRATION_VERSION)
+        );
 
         let settings_path = claude.join("settings.json");
         let mut settings = read_json(&settings_path);

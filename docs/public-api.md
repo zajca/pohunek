@@ -289,7 +289,7 @@ daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` and `prompt_accepted` hook requests are additive to the private
-worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=15`; an asset of
+worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=16`; an asset of
 an earlier version still sends the old key, which the daemon accepts only from a
 session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
@@ -486,7 +486,7 @@ All params and result type names below refer to structs exported by
 | Method | Params | `ok` result | Notes |
 |---|---|---|---|
 | `daemon.health` | `null` | `{status, daemon_version, protocol_version}` | Liveness and version probe. |
-| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, one `<overlay>_cli` check per configured overlay (`netbird_cli`, `tailscale_cli`) and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtime compiled in (`agent_manifest_embedded_shell`; Codex, Claude Code and Hermes ship only as packages, so no embedded Codex, Claude or Hermes manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn`; malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `<overlay>_cli` is `ok` with the address the provider reports for this host, `warn` when the provider's state is unavailable or reports no address, and, when the provider CLI is missing or untrusted, `fail` for an overlay that `overlays.toml` lists and `warn` for the NetBird default of an absent file. The daemon also reports one `overlay_<overlay>_listener` check per configured overlay (`overlay_netbird_listener`, `overlay_tailscale_listener`): its detail starts with `port=<n>;` and states the listener address the provider currently reports, which is the provider's state and not proof that the daemon has bound it; `warn` when the provider reports none. A daemon that predates these checks reports none. `metadata_store_rejected_lines` is `ok` when the metadata store holds no line this build cannot load, `warn` with the count (and how many may pin a package) and the command `pohunek store rejected list` otherwise, and `fail` when the store cannot be read; it never carries a line's text. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. A check status a newer daemon defines reads as `unknown` on the Rust client and the CLI, ranks like `warn` when checks are merged (never `ok`), and keeps the daemon's other checks visible. |
+| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, one `<overlay>_cli` check per configured overlay (`netbird_cli`, `tailscale_cli`) and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtime compiled in (`agent_manifest_embedded_shell`; Codex, Claude Code and Hermes ship only as packages, so no embedded Codex, Claude or Hermes manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn` (the detail of Claude hooks older than integration version 16 adds that a session whose `SessionStart` hook was killed before it reported keeps no native reference until the reinstall); malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `<overlay>_cli` is `ok` with the address the provider reports for this host, `warn` when the provider's state is unavailable or reports no address, and, when the provider CLI is missing or untrusted, `fail` for an overlay that `overlays.toml` lists and `warn` for the NetBird default of an absent file. The daemon also reports one `overlay_<overlay>_listener` check per configured overlay (`overlay_netbird_listener`, `overlay_tailscale_listener`): its detail starts with `port=<n>;` and states the listener address the provider currently reports, which is the provider's state and not proof that the daemon has bound it; `warn` when the provider reports none. A daemon that predates these checks reports none. `metadata_store_rejected_lines` is `ok` when the metadata store holds no line this build cannot load, `warn` with the count (and how many may pin a package) and the command `pohunek store rejected list` otherwise, and `fail` when the store cannot be read; it never carries a line's text. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. A check status a newer daemon defines reads as `unknown` on the Rust client and the CLI, ranks like `warn` when checks are merged (never `ok`), and keeps the daemon's other checks visible. |
 | `host.inspect` | `HostInspectParams` or `null` | `HostCapabilities` | Capability snapshot for the daemon's host. Presence and path of every agent program are resolved on each call; the version probes behind `runtimes[].version` and `supported` come from a probe cache (see "Version probe"), so a result may be older than the cache lifetime. The inventory is built off the daemon's async runtime. `HostInspectParams.skip_runtime_probes: true` answers only the feature flags, `daemon_version` and `git_available`, with empty `supported_agents` and `runtimes`, and resolves and probes no agent program; a client that only gates a request on a capability flag sends it (the CLI does for `session new --cwd`, `--from-remote` and `--input-ack-timeout-ms`). A daemon that predates the parameters ignores them and answers the full inventory, so such a client must accept a complete answer; a client that sends no parameters always gets the full inventory. The Rust method type keeps `()` parameters (the full inventory) and `Client::host_inspect_with` sends `HostInspectParams`; the TypeScript SDK types the parameters as `HostInspectParams | null`. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
 | `host.resolve` | `HostResolveParams` (`{route}`) | `HostResolution` | Resolves a host route as `--host` accepts it against this daemon's own overlay view: `{target: "local"}` for `local`, the empty route and this machine's own overlay name, or `{target: "remote", address, port, pinned_route, overlay, peer_id?, fqdn?}` for one peer. `pinned_route` (`<overlay>:peer~<id>@<port>`, or `fqdn~` without a peer id) selects the same peer after a name or address change. Same rules and typed errors as `Client::connect` (`host_unknown`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `host_identity_unpinnable`). Served on the local Unix socket only: over the overlay and on a protocol 3 connection it answers `method_not_found`, and a client of this build refuses it against a protocol 3 daemon with `daemon/daemon_protocol_too_old`. |
@@ -3386,7 +3386,7 @@ worker instance key `runtime_id` in `session.report_native_id`, which the
 daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=15`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=16`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
@@ -3769,7 +3769,11 @@ the failure in the hook failure trace (see "Hook failure trace" below). They cop
 lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
 start is not a subagent and adds no row, while a Codex one records a completed
 child; see `subagents` under `SessionInfo`. The Claude integration handler also
-registers the state hook on the main-agent `Stop` (action `stop`): it sends the worker one
+registers the state hook on the main-agent `Stop` (action `stop`): when the input names a
+`session_id` it first repeats the `identity_report` claim of `SessionStart` (the same
+`session_id` and `transcript_path` fields; the claim is safe to repeat and ordered by `sequence`),
+which recovers a native reference whose `SessionStart` hook the agent killed before it
+reported, and the report does not depend on the task list (a Stop input over the hook input limit carries no usable session id, so that turn recovers nothing). It then sends the worker one
 `subagent_snapshot` claim with, for each entry of `background_tasks`, the
 required `id`, `type` and `status`, and the optional fields that sanitize:
 `label` from `description` (every type; control and format characters removed,
@@ -3927,6 +3931,15 @@ Reason codes, with their `detail` values:
 - `worker_closed`: no usable answer line; `detail` is an errno name, `empty`
   or `malformed`;
 - `worker_refused`: the worker answered without `ok: true`;
+- `hook_started` and `hook_finished`: written only by the `session` action.
+  `hook_started` is written as soon as the interpreter runs the hook, before it
+  reads its input; `hook_finished` is the last line of a run that reaches its
+  normal exit. A `hook_started` without a later `hook_finished` for the same
+  session names a run the agent killed after that point (the hook timeout is
+  10 s). A run killed while the interpreter itself is still starting, such as a
+  first `python3` start through the Xcode shim, writes no line, because a
+  POSIX shell cannot append to the trace without following a symlink; it leaves
+  a start marker instead (see "Start markers" below);
 - `prompt_report_failed`: the Claude `prompt-submit` action raised an
   unexpected error while building or sending its report; the hook still exits 0
   with no output, so the prompt is never delayed or altered;
@@ -3946,10 +3959,12 @@ A line never carries provider payload content, ids taken from the input
 the only identifier is the Pohunek session id. One hook run can write more than
 one line: a `session` or `release` report that the worker does not accept and
 the daemon fallback then delivers keeps the worker's line, and a run whose
-first route succeeds writes none.
+first route succeeds writes none, except that every `session` run writes
+`hook_started` and `hook_finished`.
 
 The hook queues its lines and writes them when it exits, after every exchange
-with the worker or the daemon, so tracing adds no delay to a report. It opens
+with the worker or the daemon, so tracing adds no delay to a report; the
+`session` action's `hook_started` line is the one written at once. It opens
 the trace with `O_APPEND`, `O_CREAT`, `O_NOFOLLOW` and `O_NONBLOCK` and mode
 `0600`, so a symlink at the path is never followed and a new file is
 owner-private, and takes an exclusive lock on the opened file for each line
@@ -3962,6 +3977,20 @@ the file past `POHUNEK_HOOK_TRACE_MAX_BYTES`, the hook renames it to
 `pohunek-hooks.jsonl.1` (replacing an earlier rotated file) and writes to a new
 `pohunek-hooks.jsonl`, so the trace holds at most twice the bound across the
 two files. A failure to write the trace is ignored: tracing never changes the hook's exit code or output.
+
+Start markers: before it starts the interpreter, the shell part of the `session`
+action creates `pohunek-hooks.jsonl.start.<suffix>` beside the trace (the same
+absolute path plus a random suffix, mode `0600`), holding the pohunek session id
+and a newline. The shell creates it with `mktemp`, which creates a new file
+exclusively under a name it picks, so a symlink or FIFO planted at another name
+is never opened. The interpreter removes its own marker
+as soon as it runs the hook, so a marker that stays names a `SessionStart` run
+the agent killed before the interpreter ran its script. A marker is created
+only for an absolute trace path in a directory the user owns, a session id of
+ASCII letters, digits, `.`, `_` and `-`, and only while fewer than 16 markers
+exist. The interpreter of a
+later `session` run removes markers older than an hour, regular files of the
+current user only.
 
 #### Config homes and host profiles
 

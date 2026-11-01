@@ -677,6 +677,38 @@ pub(super) fn doctor_in_with(
     python: &[IntegrationFinding],
     socket: &[IntegrationFinding],
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
+    let agents: Vec<IntegrationAgentDoctor> = diagnose_with_notes(homes, params, python, socket)?
+        .into_iter()
+        .map(|(diagnosis, _)| diagnosis)
+        .collect();
+    Ok(IntegrationDoctorResult {
+        ok: agents.iter().all(|agent| agent.ok),
+        agents,
+        home_selectors: true,
+    })
+}
+
+/// [`doctor_in`] with, for each diagnosis, the sentence its handler adds to the
+/// text of an outdated install.
+pub(crate) fn doctor_in_noted(
+    homes: &ConfigHomes,
+    params: IntegrationDoctorParams,
+) -> Result<Vec<(IntegrationAgentDoctor, Option<&'static str>)>, ProtocolError> {
+    diagnose_with_notes(
+        homes,
+        params,
+        &python_findings(&PythonProbe::from_environment()),
+        &socket_findings_for_process(),
+    )
+}
+
+/// The diagnoses [`doctor_in_with`] reports, each with the note of its handler.
+fn diagnose_with_notes(
+    homes: &ConfigHomes,
+    params: IntegrationDoctorParams,
+    python: &[IntegrationFinding],
+    socket: &[IntegrationFinding],
+) -> Result<Vec<(IntegrationAgentDoctor, Option<&'static str>)>, ProtocolError> {
     let IntegrationDoctorParams {
         agent,
         profile,
@@ -685,19 +717,20 @@ pub(super) fn doctor_in_with(
     let selection = HomeSelection::from_params(profile, all_profiles)?;
     let selected = homes.existing_targets(agent.as_ref(), &selection)?;
     let runtime: Vec<IntegrationFinding> = python.iter().chain(socket).cloned().collect();
-    let agents: Vec<IntegrationAgentDoctor> = selected
+    Ok(selected
         .iter()
         .map(|target| {
             let mut diagnosis = diagnose_target(target, &runtime);
             diagnosis.home.clone_from(&target.label);
-            diagnosis
+            let note = diagnosis
+                .status
+                .as_ref()
+                .filter(|status| status.state == IntegrationInstallState::Outdated)
+                .and_then(|status| status.installed_version)
+                .and_then(|version| target.resolved.handler.outdated_note(version));
+            (diagnosis, note)
         })
-        .collect();
-    Ok(IntegrationDoctorResult {
-        ok: agents.iter().all(|agent| agent.ok),
-        agents,
-        home_selectors: true,
-    })
+        .collect())
 }
 
 /// Diagnoses the home of `target`.

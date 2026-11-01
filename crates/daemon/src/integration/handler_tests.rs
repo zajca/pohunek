@@ -14,7 +14,7 @@ use protocol::{
     IntegrationUninstallState, ProtocolError, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
 };
 
-use super::doctor::doctor_for_with;
+use super::doctor::{doctor_for_with, doctor_in_noted};
 use super::handler::{
     handler, handlers, resolve, update, Handler, Resolved, RetainedSchemas,
     UPDATE_INCOMPATIBLE_CODE,
@@ -1305,4 +1305,61 @@ fn installed_codex_scripts_are_the_rendered_bytes_and_an_unrendered_template_is_
         fs::read_to_string(&state_hook).expect("read repaired state hook"),
         *CODEX_HOOK_ASSET
     );
+}
+
+/// An install older than the `Stop` identity report tells the doctor what the
+/// reinstall restores; the current version and the other runtime say nothing.
+#[test]
+fn an_outdated_claude_install_names_the_lost_identity_recovery() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let claude = RuntimeRef::claude();
+    let handler = official(&claude).handler;
+    let note = handler
+        .outdated_note(15)
+        .expect("a note for the last version without the Stop identity report");
+    assert!(note.contains("keeps no native reference"), "{note}");
+    assert_eq!(handler.outdated_note(16), None);
+    assert_eq!(
+        official(&RuntimeRef::codex()).handler.outdated_note(1),
+        None
+    );
+
+    let dir = scoped_dir("outdated-note");
+    write_user_config(&claude, &dir);
+    let state_hook = install_current(&claude, &dir);
+    // Every managed script carries the shared version marker.
+    for script in fs::read_dir(state_hook.parent().expect("the hooks directory"))
+        .expect("list the hooks")
+        .map(|entry| entry.expect("a hook entry").path())
+    {
+        let body = fs::read_to_string(&script).expect("read the installed script");
+        fs::write(
+            &script,
+            body.replace(
+                &format!("{INTEGRATION_VERSION_PREFIX}{EXPECTED_INTEGRATION_VERSION}"),
+                &format!("{INTEGRATION_VERSION_PREFIX}15"),
+            ),
+        )
+        .expect("age the installed script");
+    }
+    let noted = with_config_dirs(&dir, &dir, || {
+        doctor_in_noted(
+            &super::config_homes_for_tests(&official_host()),
+            IntegrationDoctorParams {
+                agent: Some(claude.clone()),
+                ..Default::default()
+            },
+        )
+    })
+    .expect("doctor");
+    let [(diagnosis, Some(note))] = noted.as_slice() else {
+        panic!("one outdated diagnosis with a note: {noted:?}");
+    };
+    assert_eq!(
+        diagnosis.status.as_ref().map(|status| status.state),
+        Some(IntegrationInstallState::Outdated)
+    );
+    assert!(note.contains("keeps no native reference"), "{note}");
 }

@@ -3,17 +3,24 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=@POHUNEK_AGENT_ID@
-# POHUNEK_INTEGRATION_VERSION=15
+# POHUNEK_INTEGRATION_VERSION=16
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent
-# state on clean session exit, journal sanitized child state, and report the
+# state on clean session exit, journal sanitized child state, report the
 # main agent's background task list at the end of each turn, and report that a
-# submitted prompt was accepted.
+# submitted prompt was accepted. The end of a turn also repeats the identity
+# report, so a SessionStart hook the agent killed before it reported is
+# recovered at the next turn.
 # Fire-and-forget: every failure exits 0 without output so the hook can never
 # break the agent. Inside a pohunek session with python3 available, a run that
 # does not deliver its report appends one bounded line per reason to the hook
-# trace named by POHUNEK_HOOK_TRACE_PATH, when the worker provides one.
+# trace named by POHUNEK_HOOK_TRACE_PATH, when the worker provides one. The
+# SessionStart run also leaves `hook_started` as soon as the interpreter runs
+# its script and `hook_finished` when it ends, so a hook the agent killed after
+# that shows as started without a finish. A hook the agent killed while the
+# interpreter itself was still starting leaves a start marker beside the trace,
+# which the shell creates before it starts the interpreter.
 
 set -eu
 
@@ -26,6 +33,46 @@ esac
 [ "${POHUNEK_ENV:-}" = "1" ] || exit 0
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+# The SessionStart run records that it began before the interpreter starts,
+# because a slow first `python3` start (the Xcode shim) can outlast the hook
+# timeout, and a run killed there never reaches the trace code. A POSIX shell
+# cannot append to the trace without following a symlink, so the record is a
+# new file named after the trace: `mktemp` creates it exclusively, under a name
+# it picks, with owner-only permissions, so it never opens a symlink or a FIFO
+# planted at a guessable name. The directory must be the user's own. The file
+# holds the pohunek session id, and the interpreter removes it once it runs, so
+# a marker left behind names a run killed before that. At most 16 markers exist
+# at once; the interpreter removes markers older than an hour.
+start_marker=""
+if [ "$action" = "session" ]; then
+  case "${POHUNEK_HOOK_TRACE_PATH:-}" in
+    /*)
+      case "$POHUNEK_SESSION_ID" in
+        *[!A-Za-z0-9._-]*) ;;
+        *)
+          marker_dir="${POHUNEK_HOOK_TRACE_PATH%/*}"
+          marker_base="$POHUNEK_HOOK_TRACE_PATH.start."
+          marker_count=0
+          for existing in "$marker_base"*; do
+            if [ -e "$existing" ] || [ -L "$existing" ]; then
+              marker_count=$((marker_count + 1))
+            fi
+          done
+          if [ "$marker_count" -lt 16 ] && [ -d "$marker_dir" ] && [ -O "$marker_dir" ]; then
+            marker_file="$(mktemp "${marker_base}XXXXXX" 2>/dev/null)" || marker_file=""
+            if [ -n "$marker_file" ]; then
+              if printf '%s\n' "$POHUNEK_SESSION_ID" >"$marker_file" 2>/dev/null; then
+                start_marker="$marker_file"
+              else
+                rm -f "$marker_file" 2>/dev/null || true
+              fi
+            fi
+          fi
+          ;;
+      esac
+      ;;
+  esac
+fi
 # BEGIN agent-pid
 # @POHUNEK_AGENT_NAME@ runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
 # shell that does not exec its last command (dash) stays between the agent and
@@ -55,6 +102,7 @@ esac
 # the agent.
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
+POHUNEK_HOOK_START_MARKER="$start_marker" \
 python3 -I - 3<&0 <<'PY' || exit 0
 import atexit
 import errno
@@ -74,7 +122,8 @@ from datetime import datetime, timedelta, timezone
 # reports of one agent by this value. `time.monotonic_ns()` is only defined
 # within one process (Apple's Python 3.9 on macOS 27 counts from its own
 # start), so the system-wide monotonic clock is read instead. It is read before
-# stdin, so a large provider input never delays the moment it records.
+# stdin, so a large provider input never delays the moment it records. The
+# `stop` action reads it again before its snapshot.
 sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 invocation_start = time.monotonic()
 
@@ -175,6 +224,9 @@ MAX_TRACE_BYTES_DIGITS = 15
 # A hook holds the lock for one fstat, rename and write, so a free lock shows
 # up within a few retries, while a holder that never lets go costs a run at most
 # (TRACE_LOCK_ATTEMPTS - 1) * TRACE_LOCK_RETRY_SECONDS, 20 ms.
+# A start marker older than this belongs to a run that is long gone (the hook
+# timeout is 10 s) and is removed by the next SessionStart run.
+START_MARKER_MAX_AGE_SECONDS = 3600
 TRACE_LOCK_ATTEMPTS = 5
 TRACE_LOCK_RETRY_SECONDS = 0.005
 
@@ -203,6 +255,7 @@ def strict_positive_int(raw, max_digits):
     return None
 
 
+start_marker = os.environ.get("POHUNEK_HOOK_START_MARKER")
 trace_max_bytes = strict_positive_int(trace_max_raw, MAX_TRACE_BYTES_DIGITS)
 trace_enabled = bool(trace_path) and os.path.isabs(trace_path) and trace_max_bytes is not None
 trace_lines = []
@@ -287,6 +340,31 @@ def append_trace_line(line):
     return True
 
 
+def clear_start_markers():
+    # Removes this run's start marker, now that the interpreter runs, and the
+    # markers of runs older than START_MARKER_MAX_AGE_SECONDS. Only regular
+    # files of the current user named after the trace are touched, and a
+    # failure leaves them for the next run.
+    prefix = trace_path + ".start."
+    try:
+        if start_marker and start_marker.startswith(prefix):
+            os.unlink(start_marker)
+        cutoff = time.time() - START_MARKER_MAX_AGE_SECONDS
+        with os.scandir(os.path.dirname(trace_path)) as entries:
+            for entry in entries:
+                if not entry.path.startswith(prefix):
+                    continue
+                found = entry.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISREG(found.st_mode)
+                    and found.st_uid == os.getuid()
+                    and found.st_mtime < cutoff
+                ):
+                    os.unlink(entry.path)
+    except OSError:
+        pass
+
+
 def flush_trace():
     # Any trace failure drops the remaining lines: the trace never changes the
     # exit or output, and a contended lock costs a run its retry budget once.
@@ -301,6 +379,17 @@ def flush_trace():
 if not session_id:
     raise SystemExit(0)
 atexit.register(flush_trace)
+if action == ACTION_SESSION:
+    # Written before any other work, because a hook the agent kills never
+    # reaches the exit handler. Handlers run last-in first-out, so the second
+    # one queues `hook_finished` after every reason of the run and before the
+    # flush; `hook_started` without it names a killed run.
+    trace("hook_started")
+    flush_trace()
+    trace_lines.clear()
+    if trace_path and os.path.isabs(trace_path):
+        clear_start_markers()
+    atexit.register(lambda: trace("hook_finished"))
 
 if not worker_socket_path and not socket_path:
     trace("worker_socket_missing", "unset")
@@ -533,10 +622,13 @@ def read_hook_input():
     if not isinstance(parsed, dict):
         return {}, ("input_invalid", "not_object")
     if action == ACTION_STOP:
+        # The identity fields are returned even when the task list is void, so
+        # an unusable snapshot never costs the turn's identity report.
+        identity = {field: parsed.get(field) for field in ("session_id", "transcript_path")}
         tasks, no_snapshot = snapshot_tasks(parsed)
         if tasks is None:
-            return {}, ("no_snapshot", no_snapshot)
-        return {"tasks": tasks}, None
+            return identity, ("no_snapshot", no_snapshot)
+        return {**identity, "tasks": tasks}, None
     fields = (
         ("agent_id", "agent_type", "parent_agent_id")
         if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
@@ -885,9 +977,17 @@ if action == ACTION_PROMPT_SUBMIT:
     raise SystemExit(0)
 
 if action == ACTION_STOP:
+    # The end of a turn repeats the identity report: it is safe to repeat,
+    # ordered by `sequence`, and it recovers a SessionStart report that was lost
+    # because the agent killed that hook. The worker is the only route.
+    if native_session_id:
+        send_worker_hook("identity_report")
     if input_problem is not None:
         trace(*input_problem)
         raise SystemExit(0)
+    # A report of another process clears the snapshot of the previous owner at
+    # the worker's clock, so the snapshot is ordered after that report.
+    sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     send_worker_snapshot(hook_input["tasks"])
     raise SystemExit(0)
 

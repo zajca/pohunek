@@ -104,6 +104,14 @@ pub trait DaemonHandler: Send + Sync + Debug {
     /// they carry no id of the runtime a request addressed.
     fn inspect_provider(&self, home: Result<&Path, &ProtocolError>) -> IntegrationAgentStatus;
 
+    /// What an install of integration version `installed_version`, older than
+    /// the current asset set, lacks until it is reinstalled; one sentence the
+    /// daemon doctor appends to its outdated text. `None` when nothing the
+    /// operator would notice is missing.
+    fn outdated_note(&self, _installed_version: u32) -> Option<&'static str> {
+        None
+    }
+
     /// Read-only status of the active set in `home`, reported for `runtime`,
     /// with the recovery commands in its warnings naming `runtime`.
     fn inspect(
