@@ -54,7 +54,7 @@ pub use sweep::{
 
 #[cfg(target_os = "macos")]
 #[doc(inline)]
-pub use darwin::DarwinInspector;
+pub use darwin::{DarwinInspector, ExitReportWatch, ProcessExit};
 
 #[cfg(target_os = "macos")]
 pub(crate) use darwin::environment_entry_is;

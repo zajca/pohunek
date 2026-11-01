@@ -66,7 +66,131 @@ impl DarwinInspector {
     }
 }
 
+/// How a watched process ended, as the kernel reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessExit {
+    /// The process called `exit` with this status.
+    Code(i32),
+    /// A signal with this number terminated the process.
+    Signal {
+        /// Terminating signal number.
+        signal: i32,
+        /// Whether the process dumped core.
+        core_dumped: bool,
+    },
+    /// The kernel ended the process for memory pressure (jetsam).
+    MemoryPressure {
+        /// Terminating signal number, `SIGKILL` for jetsam.
+        signal: i32,
+    },
+}
+
+impl ProcessExit {
+    /// Decodes the `wait(2)` status and the memory flag of an exit event.
+    fn decode(event: native::ExitEvent) -> Option<Self> {
+        let status = event.wait_status;
+        if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            return Some(if event.memory_pressure {
+                Self::MemoryPressure { signal }
+            } else {
+                Self::Signal {
+                    signal,
+                    core_dumped: libc::WCOREDUMP(status),
+                }
+            });
+        }
+        libc::WIFEXITED(status).then(|| Self::Code(libc::WEXITSTATUS(status)))
+    }
+}
+
+/// Kernel registration that reports how one process ended.
+///
+/// The kernel queues the exit event on the registration, so the event is
+/// available to a reader that arrives after the process ended. The event is
+/// delivered once; callers keep the decoded result.
+#[derive(Debug)]
+pub struct ExitReportWatch {
+    queue: Async<std::os::fd::OwnedFd>,
+    pid: i32,
+}
+
+impl ExitReportWatch {
+    /// Returns how the process ended, or `None` while no event is queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the kernel attached an error to the
+    /// registration or reported a status it cannot decode.
+    pub fn try_report(&self) -> Result<Option<ProcessExit>, Error> {
+        const OPERATION: &str = "read_exit_report";
+
+        match native::drain_exit(self.queue.get_ref().as_fd(), self.pid) {
+            Ok(None) => Ok(None),
+            Ok(Some(event)) => ProcessExit::decode(event)
+                .map(Some)
+                .ok_or(Error::InvalidData {
+                    operation: OPERATION,
+                }),
+            Err(source) => Err(Error::from_io(OPERATION, source)),
+        }
+    }
+
+    /// Waits until the process ended and returns how.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed failure of [`ExitReportWatch::try_report`].
+    pub async fn report(&self) -> Result<ProcessExit, Error> {
+        const OPERATION: &str = "wait_for_exit_report";
+
+        for _ in 0..MAX_EMPTY_EXIT_DRAINS {
+            if let Some(exit) = self.try_report()? {
+                return Ok(exit);
+            }
+            self.queue
+                .readable()
+                .await
+                .map_err(|source| Error::from_io(OPERATION, source))?;
+        }
+        Err(Error::InvalidData {
+            operation: OPERATION,
+        })
+    }
+}
+
 impl DarwinInspector {
+    /// Arms a kernel registration that records how the identified process
+    /// ends (`NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXIT_DETAIL`).
+    ///
+    /// The kernel serves the status of a same-user process that is not a
+    /// child of the caller. A process that exited before the registration is
+    /// [`Error::Race`], never an exit report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Race`] when the identity no longer matches, and typed
+    /// registration failures otherwise.
+    pub fn exit_report(&self, identity: ProcessIdentity) -> Result<ExitReportWatch, Error> {
+        const OPERATION: &str = "open_exit_report";
+
+        let euid = native::effective_uid();
+        require_identity(identity, euid, OPERATION)?;
+        let pid = native_pid(identity.pid, OPERATION)?;
+        let queue = native::open_exit_queue(
+            pid,
+            libc::NOTE_EXIT | libc::NOTE_EXITSTATUS | libc::NOTE_EXIT_DETAIL,
+        )
+        .map_err(|source| process_error(OPERATION, source))?;
+        // The registration binds a process id; the recheck rejects a watch
+        // armed on a process that reused the id in between.
+        require_identity(identity, euid, OPERATION)?;
+        let queue = Async::new_nonblocking(queue)
+            .map_err(|source| Error::from_io("register_exit_report", source))?;
+        Ok(ExitReportWatch { queue, pid })
+    }
+
     /// Returns the kernel's boot session UUID (`kern.bootsessionuuid`).
     ///
     /// Unlike `kern.boottime`, which the kernel shifts whenever the calendar
@@ -225,8 +349,8 @@ impl ProcessInspector for DarwinInspector {
         let euid = native::effective_uid();
         require_identity(identity, euid, OPERATION)?;
         let pid = native_pid(identity.pid, OPERATION)?;
-        let queue =
-            native::open_exit_queue(pid).map_err(|source| process_error(OPERATION, source))?;
+        let queue = native::open_exit_queue(pid, libc::NOTE_EXIT)
+            .map_err(|source| process_error(OPERATION, source))?;
         // A kqueue filter binds a process id, not an identity. Rechecking after
         // registration rejects a watch armed on a process that reused the id
         // between the first check and the registration.
@@ -868,6 +992,16 @@ mod native {
         Pending,
     }
 
+    /// The exit event of a watched process, with the detail the kernel adds
+    /// for `NOTE_EXITSTATUS | NOTE_EXIT_DETAIL`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct ExitEvent {
+        /// The `wait(2)` status of the process.
+        pub(super) wait_status: i32,
+        /// Whether the kernel ended the process for memory pressure (jetsam).
+        pub(super) memory_pressure: bool,
+    }
+
     /// Returns the effective user id of the calling process.
     pub(super) fn effective_uid() -> u32 {
         rustix::process::geteuid().as_raw()
@@ -1293,7 +1427,7 @@ mod native {
         Ok((boot.tv_sec, boot.tv_usec))
     }
 
-    /// Registers a one-shot `NOTE_EXIT` filter for one process id.
+    /// Registers a one-shot process filter with `fflags` for one process id.
     ///
     /// The returned descriptor owns the registration: dropping it releases the
     /// kernel filter immediately.
@@ -1302,7 +1436,7 @@ mod native {
     ///
     /// Returns the operating-system error. A process that already exited is
     /// reported as `ESRCH`, never as an exit event.
-    pub(super) fn open_exit_queue(pid: i32) -> io::Result<OwnedFd> {
+    pub(super) fn open_exit_queue(pid: i32, fflags: u32) -> io::Result<OwnedFd> {
         // SAFETY: `kqueue` takes no arguments and returns a fresh descriptor
         // or -1.
         let raw = unsafe { libc::kqueue() };
@@ -1317,7 +1451,7 @@ mod native {
                 .map_err(|_range| io::Error::from(io::ErrorKind::InvalidInput))?,
             filter: libc::EVFILT_PROC,
             flags: libc::EV_ADD | libc::EV_ONESHOT | libc::EV_RECEIPT,
-            fflags: libc::NOTE_EXIT,
+            fflags,
             data: 0,
             udata: ptr::null_mut(),
         };
@@ -1357,6 +1491,20 @@ mod native {
     /// Returns the operating-system error, including an `EV_ERROR` result the
     /// kernel attached to the registered filter.
     pub(super) fn drain_exit_event(queue: BorrowedFd<'_>, pid: i32) -> io::Result<ExitSignal> {
+        Ok(match drain_exit(queue, pid)? {
+            Some(_event) => ExitSignal::Exited,
+            None => ExitSignal::Pending,
+        })
+    }
+
+    /// Drains one readable kqueue and returns the exit event of the watched
+    /// process, when one was pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, including an `EV_ERROR` result the
+    /// kernel attached to the registered filter.
+    pub(super) fn drain_exit(queue: BorrowedFd<'_>, pid: i32) -> io::Result<Option<ExitEvent>> {
         let expected =
             usize::try_from(pid).map_err(|_range| io::Error::from(io::ErrorKind::InvalidInput))?;
         let mut events = [empty_event(); MAX_DRAINED_EVENTS];
@@ -1381,7 +1529,7 @@ mod native {
         if count < 0 {
             let error = last_os_error();
             return if error.kind() == io::ErrorKind::Interrupted {
-                Ok(ExitSignal::Pending)
+                Ok(None)
             } else {
                 Err(error)
             };
@@ -1398,10 +1546,13 @@ mod native {
                 return Err(io::Error::from_raw_os_error(errno));
             }
             if event.fflags & libc::NOTE_EXIT != 0 {
-                return Ok(ExitSignal::Exited);
+                return Ok(Some(ExitEvent {
+                    wait_status: i32::try_from(event.data).unwrap_or(0),
+                    memory_pressure: event.fflags & libc::NOTE_EXIT_MEMORY != 0,
+                }));
             }
         }
-        Ok(ExitSignal::Pending)
+        Ok(None)
     }
 
     /// Returns a kernel event with no registration or result fields set.

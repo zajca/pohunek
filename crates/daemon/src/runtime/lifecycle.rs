@@ -1214,26 +1214,70 @@ impl Lifecycle<'_> {
             }
             Err(_elapsed) => return None,
         };
-        let worker_id = worker.worker_id().await;
-        match read_journal(self.state_root, generation.session_id(), worker_id.as_str()) {
-            Ok(journal) if journal.generation == generation.generation() => Some(worker),
-            Ok(journal) => {
-                tracing::warn!(
-                    session_id = generation.session_id(),
-                    worker.generation = generation.generation(),
-                    journal.generation = %journal.generation,
-                    "worker socket is served by another generation"
-                );
-                None
+        self.accept_worker(generation, worker).await
+    }
+
+    /// Accepts a connected worker only when its journal names exactly this
+    /// generation, then arms the exit watch for its process.
+    ///
+    /// Boxed so the connection attempt's own state does not hold the worker
+    /// across these awaits.
+    fn accept_worker<'a>(
+        &'a self,
+        generation: &'a Generation,
+        worker: Worker,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Worker>> + Send + 'a>> {
+        Box::pin(async move {
+            let worker_id = worker.worker_id().await;
+            match read_journal(self.state_root, generation.session_id(), worker_id.as_str()) {
+                Ok(journal) if journal.generation == generation.generation() => {
+                    let process = journal.worker_identity();
+                    drop(journal);
+                    self.watch_exit(generation, process).await;
+                    Some(worker)
+                }
+                Ok(journal) => {
+                    tracing::warn!(
+                        session_id = generation.session_id(),
+                        worker.generation = generation.generation(),
+                        journal.generation = %journal.generation,
+                        "worker socket is served by another generation"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = generation.session_id(),
+                        error = %error,
+                        "connected worker has no readable journal"
+                    );
+                    None
+                }
             }
-            Err(error) => {
-                tracing::warn!(
-                    session_id = generation.session_id(),
-                    error = %error,
-                    "connected worker has no readable journal"
-                );
-                None
+        })
+    }
+
+    /// Asks the supervisor to record how the connected worker's process ends,
+    /// for a manager that keeps no exit verdict itself.
+    ///
+    /// The exit evidence is diagnostic, so a journal identity that cannot be
+    /// read or a watch that cannot be armed is logged and never fails the
+    /// connection.
+    async fn watch_exit(&self, generation: &Generation, process: Result<ProcessIdentity, String>) {
+        let id = generation.service_id();
+        let process = match process {
+            Ok(process) => process,
+            Err(detail) => {
+                tracing::debug!(service_id = %id, detail, "worker exit watch needs a process identity");
+                return;
             }
+        };
+        if let Err(error) = self.supervisor.watch_exit(&id, process).await {
+            tracing::debug!(
+                service_id = %id,
+                error = %error,
+                "worker exit watch could not be armed"
+            );
         }
     }
 

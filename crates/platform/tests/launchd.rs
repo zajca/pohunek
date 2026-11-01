@@ -25,12 +25,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pohunek_platform::process::{HostInspector, ProcessIdentity, ProcessInspector as _};
+use pohunek_platform::process::{
+    HostInspector, ProcessIdentity, ProcessInspector as _, StartIdentity,
+};
 use pohunek_platform::supervisor::launchd::{
     job_path_sources, LaunchdDaemon, LaunchdPluginUnits, LaunchdSupervisor,
 };
 use pohunek_platform::supervisor::{
-    Activation, DaemonSupervisor as _, Error, JobDefinition, JobLogs, JobSpec, Namespace,
+    Activation, DaemonSupervisor as _, Error, JobDefinition, JobExit, JobLogs, JobSpec, Namespace,
     PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits as _, RestartPolicy,
     ServiceId, ServiceObservation, ServiceState, Supervisor as _, WorkerKey,
 };
@@ -66,6 +68,14 @@ const SLEEPING_WORKER: &str = "/bin/sleep 600 & wait";
 /// The background job keeps `bash` itself as the main process; a lone simple
 /// command would be `exec`ed and no longer match the definition's executable.
 const EXITING_WORKER: &str = "/bin/sleep 3 & wait";
+
+/// Worker that ends with the status the test writes into `$HOME/go`.
+///
+/// It holds still until the file is non-empty, so the exit watch is armed
+/// before the process can end. The file is published by rename, and the loop
+/// runs inside the job, not in the test.
+const TRIGGERED_WORKER: &str =
+    r#"while [ ! -s "$HOME/go" ]; do /bin/sleep 0.1; done; exit "$(cat "$HOME/go")""#;
 
 /// Worker that leaves an orphaned copy of itself for launchd to adopt.
 ///
@@ -2314,4 +2324,197 @@ async fn plugin_units_with_identical_argv_are_told_apart_by_label() {
             .all(|identity| !inspector.is_running(*identity).expect("liveness")),
         "removal ends both twins"
     );
+}
+
+/// Starts a triggered worker and arms its exit watch.
+async fn armed_worker(fixture: &Fixture, key: &WorkerKey) -> (ServiceId, ProcessIdentity) {
+    let id = key.service_id();
+    let definition = fixture.worker(key, TRIGGERED_WORKER, Duration::from_secs(5));
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts");
+    let observation = wait_for(|| fixture.supervisor.inspect(&id), running).await;
+    let process = observation.process.expect("running worker has a process");
+    fixture
+        .supervisor
+        .watch_exit(&id, process)
+        .await
+        .expect("exit watch arms");
+    (id, process)
+}
+
+/// Lets a triggered worker exit with `status` and waits until its process is
+/// gone.
+async fn release_worker(fixture: &Fixture, id: &ServiceId, status: &str) {
+    let staged = fixture.root.join("go.staged");
+    std::fs::write(&staged, status).expect("trigger staged");
+    std::fs::rename(&staged, fixture.root.join("go")).expect("trigger published");
+    wait_for(
+        || fixture.supervisor.inspect(id),
+        |observation| observation.process.is_none(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_worker_that_exits_with_a_status_reports_it_until_retirement() {
+    let fixture = Fixture::new();
+    let key = key("s-1301", "abcd2351");
+    let (id, process) = armed_worker(&fixture, &key).await;
+
+    release_worker(&fixture, &id, "3").await;
+
+    let evidence = fixture
+        .supervisor
+        .exit_evidence(&id)
+        .await
+        .expect("evidence readable")
+        .expect("a failed exit is evidence");
+    assert_eq!(evidence.result(), "exit-code");
+    assert_eq!(evidence.exit(), Some(JobExit::Code(3)));
+    // The kernel delivers the event once; the decoded result answers every read.
+    assert_eq!(
+        fixture.supervisor.exit_evidence(&id).await.expect("again"),
+        Some(evidence)
+    );
+    assert_eq!(
+        fixture.supervisor.exit_status(&id).await.expect("status"),
+        Some(JobExit::Code(3))
+    );
+    // A second watch for a generation with a record keeps the first record.
+    fixture
+        .supervisor
+        .watch_exit(&id, process)
+        .await
+        .expect("a second watch is a no-op");
+    assert_eq!(
+        fixture.supervisor.exit_status(&id).await.expect("kept"),
+        Some(JobExit::Code(3))
+    );
+
+    fixture
+        .supervisor
+        .retire(&id)
+        .await
+        .expect("worker retires");
+    assert!(matches!(
+        fixture.supervisor.exit_evidence(&id).await,
+        Err(Error::NotFound(missing)) if missing == id
+    ));
+    assert!(matches!(
+        fixture.supervisor.exit_status(&id).await,
+        Err(Error::NotFound(missing)) if missing == id
+    ));
+    // The process is gone: arming a watch on it is a race, never an exit.
+    assert!(matches!(
+        fixture.supervisor.watch_exit(&id, process).await,
+        Err(Error::Race { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_killed_worker_reports_the_signal() {
+    let fixture = Fixture::new();
+    let key = key("s-1302", "abcd2352");
+    let (id, process) = armed_worker(&fixture, &key).await;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(process.pid).expect("pid fits")),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("worker killed");
+    wait_for(
+        || fixture.supervisor.inspect(&id),
+        |observation| observation.process.is_none(),
+    )
+    .await;
+
+    let evidence = fixture
+        .supervisor
+        .exit_evidence(&id)
+        .await
+        .expect("evidence readable")
+        .expect("a signal is evidence");
+    assert_eq!(evidence.result(), "signal");
+    assert_eq!(evidence.exit(), Some(JobExit::Signal(9)));
+    assert_eq!(
+        fixture.supervisor.exit_status(&id).await.expect("status"),
+        Some(JobExit::Signal(9))
+    );
+}
+
+#[tokio::test]
+async fn a_clean_exit_and_an_unwatched_worker_leave_no_evidence() {
+    let fixture = Fixture::new();
+    let clean = key("s-1303", "abcd2353");
+    let (clean_id, _) = armed_worker(&fixture, &clean).await;
+    release_worker(&fixture, &clean_id, "0").await;
+
+    assert_eq!(
+        fixture
+            .supervisor
+            .exit_evidence(&clean_id)
+            .await
+            .expect("evidence readable"),
+        None,
+        "a clean end is no evidence"
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .exit_status(&clean_id)
+            .await
+            .expect("status"),
+        Some(JobExit::Code(0))
+    );
+
+    // A job whose watch was never armed has no record, running or not.
+    let unwatched = key("s-1304", "abcd2354");
+    let unwatched_id = unwatched.service_id();
+    let definition = fixture.worker(&unwatched, SLEEPING_WORKER, Duration::from_secs(5));
+    fixture
+        .supervisor
+        .start(&unwatched_id, &definition)
+        .await
+        .expect("worker starts");
+    let observation = wait_for(|| fixture.supervisor.inspect(&unwatched_id), running).await;
+    let process = observation.process.expect("running worker has a process");
+    assert_eq!(
+        fixture
+            .supervisor
+            .exit_evidence(&unwatched_id)
+            .await
+            .expect("evidence readable"),
+        None
+    );
+
+    // A process whose identity changed is refused, and leaves no record.
+    let substituted = ProcessIdentity {
+        pid: process.pid,
+        start_identity: StartIdentity::new(process.start_identity.get().wrapping_add(1)),
+    };
+    assert!(matches!(
+        fixture
+            .supervisor
+            .watch_exit(&unwatched_id, substituted)
+            .await,
+        Err(Error::Race { .. })
+    ));
+    assert_eq!(
+        fixture
+            .supervisor
+            .exit_status(&unwatched_id)
+            .await
+            .expect("status"),
+        None
+    );
+
+    // An unregistered generation is not found.
+    let absent = key("s-1305", "abcd2355").service_id();
+    assert!(matches!(
+        fixture.supervisor.exit_evidence(&absent).await,
+        Err(Error::NotFound(missing)) if missing == absent
+    ));
 }
