@@ -6,6 +6,7 @@ pub mod assistant;
 mod index;
 pub mod log;
 mod materializer;
+mod prompt_contract;
 #[cfg(feature = "protocol")]
 mod protocol_conversions;
 mod schema;
@@ -24,6 +25,8 @@ pub use materializer::{gc, materialize};
 #[doc(hidden)]
 #[doc(inline)]
 pub use materializer::{materialize_with_observer, Event};
+#[doc(inline)]
+pub use prompt_contract::{PromptContract, PromptContractError, PROMPT_CONTRACT_PATH};
 #[doc(inline)]
 pub use schema::{
     Citation, Concept, ConceptType, Deprecation, Intent, SourceKind, CONCEPT_SCHEMA_VERSION,

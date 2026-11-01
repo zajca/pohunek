@@ -286,7 +286,7 @@ pub async fn prepare_with_options(
         PreparedKnowledge::Materialized(materialized)
     };
 
-    let contract = PromptContract::embedded()?;
+    let contract = embedded_contract()?;
     let prompt = match &knowledge {
         PreparedKnowledge::Materialized(materialized) => compose(&ComposeParams {
             contract: &contract,
@@ -735,7 +735,7 @@ fn serialize_snapshot(snapshot: &Snapshot) -> String {
 }
 
 struct ComposeParams<'a> {
-    contract: &'a PromptContract,
+    contract: &'a knowledge::PromptContract,
     intent: Intent,
     request: Option<&'a str>,
     concepts: &'a [ConceptMeta],
@@ -746,7 +746,7 @@ struct ComposeParams<'a> {
 }
 
 struct ComposeDegradedParams<'a> {
-    contract: &'a PromptContract,
+    contract: &'a knowledge::PromptContract,
     intent: Intent,
     request: Option<&'a str>,
     snapshot_path: &'a str,
@@ -755,95 +755,19 @@ struct ComposeDegradedParams<'a> {
     bundle_version_note: &'a str,
 }
 
-/// Bundle-relative path of the file that defines the prompt's safety rules and
-/// navigation steps.
-const PROMPT_CONTRACT_PATH: &str = "assistant/system.md";
-
-/// Safety rules and navigation steps of the opening prompt, one line each,
-/// taken from [`PROMPT_CONTRACT_PATH`] as embedded in this binary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PromptContract {
-    safety: Vec<String>,
-    navigation: Vec<String>,
-}
-
-impl PromptContract {
-    fn embedded() -> Result<Self, AssistantError> {
-        let text = knowledge::embedded_bundle()
-            .get_text(PROMPT_CONTRACT_PATH)
-            .ok_or_else(|| contract_error("the embedded bundle has no prompt contract"))?;
-        Self::parse(text)
-    }
-
-    fn parse(text: &str) -> Result<Self, AssistantError> {
-        let safety = contract_items(text, "Safety")?;
-        let navigation = contract_items(text, "Navigation")?;
-        if safety.is_empty() || navigation.is_empty() {
-            return Err(contract_error(
-                "the prompt contract has no safety rules or no navigation steps",
-            ));
-        }
-        Ok(Self { safety, navigation })
-    }
+/// The prompt contract as embedded in this binary.
+fn embedded_contract() -> Result<knowledge::PromptContract, AssistantError> {
+    let text = knowledge::embedded_bundle()
+        .get_text(knowledge::PROMPT_CONTRACT_PATH)
+        .ok_or_else(|| contract_error("the embedded bundle has no prompt contract"))?;
+    knowledge::PromptContract::parse(text).map_err(|error| contract_error(&error.to_string()))
 }
 
 fn contract_error(reason: &str) -> AssistantError {
     ProtocolError::materialization_failed("assistant prompt contract", reason).into()
 }
 
-/// Items of the `## <heading>` section of `text`: each top-level `- ` bullet or
-/// `N. ` step, with its indented continuation lines joined by single spaces.
-///
-/// Any other content in the section (prose, sub-headings, nested or `*`
-/// bullets) is refused, so an edit of the contract cannot be merged into a
-/// neighbouring rule unnoticed.
-fn contract_items(text: &str, heading: &str) -> Result<Vec<String>, AssistantError> {
-    let mut items: Vec<String> = Vec::new();
-    let mut in_section = false;
-    for line in text.lines() {
-        if let Some(title) = line.strip_prefix("## ") {
-            in_section = title.trim() == heading;
-            continue;
-        }
-        if !in_section || line.trim().is_empty() {
-            continue;
-        }
-        let indented = line.starts_with(' ');
-        let trimmed = line.trim();
-        if !indented {
-            let item = list_item(trimmed).ok_or_else(|| {
-                contract_error(&format!("`{heading}` holds a line that is not a list item"))
-            })?;
-            items.push(item.to_owned());
-        } else if list_item(trimmed).is_some() || trimmed.starts_with(['*', '#']) {
-            return Err(contract_error(&format!(
-                "`{heading}` holds a nested list or heading"
-            )));
-        } else if let Some(last) = items.last_mut() {
-            last.push(' ');
-            last.push_str(trimmed);
-        } else {
-            return Err(contract_error(&format!(
-                "`{heading}` starts with a continuation line"
-            )));
-        }
-    }
-    Ok(items)
-}
-
-/// The text after a `- ` bullet marker or an `N. ` step number.
-fn list_item(line: &str) -> Option<&str> {
-    if let Some(rest) = line.strip_prefix("- ") {
-        return Some(rest);
-    }
-    let digits = line.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
-        return None;
-    }
-    line[digits..].strip_prefix(". ")
-}
-
-fn write_contract_safety(prompt: &mut String, contract: &PromptContract) {
+fn write_contract_safety(prompt: &mut String, contract: &knowledge::PromptContract) {
     let _ = writeln!(prompt, "## Safety");
     for rule in &contract.safety {
         let _ = writeln!(prompt, "- {rule}");

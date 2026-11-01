@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use crate::log::{self, FRAGMENT_DIR};
-use crate::{Concept, ConceptType, CONCEPT_SCHEMA_VERSION};
+use crate::{Concept, ConceptType, PromptContract, CONCEPT_SCHEMA_VERSION, PROMPT_CONTRACT_PATH};
 
 /// Summary returned after a bundle passes validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +128,13 @@ pub enum BundleValidationIssue {
         /// The fragment rule it breaks.
         reason: String,
     },
+    #[error("invalid prompt contract `{}`: {reason}", path.display())]
+    PromptContract {
+        /// The prompt contract file.
+        path: PathBuf,
+        /// The shape rule it breaks, with the offending line.
+        reason: String,
+    },
     #[error("unsupported file type in knowledge bundle: `{}`", path.display())]
     UnsupportedFileType {
         /// Path of the unsupported (non-file) entry.
@@ -142,7 +149,8 @@ pub enum BundleValidationIssue {
 /// Returns a [`BundleValidationError`] collecting every issue found: unreadable
 /// directories or files, missing or invalid frontmatter, duplicate concept ids,
 /// concepts missing a required `since`, broken internal links, reserved files
-/// carrying frontmatter, log fragments that break the rules of
+/// carrying frontmatter, an `assistant/system.md` that is not a well-formed
+/// [`PromptContract`], log fragments that break the rules of
 /// [`crate::log`], or unsupported file types.
 pub fn validate_bundle(
     dir: impl AsRef<Path>,
@@ -175,6 +183,15 @@ pub fn validate_bundle(
         };
 
         validate_links(&normalized_root, path, &content, &mut issues);
+
+        if path.strip_prefix(root).ok() == Some(Path::new(PROMPT_CONTRACT_PATH)) {
+            if let Err(error) = PromptContract::parse(&content) {
+                issues.push(BundleValidationIssue::PromptContract {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        }
 
         if is_reserved_markdown(path) {
             if has_frontmatter(&content) {
