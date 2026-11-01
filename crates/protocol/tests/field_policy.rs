@@ -470,7 +470,7 @@ const ROWS: &[Row] = &[
     row!(
         SessionOutputParams,
         Strict,
-        ["WireParams"],
+        ["WireParams", "StrictWireIdentity"],
         Probe::Key(empty_document),
         PARAMS_STRICT
     ),
@@ -596,9 +596,18 @@ fn with_probe_key(mut value: Value) -> Value {
 /// Whether `row` refuses an unknown key under one decoder.
 fn refuses(row: &Row, decode: fn(Value) -> Result<(), String>) -> bool {
     match row.probe {
-        Probe::Key(seed) => decode(with_probe_key(seed()))
-            .as_ref()
-            .is_err_and(|message| message.contains(PROBE_KEY)),
+        Probe::Key(seed) => match decode(with_probe_key(seed())) {
+            Ok(()) => false,
+            Err(message) if message.contains(PROBE_KEY) => true,
+            Err(message) => {
+                assert!(
+                    message.contains("missing field") || message.contains("untagged enum"),
+                    "{}: a key-only probe must fail on a missing field or an untagged mismatch when the key is ignored, got: {message}",
+                    row.name
+                );
+                false
+            }
+        },
         Probe::Documents(documents) => {
             let mut refused = Vec::new();
             for base in documents() {
@@ -761,6 +770,9 @@ fn hand_written_refusals(sources: &[Source]) -> Vec<(String, String)> {
 }
 
 /// Public `*Params`, `*Result` and `*Event` types that implement `Deserialize`.
+///
+/// The attributes of an item are every line above it back to the end of the
+/// previous item, so a rustfmt-wrapped `cfg_attr` block is read whole.
 fn payload_types(sources: &[Source]) -> Vec<String> {
     let mut names = Vec::new();
     for source in sources {
@@ -787,11 +799,10 @@ fn payload_types(sources: &[Source]) -> Vec<String> {
                 .iter()
                 .rev()
                 .take_while(|candidate| {
-                    let candidate = candidate.trim();
-                    candidate.starts_with('#')
-                        || candidate.starts_with(')')
-                        || candidate.ends_with(',')
-                        || candidate.ends_with('(')
+                    let candidate = candidate.trim_end();
+                    !(candidate.ends_with('}')
+                        || candidate.ends_with(';')
+                        || candidate.ends_with('{'))
                 })
                 .copied()
                 .collect::<Vec<_>>()
@@ -854,4 +865,29 @@ fn every_denying_site_and_payload_type_is_in_the_table() {
         missing.is_empty(),
         "payload types without a field-policy row: {missing:?}"
     );
+}
+
+#[test]
+fn the_scanner_reads_a_wrapped_attribute_block_whole() {
+    let source = Source {
+        file: "synthetic.rs".to_owned(),
+        code: [
+            "pub struct Earlier {}",
+            "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]",
+            "#[cfg_attr(feature = \"ts\", derive(ts_rs::TS))]",
+            "#[cfg_attr(",
+            "    feature = \"ts\",",
+            "    ts(export, export_to = \"WrappedResult.ts\")",
+            ")]",
+            "pub struct WrappedResult {",
+            "    pub ok: bool,",
+            "}",
+            "#[derive(Debug, Serialize)]",
+            "pub struct SerializeOnlyResult {",
+            "}",
+        ]
+        .join("\n"),
+    };
+
+    assert_eq!(payload_types(&[source]), ["WrappedResult"]);
 }

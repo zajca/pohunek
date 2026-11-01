@@ -2318,8 +2318,10 @@ Each protocol type has one field policy, kept in the table of
   framing (`Request`, `Response`, `ProtocolVersionRange`: a new envelope key is
   a protocol bump), signed, cross-validated and identity documents (governance
   status, transfer outcomes, `PackageIdentity`, `LaunchBinding`), the client
-  params that deny unknown keys, and the types the daemon also persists or
-  accepts as params until they gain a scoped decode.
+  params that deny unknown keys (including the `runtime` identity nested in
+  `session.output` and `session.wait` params, which has its own strict decode),
+  and the types the daemon also persists or accepts as params until they gain a
+  scoped decode.
 - **lenient**: the type carries no `deny_unknown_fields` and no hand-written
   refusal, so both decodes ignore an unknown key. Most param, result and event
   types are lenient; a daemon does not refuse a key of that kind in params, so

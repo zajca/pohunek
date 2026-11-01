@@ -12,8 +12,9 @@
 //! Design rules carried from the plan:
 //! - Requests carry a supported `v` range. Responses and events carry the
 //!   highest mutually selected exact version.
-//! - Public observation and mutation params reject unknown fields and invalid
-//!   cursor coordinates before dispatch.
+//! - The strict public params reject unknown fields (see the field-policy
+//!   table in `tests/field_policy.rs`) and invalid cursor coordinates before
+//!   dispatch.
 //! - Requests carry an `id` correlating the response and any related events.
 //! - Errors are typed (class + machine code + human message + optional recovery
 //!   hint) so `--json` consumers and operator agents can branch on them.

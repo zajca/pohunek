@@ -1325,6 +1325,29 @@ impl<'de> Deserialize<'de> for SessionRuntimeIdentity {
     }
 }
 
+/// Runtime identity nested in strict params: the daemon decodes it, so a key it
+/// does not know stays refused, unlike the identity a client reads from a
+/// result.
+struct StrictRuntimeIdentity(SessionRuntimeIdentity);
+
+impl<'de> Deserialize<'de> for StrictRuntimeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictWireIdentity {
+            worker_instance_id: String,
+            runtime_generation: RuntimeGeneration,
+        }
+        let wire = StrictWireIdentity::deserialize(deserializer)?;
+        SessionRuntimeIdentity::new(wire.worker_instance_id, wire.runtime_generation)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl SessionRuntimeIdentity {
     /// Creates a validated runtime identity.
     ///
@@ -1509,7 +1532,7 @@ impl<'de> Deserialize<'de> for SessionOutputParams {
         struct WireParams {
             session_id: SessionId,
             #[serde(default)]
-            runtime: Option<SessionRuntimeIdentity>,
+            runtime: Option<StrictRuntimeIdentity>,
             #[serde(default)]
             after_offset: Option<OutputOffset>,
             max_bytes: u32,
@@ -1519,7 +1542,7 @@ impl<'de> Deserialize<'de> for SessionOutputParams {
         let wire = WireParams::deserialize(deserializer)?;
         Self::new(
             wire.session_id,
-            wire.runtime,
+            wire.runtime.map(|runtime| runtime.0),
             wire.after_offset,
             wire.max_bytes,
             wire.wait_ms,
@@ -1962,7 +1985,7 @@ impl<'de> Deserialize<'de> for SessionWaitParams {
         struct WireParams {
             session_id: SessionId,
             #[serde(default)]
-            runtime: Option<SessionRuntimeIdentity>,
+            runtime: Option<StrictRuntimeIdentity>,
             #[serde(default)]
             after_updated_at: Option<String>,
             #[serde(default)]
@@ -1978,7 +2001,7 @@ impl<'de> Deserialize<'de> for SessionWaitParams {
         let wire = WireParams::deserialize(deserializer)?;
         Self::new(
             wire.session_id,
-            wire.runtime,
+            wire.runtime.map(|runtime| runtime.0),
             wire.after_updated_at,
             wire.after_terminal_watermark,
             wire.after_output_offset,
