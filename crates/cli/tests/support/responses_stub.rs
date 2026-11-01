@@ -9,6 +9,12 @@
 //! shell tool call that needs approval, until the conversation holds a tool
 //! result. Every other request gets a complete text reply.
 //!
+//! A prompt carrying `[flow:NAME]` (see [`FLOWS`]) scripts a multi-agent
+//! conversation: the root agent answers each of its requests with the next tool
+//! call of the flow, counted by the tool results in its conversation, and every
+//! other request, a child agent's included, gets a text reply. A child whose
+//! task message carries [`CHILD_HOLD_MARKER`] is held until the gate opens.
+//!
 //! The stub never sees a credential: it records whether any request carried an
 //! `Authorization` header, and a test asserts that none did.
 
@@ -59,6 +65,129 @@ pub(crate) const BACKGROUND_COMMAND: &str = "sleep 3600";
 /// to the model, in milliseconds.
 const BACKGROUND_YIELD_MS: u64 = 1000;
 
+/// Prefix of the prompt text that selects a scripted multi-agent flow.
+pub(crate) const FLOW_PREFIX: &str = "[flow:";
+
+/// Task text that makes the stub hold a child agent's reply until the gate
+/// opens, so the child's turn is running while the root acts on it.
+pub(crate) const CHILD_HOLD_MARKER: &str = "[child-hold]";
+
+/// Task text of a child agent that answers at once.
+pub(crate) const CHILD_TASK: &str = "[child-task]";
+
+/// Task name of the child in the flows of the `multi_agent_v2` tools.
+const V2_TASK_NAME: &str = "worker_one";
+
+/// Timeout the flows give a `wait_agent`, in milliseconds: the hang guard, since
+/// every flow waits only for a child that finishes.
+fn wait_agent_ms() -> u64 {
+    u64::try_from(pohunek_test_support::wait::HANG_GUARD.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A flow step: the tool namespace, the tool and its arguments, where the
+/// string `$ID` stands for the child's agent id (its task name in the
+/// `multi_agent_v2` flows).
+type Step = (&'static str, &'static str, fn() -> serde_json::Value);
+
+/// The scripted flows: the name in `[flow:NAME]` and the root's tool calls in
+/// order.
+pub(crate) const FLOW_NAMES: [&str; 7] = [
+    "spawn_complete",
+    "followup_v1",
+    "followup_v2",
+    "resume_after_close",
+    "interrupted_v1",
+    "interrupted_v2",
+    "close_running_v1",
+];
+
+fn flow_steps(name: &str) -> &'static [Step] {
+    const V1: &str = "multi_agent_v1";
+    const V2: &str = "collaboration";
+    fn spawn_v1(message: &str) -> serde_json::Value {
+        serde_json::json!({ "message": message })
+    }
+    fn spawn_v2(message: &str) -> serde_json::Value {
+        serde_json::json!({ "task_name": V2_TASK_NAME, "message": message, "fork_turns": "none" })
+    }
+    fn wait_v1() -> serde_json::Value {
+        serde_json::json!({ "targets": ["$ID"], "timeout_ms": wait_agent_ms() })
+    }
+    fn wait_v2() -> serde_json::Value {
+        serde_json::json!({ "timeout_ms": wait_agent_ms() })
+    }
+    match name {
+        "spawn_complete" => &[
+            (V1, "spawn_agent", || spawn_v1(&format!("{CHILD_TASK} one"))),
+            (V1, "wait_agent", wait_v1),
+        ],
+        "followup_v1" => &[
+            (V1, "spawn_agent", || spawn_v1(&format!("{CHILD_TASK} one"))),
+            (V1, "wait_agent", wait_v1),
+            (
+                V1,
+                "send_input",
+                || serde_json::json!({ "target": "$ID", "message": format!("{CHILD_TASK} two") }),
+            ),
+            (V1, "wait_agent", wait_v1),
+        ],
+        "followup_v2" => &[
+            (V2, "spawn_agent", || spawn_v2(&format!("{CHILD_TASK} one"))),
+            (V2, "wait_agent", wait_v2),
+            (
+                V2,
+                "followup_task",
+                || serde_json::json!({ "target": "$ID", "message": format!("{CHILD_TASK} two") }),
+            ),
+            (V2, "wait_agent", wait_v2),
+        ],
+        "resume_after_close" => &[
+            (V1, "spawn_agent", || spawn_v1(&format!("{CHILD_TASK} one"))),
+            (V1, "wait_agent", wait_v1),
+            (V1, "close_agent", || serde_json::json!({ "target": "$ID" })),
+            (V1, "resume_agent", || serde_json::json!({ "id": "$ID" })),
+            (
+                V1,
+                "send_input",
+                || serde_json::json!({ "target": "$ID", "message": format!("{CHILD_TASK} two") }),
+            ),
+            (V1, "wait_agent", wait_v1),
+        ],
+        "interrupted_v1" => &[
+            (V1, "spawn_agent", || {
+                spawn_v1(&format!("{CHILD_HOLD_MARKER} one"))
+            }),
+            (V1, "send_input", || {
+                serde_json::json!({
+                    "target": "$ID",
+                    "message": format!("{CHILD_TASK} two"),
+                    "interrupt": true,
+                })
+            }),
+            (V1, "wait_agent", wait_v1),
+        ],
+        "interrupted_v2" => &[
+            (V2, "spawn_agent", || {
+                spawn_v2(&format!("{CHILD_HOLD_MARKER} one"))
+            }),
+            (
+                V2,
+                "interrupt_agent",
+                || serde_json::json!({ "target": "$ID" }),
+            ),
+            (V2, "list_agents", || serde_json::json!({})),
+        ],
+        "close_running_v1" => &[
+            (V1, "spawn_agent", || {
+                spawn_v1(&format!("{CHILD_HOLD_MARKER} one"))
+            }),
+            (V1, "close_agent", || serde_json::json!({ "target": "$ID" })),
+            (V1, "wait_agent", wait_v1),
+        ],
+        _ => &[],
+    }
+}
+
 /// Largest request body the stub reads, in bytes.
 ///
 /// Agent requests carry the system prompt, tool declarations and the
@@ -81,6 +210,8 @@ struct State {
     stopping: AtomicBool,
     gate_open: Mutex<bool>,
     gate_changed: Condvar,
+    held_started: Mutex<usize>,
+    held_changed: Condvar,
     bodies: Mutex<Vec<String>>,
 }
 
@@ -153,6 +284,30 @@ impl ResponsesStub {
             .collect()
     }
 
+    /// The outputs of the tool calls in the newest request of the root agent of
+    /// a flow, oldest first: once the script is done, the output of every call
+    /// it made.
+    pub(crate) fn flow_tool_outputs(&self) -> Vec<String> {
+        let bodies = self.state.bodies.lock().expect("bodies lock");
+        let root = bodies.iter().rev().find_map(|body| {
+            let request: serde_json::Value = serde_json::from_str(body).ok()?;
+            user_messages(&request)
+                .iter()
+                .any(|message| message.contains(FLOW_PREFIX))
+                .then_some(request)
+        });
+        root.and_then(|request| {
+            request["input"].as_array().map(|input| {
+                input
+                    .iter()
+                    .filter(|item| item["type"] == "function_call_output")
+                    .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+    }
+
     /// Lets every held response, and every later one, complete.
     pub(crate) fn open_gate(&self) {
         *self.state.gate_open.lock().expect("gate lock") = true;
@@ -222,7 +377,19 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
         &serde_json::json!({ "type": "response.created", "response": { "id": "resp_stub" } }),
     )?;
     let no_tool_result = !request.body.contains(TOOL_RESULT_MARKER);
-    if request.body.contains(APPROVAL_MARKER) && no_tool_result {
+    let flow = flow_reply(&request.body);
+    if let FlowReply::Call(call) = &flow {
+        // A flow that holds its child acts on the child only once the child's
+        // turn is running.
+        if request.body.contains(CHILD_HOLD_MARKER) {
+            wait_for_held_child(state);
+        }
+        send_function_call(&mut writer, call)?;
+    } else if let FlowReply::HeldText = flow {
+        send_text(&mut writer, state, true)?;
+    } else if matches!(flow, FlowReply::Text) {
+        send_text(&mut writer, state, false)?;
+    } else if request.body.contains(APPROVAL_MARKER) && no_tool_result {
         send_approval_command(&mut writer)?;
     } else if request.body.contains(BACKGROUND_MARKER) && no_tool_result {
         send_background_command(&mut writer)?;
@@ -251,12 +418,138 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
     Ok(())
 }
 
+/// What a request of a scripted flow gets.
+enum FlowReply {
+    /// The request is not part of a flow.
+    NotAFlow,
+    /// The next tool call of the root agent's script.
+    Call(serde_json::Value),
+    /// A child agent's reply, held until the gate opens.
+    HeldText,
+    /// A text reply: a child's task, or the root once its script is done.
+    Text,
+}
+
+/// The text of the user messages in a Responses request body.
+fn user_messages(request: &serde_json::Value) -> Vec<String> {
+    request["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "message" && item["role"] == "user")
+        .map(|item| {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// The first agent id (a UUID) in `text`.
+fn first_agent_id(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    (0..bytes.len().saturating_sub(35)).find_map(|start| {
+        let candidate = text.get(start..start + 36)?;
+        let shape_ok = candidate.char_indices().all(|(index, character)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        });
+        shape_ok.then(|| candidate.to_owned())
+    })
+}
+
+/// Decides the reply of a flow request: the root (a conversation whose user
+/// messages name a flow) gets its next scripted call, a child whose task
+/// carries the hold marker is held, anything else gets text.
+fn flow_reply(body: &str) -> FlowReply {
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+        return FlowReply::NotAFlow;
+    };
+    let messages = user_messages(&request);
+    let flow = messages.iter().find_map(|message| {
+        let start = message.find(FLOW_PREFIX)? + FLOW_PREFIX.len();
+        let end = message[start..].find(']')?;
+        Some(message[start..start + end].to_owned())
+    });
+    let Some(flow) = flow else {
+        let last = request["input"]
+            .as_array()
+            .and_then(|input| input.last())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        return if last.contains(CHILD_HOLD_MARKER) {
+            FlowReply::HeldText
+        } else {
+            FlowReply::NotAFlow
+        };
+    };
+    let outputs: Vec<&str> = request["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().unwrap_or(""))
+        .collect();
+    let steps = flow_steps(&flow);
+    let Some((namespace, tool, arguments)) = steps.get(outputs.len()) else {
+        return FlowReply::Text;
+    };
+    let target = if *namespace == "collaboration" {
+        Some(V2_TASK_NAME.to_owned())
+    } else {
+        outputs.first().and_then(|output| first_agent_id(output))
+    };
+    // A step that names the child cannot be built before the child exists; the
+    // flow then ends with text and the test fails on the missing evidence.
+    let arguments = arguments().to_string();
+    let arguments = match target {
+        Some(target) => arguments.replace("$ID", &target),
+        None if arguments.contains("$ID") => return FlowReply::Text,
+        None => arguments,
+    };
+    FlowReply::Call(serde_json::json!({
+        "type": "function_call",
+        "id": format!("fc_stub_{}", outputs.len()),
+        "call_id": format!("call_stub_{}", outputs.len()),
+        "namespace": namespace,
+        "name": tool,
+        "arguments": arguments,
+    }))
+}
+
+/// Streams one tool call of a flow.
+fn send_function_call(writer: &mut TcpStream, call: &serde_json::Value) -> io::Result<()> {
+    for name in ["response.output_item.added", "response.output_item.done"] {
+        send_event(
+            writer,
+            name,
+            &serde_json::json!({ "type": name, "output_index": 0, "item": call }),
+        )?;
+    }
+    Ok(())
+}
+
 fn keep_body(state: &State, body: &str) {
     let mut bodies = state.bodies.lock().expect("bodies lock");
     if bodies.len() == KEPT_BODIES {
         bodies.remove(0);
     }
     bodies.push(body.to_owned());
+}
+
+/// Blocks until a held reply has started streaming.
+fn wait_for_held_child(state: &State) {
+    let mut started = state.held_started.lock().expect("held lock");
+    while *started == 0 {
+        started = state.held_changed.wait(started).expect("held wait");
+    }
 }
 
 /// Blocks until the gate is open.
@@ -288,6 +581,8 @@ fn send_text(writer: &mut TcpStream, state: &State, held: bool) -> io::Result<()
     )?;
     send_delta(writer, FIRST_CHUNK)?;
     if held {
+        *state.held_started.lock().expect("held lock") += 1;
+        state.held_changed.notify_all();
         wait_for_gate(state);
     }
     send_delta(writer, SECOND_CHUNK)?;

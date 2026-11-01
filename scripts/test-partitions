@@ -118,12 +118,13 @@ MACOS_BUCKETS = {
             "(package(=pohunek-cli) and binary(=all) and test(/^claude_package::capture_the_real_claude_/))",
         )),
     ),
-    # Real-upstream tests of the runtime packages. The Linux package jobs run
-    # them under `--profile package`; the Hermes macOS job also runs
-    # `hermes_package` with `--include-ignored`.
+    # Real-upstream tests of the runtime packages and of the Codex subagent
+    # hook capture. The Linux package jobs run them under `--profile package`;
+    # the Hermes macOS job also runs `hermes_package` with `--include-ignored`.
     "owned-elsewhere": Bucket(
         ("pohunek-cli",),
-        "package(=pohunek-cli) and binary(=all) and test(/^(claude|codex|pi|hermes)_package::/) "
+        "package(=pohunek-cli) and binary(=all) and "
+        "test(/^((claude|codex|pi|hermes)_package|codex_subagent_sequences)::/) "
         "and not test(/^claude_package::capture_the_real_claude_/)",
     ),
 }

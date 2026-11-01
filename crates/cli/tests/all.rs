@@ -20,6 +20,8 @@ mod attach_stream_input;
 mod claude_package;
 #[path = "codex_package.rs"]
 mod codex_package;
+#[path = "codex_subagent_sequences.rs"]
+mod codex_subagent_sequences;
 #[path = "completion_dynamic.rs"]
 mod completion_dynamic;
 #[path = "daemon_packaging.rs"]

@@ -4667,6 +4667,17 @@ mod tests {
         let fixture: Value = serde_json::from_str(CODEX_SUBAGENT_COMPATIBILITY_FIXTURE)
             .expect("valid Codex compatibility fixture");
 
+        // Codex names the child's own transcript at its start and at its stop
+        // (`agent_transcript_path`), and the parent's at its stop.
+        assert_eq!(
+            fixture["start"]["transcript_path"], fixture["stop"]["agent_transcript_path"],
+            "the start names the child's transcript"
+        );
+        assert_ne!(
+            fixture["stop"]["transcript_path"], fixture["start"]["transcript_path"],
+            "the stop names the parent's transcript"
+        );
+
         let start = run_worker_state_asset("codex", SUBAGENT_START_ACTION, &fixture["start"]);
         assert_eq!(start["type"], "subagent_start");
         assert_eq!(start["provider"], "codex");
@@ -4682,6 +4693,13 @@ mod tests {
         assert_eq!(stop["outcome"], "completed");
         assert!(stop.get("agent_transcript_path").is_none());
         assert!(stop.get("last_assistant_message").is_none());
+        for claim in [&start, &stop] {
+            let claim = claim.to_string();
+            assert!(
+                !claim.contains("sanitized"),
+                "no transcript path or message crosses the boundary: {claim}"
+            );
+        }
     }
 
     #[test]

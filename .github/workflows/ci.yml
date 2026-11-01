@@ -3039,7 +3039,7 @@ jobs:
       - name: Drive the real Codex
         run: |
           rm -f target/nextest/package/junit.xml
-          cargo nextest run --locked --profile package -p pohunek-cli --test all -E 'test(/^codex_package::/)' --run-ignored all --test-threads 1
+          cargo nextest run --locked --profile package -p pohunek-cli --test all -E 'test(/^codex_(package|subagent_sequences)::/)' --run-ignored all --test-threads 1
 
       - name: Summarize flaky tests
         if: always()

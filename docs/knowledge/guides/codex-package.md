@@ -276,7 +276,26 @@ composer.
   no recorded start records a completed subagent. Codex fires `SubagentStop`
   once per completed child turn, so a repeated stop on a finished child only
   advances its recorded ordering and leaves it completed (the Codex-specific
-  gaps are tracked in [#916](https://github.com/zajca/pohunek/issues/916)). The app-server also outlives the TUI when it is
+  gaps are tracked in [#916](https://github.com/zajca/pohunek/issues/916)).
+  The subagent hook inputs and sequences of 0.164.0 are committed as fixtures:
+  `compat/codex/subagent-hooks.json` holds a start and a stop input with their
+  transcript labels (the start names the child's own transcript; the stop names
+  the parent's, and the child's in `agent_transcript_path`; no path or message
+  crosses the hook boundary), and `compat/codex/subagent-hook-sequences.json`
+  holds, per flow (spawn, follow-up through `send_input` and `followup_task`,
+  resume after close, an interrupted turn, a close of a running child), the hook
+  events in order and their key sets. A resumed child fires no `SubagentStart`,
+  an interrupted or closed child fires no `SubagentStop`, and a `multi_agent_v2`
+  child fires no `UserPromptSubmit`. The opt-in test
+  `a_real_codex_produces_the_committed_subagent_hook_sequences` records the
+  flows again from the real `codex` through the loopback Responses stub and
+  compares them with the file; it refuses a `codex` that is not the locked
+  release, and the `codex-package` CI job runs it. Run it alone with
+  `POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test all -- --include-ignored
+  --test-threads 1 --nocapture codex_subagent_sequences::`; after a deliberate
+  change of the release or the flows, merge the observed recording it prints
+  into the file (its `format`, `tools` and `description` fields are
+  hand-written). The app-server also outlives the TUI when it is
   detached; the fixture's process guard stops every process of the fixture,
   including after a failed assertion. A Codex state hook action (`session`,
   `subagent-start`, `subagent-stop`) that fails to deliver its report still
