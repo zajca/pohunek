@@ -5613,8 +5613,9 @@ async fn notification_create_keeps_missing_session_reference() {
     let mut control = connect(&socket).await;
     let missing = SessionId("s-missing".to_owned());
 
-    let created =
-        create_notification(&mut control, notification_params(Some(missing.clone()))).await;
+    let mut params = notification_params(Some(missing.clone()));
+    "scenario-tool".clone_into(&mut params.source.provider);
+    let created = create_notification(&mut control, params).await;
 
     assert_eq!(created.record.session_id, Some(missing));
     assert_eq!(created.record.agent_kind, None);

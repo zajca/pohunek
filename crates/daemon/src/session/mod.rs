@@ -8553,6 +8553,35 @@ impl SessionRegistry {
         }
     }
 
+    /// Like [`Self::admit_session_hook`], for a report that stores a record
+    /// and so must name a session this registry holds: an unknown session is
+    /// refused with [`HookAdmissionError::UnknownSession`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`HookAdmissionError`] of [`Self::admit_session_hook`], or
+    /// `UnknownSession` when the registry holds no session `id`.
+    pub async fn admit_held_session_hook(
+        &self,
+        id: &SessionId,
+        action: pohunek_worker_protocol::HookAction,
+        provider: &str,
+        operation: &str,
+        retryable: bool,
+    ) -> Result<(), HookAdmissionError> {
+        match self
+            .session_hook_admission(id, action, provider, operation, retryable)
+            .await
+        {
+            None => {
+                let refusal = HookAdmissionError::UnknownSession;
+                log_hook_refusal(id, operation, &refusal);
+                Err(refusal)
+            }
+            Some(admission) => admission.map(|_schema| ()),
+        }
+    }
+
     /// The hook schema that admits `action` from `provider` on session `id`,
     /// or the refusal, which is logged at WARN naming `operation`. `None` when
     /// the session is unknown.
@@ -8750,6 +8779,8 @@ pub enum HookAdmissionError {
         /// The configured `worker_connect_deadline` the admission waited.
         bound: Duration,
     },
+    /// The registry holds no session with the reported id.
+    UnknownSession,
 }
 
 /// Code of the retryable refusal of a hook report whose session worker could
@@ -8798,6 +8829,12 @@ fn log_hook_refusal(id: &SessionId, operation: &str, refusal: &HookAdmissionErro
             operation,
             bound_ms = bound.as_millis(),
             "the hook report is refused: the worker's hook schema was unavailable after the bound"
+        ),
+        HookAdmissionError::UnknownSession => warn!(
+            name: "session.hook.report_refused",
+            session_id = %id.0,
+            operation,
+            "the hook report is refused: the registry holds no such session"
         ),
     }
 }

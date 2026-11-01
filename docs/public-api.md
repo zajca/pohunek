@@ -1473,12 +1473,18 @@ hooks use when the worker refuses a report. `session.report_agent`,
 / `released: false` for a session whose runtime has no schema, whose schema
 does not admit the action, or whose provider is not admitted, and
 `notification.create` answers `hook_not_admitted` for a create that
-names a session and a hooked provider (`shell`, `codex`, `claude`, `hermes`) on
+names a session and a hooked provider (`shell`, `codex`, `claude`, `hermes`, `muse`) on
 such a session. The provider is judged by the name the record would be stored
 and ranked under (control characters dropped, whitespace collapsed), and a
 create whose raw provider only normalizes to a hooked provider (for example
 `" codex"`) is refused with `hook_not_admitted` whatever the session's schema.
-A session's own runtime is always an admitted provider for identity reports.
+`notification.create` also answers `hook_not_admitted` for such a hooked
+provider when the daemon holds no session with the reported id, so such a
+report is never stored as a provider-ranked record for an id that cannot be
+checked against a hook schema; the refusal is final even with `retryable_admission`. A create from any
+other producer for an unknown session id is stored, and the three identity
+reports keep ignoring an unknown session. A session's own runtime is always an
+admitted provider for identity reports.
 
 **Retryable admission.** A session without a served launch pin is admitted by
 the schema its live worker journaled, and the public socket waits for that

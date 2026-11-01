@@ -1150,7 +1150,7 @@ mod tests {
     fn attention_create_request(id: &str) -> Request {
         let params = protocol::NotificationCreateParams {
             source: protocol::NotificationSource {
-                provider: "codex".to_owned(),
+                provider: "scenario-tool".to_owned(),
                 provider_event: "PermissionRequest".to_owned(),
                 host_local_source_id: "codex-hook-s-1".to_owned(),
             },
@@ -1176,7 +1176,7 @@ mod tests {
     fn error_create_request(id: &str) -> Request {
         let params = protocol::NotificationCreateParams {
             source: protocol::NotificationSource {
-                provider: "codex".to_owned(),
+                provider: "scenario-tool".to_owned(),
                 provider_event: "Error".to_owned(),
                 host_local_source_id: "codex-error-s-1".to_owned(),
             },
@@ -1202,7 +1202,7 @@ mod tests {
     fn turn_create_request(id: &str) -> Request {
         let params = protocol::NotificationCreateParams {
             source: protocol::NotificationSource {
-                provider: "codex".to_owned(),
+                provider: "scenario-tool".to_owned(),
                 provider_event: "Stop".to_owned(),
                 host_local_source_id: "codex-stop-s-1".to_owned(),
             },

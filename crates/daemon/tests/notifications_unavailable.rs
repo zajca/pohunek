@@ -242,6 +242,7 @@ async fn assert_notification_calls_refused(client: &mut pohunek_client::Client, 
         "{case}"
     );
     let mut debounced = create_params();
+    "scenario-tool".clone_into(&mut debounced.source.provider);
     debounced.session_id = Some(protocol::SessionId("s-1".to_owned()));
     debounced.dedupe_key = Some("attention:s-1".to_owned());
     let created = client
