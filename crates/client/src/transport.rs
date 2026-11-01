@@ -2074,7 +2074,12 @@ pub async fn names_this_machine_in(
     if target.port.is_some() {
         return Ok(false);
     }
-    match tokio::time::timeout(connect_timeout, registry.resolve_target(target.selector)).await {
+    match tokio::time::timeout(
+        registry.outer_budget(connect_timeout),
+        registry.resolve_target(target.selector),
+    )
+    .await
+    {
         Ok(Ok(HostTarget::Local)) => Ok(true),
         Ok(Err(error @ RegistryError::AmbiguousHost { .. })) => Err(ClientError::from(error)),
         Ok(Ok(HostTarget::Remote(_)) | Err(_)) | Err(_) => Ok(false),
@@ -2155,10 +2160,11 @@ async fn select_host(
                 })
         }
     };
-    match tokio::time::timeout(connect_timeout, selected).await {
+    let budget = registry.outer_budget(connect_timeout);
+    match tokio::time::timeout(budget, selected).await {
         Ok(result) => result.map_err(ClientError::from),
         Err(_elapsed) => Err(ClientError::RemoteDiscoveryFailed {
-            detail: format!("timed out resolving remote host '{host}' after {connect_timeout:?}"),
+            detail: format!("timed out resolving remote host '{host}' after {budget:?}"),
         }),
     }
 }
@@ -2312,7 +2318,8 @@ async fn resolve_remote_addr(
     registry: OverlayRegistry,
 ) -> Result<(String, SocketAddr), ClientError> {
     let target = RemoteTarget::parse(&host)?;
-    match tokio::time::timeout(connect_timeout, registry.resolve_host(target.selector)).await {
+    let budget = registry.outer_budget(connect_timeout);
+    match tokio::time::timeout(budget, registry.resolve_host(target.selector)).await {
         Ok(result) => result
             .map(|route| {
                 (
@@ -2325,7 +2332,7 @@ async fn resolve_remote_addr(
             })
             .map_err(ClientError::from),
         Err(_elapsed) => Err(ClientError::RemoteDiscoveryFailed {
-            detail: format!("timed out resolving remote host '{host}' after {connect_timeout:?}"),
+            detail: format!("timed out resolving remote host '{host}' after {budget:?}"),
         }),
     }
 }
@@ -2501,6 +2508,7 @@ mod tests {
                 display_name: Some("member".to_owned()),
                 fqdn: Some("member.test".to_owned()),
                 address: Some(self.member),
+                address_ambiguous: false,
             };
             Box::pin(async move { Ok(vec![peer]) })
         }

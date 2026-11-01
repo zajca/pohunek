@@ -68,6 +68,30 @@ impl Fixture {
         }
     }
 
+    /// Rewrites `overlays.toml` with the provider, the port and `extra` keys.
+    fn configure(&self, extra: &str) {
+        let file = self.env.config_home().join("pohunek").join("overlays.toml");
+        fs::write(
+            &file,
+            format!("providers = [\"tailscale\"]\nport = {PORT}\n{extra}\n"),
+        )
+        .expect("rewrite overlays.toml");
+    }
+
+    /// Starts the CLI without waiting for it.
+    fn spawn(&self, args: &[&str]) -> std::process::Child {
+        self.env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .env("PATH", self.fake.bin_dir())
+            .env("LD_PRELOAD", &self.redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &self.capture)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the pohunek CLI")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.env
             .command(pohunek_test_support::bin_exe("pohunek"))
@@ -615,4 +639,262 @@ fn a_name_shared_with_this_machine_is_ambiguous() {
     let (output, targets) = fixture.dial("self-box");
     assert_eq!(error_code(&output), "overlay_host_ambiguous");
     assert!(targets.is_empty(), "{targets:?}");
+}
+
+/// Replaces the fake CLI with one that records its pid and never answers.
+fn install_hanging_cli(fixture: &Fixture) -> PathBuf {
+    let pid = fixture.env.root().join("tailscale.pid");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{pid}.child'\nwait\n",
+            pid = pid.display()
+        ),
+    )
+    .expect("write the hanging fake");
+    pid
+}
+
+/// Asserts that the process whose pid `file` records is gone or only a zombie
+/// awaiting its reaper.
+fn assert_not_running(file: &std::path::Path) {
+    let recorded = fs::read_to_string(file).expect("the fake recorded its pid");
+    let stat = fs::read_to_string(
+        std::path::Path::new("/proc")
+            .join(recorded.trim())
+            .join("stat"),
+    );
+    let state = stat
+        .ok()
+        .and_then(|text| text.rsplit(')').next().map(str::to_owned))
+        .and_then(|rest| rest.split_whitespace().next().map(str::to_owned));
+    assert!(
+        state.is_none_or(|state| state == "Z"),
+        "{}: the process of the hung CLI is still running",
+        file.display()
+    );
+}
+
+/// A status probe that never answers ends at the configured deadline as
+/// `tailscale_state_unavailable` for listing and for `--host` resolution, and
+/// the CLI it started is gone.
+#[test]
+fn a_status_probe_that_never_answers_is_bounded_and_killed() {
+    let fixture = Fixture::new(&tailnet());
+    // timing-allowed: #1565 the one-second status deadline expiring is the behaviour under test.
+    fixture.configure("status_timeout_secs = 1");
+    let pid = install_hanging_cli(&fixture);
+
+    let output = fixture.run(&["host", "list", "--refresh", "--json"]);
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert!(
+        error_message(&output).contains("did not answer within"),
+        "{}",
+        error_message(&output)
+    );
+    for file in [pid.clone(), pid.with_extension("pid.child")] {
+        assert_not_running(&file);
+    }
+
+    // A CLI that exits but leaves a helper holding its output is bounded and
+    // its helper is killed too.
+    let helper = fixture.env.root().join("tailscale.helper");
+    let runs = fixture.env.root().join("tailscale.runs");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nprintf x >> '{runs}'\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{helper}'\nexit 0\n",
+            runs = runs.display(),
+            helper = helper.display()
+        ),
+    )
+    .expect("write the leaking fake");
+    let output = fixture.run(&["host", "list", "--refresh", "--json"]);
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert_not_running(&helper);
+
+    // A `--host` command probes the provider to learn whether the name is this
+    // machine and again to resolve the peer: two probes, never more.
+    let before = fs::read_to_string(&runs).expect("runs so far").len();
+    let (output, targets) = fixture.dial("alpha");
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert!(targets.is_empty(), "{targets:?}");
+    let after = fs::read_to_string(&runs).expect("runs so far").len();
+    assert_eq!(after - before, 2, "the status probe ran twice per command");
+}
+
+/// The deadline is a strict, range-checked `overlays.toml` key.
+#[test]
+fn an_unusable_status_deadline_is_refused_before_any_probe() {
+    let fixture = Fixture::new(&tailnet());
+    for value in ["0", "121", "-1", "\"fast\"", "1.5"] {
+        fixture.configure(&format!("status_timeout_secs = {value}"));
+        let output = fixture.run(&["host", "list", "--refresh", "--json"]);
+        assert_eq!(
+            error_code(&output),
+            "overlay_configuration_invalid",
+            "{value}"
+        );
+        assert!(
+            error_message(&output).contains("status_timeout_secs")
+                || error_message(&output).contains("schema"),
+            "{value}: {}",
+            error_message(&output)
+        );
+        assert_eq!(fixture.fake.invocations(), 0, "{value}");
+    }
+}
+
+/// A node address that two peers list is no route: the selectors that reach it
+/// are ambiguous between both peers, the listing keeps both as candidates and
+/// names why, and a peer with its own address is unaffected.
+#[test]
+fn an_address_listed_for_two_peers_is_not_used_for_routing() {
+    let status = Status::running(
+        SELF_ADDRESS,
+        vec![
+            Node::peer("alpha", "nALPHA00001CNTRL", &["100.64.0.10"]),
+            Node::peer("bravo", "nBRAVO00001CNTRL", &["100.64.0.10"]),
+            Node::peer("charlie", "nCHARL00001CNTRL", &["100.64.0.30"]),
+            // Shares only its IPv6 address with `echo`, and the address of
+            // this machine with `foxtrot`.
+            Node::peer(
+                "delta",
+                "nDELTA00001CNTRL",
+                &["100.64.0.40", "fd7a:115c:a1e0::40"],
+            ),
+            Node::peer("echo", "nECHO000001CNTRL", &["fd7a:115c:a1e0::40"]),
+            Node::peer("foxtrot", "nFOXTR00001CNTRL", &[SELF_ADDRESS]),
+        ],
+    );
+    let fixture = Fixture::new(&status);
+    let (peers, _) = records(&fixture.run(&["host", "list", "--refresh", "--json"]));
+    for name in ["alpha", "bravo", "delta", "echo", "foxtrot"] {
+        let entry = record(&peers, name);
+        assert!(entry["address"].is_null(), "{name}: {entry}");
+        assert_eq!(entry["classification"], "candidate", "{name}");
+        assert_eq!(entry["reason"], "address_ambiguous", "{name}");
+    }
+    assert_eq!(record(&peers, "charlie")["address"], "100.64.0.30");
+
+    for selector in ["alpha", "bravo", "100.64.0.10", "echo", "delta", "foxtrot"] {
+        let (output, targets) = fixture.dial(selector);
+        assert_eq!(error_code(&output), "overlay_host_ambiguous", "{selector}");
+        assert!(targets.is_empty(), "{selector}: {targets:?}");
+        let message = error_message(&output);
+        let named = match selector {
+            "alpha" | "bravo" | "100.64.0.10" => vec!["alpha", "bravo"],
+            "echo" | "delta" => vec!["delta", "echo"],
+            _ => vec!["foxtrot", "this machine"],
+        };
+        for name in named {
+            assert!(message.contains(name), "{selector}: {name} in {message}");
+        }
+    }
+    let (output, targets) = fixture.dial("charlie");
+    assert_eq!(error_code(&output), "host_unreachable");
+    assert_eq!(targets, ["100.64.0.30:9100"]);
+}
+
+/// Replaces the fake CLI with one that starts a helper holding the write end
+/// of the named pipe `alive`. Opening the pipe for reading returns once the
+/// helper exists, so a signal sent afterwards cannot miss it, and the pipe
+/// reads as end of file once the helper is gone, with no polling.
+fn install_pipe_holding_cli(fixture: &Fixture) -> PathBuf {
+    let alive = fixture.env.root().join("tailscale.alive");
+    nix::unistd::mkfifo(&alive, nix::sys::stat::Mode::from_bits_truncate(0o600))
+        .expect("create the liveness pipe");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\n/bin/sleep 3600 9> '{alive}' &\nwait\n",
+            alive = alive.display()
+        ),
+    )
+    .expect("write the pipe-holding fake");
+    alive
+}
+
+/// Blocks until every holder of the write end of `alive` is gone, for at most
+/// [`pohunek_test_support::wait::HANG_GUARD`].
+fn read_until_released(mut alive: fs::File) {
+    let (done, released) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read = std::io::copy(&mut alive, &mut std::io::sink());
+        let _ = done.send(read.map(|_bytes| ()));
+    });
+    released
+        .recv_timeout(pohunek_test_support::wait::HANG_GUARD)
+        .expect("a process of the hung CLI still holds the liveness pipe")
+        .expect("read the liveness pipe to its end");
+}
+
+/// A status deadline longer than the 5 s connect timeout ends the probe as
+/// `tailscale_state_unavailable`: the resolution budget follows the status
+/// deadline.
+#[test]
+fn host_resolution_waits_for_a_status_deadline_longer_than_the_connect_timeout() {
+    let fixture = Fixture::new(&tailnet());
+    // timing-allowed: #1565 the deadline versus the 5 s connect timeout is the behaviour under test and runs in a separate binary.
+    fixture.configure("status_timeout_secs = 6");
+    install_hanging_cli(&fixture);
+    let (output, targets) = fixture.dial("alpha");
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert!(targets.is_empty(), "{targets:?}");
+}
+
+/// Interrupting the CLI during a status probe takes the provider and the
+/// helper it started down with it.
+#[test]
+fn an_interrupted_command_leaves_no_provider_process() {
+    let fixture = Fixture::new(&tailnet());
+    fixture.configure("status_timeout_secs = 120");
+    let alive = install_pipe_holding_cli(&fixture);
+    let mut child = fixture.spawn(&["host", "list", "--refresh", "--json"]);
+    // Opening the read end returns once the helper holds the write end.
+    let reader = fs::File::open(&alive).expect("open the liveness pipe");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("interrupt the CLI");
+    child.wait().expect("the CLI ends");
+    read_until_released(reader);
+}
+
+/// A CLI that exited and left a helper holding its output does not outlive an
+/// interrupted command: the helper is still running while the command drains
+/// that output, and goes down with the command.
+#[test]
+fn an_interrupted_command_reaps_a_helper_that_outlives_the_provider() {
+    let fixture = Fixture::new(&tailnet());
+    fixture.configure("status_timeout_secs = 120");
+    let exited = fixture.env.root().join("tailscale.exited");
+    let alive = fixture.env.root().join("tailscale.alive");
+    for pipe in [&exited, &alive] {
+        nix::unistd::mkfifo(pipe, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("create a liveness pipe");
+    }
+    // `exited` is held by the CLI alone, `alive` by its helper alone.
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nexec 8> '{exited}'\n/bin/sleep 3600 8>&- 9> '{alive}' &\nexit 0\n",
+            exited = exited.display(),
+            alive = alive.display()
+        ),
+    )
+    .expect("write the leaking fake");
+    let mut child = fixture.spawn(&["host", "list", "--refresh", "--json"]);
+    // Each open returns once the fake holds the write end.
+    let exited_reader = fs::File::open(&exited).expect("open the exit pipe");
+    let alive_reader = fs::File::open(&alive).expect("open the liveness pipe");
+    read_until_released(exited_reader);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("interrupt the CLI");
+    child.wait().expect("the CLI ends");
+    read_until_released(alive_reader);
 }

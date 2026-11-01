@@ -21,6 +21,9 @@
 //! consulted. Error messages carry the file path and, at most, a line number,
 //! never a value from the file.
 //!
+//! `status_timeout_secs` bounds every provider status probe; see
+//! [`overlay::DEFAULT_STATUS_DEADLINE`] for the default.
+//!
 //! `POHUNEK_REMOTE_PORT`, when set, overrides the file's `port`. The file is
 //! validated either way.
 
@@ -35,6 +38,7 @@ use futures::future::join_all;
 use netbird::{NetbirdTransport, NETBIRD_OVERLAY_ID};
 use overlay::{
     ConfiguredTransport, OverlayDiagnostic, OverlayError, OverlayRegistry, OverlayTransport,
+    DEFAULT_STATUS_DEADLINE, MAX_STATUS_DEADLINE_SECS, MIN_STATUS_DEADLINE_SECS,
 };
 use overlay_tailscale::{TailscaleTransport, TAILSCALE_OVERLAY_ID};
 use pohunek_platform::filesystem::{FsError, TrustedDir};
@@ -96,10 +100,10 @@ impl Provider {
         }
     }
 
-    fn transport(self) -> Arc<dyn OverlayTransport> {
+    fn transport(self, status_deadline: Duration) -> Arc<dyn OverlayTransport> {
         match self {
-            Self::Netbird => Arc::new(NetbirdTransport::new()),
-            Self::Tailscale => Arc::new(TailscaleTransport::new()),
+            Self::Netbird => Arc::new(NetbirdTransport::with_status_deadline(status_deadline)),
+            Self::Tailscale => Arc::new(TailscaleTransport::with_status_deadline(status_deadline)),
         }
     }
 }
@@ -124,6 +128,8 @@ struct RawConfig {
     /// Wide on purpose: an out-of-range number reports the accepted range
     /// instead of a bare type error.
     port: Option<i64>,
+    /// Wide on purpose, like `port`.
+    status_timeout_secs: Option<i64>,
 }
 
 /// The overlay providers a host works over and the shared remote port.
@@ -131,6 +137,7 @@ struct RawConfig {
 pub struct OverlayConfig {
     providers: Vec<Provider>,
     port: u16,
+    status_deadline: Duration,
     /// `true` when the providers came from `overlays.toml`, `false` for the
     /// `NetBird` default of an absent file.
     from_file: bool,
@@ -160,6 +167,13 @@ impl OverlayConfig {
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Longest a provider status probe may run before it is killed and the
+    /// provider is reported unavailable.
+    #[must_use]
+    pub fn status_deadline(&self) -> Duration {
+        self.status_deadline
     }
 
     /// Load the configuration from the XDG config directory of this process.
@@ -193,6 +207,7 @@ impl OverlayConfig {
             None => Self {
                 providers: vec![Provider::Netbird],
                 port: DEFAULT_REMOTE_PORT,
+                status_deadline: DEFAULT_STATUS_DEADLINE,
                 from_file: false,
             },
         };
@@ -214,9 +229,11 @@ impl OverlayConfig {
         let entries = self
             .providers
             .iter()
-            .map(|provider| ConfiguredTransport::new(provider.transport(), self.port))
+            .map(|provider| {
+                ConfiguredTransport::new(provider.transport(self.status_deadline), self.port)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(OverlayRegistry::new(entries)?)
+        Ok(OverlayRegistry::new(entries)?.with_status_budget(self.status_deadline))
     }
 }
 
@@ -354,9 +371,23 @@ fn parse(text: &str) -> Result<OverlayConfig, String> {
             .filter(|port| *port != 0)
             .ok_or_else(|| "port must be a number in 1..=65535".to_owned())?,
     };
+    let status_deadline = match raw.status_timeout_secs {
+        None => DEFAULT_STATUS_DEADLINE,
+        Some(secs) => u64::try_from(secs)
+            .ok()
+            .filter(|secs| (MIN_STATUS_DEADLINE_SECS..=MAX_STATUS_DEADLINE_SECS).contains(secs))
+            .map(Duration::from_secs)
+            .ok_or_else(|| {
+                format!(
+                    "status_timeout_secs must be a number in \
+                     {MIN_STATUS_DEADLINE_SECS}..={MAX_STATUS_DEADLINE_SECS}"
+                )
+            })?,
+    };
     Ok(OverlayConfig {
         providers,
         port,
+        status_deadline,
         from_file: true,
     })
 }

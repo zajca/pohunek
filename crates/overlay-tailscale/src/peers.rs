@@ -6,6 +6,7 @@
 //! selectable like user-owned ones. The identity is the stable node `ID`; the
 //! map key and `HostName` are never used.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use overlay::{CandidateIdentity, ExternalIdentity, ExternalIdentityKind};
@@ -27,6 +28,27 @@ pub(crate) fn dial_address(node: &Node) -> Option<IpAddr> {
         v6.get_or_insert(address);
     }
     v6
+}
+
+/// Every Tailscale node address `node` lists, each once.
+fn node_addresses(node: &Node) -> HashSet<IpAddr> {
+    node.addresses()
+        .filter(|a| is_tailscale_node_addr(*a))
+        .collect()
+}
+
+/// The addresses that two or more of this machine and the selectable peers list.
+pub(crate) fn shared_node_addresses(status: &TailscaleStatus) -> HashSet<IpAddr> {
+    let holders = status
+        .self_node()
+        .into_iter()
+        .chain(status.peer_nodes().filter(|peer| is_selectable(peer)));
+    overlay::shared_addresses(holders.flat_map(|node| node_addresses(node).into_iter()))
+}
+
+/// True when `node` lists an address in `shared`.
+pub(crate) fn lists_any(node: &Node, shared: &HashSet<IpAddr>) -> bool {
+    node.addresses().any(|address| shared.contains(&address))
 }
 
 /// True when the owner may route to `peer`.
@@ -98,10 +120,12 @@ pub(crate) fn resolve_peer_identity<'a>(
     let value = identity.value();
     let peer = match identity.kind() {
         ExternalIdentityKind::PeerId => unique_peer(
+            status,
             dialable_peers(status).filter(|peer| peer.id() == Some(value)),
             value,
         )?,
         ExternalIdentityKind::Fqdn => unique_peer(
+            status,
             dialable_peers(status).filter(|peer| fqdn_equals(peer, value)),
             value,
         )?,
@@ -161,6 +185,7 @@ fn resolve_staged<'a>(
     ];
     for (matches_peer, matches_own) in stages {
         let peer = match unique_peer(
+            status,
             dialable_peers(status).filter(|peer| matches_peer(peer)),
             name,
         ) {
@@ -193,19 +218,51 @@ fn resolve_staged<'a>(
     Err(TailscaleError::HostUnknown(name.to_owned()))
 }
 
+/// The single dialable peer among `peers`, if any.
+///
+/// A peer that lists an address which this machine or another selectable peer
+/// lists too is not a route: the address does not name one node, so the
+/// selector is ambiguous between every node that lists it.
 fn unique_peer<'a>(
+    status: &'a TailscaleStatus,
     peers: impl Iterator<Item = &'a Node>,
     name: &str,
 ) -> Result<Option<&'a Node>, TailscaleError> {
     let peers = peers.collect::<Vec<_>>();
-    match peers.as_slice() {
-        [] => Ok(None),
-        [peer] => Ok(Some(*peer)),
-        _ => Err(TailscaleError::HostAmbiguous {
-            host: name.to_owned(),
-            candidates: peers.iter().map(|peer| peer_candidate(peer)).collect(),
-        }),
-    }
+    let candidates = match peers.as_slice() {
+        [] => return Ok(None),
+        [peer] => {
+            let addresses = node_addresses(peer);
+            let overlaps = |other: &Node| {
+                node_addresses(other)
+                    .intersection(&addresses)
+                    .next()
+                    .is_some()
+            };
+            let own = status.self_node().filter(|own| overlaps(own));
+            let sharers = status
+                .peer_nodes()
+                .filter(|other| is_selectable(other) && overlaps(other))
+                .collect::<Vec<_>>();
+            if own.is_none() && sharers.len() == 1 {
+                return Ok(Some(*peer));
+            }
+            let mut candidates = Vec::new();
+            if let Some(own) = own {
+                candidates.push(CandidateIdentity::this_machine(own.fqdn()));
+            }
+            candidates.extend(sharers.iter().map(|peer| peer_candidate(peer)));
+            return Err(TailscaleError::HostAmbiguous {
+                host: name.to_owned(),
+                candidates,
+            });
+        }
+        _ => peers,
+    };
+    Err(TailscaleError::HostAmbiguous {
+        host: name.to_owned(),
+        candidates: candidates.iter().map(|peer| peer_candidate(peer)).collect(),
+    })
 }
 
 fn peer_candidate(peer: &Node) -> CandidateIdentity {

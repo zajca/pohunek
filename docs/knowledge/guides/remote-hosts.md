@@ -25,12 +25,33 @@ sets the provider and the port for the CLI, the daemon and Rust clients alike:
 ```toml
 providers = ["netbird"]   # or "tailscale"
 port = 18722
+status_timeout_secs = 10  # optional
 ```
 
 - `providers` lists exactly one id, `netbird` or `tailscale`. Several
   entries are refused until one host can run several overlays (#1113).
 - `port` is optional and must be in `1..=65535`; it is the port the daemon
   listens on and the CLI dials, on every host that reads the file.
+- `status_timeout_secs` is optional, in `1..=120`, default 10: the longest the
+  provider status command (`netbird status --json`, `tailscale status --json`)
+  may run. A command still running then is killed and reaped with any process it started, and the probe fails
+  as `<overlay>_state_unavailable` ("did not answer within"), so a wedged
+  overlay daemon cannot hang host listing, discovery, `--host` resolution or the
+  daemon's listener retry, which tries again on its next attempt. The host
+  resolution and discovery budgets are never shorter than this deadline plus
+  two seconds, so the provider is reported unavailable rather than the whole
+  operation timing out. The probe is also killed with its helpers when the
+  CLI is interrupted or exits. The group is sent `SIGKILL` in up to three passes on the
+  deadline and cancel paths, and in one pass by the supervisor when the CLI
+  dies or the command ends; on macOS a process that forks at the very instant
+  of a signal can escape the passes. A `--host` command probes the provider
+  twice (is the name this machine, then resolve the peer), so a wedged
+  provider costs it up to two of these deadlines.
+- A peer address that the status lists for another peer or for this machine
+  (for Tailscale, any address of a node) is not used for routing. Selecting any of those peers (or the address) is
+  `overlay_host_ambiguous` with every peer that lists it; `host list` and
+  `host discover` show them as `candidate` records without an address and with
+  `reason = address_ambiguous`.
 - When nothing exists at `overlays.toml`, the defaults apply and the directory
   is not inspected (a symlinked or group-writable `~/.config` is fine): there
   is no configuration to trust, and a writer in an unsafe directory can only

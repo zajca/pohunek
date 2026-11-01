@@ -16,7 +16,9 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
+use pohunek_platform::bounded_command::BoundedError;
 use pohunek_platform::shell_env::{
     fallback_search_path, resolve_executable, resolve_executable_in_path_value,
     DARWIN_FALLBACK_DIRECTORIES,
@@ -264,13 +266,15 @@ pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
 ///
 /// The spawned command is killed if this future is dropped. Daemons can thus
 /// stop a pending status probe during shutdown instead of waiting for an
-/// unresponsive external `NetBird` CLI.
+/// unresponsive external `NetBird` CLI. A command still running after
+/// `deadline` is killed and reaped, and the call fails.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`run_status`].
-pub async fn run_status_async() -> Result<NetbirdStatus, NetbirdError> {
-    run_status_async_resolving(&LOOKUP_GATE, resolve_host_program).await
+/// Returns the same errors as [`run_status`], and
+/// [`NetbirdError::StateUnavailable`] when the command outlasts `deadline`.
+pub async fn run_status_async(deadline: Duration) -> Result<NetbirdStatus, NetbirdError> {
+    run_status_async_resolving(&LOOKUP_GATE, resolve_host_program, deadline).await
 }
 
 /// Admits one lookup thread at a time.
@@ -290,6 +294,7 @@ static LOOKUP_GATE: Semaphore = Semaphore::const_new(1);
 async fn run_status_async_resolving<R>(
     gate: &'static Semaphore,
     resolve: R,
+    deadline: Duration,
 ) -> Result<NetbirdStatus, NetbirdError>
 where
     R: FnOnce() -> Result<PathBuf, NetbirdError> + Send + 'static,
@@ -313,7 +318,7 @@ where
     let program = receiver.await.map_err(|_closed| {
         NetbirdError::StateUnavailable("the netbird lookup ended without a result".to_owned())
     })??;
-    run_status_async_at(&program).await
+    run_status_async_at(&program, deadline).await
 }
 
 /// Resolves the `netbird` CLI for this host's environment.
@@ -348,15 +353,19 @@ fn resolve_program(
     resolve_executable(program, &search).map_err(|_unresolved| NetbirdError::CliMissing)
 }
 
-async fn run_status_async_at(program: &Path) -> Result<NetbirdStatus, NetbirdError> {
-    let output = tokio::process::Command::new(program)
-        .args(NETBIRD_STATUS_ARGS)
-        // The daemon may cancel this future while shutting down. Killing the
-        // child prevents an unresponsive CLI from extending that shutdown.
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|err| command_error(program, &err))?;
+async fn run_status_async_at(
+    program: &Path,
+    deadline: Duration,
+) -> Result<NetbirdStatus, NetbirdError> {
+    let output =
+        pohunek_platform::bounded_command::run_bounded(program, &NETBIRD_STATUS_ARGS, deadline)
+            .await
+            .map_err(|err| match err {
+                BoundedError::Io(err) => command_error(program, &err),
+                BoundedError::Expired(deadline) => NetbirdError::StateUnavailable(format!(
+                    "`netbird status` did not answer within {deadline:?}"
+                )),
+            })?;
     status_from_output(&output)
 }
 
@@ -452,11 +461,15 @@ mod tests {
             .expect("runtime");
         let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
-            let status = run_status_async_resolving(&GATE, move || {
-                // Stands in for a lookup stuck in a filesystem call.
-                let _ = stalled.recv_timeout(LOOKUP_STALL);
-                Err(NetbirdError::CliMissing)
-            });
+            let status = run_status_async_resolving(
+                &GATE,
+                move || {
+                    // Stands in for a lookup stuck in a filesystem call.
+                    let _ = stalled.recv_timeout(LOOKUP_STALL);
+                    Err(NetbirdError::CliMissing)
+                },
+                overlay::DEFAULT_STATUS_DEADLINE,
+            );
             tokio::time::timeout(DEADLINE, status).await
         });
         assert!(outcome.is_err(), "the caller's deadline must fire");
@@ -464,7 +477,11 @@ mod tests {
         let queued = runtime.block_on(async {
             tokio::time::timeout(
                 DEADLINE,
-                run_status_async_resolving(&GATE, || Err(NetbirdError::CliMissing)),
+                run_status_async_resolving(
+                    &GATE,
+                    || Err(NetbirdError::CliMissing),
+                    overlay::DEFAULT_STATUS_DEADLINE,
+                ),
             )
             .await
         });

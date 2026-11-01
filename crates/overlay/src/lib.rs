@@ -19,6 +19,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures::future::join_all;
 
+/// Deadline of a provider status probe when `overlays.toml` sets none.
+pub const DEFAULT_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Time an operation that waits on provider probes keeps beyond the longest
+/// probe deadline, for the work around the probe itself.
+pub const STATUS_BUDGET_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Smallest accepted configured status deadline, in seconds.
+pub const MIN_STATUS_DEADLINE_SECS: u64 = 1;
+
+/// Largest accepted configured status deadline, in seconds.
+pub const MAX_STATUS_DEADLINE_SECS: u64 = 120;
+
 const PEER_IDENTITY_PREFIX: &str = "peer~";
 const FQDN_IDENTITY_PREFIX: &str = "fqdn~";
 
@@ -439,6 +452,39 @@ pub struct DiscoveredPeer {
     pub fqdn: Option<String>,
     /// Policy-approved dial address, or `None` for an address-less candidate.
     pub address: Option<IpAddr>,
+    /// True when the provider listed this peer's address for another peer or
+    /// for this machine too, so the address is withheld.
+    pub address_ambiguous: bool,
+}
+
+/// Withholds every address that more than one peer lists.
+///
+/// An affected peer stays in the list as an address-less candidate with
+/// [`DiscoveredPeer::address_ambiguous`] set, so no route is built from an
+/// address that does not name one peer.
+pub fn withhold_shared_addresses(peers: &mut [DiscoveredPeer]) {
+    let shared = shared_addresses(peers.iter().filter_map(|peer| peer.address));
+    for peer in peers {
+        if peer
+            .address
+            .is_some_and(|address| shared.contains(&address))
+        {
+            peer.address = None;
+            peer.address_ambiguous = true;
+        }
+    }
+}
+
+/// The addresses that occur more than once in `addresses`.
+pub fn shared_addresses(addresses: impl IntoIterator<Item = IpAddr>) -> HashSet<IpAddr> {
+    let mut seen = HashSet::new();
+    let mut shared = HashSet::new();
+    for address in addresses {
+        if !seen.insert(address) {
+            shared.insert(address);
+        }
+    }
+    shared
 }
 
 /// One provider-resolved peer address before registry routing.
@@ -515,6 +561,9 @@ pub struct RoutedPeer {
     pub fqdn: Option<String>,
     /// Exact socket route, or `None` for an address-less candidate.
     pub addr: Option<SocketAddr>,
+    /// True when the provider withheld the address because another peer or this
+    /// machine lists it too.
+    pub address_ambiguous: bool,
     /// Configured daemon port, including for address-less candidates.
     pub port: u16,
 }
@@ -681,6 +730,7 @@ impl ConfiguredTransport {
                 addr: peer
                     .address
                     .map(|address| SocketAddr::new(address, self.port())),
+                address_ambiguous: peer.address_ambiguous,
                 port: self.port(),
             })
             .collect()
@@ -718,6 +768,7 @@ impl fmt::Debug for ConfiguredTransport {
 #[derive(Debug, Clone)]
 pub struct OverlayRegistry {
     entries: Arc<[ConfiguredTransport]>,
+    status_budget: std::time::Duration,
 }
 
 impl OverlayRegistry {
@@ -739,7 +790,32 @@ impl OverlayRegistry {
         }
         Ok(Self {
             entries: entries.into(),
+            status_budget: std::time::Duration::ZERO,
         })
+    }
+
+    /// Record the longest a provider status probe of this registry may run.
+    ///
+    /// The default of zero declares no probe bound, so [`Self::outer_budget`]
+    /// returns the requested budget unchanged.
+    #[must_use]
+    pub fn with_status_budget(mut self, status_budget: std::time::Duration) -> Self {
+        self.status_budget = status_budget;
+        self
+    }
+
+    /// The budget an operation that waits on this registry's providers needs.
+    ///
+    /// An outer budget shorter than a probe's deadline would cancel the probe
+    /// before the provider is reported unavailable, so the result is never
+    /// shorter than the status budget plus [`STATUS_BUDGET_MARGIN`].
+    #[must_use]
+    pub fn outer_budget(&self, requested: std::time::Duration) -> std::time::Duration {
+        if self.status_budget.is_zero() {
+            requested
+        } else {
+            requested.max(self.status_budget.saturating_add(STATUS_BUDGET_MARGIN))
+        }
     }
 
     /// Return configured entries in deterministic configuration order.

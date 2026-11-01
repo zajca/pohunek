@@ -15,6 +15,8 @@
 // Rust guideline compliant 2026-09-30
 
 #[cfg(unix)]
+pub mod bounded_command;
+#[cfg(unix)]
 pub mod filesystem;
 pub mod peer;
 pub mod process;

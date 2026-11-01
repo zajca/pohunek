@@ -76,6 +76,7 @@ impl MemoryTransport {
             display_name: Some(host.to_owned()),
             fqdn: Some(fqdn.to_owned()),
             address: safe_address,
+            address_ambiguous: false,
         });
         if let Some(address) = safe_address {
             let resolved = ResolvedPeer {
