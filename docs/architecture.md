@@ -1282,7 +1282,14 @@ Hooks have separate roles:
   retains the claim across daemon outage. A notification hook uses the same
   endpoint: the worker attests the caller, binds the notification to its own
   session, and forwards it to the daemon's public socket; when the worker
-  refuses or lacks the request type the hook dials the daemon directly. Every private report is additionally
+  refuses or lacks the request type the hook dials the daemon directly. On the
+  public socket, `notification.create` stores a hook-provider report only for a
+  session the registry holds or whose launch is in flight: the launch
+  reserves its session id in memory, with the runtime and hook schema its worker
+  enforces, before the agent starts and releases it when the entry is installed
+  or the launch fails, so a report during the launch is judged like one for a
+  held session and a report for any other id is refused (`hook_not_admitted`).
+  A recovery's launch is judged by the reserved schema, not by the entry it replaces. A report admitted during a launch that then fails stays stored. The reservation is not persisted. Every private report is additionally
   bound to its reporter: the worker accepts it only from the process it names or
   from a descendant of that process (under `FrozenRootEntrypoint`, a report
   naming the PTY root only from the root itself), using kernel peer identity the caller

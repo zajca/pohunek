@@ -1479,9 +1479,11 @@ and ranked under (control characters dropped, whitespace collapsed), and a
 create whose raw provider only normalizes to a hooked provider (for example
 `" codex"`) is refused with `hook_not_admitted` whatever the session's schema.
 `notification.create` also answers `hook_not_admitted` for such a hooked
-provider when the daemon holds no session with the reported id, so such a
-report is never stored as a provider-ranked record for an id that cannot be
-checked against a hook schema; the refusal is final even with `retryable_admission`. A create from any
+provider when the daemon holds no session with the reported id and no launch
+in flight reserves it, so such a report is never stored as a provider-ranked
+record for an id that cannot be checked against a hook schema (a report during
+a session's launch is judged by the schema its worker enforces, like one for a
+held session); the refusal is final even with `retryable_admission`. A create from any
 other producer for an unknown session id is stored, and the three identity
 reports keep ignoring an unknown session. A session's own runtime is always an
 admitted provider for identity reports.

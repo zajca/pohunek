@@ -1173,6 +1173,27 @@ mod tests {
         )
     }
 
+    fn hook_error_params(host_local_source_id: &str) -> protocol::NotificationCreateParams {
+        protocol::NotificationCreateParams {
+            source: protocol::NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "Error".to_owned(),
+                host_local_source_id: host_local_source_id.to_owned(),
+            },
+            kind: protocol::NotificationKind::Error,
+            severity: protocol::NotificationSeverity::Error,
+            title: "Agent error".to_owned(),
+            body: "Codex reported an error.".to_owned(),
+            metadata: BTreeMap::new(),
+            session_id: None,
+            agent_kind: None,
+            source_id: None,
+            dedupe_key: None,
+            project_id: None,
+            retryable_admission: false,
+        }
+    }
+
     fn error_create_request(id: &str) -> Request {
         let params = protocol::NotificationCreateParams {
             source: protocol::NotificationSource {
@@ -1260,6 +1281,96 @@ mod tests {
         let result: protocol::NotificationListResult =
             serde_json::from_value(ok).expect("list result");
         result.notifications
+    }
+
+    /// A provider hook notification that reaches the daemon after the worker
+    /// runs and before the session's entry is installed is stored, linked to
+    /// the launching session; after the install the session is held.
+    #[tokio::test]
+    async fn a_hook_notification_in_the_launch_window_is_stored() {
+        use crate::notifications::NotificationService;
+
+        let notification_dir =
+            pohunek_test_support::tempdir_with_prefix("ph-notify-").expect("notification dir");
+        let notifications =
+            NotificationService::open(notification_dir.path()).expect("notification service opens");
+        enable_all_notification_kinds(&notifications);
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
+            ..SessionRegistryConfig::default()
+        });
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone())
+            .with_notifications(notifications);
+
+        let gate = sessions.hold_next_launch_commit();
+        let cwd = crate::test_support::thread_scoped_dir("pohunek-cwd-");
+        let creating = tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .create(SessionNewParams {
+                        agent: "shell".to_owned(),
+                        name: None,
+                        cwd: Some(cwd),
+                        cols: 80,
+                        rows: 24,
+                        project: None,
+                        repo: None,
+                        branch: None,
+                        base_branch: None,
+                        input: None,
+                        extended_input_ready_wait: None,
+                        branch_source: None,
+                        on_diverged: None,
+                        input_ack_timeout_ms: None,
+                        metadata: BTreeMap::new(),
+                        secret_env: protocol::SessionSecretEnv::default(),
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            pohunek_test_support::wait::HANG_GUARD,
+            gate.entered.notified(),
+        )
+        .await
+        .expect("the launch parks before its entry is installed");
+        let launches = sessions.launching_for_test();
+        let [launching] = launches.as_slice() else {
+            panic!("one launch is in flight: {launches:?}");
+        };
+        let launching = launching.clone();
+        assert!(
+            !sessions.holds(&launching).await,
+            "the entry is not installed yet"
+        );
+
+        let mut params = hook_error_params("window-report");
+        params.session_id = Some(launching.clone());
+        let created = create_result(
+            &state,
+            &request(
+                "window-create",
+                method::NOTIFICATION_CREATE,
+                serde_json::to_value(params).expect("params serialize"),
+            ),
+        )
+        .await;
+        assert!(created.created);
+        assert_eq!(created.record.session_id, Some(launching.clone()));
+        let listed = list_records(&state).await;
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].id, created.record.id);
+
+        gate.release.notify_one();
+        let session = creating
+            .await
+            .expect("create task joins")
+            .expect("the launch completes");
+        assert_eq!(session.id, launching);
+        assert!(sessions.holds(&launching).await);
+        assert!(sessions.launching_for_test().is_empty());
+        sessions.stop(&launching).await.expect("stop the session");
     }
 
     #[tokio::test(start_paused = true)]

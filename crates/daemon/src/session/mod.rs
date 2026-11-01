@@ -797,6 +797,9 @@ struct SessionRegistryInner {
     lifecycle_locks: SessionLocks,
     /// Detached create transactions, drained at daemon shutdown.
     creates: CreateTasks,
+    /// Sessions whose launch is in flight and whose entry is not installed
+    /// yet, so hook admission can judge their reports.
+    launching: std::sync::Mutex<HashMap<SessionId, LaunchReservation>>,
     /// Every other background task of the registry, and the blocking store
     /// writes, awaited by [`SessionRegistry::shutdown`].
     background: background::BackgroundTasks,
@@ -864,6 +867,10 @@ struct SessionRegistryInner {
     definition_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     #[cfg(test)]
     entry_record_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next launch once its worker runs, before its entry is
+    /// installed.
+    #[cfg(test)]
+    launch_commit_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     #[cfg(test)]
     snapshot_window_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     #[cfg(test)]
@@ -2487,6 +2494,7 @@ impl SessionRegistry {
                 package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
+                launching: std::sync::Mutex::new(HashMap::new()),
                 background: background::BackgroundTasks::default(),
                 settle: settle::SettleRegistry::default(),
                 supervision_retries: supervision::SupervisionRetries::default(),
@@ -2519,6 +2527,8 @@ impl SessionRegistry {
                 definition_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 entry_record_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                launch_commit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 snapshot_window_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -4047,6 +4057,51 @@ impl SessionRegistry {
         let gate = self
             .inner
             .first_store_write_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Arms a hold that parks the next launch between its running worker and
+    /// the installation of its session entry.
+    #[cfg(test)]
+    pub(crate) fn hold_next_launch_commit(&self) -> crate::runtime::lifecycle::tests::StartGate {
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: None,
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .inner
+            .launch_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    /// The sessions whose launch is in flight.
+    #[cfg(test)]
+    pub(crate) fn launching_for_test(&self) -> Vec<SessionId> {
+        self.inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Parks a launch before its entry is installed when a test armed the
+    /// hold.
+    #[cfg(test)]
+    pub(super) async fn hold_launch_commit(&self) {
+        let gate = self
+            .inner
+            .launch_commit_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -8553,14 +8608,51 @@ impl SessionRegistry {
         }
     }
 
+    /// Reserves `id` for a launch in flight, from before its agent starts
+    /// until its entry is installed or the launch fails. While the guard
+    /// lives, a hook report for `id` is judged by `hook_schema`, the schema
+    /// the launch's worker enforces, whether or not the registry holds an
+    /// entry for it.
+    pub(super) fn reserve_launch(
+        &self,
+        id: &SessionId,
+        agent_base: RuntimeRef,
+        hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
+    ) -> LaunchReservationGuard {
+        self.inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id.clone(),
+                LaunchReservation {
+                    agent_base,
+                    hook_schema,
+                },
+            );
+        LaunchReservationGuard {
+            registry: self.clone(),
+            id: id.clone(),
+        }
+    }
+
+    fn launch_reservation(&self, id: &SessionId) -> Option<LaunchReservation> {
+        self.inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
     /// Like [`Self::admit_session_hook`], for a report that stores a record
-    /// and so must name a session this registry holds: an unknown session is
-    /// refused with [`HookAdmissionError::UnknownSession`].
+    /// and so must name a session this registry holds or is launching: any
+    /// other session is refused with [`HookAdmissionError::UnknownSession`].
     ///
     /// # Errors
     ///
     /// Returns the [`HookAdmissionError`] of [`Self::admit_session_hook`], or
-    /// `UnknownSession` when the registry holds no session `id`.
+    /// `UnknownSession` when the registry neither holds nor is launching `id`.
     pub async fn admit_held_session_hook(
         &self,
         id: &SessionId,
@@ -8584,7 +8676,7 @@ impl SessionRegistry {
 
     /// The hook schema that admits `action` from `provider` on session `id`,
     /// or the refusal, which is logged at WARN naming `operation`. `None` when
-    /// the session is unknown.
+    /// the session is neither held nor launching.
     async fn session_hook_admission(
         &self,
         id: &SessionId,
@@ -8593,6 +8685,25 @@ impl SessionRegistry {
         operation: &str,
         retryable: bool,
     ) -> Option<Result<&'static pohunek_worker_protocol::HookSchema, HookAdmissionError>> {
+        // A launch in flight is judged first: a recovery keeps the entry of
+        // the runtime it replaces installed, and the new worker enforces the
+        // reserved schema. The entry is installed before the reservation is
+        // released, so a session is never missing from both.
+        if let Some(launch) = self.launch_reservation(id) {
+            return Some(
+                pohunek_worker_protocol::admit_hook(
+                    launch.hook_schema,
+                    action,
+                    provider,
+                    Some(agent_kind_label(&launch.agent_base)),
+                )
+                .map_err(|denial| {
+                    let refusal = HookAdmissionError::Denied(denial);
+                    log_hook_refusal(id, operation, &refusal);
+                    refusal
+                }),
+            );
+        }
         let (agent_base, pinned, pin) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id)?;
@@ -8768,6 +8879,32 @@ impl SessionRegistry {
     }
 }
 
+/// A launch in flight: the facts a hook report is judged by before the
+/// session's entry exists.
+#[derive(Debug, Clone)]
+struct LaunchReservation {
+    agent_base: RuntimeRef,
+    hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
+}
+
+/// Releases a launch reservation when dropped: after the launch installed its
+/// entry, and on every path that ends the launch without one.
+pub(super) struct LaunchReservationGuard {
+    registry: SessionRegistry,
+    id: SessionId,
+}
+
+impl Drop for LaunchReservationGuard {
+    fn drop(&mut self) {
+        self.registry
+            .inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
 /// Why a hook report reaching the public socket is not admitted.
 #[derive(Debug)]
 pub enum HookAdmissionError {
@@ -8779,7 +8916,8 @@ pub enum HookAdmissionError {
         /// The configured `worker_connect_deadline` the admission waited.
         bound: Duration,
     },
-    /// The registry holds no session with the reported id.
+    /// The registry neither holds nor is launching a session with the reported
+    /// id.
     UnknownSession,
 }
 
@@ -8834,7 +8972,7 @@ fn log_hook_refusal(id: &SessionId, operation: &str, refusal: &HookAdmissionErro
             name: "session.hook.report_refused",
             session_id = %id.0,
             operation,
-            "the hook report is refused: the registry holds no such session"
+            "the hook report is refused: the registry neither holds nor is launching such a session"
         ),
     }
 }
