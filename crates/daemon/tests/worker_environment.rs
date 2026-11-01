@@ -1000,6 +1000,60 @@ fn attach_input_frame(attach: &DataStream, sequence: u32, text: &str) -> DataFra
     .expect("attach input frame")
 }
 
+/// Frames kept in [`ResyncProgress`] for the timeout report.
+const RESYNC_TRACE_FRAMES: usize = 12;
+
+/// What the client that resumed reading has seen of the gap, the repaint and
+/// the live output, reported when the wait for the echo times out.
+#[derive(Default)]
+struct ResyncProgress {
+    frames: u64,
+    gaps: u32,
+    repainted: bool,
+    resync_keystroke_sent: bool,
+    snapshot_bytes: usize,
+    output_bytes: usize,
+    live: Vec<u8>,
+    last_frames: std::collections::VecDeque<String>,
+}
+
+impl ResyncProgress {
+    fn record(&mut self, frame: &DataFrame) {
+        self.frames += 1;
+        match frame.header().kind {
+            FrameKind::TerminalSnapshot { .. } => self.snapshot_bytes += frame.payload().len(),
+            FrameKind::Output { .. } => self.output_bytes += frame.payload().len(),
+            _ => {}
+        }
+        if self.last_frames.len() == RESYNC_TRACE_FRAMES {
+            self.last_frames.pop_front();
+        }
+        self.last_frames.push_back(format!(
+            "{:?} ({} payload bytes)",
+            frame.header().kind,
+            frame.payload().len()
+        ));
+    }
+}
+
+impl std::fmt::Display for ResyncProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frames read {}, gaps {}, repainted {}, resync keystroke sent {}, snapshot bytes {}, \
+             output bytes {}, live bytes after the repaint {}, last frames {:?}",
+            self.frames,
+            self.gaps,
+            self.repainted,
+            self.resync_keystroke_sent,
+            self.snapshot_bytes,
+            self.output_bytes,
+            self.live.len(),
+            self.last_frames
+        )
+    }
+}
+
 #[tokio::test]
 async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_resyncs_after() {
     let mut fixture = Fixture::start();
@@ -1035,27 +1089,28 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
     // Reading resumes: the lost output is reported as a gap that a repaint
     // follows, and live output continues after it. The repaint is over once a
     // live `Output` frame carrying the echo of a fresh keystroke arrives.
-    tokio::time::timeout(DEADLINE, async {
-        let mut gap = false;
-        let mut repainted = false;
-        let mut live = Vec::new();
+    let mut progress = ResyncProgress::default();
+    let resynced = tokio::time::timeout(DEADLINE, async {
         loop {
             let frame = read_frame(&mut attach.stream)
                 .await
                 .expect("read attach frame")
                 .expect("attach stream stays open");
+            progress.record(&frame);
             match frame.header().kind {
-                FrameKind::Gap { .. } => gap = true,
-                FrameKind::TerminalSnapshot { .. } if gap && !repainted => {
-                    repainted = true;
+                FrameKind::Gap { .. } => progress.gaps += 1,
+                FrameKind::TerminalSnapshot { .. } if progress.gaps > 0 && !progress.repainted => {
+                    progress.repainted = true;
                     let keystroke = attach_input_frame(&attach, 2, RESYNCED_KEYSTROKE);
                     write_frame(&mut attach.stream, &keystroke)
                         .await
                         .expect("send the keystroke typed after the resync");
+                    progress.resync_keystroke_sent = true;
                 }
-                FrameKind::Output { .. } if repainted => {
-                    live.extend_from_slice(frame.payload());
-                    if live
+                FrameKind::Output { .. } if progress.repainted => {
+                    progress.live.extend_from_slice(frame.payload());
+                    if progress
+                        .live
                         .windows(RESYNCED_KEYSTROKE.len())
                         .any(|window| window == RESYNCED_KEYSTROKE.as_bytes())
                     {
@@ -1064,7 +1119,7 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
                 }
                 FrameKind::Error { .. } | FrameKind::Close { .. } | FrameKind::Exit { .. } => {
                     panic!(
-                        "attach stream ended before live output resumed: {:?}",
+                        "attach stream ended before live output resumed: {:?}; {progress}",
                         frame.header().kind
                     )
                 }
@@ -1072,8 +1127,12 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
             }
         }
     })
-    .await
-    .expect("a gap, its repaint and live output reach the client that resumed reading");
+    .await;
+    assert!(
+        resynced.is_ok(),
+        "a gap, its repaint and live output did not reach the client that resumed reading \
+         within the deadline: {progress}"
+    );
 
     drop(attach);
     worker
