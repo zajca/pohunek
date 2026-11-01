@@ -267,7 +267,7 @@ The `reason` codes:
   session has no native reference until the next turn ends (the Claude `stop`
   action repeats the identity report) or never, on a hook older than integration
   version 16. A run killed while the interpreter starts leaves no line but a
-  `pohunek-hooks.jsonl.start.<pid>` file beside the trace, holding the session
+  `pohunek-hooks.jsonl.start.<suffix>` file beside the trace, holding the session
   id (the first `python3` start through the Xcode shim can outlast the hook
   timeout; `ls` the log directory for `pohunek-hooks.jsonl.start.*`). The
   interpreter of a later `session` run removes markers older than an hour;

@@ -36,13 +36,13 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # The SessionStart run records that it began before the interpreter starts,
 # because a slow first `python3` start (the Xcode shim) can outlast the hook
 # timeout, and a run killed there never reaches the trace code. A POSIX shell
-# cannot append to the trace without following a symlink, but a redirection
-# under `set -C` creates a new file and does not overwrite an existing regular
-# file or write through a dangling symlink: the marker is a new owner-private
-# file named after the trace, holding the pohunek session id. The interpreter
-# removes it once it runs, so a marker left behind names a run killed before
-# that. At most 16 markers exist at once; the interpreter removes markers older
-# than an hour.
+# cannot append to the trace without following a symlink, so the record is a
+# new file named after the trace: `mktemp` creates it exclusively, under a name
+# it picks, with owner-only permissions, so it never opens a symlink or a FIFO
+# planted at a guessable name. The directory must be the user's own. The file
+# holds the pohunek session id, and the interpreter removes it once it runs, so
+# a marker left behind names a run killed before that. At most 16 markers exist
+# at once; the interpreter removes markers older than an hour.
 start_marker=""
 if [ "$action" = "session" ]; then
   case "${POHUNEK_HOOK_TRACE_PATH:-}" in
@@ -50,6 +50,7 @@ if [ "$action" = "session" ]; then
       case "$POHUNEK_SESSION_ID" in
         *[!A-Za-z0-9._-]*) ;;
         *)
+          marker_dir="${POHUNEK_HOOK_TRACE_PATH%/*}"
           marker_base="$POHUNEK_HOOK_TRACE_PATH.start."
           marker_count=0
           for existing in "$marker_base"*; do
@@ -57,9 +58,15 @@ if [ "$action" = "session" ]; then
               marker_count=$((marker_count + 1))
             fi
           done
-          if [ "$marker_count" -lt 16 ] &&
-            (umask 077 && set -C && printf '%s\n' "$POHUNEK_SESSION_ID" >"$marker_base$$") 2>/dev/null; then
-            start_marker="$marker_base$$"
+          if [ "$marker_count" -lt 16 ] && [ -d "$marker_dir" ] && [ -O "$marker_dir" ]; then
+            marker_file="$(mktemp "${marker_base}XXXXXX" 2>/dev/null)" || marker_file=""
+            if [ -n "$marker_file" ]; then
+              if printf '%s\n' "$POHUNEK_SESSION_ID" >"$marker_file" 2>/dev/null; then
+                start_marker="$marker_file"
+              else
+                rm -f "$marker_file" 2>/dev/null || true
+              fi
+            fi
           fi
           ;;
       esac
@@ -115,7 +122,8 @@ from datetime import datetime, timedelta, timezone
 # reports of one agent by this value. `time.monotonic_ns()` is only defined
 # within one process (Apple's Python 3.9 on macOS 27 counts from its own
 # start), so the system-wide monotonic clock is read instead. It is read before
-# stdin, so a large provider input never delays the moment it records.
+# stdin, so a large provider input never delays the moment it records. The
+# `stop` action reads it again before its snapshot.
 sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 invocation_start = time.monotonic()
 

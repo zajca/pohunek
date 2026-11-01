@@ -423,6 +423,9 @@ fn integration_checks(
     checks
 }
 
+/// First Claude integration version whose `Stop` hook repeats the identity report.
+const STOP_IDENTITY_INTEGRATION_VERSION: u32 = 16;
+
 /// Convert one typed integration diagnosis without exposing inspected paths or prose.
 fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> DoctorCheck {
     let runtime = diagnosis.agent.as_wire();
@@ -498,9 +501,18 @@ fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> Doct
             } else {
                 format!(" This home is shared with {shared_profiles} other configured profile(s).")
             };
+            let stop_recovery = if runtime == "claude"
+                && status
+                    .installed_version
+                    .is_some_and(|version| version < STOP_IDENTITY_INTEGRATION_VERSION)
+            {
+                format!(" Until then a Claude session whose SessionStart hook was killed before it reported keeps no native reference, so resume and fork refuse it; hooks of integration version {STOP_IDENTITY_INTEGRATION_VERSION} or newer recover it at the end of the next turn.")
+            } else {
+                String::new()
+            };
             (
                 DoctorStatus::Warn,
-                format!("Managed integration is {state}; repair provider configuration if needed, then run `{recovery}`.{shared}"),
+                format!("Managed integration is {state}; repair provider configuration if needed, then run `{recovery}`.{shared}{stop_recovery}"),
             )
         }
     };
@@ -884,6 +896,55 @@ mod tests {
     use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 
     use super::*;
+
+    fn outdated_diagnosis(
+        agent: protocol::RuntimeRef,
+        installed_version: u32,
+    ) -> protocol::IntegrationAgentDoctor {
+        protocol::IntegrationAgentDoctor {
+            agent: agent.clone(),
+            ok: true,
+            status: Some(protocol::IntegrationAgentStatus {
+                agent,
+                available: true,
+                expected_asset_paths: Vec::new(),
+                present_asset_paths: Vec::new(),
+                registration_paths: Vec::new(),
+                installed_version: Some(installed_version),
+                expected_version: protocol::EXPECTED_INTEGRATION_VERSION,
+                state: IntegrationInstallState::Outdated,
+                recovery: protocol::IntegrationRecovery::Reinstall,
+                warnings: Vec::new(),
+                home: None,
+            }),
+            findings: Vec::new(),
+            home: None,
+        }
+    }
+
+    /// An outdated Claude integration that predates the `Stop` identity report
+    /// tells the operator what the reinstall restores; a current-enough marker
+    /// or another runtime gets the generic text.
+    #[test]
+    fn an_outdated_claude_integration_names_the_lost_identity_recovery() {
+        let old = integration_agent_check(&outdated_diagnosis(protocol::RuntimeRef::claude(), 15));
+        assert!(
+            old.detail.contains("keeps no native reference"),
+            "{}",
+            old.detail
+        );
+        for diagnosis in [
+            outdated_diagnosis(protocol::RuntimeRef::claude(), 16),
+            outdated_diagnosis(protocol::RuntimeRef::codex(), 15),
+        ] {
+            let check = integration_agent_check(&diagnosis);
+            assert!(
+                !check.detail.contains("native reference"),
+                "{}",
+                check.detail
+            );
+        }
+    }
 
     fn paths_at(root: &Path) -> Paths {
         Paths {
