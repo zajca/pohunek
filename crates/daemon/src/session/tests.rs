@@ -18892,17 +18892,18 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     let argv = wait_for_file_contains(&marker, "--fork-session").await;
     let lines = argv.lines().collect::<Vec<_>>();
     assert!(
-        lines.windows(5).any(|window| {
+        lines.windows(6).any(|window| {
             window
                 == [
                     "--model",
                     "sonnet",
+                    "--name=forked review",
                     "--resume",
                     "native-live",
                     "--fork-session",
                 ]
         }),
-        "fork argv must preserve frozen args and append the Claude fork flag: {argv:?}"
+        "fork argv must preserve frozen args, name the fork and append the Claude fork flag: {argv:?}"
     );
 
     registry.stop(&created.id).await.expect("stop the session");

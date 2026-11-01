@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Sonnet 4.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/ph-sample/cwd
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Another live session on this machine goes by "alpha", so this session is now "alpha-lexical-owl…
+──────────────────────────────────────────────────────────────────────────────── alpha-lexical-owl ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

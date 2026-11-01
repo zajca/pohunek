@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.1.0";
+const PACKAGE_VERSION: &str = "1.2.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -431,6 +431,67 @@ fn width_frames() -> Vec<Frame> {
         .collect()
 }
 
+/// Directory below a screen set that holds the screens of named sessions.
+const NAMED_SCREENS_DIR: &str = "named";
+
+/// The session name the named screens were recorded under.
+const NAMED_SCREEN_NAME: &str = "alpha";
+
+/// What each named screen means; a colliding name leaves an idle prompt box.
+fn named_screen_meaning(name: &str) -> Meaning {
+    match name {
+        "idle" | "collision" => Meaning::Idle,
+        "working_stream" => Meaning::Working,
+        other => panic!("unknown named screen {other}"),
+    }
+}
+
+/// A session name changes the terminal title and adds a banner or a rule label,
+/// never the state: every named screen of both releases reads as its unnamed
+/// counterpart, from the screen alone and with the title Claude set.
+#[test]
+fn named_screens_are_classified_like_unnamed_ones() {
+    let definition = installed_definition();
+    let mut checked = 0_usize;
+    for set in ScreenSet::ALL {
+        let directory = set.directory().join(NAMED_SCREENS_DIR);
+        for name in fixture_names(&directory) {
+            let meant = named_screen_meaning(&name).activity();
+            let frame = load_frame_from(set, &directory, &name, &name, DEFAULT_COLUMNS);
+            assert!(
+                frame.rows.iter().any(|row| row.contains(NAMED_SCREEN_NAME)),
+                "{name} shows the session name: {:#?}",
+                frame.rows
+            );
+            assert_eq!(
+                screen_activity(&definition, &frame.rows, frame.columns),
+                Some(meant),
+                "{name} of {set:?} from the screen"
+            );
+            let glyph = frame
+                .title
+                .as_deref()
+                .is_some_and(|title| title.starts_with(TURN_GLYPHS));
+            let source = if glyph {
+                StateSource::OscTitle
+            } else {
+                StateSource::Screen
+            };
+            assert_eq!(
+                frame.evidence(&definition),
+                Some((meant, source)),
+                "{name} of {set:?} with title {:?}",
+                frame.title
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 6,
+        "every named screen of both releases: {checked}"
+    );
+}
+
 #[test]
 fn the_package_directory_builds_reproducibly_with_only_its_two_files() {
     let (first, digest) = built_archive();
@@ -628,10 +689,28 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         "integration",
         "config_home",
         "transcripts",
+        "naming",
     ] {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
     package.remove("transcripts");
+    // The session name reaches Claude through `--name` in the joined form.
+    let naming = package.remove("naming").expect("a [naming] table");
+    assert_eq!(
+        naming["launch_args"].as_array().map(Vec::len),
+        Some(1),
+        "{naming}"
+    );
+    assert_eq!(
+        naming["launch_args"][0].as_str(),
+        Some("--name={session_name}")
+    );
+    assert_eq!(
+        package["requires"].as_array().map(Vec::len),
+        Some(1),
+        "the descriptor requires exactly the naming feature"
+    );
+    package.remove("requires");
     // `ready` is the one key the package declares that v0.34.2 does not: the
     // built-in Claude descriptor relied on the bracketed-paste enable signal.
     let input = package
@@ -2437,26 +2516,39 @@ impl Fixture {
 
     /// `session new` of `profile` in the fixture's working directory, at
     /// `columns` wide.
-    async fn launch_at(&self, profile: &str, name: &str, columns: u16) -> (i32, Value) {
+    async fn launch_at(&self, profile: &str, name: Option<&str>, columns: u16) -> (i32, Value) {
         let cwd = self.cwd.clone();
-        self.harness
-            .json(&[
-                "session",
-                "new",
-                "--agent",
-                profile,
-                "--cwd",
-                path_str(&cwd),
-                "--name",
-                name,
-                "--cols",
-                &columns.to_string(),
-            ])
-            .await
+        let mut arguments = vec![
+            "session".to_owned(),
+            "new".to_owned(),
+            "--agent".to_owned(),
+            profile.to_owned(),
+            "--cwd".to_owned(),
+            path_str(&cwd).to_owned(),
+            "--cols".to_owned(),
+            columns.to_string(),
+        ];
+        if let Some(name) = name {
+            // The joined form keeps a dash-leading name a value.
+            arguments.push(format!("--name={name}"));
+        }
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        self.harness.json(&arguments).await
     }
 
     async fn launch(&self, profile: &str, name: &str) -> (i32, Value) {
-        self.launch_at(profile, name, DEFAULT_COLUMNS).await
+        self.launch_at(profile, Some(name), DEFAULT_COLUMNS).await
+    }
+
+    /// Launches a session without a name and returns its id: the screens a
+    /// recording shows carry no session name.
+    async fn new_unnamed_session_id(&self) -> String {
+        let (code, launched) = self.launch_at(PROFILE, None, DEFAULT_COLUMNS).await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned()
     }
 
     async fn new_session(&self, name: &str) -> Value {
@@ -3386,8 +3478,8 @@ async fn a_real_claude_reply_held_mid_stream_reads_working() {
     let (title, _rows) = fixture.screen(&id).await;
     assert_eq!(
         title.as_deref(),
-        Some(PROGRAM_STATUS_TITLE),
-        "the title carries no turn glyph; the records report the turn"
+        Some("stream"),
+        "the title is the session name with no turn glyph; the records report the turn"
     );
     let (code, waited) = fixture
         .harness
@@ -3468,6 +3560,141 @@ async fn a_real_claude_session_start_hook_reports_the_native_reference() {
     );
 
     fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// The arguments of the Claude process behind session `id`.
+async fn session_argv(fixture: &Fixture, id: &str) -> Vec<String> {
+    let pid = fixture.inspect(id).await["pid"]
+        .as_u64()
+        .expect("the session process id");
+    command_line(pid)
+}
+
+/// The `--name` argument of `argv`, the joined form the package declares.
+fn name_argument(argv: &[String]) -> Vec<&String> {
+    argv.iter()
+        .filter(|argument| argument.starts_with("--name"))
+        .collect()
+}
+
+/// Prints what a real Claude shows for a named session: the evidence the
+/// package documentation records. Reading it is a refresh aid; the assertions
+/// are on the arguments and the detected activity.
+async fn show_named_screen(fixture: &Fixture, id: &str, label: &str) {
+    let (title, rows) = fixture.screen(id).await;
+    eprintln!("[named-screen] {label}: title={title:?}");
+    for row in rows.iter().filter(|row| !row.is_empty()) {
+        eprintln!("[named-screen] {label}: {row}");
+    }
+}
+
+/// A session's pohunek name reaches Claude as `--name=<name>` at launch,
+/// resume and fork, from the name the launch uses, and a named session is
+/// detected like an unnamed one. A dash-leading name stays one value, and two
+/// sessions with one name both launch.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
+    require_real_claude();
+    let package = installed_definition();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+
+    // Launch: the name is one joined argument, and the named screen is idle.
+    let id = fixture.new_session_id("alpha").await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, "for shortcuts").await;
+    assert_eq!(
+        name_argument(&session_argv(&fixture, &id).await),
+        ["--name=alpha"]
+    );
+    assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
+    show_named_screen(&fixture, &id, "launch alpha").await;
+
+    // A second session with the same name launches too; what Claude does with
+    // the collision is the evidence recorded on the screen.
+    let twin = fixture.new_session_id("alpha").await;
+    fixture.wait_activity(&twin, "idle").await;
+    assert_eq!(
+        name_argument(&session_argv(&fixture, &twin).await),
+        ["--name=alpha"]
+    );
+    show_named_screen(&fixture, &twin, "collision alpha").await;
+    fixture.stop(&twin).await;
+
+    // A name that starts with a dash stays the value of `--name`.
+    let dashed = fixture.new_session_id("--help").await;
+    fixture.wait_activity(&dashed, "idle").await;
+    assert_eq!(
+        name_argument(&session_argv(&fixture, &dashed).await),
+        ["--name=--help"]
+    );
+    show_named_screen(&fixture, &dashed, "launch --help").await;
+    fixture.stop(&dashed).await;
+
+    // One turn gives the conversation a transcript to resume and fork.
+    fixture.input(&id, PROMPT).await;
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    let reported = fixture.wait_reported_conversation(&id).await;
+    let reference = reported["active_agent_session_id"]
+        .as_str()
+        .expect("the conversation id")
+        .to_owned();
+
+    // Resume: the name the record has now, not the one of the first launch.
+    fixture.stop(&id).await;
+    let (code, renamed) = fixture
+        .harness
+        .json(&["session", "rename", &id, "beta"])
+        .await;
+    assert_eq!(code, 0, "{renamed}");
+    let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 0, "{resumed}");
+    fixture.wait_activity(&id, "idle").await;
+    let argv = session_argv(&fixture, &id).await;
+    assert_eq!(name_argument(&argv), ["--name=beta"], "{argv:?}");
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == reference),
+        "{argv:?}"
+    );
+    show_named_screen(&fixture, &id, "resume beta").await;
+
+    // Fork: its own name, never the source's.
+    let (code, forked) = fixture
+        .harness
+        .json(&["session", "fork", &id, "--name", "gamma"])
+        .await;
+    assert_eq!(code, 0, "{forked}");
+    let fork_id = forked["ok"]["id"]
+        .as_str()
+        .or_else(|| forked["ok"]["session"]["id"].as_str())
+        .unwrap_or_else(|| panic!("the fork names its session: {forked}"))
+        .to_owned();
+    fixture.wait_activity(&fork_id, "idle").await;
+    let argv = session_argv(&fixture, &fork_id).await;
+    assert_eq!(name_argument(&argv), ["--name=gamma"], "{argv:?}");
+    assert!(argv.iter().any(|argument| argument == "--fork-session"));
+    show_named_screen(&fixture, &fork_id, "fork gamma").await;
+
+    // A fork without a name passes none.
+    let (code, unnamed) = fixture.harness.json(&["session", "fork", &id]).await;
+    assert_eq!(code, 0, "{unnamed}");
+    let unnamed_id = unnamed["ok"]["id"]
+        .as_str()
+        .or_else(|| unnamed["ok"]["session"]["id"].as_str())
+        .unwrap_or_else(|| panic!("the fork names its session: {unnamed}"))
+        .to_owned();
+    fixture.wait_activity(&unnamed_id, "idle").await;
+    let argv = session_argv(&fixture, &unnamed_id).await;
+    assert!(name_argument(&argv).is_empty(), "{argv:?}");
+
+    for stopped in [&unnamed_id, &fork_id, &id] {
+        fixture.stop(stopped).await;
+    }
     fixture.finish().await;
 }
 
@@ -4371,8 +4598,8 @@ async fn a_real_claude_approval_prompt_is_blocked() {
     let (title, _rows) = fixture.screen(&id).await;
     assert_eq!(
         title.as_deref(),
-        Some(PROGRAM_STATUS_TITLE),
-        "Claude sets no status glyph while it reports its state in program-status records"
+        Some("approval"),
+        "a named session's title is its name, with no status glyph, while Claude reports its state in program-status records"
     );
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Blocked).await;
 
@@ -5581,7 +5808,7 @@ async fn capture_the_real_claude_first_run_screens() {
     };
     let recording = capture::RecordingRoot::new("claude");
     let fixture = Fixture::start_in(Seed::Fresh, Some(recording.directory("cwd"))).await;
-    let id = fixture.new_session_id("first-run").await;
+    let id = fixture.new_unnamed_session_id().await;
     fixture
         .wait_screen_line(&id, "Choose the text style that looks best")
         .await;
@@ -5619,7 +5846,7 @@ async fn capture_the_real_claude_screens() {
 
     // Onboarded home, untrusted folder.
     let fixture = Fixture::start_in(Seed::Onboarded, Some(recording.directory("cwd"))).await;
-    let id = fixture.new_session_id("trust").await;
+    let id = fixture.new_unnamed_session_id().await;
     fixture.wait_screen_line(&id, "Quick safety check").await;
     fixture.capture(&directory, &id, "trust").await;
     fixture.capture_widths(&directory, &id, "trust", true).await;
@@ -5629,7 +5856,7 @@ async fn capture_the_real_claude_screens() {
     // Trusted home: idle, working, idle after a turn, approval, question.
     let fixture = Fixture::start_in(Seed::Trusted, Some(recording.directory("cwd"))).await;
     fixture.install_integration().await;
-    let id = fixture.new_session_id("states").await;
+    let id = fixture.new_unnamed_session_id().await;
     fixture.wait_activity(&id, "idle").await;
     fixture.wait_screen_line(&id, "for shortcuts").await;
     fixture.capture(&directory, &id, "idle").await;
@@ -5695,7 +5922,7 @@ async fn capture_the_real_claude_screens() {
         .await;
     fixture.stop(&id).await;
 
-    let id = fixture.new_session_id("question").await;
+    let id = fixture.new_unnamed_session_id().await;
     fixture.wait_activity(&id, "idle").await;
     fixture
         .input(&id, &format!("{} ask", messages_stub::QUESTION_MARKER))
@@ -5710,6 +5937,59 @@ async fn capture_the_real_claude_screens() {
         .await;
     fixture
         .capture_widths(&directory, &id, "askuser", true)
+        .await;
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Records the screens of a real Claude Code that carries a pohunek session
+/// name into `named/` below the directory named by `POHUNEK_CLAUDE_CAPTURE_DIR`:
+/// the idle prompt box, a second session whose name collides with a live one,
+/// and a streaming reply. Without the variable the test does nothing.
+#[tokio::test]
+#[ignore = "refreshes compat/claude/screens/named from a real `claude`; run with POHUNEK_CLAUDE_CAPTURE_DIR and --ignored"]
+async fn capture_the_real_claude_named_screens() {
+    let Some(directory) = capture_directory() else {
+        return;
+    };
+    let directory = directory.join(NAMED_SCREENS_DIR);
+    fs::create_dir_all(&directory).expect("create the named capture directory");
+    let recording = capture::RecordingRoot::new("claude");
+    let fixture = Fixture::start_in(Seed::Trusted, Some(recording.directory("cwd"))).await;
+    fixture.install_integration().await;
+
+    let id = fixture.new_session_id(NAMED_SCREEN_NAME).await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, "for shortcuts").await;
+    fixture.capture(&directory, &id, "idle").await;
+
+    let twin = fixture.new_session_id(NAMED_SCREEN_NAME).await;
+    fixture.wait_activity(&twin, "idle").await;
+    fixture
+        .wait_screen_line(&twin, "Another live session on this machine")
+        .await;
+    fixture.capture(&directory, &twin, "collision").await;
+    fixture.stop(&twin).await;
+
+    fixture
+        .input(
+            &id,
+            &format!(
+                "{} {} {PROMPT}",
+                messages_stub::HOLD_MARKER,
+                messages_stub::STREAM_HOLD_MARKER
+            ),
+        )
+        .await;
+    fixture.wait_visible_working(&id).await;
+    fixture.stub.open_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::FIRST_CHUNK)
+        .await;
+    fixture.capture(&directory, &id, "working_stream").await;
+    fixture.stub.open_stream_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;
     fixture.stop(&id).await;
     fixture.finish().await;
