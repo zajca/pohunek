@@ -274,9 +274,10 @@ composer.
   app-server does not replace it. A resumed or reloaded Codex child sends
   `SubagentStop` without a preceding `SubagentStart`, so for Codex a stop with
   no recorded start records a completed subagent. Codex fires `SubagentStop`
-  once per completed child turn, so a repeated stop on a finished child only
-  advances its recorded ordering and leaves it completed (the Codex-specific
-  gaps are tracked in [#916](https://github.com/zajca/pohunek/issues/916)).
+  once per completed child turn, so a stop on a finished child is another
+  completed turn: the row takes a new revision and finish time (follow-up
+  tasks and resumed children show up when their turn ends; the rule is in
+  [sessions](../concepts/sessions.md)).
   The subagent hook inputs and sequences of 0.164.0 are committed as fixtures:
   `compat/codex/subagent-hooks.json` holds a start and a stop input with their
   transcript labels (the start names the child's own transcript; the stop names

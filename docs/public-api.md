@@ -1344,14 +1344,18 @@ subagent sequence rule (a record's phase is the phase implied by the
 highest-sequence claim admitted for its id: a start newer than a terminal
 record reopens it, a stop newer than a running record ends it, a newer start
 for a running record or a newer stop for a terminal one changes no phase but
-advances the record's journaled sequence, and a claim not newer than that
+advances the record's journaled sequence, except a newer stop of a provider that
+reports every completed turn (`codex` in `identity-subagent-v1`), which records
+one more completed turn of a terminal record with a new revision and the stop's
+time as its update and finish time, and a claim not newer than that
 sequence is ignored; the journaled sequence is capped at the worker's own
 `CLOCK_MONOTONIC` reading when the claim arrives, so a far-future claim cannot
 make the subagent's later genuine claims stale, while comparisons use the
-claim's own sequence), and the subagent providers whose stop is
-admitted only after a recorded start (`claude` in `identity-subagent-v1`, keyed
-by the reporting provider, so it also covers a Claude in a shell session's
-foreground). A schema that admits subagent
+claim's own sequence), the subagent providers whose stop is
+admitted only after a recorded start (`claude` and `muse` in
+`identity-subagent-v1`), and the providers whose every stop is a completed turn
+(`codex`). Both lists are keyed by the reporting provider, so they also cover a
+Claude or Codex in a shell session's foreground. A schema that admits subagent
 operations must declare the sequence rule; one without it admits no subagent
 record on either side. The worker applies the declared matcher, launch-process
 rule, field set and sequence rule when a hook reports, and the daemon applies
@@ -1819,7 +1823,10 @@ Important fields:
   runtime ends. A terminal child returns to `running` with a new `revision` when
   its provider starts it again (a resumed or self-woken Claude background
   agent): `finished_at_ms` is cleared, `started_at_ms` keeps the first run's
-  time, and `updated_at_ms` marks the reopen. A delayed claim older than the
+  time, and `updated_at_ms` marks the reopen. A Codex child that completes
+  another turn (a follow-up or a resumed turn, each ending in a stop) stays
+  `completed` with a new `revision`, and `updated_at_ms` and `finished_at_ms`
+  mark that turn. A delayed claim older than the
   latest one the worker admitted for a child never changes that child. A
   Claude `SubagentStop` without a
   recorded start (the prompt-suggestion helper Claude runs after every main

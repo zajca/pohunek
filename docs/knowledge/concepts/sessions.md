@@ -478,9 +478,10 @@ revision, its terminal time is cleared, `started_at_ms` keeps the time of the
 first run, and the next newer `SubagentStop` completes it. Claude sends such a
 start when a finished background agent is resumed with `SendMessage` or wakes
 itself. A newer start for a child that is already running, or a newer stop for
-a terminal child, is ignored: the phase and revision stay, but the worker
-persists the claim's sequence in the journal, so a delayed older claim cannot
-reopen or complete the record. A claim not newer than the recorded sequence is
+a terminal Claude or Muse child, is ignored: the phase and revision stay, but
+the worker persists the claim's sequence in the journal, so a delayed older
+claim cannot reopen or complete the record. A newer stop for a terminal Codex
+child is another completed turn (see below). A claim not newer than the recorded sequence is
 ignored and changes nothing. The recorded sequence, and the sequence a
 remembered orphan stop keeps, is capped at the worker's own `CLOCK_MONOTONIC`
 reading when the claim arrives, as the background mark is: a claim taken from
@@ -497,8 +498,22 @@ only, in a set bounded to 64 entries that drops its oldest entry beyond that,
 and drops an entry once a start for that id applies. A delayed start whose
 sequence is not newer than the remembered stop is ignored, so it creates no
 row. A Codex `SubagentStop` without a recorded start records a completed
-child, because Codex reports resumed children with stops and no start
-([#916](https://github.com/zajca/pohunek/issues/916)).
+child, because Codex reports resumed children with stops and no start.
+
+Codex sends a `SubagentStop` after every completed turn of a child: the first
+turn, each follow-up (`send_input`, or `followup_task` of `multi_agent_v2`) and
+each turn of a resumed child. Only the first turn is preceded by a
+`SubagentStart`. A Codex stop newer than the recorded claim of a terminal child
+is therefore one more completed turn: the record stays `completed`, takes a new
+revision, and its `updated_at_ms` and `finished_at_ms` are the time the stop
+reached the worker, while `started_at_ms` keeps the first run. The record is the
+newest terminal one for the history bound, so a chatty child stays in recent
+history and the oldest other terminal child drops first. A Codex child shows as
+`running` only between its start and its next stop: a follow-up or a resumed
+turn is recorded when it ends, not while it runs, because Codex fires no hook
+at the start of every such turn (a `multi_agent_v2` follow-up fires none). A stop older than the recorded claim, as a delayed hook of an
+earlier turn is, changes nothing. The rule belongs to the reporting provider,
+so a shell session that hosts Codex gets it too.
 
 At the end of every main-agent turn, Claude's `Stop` hook input lists the
 backgrounded tasks that are still running or pending (`background_tasks`). The

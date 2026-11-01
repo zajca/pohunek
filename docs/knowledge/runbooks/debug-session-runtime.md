@@ -80,7 +80,8 @@ reported and recorded sequences, and a `subagent.reason` code:
 `stop_without_start` (a Claude stop with no recorded start, such as Claude's
 prompt-suggestion helper after every main turn), `stale_sequence` (a claim not
 newer than the recorded one, or a start not newer than a remembered Claude
-stop without a start) and `not_running` (a newer stop for a terminal child) at INFO,
+stop without a start) and `not_running` (a newer stop for a terminal Claude or Muse child; a Codex
+child records it as a completed turn and logs nothing) at INFO,
 and `capacity` (a start refused because the running-child limit is full) at
 WARN. A child's phase follows the highest-sequence claim the worker admitted
 for it, for every provider: an ignored `duplicate_start` or `not_running`
