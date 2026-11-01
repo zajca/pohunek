@@ -1,7 +1,10 @@
 """Every step that can wait on a network or a local archive has an upper bound (#1811),
 and every fail-fast cancel names the job it came from (#1823). Stdlib only."""
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
 SETUP_MOLD_ACTION = ROOT / ".github" / "actions" / "setup-mold" / "action.yml"
 CANCEL_ACTION = ROOT / ".github" / "actions" / "cancel-run" / "action.yml"
-CANCEL_ANNOTATION = "::error title=Fail fast::"
+CANCEL_SCRIPT = ROOT / ".github" / "actions" / "cancel-run" / "cancel-run.sh"
 
 
 def steps_of(text: str) -> list[str]:
@@ -62,29 +65,70 @@ class MoldPinTests(unittest.TestCase):
 
 
 class CancelAttributionTests(unittest.TestCase):
-    def cancel_blocks(self) -> list[tuple[str, str]]:
-        blocks = [(CANCEL_ACTION.name, CANCEL_ACTION.read_text())]
+    def test_the_composite_passes_the_exact_job_to_the_script(self):
+        # A matrix shares one job id across its legs; the check run id tells them apart.
+        action = CANCEL_ACTION.read_text()
+        self.assertIn("FAILED_JOB: ${{ github.job }}", action)
+        self.assertIn("JOB_ID: ${{ job.check_run_id }}", action)
+        self.assertIn("${GITHUB_ACTION_PATH}/cancel-run.sh", action)
+
+    def test_no_job_cancels_the_run_inline(self):
+        # Only the watchers of called workflows cancel inline: they have no job of their own to resolve.
         for workflow in WORKFLOWS:
             for step in steps_of(workflow.read_text()):
                 if "gh run cancel" in step:
-                    blocks.append((workflow.name, step))
-        return blocks
+                    with self.subTest(workflow=workflow.name):
+                        self.assertIn("(a called workflow) failed first", step)
 
-    def test_every_cancel_names_its_job(self):
-        blocks = self.cancel_blocks()
-        self.assertGreater(len(blocks), 10)
-        for name, block in blocks:
-            with self.subTest(source=name):
-                self.assertIn(CANCEL_ANNOTATION, block)
-                self.assertIn("FAILED_JOB:", block)
+    def run_script(self, jobs_api_json: str | None) -> tuple[str, str, str]:
+        """Run cancel-run.sh with a fake `gh`; return (stdout, summary, gh calls)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            calls = tmp_path / "calls"
+            reply = tmp_path / "reply.json"
+            if jobs_api_json is not None:
+                reply.write_text(jobs_api_json)
+            gh = bin_dir / "gh"
+            gh.write_text(
+                "#!/bin/sh\n"
+                f'echo "$*" >> "{calls}"\n'
+                'if [ "$1" = api ]; then\n'
+                f'  [ -f "{reply}" ] || exit 1\n'
+                f'  cat "{reply}"\n'
+                "fi\n"
+            )
+            gh.chmod(0o755)
+            summary = tmp_path / "summary.md"
+            env = {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "GH_TOKEN": "x",
+                "RUN_ID": "7",
+                "REPOSITORY": "o/r",
+                "FAILED_JOB": "fast-tests",
+                "JOB_ID": "99",
+                "GITHUB_STEP_SUMMARY": str(summary),
+            }
+            result = subprocess.run(["bash", str(CANCEL_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout, summary.read_text(), calls.read_text()
 
-    def test_cancels_of_a_job_link_the_exact_job(self):
-        # A matrix shares one job id across its legs; the check run id tells them apart.
-        for name, block in self.cancel_blocks():
-            if "FAILED_JOB: ${{ github.job }}" in block:
-                with self.subTest(source=name):
-                    self.assertIn("JOB_ID: ${{ job.check_run_id }}", block)
-                    self.assertIn("/job/${JOB_ID}", block)
+    def test_the_script_names_the_display_name_the_failed_step_and_cancels(self):
+        info = '{"name": "tests (cli, fast)", "steps": [{"name": "Set up job", "conclusion": "success"}, {"name": "Run fast shard", "conclusion": "failure"}]}'
+        out, summary, calls = self.run_script(info)
+        expected = "job 'tests (cli, fast)' (fast-tests, https://github.com/o/r/actions/runs/7/job/99) failed first in step 'Run fast shard'"
+        self.assertIn(f"::error title=Fail fast::{expected}", out)
+        self.assertIn(expected, summary)
+        self.assertIn("run cancel 7 --repo o/r", calls)
+        self.assertIn("api repos/o/r/actions/jobs/99", calls)
+
+    def test_the_script_still_cancels_and_falls_back_to_the_job_id_when_the_lookup_fails(self):
+        out, summary, calls = self.run_script(None)
+        self.assertIn("job 'fast-tests' (fast-tests, https://github.com/o/r/actions/runs/7/job/99) failed first;", out)
+        self.assertNotIn("in step", out)
+        self.assertIn("failed first", summary)
+        self.assertIn("run cancel 7 --repo o/r", calls)
 
 
 if __name__ == "__main__":

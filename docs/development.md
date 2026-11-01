@@ -167,8 +167,13 @@ the advisory `cargo-audit` job and a job that was itself cancelled never
 trigger it. Read such a run accordingly: the job that failed and the run end as
 `cancelled`, while the failed step stays red in the job log and the step's
 `::error` annotation (`Fail fast`) names the job that failed first. The
-annotation sits on the failed job's check run (not on the run page) and links
-that job by its check run id, which tells the legs of a matrix apart. So a
+annotation and the job summary sit on the failed job's check run (not on the
+run page) and give the job's display name (for example `tests (cli, fast)`), its
+job id, a link by check run id and the step that failed. The name and step come
+from the jobs API on a best-effort basis; without them the message falls back
+to the job id and the link. The jobs with a sparse or relocated checkout copy
+the `cancel-run` action out of the checkout first, so every job uses the same
+script (`.github/actions/cancel-run/cancel-run.sh`). So a
 cancelled job in a pull request run can mean that another job failed first:
 open the cancelled jobs and look for the one whose step list has a red step
 followed by the executed `Cancel the run (fail fast)` step.

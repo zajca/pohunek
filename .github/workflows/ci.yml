@@ -48,8 +48,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != 
 # step needs `actions: write`, granted per job and never for the workflow.
 # Push runs, scheduled runs and the advisory audit job never cancel. The failing
 # job and the run end as `cancelled`, so no job shows `failure` on the run page;
-# the `::error` annotation on the failed job's check run names the job id and
-# links the job (`job.check_run_id`), which identifies a matrix leg. The
+# the `::error` annotation on the failed job's check run (and its job summary)
+# names the job's display name, job id, link and failed step. The
 # advisory audit, the two fail-open selectors and the verdict do not carry the
 # step.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
@@ -922,6 +922,12 @@ jobs:
           path: relocated
           persist-credentials: false
 
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -993,22 +999,9 @@ jobs:
           name: nextest-junit-${{ matrix.shard }}
           path: relocated/target/nextest/ci/junit.xml
           if-no-files-found: warn
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-          JOB_ID: ${{ job.check_run_id }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
@@ -1286,6 +1279,7 @@ jobs:
               - 'scripts/junit-flaky-summary'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-mold/**'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
@@ -1332,6 +1326,12 @@ jobs:
         with:
           path: relocated
           persist-credentials: false
+
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1409,22 +1409,9 @@ jobs:
           name: nextest-junit-heavy
           path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-          JOB_ID: ${{ job.check_run_id }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
   # user manager (transient worker units, the namespaced daemon unit, the
@@ -1617,6 +1604,12 @@ jobs:
           path: relocated
           persist-credentials: false
 
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -1682,22 +1675,9 @@ jobs:
           name: nextest-junit-relay-db
           path: relocated/target/nextest/relay-db/junit.xml
           if-no-files-found: warn
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-          JOB_ID: ${{ job.check_run_id }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
   # G3 of #1218: each package's tests run from a tree holding only the files
   # whose change selects that package, so a test that reads a path outside
@@ -1824,6 +1804,12 @@ jobs:
           path: relocated
           persist-credentials: false
 
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -1842,22 +1828,9 @@ jobs:
 
       - name: Verify the planned shards hold every selected test
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-          JOB_ID: ${{ job.check_run_id }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
@@ -3577,7 +3550,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: scripts
+          sparse-checkout: |
+            scripts
+            .github/actions/cancel-run
           persist-credentials: false
 
       # Only this workflow's test jobs: the release rehearsal's reusable
@@ -3590,21 +3565,9 @@ jobs:
 
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
-      # Inline instead of .github/actions/cancel-run: the sparse checkout of
-      # this job holds only scripts/, so the local action would be missing.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-          JOB_ID: ${{ job.check_run_id }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./.github/actions/cancel-run
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).

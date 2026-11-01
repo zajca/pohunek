@@ -1386,24 +1386,32 @@ class FailFastTests(unittest.TestCase):
                 self.assertEqual(self.permissions(job).get("actions"), "write")
                 self.assertNotRegex(job, r"(?m)^    continue-on-error:")
 
-    def test_a_job_with_a_sparse_or_relocated_tree_cancels_inline_and_the_others_use_the_action(self):
-        # A sparse or relocated checkout holds no .github/actions at its root, so such a job cannot use the local action.
-        sparse_capable = set()
+    def test_a_job_with_a_sparse_or_relocated_tree_reaches_the_action_and_the_others_use_it_in_place(self):
+        # A sparse or relocated checkout holds no .github/actions at the workspace root when the step runs.
+        # Relocated jobs copy the action out of the checkout; the sparse `scripts` job lists the action in its sparse set.
+        relocated = set()
+        sparse = set()
         for name, job in self.direct_jobs().items():
-            if re.search(r"(?m)^ +sparse-checkout:|^ +path: relocated$", job):
-                sparse_capable.add(name)
-        self.assertGreaterEqual(sparse_capable, {"fast-tests", "integration", "integration-relay", "test-selection-check", "test-duplicates"})
+            if re.search(r"(?m)^ +path: relocated$", job):
+                relocated.add(name)
+            elif re.search(r"(?m)^ +sparse-checkout:", job):
+                sparse.add(name)
+        self.assertGreaterEqual(relocated, {"fast-tests", "integration", "integration-relay", "test-selection-check"})
+        self.assertEqual(sparse, {"test-duplicates"})
         for name, job in self.direct_jobs().items():
-            last = list(job_steps(job).values())[-1]
+            steps = job_steps(job)
+            last = list(steps.values())[-1]
             with self.subTest(job=name):
-                if name in sparse_capable:
-                    self.assertNotIn(".github/actions/cancel-run", last)
-                    self.assertIn("        continue-on-error: true\n", last)
-                    self.assertIn('gh run cancel "$RUN_ID" --repo "$REPOSITORY"', last)
-                    self.assertIn("::error title=Fail fast::", last)
+                self.assertNotIn("gh run cancel", last)
+                if name in relocated:
+                    self.assertRegex(last, r"(?m)^        uses: \./cancel-run-action$")
+                    keep = steps["Keep the fail-fast action"]
+                    self.assertIn('cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"', keep)
+                    self.assertLess(list(steps).index("Keep the fail-fast action"), 2)
                 else:
                     self.assertRegex(last, r"(?m)^        uses: \./\.github/actions/cancel-run$")
                     self.assertNotIn("relocated", last)
+        self.assertIn("            .github/actions/cancel-run\n", self.direct_jobs()["test-duplicates"])
 
     def test_every_checkout_of_a_job_with_actions_write_drops_the_persisted_token(self):
         # The token stays out of git config, so later build scripts and tests cannot read it from there.
@@ -1459,9 +1467,11 @@ class FailFastTests(unittest.TestCase):
 
     def test_the_composite_cancels_the_run_and_fails_soft(self):
         action = (ROOT / ".github" / "actions" / "cancel-run" / "action.yml").read_text()
+        script = (ROOT / ".github" / "actions" / "cancel-run" / "cancel-run.sh").read_text()
         self.assertIn("      continue-on-error: true\n", action)
-        self.assertIn('gh run cancel "$RUN_ID"', action)
-        self.assertIn("::error title=Fail fast::", action)
+        self.assertIn("${GITHUB_ACTION_PATH}/cancel-run.sh", action)
+        self.assertIn('gh run cancel "$RUN_ID"', script)
+        self.assertIn("::error title=Fail fast::", script)
         self.assertIn("RUN_ID: ${{ github.run_id }}", action)
         self.assertEqual(action.count("- name:"), 1)
 
