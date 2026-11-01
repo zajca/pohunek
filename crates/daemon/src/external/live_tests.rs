@@ -175,8 +175,8 @@ impl Live {
     }
 
     /// Waits for `session_id` at `path` once the scenario has caused a pass,
-    /// requested or raised by a tree change. A pass re-registers the root and
-    /// restarts the backend's stream (#1151), so the change may arrive only
+    /// requested or raised by a tree change. A backend that registers directory
+    /// by directory rewalks the root in a pass, so the change may arrive only
     /// through a pass.
     async fn wait_for_session_after_pass(&self, path: &Path, session_id: &str) {
         self.wait_for_session_within(path, session_id, STATE_TIMEOUT)
@@ -210,6 +210,22 @@ impl Live {
             |live| !live.is_indexed(path),
         )
         .await;
+    }
+
+    /// Requests a reconciliation pass and waits until it has completed, ticking
+    /// the request like the observer's sweep.
+    async fn wait_for_pass(&self) {
+        let before = self.handle.passes();
+        let wait = async {
+            while self.handle.passes() == before {
+                let notified = self.sessions.inner.rescan.notified();
+                self.handle.request_reconcile();
+                let _ = tokio::time::timeout(SWEEP_TICK, notified).await;
+            }
+        };
+        tokio::time::timeout(STATE_TIMEOUT, wait)
+            .await
+            .unwrap_or_else(|_elapsed| panic!("timed out waiting for a reconciliation pass"));
     }
 
     /// Waits for a watcher state while ticking the retry the way the observer's
@@ -254,6 +270,20 @@ async fn creating_a_transcript_indexes_it() {
     write_transcript(&path, "created");
 
     live.wait_for_session(&path, "created").await;
+}
+
+#[tokio::test]
+async fn a_transcript_written_right_after_a_pass_is_indexed_by_a_live_event() {
+    let live =
+        Live::start(|_base, root| fs::create_dir_all(root.join("p")).expect("project")).await;
+
+    for round in 0..3 {
+        live.wait_for_pass().await;
+        let session = format!("after-pass-{round}");
+        let path = live.root.join(format!("p/{session}.jsonl"));
+        write_transcript(&path, &session);
+        live.wait_for_session(&path, &session).await;
+    }
 }
 
 #[tokio::test]

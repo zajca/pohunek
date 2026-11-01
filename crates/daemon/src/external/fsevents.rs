@@ -91,6 +91,19 @@ impl FsEventsBackend {
         })
     }
 
+    /// Stops watching a root that is gone, so a root created again at the same
+    /// path starts a fresh stream.
+    fn forget_root(&mut self, root: &Path) {
+        if let Some(position) = self
+            .registered
+            .iter()
+            .position(|entry| entry.configured == root)
+        {
+            let entry = self.registered.remove(position);
+            let _ = self.watcher.unwatch(&entry.canonical);
+        }
+    }
+
     fn translate(&self, signal: RawSignal, out: &mut Vec<WatchEvent>) {
         match signal {
             RawSignal::Error => out.push(WatchEvent::Rescan),
@@ -175,11 +188,16 @@ impl WatchBackend for FsEventsBackend {
         let canonical = match fs::canonicalize(root) {
             Ok(canonical) => canonical,
             Err(error) if is_absent_error(&error) => {
+                self.forget_root(root);
                 return RootRegistration::Missing;
             }
-            Err(error) => return RootRegistration::Failed(error),
+            Err(error) => {
+                self.forget_root(root);
+                return RootRegistration::Failed(error);
+            }
         };
         if !canonical.is_dir() {
+            self.forget_root(root);
             return RootRegistration::Missing;
         }
         // The `FSEvents` binding converts paths with `to_str().unwrap()`.
@@ -232,6 +250,20 @@ impl WatchBackend for FsEventsBackend {
         }
     }
 
+    /// Keeps the stream of every root that stays: each `watch` or `unwatch`
+    /// stops and recreates the `FSEvents` stream, and events are not delivered
+    /// until the new stream runs.
+    fn retain_roots(&mut self, roots: &[PathBuf]) {
+        let watcher = &mut self.watcher;
+        self.registered.retain(|entry| {
+            let keep = roots.contains(&entry.configured);
+            if !keep {
+                let _ = watcher.unwatch(&entry.canonical);
+            }
+            keep
+        });
+    }
+
     async fn next_events(&mut self, out: &mut Vec<WatchEvent>) -> io::Result<()> {
         tokio::select! {
             signal = self.receiver.recv() => {
@@ -266,7 +298,7 @@ mod tests {
     use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
     use notify::{Event, EventKind};
 
-    use super::{translate_event, Registered, WatchEvent};
+    use super::{translate_event, Registered, WatchBackend, WatchEvent};
 
     fn registered() -> Vec<Registered> {
         vec![Registered {
@@ -423,5 +455,47 @@ mod tests {
                 "/home/u/codex-alias/2026/s.jsonl"
             ))]
         );
+    }
+
+    fn configured(backend: &super::FsEventsBackend) -> Vec<PathBuf> {
+        backend
+            .registered
+            .iter()
+            .map(|entry| entry.configured.clone())
+            .collect()
+    }
+
+    #[test]
+    fn retaining_the_roots_that_stay_keeps_their_registrations() {
+        let base = pohunek_test_support::tempdir().expect("base");
+        let (a, b) = (base.path().join("a"), base.path().join("b"));
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut backend = super::FsEventsBackend::open().expect("backend");
+        backend.register_root(&a, &cancel);
+        backend.register_root(&b, &cancel);
+
+        backend.retain_roots(std::slice::from_ref(&a));
+
+        assert_eq!(configured(&backend), vec![a.clone()]);
+        backend.retain_roots(std::slice::from_ref(&a));
+        assert_eq!(configured(&backend), vec![a], "an unchanged set keeps it");
+    }
+
+    #[test]
+    fn a_root_that_vanished_is_forgotten_so_a_new_one_starts_a_stream() {
+        let base = pohunek_test_support::tempdir().expect("base");
+        let root = base.path().join("projects");
+        fs::create_dir(&root).expect("root");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut backend = super::FsEventsBackend::open().expect("backend");
+        backend.register_root(&root, &cancel);
+        assert_eq!(configured(&backend), vec![root.clone()]);
+
+        fs::remove_dir(&root).expect("remove root");
+        backend.register_root(&root, &cancel);
+
+        assert!(configured(&backend).is_empty());
     }
 }

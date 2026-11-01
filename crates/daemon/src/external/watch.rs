@@ -21,6 +21,7 @@ use std::future::{poll_fn, Future};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -263,6 +264,14 @@ pub(super) trait WatchBackend: Send + 'static {
     /// Drops every registration so a pass can rebuild them from the filesystem.
     fn unregister_all(&mut self);
 
+    /// Prepares the registrations for a pass that registers `roots` again. The
+    /// default rebuilds them from the filesystem; a backend whose registration
+    /// is costly to recreate keeps the registrations of the roots that stay and
+    /// drops only the others.
+    fn retain_roots(&mut self, _roots: &[PathBuf]) {
+        self.unregister_all();
+    }
+
     /// Appends the next hints to `out`, waiting until at least one state change
     /// is observed. Must be cancel-safe: the runner drops the future whenever
     /// another event source wins.
@@ -317,6 +326,7 @@ impl RootProvider for Vec<TranscriptRoot> {
 pub(crate) struct WatcherHandle {
     state: watch::Receiver<TranscriptWatch>,
     nudge: Arc<Notify>,
+    passes: Arc<AtomicUsize>,
 }
 
 #[cfg_attr(
@@ -333,6 +343,12 @@ impl WatcherHandle {
     #[cfg(test)]
     pub(super) fn subscribe(&self) -> watch::Receiver<TranscriptWatch> {
         self.state.clone()
+    }
+
+    /// Number of reconciliation passes that have completed.
+    #[cfg(test)]
+    pub(super) fn passes(&self) -> usize {
+        self.passes.load(Ordering::Acquire)
     }
 
     /// Asks for a reconciliation pass now, like a rescan hint.
@@ -432,6 +448,7 @@ struct Watcher<B, S, P> {
     last_reconcile: Instant,
     state: watch::Sender<TranscriptWatch>,
     nudge: Arc<Notify>,
+    passes: Arc<AtomicUsize>,
     shutdown: CancellationToken,
 }
 
@@ -457,6 +474,7 @@ where
 {
     let (state_tx, state_rx) = watch::channel(TranscriptWatch::Active);
     let nudge = Arc::new(Notify::new());
+    let passes = Arc::new(AtomicUsize::new(0));
     let now = Instant::now();
     let mut watcher = Watcher {
         backend: Some(backend),
@@ -478,6 +496,7 @@ where
         last_reconcile: now,
         state: state_tx,
         nudge: Arc::clone(&nudge),
+        passes: Arc::clone(&passes),
         shutdown: shutdown.clone(),
     };
     if let Some(error) = &open_error {
@@ -490,6 +509,7 @@ where
     WatcherHandle {
         state: state_rx,
         nudge,
+        passes,
     }
 }
 
@@ -781,10 +801,11 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
             self.roots.len()
         ];
         if self.unavailable.is_none() {
+            let paths: Vec<PathBuf> = self.roots.iter().map(|root| root.path.clone()).collect();
             self.backend
                 .as_mut()
                 .expect(BACKEND_PRESENT)
-                .unregister_all();
+                .retain_roots(&paths);
             for index in 0..self.roots.len() {
                 if !self.register(index).await {
                     return;
@@ -800,6 +821,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
         self.reconcile_at = now + RECONCILE_INTERVAL;
         self.sink.index_changed();
         self.publish_state();
+        self.passes.fetch_add(1, Ordering::Release);
     }
 
     /// Registers one resolved root and records its health. Returns `false` when

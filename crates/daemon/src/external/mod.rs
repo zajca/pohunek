@@ -961,6 +961,12 @@ impl WatchBackend for ReopenableBackend {
         }
     }
 
+    fn retain_roots(&mut self, roots: &[PathBuf]) {
+        if let Some(backend) = &mut self.inner {
+            backend.retain_roots(roots);
+        }
+    }
+
     async fn next_events(&mut self, out: &mut Vec<watch::WatchEvent>) -> io::Result<()> {
         match &mut self.inner {
             Some(backend) => backend.next_events(out).await,
