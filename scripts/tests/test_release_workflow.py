@@ -1581,6 +1581,7 @@ class SharedGateTests(ReleaseWorkflowFiles):
         "scripts/junit-flaky-summary",
         "rust-toolchain.toml",
         ".github/actions/setup-rust/**",
+        ".github/actions/setup-mold/**",
     )
     CI_IF = (
         "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && "
