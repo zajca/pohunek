@@ -7332,8 +7332,8 @@ fn cancelled_initial_input() -> CancellationToken {
     done
 }
 
-/// Lets integration tests drive the daemon's import of a worker's state.
-#[cfg(test)]
+/// Lets the Linux-only hook scenarios drive the daemon's import of a worker's state.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod worker_import_probe {
     use std::path::Path;
 
