@@ -147,7 +147,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
-| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot; `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms` and `--meta k=v` as on `session new`. |
+| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms` and `--meta k=v` as on `session new`. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek migration preflight [--accept-runtime-loss] [--socket <path>] [--json]` | Snapshot legacy sessions and refuse replacement while live PTYs exist; the daemon installer runs it at the one-time daemon-owned to worker-owned PTY boundary, with `--socket` naming the legacy socket moved aside. `--accept-runtime-loss` records consent to import live legacy sessions as runtime-lost. |
 | `pohunek relay login --origin <origin> [--ca-file <file>]` | Sign in to an optional team relay with the OIDC device flow and store the credential in the OS keyring. `--origin` is the exact HTTPS origin; `--ca-file` adds a public CA certificate for a privately operated relay. |
@@ -596,7 +596,9 @@ pohunek assistant --agent hermes "Explain the current session runtime."
 
 The assistant is an ordinary agent session — the same PTY, attach, and
 notification machinery — launched with a materialized offline knowledge
-bundle and a redacted snapshot of live state. No secrets enter the prompt. Its
+bundle and a launch snapshot that holds launch metadata only (intent, request,
+selected host, project and agent, bundle version). The snapshot is not redacted
+and carries no live state, so keep secrets out of the request. Its
 automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 `hermes`; explicit Hermes selection still requires the supported runtime on the
 selected host. Codex, Claude Code and Hermes are served only by their official

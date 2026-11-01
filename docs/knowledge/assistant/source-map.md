@@ -64,10 +64,28 @@ Assistant launch and prompt rendering:
 - `crates/assistant/src/lib.rs`
 - `crates/assistant/src/host.rs`
 - `crates/assistant/src/error.rs`
-- `crates/assistant/src/launch.rs`
+- `crates/assistant/src/launch.rs` — launch orchestration, the launch snapshot
+  (launch metadata only), and prompt composition. The prompt's safety rules and
+  navigation steps are rendered from `docs/knowledge/assistant/system.md`.
 - `crates/assistant/tests/select_agent.rs`
+- `crates/assistant/tests/materialize_newer_daemon.rs`
+- `crates/assistant/tests/prompt_contract.rs` — the launched prompt carries every
+  safety rule and navigation step of `system.md`.
 - `crates/prompt/src/lib.rs`
 - `crates/prompt/src/link.rs`
+
+Knowledge bundle build, embed, and materialization:
+
+- `crates/knowledge/build.rs` — assembles the embedded bundle and its content hash.
+- `crates/knowledge/src/schema.rs` — concept types and frontmatter fields.
+- `crates/knowledge/src/validation.rs` — bundle validation (frontmatter, ids,
+  links, reserved files).
+- `crates/knowledge/src/index.rs` — the intent-filtered concept index the prompt's
+  table of contents is built from.
+- `crates/knowledge/src/protocol_conversions.rs` — concept metadata as it crosses
+  the `assistant.materialize` wire.
+- `crates/knowledge/src/materializer.rs` — safe extraction of the embedded bundle.
+- `crates/knowledge/src/assistant.rs` — bundle version, content hash, and launch ids.
 - `docs/knowledge/concepts/host-governance.md`
 
 TypeScript SDK and test relay (the web control center is an external client in
@@ -95,12 +113,22 @@ TypeScript SDK and test relay (the web control center is an external client in
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
-Implemented reduced relay foundation and deferred team-relay architecture:
-PostgreSQL fencing and recovery, protected stopped-lifecycle provisioning,
-generic OIDC browser/device authentication, bounded HTTPS account and credential
-lifecycle, provider-neutral account linking, and native relay CLI are
-implemented. Host links, routing, attach, team administration, provider
-verification, and team clients remain deferred:
+Team relay status. Implemented means the issue of the team-relay delivery list
+(RFC section 23, umbrella [#56](https://github.com/zajca/pohunek/issues/56)) is
+closed as completed; deferred means it is still open:
+
+- Implemented: direct-overlay foundation (#69), RFC landing (#80), stable host
+  identity (#81), the reduced relay foundation (#85: PostgreSQL fencing and
+  recovery, protected provisioning, generic OIDC browser and device
+  authentication, bounded HTTPS account and credential lifecycle, native
+  credential CLI), Google and GitHub team admission with bounded revalidation
+  (#92), provider-neutral account linking (#107), and the RFC reconciliation (#91).
+- Deferred: host enrollment and the userspace WireGuard link (#72), protocol v4
+  host link (#70), `HostShare` enforcement (#82), session visibility and sharing
+  (#83), snapshots and subscriptions (#84), routing, aggregation, attach and the
+  typed public API (#71), the complete team administration API (#108), team
+  clients and web (#86), operational hardening (#87), and the post-release
+  webhook delivery (#73) and runtime-backed profiles (#88).
 
 - `docs/design/team-relay-control-plane-rfc.md`
 - `docs/architecture.md`
@@ -846,11 +874,30 @@ Protocol contracts and transport:
 - `crates/overlay-tailscale/tests/provider.rs`
 - `crates/overlay/tests/registry_contract.rs`
 
-Assistant knowledge implementation work in progress:
+Assistant knowledge entry points:
 
 - `crates/knowledge/src/lib.rs`
-- `crates/knowledge/src/assistant.rs`
 - `docs/knowledge/`
+
+Workspace crates by role (every workspace crate has an entry in this map;
+`cargo xtask docs check` fails when one is missing):
+
+- `crates/session-worker/src/lib.rs` — `pohunek-sessiond`: one durable PTY runtime
+  owner per live session (`pty.rs`, `journal.rs`, `lease.rs`, `server.rs`).
+- `crates/worker-protocol/src/lib.rs` — the versioned owner-private
+  daemon-to-worker protocol, framing, and environment contract.
+- `crates/platform/src/lib.rs` — operating-system contracts shared by the daemon
+  and the session worker: process facts, peer identity, the service supervisor.
+- `crates/terminal/src/lib.rs` — VT screen tracking and attach compositing.
+- `crates/service-config/src/lib.rs` — typed `service.toml` and the upgrade
+  preflight reports.
+- `crates/relay-protocol/src/lib.rs` — typed public API contract of the optional
+  team relay.
+- `crates/relay-client/src/lib.rs` — HTTPS-only native relay authentication
+  client without a daemon dependency.
+- `crates/shape-guard/src/lib.rs` — dev-only persisted-shape guard helpers.
+- `crates/test-support/src/lib.rs` — test-only helpers: hermetic fixture roots
+  and environments, binary resolution, bounded readiness waits.
 
 Design inputs:
 

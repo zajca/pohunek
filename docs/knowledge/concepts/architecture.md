@@ -2,7 +2,7 @@
 type: Concept
 id: concept/architecture
 title: Universal assistant architecture
-description: The assistant is one ordinary agent session guided by a materialized knowledge bundle, a redacted snapshot, and a small navigational prompt.
+description: The assistant is one ordinary agent session guided by a materialized knowledge bundle, a launch snapshot, and a small navigational prompt.
 source_kind: manual
 intents: [setup, project, update, debug, help]
 ---
@@ -11,9 +11,10 @@ intents: [setup, project, update, debug, help]
 
 The Universal Pohunek Assistant is designed as one capable coding-agent session,
 not as a separate runtime or a set of specialized agents. The launch command
-materializes a version-matched knowledge bundle, writes a redacted live snapshot,
-builds a short navigational prompt, and starts a normal PTY-backed session with
-initial input. Like every managed live session, that PTY belongs to its isolated
+materializes a version-matched knowledge bundle, writes a launch snapshot
+(launch metadata only: no live state and no redaction), builds a short
+navigational prompt, and starts a normal PTY-backed session with initial input.
+Like every managed live session, that PTY belongs to its isolated
 `pohunek-sessiond` worker; restarting the public daemon reconnects to the same
 assistant runtime rather than relaunching it.
 
@@ -179,8 +180,9 @@ only in `zajca/pohunek-work`.
 
 Pohunek has an [optional team-relay design](team-relay.md) with an implemented
 reduced foundation. The PostgreSQL-backed relay provides fencing, recovery,
-protected initial provisioning, generic OIDC browser/device authentication, and
-bounded HTTPS account and credential lifecycle. Standalone and direct overlay
+protected initial provisioning, generic OIDC browser/device authentication,
+bounded HTTPS account and credential lifecycle, account linking, and Google and
+GitHub team admission with bounded revalidation. Standalone and direct overlay
 modes remain independent. Host links, `HostShare`, session origin, routing,
 attach, team administration, and the team WebUI remain deferred. The relay has
 no local mode; its future team WebUI and any owner-path browser client use

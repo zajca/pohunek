@@ -2,10 +2,10 @@
 //!
 //! The crate prepares and starts a Pohunek assistant session against a local or
 //! remote daemon using only ordinary protocol requests: it selects an agent
-//! runtime, materializes the knowledge bundle and a redacted live snapshot,
-//! composes the opening prompt and calls `session.new`. [`launch`] holds the
-//! orchestration, [`HostConfig`] and [`ConnectionOptions`] describe how to reach
-//! a daemon, and [`AssistantError`] is the single error type of that path.
+//! runtime, materializes the knowledge bundle and a launch snapshot (launch
+//! metadata only), composes the opening prompt and calls `session.new`.
+//! [`launch`] holds the orchestration, [`HostConfig`] and [`ConnectionOptions`]
+//! describe how to reach a daemon, and [`AssistantError`] is the single error type of that path.
 //!
 //! # Examples
 //!

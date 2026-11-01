@@ -1434,9 +1434,7 @@ mod tests {
             let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
             for required in [
                 "explicit per-file confirmation, independent of `--yes`",
-                "Non-interactive contexts must quarantine proposed hook content instead of enabling it.",
-                ".pohunek/quarantine/hooks/<event>.pending",
-                "~/.config/pohunek/quarantine/hooks/<event>.pending",
+                "In non-interactive contexts never create or modify hooks; describe the proposed hook content to the user instead.",
             ] {
                 assert!(
                     normalized.contains(required),

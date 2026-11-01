@@ -26,7 +26,7 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
-| `crates/assistant` | Assistant launch orchestration: selects a runtime, materializes the knowledge bundle and a redacted live snapshot, and calls `session.new` over ordinary protocol requests. |
+| `crates/assistant` | Assistant launch orchestration: selects a runtime, materializes the knowledge bundle and a launch snapshot (launch metadata only), and calls `session.new` over ordinary protocol requests. |
 | `crates/logging` | Bounded owner-private JSON-lines file logging with rotation shared by the processes of one family. |
 | `crates/platform` | Narrow operating-system contracts shared by the daemon and the session worker: process facts and kernel peer identity. |
 | `crates/service-config` | Typed owner-private `service.toml` and the upgrade preflight and runtime-plan reports shared by the installer, daemon, and worker. |

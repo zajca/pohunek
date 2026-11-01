@@ -193,7 +193,7 @@ Repeat it on every machine that should host sessions. Each host needs its own
 daemon, and remote hosts must be members of the same NetBird (default) or Tailscale
 network; [Tailscale setup](docs/knowledge/guides/tailscale.md) is opt-in. Once the
 daemon runs, `pohunek assistant setup` starts an agent session with the offline
-knowledge bundle and a redacted snapshot of your hosts. Use it to finish
+knowledge bundle and the launch context. Use it to finish
 projects, agent profiles, and remote hosts.
 
 ## Install manually

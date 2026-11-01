@@ -1,19 +1,22 @@
 # Implementation Plan: Universal Pohunek Assistant
 
-Status: **implemented** (verified against the code on 2026-06-26).
-**P0–P11 are implemented** in the workspace: generated-reference pipeline + CI
-drift gates, snapshot/redaction, selection/preflight/bootstrap, prompt
-composition + `--print-prompt`, `pohunek assistant` CLI + `session.new` wiring,
-hook write hard-gate guidance, manual behavior eval, and human docs release
-artifacts. See the top-level [`ROADMAP.md`](../ROADMAP.md) for how this fits the
+Status: **partially implemented**. **P0–P3 and P5–P11 are implemented** in the
+workspace: generated-reference pipeline + CI drift gates, selection/preflight/
+bootstrap, prompt composition + `--print-prompt`, `pohunek assistant` CLI +
+`session.new` wiring, hook write hard-gate guidance, manual behavior eval, and
+human docs release artifacts. **P4 (snapshot collector and redaction) is not
+implemented and was dropped** by the owner on 2026-10-26 (issue #1296): the
+launched snapshot holds launch metadata only, and non-interactive hook
+quarantine has no implementation either. A later issue may propose a live
+snapshot with evidence of need. See the top-level [`ROADMAP.md`](../ROADMAP.md) for how this fits the
 wider plan.
 
 This is the end-to-end engineering plan for the feature
 specified in [`universal-assistant.md`](./universal-assistant.md). It is grounded
 in the current codebase (file:line references throughout) and covers everything:
 foundations, knowledge bundle, build pipeline, embedding/materialization, the one
-new protocol method, snapshot + redaction, agent selection + preflight + daemon
-bootstrap, prompt composition, the CLI surface, the hook hard gate, drift/CI,
+new protocol method, snapshot + redaction (P4, dropped), agent selection +
+preflight + daemon bootstrap, prompt composition, the CLI surface, the hook hard gate, drift/CI,
 behavior eval, and human docs outputs.
 
 The design doc is the source of truth for *what* and *why*. This plan is the
@@ -44,12 +47,19 @@ Done in the current workspace:
 
 Remaining:
 
-- None for this track. Follow-on product work starts from the roadmap's public
-  API / SDK track.
+- **P4 snapshot collector and redaction**: dropped (issue #1296); not planned.
+- Nothing else for this track. Follow-on product work starts from the roadmap's
+  public API / SDK track.
 
 ---
 
 ## 0. Grounding: What Exists Today
+
+> **Historical.** This section describes the tree at the time the plan was
+> written: four crates and protocol v1. The workspace has since grown (see
+> `docs/development.md` for the current crate table) and the line references
+> below no longer match. Treat it as background, not as a description of the
+> current code.
 
 Workspace: 4 crates — `crates/protocol`, `crates/netbird`, `crates/daemon`
 (`pohunekd`), `crates/cli` (`pohunek`). Single workspace version
@@ -426,6 +436,11 @@ returned; GC + idempotency proven.
 
 ## 6. Phase 4 — Snapshot Collector + Allowlist Redaction
 
+> **Not implemented; dropped on 2026-10-26 (issue #1296).** `collect_snapshot` in
+> `crates/assistant/src/launch.rs` writes launch metadata only and calls no
+> doctor, host, project, or session RPC. The tasks below are the original design
+> and are kept for a possible later proposal.
+
 Goal: produce the redacted `snapshot.json`. **Security-critical** — allowlist, not
 denylist.
 
@@ -599,7 +614,9 @@ of `--yes`.
      state the hard rule unambiguously (no `--yes` coverage for hooks);
    - **any pohunek command that installs/writes hooks** (if/when one exists, e.g.
      a future `pohunek hook add`) must prompt per-file regardless of `--yes`;
-   - document the quarantine path convention for non-interactive contexts.
+   - in non-interactive contexts the assistant does not create or modify hooks
+     and describes the proposed content to the user instead (the original
+     quarantine path convention was dropped with #1296).
 2. Audit existing hook-touching code paths (`session/mod.rs` hook runner,
    `project/config.rs`) to confirm none lets an agent enable a hook without a
    filesystem write the user can see; document the boundary.
@@ -689,12 +706,15 @@ Site + offline artifacts build from the same manifest; offline ships with releas
 
 ## 14. Cross-Cutting: Security Checklist
 
-- [x] Snapshot is allowlist-built; serializer cannot emit unknown fields (P4).
-- [x] Profile `[env]` and process env never collected (P4) — re-verified by test.
-- [x] Absolute paths redacted in snapshot (P4).
+- [x] Snapshot is a fixed struct of launch metadata; the serializer cannot emit
+      unknown fields.
+- [x] Profile `[env]` and process env never collected (nothing collects them).
+- [ ] ~~Absolute paths redacted in snapshot (P4)~~ — dropped with P4 (#1296); the
+      snapshot is not redacted and holds the user's request verbatim.
 - [x] Bundle bodies secret-scanned in CI (P9); public-safe rule holds.
 - [x] Prompt composer reads only allowlisted frontmatter fields (P6).
-- [x] Hook writes gated independent of `--yes`; quarantine in non-interactive (P8).
+- [x] Hook writes gated independent of `--yes`; no hook writes in non-interactive
+      contexts (P8, prompt contract only).
 - [x] No bundle bytes shipped over the wire; remote bundle from remote binary (P3).
 - [x] Remote launch fails before launch without a readable bundle unless
       `--degraded` (P3/P7).
@@ -712,7 +732,7 @@ Site + offline artifacts build from the same manifest; offline ships with releas
 | Materializer race/symlink safety | ✔ (P3) | | | |
 | `assistant.materialize` | ✔ roundtrip | ✔ helper tests | ✔ (P3) | |
 | `daemon.doctor` | ✔ result shape | | ✔ (P3) | |
-| Snapshot allowlist/redaction | ✔ (P4) | | | ✔ |
+| Snapshot allowlist/redaction | dropped (P4) | | | |
 | Agent selection | ✔ (P5) | | | |
 | Read-access preflight | ✔ (P5) | ✔ | | |
 | Daemon bootstrap | ✔ (P5) | ✔ | | |
@@ -755,7 +775,7 @@ Remaining (implementation) risks to watch:
 
 - **Milestone 1 (local assistant works):** P0 → P1 (skeleton content) → P2 →
   P3 (local only) → P4 → P5 → P6 → P7 (local). Demo: `pohunek assistant setup`
-  launches locally with a real materialized bundle and redacted snapshot.
+  launches locally with a real materialized bundle and a launch snapshot.
 - **Milestone 2 (remote + safety):** P3 (`assistant.materialize` method) → P7
   (remote path, `--degraded`) → P8.
 - **Milestone 3 (guardrails + docs):** P9 → P10 → P11 → content completion (Track

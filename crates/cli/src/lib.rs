@@ -250,7 +250,7 @@ enum Commands {
     },
 
     /// Launch the universal assistant: one capable agent session with a
-    /// materialized knowledge bundle and a redacted live snapshot.
+    /// materialized knowledge bundle and a launch snapshot.
     ///
     /// With no subcommand the intent defaults to `help`; the intent wrappers
     /// (`setup`/`project`/`update`/`debug`/`help`) only steer navigation.

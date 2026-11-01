@@ -97,7 +97,7 @@ multi-team control plane without replacing either owner path.
   bounded semantic progress policy; factory tracking and recovery state stay
   client-owned.
 - [Universal Pohunek Assistant](design/universal-assistant.md) - one ordinary
-  session-backed assistant, steered by intent and a live snapshot, for setup,
+  session-backed assistant, steered by intent and launch context, for setup,
   project configuration, updates, troubleshooting, and general help.
 - [First-class Hermes agent integration](design/hermes-agent-integration.md) —
   managed Hermes runtime plus a profile-scoped Hermes plugin with typed Pohunek

@@ -11,8 +11,9 @@ intents: [setup, project, update, debug, help]
 
 The assistant is intentionally capable. It runs as an ordinary selected agent
 session and can use that agent's normal file and command tools. Safety comes from
-clear launch boundaries, public-safe knowledge, redacted snapshots, explicit
-configuration review, and existing Pohunek daemon and filesystem controls.
+clear launch boundaries, public-safe knowledge, a launch snapshot that holds
+launch metadata only, explicit configuration review, and existing Pohunek
+daemon and filesystem controls.
 
 The assistant must:
 
