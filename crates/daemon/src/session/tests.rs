@@ -4862,6 +4862,10 @@ async fn session_names_with_format_or_separator_characters_are_refused() {
             .await
             .expect_err("a format or separator character must fail");
         assert_eq!(renamed.code, "bad_request", "{hostile:?}");
+        assert_eq!(
+            renamed.msg, "session name must not contain control, separator, or format characters",
+            "{hostile:?}"
+        );
         let new = registry
             .create(SessionNewParams {
                 name: Some(hostile.to_owned()),
