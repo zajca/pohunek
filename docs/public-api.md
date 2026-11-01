@@ -2022,9 +2022,11 @@ Important fields:
   is dedicated to it.
 - `spawned_by`: optional `{session_id, daemon_id}`, omitted when absent. When a
   `session.new` or `session.fork` request carries the request origin pair
-  (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`, which every client started
-  inside a managed session sends), the daemon records that pair on the new
-  session. It is not a request parameter: the daemon copies it from the request
+  (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`), the daemon records that pair
+  on the new session. The CLI and the Rust client send the inherited pair
+  unless the Rust client selects `OriginSource::Omitted`; the TypeScript SDK
+  sends it only when `ConnectOptions.origin` is set and never reads the
+  variables itself. It is not a request parameter: the daemon copies it from the request
   envelope, and a `spawned_by` key in the params is ignored like any unknown
   param key. The record is
   immutable, survives a daemon restart, a resume and a native recovery, and a

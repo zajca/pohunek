@@ -1,9 +1,9 @@
-//! Migration of the previous release's store through the public daemon store
-//! boundary, and the spawner record of the current schema.
+//! Schema-12 store migration through the public daemon store boundary, and the
+//! spawner record of the current schema.
 //!
-//! The fixture is the schema-11 store v0.38.1 writes: a lost Pi session with
-//! neutral paths and identifiers. The migration runs through schema 12 to the
-//! current schema, and a session that records no spawner reads as none.
+//! The fixture is a schema-12 record of a lost Pi session, in the shape the
+//! schema-12 daemon writes, with neutral paths and identifiers. A session that
+//! records no spawner reads as none.
 
 // Rust guideline compliant 2026-11-01
 
@@ -12,7 +12,7 @@ use protocol::SpawnedBy;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 
-const SCHEMA_11: &str = include_str!("../src/store/fixtures/schema-11/metadata.jsonl");
+const SCHEMA_12: &str = include_str!("../src/store/fixtures/schema-12/metadata.jsonl");
 
 fn fixture_store(root: &std::path::Path) -> Store {
     let path = root.join("metadata.jsonl");
@@ -21,14 +21,14 @@ fn fixture_store(root: &std::path::Path) -> Store {
         .create_new(true)
         .mode(0o600)
         .open(&path)
-        .expect("create owner-private schema-11 store")
-        .write_all(SCHEMA_11.as_bytes())
-        .expect("write frozen schema-11 store");
+        .expect("create owner-private schema-12 store")
+        .write_all(SCHEMA_12.as_bytes())
+        .expect("write frozen schema-12 store");
     Store::new(path)
 }
 
 #[test]
-fn the_previous_releases_store_migrates_without_inventing_a_spawner() {
+fn schema_12_sessions_migrate_without_inventing_a_spawner() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
     let store = fixture_store(root.path());
 
@@ -40,12 +40,12 @@ fn the_previous_releases_store_migrates_without_inventing_a_spawner() {
         backup,
     } = migrated
     else {
-        panic!("schema-11 store must migrate");
+        panic!("schema-12 store must migrate");
     };
-    assert_eq!((from, to, records), (11, STORE_SCHEMA_VERSION, 1));
+    assert_eq!((from, to, records), (12, STORE_SCHEMA_VERSION, 1));
     assert_eq!(
         std::fs::read_to_string(backup).expect("read backup"),
-        SCHEMA_11
+        SCHEMA_12
     );
 
     let sessions = store.load_sessions().expect("load migrated session");

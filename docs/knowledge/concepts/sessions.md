@@ -311,8 +311,10 @@ same key, which produce no sessions. These options affect selection only and do
 not add metadata to the human table or quiet output.
 
 A session records which session created it. When `session.new` or
-`session.fork` arrives from inside a managed session (the client sends the
-request origin pair `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`), the daemon
+`session.fork` carries the request origin pair (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`;
+the CLI and the Rust client send the inherited pair unless the Rust client
+selects `OriginSource::Omitted`, and the TypeScript SDK sends it only when
+`ConnectOptions.origin` is set), the daemon
 stores it as the immutable `spawned_by` (`session_id`, `daemon_id`) of the new
 session, and `session inspect --json` and `session list --json` report it. A
 request without an origin records nothing; `daemon_id` names the daemon instance
