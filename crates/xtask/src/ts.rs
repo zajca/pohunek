@@ -928,6 +928,7 @@ fn notification_record() -> NotificationRecord {
         turn_started_at: Some("2026-10-20T10:00:00Z".to_owned()),
         turn_duration_ms: Some(1500),
         session_metadata: BTreeMap::from([("work.issue".to_owned(), "955".to_owned())]),
+        hook_admitted: false,
     }
 }
 

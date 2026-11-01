@@ -33,7 +33,10 @@ use serde_json::{json, Value};
 use super::{StoreAction, NOTIFICATIONS_FORMAT_VERSION};
 
 /// Key and value snapshots by format version.
-const SNAPSHOTS: &[(u32, &str)] = &[(1, include_str!("../fixtures/format-1.txt"))];
+const SNAPSHOTS: &[(u32, &str)] = &[
+    (1, include_str!("../fixtures/format-1.txt")),
+    (2, include_str!("../fixtures/format-2.txt")),
+];
 
 /// Locations of a record inside a serialized action.
 const RECORD_ROOTS: &[&str] = &["store.record", "store.updated[]"];
@@ -66,7 +69,8 @@ fn full_record() -> NotificationRecord {
         "superseded_by": "n-2",
         "turn_started_at": "2026-10-29T09:59:00Z",
         "turn_duration_ms": 61000,
-        "session_metadata": {"purpose": "review"}
+        "session_metadata": {"purpose": "review"},
+        "hook_admitted": true
     }))
     .expect("full record")
 }
@@ -106,6 +110,7 @@ fn assert_every_field_is_reviewed(record: &NotificationRecord, policy: &Notifica
         turn_started_at: _,
         turn_duration_ms: _,
         session_metadata: _,
+        hook_admitted: _,
     } = record;
     let NotificationPolicy {
         attention_dedupe_window_secs: _,

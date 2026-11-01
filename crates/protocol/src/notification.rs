@@ -299,6 +299,16 @@ pub struct NotificationRecord {
     /// Set only by the daemon on `turn_completed` records.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_metadata: BTreeMap<String, String>,
+    /// Whether the daemon admitted the create as a hook report of the linked
+    /// session's runtime.
+    ///
+    /// Additive: an older daemon omits it, and an older client ignores it. Set
+    /// only by the daemon after hook admission; a producer cannot supply it.
+    /// An admitted record ranks above user and projector records of the same
+    /// session moment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub hook_admitted: bool,
 }
 
 /// Parameters for `notification.create`.

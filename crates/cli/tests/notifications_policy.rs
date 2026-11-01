@@ -559,3 +559,319 @@ async fn a_hook_claim_must_spell_its_provider_canonically() {
 
     harness.stop().await;
 }
+
+/// Provider name of the projector's own records.
+const PROJECTOR: &str = "pohunek";
+
+/// Waits until `session` holds a record of `provider` or more than one record,
+/// and returns its records. The caller asserts the outcome, so a ranking that
+/// keeps a second record fails on the assertion instead of timing out.
+async fn records_settled_on(harness: &Harness, session: &str, provider: &str) -> Vec<Value> {
+    pohunek_test_support::wait::wait_until("the attention record commits", || async move {
+        let records = session_records(harness, session).await;
+        (records.len() > 1 || records.iter().any(|r| r["source"]["provider"] == provider))
+            .then_some(records)
+    })
+    .await
+}
+
+/// A package runtime that reports under its own id is a hook claim of its
+/// session: its attention report upgrades the projector's committed record in
+/// place instead of adding a second one, and the record carries the daemon's
+/// `hook_admitted` marker.
+#[tokio::test]
+async fn a_runtimes_own_report_upgrades_the_projector_record() {
+    let harness = Harness::start_with_debounced_notifications().await;
+    let session = start_fixture_session(&harness, RUNTIME, IDENTITY_V1_INTEGRATION).await;
+    let key = Some(format!("attention:{session}"));
+
+    let projector = create(
+        &harness,
+        &session,
+        PROJECTOR,
+        NotificationKind::AgentBlocked,
+        key.clone(),
+    )
+    .await
+    .expect("the projector report is accepted");
+    let committed = records_settled_on(&harness, &session, PROJECTOR).await;
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert_eq!(committed[0]["id"], projector.record.id.0, "{committed:?}");
+
+    create(
+        &harness,
+        &session,
+        RUNTIME,
+        NotificationKind::AgentBlocked,
+        key,
+    )
+    .await
+    .expect("the runtime's own report is admitted");
+    let records = records_settled_on(&harness, &session, RUNTIME).await;
+    assert_eq!(records.len(), 1, "one record for the moment: {records:?}");
+    assert_eq!(records[0]["id"], projector.record.id.0, "{records:?}");
+    assert_eq!(records[0]["source"]["provider"], RUNTIME, "{records:?}");
+    assert_eq!(records[0]["hook_admitted"], json!(true), "{records:?}");
+
+    harness.stop().await;
+}
+
+/// While both are pending in one debounce window, a runtime's own report
+/// outranks a user report whichever arrives first.
+#[tokio::test]
+async fn a_runtimes_own_pending_report_outranks_a_pending_user_report() {
+    let harness = Harness::start_with_debounced_notifications().await;
+    let session = start_fixture_session(&harness, RUNTIME, IDENTITY_V1_INTEGRATION).await;
+    let key = Some(format!("attention:{session}"));
+
+    let own = create(
+        &harness,
+        &session,
+        RUNTIME,
+        NotificationKind::AgentBlocked,
+        key.clone(),
+    )
+    .await
+    .expect("the runtime's own report is admitted");
+    create(
+        &harness,
+        &session,
+        PRODUCER,
+        NotificationKind::AgentBlocked,
+        key.clone(),
+    )
+    .await
+    .expect("the user report is accepted");
+    let records = records_settled_on(&harness, &session, RUNTIME).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["id"], own.record.id.0, "{records:?}");
+
+    harness.stop().await;
+}
+
+/// A report under a runtime id that is not the session's own runtime is no
+/// hook claim: it is stored, ranks as a user report, and carries no marker, so
+/// it does not upgrade the projector's record.
+#[tokio::test]
+async fn another_runtimes_id_is_not_a_hook_claim() {
+    let harness = Harness::start_with_debounced_notifications().await;
+    let session = start_fixture_session(&harness, HOOKED_RUNTIME, IDENTITY_V1_INTEGRATION).await;
+    let key = Some(format!("attention:{session}"));
+
+    create(
+        &harness,
+        &session,
+        PROJECTOR,
+        NotificationKind::AgentBlocked,
+        key.clone(),
+    )
+    .await
+    .expect("the projector report is accepted");
+    let committed = records_settled_on(&harness, &session, PROJECTOR).await;
+    assert_eq!(committed.len(), 1, "{committed:?}");
+
+    create(
+        &harness,
+        &session,
+        RUNTIME,
+        NotificationKind::AgentBlocked,
+        key,
+    )
+    .await
+    .expect("the report is stored, not refused");
+    let records = pohunek_test_support::wait::wait_until("the second record commits", || {
+        let harness = &harness;
+        let session = &session;
+        async move {
+            let records = session_records(harness, session).await;
+            (records.len() > 1).then_some(records)
+        }
+    })
+    .await;
+    let own = records
+        .iter()
+        .find(|record| record["source"]["provider"] == RUNTIME)
+        .expect("the report is stored under its own name");
+    assert!(own.get("hook_admitted").is_none(), "{records:?}");
+
+    harness.stop().await;
+}
+
+/// A report under a runtime id that names no held session, a runtime without a
+/// hook schema, a non-canonical spelling, or a producer-supplied marker is
+/// stored unmarked and never refused.
+#[tokio::test]
+async fn an_unadmitted_runtime_id_report_is_stored_unmarked() {
+    let harness = Harness::start_with_debounced_notifications().await;
+
+    let unknown = create(&harness, SESSION, RUNTIME, NotificationKind::Error, None)
+        .await
+        .expect("an unknown session is not a refusal");
+    assert!(!unknown.record.hook_admitted, "{unknown:?}");
+
+    let session = start_fixture_session(&harness, RUNTIME, "").await;
+    let schemaless = create(&harness, &session, RUNTIME, NotificationKind::Error, None)
+        .await
+        .expect("a runtime without a hook schema is not a refusal");
+    assert!(!schemaless.record.hook_admitted, "{schemaless:?}");
+    let spelled = create(&harness, &session, " pi", NotificationKind::Error, None)
+        .await
+        .expect("a non-canonical spelling is not a refusal");
+    assert_eq!(spelled.record.source.provider, RUNTIME, "{spelled:?}");
+    assert!(!spelled.record.hook_admitted, "{spelled:?}");
+
+    // The raw request carries a `hook_admitted` key the typed params do not
+    // have, so the daemon itself is what ignores it.
+    let forged = protocol::Request::new(
+        "forged-marker",
+        protocol::method::NOTIFICATION_CREATE,
+        json!({
+            "source": {
+                "provider": PRODUCER,
+                "provider_event": "scenario",
+                "host_local_source_id": "forged-marker",
+            },
+            "kind": "error",
+            "severity": "error",
+            "title": "forged",
+            "body": "",
+            "session_id": session,
+            "hook_admitted": true,
+        }),
+    )
+    .expect("a well-formed request");
+    let mut client = Client::connect_local(harness.socket())
+        .await
+        .expect("connect to the daemon");
+    client
+        .request(&forged)
+        .await
+        .expect("the create is accepted");
+    let records = session_records(&harness, &session).await;
+    assert!(
+        records
+            .iter()
+            .any(|record| record["source"]["host_local_source_id"] == "forged-marker"),
+        "the create is stored: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.get("hook_admitted").is_none()),
+        "no stored record carries the marker: {records:?}"
+    );
+
+    harness.stop().await;
+}
+
+/// The admitted marker is persisted with the record: after the daemon restarts
+/// over the same root and adopts the session, a projector report for the same
+/// moment is still dropped in favour of the runtime's own record.
+#[tokio::test]
+async fn a_restart_keeps_the_rank_of_a_runtimes_own_record() {
+    let harness = Harness::start_durable_with_debounced_notifications().await;
+    let session = start_fixture_session(&harness, RUNTIME, IDENTITY_V1_INTEGRATION).await;
+    let key = Some(format!("attention:{session}"));
+
+    create(
+        &harness,
+        &session,
+        RUNTIME,
+        NotificationKind::AgentBlocked,
+        key.clone(),
+    )
+    .await
+    .expect("the runtime's own report is admitted");
+    let stored = records_settled_on(&harness, &session, RUNTIME).await;
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0]["hook_admitted"], json!(true), "{stored:?}");
+
+    let harness = harness.restart_with_debounced_notifications().await;
+    create(
+        &harness,
+        &session,
+        PROJECTOR,
+        NotificationKind::AgentBlocked,
+        key,
+    )
+    .await
+    .expect("the projector report is accepted");
+    // A record of another key is deferred after the projector's, so once it is
+    // listed the projector's flush has been decided.
+    let marker_key = Some(format!("attention:{SESSION}"));
+    create(
+        &harness,
+        SESSION,
+        PRODUCER,
+        NotificationKind::AgentBlocked,
+        marker_key,
+    )
+    .await
+    .expect("the later report is accepted");
+    pohunek_test_support::wait::wait_until("the later report commits", || {
+        let harness = &harness;
+        async move { (!session_records(harness, SESSION).await.is_empty()).then_some(()) }
+    })
+    .await;
+
+    let records = session_records(&harness, &session).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the projector report is dropped: {records:?}"
+    );
+    assert_eq!(records[0]["source"]["provider"], RUNTIME, "{records:?}");
+    assert_eq!(records[0]["hook_admitted"], json!(true), "{records:?}");
+
+    harness.stop().await;
+}
+
+/// A runtime's own `turn_completed` report is a turn signal for its held
+/// session, as a listed provider's is: `session.wait` returns it as a
+/// `turn_completed` event.
+#[tokio::test]
+async fn a_runtimes_own_turn_report_wakes_a_turn_wait() {
+    let harness = Harness::start_with_debounced_notifications().await;
+    let session = start_fixture_session(&harness, RUNTIME, IDENTITY_V1_INTEGRATION).await;
+
+    let (code, start) = harness
+        .json(&["session", "wait", &session, "--timeout", "1ms"])
+        .await;
+    assert_eq!(code, 0, "{start}");
+    let cursor = start["ok"]["cursor"]
+        .as_str()
+        .expect("wait cursor")
+        .to_owned();
+
+    // The default policy keeps no `turn_completed` record, so the create is
+    // answered with the policy refusal; the turn event is recorded anyway.
+    let refused = create(
+        &harness,
+        &session,
+        RUNTIME,
+        NotificationKind::TurnCompleted,
+        Some(format!("turn:{session}")),
+    )
+    .await
+    .expect_err("the policy drops the record");
+    assert_eq!(refused.code, "notification_kind_disabled", "{refused:?}");
+    let (code, woken) = harness
+        .json(&[
+            "session",
+            "wait",
+            &session,
+            "--until",
+            "turn_completed",
+            "--after",
+            &cursor,
+            "--timeout",
+            "30s",
+        ])
+        .await;
+    assert_eq!(code, 0, "{woken}");
+    assert_eq!(woken["ok"]["reason"], "event", "{woken}");
+    assert_eq!(woken["ok"]["event"]["kind"], "turn_completed", "{woken}");
+    assert_eq!(woken["ok"]["event"]["session_id"], session.as_str());
+
+    harness.stop().await;
+}

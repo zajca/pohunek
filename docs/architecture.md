@@ -1289,7 +1289,7 @@ Hooks have separate roles:
   enforces, before the agent starts and releases it when the entry is installed
   or the launch fails, so a report during the launch is judged like one for a
   held session and a report for any other id is refused (`hook_not_admitted`).
-  A recovery's launch is judged by the reserved schema, not by the entry it replaces. A report admitted during a launch that then fails stays stored. The reservation is not persisted. Every private report is additionally
+  A recovery's launch is judged by the reserved schema, not by the entry it replaces. A report admitted during a launch that then fails stays stored. The reservation is not persisted. A report under the id of a held session's own runtime is judged by that session's hook schema and, when admitted, stored with the daemon-set `hook_admitted` marker, which the notification store's ranking reads; one for a launching session whose entry is not installed, or one that is not admitted, is stored unmarked; the marker is part of notifications store format 2, and a format 1 store is read unchanged. Every private report is additionally
   bound to its reporter: the worker accepts it only from the process it names or
   from a descendant of that process (under `FrozenRootEntrypoint`, a report
   naming the PTY root only from the root itself), using kernel peer identity the caller

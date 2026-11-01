@@ -752,6 +752,23 @@ impl NotificationService {
         self.create_with_metadata_at(params, timestamp_now())
     }
 
+    /// Create or dedupe a notification the daemon admitted as a hook claim of
+    /// its session's runtime; the stored record carries the marker that ranks
+    /// it as a provider report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`NotificationError`] when validation fails or the store cannot
+    /// append the resulting action.
+    pub(crate) fn create_hook_claim(
+        &self,
+        params: NotificationCreateParams,
+    ) -> Result<NotificationCreateResult, NotificationError> {
+        let mut record = self.build_record(params, timestamp_now())?;
+        record.hook_admitted = true;
+        self.commit_record(record, Instant::now())
+    }
+
     /// Create or dedupe a notification with producer metadata.
     ///
     /// Metadata is validated against the daemon allowlist before storage.
@@ -1126,6 +1143,7 @@ impl NotificationService {
             turn_started_at: None,
             turn_duration_ms: None,
             session_metadata: BTreeMap::new(),
+            hook_admitted: false,
         };
         Ok(DeferredNotification {
             record,
@@ -1503,12 +1521,14 @@ enum SourcePriority {
     Projector,
     /// Any other producer: a user, script, or external tool.
     User,
-    /// A hook provider (see [`is_hook_provider`]).
+    /// A hook provider (see [`is_hook_provider`]) or a report the daemon
+    /// admitted as a hook claim of its session's runtime.
     Provider,
 }
 
-fn source_priority(source: &NotificationSource) -> SourcePriority {
-    if is_hook_provider(&source.provider) {
+fn source_priority(record: &NotificationRecord) -> SourcePriority {
+    let source = &record.source;
+    if record.hook_admitted || is_hook_provider(&source.provider) {
         SourcePriority::Provider
     } else if source.provider.eq_ignore_ascii_case("pohunek")
         || source.provider.eq_ignore_ascii_case("daemon")

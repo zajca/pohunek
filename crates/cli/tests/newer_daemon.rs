@@ -431,6 +431,7 @@ fn notification_created_line_of_kind(id: &str, kind: &str, severity: &str, statu
         turn_started_at: None,
         turn_duration_ms: None,
         session_metadata: std::collections::BTreeMap::new(),
+        hook_admitted: false,
     };
     let mut record = serde_json::to_value(record).expect("record JSON");
     record["kind"] = json!(kind);

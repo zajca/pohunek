@@ -136,6 +136,7 @@ pub(super) async fn handle_notification_create(
                 .prepare_deferred(params)
                 .map_err(|err| err.to_protocol_error())?;
             deferred.signal = turn_signal;
+            deferred.record.hook_admitted = hook_claim;
             if let Some(turn) = turn {
                 deferred = deferred.for_turn(turn);
             }
@@ -156,9 +157,12 @@ pub(super) async fn handle_notification_create(
     }
 
     run_notification_blocking(request, move || {
-        notifications
-            .create(params)
-            .map_err(|err| err.to_protocol_error())
+        let created = if hook_claim {
+            notifications.create_hook_claim(params)
+        } else {
+            notifications.create(params)
+        };
+        created.map_err(|err| err.to_protocol_error())
     })
     .await
 }
@@ -169,7 +173,9 @@ pub(super) async fn handle_notification_create(
 /// A create that names a session and a provider with a hook schema is a hook
 /// claim, so the public socket enforces the same admission as the worker
 /// socket and a refusal there cannot be bypassed by retrying here. Creates
-/// from other producers and creates without a session are not hook claims.
+/// from other producers are hook claims only as the runtime of their own
+/// session ([`admit_own_runtime_claim`]), and creates without a session are
+/// not hook claims.
 /// A claim for a session the registry neither holds nor is launching is
 /// refused too, so no provider-ranked record exists for an id the daemon
 /// cannot check.
@@ -188,7 +194,7 @@ async fn admit_hook_notification(
     };
     let provider = stored_provider(&params.source.provider);
     if !is_hook_provider(&provider) {
-        return Ok(false);
+        return admit_own_runtime_claim(request, params, &provider, session_id, sessions).await;
     }
     let refuse = |msg: &str| {
         error_value(
@@ -226,6 +232,54 @@ async fn admit_hook_notification(
             }
             _ => refuse("the session runtime does not admit this hook report"),
         })
+}
+
+/// Judges a create whose provider is no listed hook provider: it is a hook
+/// claim exactly when it names the runtime of a session the registry holds, by
+/// that runtime's id spelled verbatim, and the runtime's hook schema admits it.
+/// An observed external session, a launching session whose entry is not
+/// installed, or a session removed since the lookup is not held, so it is no
+/// claim.
+///
+/// Any other outcome is not a refusal: the producer name is free for scripts,
+/// so the create is stored as a plain report without the hook claim's rank
+/// (the WARN of a schema refusal still logs). Only a report that opted into the
+/// retryable answer learns that the runtime's worker could not report its
+/// schema in time.
+async fn admit_own_runtime_claim(
+    request: &Request,
+    params: &NotificationCreateParams,
+    provider: &str,
+    session_id: &protocol::SessionId,
+    sessions: &SessionRegistry,
+) -> Result<bool, Response> {
+    if provider != params.source.provider {
+        return Ok(false);
+    }
+    let Ok(session) = sessions.inspect(session_id).await else {
+        return Ok(false);
+    };
+    if session.agent_base.as_wire() != provider {
+        return Ok(false);
+    }
+    match sessions
+        .admit_held_session_hook(
+            session_id,
+            pohunek_worker_protocol::HookAction::Notification,
+            provider,
+            "hook notification",
+            params.retryable_admission,
+        )
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(refusal @ HookAdmissionError::SchemaUnavailable { .. })
+            if params.retryable_admission =>
+        {
+            Err(error_value(request, refusal.retryable_error()))
+        }
+        Err(_refusal) => Ok(false),
+    }
 }
 
 /// Enrich producer params with live session context without making a missing
