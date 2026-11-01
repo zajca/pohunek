@@ -1282,7 +1282,8 @@ impl SessionRegistry {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "worker initialization carries the persisted launch identity fields"
+        clippy::too_many_lines,
+        reason = "worker initialization carries the persisted launch identity fields and builds the whole runtime record"
     )]
     async fn initialize_runtime(
         &self,
