@@ -30,6 +30,7 @@ struct DaemonStub {
     lines: Arc<Mutex<Vec<String>>>,
     replies: Arc<Mutex<Vec<String>>>,
     notifications: crate::notifications::NotificationService,
+    sessions: crate::session::SessionRegistry,
 }
 
 impl DaemonStub {
@@ -55,6 +56,7 @@ impl DaemonStub {
         notifications.set_policy(policy).expect("enable all kinds");
         let sessions =
             crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default());
+        let held_sessions = sessions.clone();
         let (attention, _task) = crate::notifications::AttentionCoordinator::spawn(
             &crate::shutdown::DaemonShutdown::default(),
             notifications.clone(),
@@ -104,7 +106,37 @@ impl DaemonStub {
             lines,
             replies,
             notifications,
+            sessions: held_sessions,
         }
+    }
+
+    /// Starts a shell session in the daemon's registry and returns its id: a
+    /// hook notification is admitted only for a session the registry holds.
+    async fn hold_session(&self) -> String {
+        let cwd = crate::test_support::thread_scoped_dir("pohunek-hook-cwd-");
+        let created = self
+            .sessions
+            .create(protocol::SessionNewParams {
+                agent: "shell".to_owned(),
+                name: None,
+                cwd: Some(cwd),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
+                input_ack_timeout_ms: None,
+                metadata: BTreeMap::new(),
+                secret_env: protocol::SessionSecretEnv::default(),
+            })
+            .await
+            .expect("create the held session");
+        created.id.0
     }
 
     fn records(&self) -> Vec<protocol::NotificationRecord> {
@@ -227,9 +259,22 @@ async fn start_worker_initialized(
     tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
     PathBuf,
 ) {
+    start_worker_initialized_as(root, initialize, SESSION_ID).await
+}
+
+/// Like [`start_worker_initialized`], for a worker serving session `session_id`.
+async fn start_worker_initialized_as(
+    root: &Path,
+    initialize: Initialize,
+    session_id: &str,
+) -> (
+    Worker,
+    tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
+    PathBuf,
+) {
     let socket_path = root.join("socket/worker.sock");
     let server = Server::bind(ServerArgs {
-        session_id: SESSION_ID.to_owned(),
+        session_id: session_id.to_owned(),
         worker_id: WORKER_ID.to_owned(),
         generation: "abcd2345".to_owned(),
         socket_path: socket_path.clone(),
@@ -241,7 +286,7 @@ async fn start_worker_initialized(
     .await
     .expect("bind real worker");
     let task = tokio::spawn(server.serve());
-    let worker = Worker::connect(&socket_path, SESSION_ID, "daemon-notify")
+    let worker = Worker::connect(&socket_path, session_id, "daemon-notify")
         .await
         .expect("control handshake");
     worker
@@ -253,6 +298,8 @@ async fn start_worker_initialized(
 
 /// What the daemon received and recorded for one hook run.
 struct Delivery {
+    /// The session the hook ran in, held by the daemon's registry.
+    session: String,
     requests: Vec<Value>,
     replies: Vec<Value>,
     records: Vec<protocol::NotificationRecord>,
@@ -260,9 +307,17 @@ struct Delivery {
 
 /// Runs the real notify asset of `agent` inside a real worker initialized with
 /// `public_version` and returns the daemon's recorded (request, reply) pair.
-async fn deliver_through_worker(agent: &str, args: &str, public_version: u32) -> (Value, Value) {
+async fn deliver_through_worker(
+    agent: &str,
+    args: &str,
+    public_version: u32,
+) -> (Value, Value, String) {
     let delivery = deliver(agent, args, public_version, Duration::ZERO, 1).await;
-    (delivery.requests[0].clone(), delivery.replies[0].clone())
+    (
+        delivery.requests[0].clone(),
+        delivery.replies[0].clone(),
+        delivery.session,
+    )
 }
 
 /// Runs the real notify asset of `agent` against a daemon that answers
@@ -284,7 +339,10 @@ async fn deliver(
         "printf '{{}}' | /bin/sh {} {args}; true",
         notify_asset(agent).display()
     );
-    let (worker, task, _socket) = start_worker(&root, &script, public_version).await;
+    let session = daemon.hold_session().await;
+    let mut launch = initialize(&root, &script, public_version, NOTIFY_SCHEMA);
+    launch.session_id = SessionId::new(&session).expect("held session id");
+    let (worker, task, _socket) = start_worker_initialized_as(&root, launch, &session).await;
 
     Box::pin(pohunek_test_support::wait::wait_until(
         "the daemon has replied",
@@ -293,6 +351,7 @@ async fn deliver(
     .await;
 
     let delivery = Delivery {
+        session,
         requests: daemon.request_lines(),
         replies: daemon.reply_lines(),
         records: daemon.records(),
@@ -351,7 +410,7 @@ async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notificatio
 #[tokio::test(flavor = "multi_thread")]
 async fn notify_hook_delivers_through_the_worker_socket_to_a_created_notification() {
     let current = protocol::PROTOCOL_VERSION.get();
-    let (request, reply) =
+    let (request, reply, session) =
         deliver_through_worker("claude", "notification auth_success", current).await;
     assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
     assert!(
@@ -360,10 +419,10 @@ async fn notify_hook_delivers_through_the_worker_socket_to_a_created_notificatio
             .is_some_and(|id| id.starts_with("worker-hook:")),
         "the create must be forwarded by the worker, not dialed by the hook: {request}"
     );
-    assert_eq!(request["params"]["session_id"], json!(SESSION_ID));
+    assert_eq!(request["params"]["session_id"], json!(session));
     assert_eq!(reply["ok"]["created"], json!(true), "{reply}");
     assert_eq!(reply["ok"]["record"]["agent_kind"], json!("claude"));
-    assert_eq!(reply["ok"]["record"]["session_id"], json!(SESSION_ID));
+    assert_eq!(reply["ok"]["record"]["session_id"], json!(session));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -376,7 +435,7 @@ async fn worker_forwards_notifications_in_the_version_its_session_launched_with(
         ("codex", "stop"),
     ];
     for (agent, args) in cases {
-        let (request, reply) = deliver_through_worker(agent, args, PREVIOUS).await;
+        let (request, reply, session) = deliver_through_worker(agent, args, PREVIOUS).await;
         assert_eq!(
             request["v"],
             json!({"minimum": PREVIOUS, "maximum": PREVIOUS}),
@@ -394,7 +453,7 @@ async fn worker_forwards_notifications_in_the_version_its_session_launched_with(
             json!(true),
             "{agent} {args}: {reply}"
         );
-        assert_eq!(reply["ok"]["record"]["session_id"], json!(SESSION_ID));
+        assert_eq!(reply["ok"]["record"]["session_id"], json!(session));
     }
 }
 
@@ -450,6 +509,7 @@ async fn run_hook_with_worker_reply(
     let root = crate::test_support::scoped_dir(name);
     let notifications = crate::test_support::scoped_dir("ph-notify-fallback-data-");
     let daemon = DaemonStub::spawn(&root, &notifications);
+    let session = daemon.hold_session().await;
     let worker_socket = root.join("worker.sock");
     if let Some(reply) = reply {
         let listener = UnixListener::bind(&worker_socket).expect("bind scripted worker");
@@ -471,7 +531,7 @@ async fn run_hook_with_worker_reply(
         .env("PATH", super::tests::inherited_path())
         .env("TMPDIR", &*root)
         .env("POHUNEK_ENV", "1")
-        .env("POHUNEK_SESSION_ID", SESSION_ID)
+        .env("POHUNEK_SESSION_ID", &session)
         .env("POHUNEK_SOCKET_PATH", &daemon_socket)
         .env("POHUNEK_PROTOCOL_VERSION", public_version.to_string())
         .env("POHUNEK_WORKER_SOCKET_PATH", &worker_socket)

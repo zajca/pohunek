@@ -464,6 +464,70 @@ async fn a_hook_provider_spelling_is_admitted_as_it_is_stored() {
     harness.stop().await;
 }
 
+/// A hook provider's report for a session id the daemon does not hold is
+/// refused with `hook_not_admitted`, retryable or not, and stores nothing, so
+/// no provider-ranked record exists for an id the daemon cannot check. A user
+/// report for the same id is not a hook claim and is stored, and the same hook
+/// provider is admitted for a held session.
+#[tokio::test]
+async fn a_hook_provider_report_for_an_unheld_session_is_refused() {
+    let harness = Harness::start_with_debounced_notifications().await;
+
+    let outcomes = error_outcomes(&harness, SESSION, &[HOOK_PROVIDER, "codex"]).await;
+    assert!(
+        outcomes.iter().all(|(_, outcome)| outcome
+            .as_ref()
+            .is_err_and(|code| code == "hook_not_admitted")),
+        "an unheld session is refused with hook_not_admitted: {outcomes:?}"
+    );
+    assert!(
+        session_records(&harness, SESSION).await.is_empty(),
+        "a refused report stores nothing"
+    );
+
+    let mut client = Client::connect_local(harness.socket())
+        .await
+        .expect("connect to the daemon");
+    let retryable = client
+        .create_notification(NotificationCreateParams {
+            source: NotificationSource {
+                provider: HOOK_PROVIDER.to_owned(),
+                provider_event: "scenario".to_owned(),
+                host_local_source_id: format!("{HOOK_PROVIDER}-retry"),
+            },
+            kind: NotificationKind::Error,
+            severity: NotificationSeverity::ActionRequired,
+            title: "retryable report".to_owned(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            session_id: Some(SessionId(SESSION.to_owned())),
+            agent_kind: None,
+            source_id: None,
+            dedupe_key: None,
+            project_id: None,
+            retryable_admission: true,
+        })
+        .await;
+    assert!(
+        matches!(
+            &retryable,
+            Err(pohunek_client::ClientError::Protocol(error)) if error.code == "hook_not_admitted"
+        ),
+        "an unheld session is a final refusal, not a retryable one: {retryable:?}"
+    );
+
+    create(&harness, SESSION, PRODUCER, NotificationKind::Error, None)
+        .await
+        .expect("a user report is not a hook claim");
+    assert_eq!(session_records(&harness, SESSION).await.len(), 1);
+
+    let held = start_fixture_session(&harness, HOOKED_RUNTIME, IDENTITY_V1_INTEGRATION).await;
+    let admitted = error_outcomes(&harness, &held, &[HOOK_PROVIDER]).await;
+    assert_eq!(admitted[0].1.as_deref(), Ok(HOOK_PROVIDER), "{admitted:?}");
+
+    harness.stop().await;
+}
+
 /// A hook claim must name its provider verbatim. For a held session whose
 /// hook schema admits `codex` and `hermes`, the canonical names are stored,
 /// while a spelling that only normalizes to one of them is refused.

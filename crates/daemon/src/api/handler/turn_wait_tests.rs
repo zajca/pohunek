@@ -1202,7 +1202,7 @@ async fn untrusted_turn_reports_neither_wake_a_wait_nor_flood_the_journal() {
         let flood = err(fixture
             .turn_report("claude", &format!("s-unknown-{seq}"), seq)
             .await);
-        assert_eq!(flood.code, "notification_kind_disabled");
+        assert_eq!(flood.code, "hook_not_admitted");
     }
     settle().await;
     let mut moved = Duration::ZERO;

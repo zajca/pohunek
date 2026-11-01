@@ -170,6 +170,9 @@ pub(super) async fn handle_notification_create(
 /// claim, so the public socket enforces the same admission as the worker
 /// socket and a refusal there cannot be bypassed by retrying here. Creates
 /// from other producers and creates without a session are not hook claims.
+/// A claim for a session the registry neither holds nor is launching is
+/// refused too, so no provider-ranked record exists for an id the daemon
+/// cannot check.
 /// The claim is judged by the provider name the record would be stored and
 /// ranked under, and a hook claim must report that name verbatim: a spelling
 /// that only normalizes to a hook provider (surrounding whitespace, control
@@ -204,7 +207,7 @@ async fn admit_hook_notification(
         ));
     }
     sessions
-        .admit_session_hook(
+        .admit_held_session_hook(
             session_id,
             pohunek_worker_protocol::HookAction::Notification,
             &provider,
@@ -217,6 +220,9 @@ async fn admit_hook_notification(
             // Only a report that opted in learns that a retry can succeed.
             HookAdmissionError::SchemaUnavailable { .. } if params.retryable_admission => {
                 error_value(request, refusal.retryable_error())
+            }
+            HookAdmissionError::UnknownSession => {
+                refuse("the daemon neither holds nor is launching a session with this id")
             }
             _ => refuse("the session runtime does not admit this hook report"),
         })

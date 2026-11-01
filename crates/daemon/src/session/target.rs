@@ -952,6 +952,9 @@ impl SessionRegistry {
         );
         let hook_schema = self.session_hook_schema(&agent_base, &snapshot.launch_binding);
         let answers_program_status_probe = default_detector_config.answers_program_status_probe();
+        // Held until this function returns: the entry is installed by then,
+        // or the launch failed.
+        let _launch_reservation = self.reserve_launch(&id, agent_base.clone(), hook_schema);
         let started = match self
             .start_runtime(
                 &lifecycle,
@@ -1093,6 +1096,8 @@ impl SessionRegistry {
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };
+        #[cfg(test)]
+        self.hold_launch_commit().await;
         let committed_metadata = match Box::pin(self.commit_session_entry(&id, entry)).await {
             Ok(metadata) => metadata,
             Err(error) => {

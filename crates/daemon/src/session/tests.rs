@@ -23122,6 +23122,46 @@ async fn failed_entry_commit_with_a_confirmed_retire_removes_the_worktree() {
         .await;
 }
 
+/// A hook notification for a session whose create is in flight is admitted
+/// while the launch holds its reservation, and refused again once the create
+/// failed: the id is then neither held nor launching.
+#[tokio::test]
+async fn a_failed_create_releases_its_hook_admission_reservation() {
+    let mut held = HeldWorktreeCreate::start("wt-reservation-failed", "feat/reservation").await;
+    let admit = |registry: &SessionRegistry, id: SessionId| {
+        let registry = registry.clone();
+        async move {
+            registry
+                .admit_held_session_hook(
+                    &id,
+                    pohunek_worker_protocol::HookAction::Notification,
+                    "codex",
+                    "hook notification",
+                    false,
+                )
+                .await
+        }
+    };
+    assert!(
+        admit(&held.registry, held.id.clone()).await.is_ok(),
+        "a launching session admits the hook notification"
+    );
+    assert_eq!(held.registry.launching_for_test(), [held.id.clone()]);
+
+    held.fail_entry_commit();
+    held.release.notify_one();
+    held.outcome().await.expect_err("the entry cannot commit");
+
+    assert!(held.registry.launching_for_test().is_empty());
+    assert!(
+        matches!(
+            admit(&held.registry, held.id.clone()).await,
+            Err(super::HookAdmissionError::UnknownSession)
+        ),
+        "the failed create's id is refused again"
+    );
+}
+
 #[tokio::test]
 async fn dropped_create_ending_cleaned_still_removes_its_worktree() {
     let mut held = HeldWorktreeCreate::start("wt-dropped-cleaned", "feat/dropped").await;

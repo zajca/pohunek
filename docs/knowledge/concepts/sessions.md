@@ -344,7 +344,11 @@ dedupe window, provider hook records outrank daemon projector records for the
 same session attention key, and while reports are held pending in the debounce
 window a provider hook record outranks a user or external record. A provider
 ranks as a hook provider exactly when a registered hook schema lists it as an
-identity provider (today `shell`, `codex`, `claude`, and `hermes`).
+identity provider (today `shell`, `codex`, `claude`, `hermes`, and `muse`).
+A create from a hook provider for a session id the daemon neither holds nor is
+launching is refused with `hook_not_admitted`, so no provider-ranked record exists for an id
+that cannot be checked against a hook schema; creates from other producers are
+stored whatever the session id.
 
 Session notifications self-resolve. When the daemon observes a session enter
 `working`, or the session reaches a terminal lifecycle state, the projector
