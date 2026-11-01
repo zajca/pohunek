@@ -22,7 +22,8 @@ use super::{
     start, RootProvider, RootRegistration, RootScan, TranscriptSink, TranscriptWatch, WatchBackend,
     WatchEvent, WatcherDegraded, WatcherHandle, WatcherUnavailable,
     MAX_CONCURRENT_TRANSCRIPT_PARSES, MAX_PENDING_TRANSCRIPT_PATHS, RECONCILE_INTERVAL,
-    RESCAN_MIN_INTERVAL, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN, TRANSCRIPT_WRITE_DEBOUNCE,
+    RESCAN_MIN_INTERVAL, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN, STREAM_REBUILD_INTERVAL,
+    TRANSCRIPT_WRITE_DEBOUNCE,
 };
 use crate::agent::host::{HeadPaths, TranscriptParser};
 use crate::external::TranscriptRoot;
@@ -1002,6 +1003,29 @@ async fn an_added_root_starts_only_its_own_stream() {
         harness.streams(),
         BTreeSet::from([harness.root("a"), harness.root("b")])
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_went_silent_is_rebuilt_by_the_periodic_full_rebuild() {
+    let harness = StreamHarness::start(&["a", "b"]).await;
+    assert_eq!(harness.started(), 2);
+
+    // The pass at the end of this time keeps the streams: the interval has not
+    // elapsed yet.
+    advance(STREAM_REBUILD_INTERVAL.saturating_sub(RECONCILE_INTERVAL)).await;
+    assert_eq!(harness.started(), 2, "no rebuild before the interval");
+
+    // The pass that crosses it recreates every stream once.
+    advance(RECONCILE_INTERVAL).await;
+    assert_eq!(harness.started(), 4, "every stream was recreated");
+    let rebuilt = harness.shared.unregister_calls.load(Ordering::SeqCst);
+    assert_eq!(rebuilt, 1, "by one full unregister");
+
+    // And the interval starts over.
+    advance(STREAM_REBUILD_INTERVAL.saturating_sub(RECONCILE_INTERVAL)).await;
+    assert_eq!(harness.started(), 4);
+    advance(RECONCILE_INTERVAL).await;
+    assert_eq!(harness.started(), 6);
 }
 
 #[tokio::test(start_paused = true)]

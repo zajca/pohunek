@@ -1283,10 +1283,12 @@ macOS) is healthy. Each pass re-resolves the configured roots (symlinked or
 aliased roots are scanned once, a nested root of the same runtime owns its own
 transcripts), registers
 them with the watcher, and scans them, dropping indexed transcripts it no longer
-sees. On macOS a root whose registration is unchanged keeps its FSEvents stream
-across passes: the stream is recreated only when the root set or a root's
-canonical path changes or the backend reports an error or lost events, so live
-events keep flowing right after a pass. On Linux every pass rebuilds the
+sees. On macOS the watcher keeps its FSEvents stream across passes. The `notify`
+crate shares one stream for all roots and any `watch` or `unwatch` restarts it for
+every root, so the stream is recreated only when the root set or a root's
+canonical path changes, after a full event queue, and by a full rebuild every
+10 minutes that heals a stream that never started or went silent. Live events
+therefore keep flowing right after a pass. On Linux every pass rebuilds the
 inotify watches from the filesystem. A pass that could not finish drops
 nothing. The watcher only reduces latency: a file notification is a hint that
 schedules one debounced, bounded parse of that transcript, its failure is only logged because the next pass

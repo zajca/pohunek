@@ -72,6 +72,16 @@ pub(super) const RESCAN_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// transcript is indexed at the latest one interval later.
 pub(super) const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Time after which a pass rebuilds every backend registration instead of
+/// keeping the ones that did not change.
+///
+/// A native-tree backend keeps its stream across passes, and a stream that never
+/// started or silently stopped delivering reports nothing, so only a rebuild
+/// heals it. Every rebuild is a gap in live delivery, so it is much rarer than
+/// [`RECONCILE_INTERVAL`]: a dead stream costs at most this long of
+/// pass-only latency.
+pub(super) const STREAM_REBUILD_INTERVAL: Duration = Duration::from_secs(600);
+
 /// First delay before a failed backend is restarted.
 pub(super) const RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
 
@@ -446,6 +456,7 @@ struct Watcher<B, S, P> {
     restart: Backoff,
     reconcile_at: Instant,
     last_reconcile: Instant,
+    streams_rebuilt_at: Instant,
     state: watch::Sender<TranscriptWatch>,
     nudge: Arc<Notify>,
     passes: Arc<AtomicUsize>,
@@ -494,6 +505,7 @@ where
         restart: Backoff::new(),
         reconcile_at: now,
         last_reconcile: now,
+        streams_rebuilt_at: now,
         state: state_tx,
         nudge: Arc::clone(&nudge),
         passes: Arc::clone(&passes),
@@ -802,10 +814,14 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
         ];
         if self.unavailable.is_none() {
             let paths: Vec<PathBuf> = self.roots.iter().map(|root| root.path.clone()).collect();
-            self.backend
-                .as_mut()
-                .expect(BACKEND_PRESENT)
-                .retain_roots(&paths);
+            let backend = self.backend.as_mut().expect(BACKEND_PRESENT);
+            let now = Instant::now();
+            if now >= self.streams_rebuilt_at + STREAM_REBUILD_INTERVAL {
+                backend.unregister_all();
+                self.streams_rebuilt_at = now;
+            } else {
+                backend.retain_roots(&paths);
+            }
             for index in 0..self.roots.len() {
                 if !self.register(index).await {
                     return;
