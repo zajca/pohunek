@@ -1,0 +1,275 @@
+{
+  "source": "Real captures of the pinned Codex 0.164.0 (openai/codex rust-v0.164.0, commit 6aaac694803004a63c6f393d153c96d22521a6b9) against the loopback Responses stub of crates/cli/tests/support/responses_stub.rs, with a probe command registered as the hook of each event below. The probe test is a_real_codex_produces_the_committed_subagent_hook_sequences in crates/cli/tests/codex_subagent_sequences.rs.",
+  "captured_at": "2026-11-01",
+  "format": {
+    "key_sets": "The sorted top-level keys of each hook input the probe saw. `UserPromptSubmit (child)` is a UserPromptSubmit that carries an agent_id.",
+    "path_relations": "How the transcript paths of the hook inputs relate, checked in every flow that records the events: the SubagentStart transcript_path is the child's own (it differs from the root session's), the SubagentStop transcript_path is the root session's and its agent_transcript_path is the child's.",
+    "sequences": "One entry per flow. `root_events` is the hook events of the root agent in order, `child_events` those that carry the child's agent_id, in order. The two lists are not ordered against each other. Every child event of a flow carries the same agent_id. `events` is the SubagentStart and SubagentStop inputs of the flow in order, reduced to hook_event_name, agent_id and agent_type, with the synthetic id `agent-child-1` for the one child. No transcript, prompt, path or real id is kept.",
+    "tools": "The multi-agent tool family the flow drives: multi_agent_v1 (spawn_agent, send_input, wait_agent, close_agent, resume_agent) or multi_agent_v2 (spawn_agent, followup_task, interrupt_agent, wait_agent; `multi_agent_v2 = true` under [features])."
+  },
+  "key_sets": {
+    "SessionStart": [
+      "cwd",
+      "hook_event_name",
+      "model",
+      "permission_mode",
+      "session_id",
+      "source",
+      "transcript_path"
+    ],
+    "Stop": [
+      "cwd",
+      "hook_event_name",
+      "last_assistant_message",
+      "model",
+      "permission_mode",
+      "session_id",
+      "stop_hook_active",
+      "transcript_path",
+      "turn_id"
+    ],
+    "SubagentStart": [
+      "agent_id",
+      "agent_type",
+      "cwd",
+      "hook_event_name",
+      "model",
+      "permission_mode",
+      "session_id",
+      "transcript_path",
+      "turn_id"
+    ],
+    "SubagentStop": [
+      "agent_id",
+      "agent_transcript_path",
+      "agent_type",
+      "cwd",
+      "hook_event_name",
+      "last_assistant_message",
+      "model",
+      "permission_mode",
+      "session_id",
+      "stop_hook_active",
+      "transcript_path",
+      "turn_id"
+    ],
+    "UserPromptSubmit": [
+      "cwd",
+      "hook_event_name",
+      "model",
+      "permission_mode",
+      "prompt",
+      "session_id",
+      "transcript_path",
+      "turn_id"
+    ],
+    "UserPromptSubmit (child)": [
+      "agent_id",
+      "agent_type",
+      "cwd",
+      "hook_event_name",
+      "model",
+      "permission_mode",
+      "prompt",
+      "session_id",
+      "transcript_path",
+      "turn_id"
+    ]
+  },
+  "path_relations": {
+    "start_transcript_is_the_childs_own": true,
+    "stop_transcript_is_the_parents": true,
+    "stop_agent_transcript_is_the_childs": true
+  },
+  "sequences": {
+    "spawn_complete": {
+      "tools": "multi_agent_v1",
+      "description": "The root spawns one child and waits for it: SubagentStart, the child's own UserPromptSubmit for its task, then one SubagentStop.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart",
+        "UserPromptSubmit",
+        "SubagentStop"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        }
+      ]
+    },
+    "followup_v1": {
+      "tools": "multi_agent_v1",
+      "description": "A second task reaches the finished child through send_input: the child's UserPromptSubmit fires again and its second turn ends in a second SubagentStop with the same agent_id and no second SubagentStart.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart",
+        "UserPromptSubmit",
+        "SubagentStop",
+        "UserPromptSubmit",
+        "SubagentStop"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        }
+      ]
+    },
+    "followup_v2": {
+      "tools": "multi_agent_v2",
+      "description": "The follow-up goes through followup_task of the multi_agent_v2 tools: the child fires no UserPromptSubmit at all, and its second turn ends in a second SubagentStop with no second SubagentStart.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart",
+        "SubagentStop",
+        "SubagentStop"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        }
+      ]
+    },
+    "resume_after_close": {
+      "tools": "multi_agent_v1",
+      "description": "The root closes a finished child, resumes it and sends it a task: the resumed child fires a UserPromptSubmit and a SubagentStop but no SubagentStart.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart",
+        "UserPromptSubmit",
+        "SubagentStop",
+        "UserPromptSubmit",
+        "SubagentStop"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        }
+      ]
+    },
+    "interrupted_v1": {
+      "tools": "multi_agent_v1",
+      "description": "The root sends a task with interrupt=true to a child whose turn is running: the interrupted turn ends with no SubagentStop; the redirected turn fires a UserPromptSubmit and ends in the only SubagentStop.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart",
+        "UserPromptSubmit",
+        "UserPromptSubmit",
+        "SubagentStop"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        },
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStop"
+        }
+      ]
+    },
+    "interrupted_v2": {
+      "tools": "multi_agent_v2",
+      "description": "The root calls interrupt_agent on a child whose turn is running: the child ends with no SubagentStop and no later hook.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        }
+      ]
+    },
+    "close_running_v1": {
+      "tools": "multi_agent_v1",
+      "description": "The root closes a child whose turn is running: close_agent fires no subagent hook, so the child has a SubagentStart and a UserPromptSubmit and never a SubagentStop.",
+      "root_events": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop"
+      ],
+      "child_events": [
+        "SubagentStart",
+        "UserPromptSubmit"
+      ],
+      "events": [
+        {
+          "agent_id": "agent-child-1",
+          "agent_type": "default",
+          "hook_event_name": "SubagentStart"
+        }
+      ]
+    }
+  }
+}

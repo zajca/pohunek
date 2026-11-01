@@ -28,7 +28,7 @@
     {
       "binaries": ["pohunek-cli::all"],
       "sources": ["nextest-junit-cli", "package-junit-codex"],
-      "reason": "the package job runs the codex_package module of all under its real-runtime environment; the cli shard's run of the module's non-ignored tests stays until the per-test audit of #1226 settles it"
+      "reason": "the package job runs the codex_package and codex_subagent_sequences modules of all under its real-runtime environment; the cli shard's run of the modules' non-ignored tests stays until the per-test audit of #1226 settles it"
     },
     {
       "binaries": ["pohunek-cli::all"],

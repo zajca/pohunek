@@ -405,7 +405,10 @@ and its version probe; the fixture kills every process it started, also when a
 test fails. Run them with
 `POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test all --
 --include-ignored --test-threads 1 codex_package::`; the `codex-package` CI job installs the
-locked release from npm. Never point a manual run at the operator's real Codex home.
+locked release from npm and also runs `crates/cli/tests/codex_subagent_sequences.rs`
+(`... codex_subagent_sequences::`), the capture of the subagent hook sequences against
+`compat/codex/subagent-hook-sequences.json`; it fails when the `codex` on `PATH` is not the
+locked release. Never point a manual run at the operator's real Codex home.
 
 The TypeScript SDK is released as three npm-pack tarballs
 (`pohunek-ts-protocol-X.Y.Z.tgz`, `pohunek-ts-sdk-X.Y.Z.tgz`,

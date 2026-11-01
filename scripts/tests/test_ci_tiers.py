@@ -314,6 +314,15 @@ PACKAGE_JOBS = {
     "claude-package": "claude",
     "hermes-package": "hermes",
 }
+# The nextest filter each package job passes: the codex job also runs the
+# opt-in capture of the subagent hook sequences (crates/cli/tests/
+# codex_subagent_sequences.rs) against the locked codex.
+PACKAGE_FILTERS = {
+    "pi": "^pi_package::",
+    "codex": "^codex_(package|subagent_sequences)::",
+    "claude": "^claude_package::",
+    "hermes": "^hermes_package::",
+}
 PACKAGE_SELECTOR = "package-selection"
 PACKAGE_SELECT_COMMAND = 'cargo xtask package affected --base "$BASE_SHA" --json'
 
@@ -1618,7 +1627,7 @@ class RuntimePackageReportTests(unittest.TestCase):
                 names = list(steps)
                 command = (
                     f"cargo nextest run --locked --profile {PACKAGE_PROFILE} -p pohunek-cli "
-                    f"--test all -E 'test(/^{package}_package::/)' --run-ignored all --test-threads 1"
+                    f"--test all -E 'test(/{PACKAGE_FILTERS[package]}/)' --run-ignored all --test-threads 1"
                 )
                 runs = [name for name, step in steps.items() if command in step]
                 self.assertEqual(len(runs), 1, f"{job} runs {command!r} once")
@@ -1673,7 +1682,7 @@ class RuntimePackageEvidenceTests(unittest.TestCase):
                     names.index("Upload the package evidence"),
                     names.index("Build the package deterministically") + 1,
                 )
-                runs = [name for name, step in steps.items() if f"-E 'test(/^{package}_package::/)'" in step]
+                runs = [name for name, step in steps.items() if f"-E 'test(/{PACKAGE_FILTERS[package]}/)'" in step]
                 self.assertEqual(len(runs), 1)
                 self.assertLess(names.index("Upload the package evidence"), names.index(runs[0]))
 
@@ -2093,7 +2102,7 @@ class RuntimePackageBaselineTests(unittest.TestCase):
                 # After the evidence upload, so a mismatching archive keeps its
                 # evidence, and before anything is tested.
                 self.assertEqual(names.index("Match the release baseline"), names.index("Upload the package evidence") + 1)
-                runs = [name for name, step in steps.items() if f"-E 'test(/^{package}_package::/)'" in step]
+                runs = [name for name, step in steps.items() if f"-E 'test(/{PACKAGE_FILTERS[package]}/)'" in step]
                 self.assertLess(names.index("Match the release baseline"), names.index(runs[0]))
                 self.assertNotRegex(match, r"(?m)^        if: ")
                 self.assertEqual(

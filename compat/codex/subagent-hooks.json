@@ -1,10 +1,15 @@
 {
-  "source": "https://github.com/openai/codex/blob/main/codex-rs/hooks/src/schema.rs",
-  "captured_at": "2026-09-11",
+  "source": "https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/hooks/src/schema.rs (hook inputs) and codex-rs/core/src/hook_runtime.rs (which transcript each event names), rust-v0.164.0; the sequences are in subagent-hook-sequences.json",
+  "captured_at": "2026-11-01",
+  "labels": {
+    "start.transcript_path": "the child's own transcript",
+    "stop.transcript_path": "the parent's (root session) transcript",
+    "stop.agent_transcript_path": "the child's own transcript"
+  },
   "start": {
     "session_id": "session-parent-1",
     "turn_id": "turn-child-1",
-    "transcript_path": "/sanitized/parent.jsonl",
+    "transcript_path": "/sanitized/child.jsonl",
     "cwd": "/sanitized/project",
     "hook_event_name": "SubagentStart",
     "model": "sanitized-model",
