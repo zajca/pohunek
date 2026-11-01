@@ -1945,6 +1945,133 @@ mod subagent_sequences {
         );
     }
 
+    /// The start markers the `SessionStart` hook left beside the trace under `root`.
+    fn start_markers(root: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.start.", pohunek_logging::config::HOOK_TRACE_FILE_NAME);
+        let mut markers: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the trace directory")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        markers.sort();
+        markers
+    }
+
+    /// A `SessionStart` run killed while its interpreter is still starting
+    /// leaves an owner-private start marker, because the shell creates it
+    /// before the interpreter starts; a run whose interpreter runs removes its
+    /// marker and the markers older than an hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_start_hook_killed_before_its_interpreter_runs_leaves_a_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::test_support::scoped_dir("ph-hook-marker-");
+        let gate = root.join("interpreter.fifo");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the pipe");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .expect("hold the pipe");
+
+        // An interpreter that never starts: the stand-in blocks on the pipe.
+        let shim = root.join("shim");
+        std::fs::create_dir(&shim).expect("create the shim directory");
+        std::fs::write(
+            shim.join("python3"),
+            format!("#!/bin/sh\nread -r _ < '{}'\n", gate.display()),
+        )
+        .expect("write the interpreter stand-in");
+        std::fs::set_permissions(shim.join("python3"), std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            crate::integration::tests::inherited_path()
+        );
+
+        let mut hook = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+            .env("PATH", &path)
+            .spawn()
+            .expect("start the SessionStart hook");
+        pohunek_test_support::wait::wait_until("the start marker", || async {
+            (!start_markers(&root).is_empty()).then_some(())
+        })
+        .await;
+        let group = nix::unistd::Pid::from_raw(
+            i32::try_from(hook.id().expect("the hook's pid")).expect("a pid"),
+        );
+        nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
+            .expect("kill the SessionStart hook");
+        hook.wait().await.expect("reap the SessionStart hook");
+        drop(held);
+
+        let markers = start_markers(&root);
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert_eq!(
+            std::fs::read_to_string(&markers[0]).expect("read the marker"),
+            format!("{SESSION_ID}\n")
+        );
+        let mode = std::fs::metadata(&markers[0])
+            .expect("marker metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert!(trace_reasons(&root).is_empty(), "the interpreter never ran");
+
+        // A run whose interpreter runs removes its own marker and an hour-old
+        // one, and keeps a recent one.
+        let stale = root.join(format!(
+            "{}.start.stale",
+            pohunek_logging::config::HOOK_TRACE_FILE_NAME
+        ));
+        std::fs::write(&stale, "s-old\n").expect("write the stale marker");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open the stale marker")
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(2 * 3600))
+            .expect("age the stale marker");
+        let status = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+            .status()
+            .await
+            .expect("run the SessionStart hook");
+        assert!(status.success(), "{status}");
+        assert_eq!(
+            start_markers(&root),
+            markers,
+            "only the recent marker stays"
+        );
+    }
+
+    /// The shell stops creating markers at 16, so a host whose interpreter never
+    /// starts does not fill the log directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_start_markers_are_bounded() {
+        let root = crate::test_support::scoped_dir("ph-hook-marker-cap-");
+        for index in 0..16 {
+            std::fs::write(
+                root.join(format!(
+                    "{}.start.{index}",
+                    pohunek_logging::config::HOOK_TRACE_FILE_NAME
+                )),
+                "s-1\n",
+            )
+            .expect("write a marker");
+        }
+        let before = start_markers(&root);
+        let status = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+            .status()
+            .await
+            .expect("run the SessionStart hook");
+        assert!(status.success(), "{status}");
+        assert_eq!(start_markers(&root), before);
+    }
+
     /// Secret-shaped command of a background shell: a secret after a variable
     /// assignment, after a flag, and the full command line around them.
     const SECRET: &str = "sk-live-0123456789abcdef";

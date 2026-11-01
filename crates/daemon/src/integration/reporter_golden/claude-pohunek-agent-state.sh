@@ -18,7 +18,9 @@
 # trace named by POHUNEK_HOOK_TRACE_PATH, when the worker provides one. The
 # SessionStart run also leaves `hook_started` as soon as the interpreter runs
 # its script and `hook_finished` when it ends, so a hook the agent killed after
-# that shows as started without a finish.
+# that shows as started without a finish. A hook the agent killed while the
+# interpreter itself was still starting leaves a start marker beside the trace,
+# which the shell creates before it starts the interpreter.
 
 set -eu
 
@@ -31,6 +33,38 @@ esac
 [ "${POHUNEK_ENV:-}" = "1" ] || exit 0
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+# The SessionStart run records that it began before the interpreter starts,
+# because a slow first `python3` start (the Xcode shim) can outlast the hook
+# timeout, and a run killed there never reaches the trace code. A POSIX shell
+# cannot append to the trace without following a symlink, but a redirection
+# under `set -C` creates a new file exclusively and so never follows one: the
+# marker is a new owner-private file named after the trace, holding the pohunek
+# session id. The interpreter removes it once it runs, so a marker left behind
+# names a run killed before that. At most 16 markers exist at once; the
+# interpreter removes markers older than an hour.
+start_marker=""
+if [ "$action" = "session" ]; then
+  case "${POHUNEK_HOOK_TRACE_PATH:-}" in
+    /*)
+      case "$POHUNEK_SESSION_ID" in
+        *[!A-Za-z0-9._-]*) ;;
+        *)
+          marker_base="$POHUNEK_HOOK_TRACE_PATH.start."
+          marker_count=0
+          for existing in "$marker_base"*; do
+            if [ -e "$existing" ] || [ -L "$existing" ]; then
+              marker_count=$((marker_count + 1))
+            fi
+          done
+          if [ "$marker_count" -lt 16 ] &&
+            (umask 077 && set -C && printf '%s\n' "$POHUNEK_SESSION_ID" >"$marker_base$$") 2>/dev/null; then
+            start_marker="$marker_base$$"
+          fi
+          ;;
+      esac
+      ;;
+  esac
+fi
 # BEGIN agent-pid
 # Claude runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
 # shell that does not exec its last command (dash) stays between the agent and
@@ -60,6 +94,7 @@ esac
 # the agent.
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
+POHUNEK_HOOK_START_MARKER="$start_marker" \
 python3 -I - 3<&0 <<'PY' || exit 0
 import atexit
 import errno
@@ -180,6 +215,9 @@ MAX_TRACE_BYTES_DIGITS = 15
 # A hook holds the lock for one fstat, rename and write, so a free lock shows
 # up within a few retries, while a holder that never lets go costs a run at most
 # (TRACE_LOCK_ATTEMPTS - 1) * TRACE_LOCK_RETRY_SECONDS, 20 ms.
+# A start marker older than this belongs to a run that is long gone (the hook
+# timeout is 10 s) and is removed by the next SessionStart run.
+START_MARKER_MAX_AGE_SECONDS = 3600
 TRACE_LOCK_ATTEMPTS = 5
 TRACE_LOCK_RETRY_SECONDS = 0.005
 
@@ -208,6 +246,7 @@ def strict_positive_int(raw, max_digits):
     return None
 
 
+start_marker = os.environ.get("POHUNEK_HOOK_START_MARKER")
 trace_max_bytes = strict_positive_int(trace_max_raw, MAX_TRACE_BYTES_DIGITS)
 trace_enabled = bool(trace_path) and os.path.isabs(trace_path) and trace_max_bytes is not None
 trace_lines = []
@@ -292,6 +331,31 @@ def append_trace_line(line):
     return True
 
 
+def clear_start_markers():
+    # Removes this run's start marker, now that the interpreter runs, and the
+    # markers of runs older than START_MARKER_MAX_AGE_SECONDS. Only regular
+    # files of the current user named after the trace are touched, and a
+    # failure leaves them for the next run.
+    prefix = trace_path + ".start."
+    try:
+        if start_marker and start_marker.startswith(prefix):
+            os.unlink(start_marker)
+        cutoff = time.time() - START_MARKER_MAX_AGE_SECONDS
+        with os.scandir(os.path.dirname(trace_path)) as entries:
+            for entry in entries:
+                if not entry.path.startswith(prefix):
+                    continue
+                found = entry.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISREG(found.st_mode)
+                    and found.st_uid == os.getuid()
+                    and found.st_mtime < cutoff
+                ):
+                    os.unlink(entry.path)
+    except OSError:
+        pass
+
+
 def flush_trace():
     # Any trace failure drops the remaining lines: the trace never changes the
     # exit or output, and a contended lock costs a run its retry budget once.
@@ -314,6 +378,8 @@ if action == ACTION_SESSION:
     trace("hook_started")
     flush_trace()
     trace_lines.clear()
+    if trace_enabled:
+        clear_start_markers()
     atexit.register(lambda: trace("hook_finished"))
 
 if not worker_socket_path and not socket_path:

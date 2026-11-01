@@ -3937,8 +3937,9 @@ Reason codes, with their `detail` values:
   normal exit. A `hook_started` without a later `hook_finished` for the same
   session names a run the agent killed after that point (the hook timeout is
   10 s). A run killed while the interpreter itself is still starting, such as a
-  first `python3` start through the Xcode shim, writes nothing, because a
-  POSIX shell cannot open the trace without following a symlink;
+  first `python3` start through the Xcode shim, writes no line, because a
+  POSIX shell cannot append to the trace without following a symlink; it leaves
+  a start marker instead (see "Start markers" below);
 - `prompt_report_failed`: the Claude `prompt-submit` action raised an
   unexpected error while building or sending its report; the hook still exits 0
   with no output, so the prompt is never delayed or altered;
@@ -3976,6 +3977,18 @@ the file past `POHUNEK_HOOK_TRACE_MAX_BYTES`, the hook renames it to
 `pohunek-hooks.jsonl.1` (replacing an earlier rotated file) and writes to a new
 `pohunek-hooks.jsonl`, so the trace holds at most twice the bound across the
 two files. A failure to write the trace is ignored: tracing never changes the hook's exit code or output.
+
+Start markers: before it starts the interpreter, the shell part of the `session`
+action creates `pohunek-hooks.jsonl.start.<pid>` beside the trace (the same
+absolute path plus the suffix, mode `0600`), holding the pohunek session id and
+a newline. The shell creates it under `set -C`, which opens a new file
+exclusively and never follows a symlink. The interpreter removes its own marker
+as soon as it runs the hook, so a marker that stays names a `SessionStart` run
+the agent killed before the interpreter ran its script. A marker is created
+only for an absolute trace path and a session id of ASCII letters, digits, `.`,
+`_` and `-`, and only while fewer than 16 markers exist. The interpreter of a
+later `session` run removes markers older than an hour, regular files of the
+current user only.
 
 #### Config homes and host profiles
 

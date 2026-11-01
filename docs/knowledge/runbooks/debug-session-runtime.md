@@ -266,7 +266,11 @@ The `reason` codes:
   `SessionStart` run the agent killed after the interpreter began, so the
   session has no native reference until the next turn ends (the Claude `stop`
   action repeats the identity report) or never, on a hook older than integration
-  version 16. A run killed while the interpreter starts leaves no line;
+  version 16. A run killed while the interpreter starts leaves no line but a
+  `pohunek-hooks.jsonl.start.<pid>` file beside the trace, holding the session
+  id (the first `python3` start through the Xcode shim can outlast the hook
+  timeout; `ls` the log directory for `pohunek-hooks.jsonl.start.*`). The
+  interpreter of a later `session` run removes markers older than an hour;
 - `daemon_socket_missing`, `daemon_unreachable`, `daemon_timeout`,
   `daemon_closed`, `daemon_refused` (the daemon answered an error) and
   `daemon_protocol_invalid` (no worker socket and no usable

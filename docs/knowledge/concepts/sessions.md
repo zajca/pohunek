@@ -593,7 +593,9 @@ ids, paths or environment values, in the owner-private `pohunek-hooks.jsonl`
 of the pohunek log directory (path from `POHUNEK_HOOK_TRACE_PATH`, rotated
 once into `.1` at `POHUNEK_HOOK_TRACE_MAX_BYTES`, so at most twice that in
 total), and still exits 0; a `session` run also writes `hook_started` and
-`hook_finished`, so a hook the agent killed shows as started without a finish;
+`hook_finished`, so a hook the agent killed shows as started without a finish,
+and a hook killed before the interpreter ran leaves a `.start.<pid>` marker
+file beside the trace;
 the reason codes are in the
 [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook.
 

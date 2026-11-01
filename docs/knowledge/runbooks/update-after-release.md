@@ -58,7 +58,7 @@ answers it, Claude state hooks older than version 16 do not repeat the identity
 report when a turn ends, so a session whose `SessionStart` hook the agent killed
 before it reported keeps no native reference (resume and fork refuse it) until
 the hooks are reinstalled and a turn ends, and write no `hook_started` and
-`hook_finished` trace lines (reinstall the hooks of every Claude and Codex home:
+`hook_finished` trace lines and no start marker (reinstall the hooks of every Claude and Codex home:
 the version marker is shared, so `integration status` reports all of them
 `outdated` until then), and a session worker started by a release without the
 trace sets neither `POHUNEK_HOOK_TRACE_PATH` nor `POHUNEK_HOOK_TRACE_MAX_BYTES`,
