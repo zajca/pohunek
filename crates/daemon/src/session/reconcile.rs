@@ -4763,6 +4763,10 @@ pub(super) fn import_worker_subagents(
 /// Maps journaled subagents to public state, admitting only the providers,
 /// claim fields and outcomes the session's hook schema lets report subagents.
 ///
+/// An agent type that fails the shared agent-type rule is dropped from the
+/// record while the subagent itself is kept, so a journal written under a
+/// weaker rule never makes the whole snapshot unimportable.
+///
 /// A schema that declares no subagent sequence rule admits no subagent record.
 fn map_worker_subagents(
     subagents: &[pohunek_worker_protocol::SubagentSnapshot],
@@ -4801,7 +4805,11 @@ fn map_worker_subagents(
                 id: subagent.id.clone(),
                 parent_id: subagent.parent_id.clone(),
                 provider,
-                agent_type: subagent.agent_type.clone(),
+                agent_type: subagent
+                    .agent_type
+                    .as_ref()
+                    .filter(|value| pohunek_worker_protocol::is_valid_agent_type(value))
+                    .cloned(),
                 lifecycle,
                 activity: (lifecycle == SubagentLifecycle::Running)
                     .then_some(AgentActivity::Working),

@@ -1541,6 +1541,36 @@ mod subagent_sequences {
         start_at_the_input_bound("ph-subagent-claude-bound-", CLAUDE, &input).await;
     }
 
+    /// A `SubagentStart` whose `agent_type` holds a bidirectional override
+    /// creates no row, while the same start with a plain type creates a
+    /// running row: the type follows the label rule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claude_subagent_start_with_a_bidi_agent_type_creates_no_row() {
+        /// Subagent whose type holds U+202E.
+        const HOSTILE: &str = "b7a1c5d9e3f6a0b4d";
+        /// Subagent whose type is plain.
+        const PLAIN: &str = "b0d4f8b2c6e9a3d7e";
+        let root = crate::test_support::scoped_dir("ph-subagent-claude-bidi-type-");
+        let start = |id: &str, agent_type: &str| Step::Hook {
+            asset: state_asset(CLAUDE),
+            action: "subagent-start",
+            payload: json!({
+                "hook_event_name": "SubagentStart",
+                "agent_id": id,
+                "agent_type": agent_type,
+            }),
+        };
+        let steps = vec![
+            start(HOSTILE, "Explore\u{202E}evil"),
+            start(PLAIN, "Explore"),
+        ];
+        let running = Rows::from([(
+            (CLAUDE.to_owned(), PLAIN.to_owned()),
+            SubagentPhase::Running,
+        )]);
+        replay(&root, steps, &running).await.finish().await;
+    }
+
     /// The Codex state hook bounds a `subagent-start` input at
     /// `MAX_HOOK_INPUT_BYTES`: a valid start one byte over it creates no row,
     /// one exactly at it creates a running row.

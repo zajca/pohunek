@@ -25,7 +25,7 @@ use pohunek_platform::process::{
 };
 use pohunek_terminal::strip_probe_replies;
 use pohunek_worker_protocol as protocol;
-use pohunek_worker_protocol::is_task_text;
+use pohunek_worker_protocol::{is_task_text, is_valid_agent_type};
 use protocol::{
     ActiveIdentityClaim, AncestryMatcher, AttachStart, BackgroundSnapshot, Capability, CloseReason,
     ControlCode, ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest,
@@ -119,10 +119,6 @@ const MAX_LOGGED_CLEANUP_BLOCKERS: usize = 8;
 ///
 /// The same bound the daemon re-checks for background task ids.
 const MAX_SUBAGENT_ID_BYTES: usize = protocol::BACKGROUND_TASK_ID_MAX_BYTES;
-/// Maximum accepted provider-defined subagent type length.
-///
-/// The same bound the daemon re-checks for background agent types.
-pub(crate) const MAX_SUBAGENT_TYPE_BYTES: usize = protocol::BACKGROUND_AGENT_TYPE_MAX_BYTES;
 /// Maximum tasks accepted in one subagent snapshot.
 ///
 /// Claude Code does not cap its main-`Stop` `background_tasks` list. Four
@@ -4535,9 +4531,7 @@ where
                     && parent_id
                         .as_deref()
                         .is_none_or(|value| is_task_text(value, MAX_SUBAGENT_ID_BYTES))
-                    && agent_type
-                        .as_deref()
-                        .is_none_or(|value| is_task_text(value, MAX_SUBAGENT_TYPE_BYTES));
+                    && agent_type.as_deref().is_none_or(is_valid_agent_type);
                 (!text_valid).then_some(RejectReason::SubagentClaimInvalid)
             });
             if let Some(reason) = inadmissible {
@@ -8683,6 +8677,34 @@ mod tests {
         assert!(state.journal.native_reference_claim.is_none());
         assert!(state.journal.pending_launch_claims.is_empty());
         drop(state);
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A `SubagentStart` claim whose `agent_type` holds a bidirectional
+    /// override, a line separator or a control character is refused and leaves
+    /// the journal untouched; a plain type is admitted.
+    #[tokio::test]
+    async fn a_subagent_start_with_a_hidden_or_separator_agent_type_is_refused() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema =
+            protocol::hook_schema("identity-subagent-v1");
+        let before = server.shared.state.lock().await.journal.clone();
+        for (sequence, hostile) in
+            (1_u64..).zip(["Explore\u{202E}evil", "two\u{2028}lines", "tab\tbed", ""])
+        {
+            assert!(
+                !send_hook(&server, &pty, subagent_start_claim(sequence, Some(hostile))).await,
+                "{hostile:?}"
+            );
+        }
+        assert_eq!(server.shared.state.lock().await.journal, before);
+        assert!(send_hook(&server, &pty, subagent_start_claim(9, Some("Explore"))).await);
         pty.stop(
             "test-cleanup",
             server.shared.config.stop_grace,

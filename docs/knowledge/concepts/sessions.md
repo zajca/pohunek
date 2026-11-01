@@ -233,7 +233,7 @@ A session can carry an optional owner-set display name. Set it at creation with
 `pohunek session rename <target> <NAME>` (or `--clear`). The name is cosmetic:
 it shows in `pohunek session list`, `session inspect`, and other clients, but never
 affects targeting or recovery — a session is still addressed by its id. The
-daemon trims the name and rejects a control character or an over-long one. The
+daemon trims the name and rejects an over-long one (more than 128 bytes) and one holding a control, separator or format character such as a bidirectional override. The
 name is stored in the logical session record, so it survives daemon and worker
 loss.
 

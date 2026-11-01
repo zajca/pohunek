@@ -4845,6 +4845,157 @@ async fn rename_rejects_overlong_and_control_character_names() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
+/// A name holding a separator or format character (a bidi override, a line
+/// separator, a zero-width space) is refused on create and rename like a
+/// control character, so a client is never shown text that reorders other text.
+#[tokio::test]
+async fn session_names_with_format_or_separator_characters_are_refused() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    for hostile in ["safe\u{202E}evil", "two\u{2028}lines", "zero\u{200B}width"] {
+        let renamed = registry
+            .rename(&created.id, Some(hostile.to_owned()))
+            .await
+            .expect_err("a format or separator character must fail");
+        assert_eq!(renamed.code, "bad_request", "{hostile:?}");
+        assert_eq!(
+            renamed.msg, "session name must not contain control, separator, or format characters",
+            "{hostile:?}"
+        );
+        let new = registry
+            .create(SessionNewParams {
+                name: Some(hostile.to_owned()),
+                ..params()
+            })
+            .await
+            .expect_err("create must refuse the same name");
+        assert_eq!(new.code, "bad_request", "{hostile:?}");
+    }
+    assert_eq!(
+        registry.inspect(&created.id).await.expect("inspect").name,
+        None
+    );
+
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// A stopped record whose name the rule refuses (persisted under the weaker
+/// control-only rule) does not stop a registry from starting over its store:
+/// the session is listed and inspected with that name unchanged, the name is
+/// not accepted as new input, and a rename replaces it.
+#[tokio::test]
+async fn a_registry_starts_over_a_stored_name_the_rule_refuses() {
+    const LEGACY: &str = "safe\u{202E}evil";
+    let store_path = temp_store_path("legacy-session-name");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    };
+    let first = SessionRegistry::new(config.clone());
+    let created = first.create(params()).await.expect("create session");
+    first.stop(&created.id).await.expect("stop the session");
+
+    let store = crate::store::Store::new(store_path);
+    let mut record = store
+        .load_session(&created.id.0)
+        .expect("read the durable record")
+        .expect("the stopped session has a durable record");
+    record.info.name = Some(LEGACY.to_owned());
+    store
+        .record_session(&record)
+        .expect("write the legacy name");
+
+    let restarted = SessionRegistry::new(config);
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation over a refused name");
+    assert_eq!(
+        restarted
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .name
+            .as_deref(),
+        Some(LEGACY)
+    );
+    assert_eq!(
+        restarted
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.id == created.id)
+            .and_then(|info| info.name)
+            .as_deref(),
+        Some(LEGACY)
+    );
+
+    restarted
+        .rename(&created.id, Some(LEGACY.to_owned()))
+        .await
+        .expect_err("the refused name is not accepted as new input");
+    let renamed = restarted
+        .rename(&created.id, Some("clean name".to_owned()))
+        .await
+        .expect("a rename replaces the refused name");
+    assert_eq!(renamed.session.name.as_deref(), Some("clean name"));
+    let cleared = restarted
+        .rename(&created.id, None)
+        .await
+        .expect("a clear is accepted");
+    assert_eq!(cleared.session.name, None);
+}
+
+/// The daemon drops a worker-journaled `agent_type` that the label rule
+/// refuses when it applies the worker's snapshot, and keeps the subagent.
+#[tokio::test]
+async fn a_worker_snapshot_with_a_bidi_agent_type_keeps_the_subagent_without_the_type() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    for (id, agent_type) in [
+        ("child-bidi", "Explore\u{202E}evil"),
+        ("child-ok", "Explore"),
+    ] {
+        let mut subagent = worker_subagent_snapshot(id);
+        subagent.agent_type = Some(agent_type.to_owned());
+        snapshot.subagents.push(subagent);
+    }
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+
+    let subagents = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect")
+        .subagents;
+    let agent_type = |id: &str| {
+        subagents
+            .iter()
+            .find(|subagent| subagent.id == id)
+            .expect("subagent imported")
+            .agent_type
+            .clone()
+    };
+    assert_eq!(agent_type("child-bidi"), None);
+    assert_eq!(agent_type("child-ok").as_deref(), Some("Explore"));
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
 #[tokio::test]
 async fn invalid_metadata_rejected_for_create_or_set_and_set_leaves_session_unchanged() {
     let registry = SessionRegistry::new(SessionRegistryConfig {

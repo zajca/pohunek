@@ -330,7 +330,8 @@ pub struct SessionNewParams {
     pub agent: String,
     /// Owner-set display name for the session. Cosmetic only: it never affects
     /// targeting or resume, and `None` leaves the session showing its id. The
-    /// daemon trims it and rejects an over-long or control-character name.
+    /// daemon trims it and rejects an over-long name and one holding a control,
+    /// separator or format character (for example a bidirectional override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
