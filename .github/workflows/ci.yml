@@ -47,9 +47,11 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != 
 # `cancel-after-<job>` job does the same when a called workflow ends red. The
 # step needs `actions: write`, granted per job and never for the workflow.
 # Push runs, scheduled runs and the advisory audit job never cancel. The failing
-# job and the run end as `cancelled`; the `::error` annotation names the job that
-# failed first. The advisory audit, the two fail-open selectors and the verdict
-# do not carry the step.
+# job and the run end as `cancelled`, so no job shows `failure` on the run page;
+# the `::error` annotation on the failed job's check run names the job id and
+# links the job (`job.check_run_id`), which identifies a matrix leg. The
+# advisory audit, the two fail-open selectors and the verdict do not carry the
+# step.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
 # drain (#1209): the running main run completes, and GitHub keeps only the
 # newest push pending behind it, replacing an older pending one. Each scheduled
@@ -112,7 +114,8 @@ env:
   # Pinned mold release for .github/actions/setup-mold. MOLD_SHA256 is the
   # sha256 GitHub publishes for the release asset
   # mold-2.42.1-x86_64-linux.tar.gz (`gh api repos/rui314/mold/releases/tags/v2.42.1`,
-  # asset `digest`), cross-checked against a local download. Bump both together.
+  # asset `digest`), cross-checked against a local download. Bump both together, and in
+  # upgrade.yml, gate-tests.yml, release.yml and release-build.yml.
   MOLD_VERSION: "2.42.1"
   MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
   # Pinned zig release for .github/actions/setup-zig, used only as the C compiler
@@ -628,6 +631,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -742,6 +746,7 @@ jobs:
       - name: Install mold linker
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -854,6 +859,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -998,9 +1004,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
           FAILED_JOB: ${{ github.job }}
+          JOB_ID: ${{ job.check_run_id }}
         run: |
           set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
           gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
@@ -1225,6 +1232,7 @@ jobs:
               - 'packaging/**'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
+              - '.github/actions/setup-mold/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, the scripts the rows
@@ -1263,6 +1271,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
+              - '.github/actions/setup-mold/**'
               - '.github/actions/setup-uv/**'
             # The release gate's test steps (gate-tests.yml) run on a pull
             # request that changes what they run or how: the two workflows,
@@ -1411,9 +1420,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
           FAILED_JOB: ${{ github.job }}
+          JOB_ID: ${{ job.check_run_id }}
         run: |
           set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
           gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
@@ -1437,6 +1447,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -1682,9 +1693,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
           FAILED_JOB: ${{ github.job }}
+          JOB_ID: ${{ job.check_run_id }}
         run: |
           set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
           gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   # G3 of #1218: each package's tests run from a tree holding only the files
@@ -1727,6 +1739,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -1840,9 +1853,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
           FAILED_JOB: ${{ github.job }}
+          JOB_ID: ${{ job.check_run_id }}
         run: |
           set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
           gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   # A skipped test job counts as passed, so this job fails a run where a test
@@ -1912,6 +1926,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -1952,6 +1967,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2143,6 +2159,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2230,6 +2247,7 @@ jobs:
       # from source in this job, so a toolchain is still required here.
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2536,6 +2554,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2669,6 +2688,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2831,6 +2851,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2970,6 +2991,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3122,6 +3144,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3577,9 +3600,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
           FAILED_JOB: ${{ github.job }}
+          JOB_ID: ${{ job.check_run_id }}
         run: |
           set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
           gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
@@ -3604,6 +3628,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3925,6 +3950,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3975,6 +4001,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}

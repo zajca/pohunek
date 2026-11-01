@@ -166,8 +166,12 @@ when the called workflow ends red. Push runs (`main` drains), scheduled runs,
 the advisory `cargo-audit` job and a job that was itself cancelled never
 trigger it. Read such a run accordingly: the job that failed and the run end as
 `cancelled`, while the failed step stays red in the job log and the step's
-`::error` annotation (`Fail fast`) names the job that failed first. So a
-cancelled job in a pull request run can mean that another job failed first.
+`::error` annotation (`Fail fast`) names the job that failed first. The
+annotation sits on the failed job's check run (not on the run page) and links
+that job by its check run id, which tells the legs of a matrix apart. So a
+cancelled job in a pull request run can mean that another job failed first:
+open the cancelled jobs and look for the one whose step list has a red step
+followed by the executed `Cancel the run (fail fast)` step.
 The `test selection verdict` check still runs after the cancel and is red when
 a job it waits for failed or was cancelled; for a job that decides the pull
 request outside the verdict, look for the `Fail fast` annotation. A job that
@@ -177,6 +181,15 @@ a timeout inside it does not guarantee), and the two selector jobs (`test select
 do not carry it, because a failed selection runs everything instead of
 ending the run. A fork or Dependabot pull request has a read-only token, so the
 cancel call is refused and the run keeps its real failure.
+
+**Step bounds.** Every step that waits on a network or a local archive has an
+upper bound that fails the job with an error. The mold install is always the
+`.github/actions/setup-mold` composite (never an inline `apt-get`): curl has
+transfer limits, `sha256sum`, `tar` and `mold --version` run under `timeout`,
+and each caller sets `timeout-minutes` on the `uses:` step, because composite
+steps accept no `timeout-minutes` of their own. The remaining `apt-get` step
+(`musl-tools` in `release-build.yml`) has a step `timeout-minutes` and apt
+network timeouts. `scripts/tests/test_ci_step_bounds.py` pins both.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

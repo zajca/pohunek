@@ -41,6 +41,12 @@ runs:
         DOWNLOAD_STALL_SECONDS: "30"
         DOWNLOAD_MAX_TIME_SECONDS: "120"
         DOWNLOAD_RETRY_MAX_TIME_SECONDS: "300"
+        # Local steps after the download. The archive is verified and extracted
+        # from a local file in well under a second; a limit this generous only
+        # ends a wedged filesystem or process. Composite steps accept no
+        # `timeout-minutes`, so the caller bounds the whole action with a
+        # step-level `timeout-minutes` on its `uses:` step.
+        LOCAL_STEP_TIMEOUT_SECONDS: "120"
       run: |
         set -eu
         # GitHub does not enforce `required: true` on composite inputs.
@@ -73,8 +79,18 @@ runs:
           exit 1
         fi
         # Fails closed: extraction only runs after the hash matches.
-        (cd "$dest" && printf '%s  %s\n' "$MOLD_SHA256" "$archive" | sha256sum -c -)
-        tar -xzf "$dest/$archive" -C "$dest" --strip-components=1
+        # `timeout` exits 124 when it kills the command.
+        rc=0
+        (cd "$dest" && printf '%s  %s\n' "$MOLD_SHA256" "$archive" | timeout "$LOCAL_STEP_TIMEOUT_SECONDS" sha256sum -c -) || rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::setup-mold: sha256 verification of $archive failed (exit $rc)" >&2
+          exit 1
+        fi
+        timeout "$LOCAL_STEP_TIMEOUT_SECONDS" tar -xzf "$dest/$archive" -C "$dest" --strip-components=1 || rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::setup-mold: extraction of $archive failed (exit $rc)" >&2
+          exit 1
+        fi
         rm -f "$dest/$archive"
         echo "$dest/bin" >> "$GITHUB_PATH"
-        "$dest/bin/mold" --version
+        timeout "$LOCAL_STEP_TIMEOUT_SECONDS" "$dest/bin/mold" --version

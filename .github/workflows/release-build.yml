@@ -49,6 +49,11 @@ env:
   # against a local download. Bump both together with release.yml.
   SCCACHE_VERSION: "0.18.0"
   SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+  # Pinned mold release for .github/actions/setup-mold; the provenance of
+  # MOLD_SHA256 is documented in ci.yml. Bump together with ci.yml, upgrade.yml,
+  # gate-tests.yml, release.yml and release-build.yml.
+  MOLD_VERSION: "2.42.1"
+  MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
 
 jobs:
   meta:
@@ -120,7 +125,12 @@ jobs:
 
       - name: Install musl toolchain
         if: ${{ endsWith(matrix.target, '-musl') }}
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # The step limit bounds a hung mirror; apt's own timeouts end a stalled
+        # connection sooner, and the step fails with apt's error.
+        timeout-minutes: 10
+        run: |
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y musl-tools
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -131,7 +141,11 @@ jobs:
       # with the job-level mold RUSTFLAGS; only the musl target link itself
       # drops mold, in the "Build and package each component" step.
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Enable sccache
         uses: ./.github/actions/setup-sccache

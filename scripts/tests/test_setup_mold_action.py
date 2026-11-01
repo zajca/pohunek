@@ -292,6 +292,7 @@ class SetupMoldActionTests(unittest.TestCase):
                 "MOLD_VERSION": MOLD_VERSION,
                 "MOLD_SHA256": sha256,
                 "DOWNLOAD_RETRIES": action_env("DOWNLOAD_RETRIES"),
+                "LOCAL_STEP_TIMEOUT_SECONDS": action_env("LOCAL_STEP_TIMEOUT_SECONDS"),
                 "TEST_SERVER_PORT": str(server.port),
                 **TRANSFER_LIMITS_FOR_TESTS,
                 **overrides,

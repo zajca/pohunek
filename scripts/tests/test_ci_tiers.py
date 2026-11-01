@@ -1950,7 +1950,7 @@ class RuntimePackageBaselineTests(unittest.TestCase):
         # The download limit is a workflow constant, not a step timeout that
         # would turn a stalled download into a failed job.
         self.assertRegex(workflow_env("PACKAGE_BASELINE_FETCH_TIMEOUT"), r"^[0-9]+s$")
-        self.assertNotIn("timeout-minutes", selector)
+        self.assertNotIn("timeout-minutes", steps["Fetch the release baseline"])
 
         run = SelectorRun(self, {"core_changed": True, "packages": []}, self.verdicts({p: verified(p) for p in RELEASED_DIGESTS}))
         self.assertEqual(run.result, "success", run.stderr)

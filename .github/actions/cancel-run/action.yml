@@ -3,7 +3,9 @@ description: >-
   Cancel the current workflow run after a required job failed, so the runners
   of the jobs that are still running are freed for other work. The failing job
   and the run end as cancelled (the failed step stays failed in the job log);
-  the `::error` annotation names the job that failed first. The caller decides
+  the `::error` annotation sits on the failed job's check run and names the
+  job id plus a link to that job (matrix legs share one job id, so the link is
+  what identifies the leg). The caller decides
   when this runs and must grant `actions: write` to its job. The call is
   allowed to fail: a token without that scope (a fork or Dependabot pull
   request) must not change the result of the run, which stays the real failure.
@@ -19,7 +21,8 @@ runs:
         RUN_ID: ${{ github.run_id }}
         REPOSITORY: ${{ github.repository }}
         FAILED_JOB: ${{ github.job }}
+        JOB_ID: ${{ job.check_run_id }}
       run: |
         set -eu
-        echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+        echo "::error title=Fail fast::job ${FAILED_JOB} (https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}/job/${JOB_ID}) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
         gh run cancel "$RUN_ID" --repo "$REPOSITORY"
