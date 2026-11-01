@@ -70,6 +70,7 @@ class CancelAttributionTests(unittest.TestCase):
         action = CANCEL_ACTION.read_text()
         self.assertIn("FAILED_JOB: ${{ github.job }}", action)
         self.assertIn("JOB_ID: ${{ job.check_run_id }}", action)
+        self.assertRegex(action, r"(?m)^        LOOKUP_TIMEOUT_SECONDS: \d+$")
         self.assertIn("${GITHUB_ACTION_PATH}/cancel-run.sh", action)
 
     def test_no_job_cancels_the_run_inline(self):
@@ -80,7 +81,9 @@ class CancelAttributionTests(unittest.TestCase):
                     with self.subTest(workflow=workflow.name):
                         self.assertIn("(a called workflow) failed first", step)
 
-    def run_script(self, jobs_api_json: str | None) -> tuple[str, str, str]:
+    def run_script(
+        self, jobs_api_json: str | None, job_id: str = "99", hang: bool = False, timeout: str = "20"
+    ) -> tuple[str, str, str]:
         """Run cancel-run.sh with a fake `gh`; return (stdout, summary, gh calls)."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -95,11 +98,14 @@ class CancelAttributionTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 f'echo "$*" >> "{calls}"\n'
                 'if [ "$1" = api ]; then\n'
-                f'  [ -f "{reply}" ] || exit 1\n'
+                + (f'  read -r _ < "{tmp_path / "never"}"\n' if hang else "")
+                + f'  [ -f "{reply}" ] || exit 1\n'
                 f'  cat "{reply}"\n'
                 "fi\n"
             )
             gh.chmod(0o755)
+            if hang:
+                os.mkfifo(tmp_path / "never")
             summary = tmp_path / "summary.md"
             env = {
                 "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -107,7 +113,8 @@ class CancelAttributionTests(unittest.TestCase):
                 "RUN_ID": "7",
                 "REPOSITORY": "o/r",
                 "FAILED_JOB": "fast-tests",
-                "JOB_ID": "99",
+                "JOB_ID": job_id,
+                "LOOKUP_TIMEOUT_SECONDS": timeout,
                 "GITHUB_STEP_SUMMARY": str(summary),
             }
             result = subprocess.run(["bash", str(CANCEL_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
@@ -128,6 +135,22 @@ class CancelAttributionTests(unittest.TestCase):
         self.assertIn("job 'fast-tests' (fast-tests, https://github.com/o/r/actions/runs/7/job/99) failed first;", out)
         self.assertNotIn("in step", out)
         self.assertIn("failed first", summary)
+        self.assertIn("run cancel 7 --repo o/r", calls)
+
+
+    def test_an_empty_job_id_skips_the_lookup_and_the_job_link_but_cancels(self):
+        out, summary, calls = self.run_script('{"name": "unused"}', job_id="")
+        expected = "job 'fast-tests' (fast-tests, https://github.com/o/r/actions/runs/7) failed first"
+        self.assertIn(f"::error title=Fail fast::{expected}", out)
+        self.assertIn(expected, summary)
+        self.assertNotIn("/job/", out)
+        self.assertNotIn("api ", calls)
+        self.assertIn("run cancel 7 --repo o/r", calls)
+
+    def test_a_lookup_that_outlives_its_bound_falls_back_and_cancels(self):
+        # A zero bound fires the watchdog at once; the fake `gh api` blocks on a fifo nobody writes.
+        out, _, calls = self.run_script('{"name": "unused"}', hang=True, timeout="0")
+        self.assertIn("::error title=Fail fast::job 'fast-tests' (fast-tests, https://github.com/o/r/actions/runs/7/job/99) failed first;", out)
         self.assertIn("run cancel 7 --repo o/r", calls)
 
 

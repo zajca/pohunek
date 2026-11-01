@@ -21,4 +21,5 @@ runs:
         REPOSITORY: ${{ github.repository }}
         FAILED_JOB: ${{ github.job }}
         JOB_ID: ${{ job.check_run_id }}
+        LOOKUP_TIMEOUT_SECONDS: 20
       run: ${GITHUB_ACTION_PATH}/cancel-run.sh
