@@ -1961,29 +1961,32 @@ mod subagent_sequences {
         markers
     }
 
-    /// A `SessionStart` run killed while its interpreter is still starting
-    /// leaves an owner-private start marker, because the shell creates it
-    /// before the interpreter starts; a run whose interpreter runs removes its
-    /// marker and the markers older than an hour.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_session_start_hook_killed_before_its_interpreter_runs_leaves_a_marker() {
+    /// Starts the `SessionStart` hook with a `python3` stand-in that records
+    /// `<name>.started` under `root` and then blocks on a pipe, so the
+    /// interpreter never runs the hook. The returned file holds the pipe open.
+    fn hook_with_blocked_interpreter(
+        root: &Path,
+        name: &str,
+    ) -> (tokio::process::Child, std::fs::File) {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = crate::test_support::scoped_dir("ph-hook-marker-");
-        let gate = root.join("interpreter.fifo");
+        let gate = root.join(format!("{name}.fifo"));
         nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the pipe");
+        // Opened read-write, so the stand-in's read blocks instead of ending.
         let held = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&gate)
             .expect("hold the pipe");
-
-        // An interpreter that never starts: the stand-in blocks on the pipe.
-        let shim = root.join("shim");
+        let shim = root.join(format!("{name}-shim"));
         std::fs::create_dir(&shim).expect("create the shim directory");
         std::fs::write(
             shim.join("python3"),
-            format!("#!/bin/sh\nread -r _ < '{}'\n", gate.display()),
+            format!(
+                "#!/bin/sh\n: > '{}'\nread -r _ < '{}'\n",
+                root.join(format!("{name}.started")).display(),
+                gate.display()
+            ),
         )
         .expect("write the interpreter stand-in");
         std::fs::set_permissions(shim.join("python3"), std::fs::Permissions::from_mode(0o755))
@@ -1993,21 +1996,39 @@ mod subagent_sequences {
             shim.display(),
             crate::integration::tests::inherited_path()
         );
-
-        let mut hook = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+        let hook = session_hook_command(root, std::fs::File::open("/dev/null").expect("null"))
             .env("PATH", &path)
             .spawn()
             .expect("start the SessionStart hook");
-        pohunek_test_support::wait::wait_until("the start marker", || async {
-            (!start_markers(&root).is_empty()).then_some(())
-        })
-        .await;
+        (hook, held)
+    }
+
+    /// Kills the hook's whole process group: the interpreter is a child of the
+    /// hook's shell.
+    async fn kill_hook_group(hook: &mut tokio::process::Child) {
         let group = nix::unistd::Pid::from_raw(
             i32::try_from(hook.id().expect("the hook's pid")).expect("a pid"),
         );
         nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
             .expect("kill the SessionStart hook");
         hook.wait().await.expect("reap the SessionStart hook");
+    }
+
+    /// A `SessionStart` run killed while its interpreter is still starting
+    /// leaves an owner-private start marker, because the shell creates it
+    /// before the interpreter starts; a run whose interpreter runs removes its
+    /// marker and the markers older than an hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_start_hook_killed_before_its_interpreter_runs_leaves_a_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::test_support::scoped_dir("ph-hook-marker-");
+        let (mut hook, held) = hook_with_blocked_interpreter(&root, "killed");
+        pohunek_test_support::wait::wait_until("the start marker", || async {
+            (!start_markers(&root).is_empty()).then_some(())
+        })
+        .await;
+        kill_hook_group(&mut hook).await;
         drop(held);
 
         let markers = start_markers(&root);
@@ -2034,7 +2055,7 @@ mod subagent_sequences {
             .write(true)
             .open(&stale)
             .expect("open the stale marker")
-            .set_modified(SystemTime::now() - std::time::Duration::from_secs(2 * 3600))
+            .set_modified(SystemTime::now() - std::time::Duration::from_hours(2))
             .expect("age the stale marker");
         let status = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
             .status()
@@ -2064,12 +2085,28 @@ mod subagent_sequences {
             .expect("write a marker");
         }
         let before = start_markers(&root);
+        let (mut hook, held) = hook_with_blocked_interpreter(&root, "marker-cap");
+        // The shell ran ahead of the interpreter once the stand-in is waiting.
+        pohunek_test_support::wait::wait_until("the interpreter stand-in", || async {
+            root.join("marker-cap.started").exists().then_some(())
+        })
+        .await;
+        kill_hook_group(&mut hook).await;
+        drop(held);
+        assert_eq!(start_markers(&root), before, "a 17th marker is not created");
+    }
+
+    /// A run with an invalid size bound still removes its marker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_without_a_trace_bound_removes_its_start_marker() {
+        let root = crate::test_support::scoped_dir("ph-hook-marker-nobound-");
         let status = session_hook_command(&root, std::fs::File::open("/dev/null").expect("null"))
+            .env("POHUNEK_HOOK_TRACE_MAX_BYTES", "0")
             .status()
             .await
             .expect("run the SessionStart hook");
         assert!(status.success(), "{status}");
-        assert_eq!(start_markers(&root), before);
+        assert!(start_markers(&root).is_empty());
     }
 
     /// Secret-shaped command of a background shell: a secret after a variable

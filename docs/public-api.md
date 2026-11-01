@@ -3981,8 +3981,9 @@ two files. A failure to write the trace is ignored: tracing never changes the ho
 Start markers: before it starts the interpreter, the shell part of the `session`
 action creates `pohunek-hooks.jsonl.start.<pid>` beside the trace (the same
 absolute path plus the suffix, mode `0600`), holding the pohunek session id and
-a newline. The shell creates it under `set -C`, which opens a new file
-exclusively and never follows a symlink. The interpreter removes its own marker
+a newline. The shell creates it under `set -C`, which creates a new file and
+overwrites neither an existing regular file nor the target of a dangling
+symlink. The interpreter removes its own marker
 as soon as it runs the hook, so a marker that stays names a `SessionStart` run
 the agent killed before the interpreter ran its script. A marker is created
 only for an absolute trace path and a session id of ASCII letters, digits, `.`,

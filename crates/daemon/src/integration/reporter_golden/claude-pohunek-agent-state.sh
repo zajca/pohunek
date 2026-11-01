@@ -37,11 +37,12 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # because a slow first `python3` start (the Xcode shim) can outlast the hook
 # timeout, and a run killed there never reaches the trace code. A POSIX shell
 # cannot append to the trace without following a symlink, but a redirection
-# under `set -C` creates a new file exclusively and so never follows one: the
-# marker is a new owner-private file named after the trace, holding the pohunek
-# session id. The interpreter removes it once it runs, so a marker left behind
-# names a run killed before that. At most 16 markers exist at once; the
-# interpreter removes markers older than an hour.
+# under `set -C` creates a new file and does not overwrite an existing regular
+# file or write through a dangling symlink: the marker is a new owner-private
+# file named after the trace, holding the pohunek session id. The interpreter
+# removes it once it runs, so a marker left behind names a run killed before
+# that. At most 16 markers exist at once; the interpreter removes markers older
+# than an hour.
 start_marker=""
 if [ "$action" = "session" ]; then
   case "${POHUNEK_HOOK_TRACE_PATH:-}" in
@@ -378,7 +379,7 @@ if action == ACTION_SESSION:
     trace("hook_started")
     flush_trace()
     trace_lines.clear()
-    if trace_enabled:
+    if trace_path and os.path.isabs(trace_path):
         clear_start_markers()
     atexit.register(lambda: trace("hook_finished"))
 
