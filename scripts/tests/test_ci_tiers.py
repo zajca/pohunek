@@ -1377,9 +1377,13 @@ class FailFastTests(unittest.TestCase):
                 self.assertEqual(self.permissions(job).get("actions"), "write")
                 self.assertNotRegex(job, r"(?m)^    continue-on-error:")
 
-    def test_a_job_with_a_sparse_test_tree_cancels_inline_and_the_others_use_the_action(self):
-        # The sparse test tree drops .github/actions, so the jobs that may run from it cannot use the local action.
-        sparse_capable = {"fast-tests", "integration", "integration-relay", "test-selection-check"}
+    def test_a_job_with_a_sparse_or_relocated_tree_cancels_inline_and_the_others_use_the_action(self):
+        # A sparse or relocated checkout holds no .github/actions at its root, so such a job cannot use the local action.
+        sparse_capable = set()
+        for name, job in self.direct_jobs().items():
+            if re.search(r"(?m)^ +sparse-checkout:|^ +path: relocated$", job):
+                sparse_capable.add(name)
+        self.assertGreaterEqual(sparse_capable, {"fast-tests", "integration", "integration-relay", "test-selection-check", "test-duplicates"})
         for name, job in self.direct_jobs().items():
             last = list(job_steps(job).values())[-1]
             with self.subTest(job=name):
@@ -1391,6 +1395,15 @@ class FailFastTests(unittest.TestCase):
                 else:
                     self.assertRegex(last, r"(?m)^        uses: \./\.github/actions/cancel-run$")
                     self.assertNotIn("relocated", last)
+
+    def test_every_checkout_of_a_job_with_actions_write_drops_the_persisted_token(self):
+        # The token stays out of git config, so later build scripts and tests cannot read it from there.
+        for name, job in workflow_jobs().items():
+            if self.permissions(job).get("actions") != "write":
+                continue
+            with self.subTest(job=name):
+                checkouts = len(re.findall(r"uses: actions/checkout@", job))
+                self.assertEqual(checkouts, len(re.findall(r"(?m)^          persist-credentials: false$", job)))
 
     def test_the_advisory_audit_the_verdict_and_the_fail_open_selectors_do_not_carry_the_step_or_the_scope(self):
         jobs = workflow_jobs()

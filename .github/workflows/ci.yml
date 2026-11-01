@@ -157,6 +157,8 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Verify native runner architecture
         shell: bash
@@ -337,6 +339,8 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Verify native runner architecture
         shell: bash
@@ -619,6 +623,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -677,6 +683,8 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install zig
         uses: ./.github/actions/setup-zig
@@ -841,6 +849,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -904,6 +914,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: relocated
+          persist-credentials: false
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -1025,6 +1036,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+          persist-credentials: false
       # Every job of the run checks out GITHUB_SHA (the merge ref of a pull
       # request, the run's commit otherwise), so this tree is the tree the run
       # tests. scripts/ci-evidence reads it from the artifact name to accept a
@@ -1310,6 +1322,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: relocated
+          persist-credentials: false
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1419,6 +1432,8 @@ jobs:
       POHUNEK_SYSTEMD_E2E: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -1589,6 +1604,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: relocated
+          persist-credentials: false
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1793,6 +1809,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: relocated
+          persist-credentials: false
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -1890,6 +1907,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -1928,6 +1947,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -2117,6 +2138,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -3532,6 +3555,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: scripts
+          persist-credentials: false
 
       # Only this workflow's test jobs: the release rehearsal's reusable
       # workflow uploads its own JUnit reports, which this job does not wait for.
@@ -3543,9 +3567,20 @@ jobs:
 
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
+      # Inline instead of .github/actions/cancel-run: the sparse checkout of
+      # this job holds only scripts/, so the local action would be missing.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          FAILED_JOB: ${{ github.job }}
+        run: |
+          set -eu
+          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
+          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).
@@ -3564,6 +3599,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -3635,6 +3672,8 @@ jobs:
     if: ${{ !cancelled() && needs.build-bins.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -3844,6 +3883,8 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -3879,6 +3920,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -3927,6 +3970,8 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
