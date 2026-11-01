@@ -583,10 +583,23 @@ deferred through the reporter's next snapshot, which only records itself, and
 settle at the earliest on the one after it. Codex `Stop` carries no task list, so Codex
 rows are never reconciled this way ([#916](https://github.com/zajca/pohunek/issues/916)).
 
+The running-child limit is 64 per provider, so a provider whose children never
+report a stop cannot refuse another provider's starts. A Codex child whose turn
+was interrupted (`interrupt_agent`, or `send_input` with `interrupt`) or that
+was closed while it ran fires no `SubagentStop`, and no other hook marks that
+end, so its row stays `running` until a later stop of the same child, or until
+the runtime ends, when it becomes `lost`. Such rows fill only Codex's own 64
+slots; the 65th Codex start is refused with `capacity`, and its later stop
+still records a completed row. The largest set the worker keeps, three
+providers at their limit with the longest accepted ids, parents and types
+beside the 32 terminal rows and a full background snapshot, measures about
+0.42 MiB in the journal and 0.39 MiB in the `inspect` response, inside the
+1 MiB journal and control-line limits.
+
 Every admitted subagent claim the worker ignores or refuses is logged in the
 session's worker log with a reason code: `duplicate_start`,
 `stop_without_start`, `stale_sequence` and `not_running` at INFO, and
-`capacity` (the running-child limit) at WARN; an inadmissible claim, including
+`capacity` (the provider's running-child limit) at WARN; an inadmissible claim, including
 a snapshot whose task list breaks a bound, is logged as the
 `worker.identity.rejected` warning. A snapshot logs one
 `worker.subagent.reconciled` at INFO for each row it completes (reason

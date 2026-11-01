@@ -286,7 +286,9 @@ composer.
   holds, per flow (spawn, follow-up through `send_input` and `followup_task`,
   resume after close, an interrupted turn, a close of a running child), the hook
   events in order and their key sets. A resumed child fires no `SubagentStart`,
-  an interrupted or closed child fires no `SubagentStop`, and a `multi_agent_v2`
+  an interrupted or closed child fires no `SubagentStop` (its row stays
+  `running` until a later stop or the end of the runtime, and counts against
+  Codex's own 64 running children only), and a `multi_agent_v2`
   child fires no `UserPromptSubmit`. The opt-in test
   `a_real_codex_produces_the_committed_subagent_hook_sequences` records the
   flows again from the real `codex` through the loopback Responses stub and
