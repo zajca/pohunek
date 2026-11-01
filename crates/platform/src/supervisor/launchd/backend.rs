@@ -1107,11 +1107,6 @@ impl Jobs {
             return Err(Error::NotFound(id.clone()));
         }
         let Some(stored) = stored()? else {
-            // A retire boots the job out before it removes the definition, so
-            // a job that vanished after the first probe is gone, not invalid.
-            if self.presence(operation, label).await? == Presence::Absent {
-                return Err(Error::NotFound(id.clone()));
-            }
             return Err(Error::InvalidData {
                 operation,
                 detail: "loaded job has no private definition".to_owned(),
