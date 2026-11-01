@@ -1469,3 +1469,47 @@ async fn a_previous_release_reads_and_rewrites_the_retention_policy_beside_an_id
     );
     daemon.stop().await;
 }
+
+/// Params with a key the daemon does not know stay refused: tolerance of
+/// unknown keys applies to what a client decodes, never to what the daemon
+/// decodes.
+#[tokio::test]
+async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
+    let daemon = Daemon::start("window-params-unknown-key").await;
+    let mut client = daemon.connect().await;
+
+    for (id, method_name, params) in [
+        (
+            "read-extra",
+            method::SESSION_READ,
+            json!({"session_id": "s-1", "key_from_a_newer_client": 1}),
+        ),
+        (
+            "command-extra",
+            method::COMMAND_RUN,
+            json!({
+                "package": "acme.fleet-state",
+                "command": "host-state",
+                "key_from_a_newer_client": 1,
+            }),
+        ),
+    ] {
+        let request = Request::new(id, method_name, params).expect("valid request");
+        let response = exchange(
+            &mut client,
+            &serde_json::to_value(&request).expect("serialize request"),
+        )
+        .await;
+        assert_eq!(
+            response["err"]["code"], "bad_request",
+            "{method_name}: {response}"
+        );
+        assert!(
+            response["err"]["msg"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("unknown field")),
+            "{method_name}: {response}"
+        );
+    }
+    daemon.stop().await;
+}

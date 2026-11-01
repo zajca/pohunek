@@ -289,7 +289,6 @@ crate::tolerant_enum!(SessionWaitTurnReason);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionTurnEvent.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionTurnEvent {
     /// Session the event belongs to.
     pub session_id: SessionId,
@@ -308,7 +307,6 @@ pub struct SessionTurnEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionTurnProgress.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionTurnProgress {
     /// Targeted session.
     pub session_id: SessionId,
@@ -336,7 +334,6 @@ pub struct SessionTurnProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitTurnResult.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionWaitTurnResult {
     /// Why the wait completed.
     pub reason: SessionWaitTurnReason,

@@ -74,7 +74,6 @@ impl std::fmt::Display for ErrorClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ProtocolError.ts"))]
-#[serde(deny_unknown_fields)]
 #[error("{class}/{code}: {msg}")]
 pub struct ProtocolError {
     /// Broad category, for coarse branching.

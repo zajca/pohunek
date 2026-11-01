@@ -12,7 +12,7 @@
 //! Design rules carried from the plan:
 //! - Requests carry a supported `v` range. Responses and events carry the
 //!   highest mutually selected exact version.
-//! - Public observation and mutation DTOs reject unknown fields and invalid
+//! - Public observation and mutation params reject unknown fields and invalid
 //!   cursor coordinates before dispatch.
 //! - Requests carry an `id` correlating the response and any related events.
 //! - Errors are typed (class + machine code + human message + optional recovery
