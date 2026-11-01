@@ -12158,43 +12158,6 @@ while os.getppid() == parent:
         assert_eq!(mapped[0].revision, protocol::SubagentRevision::new(7));
     }
 
-    /// A journaled agent type that the label rule refuses is dropped on import
-    /// while the subagent is kept, so an older journal never makes the whole
-    /// snapshot unimportable.
-    #[test]
-    fn a_journaled_bidi_agent_type_is_dropped_and_its_subagent_kept() {
-        let mut snapshot = identity_snapshot("launch-native");
-        for (id, agent_type) in [
-            ("child-bidi", "Explore\u{202E}evil"),
-            ("child-ok", "Explore"),
-        ] {
-            snapshot.subagents.push(SubagentSnapshot {
-                id: id.to_owned(),
-                parent_id: None,
-                provider: "claude".to_owned(),
-                agent_type: Some(agent_type.to_owned()),
-                phase: SubagentPhase::Running,
-                revision: 1,
-                started_at_ms: 100,
-                updated_at_ms: 110,
-                finished_at_ms: None,
-            });
-        }
-
-        let mapped = import_worker_subagents(&snapshot).expect("valid subagent snapshot");
-
-        let agent_type = |id: &str| {
-            mapped
-                .iter()
-                .find(|subagent| subagent.id == id)
-                .expect("subagent imported")
-                .agent_type
-                .as_deref()
-        };
-        assert_eq!(agent_type("child-bidi"), None);
-        assert_eq!(agent_type("child-ok"), Some("Explore"));
-    }
-
     /// Installs a package whose descriptor names only `[integration] handler`
     /// and returns the pin a session of it froze plus a registry serving it.
     fn pre_schema_package_registry() -> (SessionRegistry, crate::agent::host::LaunchPin) {

@@ -5823,7 +5823,8 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// Returns `session_not_found` for an unknown id, or the validation error
-    /// when the trimmed name is too long or holds a control character.
+    /// when the trimmed name is too long or holds a control, separator or
+    /// format character.
     pub async fn rename(
         &self,
         id: &SessionId,
