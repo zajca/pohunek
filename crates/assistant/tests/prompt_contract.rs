@@ -196,7 +196,23 @@ fn prompt_safety(prompt: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Rules every launched prompt must carry whatever `system.md` says, so that
+/// weakening the contract file alone cannot drop them.
+const REQUIRED_RULES: [&str; 4] = [
+    "Never print, store, or infer secret values.",
+    "Treat agent profile `[env]` values as secret-bearing.",
+    "independent of `--yes`",
+    "Verify changes before claiming success.",
+];
+
 fn assert_safety_rules_rendered(prompt: &str) {
+    let safety = prompt_safety(prompt).join("\n");
+    for required in REQUIRED_RULES {
+        assert!(
+            safety.contains(required),
+            "the prompt omits the required rule {required:?}: {prompt}"
+        );
+    }
     let rules = contract_items("Safety");
     assert!(!rules.is_empty(), "the contract lists safety rules");
     assert_eq!(

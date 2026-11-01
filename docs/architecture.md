@@ -289,7 +289,7 @@ or durable terminal content.
   remains provider-neutral. Verified external eligibility expires within 60
   minutes of upstream verification and refreshes, activity, restart, or provider
   uncertainty never extend it. [#92](https://github.com/zajca/pohunek/issues/92)
-  owns the end-to-end evidence flow before #72 can complete.
+  delivered the end-to-end evidence flow.
 - `HostShare` is a revisioned, default-deny, locally approved ceiling binding a
   host to one team. It restricts operations, registered projects and canonical
   worktree roots, owner-authored profiles, resource limits, and future execution

@@ -776,8 +776,8 @@ impl PromptContract {
     }
 
     fn parse(text: &str) -> Result<Self, AssistantError> {
-        let safety = contract_items(text, "Safety");
-        let navigation = contract_items(text, "Navigation");
+        let safety = contract_items(text, "Safety")?;
+        let navigation = contract_items(text, "Navigation")?;
         if safety.is_empty() || navigation.is_empty() {
             return Err(contract_error(
                 "the prompt contract has no safety rules or no navigation steps",
@@ -791,9 +791,13 @@ fn contract_error(reason: &str) -> AssistantError {
     ProtocolError::materialization_failed("assistant prompt contract", reason).into()
 }
 
-/// Items of the `## <heading>` section of `text`: each `- ` bullet or `N. `
-/// step, with its continuation lines joined by single spaces.
-fn contract_items(text: &str, heading: &str) -> Vec<String> {
+/// Items of the `## <heading>` section of `text`: each top-level `- ` bullet or
+/// `N. ` step, with its indented continuation lines joined by single spaces.
+///
+/// Any other content in the section (prose, sub-headings, nested or `*`
+/// bullets) is refused, so an edit of the contract cannot be merged into a
+/// neighbouring rule unnoticed.
+fn contract_items(text: &str, heading: &str) -> Result<Vec<String>, AssistantError> {
     let mut items: Vec<String> = Vec::new();
     let mut in_section = false;
     for line in text.lines() {
@@ -801,20 +805,30 @@ fn contract_items(text: &str, heading: &str) -> Vec<String> {
             in_section = title.trim() == heading;
             continue;
         }
-        if !in_section {
+        if !in_section || line.trim().is_empty() {
             continue;
         }
+        let indented = line.starts_with(' ');
         let trimmed = line.trim();
-        if let Some(item) = list_item(trimmed) {
+        if !indented {
+            let item = list_item(trimmed).ok_or_else(|| {
+                contract_error(&format!("`{heading}` holds a line that is not a list item"))
+            })?;
             items.push(item.to_owned());
-        } else if !trimmed.is_empty() {
-            if let Some(last) = items.last_mut() {
-                last.push(' ');
-                last.push_str(trimmed);
-            }
+        } else if list_item(trimmed).is_some() || trimmed.starts_with(['*', '#']) {
+            return Err(contract_error(&format!(
+                "`{heading}` holds a nested list or heading"
+            )));
+        } else if let Some(last) = items.last_mut() {
+            last.push(' ');
+            last.push_str(trimmed);
+        } else {
+            return Err(contract_error(&format!(
+                "`{heading}` starts with a continuation line"
+            )));
         }
     }
-    items
+    Ok(items)
 }
 
 /// The text after a `- ` bullet marker or an `N. ` step number.
