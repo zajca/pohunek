@@ -978,6 +978,72 @@ class HookTests(unittest.TestCase):
         self.assertEqual(response, {"ok": True})
         self.assertEqual(client.recv.call_count, 2)
 
+    def _routed_reporter(self) -> tuple[Reporter, list[str]]:
+        reporter = Reporter("hermes", environ={
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
+            "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
+            "POHUNEK_PROTOCOL_VERSION": "1", "POHUNEK_DAEMON_ID": "host-a",
+        })
+        reporter._start_identity = 1
+        return reporter, []
+
+    def _report_through_socket(self, reporter: Reporter, connected: list[str], *, connect: object = None,
+                               sendall: object = None, recv: object = None) -> None:
+        """Runs identity() and release() over a scripted socket that records every endpoint."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.connect.side_effect = lambda endpoint: connected.append(endpoint) or connect
+        if sendall is not None:
+            client.sendall.side_effect = sendall
+        client.recv.side_effect = recv
+        with mock.patch("pohunek._pohunek_reporter.socket.socket", return_value=client):
+            reporter.identity("native-session")
+
+    def test_a_delivered_identity_report_without_a_reply_is_unanswered_not_a_failure(self) -> None:
+        reporter, connected = self._routed_reporter()
+        self._report_through_socket(reporter, connected, recv=socket.timeout("report deadline exceeded"))
+
+        self.assertEqual(connected, ["/tmp/worker"])
+        self.assertEqual(reporter.failures, 0)
+        self.assertEqual(reporter.worker_sends["identity_report"]["outcome"], "unanswered")
+
+    def test_an_identity_report_that_was_not_delivered_is_a_failure_without_a_public_fallback(self) -> None:
+        reporter, connected = self._routed_reporter()
+        self._report_through_socket(reporter, connected, sendall=socket.timeout("send deadline exceeded"))
+
+        self.assertEqual(connected, ["/tmp/worker"])
+        self.assertEqual(reporter.failures, 1)
+        self.assertEqual(reporter.worker_sends["identity_report"]["outcome"], "TimeoutError")
+
+    def test_a_refused_identity_report_is_a_failure_without_a_public_fallback(self) -> None:
+        reporter, connected = self._routed_reporter()
+        self._report_through_socket(reporter, connected, recv=[b'{"ok":false}\n'])
+
+        self.assertEqual(connected, ["/tmp/worker"])
+        self.assertEqual(reporter.failures, 1)
+        self.assertEqual(reporter.worker_sends["identity_report"]["outcome"], "rejected")
+
+    def test_a_dropped_identity_connection_is_a_failure_without_a_public_fallback(self) -> None:
+        reporter, connected = self._routed_reporter()
+        self._report_through_socket(reporter, connected, recv=[b""])
+
+        self.assertEqual(connected, ["/tmp/worker"])
+        self.assertEqual(reporter.failures, 1)
+        self.assertEqual(reporter.worker_sends["identity_report"]["outcome"], "rejected")
+
+    def test_an_unanswered_or_refused_release_still_falls_back_to_the_public_release(self) -> None:
+        for name, recv in (("unanswered", socket.timeout("report deadline exceeded")), ("refused", [b'{"ok":false}\n'])):
+            with self.subTest(name):
+                reporter, _ = self._routed_reporter()
+                client = mock.MagicMock()
+                client.__enter__.return_value = client
+                client.recv.side_effect = recv
+                with mock.patch("pohunek._pohunek_reporter.socket.socket", return_value=client), \
+                        mock.patch.object(reporter, "_send_public") as public:
+                    reporter.release()
+                public.assert_called_once()
+                self.assertEqual(public.call_args.args[0], "session.release_agent")
+
     def test_worker_instance_environment_name_names_the_instance(self) -> None:
         base = {
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1",

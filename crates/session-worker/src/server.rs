@@ -8436,6 +8436,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_identity_report_is_applied_and_journaled_when_its_reporter_gave_up_before_the_reply(
+    ) {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        let mut events = server.shared.events.subscribe();
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // The state lock stands in for a durable write in flight under it; the
+        // reporter has closed its end of the connection before the report runs.
+        let held = server.shared.state.lock().await;
+        let (reporter_end, mut worker_end) = tokio::io::duplex(1);
+        drop(reporter_end);
+        let report = tokio::spawn({
+            let shared = std::sync::Arc::clone(&server.shared);
+            let peer = subject_peer(&pty);
+            let claim = launch_report(&pty, 1, "ref-late-reply");
+            async move {
+                super::serve_identity_hook_with_probe(
+                    shared,
+                    &mut super::ControlWriter::new(&mut worker_end),
+                    claim,
+                    &peer,
+                    |_| Ok(true),
+                )
+                .await
+            }
+        });
+        drop(held);
+        assert!(
+            report.await.expect("the report task ends").is_err(),
+            "the reply to a closed connection fails"
+        );
+        drop(guard);
+
+        let committed = server.shared.journal.load().expect("journal on disk");
+        assert_eq!(
+            committed
+                .active_identity
+                .expect("the report is journaled")
+                .native_reference
+                .as_deref(),
+            Some("ref-late-reply")
+        );
+        assert_eq!(
+            committed
+                .launch_identity
+                .expect("the launch claim is journaled")
+                .native_reference,
+            "ref-late-reply"
+        );
+        assert!(matches!(
+            events.try_recv().expect("the change is announced").kind,
+            EventKind::IdentityChanged { .. }
+        ));
+        let logged =
+            String::from_utf8_lossy(&capture.0.lock().expect("event capture")).into_owned();
+        assert!(logged.contains("identity.accepted=true"), "{logged}");
+        assert!(logged.contains("identity.delivered=false"), "{logged}");
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn the_launch_processs_latest_reference_outlives_the_claim_lease_and_its_release() {
         let (server, pty, _directory) = launch_claim_fixture().await;
         assert!(send_hook(&server, &pty, launch_report(&pty, 1, "first")).await);
