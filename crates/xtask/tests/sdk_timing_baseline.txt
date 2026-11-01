@@ -8,4 +8,4 @@ sdk/ts/sdk/test/reconnect.test.ts 1
 sdk/ts/sdk/test/request-response.test.ts 3
 sdk/ts/sdk/test/runtime-path-contract.test.ts 1
 sdk/ts/sdk/test/ws-transport.test.ts 3
-sdk/ts/testkit/test/fixture-daemon.test.ts 8
+sdk/ts/testkit/test/fixture-daemon.test.ts 4

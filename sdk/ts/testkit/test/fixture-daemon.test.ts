@@ -11,6 +11,8 @@ import {
   CLIENT_PROTOCOL_VERSIONS,
   type HostRecord,
   type ProtocolEvent,
+  type AgentActivity,
+  type SessionInputResult,
   type SessionOutputParams,
   type SessionTurnEventKind,
   type SessionWaitParams,
@@ -176,15 +178,7 @@ describe("@pohunek/testkit fixture daemon", () => {
         cols: TEST_COLS,
         rows: TEST_ROWS,
       });
-      setTimeout(() => {
-        daemon.scenario.setAgentState(created.id, "idle", "report");
-      }, 20);
-
-      const result = await client.call("session.input", {
-        session_id: created.id,
-        text: "hello",
-        wait: { until: ["idle"], timeout_ms: 200 },
-      });
+      const result = await inputThenReport(daemon, client, created.id, { until: ["idle"] });
 
       expect(result.accepted).toBe(true);
       expect(result.activity).toBe("idle");
@@ -207,15 +201,7 @@ describe("@pohunek/testkit fixture daemon", () => {
         cols: TEST_COLS,
         rows: TEST_ROWS,
       });
-      setTimeout(() => {
-        daemon.scenario.setAgentState(created.id, "idle", "report");
-      }, 20);
-
-      const result = await client.call("session.input", {
-        session_id: created.id,
-        text: "hello",
-        wait: { timeout_ms: 200 },
-      });
+      const result = await inputThenReport(daemon, client, created.id, {});
 
       expect(result.activity).toBe("idle");
       await client.close();
@@ -252,24 +238,11 @@ describe("@pohunek/testkit fixture daemon", () => {
         rows: TEST_ROWS,
       });
 
-      setTimeout(() => {
-        daemon.scenario.setAgentState(created.id, "idle", "report");
-      }, 10);
-      await expectProtocolError(client.call("session.input", {
-        session_id: created.id,
-        text: "hello",
-        wait: { until: ["idle"], timeout_ms: 100 },
-      }), "session_input_timeout");
-
-      setTimeout(() => {
-        daemon.scenario.setAgentState(created.id, "working", "report");
-        daemon.scenario.setAgentState(created.id, "idle", "report");
-      }, 10);
-      const result = await client.call("session.input", {
-        session_id: created.id,
-        text: "again",
-        wait: { until: ["idle"], timeout_ms: 500 },
-      });
+      // The fixture holds its waiter before idle is reported, so the first idle
+      // (revision 1) is seen and must not satisfy a delayed-submit wait; the
+      // wait ends at the idle after working evidence (revision 3).
+      const result = await inputThenReport(daemon, client, created.id, { until: ["idle"] }, ["idle", "working", "idle"]);
+      expect(result.activity_revision).toBe("3");
       expect(result.activity).toBe("idle");
       expect(result.submitted).toBe(true);
       await client.close();
@@ -1740,6 +1713,37 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, action: string):
       },
     );
   });
+}
+
+/**
+ * Sends `session.input` with a wait and reports activity once the fixture
+ * holds the input waiter.
+ *
+ * The fixture counts only activity raised after the waiter opened, so the
+ * report waits for the waiter instead of a timer; the timeout is a hang guard,
+ * never the expected outcome.
+ */
+async function inputThenReport(
+  daemon: FixtureDaemonHandle,
+  client: Client,
+  sessionId: string,
+  wait: { readonly until?: Array<"idle"> },
+  reported: readonly AgentActivity[] = ["idle"],
+): Promise<SessionInputResult> {
+  const waiting = client.call("session.input", {
+    session_id: sessionId,
+    text: "hello",
+    wait: { ...wait, timeout_ms: MAX_SESSION_WAIT_MS },
+  });
+  await withTimeout(
+    waitForActiveInputWaiter(daemon),
+    SOCKET_END_TIMEOUT_MS,
+    "fixture input waiter registration",
+  );
+  for (const activity of reported) {
+    daemon.scenario.setAgentState(sessionId, activity, "report");
+  }
+  return waiting;
 }
 
 async function waitForActiveInputWaiter(daemon: FixtureDaemonHandle): Promise<void> {

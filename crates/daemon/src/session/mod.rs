@@ -99,6 +99,8 @@ mod profile_pin_tests;
 mod profile_secret_env_tests;
 mod read;
 mod reconcile;
+#[cfg(test)]
+pub(crate) use reconcile::worker_import_probe;
 mod rejected_lines;
 use claim::{ClaimKey, ClaimOrigin, PendingActivity, PendingRelease};
 use forward::Forwarded;

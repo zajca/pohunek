@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use pohunek_daemon::procwatch::{HostInspector, ProcessIdentity, ProcessInspector};
@@ -27,6 +28,9 @@ use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_platform::process::{
+    Error as ProcessError, ExitWatch, OwnershipMarkers, Pid, ProcessFact,
+};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::host_lock::{HostLock, UNREADABLE_HOLDERS};
 use pohunek_test_support::process_env::ProcessEnv;
@@ -36,6 +40,9 @@ use protocol::{
     RuntimeState, SessionId, SessionInfo, SessionNewParams, SessionState, ENV_DAEMON_ID,
     ENV_SESSION_ID,
 };
+
+#[path = "../src/procwatch/readable_host.rs"]
+mod readable_host;
 
 /// Seconds the root sleeps if the stop never kills it.
 const ROOT_SLEEP_SECONDS: u32 = 30;
@@ -164,6 +171,78 @@ enum Root {
     Exits(u8),
 }
 
+/// The host as the daemon of a scenario observes it.
+///
+/// Unrelated processes of the test host (other tests' fresh execs) start after
+/// the worker and may hide their markers, which would make any removal sweep
+/// of the scenario unconfirmed at random. They read as exited, as in
+/// [`readable_host::ReadableHost`], except the one process a scenario hides on
+/// purpose: its markers stay withheld, so the sweep still cannot dismiss it.
+#[derive(Debug)]
+struct ScenarioHost {
+    readable: readable_host::ReadableHost,
+    host: HostInspector,
+    /// Pid of the holder whose withheld markers are the subject; 0 until set.
+    withheld: Arc<AtomicU32>,
+}
+
+impl ProcessInspector for ScenarioHost {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, ProcessError> {
+        self.host.identity(pid)
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, ProcessError> {
+        self.host.is_running(identity)
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, ProcessError> {
+        self.host.parent_pid(pid)
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, ProcessError> {
+        self.host.process(pid)
+    }
+
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, ProcessError> {
+        self.host.same_user_processes()
+    }
+
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, ProcessError> {
+        self.host.descendants(root)
+    }
+
+    fn descendant_identities(
+        &self,
+        root: ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, ProcessError> {
+        self.host.descendant_identities(root)
+    }
+
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, ProcessError> {
+        self.host.cwd(pid)
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, ProcessError> {
+        self.host.executable(pid)
+    }
+
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, ProcessError> {
+        self.host.exit_watch(identity)
+    }
+
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, ProcessError> {
+        if pid == self.withheld.load(Ordering::Acquire) {
+            self.host.ownership_markers(pid)
+        } else {
+            self.readable.ownership_markers(pid)
+        }
+    }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, ProcessError> {
+        self.host.foreground_process_group(root_pid)
+    }
+}
+
 /// One scenario: its environment, the holder's barrier and ready file, and
 /// the registry configuration every daemon instance of the scenario shares.
 struct Scenario {
@@ -171,6 +250,11 @@ struct Scenario {
     ready: PathBuf,
     config: SessionRegistryConfig,
     release: ReleaseHolder,
+    /// The holder whose markers the kernel withholds on purpose, shared with
+    /// the host view of every daemon instance of the scenario.
+    withheld: Arc<AtomicU32>,
+    /// Whether the holder hides its markers.
+    hides_markers: bool,
     /// Keeps other test runs' unreadable holders from overlapping this
     /// scenario's sweeps; declared last, so it is released last.
     _host_lock: HostLock,
@@ -258,6 +342,8 @@ impl Scenario {
             ready,
             config,
             release: ReleaseHolder(barrier),
+            withheld: Arc::new(AtomicU32::new(0)),
+            hides_markers: matches!(holder, Holder::NonDumpable),
             _host_lock: host_lock,
         }
     }
@@ -291,7 +377,11 @@ impl Scenario {
         SessionRegistry::new_with_launcher_and_inspector(
             config,
             launcher,
-            Arc::new(HostInspector::new()),
+            Arc::new(ScenarioHost {
+                readable: readable_host::ReadableHost::new(),
+                host: HostInspector::new(),
+                withheld: Arc::clone(&self.withheld),
+            }),
         )
     }
 
@@ -336,6 +426,9 @@ impl Scenario {
             .identity(holder_pid)
             .expect("inspect the escaped holder")
             .expect("the escaped holder runs");
+        if self.hides_markers {
+            self.withheld.store(holder.pid, Ordering::Release);
+        }
         (created, holder)
     }
 

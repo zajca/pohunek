@@ -7332,6 +7332,93 @@ fn cancelled_initial_input() -> CancellationToken {
     done
 }
 
+/// Lets integration tests drive the daemon's import of a worker's state.
+#[cfg(test)]
+pub(crate) mod worker_import_probe {
+    use std::path::Path;
+
+    use pohunek_worker_protocol::InspectSnapshot;
+    use protocol::{SessionInfo, SubagentInfo};
+
+    use super::{
+        map_worker_subagents, reported_hook_schema, scan_session_directory, TrustedDir,
+        WorkerMetadataApplyOutcome,
+    };
+    use crate::session::RuntimeHandle;
+    use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+
+    /// The subagents the daemon's startup scan maps from the journal `bytes`
+    /// of worker `worker_id`: the scan stages them as `scratch/<session>/<worker>.json`
+    /// and reads them through the trusted state tree, with its size limit and
+    /// identity checks, then applies the provider and field validators.
+    pub(crate) fn journal_subagents(
+        bytes: &[u8],
+        scratch: &Path,
+        session_id: &str,
+        worker_id: &str,
+    ) -> Result<Vec<SubagentInfo>, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let session_directory = scratch.join(session_id);
+        std::fs::create_dir_all(&session_directory).map_err(|error| error.to_string())?;
+        std::fs::set_permissions(scratch, std::fs::Permissions::from_mode(0o700))
+            .and_then(|()| {
+                std::fs::set_permissions(&session_directory, std::fs::Permissions::from_mode(0o700))
+            })
+            .map_err(|error| error.to_string())?;
+        let journal = session_directory.join(format!("{worker_id}.json"));
+        std::fs::write(&journal, bytes).map_err(|error| error.to_string())?;
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+        let root = TrustedDir::open_absolute(scratch, 0o700).map_err(|error| error.to_string())?;
+        let scan = scan_session_directory(&root, scratch, session_id.as_ref(), session_id)
+            .map_err(|error| error.to_string())?;
+        if !scan.rejected.is_empty() {
+            return Err(format!("journal rejected: {:?}", scan.rejected));
+        }
+        let [evidence] = scan.evidence.as_slice() else {
+            return Err(format!("{} journals scanned", scan.evidence.len()));
+        };
+        let schema =
+            reported_hook_schema(evidence.hook_schema.as_deref()).map_err(str::to_owned)?;
+        map_worker_subagents(&evidence.subagents, schema).map_err(str::to_owned)
+    }
+
+    /// What `session.inspect` shows after a daemon imports `snapshot` (as
+    /// carried on the wire) for a live session, with the snapshot taken as
+    /// that session's worker answer.
+    pub(crate) async fn inspected_after_import(snapshot: &InspectSnapshot) -> SessionInfo {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(crate::session::tests::params())
+            .await
+            .expect("create the session the import targets");
+        let own = {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get(&created.id).expect("live entry");
+            let RuntimeHandle::Worker(worker) = &entry.runtime else {
+                panic!("worker runtime");
+            };
+            worker.clone()
+        };
+        let mut imported = own.inspect().await.expect("inspect the session's worker");
+        imported.hook_schema.clone_from(&snapshot.hook_schema);
+        imported.subagents.clone_from(&snapshot.subagents);
+        imported.background.clone_from(&snapshot.background);
+        let outcome = registry
+            .apply_worker_metadata_snapshot(&created.id, &imported)
+            .await;
+        assert_eq!(outcome, WorkerMetadataApplyOutcome::Applied);
+        let info = registry.inspect(&created.id).await.expect("inspect");
+        registry.stop(&created.id).await.expect("stop the session");
+        registry.settle_transactions().await;
+        info
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
