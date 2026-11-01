@@ -16,8 +16,8 @@ use std::fs;
 use package::{build_archive, read_archive, ArchiveEntry, Limits};
 use pohunek_client::Client;
 use protocol::{
-    NotificationCreateParams, NotificationCreateResult, NotificationKind, NotificationSeverity,
-    NotificationSource, ProtocolError, SessionId,
+    NotificationCreateParams, NotificationCreateResult, NotificationKind, NotificationPolicyParams,
+    NotificationSeverity, NotificationSource, ProtocolError, SessionId,
 };
 use serde_json::{json, Value};
 
@@ -203,6 +203,45 @@ async fn policy_set_overrides_any_runtime_id() {
         "{}",
         stderr_text(&invalid)
     );
+
+    harness.stop().await;
+}
+
+/// `notification.policy.set` answers with the policy it stored: a kind the
+/// params leave out carries the daemon's default, so the result and a later
+/// `notification.policy.get` both hold every known kind.
+#[tokio::test]
+async fn policy_set_returns_the_completed_policy() {
+    let harness = Harness::start_with_debounced_notifications().await;
+    let params: NotificationPolicyParams = serde_json::from_value(json!({
+        "policy": {
+            "attention_dedupe_window_secs": 300,
+            "enabled": {"system": true},
+        }
+    }))
+    .expect("the daemon decodes params that leave kinds out");
+    let mut client = Client::connect_local(harness.socket())
+        .await
+        .expect("connect to the daemon");
+
+    let result = client
+        .set_notification_policy(params)
+        .await
+        .expect("set the policy");
+
+    for kind in NotificationKind::KNOWN {
+        assert!(
+            result.policy.enabled.get(kind).is_some(),
+            "the result holds {}: {result:?}",
+            kind.as_str()
+        );
+    }
+    let mut expected = documented_default_kinds();
+    expected["system"] = json!(true);
+    let returned = serde_json::to_value(&result.policy).expect("encode the result");
+    assert_eq!(returned["enabled"], expected, "{returned}");
+    let policy = policy_get(&harness).await;
+    assert_eq!(policy["enabled"], expected, "{policy}");
 
     harness.stop().await;
 }

@@ -2337,7 +2337,8 @@ Each protocol type has one field policy, kept in the table of
   the wire name of a `NotificationKind` to a boolean, not a struct: the keys it
   keeps are the kinds this build does not know. A kind the document leaves out
   stays out on the client round trip, and the daemon applies its default for
-  that kind when it reads such a document; `notification.policy.set` stores and
+  that kind when it reads such a document and completes the policy it loaded, so
+  `notification.policy.get` returns every kind; `notification.policy.set` stores and
   returns the policy complete, with that default filled in, so a daemon of the
   earlier release, which requires every flag, reads what this one wrote. The six current kinds serialize in declaration order, exactly
   the bytes of the struct it replaces, so neither the notification format nor

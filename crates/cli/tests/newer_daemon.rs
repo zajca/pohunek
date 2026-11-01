@@ -549,6 +549,48 @@ fn a_notification_watch_kind_filter_does_not_select_a_record_of_unknown_kind() {
     assert!(stdout.contains("n-known"), "{stdout}");
 }
 
+/// `pohunek notifications list` against a daemon whose result holds a record
+/// of a kind this build does not know followed by a known one.
+fn list_a_newer_kind(extra: &[&str]) -> Output {
+    let record = |id: &str, kind: &str| {
+        let line = notification_created_line_of_kind(id, kind, "info", "unread");
+        let event: Value = serde_json::from_str(&line).expect("event JSON");
+        event["record"].clone()
+    };
+    let result = json!({
+        "notifications": [
+            record("n-newer-kind", "a_kind_from_a_newer_daemon"),
+            record("n-known", "approval_required"),
+        ]
+    });
+    let mut arguments = vec!["notifications", "list"];
+    arguments.extend_from_slice(extra);
+    run_against_scripted_daemon(&arguments, move |request| {
+        (request.method() == protocol::method::NOTIFICATION_LIST).then(|| Ok(result.clone()))
+    })
+}
+
+#[test]
+fn a_notification_list_shows_a_record_of_a_kind_from_a_newer_daemon_as_unknown() {
+    let output = list_a_newer_kind(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    let records = document["ok"]["notifications"]
+        .as_array()
+        .expect("notification records");
+    assert_eq!(records.len(), 2, "{document}");
+    let kind_of = |id: &str| {
+        records
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is listed: {document}"))["kind"]
+            .clone()
+    };
+    assert_eq!(kind_of("n-newer-kind"), "unknown", "{document}");
+    assert_eq!(kind_of("n-known"), "approval_required", "{document}");
+}
+
 fn newer_daemon_project() -> Value {
     json!({
         "id": "p-1",
