@@ -80,7 +80,8 @@ impl PromptContract {
 }
 
 /// Items of the `## <heading>` section of `text`: each top-level `- ` bullet or
-/// `N. ` step, with its continuation lines (indented by spaces or tabs) joined by single spaces.
+/// `N. ` step, with its continuation lines (indented by spaces or tabs) joined
+/// by single spaces.
 ///
 /// Any other content in the section (prose, sub-headings, nested or `*`
 /// bullets) is refused, so an edit of the contract cannot be merged into a

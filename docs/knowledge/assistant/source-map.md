@@ -80,6 +80,8 @@ Knowledge bundle build, embed, and materialization:
 - `crates/knowledge/src/schema.rs` — concept types and frontmatter fields.
 - `crates/knowledge/src/validation.rs` — bundle validation (frontmatter, ids,
   links, reserved files).
+- `crates/knowledge/src/prompt_contract.rs` — shape of the `## Safety` and
+  `## Navigation` sections of `assistant/system.md`, shared by validation and launch.
 - `crates/knowledge/src/index.rs` — the intent-filtered concept index the prompt's
   table of contents is built from.
 - `crates/knowledge/src/protocol_conversions.rs` — concept metadata as it crosses
