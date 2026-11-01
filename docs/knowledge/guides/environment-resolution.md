@@ -78,9 +78,10 @@ below the sticky root-owned `/tmp` passes. The executable file itself is never
 accepted when group- or world-writable.
 
 **macOS admin-group exception.** A lookup directory may be group-writable on
-macOS when it is owned by the user, its group is `admin` (gid 80), it is not
+macOS when the process does not run as root, it is owned by the user, its group is `admin` (gid 80), it is not
 writable by others, and it has no allow ACL. This is the shape of a stock
-Homebrew `bin` and `Cellar` (`user:admin 775`). Root-owned directories that
+Homebrew `bin` and `Cellar` (`user:admin 775`). A process running as root never applies the exception, because any admin could
+then plant a binary that root runs. Root-owned directories that
 the admin group can write (`/Applications`, an MDM-managed Homebrew) stay
 refused, as does any other group, so the app-bundle command-line tools stay
 unsupported. The rule lives only in the executable lookup; every other trusted

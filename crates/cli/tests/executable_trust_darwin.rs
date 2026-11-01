@@ -166,39 +166,23 @@ fn assert_resolved(fixture: &Fixture, path: &str) {
     );
 }
 
-/// Fails hard when a built-in fallback directory holds a `tailscale`, because
-/// the lookup would then find that one after refusing the fixture's.
-fn assert_no_fallback_tailscale() {
-    for directory in [
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-    ] {
-        assert!(
-            fs::symlink_metadata(Path::new(directory).join("tailscale")).is_err(),
-            "{directory} holds a tailscale that the fallback lookup would find"
-        );
-    }
-}
-
+/// The refused fake never runs and its peer is never listed.
+///
+/// The binary also searches the built-in Homebrew fallback directories of the
+/// host, so the scenario asserts what the fixture alone decides, not the error
+/// a host with its own `tailscale` would turn into another one.
 fn assert_refused(fixture: &Fixture, path: &str) {
-    assert_no_fallback_tailscale();
-    let output = fixture.host_list(path);
-    assert_eq!(
-        json(&output)["err"]["code"],
-        "tailscale_cli_missing",
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let detail = fixture.doctor_cli_detail(path);
+    let listing = fixture.host_list(path);
+    let listed = String::from_utf8_lossy(&listing.stdout).into_owned();
     assert!(
-        detail.contains("not installed or not trusted"),
-        "the doctor refuses the CLI: {detail}"
+        !listed.contains("alpha"),
+        "the refused fake's peer is not listed: {listed}"
+    );
+    fixture.run(path, &["doctor", "--json"]);
+    assert_eq!(
+        fixture.fake.invocations(),
+        0,
+        "the refused fake was never run"
     );
 }
 

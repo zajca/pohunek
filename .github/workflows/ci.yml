@@ -304,11 +304,11 @@ jobs:
           print(extracted)
           " "$metadata" "$PWD")"
           output="$RUNNER_TEMP/apfs-root-test.txt"
-          (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$bin" filesystem::tests::apfs_foreign_owned_private_directory_is_rejected --ignored --exact) | tee "$output"
+          (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$bin" filesystem::tests::apfs_foreign_owned_private_directory_is_rejected shell_env::executable::tests::root_never_trusts_an_admin_group_writable_directory --ignored --exact) | tee "$output"
           # libtest exits 0 when the filter matches nothing, so require that
-          # exactly this one test ran and passed.
-          grep -qx 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]* filtered out; finished in .*' "$output" \
-            || { echo "the APFS root test did not run exactly once" >&2; exit 1; }
+          # exactly these two tests ran and passed.
+          grep -qx 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]* filtered out; finished in .*' "$output" \
+            || { echo "the root tests did not run exactly once" >&2; exit 1; }
 
       - name: Summarize flaky tests
         if: always()
