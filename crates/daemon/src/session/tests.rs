@@ -1664,6 +1664,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
 
     let registry = SessionRegistry::default();
     let binding = |agent_base: RuntimeRef, launch_binding: LaunchPin| crate::store::ResumeBinding {
+        spawned_by: None,
         session_id: "s-pin".to_owned(),
         name: None,
         agent: agent_base.as_wire().to_owned(),
@@ -10379,7 +10380,7 @@ async fn assert_worker_metadata_applied(
     what: &str,
 ) {
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
-        match registry.apply_worker_metadata_snapshot(id, snapshot).await {
+        match Box::pin(registry.apply_worker_metadata_snapshot(id, snapshot)).await {
             WorkerMetadataApplyOutcome::Applied => return,
             WorkerMetadataApplyOutcome::Retryable(_) => tokio::task::yield_now().await,
             outcome @ WorkerMetadataApplyOutcome::Discarded => {
@@ -10855,7 +10856,7 @@ async fn forward_claim(
         reported_session: None,
     });
     assert_eq!(
-        registry.apply_worker_metadata_snapshot(id, snapshot).await,
+        Box::pin(registry.apply_worker_metadata_snapshot(id, snapshot)).await,
         WorkerMetadataApplyOutcome::Applied
     );
 }
@@ -19171,6 +19172,7 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
 async fn non_resumable_profile_binding_reports_agent_not_resumable() {
     let registry = SessionRegistry::default();
     let binding = crate::store::ResumeBinding {
+        spawned_by: None,
         session_id: "s-noresume".to_owned(),
         name: None,
         agent: "noresume".to_owned(),
@@ -19720,6 +19722,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         ..SessionRegistryConfig::default()
     });
     let binding = crate::store::ResumeBinding {
+        spawned_by: None,
         session_id: "s-hermes-policy".to_owned(),
         name: None,
         agent: "hermes".to_owned(),
@@ -20136,6 +20139,7 @@ async fn resume_binding_restores_metadata_from_store() {
     let store = crate::store::Store::new(store_path.clone());
     store
         .record_resume(&crate::store::ResumeBinding {
+            spawned_by: None,
             session_id: "s-42".to_owned(),
             name: None,
             agent: "claude".to_owned(),
@@ -29092,7 +29096,7 @@ pub(in crate::session) async fn sync_from(
     worker: &Worker,
 ) {
     let snapshot = worker.inspect().await.expect("inspect worker");
-    registry.apply_worker_metadata_snapshot(id, &snapshot).await;
+    Box::pin(registry.apply_worker_metadata_snapshot(id, &snapshot)).await;
 }
 
 async fn active_agent_of(registry: &SessionRegistry, id: &SessionId) -> Option<String> {

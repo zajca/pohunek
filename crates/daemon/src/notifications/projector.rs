@@ -1352,6 +1352,7 @@ mod tests {
 
     fn session_info(session_id: &str, state: SessionState, exit_code: Option<i32>) -> SessionInfo {
         SessionInfo {
+            spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             name: None,

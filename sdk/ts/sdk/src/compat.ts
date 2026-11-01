@@ -183,7 +183,9 @@ export function downgradeRequestParams(version: number, method: string, params: 
     Array.isArray(filters) &&
     filters.some((filter) =>
       isObject(filter) &&
-      (filter["key"] === "metadata_eq" || filter["key"] === "metadata_has"),
+      (filter["key"] === "metadata_eq" ||
+        filter["key"] === "metadata_has" ||
+        filter["key"] === "spawned_by"),
     )
   ) {
     throw new CompatError({ kind: "methodNotDefined", method });

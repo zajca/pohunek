@@ -424,10 +424,15 @@ impl Harness {
 
     /// Runs `pohunek` with the hermetic environment.
     pub(crate) async fn run(&self, arguments: &[&str]) -> Output {
+        self.run_with_env(arguments, &[]).await
+    }
+
+    /// Runs `pohunek` with the hermetic environment plus `extra` variables.
+    pub(crate) async fn run_with_env(&self, arguments: &[&str], extra: &[(&str, &str)]) -> Output {
         let mut command = self
             .env
             .tokio_command(pohunek_test_support::bin_exe("pohunek"));
-        command.args(arguments);
+        command.args(arguments).envs(extra.iter().copied());
         guard("the pohunek binary to finish", command.output())
             .await
             .expect("run the pohunek binary")

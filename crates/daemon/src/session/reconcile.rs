@@ -9626,6 +9626,7 @@ while os.getppid() == parent:
 
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
+            spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             name: Some("restart continuity".to_owned()),
@@ -9681,6 +9682,7 @@ while os.getppid() == parent:
         let store_path = root.join("data/metadata.jsonl");
         let store = Store::new(store_path.clone());
         let stale_recovery = ResumeBinding {
+            spawned_by: None,
             session_id: session_id.to_owned(),
             name: Some("restart continuity".to_owned()),
             agent: "claude".to_owned(),
@@ -11199,6 +11201,7 @@ while os.getppid() == parent:
             active_agent_origin: None,
             native_identity_ordering: None,
             info: SessionInfo {
+                spawned_by: None,
                 id: SessionId("s-identity".to_owned()),
                 external: Some(false),
                 name: None,
@@ -11252,6 +11255,7 @@ while os.getppid() == parent:
                 },
             },
             recovery: Some(ResumeBinding {
+                spawned_by: None,
                 session_id: "s-identity".to_owned(),
                 name: None,
                 agent: "codex".to_owned(),
@@ -12737,6 +12741,7 @@ handler = "codex-hook-v1"
     fn manifest_session_info(id: &str, state: SessionState) -> SessionInfo {
         let created_at = "2026-07-01T00:00:00Z".to_owned();
         SessionInfo {
+            spawned_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             name: None,
@@ -12832,6 +12837,7 @@ handler = "codex-hook-v1"
         // check), so import still proceeds; it is attached to the imported
         // record by matching `session_id`.
         let recoverable_binding = ResumeBinding {
+            spawned_by: None,
             session_id: "s-recoverable".to_owned(),
             name: Some("recoverable".to_owned()),
             agent: "codex".to_owned(),
@@ -13150,6 +13156,7 @@ handler = "codex-hook-v1"
     /// A resume binding as a legacy daemon persisted it for `session_id`.
     fn legacy_binding(session_id: &str) -> ResumeBinding {
         ResumeBinding {
+            spawned_by: None,
             session_id: session_id.to_owned(),
             name: None,
             agent: "codex".to_owned(),

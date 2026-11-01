@@ -10,6 +10,7 @@ import type { SessionId } from "./SessionId";
 import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
 import type { SessionWarning } from "./SessionWarning";
+import type { SpawnedBy } from "./SpawnedBy";
 import type { StateSource } from "./StateSource";
 import type { SubagentInfo } from "./SubagentInfo";
 import type { WorktreeSource } from "./WorktreeSource";
@@ -242,6 +243,13 @@ export type SessionNewResult = {
    * Owner-controlled; must not contain secrets.
    */
   metadata?: { [key in string]: string };
+  /**
+   * The session whose request created this one, recorded by the daemon from
+   * the request origin and never changed afterwards. `None` when the
+   * creating request carried no origin. See [`SpawnedBy`] for what the
+   * record does and does not prove.
+   */
+  spawned_by?: SpawnedBy;
   /**
    * Creation timestamp in the daemon's wire timestamp format.
    */

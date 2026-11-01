@@ -843,6 +843,7 @@ fn worker_id(session: &str) -> ServiceId {
 
 fn session(id: &str, name: Option<&str>) -> SessionInfo {
     SessionInfo {
+        spawned_by: None,
         name: name.map(str::to_owned),
         id: SessionId(id.to_owned()),
         external: Some(false),

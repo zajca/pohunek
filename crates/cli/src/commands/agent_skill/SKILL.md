@@ -44,6 +44,11 @@ pohunek doctor --json
   probe by default; for an explicit re-probe run
   `pohunek host discover --refresh --json`.
 - `pohunek session list --json` is the session inventory for the target host.
+  A session created from inside another session reports that session as
+  `spawned_by` (`session_id`, `daemon_id`); `session list --spawned-by
+  <session-id> --json` lists the children of one session. The host records it
+  from the request origin, so it is attribution, not a security boundary: a
+  same-user process can omit the origin and then nothing is recorded.
 - `pohunek doctor --json` reports local environment health: daemon
   reachability, socket and state directories, and required binaries. It checks
   the machine it runs on and ignores the global `--host` flag; run it first

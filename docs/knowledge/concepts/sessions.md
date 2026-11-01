@@ -310,6 +310,20 @@ predicates are all required to match, including contradictory values for the
 same key, which produce no sessions. These options affect selection only and do
 not add metadata to the human table or quiet output.
 
+A session records which session created it. When `session.new` or
+`session.fork` arrives from inside a managed session (the client sends the
+request origin pair `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`), the daemon
+stores it as the immutable `spawned_by` (`session_id`, `daemon_id`) of the new
+session, and `session inspect --json` and `session list --json` report it. A
+request without an origin records nothing; `daemon_id` names the daemon instance
+that launched the spawner's runtime (an earlier instance on this host or another
+host) and is kept as received, never resolved against local sessions; a fork does
+not inherit the source session's value. `pohunek session list --spawned-by <session-id>` returns
+exactly the sessions that session spawned and combines with `--meta-eq`,
+`--meta-has` and `--filter` using AND semantics. The link is attribution written
+by the host from the request origin, not a security boundary: a process of the
+same user can omit the origin variables, and then nothing is recorded.
+
 Sessions created by older review flows may retain `review.source` and
 `review.dispatched_at` metadata. Those keys remain opaque session metadata.
 

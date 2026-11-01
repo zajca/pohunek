@@ -843,11 +843,26 @@ impl SessionRegistry {
     /// absent or cannot be verified, `agent_native_store_relocated` when the
     /// agent would keep its conversations outside the declared store,
     /// and otherwise the source lookup, launch-template, or launch error.
+    pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
+        self.fork_spawned_by(params, None).await
+    }
+
+    /// [`Self::fork`] recording `spawned_by`, the origin of the forking
+    /// request, on the new session. The source session's own `spawned_by` is
+    /// never inherited: the fork is a distinct session created by this request.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fork`].
     #[expect(
         clippy::too_many_lines,
         reason = "the fork transaction stays linear so every refusal precedes the registration"
     )]
-    pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
+    pub async fn fork_spawned_by(
+        &self,
+        params: SessionForkParams,
+        spawned_by: Option<protocol::SpawnedBy>,
+    ) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
         // Held from resolving the pin until the detached registration has
@@ -955,6 +970,7 @@ impl SessionRegistry {
                     branch,
                     worktree_path,
                     metadata: binding.metadata,
+                    spawned_by,
                     warnings: outdated_hooks,
                     reference_launch: None,
                     initial_input_pending: false,
@@ -1161,6 +1177,7 @@ impl SessionRegistry {
             project_id: entry.info.project_id.clone(),
             is_linked_worktree: entry.info.is_linked_worktree,
             metadata: entry.info.metadata.clone(),
+            spawned_by: entry.info.spawned_by.clone(),
             // Structural relaunch snapshot (C.4): copied verbatim from the frozen
             // entry snapshot on EVERY persist and on explicit resume, so neither a
             // resize re-persist nor a terminal relaunch can overwrite the
@@ -1341,6 +1358,7 @@ impl SessionRegistry {
                 branch,
                 worktree_path,
                 metadata: binding.metadata,
+                spawned_by: binding.spawned_by,
                 warnings: outdated_hooks,
                 // The live entry's launch marker is carried when the resumed entry
                 // is installed.

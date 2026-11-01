@@ -142,6 +142,10 @@ pub struct ResumeBinding {
     /// limits but does not classify values; callers must not store secrets here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    /// The creating request's origin ([`protocol::SessionInfo::spawned_by`]),
+    /// kept so a relaunch of the session reports the same spawner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<protocol::SpawnedBy>,
     /// Structural relaunch snapshot (C.4): the resolved launch program, frozen at
     /// creation so a host profile's `program` override survives a restart even if
     /// the profile is later edited or deleted. Serde default (`""`) for a legacy
@@ -238,6 +242,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             #[serde(default)]
             metadata: BTreeMap<String, String>,
             #[serde(default)]
+            spawned_by: Option<protocol::SpawnedBy>,
+            #[serde(default)]
             program: String,
             #[serde(default)]
             args: Vec<String>,
@@ -281,6 +287,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             project_id: raw.project_id,
             is_linked_worktree: raw.is_linked_worktree,
             metadata: raw.metadata,
+            spawned_by: raw.spawned_by,
             program: raw.program,
             args: raw.args,
             input_rules: raw.input_rules,
@@ -2715,6 +2722,7 @@ mod tests {
 
     fn resume(session_id: &str, native: &str) -> ResumeBinding {
         ResumeBinding {
+            spawned_by: None,
             session_id: session_id.to_owned(),
             name: None,
             agent: "claude".to_owned(),

@@ -281,6 +281,7 @@ impl Host {
 
 fn session_info() -> SessionInfo {
     SessionInfo {
+        spawned_by: None,
         name: None,
         id: SessionId(SESSION.to_owned()),
         external: Some(false),

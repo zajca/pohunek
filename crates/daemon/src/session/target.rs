@@ -84,6 +84,9 @@ pub(super) struct PtySessionSpec {
     pub(super) worktree_path: Option<PathBuf>,
     /// Owner-controlled metadata attached to the session.
     pub(super) metadata: BTreeMap<String, String>,
+    /// Origin of the request that created the session, carried unchanged by
+    /// every later registration of it.
+    pub(super) spawned_by: Option<protocol::SpawnedBy>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
     /// The association a session created by `project`/`repo` in a directory
@@ -752,6 +755,7 @@ impl SessionRegistry {
             branch,
             worktree_path,
             metadata,
+            spawned_by,
             warnings,
             reference_launch,
             initial_input_pending,
@@ -874,6 +878,7 @@ impl SessionRegistry {
             branch: branch.clone(),
             worktree_path: worktree_path.clone(),
             metadata: metadata.clone(),
+            spawned_by: spawned_by.clone(),
             warnings: warnings.clone(),
             capability_refusals: None,
             output_force_closed: false,
@@ -909,6 +914,7 @@ impl SessionRegistry {
                 project_id: project_id.clone(),
                 is_linked_worktree,
                 metadata: metadata.clone(),
+                spawned_by: spawned_by.clone(),
                 program: snapshot.program.clone(),
                 args: snapshot.args.clone(),
                 input_rules: StoredInputRules::from(input_rules),
@@ -1031,6 +1037,7 @@ impl SessionRegistry {
             branch,
             worktree_path,
             metadata,
+            spawned_by,
             warnings,
             capability_refusals: None,
             output_force_closed: false,

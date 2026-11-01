@@ -1095,6 +1095,26 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session-list spawner filter takes a session id and matches the recorded spawner", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("spawned-by-filter") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
+      expect(created.spawned_by).toBeUndefined();
+
+      expect(await client.call("session.list", {
+        filters: [{ key: "spawned_by", value: "s-parent" }],
+      })).toEqual([]);
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "spawned_by", value: { session_id: "s-parent" } as unknown as string }],
+      }), "bad_request");
+
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("models session lifecycle parity and project/worktree safeguards", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("parity") } });
     try {

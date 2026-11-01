@@ -69,6 +69,10 @@
       "project_label": "pohunek",
       "repo": "/workspace/pohunek",
       "rows": 32,
+      "spawned_by": {
+        "daemon_id": "d-spawner-fixture",
+        "session_id": "s-spawner-fixture"
+      },
       "state": "done",
       "state_source": "report",
       "subagents": [

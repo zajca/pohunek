@@ -3265,7 +3265,21 @@ impl SessionRegistry {
     /// As [`Self::create`].
     pub async fn create_outcome(
         &self,
+        params: SessionNewParams,
+    ) -> Result<CreateOutcome, ProtocolError> {
+        self.create_outcome_spawned_by(params, None).await
+    }
+
+    /// [`Self::create_outcome`] recording `spawned_by`, the origin of the
+    /// creating request, on the new session.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_outcome_spawned_by(
+        &self,
         mut params: SessionNewParams,
+        spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<CreateOutcome, ProtocolError> {
         self.ensure_migration_settled()?;
         // Taken before anything clones the params, so the secret values live
@@ -3346,6 +3360,7 @@ impl SessionRegistry {
                 validated_program,
                 fallback_cwd,
                 secret_env,
+                spawned_by,
             ))
             .await?;
             let (session, prompt_delivered) = registry
@@ -3755,6 +3770,7 @@ impl SessionRegistry {
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         fallback_cwd: PathBuf,
         secret_env: LaunchEnv,
+        spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<
         (
             SessionInfo,
@@ -3767,7 +3783,8 @@ impl SessionRegistry {
         // fails verification launches nothing and leaves no record.
         let _package_launch = self.guard_package_launch(&resolved.definition).await?;
         let guard = self.lock_lifecycle(&id).await;
-        let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
+        let intent =
+            create_intent_record(&id, &params, &resolved, &fallback_cwd, spawned_by.as_ref())?;
         self.write_session_record(intent).await?;
         let mut hook_stderr_tails = Vec::new();
         let mut worktree_source = None;
@@ -3799,6 +3816,7 @@ impl SessionRegistry {
                         validated_program,
                         secret_env,
                         target,
+                        spawned_by,
                     )
                 }
             }
@@ -4182,6 +4200,7 @@ impl SessionRegistry {
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         secret_env: LaunchEnv,
         target: TargetResolution,
+        spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
         let reference_launch = target.reference_launch();
         let TargetResolution {
@@ -4295,6 +4314,7 @@ impl SessionRegistry {
             branch,
             worktree_path,
             metadata: params.metadata.clone(),
+            spawned_by,
             warnings,
             reference_launch,
             initial_input_pending: plan.pending_initial_input.is_some(),
@@ -8092,6 +8112,7 @@ fn external_session_info(
         capability_refusals: None,
         output_force_closed: false,
         metadata: BTreeMap::new(),
+        spawned_by: None,
         created_at: now.clone(),
         updated_at: now,
         exit_code: None,
@@ -8245,6 +8266,7 @@ fn create_intent_record(
     params: &SessionNewParams,
     resolved: &ResolvedAgent,
     cwd: &Path,
+    spawned_by: Option<&protocol::SpawnedBy>,
 ) -> Result<SessionRecord, ProtocolError> {
     let native = resolved.native_launch();
     let created_at = timestamp_now();
@@ -8296,6 +8318,7 @@ fn create_intent_record(
         branch: params.branch.clone(),
         worktree_path: None,
         metadata: params.metadata.clone(),
+        spawned_by: spawned_by.cloned(),
         warnings: Vec::new(),
         capability_refusals: None,
         output_force_closed: false,

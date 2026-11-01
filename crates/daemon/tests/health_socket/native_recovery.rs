@@ -1527,6 +1527,85 @@ async fn claude_fork_child_records_its_own_conversation_and_resumes_it() {
     );
 }
 
+/// A fork records the origin of the forking request on the child, never the
+/// source's, and the child keeps it through a stop, a resume and a daemon
+/// restart.
+#[tokio::test]
+async fn a_fork_records_the_forking_request_origin_and_keeps_it_through_resume_and_restart() {
+    let mut rig = ClaudeRig::new("claude-fork-spawned-by").await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let origin = protocol::SpawnedBy {
+        session_id: SessionId("s-forking-parent".to_owned()),
+        daemon_id: "d-forking-parent".to_owned(),
+    };
+    let fork_request = |request_id: &str| {
+        Request::make(
+            request_id,
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": rig.session.id,
+                "cwd_mode": "same",
+                "cols": 80,
+                "rows": 24
+            }),
+        )
+    };
+    let with_origin = fork_request("fork-with-origin")
+        .with_origin(
+            Some(origin.session_id.clone()),
+            Some(origin.daemon_id.clone()),
+        )
+        .expect("valid origin pair");
+    let without_origin = fork_request("fork-without-origin");
+    let forked: protocol::SessionForkResult =
+        serde_json::from_value(ok_payload(exchange(&mut rig.control, &with_origin).await))
+            .expect("fork with an origin");
+    let plain: protocol::SessionForkResult = serde_json::from_value(ok_payload(
+        exchange(&mut rig.control, &without_origin).await,
+    ))
+    .expect("fork without an origin");
+    let child = forked.session.id.clone();
+    rig.additional_sessions.push(plain.session.id.clone());
+
+    rig.transcript(FORKED);
+    rig.report_for(&child, "fork", FORKED).await;
+    let source_id = rig.session.id.clone();
+    let source = inspect_session(&mut rig.control, &source_id).await;
+    rig.stop(&child).await;
+    ok_payload(rig.resume_session(&child).await);
+    let resumed = inspect_session(&mut rig.control, &child).await;
+    for id in [child.clone(), plain.session.id.clone(), source_id.clone()] {
+        rig.stop(&id).await;
+    }
+
+    let mut rig = rig.restarted().await;
+    let restarted_child = inspect_session(&mut rig.control, &child).await;
+    let restarted_plain = inspect_session(&mut rig.control, &plain.session.id).await;
+    rig.stop_daemon().await;
+
+    assert_eq!(forked.session.spawned_by.as_ref(), Some(&origin));
+    assert_eq!(
+        plain.session.spawned_by, None,
+        "a fork records no origin it was not sent"
+    );
+    assert_eq!(
+        source.spawned_by, None,
+        "the source never gains the fork's origin"
+    );
+    assert_eq!(
+        resumed.spawned_by.as_ref(),
+        Some(&origin),
+        "a resume keeps the spawner"
+    );
+    assert_eq!(
+        restarted_child.spawned_by.as_ref(),
+        Some(&origin),
+        "a daemon restart keeps the spawner"
+    );
+    assert_eq!(restarted_plain.spawned_by, None);
+}
+
 impl ClaudeRig {
     /// Rewrites the completed generation journal's native-reference claim into
     /// a newer conversation switch of the session's launch process that the

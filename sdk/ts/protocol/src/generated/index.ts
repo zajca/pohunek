@@ -243,6 +243,7 @@ export type { SessionWaitTurnReason } from "./SessionWaitTurnReason";
 export type { SessionWaitTurnResult } from "./SessionWaitTurnResult";
 export type { SessionWarning } from "./SessionWarning";
 export type { SessionWarningKind } from "./SessionWarningKind";
+export type { SpawnedBy } from "./SpawnedBy";
 export type { StateSource } from "./StateSource";
 export type { StoreRejectedLine } from "./StoreRejectedLine";
 export type { StoreRejectedListResult } from "./StoreRejectedListResult";

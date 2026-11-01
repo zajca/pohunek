@@ -29,6 +29,8 @@ mod required_hooks;
 mod root_reporter;
 #[path = "health_socket/session_metadata.rs"]
 mod session_metadata;
+#[path = "health_socket/spawned_by.rs"]
+mod spawned_by;
 #[path = "health_socket/store_memo.rs"]
 mod store_memo;
 mod support;

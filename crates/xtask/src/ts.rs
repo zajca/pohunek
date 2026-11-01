@@ -28,7 +28,7 @@ use protocol::{
     SessionEvent, SessionId, SessionInfo, SessionListFilter, SessionListParams, SessionOutputGap,
     SessionOutputParams, SessionOutputResult, SessionRuntimeIdentity, SessionScreenParams,
     SessionScreenResult, SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, StateSource, SubagentInfo, SubagentLifecycle,
+    SessionWarning, SessionWarningKind, SpawnedBy, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TerminalCursor, TerminalDimensions, TerminalWatermark,
     CLIENT_PROTOCOL_VERSIONS, MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS,
     MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
@@ -743,6 +743,7 @@ where
 
 fn session_minimal() -> SessionInfo {
     SessionInfo {
+        spawned_by: None,
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: None,
         capabilities: SessionCapabilities::default(),
@@ -784,6 +785,10 @@ fn session_minimal() -> SessionInfo {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one literal sets every SessionInfo field so the golden fixture covers the whole wire shape"
+)]
 fn session_full() -> SessionInfo {
     let mut metadata = BTreeMap::new();
     metadata.insert("ticket".to_owned(), "POH-12".to_owned());
@@ -882,6 +887,10 @@ fn session_full() -> SessionInfo {
         capability_refusals: None,
         output_force_closed: true,
         metadata,
+        spawned_by: Some(SpawnedBy {
+            session_id: SessionId("s-spawner-fixture".to_owned()),
+            daemon_id: "d-spawner-fixture".to_owned(),
+        }),
         created_at: CREATED_AT.to_owned(),
         updated_at: UPDATED_AT.to_owned(),
         exit_code: Some(SUCCESS_EXIT_CODE),

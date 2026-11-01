@@ -2617,6 +2617,7 @@ function isSessionListFilter(value: unknown): value is SessionListFilter {
     case "agent":
     case "id":
     case "project":
+    case "spawned_by":
       return typeof filterValue === "string";
     case "metadata_eq":
       return (
@@ -2668,6 +2669,8 @@ function sessionMatchesFilter(session: SessionInfo, filter: SessionListFilter): 
       return session.metadata?.[filter.value.key] === filter.value.value;
     case "metadata_has":
       return session.metadata !== undefined && Object.hasOwn(session.metadata, filter.value.key);
+    case "spawned_by":
+      return session.spawned_by?.session_id === filter.value;
   }
 }
 

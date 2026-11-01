@@ -13,4 +13,5 @@ export type SessionListFilter =
   | { "key": "id"; "value": string }
   | { "key": "project"; "value": string }
   | { "key": "metadata_eq"; "value": { key: string; value: string } }
-  | { "key": "metadata_has"; "value": { key: string } };
+  | { "key": "metadata_has"; "value": { key: string } }
+  | { "key": "spawned_by"; "value": string };

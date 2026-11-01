@@ -175,8 +175,8 @@ pub use session::{
     SessionRetentionPolicy, SessionRetentionReason, SessionRetentionResult, SessionRuntime,
     SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind, SubagentInfo,
-    SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
+    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind, SpawnedBy,
+    SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
     TerminalDimensionsError, UnconfirmedProcess, WorktreeSource,
 };
 #[doc(inline)]
