@@ -2402,6 +2402,17 @@ fn pipe_of(pid: rustix::process::Pid, fd: u32) -> String {
 /// holds, and that this process no longer holds the pipe's read end.
 #[cfg(target_os = "linux")]
 fn assert_drain_descriptors(holder: rustix::process::Pid, drain: rustix::process::Pid) {
+    // The kernel maps the new program only after it has closed the
+    // close-on-exec descriptors, so the drain's program in its memory map means
+    // the exec is over. A descriptor listed from here on is either one the
+    // drain keeps or one it opens and closes itself.
+    let program = fs::canonicalize("/bin/cat").expect("resolve the drain program");
+    pohunek_test_support::wait::poll_until("the drain has exec'd its program", || {
+        let maps = fs::read_to_string(format!("/proc/{}/maps", drain.as_raw_nonzero())).ok()?;
+        maps.lines()
+            .any(|line| line.ends_with(&program.display().to_string()))
+            .then_some(())
+    });
     // The drain holds the writer's pipe as stdin and `/dev/null` as stdout
     // and stderr. Any higher descriptor is the drain's own (GNU cat opens a
     // splice pipe), never one this process holds.
@@ -2425,8 +2436,15 @@ fn assert_drain_descriptors(holder: rustix::process::Pid, drain: rustix::process
             .to_string_lossy()
             .parse()
             .expect("numeric descriptor");
+        // The exec is over (see above), so an inherited descriptor would stay
+        // open; only one the drain opens and closes itself can vanish between
+        // the listing and the read.
         if fd > 2 {
-            let target = pipe_of(drain, fd);
+            let target = match fs::read_link(format!("/proc/{}/fd/{fd}", drain.as_raw_nonzero())) {
+                Ok(target) => target.display().to_string(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("read descriptor {fd} of the drain: {error}"),
+            };
             assert!(
                 !own.contains(&target),
                 "the drain inherited descriptor {fd} ({target}) from the daemon"

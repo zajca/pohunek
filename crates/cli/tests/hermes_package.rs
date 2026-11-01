@@ -1414,12 +1414,25 @@ try:
     from pohunek._pohunek_reporter import Reporter
     import socket
     reporter = Reporter('hermes')
-    original_send = reporter._send
+    def blocking_send(endpoint, message):
+        # The subject is the worker's verdict on the claim, so the child waits
+        # for that answer without the reporter's hook budget; the test's own
+        # startup barrier bounds the wait.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(endpoint)
+            client.sendall((json.dumps(message, separators=(',', ':')) + '\n').encode('utf-8'))
+            response = bytearray()
+            while b'\n' not in response:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        return json.loads(bytes(response).split(b'\n', 1)[0]) if response else None
     identity_responses = []
     send_errors = []
     def capture_worker_identity(endpoint, message):
         try:
-            response = original_send(endpoint, message)
+            response = blocking_send(endpoint, message)
         except BaseException as send_error:
             send_errors.append(type(send_error).__name__)
             raise
