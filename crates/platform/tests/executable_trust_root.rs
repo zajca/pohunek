@@ -147,7 +147,7 @@ fn root_built_fixtures_are_judged_by_an_unprivileged_process() {
     let foreign = directory(&shared, "foreign", 0o755);
     chown(&foreign, Some(FOREIGN_UID), Some(ADMIN_GID)).expect("hand the directory away");
     let foreign_program = executable(&foreign, "agent");
-    chown(&foreign_program, Some(FOREIGN_UID), Some(ADMIN_GID)).expect("hand the program away");
+    chown(&foreign_program, Some(user), Some(group)).expect("hand the program to the user");
 
     let test_binary = std::env::current_exe().expect("locate the test binary");
     let output = Command::new(test_binary)
@@ -211,17 +211,25 @@ fn an_unprivileged_process_applies_the_admin_group_rule_to_the_fixtures() {
     assert!(
         matches!(
             resolve_executable(shared.join("link").as_os_str(), &search),
-            Err(ExecutableError::NotExecutable(Refusal::ChainSymlinkOwner {
-                owner: FOREIGN_UID
-            }))
+            Err(ExecutableError::NotExecutable(
+                Refusal::ChainSharedDirectory {
+                    owner: FOREIGN_UID,
+                    ..
+                }
+            ))
         ),
         "a symlink another account owns inside a user-owned admin directory is refused"
     );
     assert!(
         matches!(
             resolve_executable(shared.join("foreign/agent").as_os_str(), &search),
-            Err(ExecutableError::NotExecutable(_))
+            Err(ExecutableError::NotExecutable(
+                Refusal::ChainSharedDirectory {
+                    owner: FOREIGN_UID,
+                    ..
+                }
+            ))
         ),
-        "a program below a directory another account owns is refused"
+        "a user's program below a directory another account owns is refused"
     );
 }
