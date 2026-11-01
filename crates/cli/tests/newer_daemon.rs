@@ -1006,3 +1006,137 @@ fn a_turn_wait_result_with_keys_from_a_newer_daemon_exits_zero_without_printing_
         "the CLI prints only the fields it decoded: {document}"
     );
 }
+
+#[test]
+fn a_session_list_with_an_unknown_capability_key_lists_every_session() {
+    let mut newer = plain_session();
+    newer["capabilities"] = json!({"resume": true, "fork": false, "a_key_from_a_newer_daemon": 1});
+    let mut other = plain_session();
+    other["id"] = json!("s-2");
+    let output = run_against_scripted_daemon(
+        &["session", "list", "--json"],
+        results_daemon(vec![(
+            protocol::method::SESSION_LIST,
+            json!([newer, other]),
+        )]),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    let ids: Vec<&Value> = document["ok"]
+        .as_array()
+        .expect("a session array")
+        .iter()
+        .map(|session| &session["id"])
+        .collect();
+    assert_eq!(ids, [&json!("s-1"), &json!("s-2")], "{document}");
+}
+
+/// Answers `get_method` with `current` and records the params of `set_method`,
+/// answering it with the policy it received under `field`.
+fn policy_round_trip_daemon(
+    get_method: &'static str,
+    set_method: &'static str,
+    field: &'static str,
+    current: Value,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+) -> impl Fn(&Request) -> Option<Result<Value, String>> {
+    move |request| {
+        if request.method() == get_method {
+            return Some(Ok(json!({ field: current.clone() })));
+        }
+        if request.method() == set_method {
+            let params = request.params().clone();
+            let answer = json!({ field: params[field].clone() });
+            sent.lock().expect("record the policy").push(params);
+            return Some(Ok(answer));
+        }
+        None
+    }
+}
+
+#[test]
+fn a_notification_policy_set_sends_back_the_keys_of_a_newer_daemon() {
+    let mut current = serde_json::to_value(protocol::NotificationPolicy {
+        attention_dedupe_window_secs: 90,
+        attention_debounce_secs: 7,
+        enabled: protocol::NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: false,
+            session_finished: false,
+            error: true,
+            system: true,
+        },
+        providers: std::collections::BTreeMap::new(),
+        retention: protocol::NotificationRetentionPolicy::default(),
+        unknown_fields: protocol::tolerant::UnknownFields::default(),
+    })
+    .expect("policy JSON");
+    current["a_key_from_a_newer_daemon"] = json!({"nested": [1, 2]});
+    current["retention"]["a_retention_key_from_a_newer_daemon"] = json!(5);
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let output = run_against_scripted_daemon(
+        &[
+            "notifications",
+            "policy",
+            "set",
+            "--provider",
+            "default",
+            "--kind",
+            "turn_completed",
+            "--enabled",
+        ],
+        policy_round_trip_daemon(
+            protocol::method::NOTIFICATION_POLICY_GET,
+            protocol::method::NOTIFICATION_POLICY_SET,
+            "policy",
+            current.clone(),
+            std::sync::Arc::clone(&sent),
+        ),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let sent = sent.lock().expect("recorded params");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let policy = &sent[0]["policy"];
+    assert_eq!(policy["enabled"]["turn_completed"], true, "{policy}");
+    assert_eq!(
+        policy["a_key_from_a_newer_daemon"], current["a_key_from_a_newer_daemon"],
+        "{policy}"
+    );
+    assert_eq!(
+        policy["retention"]["a_retention_key_from_a_newer_daemon"], 5,
+        "{policy}"
+    );
+}
+
+#[test]
+fn a_session_policy_set_sends_back_the_retention_keys_of_a_newer_daemon() {
+    let mut current =
+        serde_json::to_value(protocol::SessionRetentionPolicy::default()).expect("policy JSON");
+    current["a_key_from_a_newer_daemon"] = json!("kept");
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let output = run_against_scripted_daemon(
+        &["session", "policy", "set", "--enabled"],
+        policy_round_trip_daemon(
+            protocol::method::SESSION_POLICY_GET,
+            protocol::method::SESSION_POLICY_SET,
+            "retention",
+            current,
+            std::sync::Arc::clone(&sent),
+        ),
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let sent = sent.lock().expect("recorded params");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let retention = &sent[0]["retention"];
+    assert_eq!(retention["enabled"], true, "{retention}");
+    assert_eq!(
+        retention["a_key_from_a_newer_daemon"], "kept",
+        "{retention}"
+    );
+}

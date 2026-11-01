@@ -12,6 +12,9 @@
 //!   by clients.
 //! - `Lenient`: both decodes ignore an unknown key because the type carries no
 //!   `deny_unknown_fields` and no hand-written refusal.
+//! - `Scoped`: a dual-use type with an `UnknownFields` member. A plain decode
+//!   (the daemon's) refuses an unknown key; a decode inside `protocol::tolerant`
+//!   keeps it and serialization writes it back.
 //!
 //! The probe adds an extra key to a document of the type. Where a complete
 //! document is cheap the row supplies it. Otherwise the key goes into a seed
@@ -43,6 +46,7 @@ enum Class {
     Strict,
     Relax,
     Lenient,
+    Scoped,
 }
 
 /// How a row is probed.
@@ -65,6 +69,8 @@ struct Row {
     probe: Probe,
     plain: fn(Value) -> Result<(), String>,
     tolerant: fn(Value) -> Result<(), String>,
+    /// Tolerant decode followed by serialization.
+    tolerant_round_trip: fn(Value) -> Result<Value, String>,
 }
 
 fn empty_document() -> Value {
@@ -103,6 +109,11 @@ macro_rules! row {
                 protocol::tolerant::from_value::<protocol::$ty>(value)
                     .map(drop)
                     .map_err(|error| error.to_string())
+            },
+            tolerant_round_trip: |value| {
+                let decoded = protocol::tolerant::from_value::<protocol::$ty>(value)
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_value(decoded).map_err(|error| error.to_string())
             },
         }
     };
@@ -230,14 +241,40 @@ fn session_policy_result_bases() -> Vec<Value> {
     vec![json!({"retention": protocol::SessionRetentionPolicy::default()})]
 }
 
-fn notification_policy_result_bases() -> Vec<Value> {
-    vec![json!({"policy": {
+fn notification_policy_document() -> Value {
+    json!({
         "attention_dedupe_window_secs": 90,
         "enabled": {
             "agent_blocked": true, "approval_required": true, "turn_completed": true,
             "session_finished": true, "error": true, "system": true,
         },
-    }})]
+    })
+}
+
+fn notification_policy_result_bases() -> Vec<Value> {
+    vec![json!({"policy": notification_policy_document()})]
+}
+
+fn session_capabilities_bases() -> Vec<Value> {
+    vec![json!({"resume": true, "fork": false})]
+}
+
+fn session_retention_policy_bases() -> Vec<Value> {
+    vec![
+        serde_json::to_value(protocol::SessionRetentionPolicy::default())
+            .expect("serialize the default session retention policy"),
+    ]
+}
+
+fn notification_policy_bases() -> Vec<Value> {
+    vec![notification_policy_document()]
+}
+
+fn notification_retention_policy_bases() -> Vec<Value> {
+    vec![
+        serde_json::to_value(protocol::NotificationRetentionPolicy::default())
+            .expect("serialize the default notification retention policy"),
+    ]
 }
 
 const ROWS: &[Row] = &[
@@ -384,10 +421,34 @@ const ROWS: &[Row] = &[
         FRAMING
     ),
     // Strict: persisted or sent as params as well as returned.
-    row!(SessionCapabilities, Strict, DUAL_USE),
-    row!(SessionRetentionPolicy, Strict, DUAL_USE),
-    row!(NotificationPolicy, Strict, DUAL_USE),
-    row!(NotificationRetentionPolicy, Strict, DUAL_USE),
+    row!(
+        SessionCapabilities,
+        Scoped,
+        [],
+        Probe::Documents(session_capabilities_bases),
+        DUAL_USE
+    ),
+    row!(
+        SessionRetentionPolicy,
+        Scoped,
+        [],
+        Probe::Documents(session_retention_policy_bases),
+        DUAL_USE
+    ),
+    row!(
+        NotificationPolicy,
+        Scoped,
+        [],
+        Probe::Documents(notification_policy_bases),
+        DUAL_USE
+    ),
+    row!(
+        NotificationRetentionPolicy,
+        Scoped,
+        [],
+        Probe::Documents(notification_retention_policy_bases),
+        DUAL_USE
+    ),
     row!(NotificationKindPolicy, Strict, DUAL_USE),
     // Strict: signed, cross-validated or identity documents.
     row!(HostGovernanceStatus, Strict, SIGNED),
@@ -632,10 +693,14 @@ fn refuses(row: &Row, decode: fn(Value) -> Result<(), String>) -> bool {
 #[test]
 fn every_row_behaves_as_its_class_says() {
     for row in ROWS {
-        let expected = row.class == Class::Strict;
+        let (plain_refuses, tolerant_refuses) = match row.class {
+            Class::Strict => (true, true),
+            Class::Relax | Class::Lenient => (false, false),
+            Class::Scoped => (true, false),
+        };
         assert_eq!(
             refuses(row, row.plain),
-            expected,
+            plain_refuses,
             "{} ({:?}: {}): plain decode",
             row.name,
             row.class,
@@ -643,12 +708,38 @@ fn every_row_behaves_as_its_class_says() {
         );
         assert_eq!(
             refuses(row, row.tolerant),
-            expected,
+            tolerant_refuses,
             "{} ({:?}: {}): tolerant decode",
             row.name,
             row.class,
             row.reason
         );
+    }
+}
+
+#[test]
+fn a_scoped_type_writes_back_the_keys_it_kept() {
+    for row in ROWS.iter().filter(|row| row.class == Class::Scoped) {
+        let Probe::Documents(documents) = row.probe else {
+            panic!("{}: a scoped row needs complete documents", row.name);
+        };
+        for base in documents() {
+            let kept = (row.tolerant_round_trip)(with_probe_key(base.clone()))
+                .unwrap_or_else(|error| panic!("{}: tolerant decode: {error}", row.name));
+            assert_eq!(
+                kept.get(PROBE_KEY),
+                Some(&json!(1)),
+                "{}: the round trip returns the key it decoded",
+                row.name
+            );
+            let untouched = (row.tolerant_round_trip)(base.clone())
+                .unwrap_or_else(|error| panic!("{}: tolerant decode: {error}", row.name));
+            assert!(
+                untouched.get(PROBE_KEY).is_none(),
+                "{}: no key appears from nothing",
+                row.name
+            );
+        }
     }
 }
 
@@ -769,6 +860,36 @@ fn hand_written_refusals(sources: &[Source]) -> Vec<(String, String)> {
     refusals
 }
 
+/// Every `UnknownFields` member: the type that holds it.
+fn unknown_field_owners(sources: &[Source]) -> Vec<(String, String)> {
+    let mut owners = Vec::new();
+    for source in sources {
+        let lines: Vec<&str> = source.code.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.trim_end().ends_with("UnknownFields,") {
+                continue;
+            }
+            let owner = lines[..index]
+                .iter()
+                .rev()
+                .find_map(|candidate| {
+                    let trimmed = candidate.trim_start();
+                    let rest = trimmed.strip_prefix("pub struct ")?;
+                    Some(
+                        rest.chars()
+                            .take_while(|character| {
+                                character.is_alphanumeric() || *character == '_'
+                            })
+                            .collect::<String>(),
+                    )
+                })
+                .unwrap_or_else(|| panic!("{}:{}: no struct above", source.file, index + 1));
+            owners.push((source.file.clone(), owner));
+        }
+    }
+    owners
+}
+
 /// Public `*Params`, `*Result` and `*Event` types that implement `Deserialize`.
 ///
 /// The attributes of an item are every line above it back to the end of the
@@ -848,6 +969,24 @@ fn every_denying_site_and_payload_type_is_in_the_table() {
     assert_eq!(
         found_mirrors, expected_mirrors,
         "every deny_unknown_fields site must be a table row or a named mirror of one"
+    );
+
+    let owners = unknown_field_owners(&sources);
+    for (file, owner) in &owners {
+        let row = table
+            .get(owner.as_str())
+            .unwrap_or_else(|| panic!("{file}: {owner} has an UnknownFields member and no row"));
+        assert_eq!(row.class, Class::Scoped, "{file}: {owner}");
+    }
+    let scoped: BTreeSet<&str> = ROWS
+        .iter()
+        .filter(|row| row.class == Class::Scoped)
+        .map(|row| row.name)
+        .collect();
+    let owning: BTreeSet<&str> = owners.iter().map(|(_, owner)| owner.as_str()).collect();
+    assert_eq!(
+        owning, scoped,
+        "every scoped row needs exactly its UnknownFields member"
     );
 
     for (file, owner) in hand_written_refusals(&sources) {

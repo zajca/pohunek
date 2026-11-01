@@ -105,12 +105,12 @@ impl SessionRegistry {
     /// Returns the current session retention policy.
     #[must_use]
     pub fn retention_policy(&self) -> SessionRetentionPolicy {
-        *self
-            .inner
+        self.inner
             .retention
             .policy
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Loads the durable retention policy into the registry.
@@ -133,7 +133,7 @@ impl SessionRegistry {
             .retention
             .policy
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = policy;
+            .unwrap_or_else(PoisonError::into_inner) = policy.clone();
         Ok(policy)
     }
 
@@ -154,14 +154,15 @@ impl SessionRegistry {
     ) -> Result<SessionRetentionPolicy, ProtocolError> {
         validate_policy(&policy)?;
         if let Some(path) = self.inner.retention.path.clone() {
-            blocking(move || write_policy(&path, &policy)).await?;
+            let persisted = policy.clone();
+            blocking(move || write_policy(&path, &persisted)).await?;
         }
         *self
             .inner
             .retention
             .policy
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = policy;
+            .unwrap_or_else(PoisonError::into_inner) = policy.clone();
         Ok(policy)
     }
 
@@ -906,22 +907,22 @@ mod tests {
         validate_policy(&base).expect("the shipped default policy must validate");
         assert!(validate_policy(&SessionRetentionPolicy {
             sweep_interval_secs: 1,
-            ..base
+            ..base.clone()
         })
         .is_err());
         assert!(validate_policy(&SessionRetentionPolicy {
             terminal_ttl_secs: 0,
-            ..base
+            ..base.clone()
         })
         .is_err());
         assert!(validate_policy(&SessionRetentionPolicy {
             lost_ttl_secs: 0,
-            ..base
+            ..base.clone()
         })
         .is_err());
         assert!(validate_policy(&SessionRetentionPolicy {
             max_removals_per_sweep: 0,
-            ..base
+            ..base.clone()
         })
         .is_err());
     }
@@ -947,6 +948,7 @@ mod tests {
             terminal_ttl_secs: 7_200,
             lost_ttl_secs: 14_400,
             max_removals_per_sweep: 3,
+            ..Default::default()
         };
 
         write_policy(&path, &stored).expect("write policy");

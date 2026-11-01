@@ -1716,20 +1716,24 @@ async fn assert_unavailable_journal_refuses_recovery(
 
 #[tokio::test]
 async fn claude_corrupt_exact_generation_journal_refuses_resume_and_fork() {
-    assert_unavailable_journal_refuses_recovery("claude-corrupt-recovery-journal", |_original| {
-        b"{ invalid journal".to_vec()
-    })
+    Box::pin(assert_unavailable_journal_refuses_recovery(
+        "claude-corrupt-recovery-journal",
+        |_original| b"{ invalid journal".to_vec(),
+    ))
     .await;
 }
 
 #[tokio::test]
 async fn claude_mismatched_generation_instance_refuses_resume_and_fork() {
-    assert_unavailable_journal_refuses_recovery("claude-mismatched-recovery-journal", |original| {
-        let mut journal: serde_json::Value =
-            serde_json::from_slice(original).expect("real worker journal decodes");
-        journal["runtime_id"] = serde_json::json!("different-worker-instance");
-        serde_json::to_vec(&journal).expect("mismatched journal serializes")
-    })
+    Box::pin(assert_unavailable_journal_refuses_recovery(
+        "claude-mismatched-recovery-journal",
+        |original| {
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(original).expect("real worker journal decodes");
+            journal["runtime_id"] = serde_json::json!("different-worker-instance");
+            serde_json::to_vec(&journal).expect("mismatched journal serializes")
+        },
+    ))
     .await;
 }
 

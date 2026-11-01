@@ -306,8 +306,12 @@ where the containing contract is explicitly open. New methods and error codes
 are additive; older daemons return `daemon/method_not_found` for unknown
 methods. Optional fields retain their documented omission behavior. Envelope,
 observation, native-report, capability, and notification-policy objects are
-strict and reject unknown fields, so changing their accepted shape requires the
-appropriate negotiated-version treatment. `RuntimeRef` values and provider-policy map
+strict: the daemon rejects unknown fields in them. A client keeps the unknown
+keys of the session capabilities, the session retention policy and the
+notification policy (with its `retention`) it reads, and sends the policies
+back; the per-kind notification flags stay strict for the client too.
+Changing their accepted shape requires the appropriate negotiated-version
+treatment. `RuntimeRef` values and provider-policy map
 keys are deliberately open value namespaces, not open object shapes.
 
 Non-additive wire changes require a protocol version bump. Examples: changing a

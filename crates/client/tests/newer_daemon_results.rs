@@ -375,3 +375,27 @@ async fn a_session_output_result_with_unknown_keys_in_the_result_and_the_gap_dec
 
     assert!(decoded.gap().is_some(), "the gap is kept");
 }
+
+#[tokio::test]
+async fn a_session_list_with_an_unknown_capability_key_lists_every_session() {
+    let mut newer = session_info();
+    newer["capabilities"][UNKNOWN_KEY] = json!(true);
+    let mut plain = session_info();
+    plain["id"] = json!("s-2");
+    let script = script(&[(
+        protocol::method::SESSION_LIST,
+        Outcome::Ok(json!([newer, plain])),
+    )]);
+    let (mut client, _daemon, _env) = connect(script, false).await;
+
+    let sessions = client
+        .call::<protocol::method::SessionList>(protocol::SessionListParams::default())
+        .await
+        .expect("the list decodes");
+
+    let ids: Vec<&str> = sessions
+        .iter()
+        .map(|session| session.id.0.as_str())
+        .collect();
+    assert_eq!(ids, ["s-1", "s-2"]);
+}

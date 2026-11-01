@@ -1,21 +1,24 @@
-//! Client-side tolerant decoding of enums a newer daemon may extend.
+//! Client-side tolerant decoding of enums and dual-use types a newer daemon may
+//! extend.
 //!
-//! Plain `serde_json::from_*` is strict everywhere: an enum value the decoding
-//! build does not know is an error. That is what the daemon wants for client
+//! Plain `serde_json::from_*` is strict everywhere: an enum value or an object
+//! key the decoding build does not know is an error. That is what the daemon wants for client
 //! params, the session store, the notification store and governance state.
 //! The client decodes daemon responses and events through [`from_value`],
 //! [`from_str`] and [`from_slice`] instead. Inside one of those calls an enum
 //! that opted in (see [`tolerant_enum!`](crate::tolerant_enum)) maps an unknown
-//! string to its hidden `Unknown` variant; every other decode error is still an
-//! error.
+//! string to its hidden `Unknown` variant, and a type with an [`UnknownFields`]
+//! member keeps an unknown key; every other decode error is still an error.
 //!
 //! The mode is a thread-local flag that is set only for the duration of one
 //! synchronous decode call and restored on exit, including on unwind. It is
 //! never a guard object a caller could hold across an `.await`.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
@@ -47,12 +50,14 @@ pub fn is_active() -> bool {
     ACTIVE.get()
 }
 
-/// Decodes `value` with unknown values of tolerant enums mapped to `Unknown`.
+/// Decodes `value` with unknown values of tolerant enums mapped to `Unknown` and
+/// the unknown keys of [`UnknownFields`] members kept.
 ///
 /// # Errors
 ///
 /// Returns the `serde_json` error when `value` does not match `T` for any
-/// reason other than an unknown value of a tolerant enum.
+/// reason other than an unknown value of a tolerant enum or an unknown key of an
+/// [`UnknownFields`] member.
 pub fn from_value<T: DeserializeOwned>(value: serde_json::Value) -> serde_json::Result<T> {
     let _scope = Scope::enter();
     serde_json::from_value(value)
@@ -63,7 +68,8 @@ pub fn from_value<T: DeserializeOwned>(value: serde_json::Value) -> serde_json::
 /// # Errors
 ///
 /// Returns the `serde_json` error when `text` is not valid JSON or does not
-/// match `T` for any reason other than an unknown value of a tolerant enum.
+/// match `T` for any reason other than an unknown value of a tolerant enum or an
+/// unknown key of an [`UnknownFields`] member.
 pub fn from_str<T: DeserializeOwned>(text: &str) -> serde_json::Result<T> {
     let _scope = Scope::enter();
     serde_json::from_str(text)
@@ -74,7 +80,8 @@ pub fn from_str<T: DeserializeOwned>(text: &str) -> serde_json::Result<T> {
 /// # Errors
 ///
 /// Returns the `serde_json` error when `bytes` is not valid JSON or does not
-/// match `T` for any reason other than an unknown value of a tolerant enum.
+/// match `T` for any reason other than an unknown value of a tolerant enum or an
+/// unknown key of an [`UnknownFields`] member.
 pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
     let _scope = Scope::enter();
     serde_json::from_slice(bytes)
@@ -147,4 +154,53 @@ macro_rules! tolerant_enum {
             }
         }
     };
+}
+
+/// The keys of a dual-use protocol type that this build does not know.
+///
+/// A type that a client reads from the daemon and the daemon also persists or
+/// accepts as params carries this as its one `#[serde(flatten)]` member. A
+/// plain decode (the daemon's) refuses a non-empty key set, so the type is as
+/// strict as `deny_unknown_fields` there. A decode inside [`from_value`],
+/// [`from_str`] or [`from_slice`] keeps the keys and serialization writes them
+/// back, so a client that reads such a document, changes one value and sends
+/// it on returns every key it decoded. An empty set serializes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnknownFields(BTreeMap<String, serde_json::Value>);
+
+impl UnknownFields {
+    /// Whether no unknown key was kept.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The kept keys, in key order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+}
+
+impl Serialize for UnknownFields {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_map(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnknownFields {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let keys = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        if !is_active() {
+            if let Some(key) = keys.keys().next() {
+                return Err(D::Error::custom(format!("unknown field `{key}`")));
+            }
+        }
+        Ok(Self(keys))
+    }
 }

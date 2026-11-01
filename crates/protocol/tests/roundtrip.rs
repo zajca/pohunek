@@ -223,6 +223,7 @@ fn notification_policy() -> NotificationPolicy {
             ),
         ]),
         retention: protocol::NotificationRetentionPolicy::default(),
+        unknown_fields: protocol::tolerant::UnknownFields::default(),
     }
 }
 

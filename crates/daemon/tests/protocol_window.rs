@@ -1484,6 +1484,10 @@ fn nested_runtime(with_unknown_key: bool) -> Value {
 /// unknown keys applies to what a client decodes, never to what the daemon
 /// decodes.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of every strict params type, each row sending its own refused request"
+)]
 async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
     let daemon = Daemon::start("window-params-unknown-key").await;
     let mut client = daemon.connect().await;
@@ -1513,6 +1517,48 @@ async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
                 "states": ["running"],
                 "timeout_ms": 1000,
             }),
+        ),
+        (
+            "notification-policy-extra",
+            method::NOTIFICATION_POLICY_SET,
+            json!({"policy": {
+                "attention_dedupe_window_secs": 90,
+                "enabled": {
+                    "agent_blocked": true, "approval_required": true,
+                    "turn_completed": true, "session_finished": true,
+                    "error": true, "system": true,
+                },
+                "key_from_a_newer_client": 1,
+            }}),
+        ),
+        (
+            "notification-retention-extra",
+            method::NOTIFICATION_POLICY_SET,
+            json!({"policy": {
+                "attention_dedupe_window_secs": 90,
+                "enabled": {
+                    "agent_blocked": true, "approval_required": true,
+                    "turn_completed": true, "session_finished": true,
+                    "error": true, "system": true,
+                },
+                "retention": {
+                    "sweep_interval_secs": 60, "info_ttl_secs": 1,
+                    "warning_ttl_secs": 1, "resolved_attention_ttl_secs": 1,
+                    "resolved_error_ttl_secs": 1, "archived_ttl_secs": 1,
+                    "compaction_min_actions": 1,
+                    "key_from_a_newer_client": 1,
+                },
+            }}),
+        ),
+        (
+            "session-policy-extra",
+            method::SESSION_POLICY_SET,
+            json!({"retention": {
+                "enabled": true, "sweep_interval_secs": 3600,
+                "terminal_ttl_secs": 3600, "lost_ttl_secs": 3600,
+                "max_removals_per_sweep": 5,
+                "key_from_a_newer_client": 1,
+            }}),
         ),
         (
             "command-extra",

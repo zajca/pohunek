@@ -8256,6 +8256,7 @@ fn create_intent_record(
             fork: native
                 .as_ref()
                 .is_some_and(NativeSessionLaunch::supports_fork),
+            ..protocol::SessionCapabilities::default()
         },
         name: validate_session_name(params.name.as_deref())?,
         agent: resolved.name.clone(),

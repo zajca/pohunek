@@ -920,6 +920,7 @@ impl Fixture {
             capabilities: SessionCapabilities {
                 resume: true,
                 fork: true,
+                ..Default::default()
             },
             name: Some("systemd durability e2e".to_owned()),
             agent: "claude".to_owned(),

@@ -2028,6 +2028,7 @@ fn apply_policy_args(current: SessionRetentionPolicy, args: PolicyArgs) -> Sessi
         max_removals_per_sweep: args
             .max_removals_per_sweep
             .unwrap_or(current.max_removals_per_sweep),
+        unknown_fields: current.unknown_fields,
     }
 }
 

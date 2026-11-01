@@ -120,6 +120,8 @@ fn assert_every_field_is_reviewed(record: &NotificationRecord, policy: &Notifica
                 system: _,
             },
         providers: _,
+        // Serializes no key while empty, so the document keeps its format-1 keys.
+        unknown_fields: _,
         retention:
             NotificationRetentionPolicy {
                 sweep_interval_secs: _,
@@ -129,6 +131,7 @@ fn assert_every_field_is_reviewed(record: &NotificationRecord, policy: &Notifica
                 resolved_error_ttl_secs: _,
                 archived_ttl_secs: _,
                 compaction_min_actions: _,
+                unknown_fields: _,
             },
     } = policy;
 }

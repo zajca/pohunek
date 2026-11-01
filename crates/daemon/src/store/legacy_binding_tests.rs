@@ -148,7 +148,8 @@ fn the_v0_33_0_fixture_binding_maps_to_a_native_launch() {
         sessions[0].info.capabilities,
         SessionCapabilities {
             resume: true,
-            fork: true
+            fork: true,
+            ..Default::default()
         },
         "the frozen capabilities follow the mapped launch spec"
     );
@@ -320,7 +321,8 @@ fn the_v0_33_1_damaged_fixture_binding_is_repaired_for_a_built_in_agent() {
         sessions[0].info.capabilities,
         SessionCapabilities {
             resume: true,
-            fork: true
+            fork: true,
+            ..Default::default()
         }
     );
 }
@@ -365,7 +367,8 @@ fn damaged_codex_and_hermes_bindings_are_repaired_without_fork() {
             sessions[0].info.capabilities,
             SessionCapabilities {
                 resume: true,
-                fork: false
+                fork: false,
+                ..Default::default()
             },
             "{agent}"
         );
@@ -390,7 +393,8 @@ fn a_damaged_profile_binding_is_marked_for_repair_through_the_registry() {
         sessions[0].info.capabilities,
         SessionCapabilities {
             resume: false,
-            fork: false
+            fork: false,
+            ..Default::default()
         },
         "capabilities are decided when the spec is resolved"
     );

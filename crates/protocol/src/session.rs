@@ -2764,15 +2764,19 @@ where
 /// provider behavior from [`SessionInfo::agent`] or [`SessionInfo::agent_base`].
 /// A daemon loading a record that predates this field defaults both flags to
 /// false, preserving the fail-closed persistence contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionCapabilities.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionCapabilities {
     /// Whether the session has a frozen native resume operation.
     pub resume: bool,
     /// Whether the session has a frozen native fork operation.
     pub fork: bool,
+    /// Keys of a newer daemon this build does not know; refused outside
+    /// `protocol::tolerant`.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub unknown_fields: crate::tolerant::UnknownFields,
 }
 
 /// Typed reasons the session's recovery resolution refuses an operation its
@@ -3354,10 +3358,9 @@ const DEFAULT_SESSION_MAX_REMOVALS_PER_SWEEP: u32 = 25;
 /// therefore opt-in via [`Self::enabled`], and the shipped TTLs are generous so
 /// that turning them on cannot surprise an operator who still has a stale
 /// session parked on a review worktree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionPolicy.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct SessionRetentionPolicy {
     /// Whether the daemon performs automatic retention sweeps.
     ///
@@ -3377,6 +3380,11 @@ pub struct SessionRetentionPolicy {
     pub lost_ttl_secs: u32,
     /// Upper bound on sessions removed by one sweep.
     pub max_removals_per_sweep: u32,
+    /// Keys of a newer daemon this build does not know; refused outside
+    /// `protocol::tolerant`.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub unknown_fields: crate::tolerant::UnknownFields,
 }
 
 impl Default for SessionRetentionPolicy {
@@ -3387,6 +3395,7 @@ impl Default for SessionRetentionPolicy {
             terminal_ttl_secs: DEFAULT_SESSION_TERMINAL_TTL_SECS,
             lost_ttl_secs: DEFAULT_SESSION_LOST_TTL_SECS,
             max_removals_per_sweep: DEFAULT_SESSION_MAX_REMOVALS_PER_SWEEP,
+            unknown_fields: crate::tolerant::UnknownFields::default(),
         }
     }
 }
@@ -3552,7 +3561,7 @@ pub struct SessionRetentionResult {
 }
 
 /// Parameters for `session.policy.set`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyParams.ts"))]
 #[serde(deny_unknown_fields)]
@@ -3562,7 +3571,7 @@ pub struct SessionPolicyParams {
 }
 
 /// Result returned by `session.policy.get` and `session.policy.set`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyResult.ts"))]
 pub struct SessionPolicyResult {

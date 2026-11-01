@@ -769,6 +769,7 @@ impl SessionRegistry {
                 .native
                 .as_ref()
                 .is_some_and(NativeSessionLaunch::supports_fork),
+            ..protocol::SessionCapabilities::default()
         };
         let carried_native_report = match &registration {
             PtyRegistration::Create => None,
@@ -843,7 +844,7 @@ impl SessionRegistry {
         let preparing_info = SessionInfo {
             id: id.clone(),
             external: Some(false),
-            capabilities,
+            capabilities: capabilities.clone(),
             name: name.clone(),
             agent: agent.clone(),
             agent_base: agent_base.clone(),

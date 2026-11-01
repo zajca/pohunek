@@ -500,7 +500,6 @@ const DEFAULT_COMPACTION_MIN_ACTIONS: u32 = 1_000;
     feature = "ts",
     ts(export, export_to = "NotificationRetentionPolicy.ts")
 )]
-#[serde(deny_unknown_fields)]
 pub struct NotificationRetentionPolicy {
     /// Interval between daemon-owned retention sweeps.
     pub sweep_interval_secs: u32,
@@ -516,6 +515,11 @@ pub struct NotificationRetentionPolicy {
     pub archived_ttl_secs: u32,
     /// Minimum action-log entries before a retention sweep may compact it.
     pub compaction_min_actions: u32,
+    /// Keys of a newer daemon this build does not know; refused outside
+    /// `protocol::tolerant`.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub unknown_fields: crate::tolerant::UnknownFields,
 }
 
 impl Default for NotificationRetentionPolicy {
@@ -528,6 +532,7 @@ impl Default for NotificationRetentionPolicy {
             resolved_error_ttl_secs: DEFAULT_RESOLVED_ERROR_TTL_SECS,
             archived_ttl_secs: DEFAULT_ARCHIVED_TTL_SECS,
             compaction_min_actions: DEFAULT_COMPACTION_MIN_ACTIONS,
+            unknown_fields: crate::tolerant::UnknownFields::default(),
         }
     }
 }
@@ -536,7 +541,6 @@ impl Default for NotificationRetentionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicy.ts"))]
-#[serde(deny_unknown_fields)]
 pub struct NotificationPolicy {
     /// Dedupe window for equivalent attention events.
     pub attention_dedupe_window_secs: u32,
@@ -564,6 +568,11 @@ pub struct NotificationPolicy {
     /// are retained regardless of these age limits.
     #[serde(default)]
     pub retention: NotificationRetentionPolicy,
+    /// Keys of a newer daemon this build does not know; refused outside
+    /// `protocol::tolerant`.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub unknown_fields: crate::tolerant::UnknownFields,
 }
 
 impl NotificationPolicy {
