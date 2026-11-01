@@ -87,10 +87,13 @@ the CLI. The daemon repeats that authoritative denial and also denies `session.r
 `session.report_native_id` may target the origin, and only for lifecycle
 reporting.
 
-Hooks use a short local socket deadline, prefer worker-private identity reports,
-and fall back to the hardened public native-ID report. They never start a
-subprocess, use a network, or access a Hermes database. Hook failures are
-swallowed and counted; process/screen detection remains available. Do not treat
+Hooks use a short local socket deadline that bounds the agent's turn, not the
+outcome of a report. Identity goes to the session worker only, with no public
+native-ID fallback; a report the worker received is applied whether or not its
+reply arrives in time, and a missing reply is not counted as a failure. They
+never start a subprocess, use a network, or access a Hermes database. Hook
+failures other than that are swallowed and counted; process/screen detection
+remains available. Do not treat
 `on_session_end` as a process exit.
 
 ## Doctor-led recovery

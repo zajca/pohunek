@@ -26,7 +26,6 @@ _PROVIDER_LABELS = {
     "shell": "Shell",
 }
 _PUBLIC_METHODS = frozenset((
-    "session.report_native_id",
     "session.report_agent",
     "notification.create",
     "session.release_agent",

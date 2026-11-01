@@ -8451,21 +8451,40 @@ mod tests {
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
 
-        // The reporter has closed its end of the connection before the report
-        // runs, so the reply cannot be delivered.
+        // A durable write in flight under the state lock delays the report
+        // while the reporter closes its end of the connection.
+        let held = server.shared.state.lock().await;
         let (reporter_end, mut worker_end) = tokio::io::duplex(1);
-        drop(reporter_end);
-        let reply = super::serve_identity_hook_with_probe(
+        let mut writer = super::ControlWriter::new(&mut worker_end);
+        let peer = subject_peer(&pty);
+        let mut serving = std::pin::pin!(super::serve_identity_hook_with_probe(
             std::sync::Arc::clone(&server.shared),
-            &mut super::ControlWriter::new(&mut worker_end),
+            &mut writer,
             launch_report(&pty, 1, "ref-late-reply"),
-            &subject_peer(&pty),
+            &peer,
             |_| Ok(true),
-        )
-        .await;
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut serving => panic!("the report cannot be served while the state lock is held"),
+            () = std::future::ready(()) => {}
+        }
+        drop(reporter_end);
+        drop(held);
+        let reply = serving.await;
         assert!(reply.is_err(), "the reply to a closed connection fails");
         drop(guard);
 
+        let state_identity = server
+            .shared
+            .state
+            .lock()
+            .await
+            .journal
+            .active_identity
+            .as_ref()
+            .and_then(|active| active.native_reference.clone());
+        assert_eq!(state_identity.as_deref(), Some("ref-late-reply"));
         let committed = server.shared.journal.load().expect("journal on disk");
         assert_eq!(
             committed

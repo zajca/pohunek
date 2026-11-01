@@ -2158,6 +2158,7 @@ mod subagent_sequences {
     async fn a_trace_in_a_directory_of_another_owner_gets_no_start_marker() {
         // The scenario needs a directory the user does not own, which only a
         // shared directory of the host provides.
+        // hermetic-allowed: #1818 the scenario needs a directory of another owner
         let shared = std::fs::metadata("/dev/shm");
         let foreign = shared.as_ref().is_ok_and(|metadata| {
             std::os::unix::fs::MetadataExt::uid(metadata) != rustix::process::geteuid().as_raw()
