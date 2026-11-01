@@ -35,12 +35,12 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// Number of `SIGKILL` passes sent to a process group.
 ///
-/// A second pass reaches a child that was forked while the first one walked the
-/// group; a process that is already dying cannot fork again, so a third pass
-/// covers the one that the second raced. The supervisor stays unreaped while
-/// the passes run, which keeps its pid, the group id, from being reused. Its
-/// zombie also keeps the group non-empty, so the passes are counted rather than
-/// repeated until the group is gone.
+/// A later pass reaches a child whose fork was still joining the group while an
+/// earlier pass walked it. The passes narrow that window without closing it: a
+/// fork that races every pass still escapes. The supervisor stays unreaped
+/// while the passes run, which keeps its pid, the group id, from being reused.
+/// Its zombie also keeps the group non-empty, so the passes are counted rather
+/// than repeated until the group is gone.
 const KILL_PASSES: u32 = 3;
 
 /// Size of one read from a command's output pipe.
