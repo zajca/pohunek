@@ -250,7 +250,7 @@ enum Commands {
     },
 
     /// Launch the universal assistant: one capable agent session with a
-    /// materialized knowledge bundle and a redacted live snapshot.
+    /// materialized knowledge bundle and a launch snapshot.
     ///
     /// With no subcommand the intent defaults to `help`; the intent wrappers
     /// (`setup`/`project`/`update`/`debug`/`help`) only steer navigation.
@@ -321,7 +321,8 @@ struct AssistantArgs {
     /// Print the exact navigational prompt and resolved paths, then exit.
     #[arg(long)]
     print_prompt: bool,
-    /// Skip live-state snapshot collection (privacy/speed).
+    /// Mark the launch snapshot as not collected; it still holds the launch
+    /// metadata and the request.
     #[arg(long)]
     no_snapshot: bool,
     /// Launch without a readable knowledge bundle (snapshot + source map only).

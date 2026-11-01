@@ -12,7 +12,8 @@ intents: [setup, project, update, debug, help]
 Status: the reduced relay foundation is implemented. It has PostgreSQL-backed
 lease fencing and recovery, protected stopped-lifecycle initial Owner and
 service-account provisioning, generic OIDC browser and device login, bounded
-HTTPS account and credential lifecycle, provider-neutral account linking, and a
+HTTPS account and credential lifecycle, provider-neutral account linking,
+Google and GitHub team admission with bounded revalidation, and a
 native HTTPS/keyring CLI. It has no host link, team client or WebUI, routing,
 attach path, host enrollment, or complete team-administration API. Current
 Pohunek releases otherwise use public protocol v4 through an owner-only Unix
@@ -82,11 +83,10 @@ OS-keyring storage. Credentials expire, are delivered once, and are never put in
 URLs, routine output, or logs. A keyring write failure attempts compensating
 revocation.
 
-This generic OIDC implementation contains no Keycloak-specific provider or
-social-account verification. Complete team administration is deferred to
-[#108](https://github.com/zajca/pohunek/issues/108) and Keycloak-brokered
-Google/GitHub verification to
-[#92](https://github.com/zajca/pohunek/issues/92).
+The OIDC login itself is provider-neutral; Keycloak-brokered Google and GitHub
+team admission with bounded external-eligibility revalidation was delivered by
+[#92](https://github.com/zajca/pohunek/issues/92). Complete team administration
+is deferred to [#108](https://github.com/zajca/pohunek/issues/108).
 
 ## Account linking
 
@@ -269,10 +269,10 @@ sections; use the
 umbrella is [#56](https://github.com/zajca/pohunek/issues/56); implementation is
 split among completed host identity [#81](https://github.com/zajca/pohunek/issues/81),
 the reduced relay foundation [#85](https://github.com/zajca/pohunek/issues/85),
-account linking [#107](https://github.com/zajca/pohunek/issues/107), team
-administration [#108](https://github.com/zajca/pohunek/issues/108), verified
+account linking [#107](https://github.com/zajca/pohunek/issues/107), verified
 Keycloak-brokered external evidence [#92](https://github.com/zajca/pohunek/issues/92),
-then transport [#72](https://github.com/zajca/pohunek/issues/72), protocol v4
+team administration [#108](https://github.com/zajca/pohunek/issues/108), then
+transport [#72](https://github.com/zajca/pohunek/issues/72), protocol v4
 [#70](https://github.com/zajca/pohunek/issues/70), shares
 [#82](https://github.com/zajca/pohunek/issues/82), session authorization
 [#83](https://github.com/zajca/pohunek/issues/83), synchronization

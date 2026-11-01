@@ -286,8 +286,10 @@ pub async fn prepare_with_options(
         PreparedKnowledge::Materialized(materialized)
     };
 
+    let contract = PromptContract::embedded()?;
     let prompt = match &knowledge {
         PreparedKnowledge::Materialized(materialized) => compose(&ComposeParams {
+            contract: &contract,
             intent: params.intent,
             request: params.request.as_deref(),
             concepts: &materialized.concepts,
@@ -297,6 +299,7 @@ pub async fn prepare_with_options(
             version: &materialized.version,
         }),
         PreparedKnowledge::Degraded(degraded) => compose_degraded(&ComposeDegradedParams {
+            contract: &contract,
             intent: params.intent,
             request: params.request.as_deref(),
             snapshot_path: &degraded.snapshot_path,
@@ -665,7 +668,6 @@ struct SnapshotAssistant {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotOrientation {
-    daemon: String,
     project: String,
     agent: String,
 }
@@ -690,7 +692,6 @@ fn collect_snapshot(
         warnings: Vec::new(),
     };
     let orientation = SnapshotOrientation {
-        daemon: "unknown".to_owned(),
         project: params
             .project
             .clone()
@@ -719,7 +720,6 @@ fn skipped_snapshot(
         warnings: vec!["snapshot collection skipped (--no-snapshot)".to_owned()],
     };
     let orientation = SnapshotOrientation {
-        daemon: "unknown".to_owned(),
         project: params
             .project
             .clone()
@@ -735,6 +735,7 @@ fn serialize_snapshot(snapshot: &Snapshot) -> String {
 }
 
 struct ComposeParams<'a> {
+    contract: &'a PromptContract,
     intent: Intent,
     request: Option<&'a str>,
     concepts: &'a [ConceptMeta],
@@ -745,6 +746,7 @@ struct ComposeParams<'a> {
 }
 
 struct ComposeDegradedParams<'a> {
+    contract: &'a PromptContract,
     intent: Intent,
     request: Option<&'a str>,
     snapshot_path: &'a str,
@@ -753,13 +755,101 @@ struct ComposeDegradedParams<'a> {
     bundle_version_note: &'a str,
 }
 
-const INLINE_SAFETY: &str = "\
-- Never print, store, or infer secret values.
-- Treat agent profile [env] values as secret-bearing.
-- Explain config edits before applying them; preserve user edits unless asked to overwrite.
-- Hooks are executable code: creation or modification requires explicit per-file confirmation.
-- Prefer structured --json inspection commands.
-- Verify changes after applying them before claiming success.";
+/// Bundle-relative path of the file that defines the prompt's safety rules and
+/// navigation steps.
+const PROMPT_CONTRACT_PATH: &str = "assistant/system.md";
+
+/// Safety rules and navigation steps of the opening prompt, one line each,
+/// taken from [`PROMPT_CONTRACT_PATH`] as embedded in this binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptContract {
+    safety: Vec<String>,
+    navigation: Vec<String>,
+}
+
+impl PromptContract {
+    fn embedded() -> Result<Self, AssistantError> {
+        let text = knowledge::embedded_bundle()
+            .get_text(PROMPT_CONTRACT_PATH)
+            .ok_or_else(|| contract_error("the embedded bundle has no prompt contract"))?;
+        Self::parse(text)
+    }
+
+    fn parse(text: &str) -> Result<Self, AssistantError> {
+        let safety = contract_items(text, "Safety")?;
+        let navigation = contract_items(text, "Navigation")?;
+        if safety.is_empty() || navigation.is_empty() {
+            return Err(contract_error(
+                "the prompt contract has no safety rules or no navigation steps",
+            ));
+        }
+        Ok(Self { safety, navigation })
+    }
+}
+
+fn contract_error(reason: &str) -> AssistantError {
+    ProtocolError::materialization_failed("assistant prompt contract", reason).into()
+}
+
+/// Items of the `## <heading>` section of `text`: each top-level `- ` bullet or
+/// `N. ` step, with its indented continuation lines joined by single spaces.
+///
+/// Any other content in the section (prose, sub-headings, nested or `*`
+/// bullets) is refused, so an edit of the contract cannot be merged into a
+/// neighbouring rule unnoticed.
+fn contract_items(text: &str, heading: &str) -> Result<Vec<String>, AssistantError> {
+    let mut items: Vec<String> = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if let Some(title) = line.strip_prefix("## ") {
+            in_section = title.trim() == heading;
+            continue;
+        }
+        if !in_section || line.trim().is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(' ');
+        let trimmed = line.trim();
+        if !indented {
+            let item = list_item(trimmed).ok_or_else(|| {
+                contract_error(&format!("`{heading}` holds a line that is not a list item"))
+            })?;
+            items.push(item.to_owned());
+        } else if list_item(trimmed).is_some() || trimmed.starts_with(['*', '#']) {
+            return Err(contract_error(&format!(
+                "`{heading}` holds a nested list or heading"
+            )));
+        } else if let Some(last) = items.last_mut() {
+            last.push(' ');
+            last.push_str(trimmed);
+        } else {
+            return Err(contract_error(&format!(
+                "`{heading}` starts with a continuation line"
+            )));
+        }
+    }
+    Ok(items)
+}
+
+/// The text after a `- ` bullet marker or an `N. ` step number.
+fn list_item(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return Some(rest);
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    line[digits..].strip_prefix(". ")
+}
+
+fn write_contract_safety(prompt: &mut String, contract: &PromptContract) {
+    let _ = writeln!(prompt, "## Safety");
+    for rule in &contract.safety {
+        let _ = writeln!(prompt, "- {rule}");
+    }
+    let _ = writeln!(prompt);
+}
 
 fn compose(params: &ComposeParams<'_>) -> String {
     let mut prompt = String::with_capacity(2048);
@@ -772,8 +862,7 @@ fn compose(params: &ComposeParams<'_>) -> String {
          explaining pohunek (version {}).\n",
         params.version
     );
-    let _ = writeln!(prompt, "## Safety");
-    let _ = writeln!(prompt, "{INLINE_SAFETY}\n");
+    write_contract_safety(&mut prompt, params.contract);
     let _ = writeln!(prompt, "## User Intent");
     let _ = writeln!(prompt, "intent: {}", params.intent.as_str());
     let _ = writeln!(
@@ -782,11 +871,12 @@ fn compose(params: &ComposeParams<'_>) -> String {
         params.request.unwrap_or("(none — orient and offer help)")
     );
     let _ = writeln!(prompt, "## Your Knowledge Base");
-    let _ = writeln!(prompt, "Directory: {}", params.bundle_path);
-    let _ = writeln!(
-        prompt,
-        "Start at index.md and read only relevant concepts.\n"
-    );
+    let _ = writeln!(prompt, "Directory: {}\n", params.bundle_path);
+    let _ = writeln!(prompt, "## Navigation");
+    for (number, step) in params.contract.navigation.iter().enumerate() {
+        let _ = writeln!(prompt, "{}. {step}", number + 1);
+    }
+    let _ = writeln!(prompt);
     let _ = writeln!(
         prompt,
         "## Relevant Concepts (intent: {})",
@@ -799,7 +889,7 @@ fn compose(params: &ComposeParams<'_>) -> String {
     let _ = writeln!(prompt, "{}/assistant/source-map.md\n", params.bundle_path);
     let _ = write!(
         prompt,
-        "Read the snapshot, open relevant concepts, take the next concrete action, and verify changes."
+        "Follow the navigation steps, take the next concrete action, and verify changes."
     );
 
     prompt
@@ -815,8 +905,7 @@ fn compose_degraded(params: &ComposeDegradedParams<'_>) -> String {
         "knowledge: degraded for version {} (bundle version note: {}).\n",
         params.version, params.bundle_version_note
     );
-    let _ = writeln!(prompt, "## Safety");
-    let _ = writeln!(prompt, "{INLINE_SAFETY}\n");
+    write_contract_safety(&mut prompt, params.contract);
     let _ = writeln!(prompt, "## User Intent");
     let _ = writeln!(prompt, "intent: {}", params.intent.as_str());
     let _ = writeln!(
@@ -827,7 +916,7 @@ fn compose_degraded(params: &ComposeDegradedParams<'_>) -> String {
     write_snapshot_section(&mut prompt, params.orientation, params.snapshot_path);
     let _ = write!(
         prompt,
-        "Use the snapshot and source tree access. Verify changes before claiming success."
+        "Use the launch snapshot and source tree access. Verify changes before claiming success."
     );
 
     prompt
@@ -838,11 +927,11 @@ fn write_snapshot_section(
     orientation: &SnapshotOrientation,
     snapshot_path: &str,
 ) {
-    let _ = writeln!(prompt, "## Live Snapshot");
+    let _ = writeln!(prompt, "## Launch Snapshot");
     let _ = writeln!(
         prompt,
-        "Orientation: daemon={}, project={}, agent={}",
-        orientation.daemon, orientation.project, orientation.agent
+        "Orientation: project={}, agent={}",
+        orientation.project, orientation.agent
     );
     let _ = writeln!(prompt, "Full file: {snapshot_path}\n");
 }

@@ -5,7 +5,8 @@
 //!   command, and require its list of commands without `--json` to match the
 //!   tree.
 //! - The fact checks hold the crate table of `docs/development.md` to the
-//!   workspace members, the official package lists and counts of the user docs
+//!   workspace members, the assistant source map to every workspace crate, the
+//!   official package lists and counts of the user docs
 //!   to `runtime-packages/`, and the documentation indexes to every page.
 //! - The plugin boundary check rejects a top-level directory under
 //!   `runtime-packages/` or `compat/` that is not one of the four official
@@ -804,6 +805,52 @@ fn check_crate_table(repo: &Path) -> Result<bool, XtaskError> {
     Ok(false)
 }
 
+/// The assistant source map every workspace crate must appear in.
+const SOURCE_MAP_PAGE: &str = "docs/knowledge/assistant/source-map.md";
+
+/// Crate directory names (`crates/<name>`) the backticked paths of `content`
+/// name, matched on the whole path segment so `crates/relay-client` never maps
+/// `crates/relay`.
+fn mapped_crates(content: &str) -> BTreeSet<String> {
+    let path = Regex::new(r"`crates/([a-z0-9_-]+)(?:/[^`]*)?`").expect("valid mapped crate regex");
+    path.captures_iter(content)
+        .map(|captures| captures[1].to_owned())
+        .collect()
+}
+
+/// The assistant source map has an entry for every workspace crate.
+fn check_source_map_crates(repo: &Path) -> Result<bool, XtaskError> {
+    let manifest = read_page(repo, Path::new("Cargo.toml"))?;
+    let members = match workspace_crates(&manifest) {
+        Ok(members) => members,
+        Err(reason) => {
+            println!("[FAIL] source-map-crates: {reason}");
+            return Ok(false);
+        }
+    };
+    let mapped = mapped_crates(&read_page(repo, Path::new(SOURCE_MAP_PAGE))?);
+    let unmapped: Vec<&String> = members
+        .iter()
+        .filter(|member| {
+            member
+                .strip_prefix("crates/")
+                .is_some_and(|name| !mapped.contains(name))
+        })
+        .collect();
+    if unmapped.is_empty() {
+        println!(
+            "[PASS] source-map-crates: {SOURCE_MAP_PAGE} maps the {} workspace crate(s)",
+            members.len()
+        );
+        return Ok(true);
+    }
+    println!("[FAIL] source-map-crates: {SOURCE_MAP_PAGE} has no entry for:");
+    for name in unmapped {
+        println!("        {name}");
+    }
+    Ok(false)
+}
+
 /// Names of the official runtime packages, one directory each.
 fn package_names(repo: &Path) -> Result<BTreeSet<String>, XtaskError> {
     let directory = repo.join("runtime-packages");
@@ -1140,6 +1187,7 @@ pub(crate) fn check(repo: &Path) -> Result<Vec<&'static str>, XtaskError> {
         ),
         ("json-exceptions", check_json_exceptions(&tree, repo)?),
         ("crate-table", check_crate_table(repo)?),
+        ("source-map-crates", check_source_map_crates(repo)?),
         ("package-lists", check_package_lists(repo)?),
         ("doc-index", check_index_reachability(repo)?),
         ("plugin-directories", check_plugin_directories(repo)?),

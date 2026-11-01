@@ -140,8 +140,8 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   reads, no network access; `--host` is accepted and ignored.
 - **Universal assistant**: `pohunek assistant "how do I …"` launches a capable
   agent session preloaded with an offline knowledge bundle about pohunek
-  itself and a redacted live snapshot of your hosts — self-hosted support for
-  setup, project configuration, updates, and debugging.
+  itself and the launch context (selected host, project and agent) —
+  self-hosted support for setup, project configuration, updates, and debugging.
 - **SDKs — build your own GUI or client**: a Rust client crate
   (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
   `@pohunek/sdk`, and `@pohunek/testkit`) speak the same versioned

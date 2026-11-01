@@ -25,9 +25,10 @@ Pohunek has two explicit trust domains:
   configured.
 - **Optional team relay, reduced foundation implemented.** `pohunek-relayd`
   provides PostgreSQL-backed fenced authority, recovery, protected local
-  provisioning, generic OIDC authentication, and bounded HTTPS account and
-  credential operations. Host enrollment, shares, routing, attach, team clients,
-  and team administration remain deferred. Enrolling does not replace or require
+  provisioning, generic OIDC authentication, bounded HTTPS account and
+  credential operations, account linking, and Google and GitHub team admission
+  with bounded revalidation. Host enrollment, shares, routing, attach, team
+  clients, and team administration remain deferred. Enrolling does not replace or require
   an overlay.
 
 The following invariants span both domains:
@@ -54,9 +55,9 @@ The following invariants span both domains:
 | Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped; Linux and Apple Silicon macOS (deployment target 14.0, tested on macOS 15) are supported platforms | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); open macOS follow-ups [#100](https://github.com/zajca/pohunek/issues/100) and [#102](https://github.com/zajca/pohunek/issues/102)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay browser client transport | External client in `zajca/pohunek-work`; the SDK ships the `WsTransport` client and a loopback test relay | Team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v4 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
-| Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, provider-neutral account linking, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107); follow-up [#108](https://github.com/zajca/pohunek/issues/108), [#92](https://github.com/zajca/pohunek/issues/92), and [#86](https://github.com/zajca/pohunek/issues/86) |
-| Verified Keycloak-brokered social identity and bounded external eligibility | Accepted, not implemented; blocks completion of transport enrollment | [#92](https://github.com/zajca/pohunek/issues/92) |
-| Host-initiated userspace WireGuard link | Accepted, not implemented; transport completion follows #92 | [#72](https://github.com/zajca/pohunek/issues/72) |
+| Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, provider-neutral account linking, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107); follow-up [#108](https://github.com/zajca/pohunek/issues/108) and [#86](https://github.com/zajca/pohunek/issues/86) |
+| Verified Keycloak-brokered social identity and bounded external eligibility | Implemented | [#92](https://github.com/zajca/pohunek/issues/92) |
+| Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
 | Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
 | Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
 | Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
@@ -288,7 +289,7 @@ or durable terminal content.
   remains provider-neutral. Verified external eligibility expires within 60
   minutes of upstream verification and refreshes, activity, restart, or provider
   uncertainty never extend it. [#92](https://github.com/zajca/pohunek/issues/92)
-  owns the end-to-end evidence flow before #72 can complete.
+  delivered the end-to-end evidence flow.
 - `HostShare` is a revisioned, default-deny, locally approved ceiling binding a
   host to one team. It restricts operations, registered projects and canonical
   worktree roots, owner-authored profiles, resource limits, and future execution

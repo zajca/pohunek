@@ -11,8 +11,9 @@ intents: [setup, project, update, debug, help]
 
 The assistant is intentionally capable. It runs as an ordinary selected agent
 session and can use that agent's normal file and command tools. Safety comes from
-clear launch boundaries, public-safe knowledge, redacted snapshots, explicit
-configuration review, and existing Pohunek daemon and filesystem controls.
+clear launch boundaries, public-safe knowledge, a launch snapshot that holds
+launch metadata only, explicit configuration review, and existing Pohunek
+daemon and filesystem controls.
 
 The assistant must:
 
@@ -205,10 +206,10 @@ future relay work must preserve these independent authorization responsibilities
 - Each relay operation is bound to one active share and its current revision;
   permissions from different shares are never composed for one operation.
 
-The planned relay uses Keycloak as the reference broker for Google and GitHub,
-but the implemented foundation remains provider-neutral. Verified external
-eligibility is deferred to [#92](https://github.com/zajca/pohunek/issues/92);
-it will be evidence, not an editable profile attribute, and it expires no later
+The relay uses Keycloak as the reference broker for Google and GitHub, while
+the OIDC login stays provider-neutral. Verified external eligibility was
+delivered by [#92](https://github.com/zajca/pohunek/issues/92);
+it is evidence, not an editable profile attribute, and it expires no later
 than 60 minutes after authoritative upstream verification. Token refresh,
 activity, restart, unknown state, or provider failure cannot extend it.
 Confirmed removal and local revocation cancel affected relay access, including

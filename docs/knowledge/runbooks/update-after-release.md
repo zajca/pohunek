@@ -544,9 +544,9 @@ proceed after the post-stop check, not a recovery command. See
 [debug session runtime](debug-session-runtime.md). The same flag is the one
 consent for the service-managed upgrade below; there is no second flag.
 
-When the assistant feature is available, its update intent should use bundle
-version metadata and `changed_in` frontmatter to explain version-specific
-changes before recommending edits.
+When the assistant feature is available, its update intent should compare the
+bundle version in the launch snapshot with the installed binary's version and
+check behavior against that binary before recommending edits.
 
 ## Testing an install or upgrade with an isolated HOME (macOS)
 

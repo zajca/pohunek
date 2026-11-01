@@ -125,7 +125,14 @@ impl Checkout {
             "docs/README.md",
             "[CLI](cli.md) [Dev](development.md) [Install](install.md) [Features](features.md)\n",
         );
-        checkout.write("docs/knowledge/index.md", "# Index\n");
+        checkout.write(
+            "docs/knowledge/index.md",
+            "# Index\n\n[map](assistant/source-map.md)\n",
+        );
+        checkout.write(
+            "docs/knowledge/assistant/source-map.md",
+            "# Map\n\n- `crates/alpha/src/lib.rs`\n",
+        );
         checkout.write("docs/cli.md", &reference(&[], &[]));
         checkout
     }
@@ -149,7 +156,7 @@ impl Checkout {
         self.write("docs/knowledge/guides/page.md", body);
         self.write(
             "docs/knowledge/index.md",
-            "# Index\n\n[page](guides/page.md)\n",
+            "# Index\n\n[page](guides/page.md) [map](assistant/source-map.md)\n",
         );
         self.failed_checks()
     }
@@ -269,7 +276,7 @@ fn retired_pages_and_the_history_log_are_not_held_to_the_current_tree() {
     );
     checkout.write(
         "docs/knowledge/index.md",
-        "# Index\n\n[old](guides/old.md) [log](log.md)\n",
+        "# Index\n\n[old](guides/old.md) [log](log.md) [map](assistant/source-map.md)\n",
     );
     assert_eq!(checkout.failed_checks(), Vec::<&str>::new());
 }
@@ -325,11 +332,48 @@ fn the_crate_table_must_list_exactly_the_workspace_crates() {
         "Cargo.toml",
         "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
     );
-    assert_eq!(added.failed_checks(), vec!["crate-table"]);
+    assert_eq!(
+        added.failed_checks(),
+        vec!["crate-table", "source-map-crates"]
+    );
 
     let removed = Checkout::consistent();
     removed.write("Cargo.toml", "[workspace]\nmembers = []\n");
     assert_eq!(removed.failed_checks(), vec!["crate-table"]);
+}
+
+#[test]
+fn the_source_map_must_name_every_workspace_crate_by_whole_path_segment() {
+    let unmapped = Checkout::consistent();
+    unmapped.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/alpha\", \"crates/relay\"]\n",
+    );
+    unmapped.write(
+        "docs/development.md",
+        "| Crate | Role |\n|---|---|\n| `crates/alpha` | A. |\n| `crates/relay` | R. |\n",
+    );
+    // A longer crate name that starts with `relay` does not map `crates/relay`.
+    unmapped.write(
+        "docs/knowledge/assistant/source-map.md",
+        "- `crates/alpha/src/lib.rs`\n- `crates/relay-client/src/`\n",
+    );
+    assert_eq!(unmapped.failed_checks(), vec!["source-map-crates"]);
+
+    let mapped = Checkout::consistent();
+    mapped.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/alpha\", \"crates/relay\"]\n",
+    );
+    mapped.write(
+        "docs/development.md",
+        "| Crate | Role |\n|---|---|\n| `crates/alpha` | A. |\n| `crates/relay` | R. |\n",
+    );
+    mapped.write(
+        "docs/knowledge/assistant/source-map.md",
+        "- `crates/alpha/src/lib.rs`\n- `crates/relay/` — the relay.\n",
+    );
+    assert_eq!(mapped.failed_checks(), Vec::<&str>::new());
 }
 
 #[test]

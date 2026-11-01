@@ -1541,9 +1541,11 @@ description conflicts until the issue is reconciled.
 | Complete | [#69](https://github.com/zajca/pohunek/issues/69) | Completed | Direct-overlay foundation. |
 | Complete | [#80](https://github.com/zajca/pohunek/issues/80) | Completed | Original accepted RFC/canonical documentation landing. |
 | Complete | [#81](https://github.com/zajca/pohunek/issues/81) | Completed | Stable host identity, single enrollment, exact owner and local transfer. |
-| Reconcile | [#91](https://github.com/zajca/pohunek/issues/91) | Pending merge | Documentation reconciliation; it is not closed by this RFC edit. |
-| 1 | [#85](https://github.com/zajca/pohunek/issues/85) | Planned | Relay/PostgreSQL foundation, OIDC, durable audit/admission, recovery generation/quarantine, lease fencing, principals and credentials. |
-| 2 | [#92](https://github.com/zajca/pohunek/issues/92) | Planned | Keycloak-brokered Google/GitHub admission and bounded external-evidence revalidation. |
+| Complete | [#91](https://github.com/zajca/pohunek/issues/91) | Completed | Documentation reconciliation. |
+| 1 | [#85](https://github.com/zajca/pohunek/issues/85) | Completed (reduced foundation; complete team administration is [#108](https://github.com/zajca/pohunek/issues/108)) | Relay/PostgreSQL foundation, OIDC, durable audit/admission, recovery generation/quarantine, lease fencing, principals and credentials. |
+| 2 | [#92](https://github.com/zajca/pohunek/issues/92) | Completed | Keycloak-brokered Google/GitHub admission and bounded external-evidence revalidation. |
+| Complete | [#107](https://github.com/zajca/pohunek/issues/107) | Completed | Provider-neutral relay account linking. |
+| Planned | [#108](https://github.com/zajca/pohunek/issues/108) | Planned | Complete relay team administration API: teams, members, groups, custom roles, grants, service accounts. |
 | 3 | [#72](https://github.com/zajca/pohunek/issues/72) | Planned | Embedded userspace WireGuard, address allocation, OIDC host enrollment, and host-initiated link transport. |
 | 4 | [#70](https://github.com/zajca/pohunek/issues/70) | Planned | Protocol v4 host link, daemon relay context, immutable origin, and share guard framework. |
 | 5 | [#82](https://github.com/zajca/pohunek/issues/82) | Planned | Locally approved `HostShare` lifecycle and profile/project/operation/resource policy. |

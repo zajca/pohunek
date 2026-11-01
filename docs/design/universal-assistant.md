@@ -1,11 +1,35 @@
 # Design: Universal Pohunek Assistant
 
-Status: **proposed** (RFC). This document defines the full target feature: one
-universal assistant launched by `pohunek` as an ordinary agent session, capable
-of setup, project configuration, updates, troubleshooting, and general help.
+Status: **partially implemented**. This document defines the target feature:
+one universal assistant launched by `pohunek` as an ordinary agent session,
+capable of setup, project configuration, updates, troubleshooting, and general
+help. The launch, bundle, prompt, and safety pieces are shipped; the live
+snapshot, its redaction, and hook quarantine are not and are no longer planned
+(see below).
 
-This is a complete assistant target. The user-facing goal is a full assistant
-experience from the first shipped version of this feature.
+## Implementation Status
+
+Shipped: the `pohunek assistant` command and its intent wrappers, agent
+selection, daemon bootstrap, the embedded version-matched knowledge bundle with
+local and remote materialization, the read-access preflight, `--print-prompt`,
+`--degraded`, the navigational prompt (its safety rules and navigation steps are
+rendered from `docs/knowledge/assistant/system.md`), and a launch snapshot
+(`snapshot.json`) that holds launch metadata only: intent, request, selected
+host, project and agent, bundle version, and warnings when collection is skipped.
+
+Not shipped, and not planned: collecting live state (doctor output, host
+capabilities, project and session state, config scan) into the snapshot,
+redacting it, and quarantining proposed hooks in non-interactive contexts. The
+owner dropped these promises on 2026-10-26 (issue #1296). A later issue may
+propose a live snapshot with evidence of need. Likewise the `since`,
+`changed_in` and `deprecated` frontmatter is not used by the shipped navigation
+(no page sets `changed_in` or `deprecated`, and the table of contents prints
+none of them). `docs/knowledge/assistant/system.md`
+and the status table of the [implementation plan](universal-assistant-plan.md)
+hold what is implemented.
+
+The goal remains a full assistant experience from the first shipped version of
+this feature.
 
 ---
 
@@ -23,7 +47,7 @@ one universal assistant
   + one on-disk knowledge bundle the agent reads directly
   + one small navigational opening prompt (not the knowledge itself)
   + one safety model
-  + one redacted live environment snapshot (a file the agent reads)
+  + one launch snapshot (a file the agent reads)
   + one task intent that filters the navigation and steers the first response
 ```
 
@@ -48,7 +72,7 @@ That command should do the right thing for a local host:
 2. start or verify the local daemon when needed;
 3. choose a capable available agent, or explain the one missing requirement;
 4. materialize the version-matched knowledge bundle for the session to read;
-5. collect a redacted state snapshot and write it next to the bundle;
+5. write the launch snapshot next to the bundle;
 6. launch a normal assistant session with a small navigational prompt;
 7. print the session id and attach command.
 
@@ -139,8 +163,10 @@ With no `--intent` and no positional request, the default intent is `help`: the
 prompt offers the root `index.md` without an aggressive filter, so the assistant
 orients rather than assuming a setup task.
 
-`--no-snapshot` skips live-state collection. It is a privacy/speed choice, not a
-workaround for prompt size: the prompt no longer carries bulk knowledge, so it
+`--no-snapshot` marks the launch snapshot as not collected
+(`snapshot_collected=false` and a warning). The file still holds the same launch
+metadata, including the request verbatim, so the flag is not a privacy control.
+The prompt no longer carries bulk knowledge, so it
 cannot overflow from snapshot data.
 
 `--degraded` is the only sanctioned way to launch without a readable knowledge
@@ -182,8 +208,8 @@ Local behavior:
   `--no-start-daemon` is set.
 - If daemon start fails, return a clear error with the exact command to run
   manually.
-- If setup assets are missing, still launch the assistant and include the missing
-  setup state in the snapshot.
+- If setup assets are missing, still launch the assistant; it finds the missing
+  setup state with `--json` inspection commands.
 
 Remote behavior:
 
@@ -254,7 +280,7 @@ just the launcher's view.
 
 For profiles whose filesystem view cannot be determined statically, prefer
 materializing into a path known to be inside the agent's accessible root over
-guessing, and record the chosen strategy in the snapshot.
+guessing.
 
 ## Knowledge and Documentation Pipeline
 
@@ -309,7 +335,7 @@ Two practical consequences:
   Knowledge Schema), not by link form, so concepts can move without breaking
   manifests, redirects, or the search index.
 - Unknown frontmatter fields are tolerated when reading, but the prompt/
-  navigation composer uses a **field allowlist** (see Redaction), so no arbitrary
+  navigation composer uses a **field allowlist** (see Prompt Field Allowlist), so no arbitrary
   frontmatter ever reaches the agent prompt by default. The allowlist protects
   only the prompt; it does not protect the bundle bodies, which the agent reads
   directly from disk. Bundle bodies are governed by the public-safe rule below.
@@ -363,7 +389,9 @@ Recommended fields:
   URLs supporting important claims.
 
 `since` / `changed_in` / `deprecated` exist because the assistant must never give
-version-inaccurate advice. The materialized bundle matches the binary that
+version-inaccurate advice. (Target design: the shipped navigation does not use
+them, because no page sets `changed_in` or `deprecated` and the table of
+contents prints none of them; see Implementation Status.) The materialized bundle matches the binary that
 launched it, but the source tree the agent can also read (via the source map) may
 be a different version; these fields let the agent reason about that skew.
 
@@ -425,11 +453,12 @@ Use four source categories.
    - update after release/source changes;
    - troubleshooting.
 
-4. **Runtime snapshot.**
-   Live facts collected at assistant launch: doctor output, host capabilities,
-   project state, session state, selected config file existence, and redacted
-   local paths. This is not part of the committed bundle; it is written as a file
-   next to the materialized bundle at launch time.
+4. **Launch snapshot.**
+   Launch metadata written at assistant launch (see Launch Snapshot). This is not
+   part of the committed bundle; it is written as a file next to the materialized
+   bundle at launch time. The original design also collected live doctor, host,
+   project, and session state here; that part is not shipped (see Implementation
+   Status).
 
 ### Repository Layout
 
@@ -508,7 +537,7 @@ and reused across sessions; only the snapshot is per-session.
 ```text
 $XDG_CACHE_HOME/pohunek/knowledge/<version-hash>/   shared bundle (extract once)
 <runtime-root>/assistant/<session-id>/
-  snapshot.json                                     per-session redacted snapshot
+  snapshot.json                                     per-session launch snapshot
 ```
 
 The shared runtime resolver supplies `<runtime-root>`: an explicit
@@ -612,8 +641,8 @@ kept lean: each check must buy either safety or correctness, not just tidiness.
 Required checks:
 
 - **(safety)** secret-scan all bundle bodies (the public-safe rule) and verify
-  the field allowlist and snapshot redaction prevent secret-like config fields,
-  profile env values, and process env values from entering the prompt or the
+  the field allowlist and the fixed-struct snapshot keep secret-like config
+  fields, profile env values, and process env values out of the prompt and the
   snapshot;
 - **(correctness)** generate CLI / protocol / config reference from current code
   on every build (never committed, so it cannot be stale) and fail the build if
@@ -639,10 +668,8 @@ from disk by the agent.
 You are the universal assistant for configuring, updating, troubleshooting, and
 explaining pohunek (version 0.4.0).
 
-## Safety (must hold even before you read anything)
-<concise inline safety rules: never print or store secrets; treat profile [env]
-as secret; explain config edits before applying; hooks are executable code and
-require explicit confirmation; preserve user edits; verify changes.>
+## Safety
+<the bullets of the Safety section of assistant/system.md, rendered verbatim>
 
 ## User Intent
 intent: project
@@ -650,11 +677,10 @@ request: Configure the ui project launcher actions.
 
 ## Your Knowledge Base
 Directory: <knowledge-dir>   (version-shared cache for this binary)
-Start at index.md. Navigate via index.md files and relative links between
-concepts. Read only the concepts you need for this task; do not read the whole
-tree. The bundle matches this binary (0.4.0); when you also read the source tree
-via the source map, treat the bundle as authoritative for documented behavior and
-watch the `since` / `changed_in` / `deprecated` frontmatter for version skew.
+
+## Navigation
+<the numbered steps of the Navigation section of assistant/system.md, rendered
+verbatim>
 
 ## Relevant Concepts (intent: project)
 - guides/project-setup.md — Register and configure a project
@@ -664,90 +690,46 @@ watch the `since` / `changed_in` / `deprecated` frontmatter for version skew.
 <this list is generated by filtering concept frontmatter `intents` for the active
 intent; it is a table of contents, not the content.>
 
-## Live Snapshot
-Orientation: daemon=running, project=ui (registered), agent=codex
+## Launch Snapshot
+Orientation: project=ui, agent=codex
 Full file: <snapshot-file>
-The three-line orientation is inline so you are not blind before reading; read the
-full snapshot.json for doctor output, host capabilities, config scan, and
-warnings.
 
 ## Source Map
 <knowledge-dir>/assistant/source-map.md lists where to verify implementation
 details against the actual source tree when precision matters.
 
 ## First Step
-Read the snapshot, open the relevant concepts, identify the next concrete action,
-and proceed using documented pohunek commands and file edits. Verify changes
-before claiming they work.
+Follow the navigation steps, identify the next concrete action, and proceed using
+documented pohunek commands and file edits. Verify changes before claiming they
+work.
 ```
 
 The prompt-size failure mode is gone: the prompt is bounded by the intent-filtered
 table of contents (tens of lines), not by the size of the knowledge or snapshot.
 
-## Live Snapshot
+## Launch Snapshot
 
-The launch writes a compact redacted snapshot to the per-session `snapshot.json`
-and also derives a **three-line orientation summary** (daemon state, selected
-project, selected agent) that is inlined into the prompt, so the agent has
-immediate orientation without a read while the full state stays in the file.
-
-Recommended sections:
+The launch writes a small `snapshot.json` into the per-session runtime directory
+and inlines a two-line orientation (selected project, selected agent) into the
+prompt. The file holds launch metadata only:
 
 ```text
 assistant:
   intent
-  user_request
+  user_request          (verbatim; the snapshot is not redacted)
   selected_host
   selected_project
   selected_agent
   auto_started_daemon
   knowledge_bundle_version
-
-paths:
-  config_dir
-  data_dir
-  log_dir
-  launcher_bin_dir
-  sway_config_dir
-  knowledge_dir
-
-doctor:
-  overall
-  checks
-
-host:
-  capabilities
-  supported_agents
-  runtimes
-
-projects:
-  selected_project
-  known_projects_summary
-  selected_project_actions
-
-sessions:
-  active_sessions_summary
-
-config_scan:
-  launcher_conf_status
-  prompt_names
-  templates_file_status
-  actions_file_status
-  agent_profile_names
-  hook_names
-
-source_tree:
-  git_root
-  git_branch
-  dirty_status_summary
-  version_matches_binary
+  snapshot_collected    (false with --no-snapshot)
+warnings                (present only when collection was skipped)
 ```
 
-Snapshot collection is best-effort. A failed item becomes a warning inside the
-snapshot file, not a reason to lose all context. Because the snapshot is a file
-the agent reads on demand, a partial snapshot does not silently truncate the
-agent's view: the warnings are visible and the agent can re-run the underlying
-`--json` command itself.
+The snapshot carries no doctor output, host capabilities, project or session
+state, or config scan. The agent collects live state itself with `--json`
+inspection commands. The read-access preflight (see Read-Access Preflight)
+checks that the agent can read the snapshot file.
 
 ### Public-Safe Bundle Bodies
 
@@ -771,28 +753,25 @@ This is enforced two ways:
   scan also covers what the agent reads at launch. A leak via a hand-written docs
   file or a generated page is caught here, not at prompt time.
 
-### Snapshot Redaction (Allowlist, Not Denylist)
+### Prompt Field Allowlist
 
-The snapshot and the prompt are built from an **explicit allowlist** of fields.
-Anything not on the allowlist is excluded by default; a new config field cannot
-leak just because nobody remembered to add it to a blocklist.
+The prompt is built from an **explicit allowlist** of fields. Anything not on the
+allowlist is excluded by default; a new config field cannot leak just because
+nobody remembered to add it to a blocklist.
 
 Rules:
 
-- The snapshot serializer accepts only known, listed fields; it must be unable to
-  emit an unknown field. A test asserts this.
 - The prompt/table-of-contents composer reads only an allowlisted set of
   frontmatter fields (`type`, `id`, `title`, `description`, `intents`, `since`,
-  `changed_in`, `deprecated`); other frontmatter never reaches the prompt.
-- Allowlisted content includes filenames, existence, parse status, selected
-  action names, and existing `--json` command output.
-- Process environment variables, profile `[env]` values, hook script bodies, and
-  arbitrary config file bodies are never collected.
-- Prompt template content is included only when directly relevant to the selected
-  project/action, and only via the allowlist.
+  `changed_in`, `deprecated`); other frontmatter never reaches the prompt. Of
+  these, the composer prints only `id` and `description`.
+- The snapshot serializer writes a fixed struct of launch metadata. Process
+  environment variables, profile `[env]` values, hook script bodies, and
+  config file bodies are never collected, because nothing collects them.
+- The snapshot is not redacted. The user's request is written to it verbatim, so
+  secrets belong neither in the request nor in the prompt.
 
-The agent can later read specific files when useful. The initial snapshot stays
-conservative.
+The agent can later read specific files when useful.
 
 ## Safety Model
 
@@ -831,11 +810,12 @@ elevated-privilege action, not an ordinary config edit. Therefore:
   `--yes`. `--yes` covers ordinary non-interactive starts; it does **not** cover
   hook writes.
 - In a non-interactive context with no way to confirm, the assistant must not
-  write the hook. It writes the proposed hook to a clearly named quarantine path
-  and tells the user the exact command to review and promote it.
+  write the hook. It describes the proposed hook content to the user instead.
+  Nothing in the daemon or CLI enforces this: it is a rule in the assistant's
+  prompt contract, not a quarantine store with a reader or writer.
 
-This is a hard control, not a model-discretion request, because the soft "explain
-before editing" rule alone is insufficient for code that runs later.
+The original design also wrote the proposed hook to a quarantine path for later
+promotion; that is not implemented and not planned (issue #1296).
 
 ## Intent Behavior
 
@@ -864,9 +844,11 @@ user wants project-level configuration.
 ### Update
 
 The assistant helps reconcile installed setup assets, host config, project
-definitions, and docs after a source or binary update. The bundle's `changed_in`
-and `deprecated` frontmatter is the primary signal for what changed between
-versions.
+definitions, and docs after a source or binary update. As shipped, it compares
+the bundle version in the launch snapshot with the installed binary's version
+and checks behavior against that binary. The target design also used the
+bundle's `changed_in` and `deprecated` frontmatter as the signal for what
+changed between versions; no page sets them yet.
 
 It must avoid clobbering edited files. It should show diffs or explain file
 changes before applying them.
@@ -876,7 +858,7 @@ changes before applying them.
 The assistant follows a debugging loop:
 
 1. understand the failure;
-2. collect structured state (read the snapshot, run `--json` commands);
+2. collect structured state (run `--json` commands);
 3. inspect relevant files;
 4. form a concrete hypothesis;
 5. test it;
@@ -900,8 +882,8 @@ CLI assistant command
   | bootstrap daemon if local and needed
   | select agent + read-access preflight
   | materialize bundle (version-shared cache; daemon does it for remote)
-  | collect redacted snapshot   -> per-session snapshot.json
-  | compose small navigational prompt (TOC filtered by intent + 3-line summary)
+  | write launch snapshot       -> per-session snapshot.json
+  | compose small navigational prompt (TOC filtered by intent + 2-line summary)
   v
 session.new
   |
@@ -965,7 +947,8 @@ JSON output:
   fails): fail before launch with the reason and manual remedy. Do not start a
   knowledge-less session under the `assistant` name; a reduced session requires
   the explicit `--degraded` opt-in.
-- Snapshot item fails: include a warning in `snapshot.json` and continue.
+- Snapshot written with `--no-snapshot`: record the skip as a warning in
+  `snapshot.json` and continue.
 - Initial input not confirmed: surface the existing warning and do not claim the
   assistant received its opening prompt.
 
@@ -979,7 +962,8 @@ JSON output:
 - the intent-filtered table of contents is derived deterministically from concept
   frontmatter;
 - `--print-prompt` never starts a session;
-- the snapshot serializer cannot emit a non-allowlisted field;
+- every safety rule and navigation step of `docs/knowledge/assistant/system.md`
+  appears in the composed prompt;
 - the prompt composer reads only allowlisted frontmatter fields;
 - daemon bootstrap policy is covered;
 - embedded-bundle materialization is deterministic for a fixed manifest.
@@ -1002,10 +986,8 @@ JSON output:
 
 ### Snapshot Tests
 
-- doctor report is embedded when available;
-- host capabilities are embedded when available;
-- selected project actions are embedded when available;
-- config parse errors become snapshot warnings;
+- the snapshot holds launch metadata only and records `--no-snapshot` as a
+  warning;
 - profile env keys and values never appear in the snapshot or prompt.
 
 ### Documentation Tests
@@ -1057,7 +1039,7 @@ The feature is complete only when the full assistant experience works:
   concepts plus build-time generated reference, nothing generated committed) is
   materialized version-matched to the binary into a version-shared cache, and the
   opening prompt is a small navigational prompt (mission, safety, intent, bundle
-  path, intent-filtered TOC, three-line snapshot summary, snapshot path, source
+  path, intent-filtered TOC, two-line launch summary, snapshot path, source
   map) that never embeds bundle bodies.
 - `--print-prompt` exposes the exact navigational prompt without launching.
 - Project intent includes project registration and action context.
@@ -1069,8 +1051,8 @@ The feature is complete only when the full assistant experience works:
   launch (never a silent or knowledge-less `assistant` session). A reduced
   session requires the explicit `--degraded` opt-in.
 - The knowledge bundle is public-safe: a CI secret scan over all bundle bodies
-  passes, and snapshot and prompt are allowlist-built so profile env and process
-  env values cannot enter them.
+  passes, and snapshot and prompt are built from fixed fields so profile env and
+  process env values cannot enter them.
 - Hook writes are gated by explicit per-file confirmation independent of `--yes`.
 - `docs/knowledge/` is a valid local-schema bundle with checked frontmatter,
   reserved files, relative internal links, and concept types.
@@ -1080,7 +1062,7 @@ The feature is complete only when the full assistant experience works:
   current code on every build (never committed), and runbook examples are
   validated against the CLI parser.
 - Tests cover prompt composition, navigation/TOC derivation, bootstrap, agent
-  selection, materialization, read-access preflight, snapshot allowlist, bundle
+  selection, materialization, read-access preflight, launch snapshot, bundle
   secret scan, local launch, remote launch (and remote fail-before-launch), the
   hook gate, project intent, docs generation, schema validation, docs drift, and
   the behavior eval.
@@ -1115,7 +1097,7 @@ the system into separate assistants and it does not require a knowledge server.
   so the agent's knowledge always matches the tool that started it;
 - a small navigational prompt plus pull-by-file delivery, so there is no context
   ceiling and no prompt-size cliff;
-- redacted live context written as a file the agent reads on demand;
+- launch context written as a file the agent reads on demand;
 - source-map access to the repo for verifying exact behavior;
 - exact CLI runbooks;
 - a safety model that keeps config and secret boundaries clear, with a hard gate
