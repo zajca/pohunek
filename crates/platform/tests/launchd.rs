@@ -400,6 +400,37 @@ async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
 }
 
 #[tokio::test]
+async fn a_loaded_worker_without_its_definition_is_invalid_data_until_retired() {
+    let fixture = Fixture::new();
+    let key = key("s-1002", "abcd2347");
+    let id = key.service_id();
+    let definition = fixture.worker(&key, SLEEPING_WORKER, Duration::from_secs(5));
+
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts");
+    wait_for(|| fixture.supervisor.inspect(&id), running).await;
+    std::fs::remove_file(fixture.definition_path(&key)).expect("definition removed");
+
+    // The job stays loaded, so the missing definition is damage, not a
+    // vanished job.
+    assert!(matches!(
+        fixture.supervisor.inspect(&id).await,
+        Err(Error::InvalidData {
+            operation: "inspect",
+            ..
+        })
+    ));
+    fixture
+        .supervisor
+        .retire(&id)
+        .await
+        .expect("worker retires");
+}
+
+#[tokio::test]
 async fn an_exited_worker_stays_loaded_without_a_process_and_is_never_proven_ended() {
     let fixture = Fixture::new();
     let key = key("s-1002", "abcd2346");

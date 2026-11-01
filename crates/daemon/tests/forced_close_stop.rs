@@ -29,7 +29,8 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_platform::process::{
-    Error as ProcessError, ExitWatch, OwnershipMarkers, Pid, ProcessFact,
+    ControlGroupPath, Error as ProcessError, ExitWatch, OwnershipMarkers, Pid, ProcessCoalitions,
+    ProcessFact, ProcessLineage,
 };
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::host_lock::{HostLock, UNREADABLE_HOLDERS};
@@ -236,6 +237,25 @@ impl ProcessInspector for ScenarioHost {
         } else {
             self.readable.ownership_markers(pid)
         }
+    }
+
+    fn process_age(
+        &self,
+        identity: ProcessIdentity,
+    ) -> Result<Option<std::time::Duration>, ProcessError> {
+        self.host.process_age(identity)
+    }
+
+    fn lineage(&self, pid: Pid) -> Result<Option<ProcessLineage>, ProcessError> {
+        self.host.lineage(pid)
+    }
+
+    fn coalitions(&self, pid: Pid) -> Result<Option<ProcessCoalitions>, ProcessError> {
+        self.host.coalitions(pid)
+    }
+
+    fn control_group(&self, pid: Pid) -> Result<Option<ControlGroupPath>, ProcessError> {
+        self.host.control_group(pid)
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, ProcessError> {
