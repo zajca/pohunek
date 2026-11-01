@@ -400,6 +400,46 @@ async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
 }
 
 #[tokio::test]
+async fn a_loaded_worker_without_its_definition_is_invalid_data() {
+    let mut fixture = Fixture::new();
+    let key = key("s-1002", "abcd2347");
+    let id = key.service_id();
+    // The definition is removed below, so the drop guard needs the label to
+    // boot the job out when an assertion fails before the retirement.
+    fixture
+        .extra_labels
+        .push(fixture.namespace.worker_label(&key));
+    let definition = fixture.worker(&key, SLEEPING_WORKER, Duration::from_secs(5));
+
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts");
+    wait_for(|| fixture.supervisor.inspect(&id), running).await;
+    std::fs::remove_file(fixture.definition_path(&key)).expect("definition removed");
+
+    // The job stays loaded, so the missing definition is damage, not a
+    // vanished job.
+    let inspected = fixture.supervisor.inspect(&id).await;
+    assert!(
+        matches!(
+            inspected,
+            Err(Error::InvalidData {
+                operation: "inspect",
+                ..
+            })
+        ),
+        "a loaded job without a definition is invalid data: {inspected:?}"
+    );
+    fixture
+        .supervisor
+        .retire(&id)
+        .await
+        .expect("worker retires");
+}
+
+#[tokio::test]
 async fn an_exited_worker_stays_loaded_without_a_process_and_is_never_proven_ended() {
     let fixture = Fixture::new();
     let key = key("s-1002", "abcd2346");
