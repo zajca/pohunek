@@ -690,7 +690,7 @@ pub(super) fn doctor_in_with(
 
 /// [`doctor_in`] with, for each diagnosis, the sentence its handler adds to the
 /// text of an outdated install.
-pub fn doctor_in_noted(
+pub(crate) fn doctor_in_noted(
     homes: &ConfigHomes,
     params: IntegrationDoctorParams,
 ) -> Result<Vec<(IntegrationAgentDoctor, Option<&'static str>)>, ProtocolError> {

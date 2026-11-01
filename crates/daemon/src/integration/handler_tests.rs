@@ -1317,10 +1317,10 @@ fn an_outdated_claude_install_names_the_lost_identity_recovery() {
     let claude = RuntimeRef::claude();
     let handler = official(&claude).handler;
     let note = handler
-        .outdated_note(EXPECTED_INTEGRATION_VERSION - 1)
-        .expect("a note for the version before the current one");
+        .outdated_note(15)
+        .expect("a note for the last version without the Stop identity report");
     assert!(note.contains("keeps no native reference"), "{note}");
-    assert_eq!(handler.outdated_note(EXPECTED_INTEGRATION_VERSION), None);
+    assert_eq!(handler.outdated_note(16), None);
     assert_eq!(
         official(&RuntimeRef::codex()).handler.outdated_note(1),
         None
@@ -1339,10 +1339,7 @@ fn an_outdated_claude_install_names_the_lost_identity_recovery() {
             &script,
             body.replace(
                 &format!("{INTEGRATION_VERSION_PREFIX}{EXPECTED_INTEGRATION_VERSION}"),
-                &format!(
-                    "{INTEGRATION_VERSION_PREFIX}{}",
-                    EXPECTED_INTEGRATION_VERSION - 1
-                ),
+                &format!("{INTEGRATION_VERSION_PREFIX}15"),
             ),
         )
         .expect("age the installed script");

@@ -92,7 +92,8 @@ impl StagedUpdate for StagedCodex {
 /// First integration version whose `Stop` hook repeats the identity report.
 const STOP_IDENTITY_INTEGRATION_VERSION: u32 = 16;
 
-/// What a Claude install older than [`STOP_IDENTITY_INTEGRATION_VERSION`] lacks.
+/// What a Claude install older than [`STOP_IDENTITY_INTEGRATION_VERSION`] lacks;
+/// the version it names is that constant.
 const STOP_IDENTITY_NOTE: &str = "Until then a Claude session whose SessionStart hook was killed before it reported keeps no native reference, so resume and fork refuse it; hooks of integration version 16 or newer recover it at the end of the next turn.";
 
 impl DaemonHandler for CodexHook {
