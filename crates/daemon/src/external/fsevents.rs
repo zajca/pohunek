@@ -1,11 +1,14 @@
 //! macOS `FSEvents` backend for live transcript watching.
 //!
-//! `FSEvents` watches a directory tree natively, so one recursive stream per
+//! `FSEvents` watches a directory tree natively, so one recursive watch per
 //! provider root replaces inotify's per-directory watches. The `notify` crate
-//! owns the stream and its run-loop thread; its callback only forwards events
-//! into a bounded queue. Dropped events, kernel/user drop flags, callback
-//! errors and a full queue all surface as [`WatchEvent::Rescan`], so the runner
-//! reconciles the index instead of trusting an incomplete event history.
+//! owns one `FSEventStream` for all watched paths and its run-loop thread, and
+//! every `watch` or `unwatch` stops and recreates that shared stream, so a
+//! change of the root set interrupts live delivery for every root. Its callback
+//! only forwards events into a bounded queue. Dropped events, kernel/user drop
+//! flags, callback errors and a full queue all surface as
+//! [`WatchEvent::Rescan`], so the runner reconciles the index instead of
+//! trusting an incomplete event history.
 
 // Rust guideline compliant 2026-09-29
 
@@ -48,9 +51,13 @@ struct Registered {
 
 /// Recursive `FSEvents` watch over the provider transcript roots.
 ///
-/// The locked `notify` crate discards errors from starting the stream, so a
-/// stream that silently failed to start delivers nothing. That only costs
-/// latency: the periodic reconciliation pass keeps the index current.
+/// The locked `notify` crate discards errors from starting the stream and never
+/// reports one afterwards, so a stream that failed to start or stopped delivering
+/// is silent. That only costs latency: the periodic reconciliation pass keeps
+/// the index current, and the watcher rebuilds every registration once per
+/// `STREAM_REBUILD_INTERVAL`. A full event queue, and a callback error should a
+/// later `notify` report one, mark the stream suspect, so the next pass
+/// recreates it instead of keeping a stream that may be dead.
 #[derive(Debug)]
 pub(super) struct FsEventsBackend {
     watcher: RecommendedWatcher,
@@ -58,6 +65,18 @@ pub(super) struct FsEventsBackend {
     lost: Arc<AtomicBool>,
     lost_wake: Arc<Notify>,
     registered: Vec<Registered>,
+    /// Set when a callback error or a lost event suggests a stream stopped
+    /// delivering; the next `retain_roots` drops every registration.
+    suspect: bool,
+    /// Calls of `watch` and `unwatch` that reached `notify`.
+    stream_calls: StreamCalls,
+}
+
+/// Counts of the calls that restart the shared `FSEvents` stream.
+#[derive(Debug, Default)]
+struct StreamCalls {
+    watched: usize,
+    unwatched: usize,
 }
 
 impl FsEventsBackend {
@@ -88,12 +107,44 @@ impl FsEventsBackend {
             lost,
             lost_wake,
             registered: Vec::new(),
+            suspect: false,
+            stream_calls: StreamCalls::default(),
         })
     }
 
-    fn translate(&self, signal: RawSignal, out: &mut Vec<WatchEvent>) {
+    /// Starts watching `path`, which restarts the shared stream.
+    fn start_watch(&mut self, path: &Path) -> notify::Result<()> {
+        self.stream_calls.watched += 1;
+        self.watcher.watch(path, RecursiveMode::Recursive)
+    }
+
+    /// Stops watching `path`, which restarts the shared stream.
+    fn stop_watch(&mut self, path: &Path) {
+        self.stream_calls.unwatched += 1;
+        let _ = self.watcher.unwatch(path);
+    }
+
+    /// Stops watching a root that is gone, so a root created again at the same
+    /// path is watched afresh.
+    fn forget_root(&mut self, root: &Path) {
+        if let Some(position) = self
+            .registered
+            .iter()
+            .position(|entry| entry.configured == root)
+        {
+            let entry = self.registered.remove(position);
+            self.stop_watch(&entry.canonical);
+        }
+    }
+
+    fn translate(&mut self, signal: RawSignal, out: &mut Vec<WatchEvent>) {
         match signal {
-            RawSignal::Error => out.push(WatchEvent::Rescan),
+            // `notify` 8.2.0 never reports an error through its callback; the arm
+            // guards a later version.
+            RawSignal::Error => {
+                self.suspect = true;
+                out.push(WatchEvent::Rescan);
+            }
             RawSignal::Event(event) => translate_event(&self.registered, event, out),
         }
     }
@@ -175,15 +226,21 @@ impl WatchBackend for FsEventsBackend {
         let canonical = match fs::canonicalize(root) {
             Ok(canonical) => canonical,
             Err(error) if is_absent_error(&error) => {
+                self.forget_root(root);
                 return RootRegistration::Missing;
             }
-            Err(error) => return RootRegistration::Failed(error),
+            Err(error) => {
+                self.forget_root(root);
+                return RootRegistration::Failed(error);
+            }
         };
         if !canonical.is_dir() {
+            self.forget_root(root);
             return RootRegistration::Missing;
         }
         // The `FSEvents` binding converts paths with `to_str().unwrap()`.
         if canonical.to_str().is_none() {
+            self.forget_root(root);
             return RootRegistration::Failed(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "transcript root path is not valid UTF-8",
@@ -198,10 +255,10 @@ impl WatchBackend for FsEventsBackend {
                 return RootRegistration::Complete;
             }
             let stale = existing.canonical.clone();
-            let _ = self.watcher.unwatch(&stale);
+            self.stop_watch(&stale);
             self.registered.retain(|entry| entry.configured != root);
         }
-        match self.watcher.watch(&canonical, RecursiveMode::Recursive) {
+        match self.start_watch(&canonical) {
             Ok(()) => {
                 self.registered.push(Registered {
                     configured: root.to_path_buf(),
@@ -227,8 +284,31 @@ impl WatchBackend for FsEventsBackend {
     }
 
     fn unregister_all(&mut self) {
-        for entry in self.registered.drain(..) {
-            let _ = self.watcher.unwatch(&entry.canonical);
+        self.suspect = false;
+        let entries = std::mem::take(&mut self.registered);
+        for entry in entries {
+            self.stop_watch(&entry.canonical);
+        }
+    }
+
+    /// Keeps the shared stream running while no root leaves: each `watch` or
+    /// `unwatch` stops and recreates the `FSEvents` stream, and events are not
+    /// delivered until the new stream runs. After a callback error or lost events every
+    /// registration is dropped instead, so a stream that stopped delivering is
+    /// recreated.
+    fn retain_roots(&mut self, roots: &[PathBuf]) {
+        if self.suspect {
+            self.suspect = false;
+            self.unregister_all();
+            return;
+        }
+        let (kept, dropped): (Vec<Registered>, Vec<Registered>) = self
+            .registered
+            .drain(..)
+            .partition(|entry| roots.contains(&entry.configured));
+        self.registered = kept;
+        for entry in dropped {
+            self.stop_watch(&entry.canonical);
         }
     }
 
@@ -252,6 +332,7 @@ impl WatchBackend for FsEventsBackend {
             self.translate(signal, out);
         }
         if self.lost.swap(false, Ordering::AcqRel) {
+            self.suspect = true;
             out.push(WatchEvent::Rescan);
         }
         Ok(())
@@ -266,7 +347,7 @@ mod tests {
     use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
     use notify::{Event, EventKind};
 
-    use super::{translate_event, Registered, WatchEvent};
+    use super::{translate_event, Registered, WatchBackend, WatchEvent};
 
     fn registered() -> Vec<Registered> {
         vec![Registered {
@@ -422,6 +503,145 @@ mod tests {
             vec![WatchEvent::Changed(PathBuf::from(
                 "/home/u/codex-alias/2026/s.jsonl"
             ))]
+        );
+    }
+
+    fn configured(backend: &super::FsEventsBackend) -> Vec<PathBuf> {
+        backend
+            .registered
+            .iter()
+            .map(|entry| entry.configured.clone())
+            .collect()
+    }
+
+    fn calls(backend: &super::FsEventsBackend) -> (usize, usize) {
+        (backend.stream_calls.watched, backend.stream_calls.unwatched)
+    }
+
+    fn open() -> (
+        tempfile::TempDir,
+        super::FsEventsBackend,
+        tokio_util::sync::CancellationToken,
+    ) {
+        (
+            pohunek_test_support::tempdir().expect("base"),
+            super::FsEventsBackend::open().expect("backend"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn a_pass_over_an_unchanged_root_set_makes_no_watch_call() {
+        let (base, mut backend, cancel) = open();
+        let root = base.path().join("projects");
+        fs::create_dir(&root).expect("root");
+        backend.register_root(&root, &cancel);
+        assert_eq!(calls(&backend), (1, 0));
+
+        backend.retain_roots(std::slice::from_ref(&root));
+        backend.register_root(&root, &cancel);
+
+        assert_eq!(calls(&backend), (1, 0), "the stream was not restarted");
+        assert_eq!(configured(&backend), vec![root]);
+    }
+
+    #[test]
+    fn retaining_the_roots_that_stay_unwatches_only_the_others() {
+        let (base, mut backend, cancel) = open();
+        let (a, b) = (base.path().join("a"), base.path().join("b"));
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        backend.register_root(&a, &cancel);
+        backend.register_root(&b, &cancel);
+
+        backend.retain_roots(std::slice::from_ref(&a));
+
+        assert_eq!(configured(&backend), vec![a], "the removed root left");
+        assert_eq!(calls(&backend), (2, 1));
+    }
+
+    #[test]
+    fn a_root_that_vanished_is_forgotten_and_watched_again_when_it_returns() {
+        let (base, mut backend, cancel) = open();
+        let root = base.path().join("projects");
+        fs::create_dir(&root).expect("root");
+        backend.register_root(&root, &cancel);
+
+        fs::remove_dir(&root).expect("remove root");
+        backend.register_root(&root, &cancel);
+        assert!(configured(&backend).is_empty());
+        assert_eq!(calls(&backend), (1, 1), "the gone root was unwatched");
+
+        fs::create_dir(&root).expect("recreate root");
+        backend.register_root(&root, &cancel);
+        assert_eq!(configured(&backend), vec![root], "watched again");
+        assert_eq!(calls(&backend), (2, 1));
+    }
+
+    #[test]
+    fn a_root_whose_canonical_path_changed_is_watched_at_the_new_target() {
+        let (base, mut backend, cancel) = open();
+        let (a, b) = (base.path().join("a"), base.path().join("b"));
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).expect("link to a");
+        backend.register_root(&link, &cancel);
+        let canonical_a = fs::canonicalize(&a).expect("canonical a");
+        assert_eq!(backend.registered[0].canonical, canonical_a);
+
+        let staged = base.path().join("link.new");
+        std::os::unix::fs::symlink(&b, &staged).expect("stage link");
+        fs::rename(&staged, &link).expect("retarget the link");
+        backend.register_root(&link, &cancel);
+
+        assert_eq!(configured(&backend), vec![link]);
+        assert_eq!(
+            backend.registered[0].canonical,
+            fs::canonicalize(&b).expect("canonical b")
+        );
+        assert_eq!(calls(&backend), (2, 1), "the old target was unwatched");
+    }
+
+    #[test]
+    fn a_callback_error_marks_the_streams_suspect_and_the_next_pass_recreates_them() {
+        let (base, mut backend, cancel) = open();
+        let root = base.path().join("projects");
+        fs::create_dir(&root).expect("root");
+        backend.register_root(&root, &cancel);
+
+        let mut out = Vec::new();
+        backend.translate(super::RawSignal::Error, &mut out);
+        assert_eq!(out, vec![WatchEvent::Rescan]);
+        backend.retain_roots(std::slice::from_ref(&root));
+        assert!(
+            configured(&backend).is_empty(),
+            "the suspect stream is dropped"
+        );
+        backend.register_root(&root, &cancel);
+        backend.retain_roots(std::slice::from_ref(&root));
+        assert_eq!(configured(&backend), vec![root], "and later passes keep it");
+    }
+
+    #[tokio::test]
+    async fn a_lost_event_queue_makes_the_next_pass_recreate_the_streams() {
+        let (base, mut backend, cancel) = open();
+        let root = base.path().join("projects");
+        fs::create_dir(&root).expect("root");
+        backend.register_root(&root, &cancel);
+
+        backend
+            .lost
+            .store(true, std::sync::atomic::Ordering::Release);
+        backend.lost_wake.notify_one();
+        let mut out = Vec::new();
+        backend.next_events(&mut out).await.expect("events");
+        assert!(out.contains(&WatchEvent::Rescan), "{out:?}");
+
+        backend.retain_roots(std::slice::from_ref(&root));
+        assert!(
+            configured(&backend).is_empty(),
+            "the suspect stream is dropped"
         );
     }
 }

@@ -5,7 +5,7 @@
 
 // Rust guideline compliant 2026-09-29
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::{
-    start, RootRegistration, RootScan, TranscriptSink, TranscriptWatch, WatchBackend, WatchEvent,
-    WatcherDegraded, WatcherHandle, WatcherUnavailable, MAX_CONCURRENT_TRANSCRIPT_PARSES,
-    MAX_PENDING_TRANSCRIPT_PATHS, RECONCILE_INTERVAL, RESCAN_MIN_INTERVAL, RETRY_BACKOFF_MAX,
-    RETRY_BACKOFF_MIN, TRANSCRIPT_WRITE_DEBOUNCE,
+    start, RootProvider, RootRegistration, RootScan, TranscriptSink, TranscriptWatch, WatchBackend,
+    WatchEvent, WatcherDegraded, WatcherHandle, WatcherUnavailable,
+    MAX_CONCURRENT_TRANSCRIPT_PARSES, MAX_PENDING_TRANSCRIPT_PATHS, RECONCILE_INTERVAL,
+    RESCAN_MIN_INTERVAL, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN, STREAM_REBUILD_INTERVAL,
+    TRANSCRIPT_WRITE_DEBOUNCE,
 };
 use crate::agent::host::{HeadPaths, TranscriptParser};
 use crate::external::TranscriptRoot;
@@ -50,6 +51,10 @@ struct FakeShared {
     restart_calls: AtomicUsize,
     restart_ok: AtomicBool,
     unregister_calls: AtomicUsize,
+    /// Roots that hold a live stream, like a native-tree backend's registrations.
+    streams: Mutex<HashSet<PathBuf>>,
+    /// Streams created over the backend's lifetime.
+    streams_started: AtomicUsize,
 }
 
 struct FakeBackend {
@@ -70,6 +75,16 @@ impl WatchBackend for FakeBackend {
             .get(root)
             .copied()
             .unwrap_or(FakeRegistration::Complete);
+        if matches!(registration, FakeRegistration::Complete)
+            && self
+                .shared
+                .streams
+                .lock()
+                .expect("streams")
+                .insert(root.to_path_buf())
+        {
+            self.shared.streams_started.fetch_add(1, Ordering::SeqCst);
+        }
         match registration {
             FakeRegistration::Complete => RootRegistration::Complete,
             FakeRegistration::Partial => RootRegistration::Partial {
@@ -103,6 +118,15 @@ impl WatchBackend for FakeBackend {
 
     fn unregister_all(&mut self) {
         self.shared.unregister_calls.fetch_add(1, Ordering::SeqCst);
+        self.shared.streams.lock().expect("streams").clear();
+    }
+
+    fn retain_roots(&mut self, roots: &[PathBuf]) {
+        self.shared
+            .streams
+            .lock()
+            .expect("streams")
+            .retain(|root| roots.contains(root));
     }
 
     async fn next_events(&mut self, out: &mut Vec<WatchEvent>) -> io::Result<()> {
@@ -413,7 +437,7 @@ async fn lost_state_hints_coalesce_into_one_rate_limited_pass() {
     assert_eq!(harness.reconciles(), 1);
     advance(RESCAN_MIN_INTERVAL).await;
     assert_eq!(harness.reconciles(), 2);
-    assert_eq!(harness.shared.unregister_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.handle.passes(), 2);
     assert_eq!(harness.shared.register_calls.load(Ordering::SeqCst), 2);
 
     harness.send(vec![WatchEvent::Rescan]);
@@ -843,6 +867,233 @@ async fn a_root_that_stops_being_an_alias_is_picked_up_by_the_next_pass() {
         Some(vec![base.path().join("a")]),
         "and an alias again once it points back"
     );
+}
+
+/// Roots that a test changes between passes.
+struct MutableRoots(Arc<Mutex<Vec<TranscriptRoot>>>);
+
+impl RootProvider for MutableRoots {
+    fn roots(&self) -> impl Future<Output = Vec<TranscriptRoot>> + Send {
+        std::future::ready(self.0.lock().expect("roots").clone())
+    }
+}
+
+/// A watcher over `names` below a fresh base whose backend keeps the streams of
+/// the roots that stay.
+struct StreamHarness {
+    base: tempfile::TempDir,
+    roots: Arc<Mutex<Vec<TranscriptRoot>>>,
+    shared: Arc<FakeShared>,
+    input: Input,
+    sink: Arc<FakeSink>,
+}
+
+impl StreamHarness {
+    async fn start(names: &[&str]) -> Self {
+        let base = pohunek_test_support::tempdir().expect("base");
+        for name in names {
+            std::fs::create_dir(base.path().join(name)).expect("root directory");
+        }
+        let shared = Arc::new(FakeShared::default());
+        let (input, receiver) = mpsc::unbounded_channel();
+        let backend = FakeBackend {
+            input: receiver,
+            shared: Arc::clone(&shared),
+        };
+        let sink = Arc::new(FakeSink::default());
+        let roots = Arc::new(Mutex::new(
+            names
+                .iter()
+                .map(|name| claude_root(&base.path().join(name)))
+                .collect(),
+        ));
+        start(
+            backend,
+            MutableRoots(Arc::clone(&roots)),
+            Arc::clone(&sink),
+            CancellationToken::new(),
+            &TaskTracker::new(),
+            None,
+        )
+        .await;
+        Self {
+            base,
+            roots,
+            shared,
+            input,
+            sink,
+        }
+    }
+
+    fn root(&self, name: &str) -> PathBuf {
+        self.base.path().join(name)
+    }
+
+    fn set_roots(&self, names: &[&str]) {
+        *self.roots.lock().expect("roots") = names
+            .iter()
+            .map(|name| {
+                std::fs::create_dir_all(self.base.path().join(name)).expect("root directory");
+                claude_root(&self.base.path().join(name))
+            })
+            .collect();
+    }
+
+    fn started(&self) -> usize {
+        self.shared.streams_started.load(Ordering::SeqCst)
+    }
+
+    fn streams(&self) -> BTreeSet<PathBuf> {
+        self.shared
+            .streams
+            .lock()
+            .expect("streams")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_periodic_pass_over_an_unchanged_root_set_keeps_every_stream() {
+    let harness = StreamHarness::start(&["a", "b"]).await;
+    assert_eq!(harness.started(), 2);
+    let passes = harness.sink.reconciles.load(Ordering::SeqCst);
+
+    advance(RECONCILE_INTERVAL).await;
+    advance(RECONCILE_INTERVAL).await;
+
+    assert!(harness.sink.reconciles.load(Ordering::SeqCst) >= passes + 2);
+    assert_eq!(harness.started(), 2, "no pass restarted a stream");
+    assert_eq!(
+        harness.streams(),
+        BTreeSet::from([harness.root("a"), harness.root("b")])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rescan_hint_and_a_tree_change_keep_the_streams() {
+    let harness = StreamHarness::start(&["a"]).await;
+    let passes = harness.sink.reconciles.load(Ordering::SeqCst);
+
+    let _ = harness.input.send(Ok(vec![WatchEvent::Rescan]));
+    advance(RESCAN_MIN_INTERVAL).await;
+    let after_rescan = harness.sink.reconciles.load(Ordering::SeqCst);
+    assert!(after_rescan > passes, "the rescan hint ran a pass");
+
+    let _ = harness
+        .input
+        .send(Ok(vec![WatchEvent::TreeChanged(harness.root("a"))]));
+    advance(RESCAN_MIN_INTERVAL).await;
+    assert!(harness.sink.reconciles.load(Ordering::SeqCst) > after_rescan);
+
+    assert_eq!(harness.started(), 1, "no pass restarted the stream");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_added_root_starts_only_its_own_stream() {
+    let harness = StreamHarness::start(&["a"]).await;
+    assert_eq!(harness.started(), 1);
+
+    harness.set_roots(&["a", "b"]);
+    advance(RECONCILE_INTERVAL).await;
+
+    assert_eq!(harness.started(), 2, "only the added root started a stream");
+    assert_eq!(
+        harness.streams(),
+        BTreeSet::from([harness.root("a"), harness.root("b")])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_went_silent_is_rebuilt_by_the_periodic_full_rebuild() {
+    let harness = StreamHarness::start(&["a", "b"]).await;
+    assert_eq!(harness.started(), 2);
+
+    // The pass at the end of this time keeps the streams: the interval has not
+    // elapsed yet.
+    advance(STREAM_REBUILD_INTERVAL.saturating_sub(RECONCILE_INTERVAL)).await;
+    assert_eq!(harness.started(), 2, "no rebuild before the interval");
+
+    // The pass that crosses it recreates every stream once.
+    advance(RECONCILE_INTERVAL).await;
+    assert_eq!(harness.started(), 4, "every stream was recreated");
+    let rebuilt = harness.shared.unregister_calls.load(Ordering::SeqCst);
+    assert_eq!(rebuilt, 1, "by one full unregister");
+
+    // And the interval starts over.
+    advance(STREAM_REBUILD_INTERVAL.saturating_sub(RECONCILE_INTERVAL)).await;
+    assert_eq!(harness.started(), 4);
+    advance(RECONCILE_INTERVAL).await;
+    assert_eq!(harness.started(), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_removed_root_drops_only_its_own_stream() {
+    let harness = StreamHarness::start(&["a", "b"]).await;
+    assert_eq!(harness.started(), 2);
+
+    harness.set_roots(&["a"]);
+    advance(RECONCILE_INTERVAL).await;
+
+    assert_eq!(harness.started(), 2, "the kept root was not restarted");
+    assert_eq!(harness.streams(), BTreeSet::from([harness.root("a")]));
+}
+
+/// A backend that keeps the trait's default `retain_roots`, like inotify.
+struct RebuildingBackend(FakeBackend);
+
+impl WatchBackend for RebuildingBackend {
+    const OFFLOAD_REGISTRATION: bool = false;
+
+    fn register_root(&mut self, root: &Path, cancel: &CancellationToken) -> RootRegistration {
+        self.0.register_root(root, cancel)
+    }
+
+    fn restart(&mut self) -> io::Result<()> {
+        self.0.restart()
+    }
+
+    fn unregister_all(&mut self) {
+        self.0.unregister_all();
+    }
+
+    fn next_events(
+        &mut self,
+        out: &mut Vec<WatchEvent>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        self.0.next_events(out)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_backend_with_the_default_retention_rebuilds_every_registration_per_pass() {
+    let base = pohunek_test_support::tempdir().expect("base");
+    let shared = Arc::new(FakeShared::default());
+    let (_input, receiver) = mpsc::unbounded_channel();
+    let backend = RebuildingBackend(FakeBackend {
+        input: receiver,
+        shared: Arc::clone(&shared),
+    });
+    start(
+        backend,
+        vec![claude_root(base.path())],
+        Arc::new(FakeSink::default()),
+        CancellationToken::new(),
+        &TaskTracker::new(),
+        None,
+    )
+    .await;
+    let unregistered = shared.unregister_calls.load(Ordering::SeqCst);
+
+    advance(RECONCILE_INTERVAL).await;
+
+    assert_eq!(
+        shared.unregister_calls.load(Ordering::SeqCst),
+        unregistered + 1,
+        "the default unregisters everything before the pass registers it again"
+    );
+    assert_eq!(shared.streams_started.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(start_paused = true)]
