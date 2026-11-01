@@ -18,7 +18,7 @@ directory holds exactly what the archive holds:
 
 ```text
 runtime-packages/hermes/
-  runtime.toml    runtime descriptor (package pohunek.runtime.hermes 1.0.3)
+  runtime.toml    runtime descriptor (package pohunek.runtime.hermes 1.0.4)
   detect.toml     detection manifest named by `detect_manifest`
   operator.toml   closed sidecar: every operator payload file and its SHA-256
   operator/       the operator plugin payload the sidecar lists
