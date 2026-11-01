@@ -2361,7 +2361,7 @@ async fn release_worker(fixture: &Fixture, id: &ServiceId, status: &str) {
 #[tokio::test]
 async fn a_worker_that_exits_with_a_status_reports_it_until_retirement() {
     let fixture = Fixture::new();
-    let key = key("s-1301", "abcd2351");
+    let key = key("s-1301", "abcd2356");
     let (id, process) = armed_worker(&fixture, &key).await;
 
     release_worker(&fixture, &id, "3").await;
