@@ -309,7 +309,10 @@ observation, native-report, capability, and notification-policy objects are
 strict: the daemon rejects unknown fields in them. A client keeps the unknown
 keys of the session capabilities, the session retention policy and the
 notification policy (with its `retention`) it reads, and sends the policies
-back; the per-kind notification flags stay strict for the client too.
+back. The per-kind flags of `NotificationPolicy` are a map from
+`NotificationKind` to boolean: the generated `NotificationKindPolicy` TypeScript
+type has an optional key per kind, because a daemon that predates a kind omits
+it, and a client keeps the kinds it does not know and sends them back.
 Changing their accepted shape requires the appropriate negotiated-version
 treatment. `RuntimeRef` values and provider-policy map
 keys are deliberately open value namespaces, not open object shapes.

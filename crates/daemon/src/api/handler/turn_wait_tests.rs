@@ -561,9 +561,10 @@ async fn disabled_hook_turn_wakes_the_wait_without_an_inbox_record_and_chains() 
 async fn enabled_turn_names_its_inbox_record() {
     let fixture = Fixture::with_policy(
         SessionRegistryConfig::default(),
-        Some(every_provider(NotificationKindPolicy {
-            turn_completed: true,
-            ..default_policy().enabled
+        Some(every_provider({
+            let mut policy = default_policy().enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
         })),
     );
     let session = fixture.session("enabled").await;
@@ -626,9 +627,10 @@ async fn a_blocked_agent_fires_through_the_projector_whatever_the_policy() {
     for blocked_inbox in [true, false] {
         let fixture = Fixture::with_policy(
             SessionRegistryConfig::default(),
-            Some(every_provider(NotificationKindPolicy {
-                agent_blocked: blocked_inbox,
-                ..default_policy().enabled
+            Some(every_provider({
+                let mut policy = default_policy().enabled;
+                policy.set(protocol::NotificationKind::AgentBlocked, blocked_inbox);
+                policy
             })),
         );
         let session = fixture.session("blocked").await;
@@ -662,9 +664,10 @@ async fn a_blocked_agent_fires_through_the_projector_whatever_the_policy() {
 #[tokio::test]
 async fn a_dropped_provider_report_keeps_the_inbox_record_and_its_deadline() {
     let mut policy = default_policy();
-    let claude = NotificationKindPolicy {
-        approval_required: false,
-        ..policy.enabled.clone()
+    let claude = {
+        let mut policy = policy.enabled.clone();
+        policy.set(protocol::NotificationKind::ApprovalRequired, false);
+        policy
     };
     policy.providers.insert("claude".to_owned(), claude);
     let fixture = Fixture::with_policy(SessionRegistryConfig::default(), Some(policy));
@@ -1309,9 +1312,10 @@ async fn a_stale_stop_during_the_next_turn_is_dropped() {
 async fn a_flap_between_two_hook_stops_inside_the_window_is_one_logical_turn() {
     let fixture = Fixture::with_policy(
         SessionRegistryConfig::default(),
-        Some(every_provider(NotificationKindPolicy {
-            turn_completed: true,
-            ..default_policy().enabled
+        Some(every_provider({
+            let mut policy = default_policy().enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
         })),
     );
     let session = fixture.session("two-quick").await;

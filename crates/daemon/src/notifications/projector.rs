@@ -1276,10 +1276,9 @@ mod tests {
 
     use protocol::{
         event, AgentActivity, Event, NotificationCreateParams, NotificationDeleteParams,
-        NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationSeverity,
-        NotificationSource, NotificationStatus, NotificationUpdateParams, RuntimeGeneration,
-        RuntimeRef, RuntimeState, SessionId, SessionInfo, SessionRuntime, SessionState,
-        StateSource,
+        NotificationKind, NotificationListParams, NotificationSeverity, NotificationSource,
+        NotificationStatus, NotificationUpdateParams, RuntimeGeneration, RuntimeRef, RuntimeState,
+        SessionId, SessionInfo, SessionRuntime, SessionState, StateSource,
     };
     use serde_json::json;
 
@@ -1396,9 +1395,10 @@ mod tests {
 
     fn enable_session_finished(service: &NotificationService) {
         let mut policy = default_policy();
-        policy.enabled = NotificationKindPolicy {
-            session_finished: true,
-            ..policy.enabled
+        policy.enabled = {
+            let mut policy = policy.enabled;
+            policy.set(protocol::NotificationKind::SessionFinished, true);
+            policy
         };
         policy.providers.clear();
         service.set_policy(policy).expect("set notification policy");
@@ -1406,9 +1406,10 @@ mod tests {
 
     fn enable_turn_completed(service: &NotificationService) {
         let mut policy = default_policy();
-        policy.enabled = NotificationKindPolicy {
-            turn_completed: true,
-            ..policy.enabled
+        policy.enabled = {
+            let mut policy = policy.enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
         };
         policy.providers.clear();
         service.set_policy(policy).expect("set notification policy");

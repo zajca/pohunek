@@ -43,14 +43,14 @@ impl DaemonStub {
         let notifications = crate::notifications::NotificationService::open(notification_dir)
             .expect("notification service");
         let mut policy = crate::notifications::default_policy();
-        policy.enabled = protocol::NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: true,
-            session_finished: true,
-            error: true,
-            system: true,
-        };
+        policy.enabled = protocol::NotificationKindPolicy::from_flags([
+            (protocol::NotificationKind::AgentBlocked, true),
+            (protocol::NotificationKind::ApprovalRequired, true),
+            (protocol::NotificationKind::TurnCompleted, true),
+            (protocol::NotificationKind::SessionFinished, true),
+            (protocol::NotificationKind::Error, true),
+            (protocol::NotificationKind::System, true),
+        ]);
         policy.providers.clear();
         notifications.set_policy(policy).expect("enable all kinds");
         let sessions =

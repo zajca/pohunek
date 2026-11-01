@@ -13,9 +13,9 @@ use std::time::Duration;
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use pohunek_test_support::wait::guard;
 use protocol::{
-    event, method, NotificationCreateParams, NotificationKind, NotificationKindPolicy,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    ProtocolError, SessionId, IDLE_STOP_METADATA_KEY,
+    event, method, NotificationCreateParams, NotificationKind, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, ProtocolError, SessionId,
+    IDLE_STOP_METADATA_KEY,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -64,9 +64,10 @@ fn config(config_dir: Option<PathBuf>) -> SessionRegistryConfig {
 
 /// The notification policy that keeps `system` records in the inbox.
 fn system_enabled() -> protocol::NotificationPolicy {
-    every_provider(NotificationKindPolicy {
-        system: true,
-        ..default_policy().enabled
+    every_provider({
+        let mut policy = default_policy().enabled;
+        policy.set(protocol::NotificationKind::System, true);
+        policy
     })
 }
 

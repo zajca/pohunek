@@ -667,9 +667,10 @@ fn turn_kind(kind: NotificationKind) -> Option<SessionTurnEventKind> {
         NotificationKind::TurnCompleted => Some(SessionTurnEventKind::TurnCompleted),
         NotificationKind::AgentBlocked => Some(SessionTurnEventKind::AgentBlocked),
         NotificationKind::ApprovalRequired => Some(SessionTurnEventKind::ApprovalRequired),
-        NotificationKind::SessionFinished | NotificationKind::Error | NotificationKind::System => {
-            None
-        }
+        NotificationKind::SessionFinished
+        | NotificationKind::Error
+        | NotificationKind::System
+        | NotificationKind::Unknown => None,
     }
 }
 
@@ -698,9 +699,9 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        event, Event, NotificationCreateParams, NotificationKind, NotificationKindPolicy,
-        NotificationListParams, NotificationRecord, NotificationSeverity, NotificationSource,
-        NotificationStatus, SessionId,
+        event, Event, NotificationCreateParams, NotificationKind, NotificationListParams,
+        NotificationRecord, NotificationSeverity, NotificationSource, NotificationStatus,
+        SessionId,
     };
     use tokio::sync::broadcast;
 
@@ -725,9 +726,10 @@ mod tests {
 
     fn enable_turn_completed(service: &NotificationService) {
         let mut policy = default_policy();
-        policy.enabled = NotificationKindPolicy {
-            turn_completed: true,
-            ..policy.enabled
+        policy.enabled = {
+            let mut policy = policy.enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
         };
         policy.providers.clear();
         service.set_policy(policy).expect("set policy");

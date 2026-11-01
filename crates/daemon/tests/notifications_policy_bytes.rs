@@ -22,24 +22,24 @@ fn policy() -> NotificationPolicy {
     NotificationPolicy {
         attention_dedupe_window_secs: 90,
         attention_debounce_secs: 7,
-        enabled: NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: false,
-            session_finished: false,
-            error: true,
-            system: true,
-        },
+        enabled: NotificationKindPolicy::from_flags([
+            (protocol::NotificationKind::AgentBlocked, true),
+            (protocol::NotificationKind::ApprovalRequired, true),
+            (protocol::NotificationKind::TurnCompleted, false),
+            (protocol::NotificationKind::SessionFinished, false),
+            (protocol::NotificationKind::Error, true),
+            (protocol::NotificationKind::System, true),
+        ]),
         providers: BTreeMap::from([(
             "codex".to_owned(),
-            NotificationKindPolicy {
-                agent_blocked: true,
-                approval_required: false,
-                turn_completed: true,
-                session_finished: false,
-                error: true,
-                system: false,
-            },
+            NotificationKindPolicy::from_flags([
+                (protocol::NotificationKind::AgentBlocked, true),
+                (protocol::NotificationKind::ApprovalRequired, false),
+                (protocol::NotificationKind::TurnCompleted, true),
+                (protocol::NotificationKind::SessionFinished, false),
+                (protocol::NotificationKind::Error, true),
+                (protocol::NotificationKind::System, false),
+            ]),
         )]),
         retention: NotificationRetentionPolicy {
             sweep_interval_secs: 60,

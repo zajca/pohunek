@@ -880,14 +880,7 @@ fn set_kind_enabled(
     kind: NotificationKind,
     enabled: bool,
 ) {
-    match kind {
-        NotificationKind::AgentBlocked => policy.agent_blocked = enabled,
-        NotificationKind::ApprovalRequired => policy.approval_required = enabled,
-        NotificationKind::TurnCompleted => policy.turn_completed = enabled,
-        NotificationKind::SessionFinished => policy.session_finished = enabled,
-        NotificationKind::Error => policy.error = enabled,
-        NotificationKind::System => policy.system = enabled,
-    }
+    policy.set(kind, enabled);
 }
 
 fn render_single_host_list_json(result: &NotificationListResult) -> Result<String, CliError> {
@@ -1173,16 +1166,21 @@ fn render_policy_human(host: &str, policy: &NotificationPolicy) -> String {
 }
 
 fn render_kind_policy(output: &mut String, label: &str, policy: &protocol::NotificationKindPolicy) {
-    let _ = writeln!(
-        output,
-        "  {label}: agent_blocked={} approval_required={} turn_completed={} session_finished={} error={} system={}",
-        policy.agent_blocked,
-        policy.approval_required,
-        policy.turn_completed,
-        policy.session_finished,
-        policy.error,
-        policy.system,
-    );
+    let _ = write!(output, "  {label}:");
+    for kind in NotificationKind::KNOWN {
+        match policy.get(kind) {
+            Some(enabled) => {
+                let _ = write!(output, " {}={enabled}", kind.as_str());
+            }
+            None => {
+                let _ = write!(output, " {}=unset", kind.as_str());
+            }
+        }
+    }
+    for (key, value) in policy.unknown_flags() {
+        let _ = write!(output, " {key}={value}");
+    }
+    output.push('\n');
 }
 
 fn render_retention_results_human(results: &[HostResult<NotificationRetentionResult>]) -> String {

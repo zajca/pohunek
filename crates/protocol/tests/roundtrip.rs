@@ -183,14 +183,14 @@ fn notification_record() -> NotificationRecord {
 }
 
 fn notification_kind_policy() -> NotificationKindPolicy {
-    NotificationKindPolicy {
-        agent_blocked: true,
-        approval_required: true,
-        turn_completed: false,
-        session_finished: false,
-        error: true,
-        system: false,
-    }
+    NotificationKindPolicy::from_flags([
+        (protocol::NotificationKind::AgentBlocked, true),
+        (protocol::NotificationKind::ApprovalRequired, true),
+        (protocol::NotificationKind::TurnCompleted, false),
+        (protocol::NotificationKind::SessionFinished, false),
+        (protocol::NotificationKind::Error, true),
+        (protocol::NotificationKind::System, false),
+    ])
 }
 
 fn notification_policy() -> NotificationPolicy {
@@ -201,25 +201,25 @@ fn notification_policy() -> NotificationPolicy {
         providers: BTreeMap::from([
             (
                 "codex".to_owned(),
-                NotificationKindPolicy {
-                    agent_blocked: true,
-                    approval_required: true,
-                    turn_completed: false,
-                    session_finished: false,
-                    error: true,
-                    system: true,
-                },
+                NotificationKindPolicy::from_flags([
+                    (protocol::NotificationKind::AgentBlocked, true),
+                    (protocol::NotificationKind::ApprovalRequired, true),
+                    (protocol::NotificationKind::TurnCompleted, false),
+                    (protocol::NotificationKind::SessionFinished, false),
+                    (protocol::NotificationKind::Error, true),
+                    (protocol::NotificationKind::System, true),
+                ]),
             ),
             (
                 "claude".to_owned(),
-                NotificationKindPolicy {
-                    agent_blocked: true,
-                    approval_required: true,
-                    turn_completed: true,
-                    session_finished: false,
-                    error: true,
-                    system: false,
-                },
+                NotificationKindPolicy::from_flags([
+                    (protocol::NotificationKind::AgentBlocked, true),
+                    (protocol::NotificationKind::ApprovalRequired, true),
+                    (protocol::NotificationKind::TurnCompleted, true),
+                    (protocol::NotificationKind::SessionFinished, false),
+                    (protocol::NotificationKind::Error, true),
+                    (protocol::NotificationKind::System, false),
+                ]),
             ),
         ]),
         retention: protocol::NotificationRetentionPolicy::default(),
@@ -3051,10 +3051,24 @@ fn notification_policy_is_strict_open_and_deterministic() {
         "providers": {"zeta-agent": flags, "future-agent": flags}
     }))
     .expect("arbitrary provider names remain forward compatible");
-    assert!(!policy.for_provider("future-agent").system);
+    assert_eq!(
+        policy
+            .for_provider("future-agent")
+            .get(NotificationKind::System),
+        Some(false)
+    );
     assert_eq!(policy.for_provider("missing"), &policy.enabled);
     let wire = serde_json::to_string(&policy).expect("serialize policy");
     assert!(wire.find("future-agent").unwrap() < wire.find("zeta-agent").unwrap());
+
+    assert_eq!(
+        serde_json::to_string(&notification_kind_policy()).unwrap(),
+        concat!(
+            r#"{"agent_blocked":true,"approval_required":true,"turn_completed":false,"#,
+            r#""session_finished":false,"error":true,"system":false}"#
+        ),
+        "the six kinds serialize with the keys and order of the struct they replace"
+    );
 
     let mut invalid_flags = serde_json::to_value(notification_kind_policy()).unwrap();
     invalid_flags["future_flag"] = json!(true);

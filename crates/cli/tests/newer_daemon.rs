@@ -397,8 +397,13 @@ fn an_integration_doctor_finding_from_a_newer_daemon_renders_unknown() {
 }
 
 /// One `notification_created` event line whose record carries `severity` and
-/// `status` as raw wire strings.
+/// `status` as raw wire strings, a kind this build knows.
 fn notification_created_line(id: &str, severity: &str, status: &str) -> String {
+    notification_created_line_of_kind(id, "approval_required", severity, status)
+}
+
+/// Like [`notification_created_line`] with the `kind` as a raw wire string.
+fn notification_created_line_of_kind(id: &str, kind: &str, severity: &str, status: &str) -> String {
     let record = protocol::NotificationRecord {
         id: protocol::NotificationId(id.to_owned()),
         source: protocol::NotificationSource {
@@ -428,6 +433,7 @@ fn notification_created_line(id: &str, severity: &str, status: &str) -> String {
         session_metadata: std::collections::BTreeMap::new(),
     };
     let mut record = serde_json::to_value(record).expect("record JSON");
+    record["kind"] = json!(kind);
     record["severity"] = json!(severity);
     record["status"] = json!(status);
     let event = protocol::Event::new(
@@ -489,6 +495,58 @@ fn a_notification_watch_filter_does_not_select_a_record_of_unknown_status() {
         assert!(!stdout.contains("n-newer"), "{filter:?}: {stdout}");
         assert!(stdout.contains("n-known"), "{filter:?}: {stdout}");
     }
+}
+
+/// A record of a kind this build does not know followed by a known one.
+fn newer_kind_notification_stream() -> Vec<String> {
+    vec![
+        notification_created_line_of_kind(
+            "n-newer-kind",
+            "a_kind_from_a_newer_daemon",
+            "info",
+            "unread",
+        ),
+        notification_created_line("n-known", "info", "unread"),
+    ]
+}
+
+fn watch_a_newer_kind(extra: &[&str]) -> Output {
+    let mut arguments = vec!["notifications", "watch"];
+    arguments.extend_from_slice(extra);
+    run_against_streaming_daemon(
+        &arguments,
+        |_request| None,
+        newer_kind_notification_stream(),
+    )
+}
+
+#[test]
+fn a_notification_watch_keeps_streaming_past_a_record_of_a_kind_from_a_newer_daemon() {
+    let output = watch_a_newer_kind(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let records: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON line per record"))
+        .collect();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["record"]["id"], "n-newer-kind", "{records:?}");
+    assert_eq!(records[0]["record"]["kind"], "unknown", "{records:?}");
+    assert_eq!(records[1]["record"]["id"], "n-known", "{records:?}");
+    assert_eq!(
+        records[1]["record"]["kind"], "approval_required",
+        "{records:?}"
+    );
+}
+
+#[test]
+fn a_notification_watch_kind_filter_does_not_select_a_record_of_unknown_kind() {
+    let output = watch_a_newer_kind(&["--kind", "approval_required"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("n-newer-kind"), "{stdout}");
+    assert!(stdout.contains("n-known"), "{stdout}");
 }
 
 fn newer_daemon_project() -> Value {
@@ -1060,14 +1118,14 @@ fn a_notification_policy_set_sends_back_the_keys_of_a_newer_daemon() {
     let mut current = serde_json::to_value(protocol::NotificationPolicy {
         attention_dedupe_window_secs: 90,
         attention_debounce_secs: 7,
-        enabled: protocol::NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: false,
-            session_finished: false,
-            error: true,
-            system: true,
-        },
+        enabled: protocol::NotificationKindPolicy::from_flags([
+            (protocol::NotificationKind::AgentBlocked, true),
+            (protocol::NotificationKind::ApprovalRequired, true),
+            (protocol::NotificationKind::TurnCompleted, false),
+            (protocol::NotificationKind::SessionFinished, false),
+            (protocol::NotificationKind::Error, true),
+            (protocol::NotificationKind::System, true),
+        ]),
         providers: std::collections::BTreeMap::new(),
         retention: protocol::NotificationRetentionPolicy::default(),
         unknown_fields: protocol::tolerant::UnknownFields::default(),
@@ -1075,6 +1133,10 @@ fn a_notification_policy_set_sends_back_the_keys_of_a_newer_daemon() {
     .expect("policy JSON");
     current["a_key_from_a_newer_daemon"] = json!({"nested": [1, 2]});
     current["retention"]["a_retention_key_from_a_newer_daemon"] = json!(5);
+    current["enabled"]["a_kind_from_a_newer_daemon"] = json!(true);
+    let mut override_flags = current["enabled"].clone();
+    override_flags["another_kind_from_a_newer_daemon"] = json!(false);
+    current["providers"] = json!({ "codex": override_flags });
     let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let output = run_against_scripted_daemon(
@@ -1102,6 +1164,14 @@ fn a_notification_policy_set_sends_back_the_keys_of_a_newer_daemon() {
     assert_eq!(sent.len(), 1, "{sent:?}");
     let policy = &sent[0]["policy"];
     assert_eq!(policy["enabled"]["turn_completed"], true, "{policy}");
+    assert_eq!(
+        policy["enabled"]["a_kind_from_a_newer_daemon"], true,
+        "{policy}"
+    );
+    assert_eq!(
+        policy["providers"]["codex"], current["providers"]["codex"],
+        "{policy}"
+    );
     assert_eq!(
         policy["a_key_from_a_newer_daemon"], current["a_key_from_a_newer_daemon"],
         "{policy}"

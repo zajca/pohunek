@@ -212,14 +212,14 @@ async fn spawn_server(
     let notifications = NotificationService::open(&state_root.join("notification-data"))
         .expect("notification service opens");
     let mut policy = pohunek_daemon::notifications::default_policy();
-    policy.enabled = protocol::NotificationKindPolicy {
-        agent_blocked: true,
-        approval_required: true,
-        turn_completed: true,
-        session_finished: true,
-        error: true,
-        system: true,
-    };
+    policy.enabled = protocol::NotificationKindPolicy::from_flags([
+        (protocol::NotificationKind::AgentBlocked, true),
+        (protocol::NotificationKind::ApprovalRequired, true),
+        (protocol::NotificationKind::TurnCompleted, true),
+        (protocol::NotificationKind::SessionFinished, true),
+        (protocol::NotificationKind::Error, true),
+        (protocol::NotificationKind::System, true),
+    ]);
     policy.providers.clear();
     notifications
         .set_policy(policy)
@@ -1529,6 +1529,32 @@ async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
                     "error": true, "system": true,
                 },
                 "key_from_a_newer_client": 1,
+            }}),
+        ),
+        (
+            "notification-kind-extra",
+            method::NOTIFICATION_POLICY_SET,
+            json!({"policy": {
+                "attention_dedupe_window_secs": 90,
+                "enabled": {
+                    "agent_blocked": true, "approval_required": true,
+                    "turn_completed": true, "session_finished": true,
+                    "error": true, "system": true,
+                    "a_kind_from_a_newer_client": true,
+                },
+            }}),
+        ),
+        (
+            "notification-provider-kind-extra",
+            method::NOTIFICATION_POLICY_SET,
+            json!({"policy": {
+                "attention_dedupe_window_secs": 90,
+                "enabled": {
+                    "agent_blocked": true, "approval_required": true,
+                    "turn_completed": true, "session_finished": true,
+                    "error": true, "system": true,
+                },
+                "providers": {"codex": {"a_kind_from_a_newer_client": true}},
             }}),
         ),
         (

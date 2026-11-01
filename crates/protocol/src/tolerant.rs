@@ -179,6 +179,16 @@ impl UnknownFields {
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.0.keys().map(String::as_str)
     }
+
+    /// The kept keys with their raw values, in key order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.0.iter().map(|(key, value)| (key.as_str(), value))
+    }
+
+    /// Keeps `value` under `key`; `true` when the key was already kept.
+    pub(crate) fn insert(&mut self, key: String, value: serde_json::Value) -> bool {
+        self.0.insert(key, value).is_some()
+    }
 }
 
 impl Serialize for UnknownFields {

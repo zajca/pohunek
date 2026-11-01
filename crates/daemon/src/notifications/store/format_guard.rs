@@ -25,8 +25,8 @@ use persisted_shape::{
     unit_values, EnumEntry, Leaves, SnapshotGuard,
 };
 use protocol::{
-    NotificationKind, NotificationKindPolicy, NotificationPolicy, NotificationRecord,
-    NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationKind, NotificationPolicy, NotificationRecord, NotificationRetentionPolicy,
+    NotificationSeverity, NotificationSource, NotificationStatus,
 };
 use serde_json::{json, Value};
 
@@ -110,15 +110,7 @@ fn assert_every_field_is_reviewed(record: &NotificationRecord, policy: &Notifica
     let NotificationPolicy {
         attention_dedupe_window_secs: _,
         attention_debounce_secs: _,
-        enabled:
-            NotificationKindPolicy {
-                agent_blocked: _,
-                approval_required: _,
-                turn_completed: _,
-                session_finished: _,
-                error: _,
-                system: _,
-            },
+        enabled: _,
         providers: _,
         // Serializes no key while empty, so the document keeps its format-1 keys.
         unknown_fields: _,
@@ -182,10 +174,7 @@ fn enums() -> Vec<EnumEntry> {
         },
         EnumEntry {
             paths: at_records("kind"),
-            values: unit_values!(
-                NotificationKind: AgentBlocked, ApprovalRequired, TurnCompleted, SessionFinished,
-                Error, System
-            ),
+            values: kind_values(),
         },
         EnumEntry {
             paths: at_records("severity"),
@@ -251,13 +240,32 @@ fn collapse_maps(path: &str) -> String {
     path.to_owned()
 }
 
-/// The sample policy: every key populated, with one provider override.
+/// The serialized values of `NotificationKind`. A variant missing here fails to
+/// compile, and the policy sample must carry exactly one flag per value.
+fn kind_values() -> Vec<String> {
+    unit_values!(
+        NotificationKind: AgentBlocked, ApprovalRequired, TurnCompleted, SessionFinished,
+        Error, System; skip Unknown
+    )
+}
+
+/// The sample policy: every key populated, with one provider override, and one
+/// flag per notification kind.
 fn policy_document() -> Value {
     let mut policy = crate::notifications::default_policy();
     policy
         .providers
         .insert("codex".to_owned(), policy.enabled.clone());
-    serde_json::to_value(policy).expect("policy json")
+    let document = serde_json::to_value(policy).expect("policy json");
+    let flags = document["enabled"].as_object().expect("policy flags");
+    let flagged: BTreeSet<&str> = flags.keys().map(String::as_str).collect();
+    let kinds = kind_values();
+    let kinds: BTreeSet<&str> = kinds.iter().map(String::as_str).collect();
+    assert_eq!(
+        flagged, kinds,
+        "the policy sample must carry exactly one flag per notification kind"
+    );
+    document
 }
 
 /// Key and `path=value` lines of the notification store.
