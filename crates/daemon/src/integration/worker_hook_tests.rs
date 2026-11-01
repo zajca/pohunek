@@ -1815,6 +1815,13 @@ mod subagent_sequences {
         assert_eq!(report["native_reference"], "native-recovered", "{report}");
         assert_eq!(report["provider"], "claude", "{report}");
         assert!(report.get("session_source").is_none(), "{report}");
+        // The snapshot is ordered after the identity report, whose acceptance
+        // clears the snapshot of a previous owner at the worker's clock.
+        let snapshot: Value = serde_json::from_str(&claims[1]).expect("the snapshot claim");
+        assert!(
+            snapshot["sequence"].as_u64() > report["sequence"].as_u64(),
+            "{report} {snapshot}"
+        );
     }
 
     /// A Stop whose task list cannot be used still reports the identity, and a

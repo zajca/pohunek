@@ -902,7 +902,7 @@ if action == ACTION_PROMPT_SUBMIT:
     raise SystemExit(0)
 
 if action == ACTION_STOP:
-    # The end of a turn repeats the identity report: it is idempotent and
+    # The end of a turn repeats the identity report: it is safe to repeat,
     # ordered by `sequence`, and it recovers a SessionStart report that was lost
     # because the agent killed that hook. The worker is the only route.
     if native_session_id:
@@ -910,6 +910,9 @@ if action == ACTION_STOP:
     if input_problem is not None:
         trace(*input_problem)
         raise SystemExit(0)
+    # A report of another process clears the snapshot of the previous owner at
+    # the worker's clock, so the snapshot is ordered after that report.
+    sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     send_worker_snapshot(hook_input["tasks"])
     raise SystemExit(0)
 

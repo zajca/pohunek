@@ -3771,9 +3771,9 @@ start is not a subagent and adds no row, while a Codex one records a completed
 child; see `subagents` under `SessionInfo`. The Claude integration handler also
 registers the state hook on the main-agent `Stop` (action `stop`): when the input names a
 `session_id` it first repeats the `identity_report` claim of `SessionStart` (the same
-`session_id` and `transcript_path` fields; the claim is idempotent and ordered by `sequence`),
+`session_id` and `transcript_path` fields; the claim is safe to repeat and ordered by `sequence`),
 which recovers a native reference whose `SessionStart` hook the agent killed before it
-reported, and the report does not depend on the task list. It then sends the worker one
+reported, and the report does not depend on the task list (a Stop input over the hook input limit carries no usable session id, so that turn recovers nothing). It then sends the worker one
 `subagent_snapshot` claim with, for each entry of `background_tasks`, the
 required `id`, `type` and `status`, and the optional fields that sanitize:
 `label` from `description` (every type; control and format characters removed,
