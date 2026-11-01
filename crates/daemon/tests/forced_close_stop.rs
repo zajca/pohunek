@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use pohunek_daemon::procwatch::{HostInspector, ProcessIdentity, ProcessInspector};
 use pohunek_daemon::runtime::{
@@ -276,7 +276,7 @@ struct Scenario {
     /// Whether the holder hides its markers.
     hides_markers: bool,
     /// The worker journal's path, resolved by the first read.
-    journal_path: std::sync::OnceLock<PathBuf>,
+    journal_path: OnceLock<PathBuf>,
     /// Keeps other test runs' unreadable holders from overlapping this
     /// scenario's sweeps; declared last, so it is released last.
     _host_lock: HostLock,
@@ -384,8 +384,8 @@ impl Scenario {
             release: ReleaseHolder(barrier),
             withheld: Arc::new(AtomicU32::new(0)),
             hides_markers: matches!(holder, Holder::NonDumpable),
+            journal_path: OnceLock::new(),
             _host_lock: host_lock,
-            journal_path: std::sync::OnceLock::new(),
         }
     }
 

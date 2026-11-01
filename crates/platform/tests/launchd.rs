@@ -400,7 +400,7 @@ async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
 }
 
 #[tokio::test]
-async fn a_loaded_worker_without_its_definition_is_invalid_data_until_retired() {
+async fn a_loaded_worker_without_its_definition_is_invalid_data() {
     let mut fixture = Fixture::new();
     let key = key("s-1002", "abcd2347");
     let id = key.service_id();
