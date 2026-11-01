@@ -4356,8 +4356,14 @@ mod tests {
                 asset.contains("python3 -I - 3<&0 <<'PY' || exit 0"),
                 "the python heredoc must be guarded with `|| exit 0`"
             );
+            // The only temporary file a hook creates is the `SessionStart` start
+            // marker, which holds the pohunek session id and nothing from the input.
             assert!(
-                !asset.contains("mktemp") && !asset.contains("POHUNEK_HOOK_INPUT_FILE"),
+                asset
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#') && line.contains("mktemp"))
+                    .all(|line| line.contains("marker_file=") && !line.contains("input"))
+                    && !asset.contains("POHUNEK_HOOK_INPUT_FILE"),
                 "{agent} state hook must not persist provider payloads"
             );
         }
