@@ -42,7 +42,7 @@ const SHELL: &str = "/bin/sh";
 const SUPERVISOR: &str = r#"exec 3<&0
 "$@" </dev/null 3<&- &
 child=$!
-(while read -r _ <&3; do :; done; kill -KILL -- "-$$") 2>/dev/null &
+(while read -r _ <&3; do :; done; kill -s KILL -- "-$$") 2>/dev/null &
 watcher=$!
 wait "$child"
 status=$?

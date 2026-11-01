@@ -811,9 +811,9 @@ fn read_until_released(alive: &mut fs::File) {
     std::io::copy(alive, &mut std::io::sink()).expect("read the liveness pipe to its end");
 }
 
-/// A deadline longer than the connect timeout that used to bound `--host`
-/// resolution still ends the probe as `tailscale_state_unavailable`: the
-/// resolution budget follows the status deadline.
+/// A status deadline longer than the 5 s connect timeout ends the probe as
+/// `tailscale_state_unavailable`: the resolution budget follows the status
+/// deadline.
 #[test]
 fn host_resolution_waits_for_a_status_deadline_longer_than_the_connect_timeout() {
     let fixture = Fixture::new(&tailnet());
