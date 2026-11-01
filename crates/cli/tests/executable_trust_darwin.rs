@@ -166,7 +166,28 @@ fn assert_resolved(fixture: &Fixture, path: &str) {
     );
 }
 
+/// Fails hard when a built-in fallback directory holds a `tailscale`, because
+/// the lookup would then find that one after refusing the fixture's.
+fn assert_no_fallback_tailscale() {
+    for directory in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        assert!(
+            fs::symlink_metadata(Path::new(directory).join("tailscale")).is_err(),
+            "{directory} holds a tailscale that the fallback lookup would find"
+        );
+    }
+}
+
 fn assert_refused(fixture: &Fixture, path: &str) {
+    assert_no_fallback_tailscale();
     let output = fixture.host_list(path);
     assert_eq!(
         json(&output)["err"]["code"],

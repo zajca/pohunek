@@ -52,8 +52,8 @@ Pohunek never starts, stops or logs in Tailscale. It only runs
   Homebrew `/opt/homebrew/bin`, are accepted (see
   [environment resolution](environment-resolution.md)); support is claimed once
   it is verified on a real Mac. The App Store and standalone builds are refused,
-  because their command-line tool lives inside a root-owned application bundle
-  directory: `host list` fails with `tailscale_cli_missing`, the doctor reports
+  because their command-line tool lives below `/Applications`, a root-owned
+  directory the admin group can write: `host list` fails with `tailscale_cli_missing`, the doctor reports
   `tailscale_cli` as `fail`, and the daemon binds no listener. A Mac keeps working over NetBird and
   reaches Tailscale hosts only through a Linux host. Support is tracked in
   [#1583](https://github.com/zajca/pohunek/issues/1583).

@@ -325,9 +325,8 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
 /// others can write (a sticky `/tmp`) may hold a chain entry only when that
 /// entry is owned by `owners` too: sticky protects an entry from everyone but
 /// its owner, so an entry another account created there is the attack itself.
-/// A directory whose group write is accepted needs no such exception: the
-/// symlink owner rule and the ancestor policy already refuse an entry another
-/// account created.
+/// A directory whose group write is accepted (the macOS admin exception) holds
+/// a chain entry only when that entry is owned by `owners` as well.
 fn lookup_chain_is_owner_controlled(
     path: &Path,
     owners: Owners,

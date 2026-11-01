@@ -32,7 +32,8 @@
 //! Every tier yields a [`SearchPath`]: absolute, normalized, control-character
 //! free, deduplicated directories. Discovery and the fallback list keep only
 //! trusted directories ([`trusted_directory`]): existing, owned by the user or
-//! root, and not writable by group or others along the whole canonical path.
+//! root, and not writable by group or others along the whole canonical path
+//! (on macOS, a user-owned directory of the `admin` group may be group-writable).
 //! A shell is never used to run commands; the only shell invocation is the
 //! discovery above, as the installing user.
 //!

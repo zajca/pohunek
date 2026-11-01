@@ -4,7 +4,8 @@
 //! daemon spawns programs with, so the doctor, the capability snapshot, and the
 //! spawn path always agree. A candidate counts only when it is a regular file
 //! (after following symlinks) owned by the effective user or root, writable by
-//! neither group nor others, in directories only the owner or root can change,
+//! neither group nor others, in directories only the owner or root can change (on macOS also the `admin`
+//! group, for user-owned directories),
 //! and executable for the effective user. A candidate that fails is skipped, so
 //! it neither resolves nor stops the `PATH` search; relative and empty `PATH`
 //! entries are skipped too. Resolution takes the `PATH` value as an argument so
