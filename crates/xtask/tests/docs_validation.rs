@@ -229,6 +229,18 @@ fn docs_check_rejects_tab_nested_list_in_prompt_contract() {
     );
 }
 
+#[test]
+fn docs_check_rejects_unicode_space_nested_list_in_prompt_contract() {
+    let error = validate_docs(source_fixture("prompt-contract-nbsp-nested"))
+        .expect_err("a list nested by a no-break space must be rejected");
+    assert_bundle_issue(
+        "prompt-contract-nbsp-nested",
+        &error,
+        "prompt_contract",
+        "line 15: `Safety` holds a nested list or heading",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn docs_build_rejects_symlinked_source_file() {
