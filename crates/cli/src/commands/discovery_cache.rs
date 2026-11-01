@@ -59,7 +59,8 @@ struct RegistryRoute {
 pub(crate) async fn records(cache_root: &Path, refresh: bool) -> Result<Vec<HostRecord>, CliError> {
     let registry = pohunek_client::default_overlay_registry()?;
     let routes = registry_routes(&registry);
-    records_with(cache_root, refresh, routes, move |options| {
+    let options = pohunek_client::DiscoveryOptions::new().covering(&registry);
+    records_with(cache_root, refresh, routes, options, move |options| {
         let registry = registry.clone();
         async move { Ok(pohunek_client::discover_hosts_with_options(&registry, options).await?) }
     })
@@ -85,13 +86,13 @@ async fn records_with<F, Fut>(
     cache_root: &Path,
     refresh: bool,
     routes: Vec<RegistryRoute>,
+    options: pohunek_client::DiscoveryOptions,
     discover: F,
 ) -> Result<Vec<HostRecord>, CliError>
 where
     F: Fn(pohunek_client::DiscoveryOptions) -> Fut,
     Fut: Future<Output = Result<Vec<HostRecord>, CliError>>,
 {
-    let options = pohunek_client::DiscoveryOptions::new();
     let dir = cache_root.join(CACHE_SUBDIR);
     ensure_private_dir(&dir)?;
     let before = load_fresh(&dir, &routes)?;
@@ -432,33 +433,49 @@ mod tests {
         .expect("store");
         let calls = Arc::new(AtomicUsize::new(0));
         let hit_calls = Arc::clone(&calls);
-        let hit = records_with(&root, false, routes(port), move |_| {
-            let calls = Arc::clone(&hit_calls);
-            async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![record("unexpected")])
-            }
-        })
+        let hit = records_with(
+            &root,
+            false,
+            routes(port),
+            pohunek_client::DiscoveryOptions::new(),
+            move |_| {
+                let calls = Arc::clone(&hit_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![record("unexpected")])
+                }
+            },
+        )
         .await
         .expect("hit");
         assert_eq!(hit[0].name.as_deref(), Some("cached"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let refresh_calls = Arc::clone(&calls);
-        let refreshed = records_with(&root, true, routes(port), move |_| {
-            let calls = Arc::clone(&refresh_calls);
-            async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![record("refreshed")])
-            }
-        })
+        let refreshed = records_with(
+            &root,
+            true,
+            routes(port),
+            pohunek_client::DiscoveryOptions::new(),
+            move |_| {
+                let calls = Arc::clone(&refresh_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![record("refreshed")])
+                }
+            },
+        )
         .await
         .expect("refresh");
         assert_eq!(refreshed[0].name.as_deref(), Some("refreshed"));
         let before = fs::read(dir.join(CACHE_FILE)).expect("before failed refresh");
-        let failed = records_with(&root, true, routes(port), |_| async {
-            Err(CliError::Spawn("discovery failed".to_owned()))
-        })
+        let failed = records_with(
+            &root,
+            true,
+            routes(port),
+            pohunek_client::DiscoveryOptions::new(),
+            |_| async { Err(CliError::Spawn("discovery failed".to_owned())) },
+        )
         .await;
         let _error = failed.expect_err("refresh must fail");
         assert_eq!(
@@ -474,26 +491,38 @@ mod tests {
         let left_root = root.clone();
         let left_calls = Arc::clone(&calls);
         let left = async move {
-            records_with(&left_root, false, routes(TEST_PORT), move |_| {
-                let calls = Arc::clone(&left_calls);
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    Ok(vec![record("once")])
-                }
-            })
+            records_with(
+                &left_root,
+                false,
+                routes(TEST_PORT),
+                pohunek_client::DiscoveryOptions::new(),
+                move |_| {
+                    let calls = Arc::clone(&left_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Ok(vec![record("once")])
+                    }
+                },
+            )
             .await
         };
         let right_root = root.clone();
         let right_calls = Arc::clone(&calls);
         let right = async move {
-            records_with(&right_root, false, routes(TEST_PORT), move |_| {
-                let calls = Arc::clone(&right_calls);
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(vec![record("twice")])
-                }
-            })
+            records_with(
+                &right_root,
+                false,
+                routes(TEST_PORT),
+                pohunek_client::DiscoveryOptions::new(),
+                move |_| {
+                    let calls = Arc::clone(&right_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![record("twice")])
+                    }
+                },
+            )
             .await
         };
         let (left, right) = tokio::join!(left, right);

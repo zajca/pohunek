@@ -37,7 +37,11 @@ status_timeout_secs = 10  # optional
   may run. A command still running then is killed and reaped with any process it started, and the probe fails
   as `<overlay>_state_unavailable` ("did not answer within"), so a wedged
   overlay daemon cannot hang host listing, discovery, `--host` resolution or the
-  daemon's listener retry, which tries again on its next attempt.
+  daemon's listener retry, which tries again on its next attempt. The host
+  resolution and discovery budgets are never shorter than this deadline plus
+  two seconds, so the provider is reported unavailable rather than the whole
+  operation timing out. The probe is also killed with its helpers when the
+  CLI is interrupted or exits.
 - A peer address that the status lists for another peer or for this machine
   (for Tailscale, any address of a node) is not used for routing. Selecting any of those peers (or the address) is
   `overlay_host_ambiguous` with every peer that lists it; `host list` and

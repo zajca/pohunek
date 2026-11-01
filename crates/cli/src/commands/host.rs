@@ -186,7 +186,11 @@ fn render_records_human(records: &[HostRecord]) -> String {
         .map(|record| {
             let (status, mut version) = class_columns(&record.class);
             if let Some(reason) = &record.reason {
-                version = format!("probe failed: {reason}");
+                version = match record.class {
+                    // No probe ran for a candidate; the reason says why.
+                    HostClass::Candidate => reason.clone(),
+                    _ => format!("probe failed: {reason}"),
+                };
             }
             let status = match (record.local, &record.class) {
                 (true, HostClass::ReachableDaemon { .. }) => LOCAL_STATUS.to_owned(),

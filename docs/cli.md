@@ -53,6 +53,11 @@ same health probe the peers get, sent to the machine's own overlay address and
 daemon port: a daemon that does not answer there reads `unreachable` with the
 probe error in the record's `reason` (also logged at WARN by the daemon, and shown
 in the VERSION column as `probe failed: <reason>`), and an overlay that reports no address leaves a `candidate`.
+A peer whose address the overlay lists for another peer or for this machine is also a
+`candidate` without an address: its `reason` is `address_ambiguous` (shown in the
+VERSION column as the bare reason, since no probe ran), and selecting it by name, node
+identity or address fails as `overlay_host_ambiguous` until the overlay lists the
+address for one node only.
 The status column shows `local` for a reachable daemon and `local:<status>`
 otherwise. When the overlay does not report the machine's identity within the 5 s
 connect timeout, no local record is listed and the peers still print. `--all-hosts`

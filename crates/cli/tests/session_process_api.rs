@@ -2956,8 +2956,8 @@ const PIN_WRONG_PORT: &str = "1";
 #[cfg(target_os = "linux")]
 const PIN_STALL: &str = "stall";
 
-/// How long a stalled fake `netbird` hangs: beyond the client's 5 s connect
-/// timeout, so only a bounded lookup finishes.
+/// How long a stalled fake `netbird` hangs: beyond the default 10 s status
+/// deadline, so only a bounded lookup finishes.
 #[cfg(target_os = "linux")]
 const PIN_STALL_SECONDS: u32 = 30;
 
@@ -3263,9 +3263,9 @@ fn pinned_operations_of_the_machines_own_overlay_name_stay_on_the_local_daemon()
 fn a_stalled_lookup_of_a_pinned_peer_fails_under_the_typed_name() {
     for command in PINNED_SESSION_COMMANDS {
         let run = run_pinned("peer-a", command, &pin_before(), PIN_STALL, None);
-        let document = assert_json_error(&run.output, "remote_discovery_failed");
+        let document = assert_json_error(&run.output, "netbird_state_unavailable");
         let message = document["err"]["msg"].as_str().expect("error message");
-        assert!(message.contains("peer-a"), "{command:?}: {message}");
+        assert!(message.contains("netbird"), "{command:?}: {message}");
         assert!(!message.contains("peer~"), "{command:?}: {message}");
         assert!(
             run.dialed.iter().all(|ip| ip == PIN_FIRST_IP),

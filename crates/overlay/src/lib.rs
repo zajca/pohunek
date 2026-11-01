@@ -22,6 +22,10 @@ use futures::future::join_all;
 /// Deadline of a provider status probe when `overlays.toml` sets none.
 pub const DEFAULT_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Time an operation that waits on provider probes keeps beyond the longest
+/// probe deadline, for the work around the probe itself.
+pub const STATUS_BUDGET_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Smallest accepted configured status deadline, in seconds.
 pub const MIN_STATUS_DEADLINE_SECS: u64 = 1;
 
@@ -764,6 +768,7 @@ impl fmt::Debug for ConfiguredTransport {
 #[derive(Debug, Clone)]
 pub struct OverlayRegistry {
     entries: Arc<[ConfiguredTransport]>,
+    status_budget: std::time::Duration,
 }
 
 impl OverlayRegistry {
@@ -785,7 +790,32 @@ impl OverlayRegistry {
         }
         Ok(Self {
             entries: entries.into(),
+            status_budget: std::time::Duration::ZERO,
         })
+    }
+
+    /// Record the longest a provider status probe of this registry may run.
+    ///
+    /// The default of zero declares no probe bound, so [`Self::outer_budget`]
+    /// returns the requested budget unchanged.
+    #[must_use]
+    pub fn with_status_budget(mut self, status_budget: std::time::Duration) -> Self {
+        self.status_budget = status_budget;
+        self
+    }
+
+    /// The budget an operation that waits on this registry's providers needs.
+    ///
+    /// An outer budget shorter than a probe's deadline would cancel the probe
+    /// before the provider is reported unavailable, so the result is never
+    /// shorter than the status budget plus [`STATUS_BUDGET_MARGIN`].
+    #[must_use]
+    pub fn outer_budget(&self, requested: std::time::Duration) -> std::time::Duration {
+        if self.status_budget.is_zero() {
+            requested
+        } else {
+            requested.max(self.status_budget.saturating_add(STATUS_BUDGET_MARGIN))
+        }
     }
 
     /// Return configured entries in deterministic configuration order.

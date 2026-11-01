@@ -102,6 +102,17 @@ impl DiscoveryOptions {
         self.concurrency.get()
     }
 
+    /// Return options whose deadline covers the status probes of `registry`.
+    ///
+    /// The deadline is never shorter than the registry's status budget plus its
+    /// margin, so a hung provider ends as unavailable instead of as a timeout
+    /// of the whole discovery.
+    #[must_use]
+    pub fn covering(mut self, registry: &OverlayRegistry) -> Self {
+        self.deadline = registry.outer_budget(self.deadline);
+        self
+    }
+
     /// Return the complete discovery deadline.
     #[must_use]
     pub fn deadline(&self) -> Duration {
@@ -226,7 +237,7 @@ async fn discover_with_registry(
     options: DiscoveryOptions,
     origin: Option<RequestOrigin>,
 ) -> Result<Vec<HostRecord>, crate::ClientError> {
-    let deadline = tokio::time::Instant::now() + options.deadline();
+    let deadline = tokio::time::Instant::now() + registry.outer_budget(options.deadline());
     let mut results = Vec::with_capacity(registry.entries().len());
     let mut completed = vec![false; registry.entries().len()];
     let mut pending = stream::iter(registry.entries().iter().cloned().enumerate())

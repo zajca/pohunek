@@ -233,7 +233,7 @@ impl OverlayConfig {
                 ConfiguredTransport::new(provider.transport(self.status_deadline), self.port)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(OverlayRegistry::new(entries)?)
+        Ok(OverlayRegistry::new(entries)?.with_status_budget(self.status_deadline))
     }
 }
 

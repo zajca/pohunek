@@ -78,6 +78,20 @@ impl Fixture {
         .expect("rewrite overlays.toml");
     }
 
+    /// Starts the CLI without waiting for it.
+    fn spawn(&self, args: &[&str]) -> std::process::Child {
+        self.env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .env("PATH", self.fake.bin_dir())
+            .env("LD_PRELOAD", &self.redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &self.capture)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the pohunek CLI")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.env
             .command(pohunek_test_support::bin_exe("pohunek"))
@@ -759,8 +773,73 @@ fn an_address_listed_for_two_peers_is_not_used_for_routing() {
         let (output, targets) = fixture.dial(selector);
         assert_eq!(error_code(&output), "overlay_host_ambiguous", "{selector}");
         assert!(targets.is_empty(), "{selector}: {targets:?}");
+        let message = error_message(&output);
+        let named = match selector {
+            "alpha" | "bravo" | "100.64.0.10" => vec!["alpha", "bravo"],
+            "echo" | "delta" => vec!["delta", "echo"],
+            _ => vec!["foxtrot", "this machine"],
+        };
+        for name in named {
+            assert!(message.contains(name), "{selector}: {name} in {message}");
+        }
     }
     let (output, targets) = fixture.dial("charlie");
     assert_eq!(error_code(&output), "host_unreachable");
     assert_eq!(targets, ["100.64.0.30:9100"]);
+}
+
+/// Replaces the fake CLI with one that starts a helper, then holds the write
+/// end of the named pipe `alive` in both. The pipe reads as end of file once
+/// the CLI and its helper are gone, with no polling.
+fn install_pipe_holding_cli(fixture: &Fixture) -> PathBuf {
+    let alive = fixture.env.root().join("tailscale.alive");
+    nix::unistd::mkfifo(&alive, nix::sys::stat::Mode::from_bits_truncate(0o600))
+        .expect("create the liveness pipe");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nexec 9> '{alive}'\n/bin/sleep 3600 &\nwait\n",
+            alive = alive.display()
+        ),
+    )
+    .expect("write the pipe-holding fake");
+    alive
+}
+
+/// Blocks until every holder of the write end of `alive` is gone.
+fn read_until_released(alive: &mut fs::File) {
+    std::io::copy(alive, &mut std::io::sink()).expect("read the liveness pipe to its end");
+}
+
+/// A deadline longer than the connect timeout that used to bound `--host`
+/// resolution still ends the probe as `tailscale_state_unavailable`: the
+/// resolution budget follows the status deadline.
+#[test]
+fn host_resolution_waits_for_a_status_deadline_longer_than_the_connect_timeout() {
+    let fixture = Fixture::new(&tailnet());
+    // timing-allowed: #1565 the deadline versus the 5 s connect timeout is the behaviour under test and runs in a separate binary.
+    fixture.configure("status_timeout_secs = 6");
+    install_hanging_cli(&fixture);
+    let (output, targets) = fixture.dial("alpha");
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert!(targets.is_empty(), "{targets:?}");
+}
+
+/// Interrupting the CLI during a status probe takes the provider and the
+/// helper it started down with it.
+#[test]
+fn an_interrupted_command_leaves_no_provider_process() {
+    let fixture = Fixture::new(&tailnet());
+    fixture.configure("status_timeout_secs = 120");
+    let alive = install_pipe_holding_cli(&fixture);
+    let mut child = fixture.spawn(&["host", "list", "--refresh", "--json"]);
+    // Opening the read end returns once the fake holds the write end.
+    let mut reader = fs::File::open(&alive).expect("open the liveness pipe");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("interrupt the CLI");
+    child.wait().expect("the CLI ends");
+    read_until_released(&mut reader);
 }

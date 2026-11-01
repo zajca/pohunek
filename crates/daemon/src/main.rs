@@ -1659,47 +1659,67 @@ mod tests {
             .expect("remote supervisor exits after shutdown");
     }
 
-    /// Asserts that the process whose pid `file` records no longer exists.
-    #[cfg(target_os = "linux")]
-    fn assert_gone(file: &std::path::Path) {
-        let pid = std::fs::read_to_string(file).expect("the fake recorded its pid");
-        assert!(
-            !std::path::Path::new("/proc").join(pid.trim()).exists(),
-            "the hung CLI was killed and reaped"
-        );
-    }
-
-    /// A status probe that never answers ends at its deadline as a retryable
-    /// bind outcome, the hung CLI is killed and reaped while the daemon runs,
-    /// and the next attempt, with the CLI answering, binds the listener.
-    #[tokio::test]
-    async fn a_hung_status_probe_is_retried_and_the_next_attempt_binds() {
-        const SELF_ADDRESS: &str = "100.64.0.7";
-        let (_state_root, governance) = governance_service().await;
-        let scripts = pohunek_test_support::tempdir().expect("create the fake CLI root");
-        std::fs::set_permissions(scripts.path(), std::fs::Permissions::from_mode(0o700))
+    /// Installs a fake `netbird` in a fresh owner-private directory and puts it
+    /// alone on `PATH`.
+    ///
+    /// Its first run (marked by `hung`) opens the write end of the named pipe
+    /// `alive`, starts a helper that holds it too and never answers; every
+    /// later run prints `status`. The pipe reads as end of file once the CLI
+    /// and the helper are gone. Returns the pipe's path.
+    fn install_hanging_netbird(
+        scripts: &std::path::Path,
+        status: &str,
+        process_env: &mut pohunek_test_support::process_env::ProcessEnv,
+    ) -> std::path::PathBuf {
+        std::fs::set_permissions(scripts, std::fs::Permissions::from_mode(0o700))
             .expect("make the fake CLI root owner-private");
-        let bin = scripts.path().join("bin");
+        let bin = scripts.join("bin");
         std::fs::create_dir(&bin).expect("create the fake CLI directory");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))
             .expect("make the fake CLI directory owner-private");
-        let pid = scripts.path().join("netbird.pid");
-        let hung = scripts.path().join("hung");
-        // The first run hangs; every later run answers.
+        let alive = scripts.join("netbird.alive");
+        nix::unistd::mkfifo(&alive, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("create the liveness pipe");
+        let hung = scripts.join("hung");
         pohunek_test_support::fs::write_executable(
             bin.join("netbird"),
             format!(
-                "#!/bin/sh\nif [ ! -e '{hung}' ]; then\n: > '{hung}'\nprintf '%s' \"$$\" > '{pid}'\nexec /bin/sleep 3600\nfi\nprintf '%s\\n' '{{\"netbirdIp\":\"{SELF_ADDRESS}\",\"peers\":[]}}'\n",
+                "#!/bin/sh\nif [ ! -e '{hung}' ]; then\n: > '{hung}'\nexec 9> '{alive}'\n/bin/sleep 3600 &\nwait\nfi\nprintf '%s\\n' '{status}'\n",
                 hung = hung.display(),
-                pid = pid.display(),
+                alive = alive.display(),
             ),
         )
         .expect("write the fake netbird");
-        let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
         process_env.set("PATH", &bin);
+        alive
+    }
+
+    /// Blocks until every holder of the write end of the pipe is gone.
+    fn read_until_released(mut alive: std::fs::File) {
+        std::io::copy(&mut alive, &mut std::io::sink()).expect("read the liveness pipe");
+    }
+
+    /// A status probe that never answers ends at its deadline as a retryable
+    /// bind outcome, the hung CLI and its helper are killed while the daemon
+    /// runs, and the next attempt, with the CLI answering, binds the listener.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_status_probe_is_retried_and_the_next_attempt_binds() {
+        const SELF_ADDRESS: &str = "100.64.0.7";
+        const STATUS_DEADLINE: Duration = Duration::from_secs(1);
+        // Real process I/O runs while the clock is paused; only the `advance`
+        // below moves virtual time.
+        let _inhibitor = pohunek_test_support::time::AutoAdvanceInhibitor::new();
+        let (_state_root, governance) = governance_service().await;
+        let scripts = pohunek_test_support::tempdir().expect("create the fake CLI root");
+        let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+        let alive = install_hanging_netbird(
+            scripts.path(),
+            &format!("{{\"netbirdIp\":\"{SELF_ADDRESS}\",\"peers\":[]}}"),
+            &mut process_env,
+        );
 
         let transport = Arc::new(netbird::NetbirdTransport::with_status_deadline(
-            Duration::from_secs(1),
+            STATUS_DEADLINE,
         ));
         let configured = ConfiguredTransport::new(transport, pohunek_client::DEFAULT_REMOTE_PORT)
             .expect("configured NetBird overlay");
@@ -1717,20 +1737,27 @@ mod tests {
         let unused = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
-        let first = bind_remote_server(
+        let first = tokio::spawn(bind_remote_server(
             state.clone(),
             configured.clone(),
             MissingCli::Retry,
             None,
             opener(unused),
-        )
-        .await;
+        ));
+        // Opening the read end returns once the fake holds the write end.
+        let reader = tokio::task::spawn_blocking(move || std::fs::File::open(alive))
+            .await
+            .expect("open task")
+            .expect("open the liveness pipe");
+        tokio::time::advance(STATUS_DEADLINE).await;
+        let first = first.await.expect("first bind attempt");
         assert!(
             matches!(first, RemoteBind::Retry),
             "a hung probe is retried"
         );
-        #[cfg(target_os = "linux")]
-        assert_gone(&pid);
+        tokio::task::spawn_blocking(move || read_until_released(reader))
+            .await
+            .expect("the hung CLI and its helper are gone");
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1738,6 +1765,31 @@ mod tests {
         let second =
             bind_remote_server(state, configured, MissingCli::Retry, None, opener(listener)).await;
         assert!(matches!(second, RemoteBind::Bound(_)), "the retry binds");
+    }
+
+    /// An outer budget that cancels a status probe before its own deadline
+    /// takes the hung CLI and the helper it started down with it.
+    #[tokio::test]
+    async fn a_cancelled_status_probe_leaves_no_provider_process() {
+        let scripts = pohunek_test_support::tempdir().expect("create the fake CLI root");
+        let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+        let alive = install_hanging_netbird(scripts.path(), "{}", &mut process_env);
+        let transport = Arc::new(netbird::NetbirdTransport::with_status_deadline(
+            pohunek_test_support::wait::HANG_GUARD,
+        ));
+        let probe = tokio::spawn(async move { transport.listener_addr().await });
+        let reader = tokio::task::spawn_blocking(move || std::fs::File::open(alive))
+            .await
+            .expect("open task")
+            .expect("open the liveness pipe");
+        probe.abort();
+        assert!(probe
+            .await
+            .expect_err("the probe is cancelled")
+            .is_cancelled());
+        tokio::task::spawn_blocking(move || read_until_released(reader))
+            .await
+            .expect("the hung CLI and its helper are gone");
     }
 
     #[derive(Debug)]

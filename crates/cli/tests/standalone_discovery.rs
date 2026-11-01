@@ -780,7 +780,16 @@ fn an_address_listed_for_two_netbird_peers_is_not_used_for_routing() {
     assert_eq!(solo["address"], "100.64.0.3");
     assert!(solo["reason"].is_null(), "{solo}");
 
-    for selector in ["one", "two.example", "100.64.0.2", "echo"] {
+    let expected = [
+        ("one", vec!["peer one.example", "peer two.example"]),
+        ("two.example", vec!["peer one.example", "peer two.example"]),
+        ("100.64.0.2", vec!["peer one.example", "peer two.example"]),
+        (
+            "echo",
+            vec!["this machine (self.example)", "peer echo.example"],
+        ),
+    ];
+    for (selector, candidates) in expected {
         let output = inspect_output(status, selector);
         assert!(!output.status.success(), "{selector}");
         let document: serde_json::Value =
@@ -789,5 +798,54 @@ fn an_address_listed_for_two_netbird_peers_is_not_used_for_routing() {
             document["err"]["code"], "overlay_host_ambiguous",
             "{selector}"
         );
+        let message = document["err"]["msg"].as_str().expect("error message");
+        for candidate in candidates {
+            assert!(
+                message.contains(candidate),
+                "{selector}: {candidate} is named in {message}"
+            );
+        }
     }
+    #[cfg(target_os = "linux")]
+    for selector in ["one", "two.example", "echo"] {
+        let (output, dialed) = dial_redirected(status, selector);
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+        assert_eq!(
+            document["err"]["code"], "overlay_host_ambiguous",
+            "{selector}"
+        );
+        assert!(dialed.is_empty(), "{selector} dialed {dialed:?}");
+    }
+}
+
+/// Runs `--host <selector> session list --json` against a fake `netbird`
+/// reporting `status`, and returns the output with the addresses the run
+/// connected to.
+#[cfg(target_os = "linux")]
+fn dial_redirected(status: &str, selector: &str) -> (std::process::Output, Vec<String>) {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\ncat <<'EOF'\n{status}\nEOF\n"),
+    )
+    .expect("write fake netbird");
+    let (library, capture) = connect_redirect::build(env.root());
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["--host", selector, "session", "list", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("LD_PRELOAD", &library)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &capture)
+        .output()
+        .expect("run CLI dial");
+    let dialed = fs::read_to_string(&capture)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (output, dialed)
 }

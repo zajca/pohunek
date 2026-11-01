@@ -1,9 +1,17 @@
 //! Bounded execution of a short-lived helper command.
 //!
-//! The command runs in its own process group, so an expiry kills the helper
-//! and everything it started, and the group is reaped with it. Output beyond
-//! [`MAX_OUTPUT_BYTES`] per stream is discarded while the pipe keeps draining,
-//! so a chatty helper can neither fill memory nor block on a full pipe.
+//! The command runs under a small `sh` supervisor in its own process group.
+//! Every way the call can end takes the group down with it:
+//!
+//! - the deadline elapses;
+//! - the caller's future is dropped (an outer budget, a shutdown);
+//! - the calling process dies, by a signal or otherwise: the supervisor holds
+//!   the read end of a pipe the caller keeps open, and kills the group when
+//!   that pipe closes.
+//!
+//! Output beyond [`MAX_OUTPUT_BYTES`] per stream is discarded while the pipe
+//! keeps draining, so a chatty helper can neither fill memory nor block on a
+//! full pipe.
 
 use std::io;
 use std::path::Path;
@@ -23,6 +31,25 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 /// Size of one read from a command's output pipe.
 const READ_CHUNK_BYTES: usize = 8192;
 
+/// The POSIX shell that runs the supervisor.
+const SHELL: &str = "/bin/sh";
+
+/// Runs the command (`"$@"`) with a null stdin and waits for it.
+///
+/// Its own stdin is a pipe held by the caller: a watcher kills the whole
+/// process group of this shell, `$$`, when that pipe reaches end of file, which
+/// happens when the caller exits for any reason.
+const SUPERVISOR: &str = r#"exec 3<&0
+"$@" </dev/null 3<&- &
+child=$!
+(while read -r _ <&3; do :; done; kill -KILL -- "-$$") 2>/dev/null &
+watcher=$!
+wait "$child"
+status=$?
+kill "$watcher" 2>/dev/null
+exit "$status"
+"#;
+
 /// Why a bounded command produced no output.
 #[derive(Debug)]
 pub enum BoundedError {
@@ -33,10 +60,35 @@ pub enum BoundedError {
     Expired(Duration),
 }
 
+/// Kills a process group when dropped while armed.
+///
+/// The group id is the pid of the supervisor, the group leader. The guard is
+/// armed only while the supervisor is unreaped, so its pid cannot belong to
+/// another process.
+struct GroupGuard {
+    group: Option<Pid>,
+}
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.group = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.group {
+            // A group with no member left is already gone.
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+    }
+}
+
 /// Runs `program args` and collects its output within `deadline`.
 ///
-/// The child gets no stdin. When the deadline elapses the whole process group
-/// is killed and the child is waited for. Dropping the future kills the child.
+/// The command gets no stdin. When the deadline elapses, or this future is
+/// dropped before the command was reaped, the whole process group is killed;
+/// on expiry the supervisor is also waited for.
 ///
 /// # Errors
 ///
@@ -48,16 +100,28 @@ pub async fn run_bounded(
     args: &[&str],
     deadline: Duration,
 ) -> Result<Output, BoundedError> {
-    let mut child = Command::new(program)
+    let mut child = Command::new(SHELL)
+        .arg("-c")
+        .arg(SUPERVISOR)
+        .arg("pohunek-bounded-command")
+        .arg(program)
         .args(args)
-        .stdin(Stdio::null())
+        // Held open until this call ends; its closing is the supervisor's
+        // signal that the caller is gone.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
-        // Dropping the future (daemon shutdown) must not leave the helper behind.
         .kill_on_drop(true)
         .spawn()
         .map_err(BoundedError::Io)?;
+    // Declared after `child` so it drops first, while the child is unreaped.
+    let mut guard = GroupGuard {
+        group: child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw),
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     // The child is waited for only after both pipes closed, so it stays
@@ -65,8 +129,10 @@ pub async fn run_bounded(
     // the group may still hold an output pipe.
     let collected = tokio::time::timeout(deadline, async {
         let (stdout, stderr) = tokio::join!(read_capped(stdout), read_capped(stderr));
+        let status = child.wait().await?;
+        guard.disarm();
         Ok::<_, io::Error>(Output {
-            status: child.wait().await?,
+            status,
             stdout: stdout?,
             stderr: stderr?,
         })
@@ -76,6 +142,7 @@ pub async fn run_bounded(
         Ok(output) => output.map_err(BoundedError::Io),
         Err(_elapsed) => {
             terminate(&mut child).await;
+            guard.disarm();
             Err(BoundedError::Expired(deadline))
         }
     }
@@ -84,9 +151,8 @@ pub async fn run_bounded(
 /// Kills the child's process group and waits for the child, for at most
 /// [`REAP_GRACE`].
 ///
-/// The group id is the child's pid, which `process_group(0)` made the leader.
 /// The child has not been reaped when this runs, so no other process can hold
-/// that id. A failed kill means the group is already gone.
+/// its pid. A failed kill means the group is already gone.
 async fn terminate(child: &mut Child) {
     if let Some(group) = child
         .id()
