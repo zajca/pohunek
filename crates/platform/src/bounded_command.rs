@@ -9,6 +9,11 @@
 //!   the read end of a pipe the caller keeps open, and kills the group when
 //!   that pipe closes.
 //!
+//! The group is killed with `SIGKILL`. The deadline and drop paths send it up
+//! to [`KILL_PASSES`] times, because on macOS a process that forks while the
+//! signal walks the group can escape one pass. The watcher sends one pass: it
+//! belongs to the group and dies with it, so it cannot repeat.
+//!
 //! Output beyond [`MAX_OUTPUT_BYTES`] per stream is discarded while the pipe
 //! keeps draining, so a chatty helper can neither fill memory nor block on a
 //! full pipe.
@@ -27,6 +32,16 @@ pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Longest wait for a killed child to be reaped.
 const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Number of `SIGKILL` passes sent to a process group.
+///
+/// A second pass reaches a child that was forked while the first one walked the
+/// group; a process that is already dying cannot fork again, so a third pass
+/// covers the one that the second raced. The supervisor stays unreaped while
+/// the passes run, which keeps its pid, the group id, from being reused. Its
+/// zombie also keeps the group non-empty, so the passes are counted rather than
+/// repeated until the group is gone.
+const KILL_PASSES: u32 = 3;
 
 /// Size of one read from a command's output pipe.
 const READ_CHUNK_BYTES: usize = 8192;
@@ -78,8 +93,15 @@ impl GroupGuard {
 impl Drop for GroupGuard {
     fn drop(&mut self) {
         if let Some(group) = self.group {
-            // A group with no member left is already gone.
-            let _ = kill_process_group(group, Signal::KILL);
+            for pass in 0..KILL_PASSES {
+                if pass > 0 {
+                    std::thread::yield_now();
+                }
+                // A group with no member left is already gone.
+                if kill_process_group(group, Signal::KILL).is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -87,8 +109,8 @@ impl Drop for GroupGuard {
 /// Runs `program args` and collects its output within `deadline`.
 ///
 /// The command gets no stdin. When the deadline elapses, or this future is
-/// dropped before the command was reaped, the whole process group is killed;
-/// on expiry the supervisor is also waited for.
+/// dropped before the command was reaped, the whole process group is killed
+/// (see [`KILL_PASSES`]); on expiry the supervisor is also waited for.
 ///
 /// # Errors
 ///
@@ -148,18 +170,25 @@ pub async fn run_bounded(
     }
 }
 
-/// Kills the child's process group and waits for the child, for at most
-/// [`REAP_GRACE`].
+/// Kills the child's process group in [`KILL_PASSES`] passes and waits for the
+/// child, for at most [`REAP_GRACE`].
 ///
-/// The child has not been reaped when this runs, so no other process can hold
-/// its pid. A failed kill means the group is already gone.
+/// The child has not been reaped while the passes run, so no other process can
+/// hold its pid. A failed kill means the group is already gone.
 async fn terminate(child: &mut Child) {
     if let Some(group) = child
         .id()
         .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw)
     {
-        let _ = kill_process_group(group, Signal::KILL);
+        for pass in 0..KILL_PASSES {
+            if pass > 0 {
+                tokio::task::yield_now().await;
+            }
+            if kill_process_group(group, Signal::KILL).is_err() {
+                break;
+            }
+        }
     }
     // Reaps the child; the grace bounds a child stuck in uninterruptible sleep.
     let _ = tokio::time::timeout(REAP_GRACE, child.wait()).await;

@@ -5173,7 +5173,7 @@ status --json`, `tailscale status --json`); it defaults to 10 and a value
 outside `1..=120` fails. A command still running at the deadline is killed and
 reaped together with any process it started, and the probe fails as `<overlay>_state_unavailable` with the message
 "did not answer within"; host listing, discovery, `--host` resolution and the
-daemon's remote-listener retry all end at that deadline: the connect timeout that bounds host resolution and the discovery deadline are raised to the status deadline plus two seconds when they would be shorter. The command is also killed, with its helpers, when the caller's operation is cancelled or the calling process exits or is interrupted. A peer address that
+daemon's remote-listener retry all end at that deadline: the connect timeout that bounds host resolution and the discovery deadline are raised to the status deadline plus two seconds when they would be shorter. The command is also killed, with its helpers, when the caller's operation is cancelled or the calling process exits or is interrupted. The group is sent `SIGKILL` three times on the deadline and cancel paths and once when the calling process dies; on macOS a process that forks at the very instant of a signal can escape the passes. A peer address that
 the status lists for another peer, for this machine, or in any of the peer's
 addresses (a Tailscale node lists several) is never a route: a selector that reaches
 it fails as `overlay_host_ambiguous` naming every peer that lists it, and

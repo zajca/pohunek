@@ -41,7 +41,9 @@ status_timeout_secs = 10  # optional
   resolution and discovery budgets are never shorter than this deadline plus
   two seconds, so the provider is reported unavailable rather than the whole
   operation timing out. The probe is also killed with its helpers when the
-  CLI is interrupted or exits.
+  CLI is interrupted or exits. The group is sent `SIGKILL` three times on the
+  deadline and cancel paths and once when the CLI itself dies; on macOS a
+  process that forks at the very instant of a signal can escape the passes.
 - A peer address that the status lists for another peer or for this machine
   (for Tailscale, any address of a node) is not used for routing. Selecting any of those peers (or the address) is
   `overlay_host_ambiguous` with every peer that lists it; `host list` and
