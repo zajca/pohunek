@@ -256,6 +256,47 @@ async fn the_daemon_starts_on_a_newer_minor_file_and_warns_per_key() {
 /// Column counts of the resizes each session gets before the first restart.
 const RESIZES_BEFORE_RESTART_COLS: [u16; 2] = [90, 91];
 
+/// launchd keeps no verdict of its own; the exit watch armed when the
+/// runtime became live records the kernel's wait status.
+#[cfg(target_os = "macos")]
+async fn assert_killed_by_sigkill(fixture: &Installation, session: &str) {
+    let exit = fixture
+        .inspect(session)
+        .await
+        .runtime
+        .and_then(|runtime| runtime.exit)
+        .expect("a watched worker's end is recorded");
+    assert_eq!(
+        (exit.cause.as_str(), exit.signal, exit.code),
+        ("signal", Some(Signal::SIGKILL as i32), None)
+    );
+}
+
+/// No watch was armed while the daemon was down, so the loss commits without
+/// an exit.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_died_while_the_daemon_was_down_has_no_exit_evidence() {
+    let fixture = Installation::new(Settings::default()).await;
+    fixture.start_daemon().await;
+    let session = fixture.new_session("died-while-down").await.id.0;
+    let before = fixture.snapshot(&session).await;
+
+    fixture.stop_daemon().await;
+    signal(before.worker.pid, Signal::SIGKILL);
+    fixture.start_daemon().await;
+
+    fixture
+        .wait_reason(&session, RuntimeState::Lost, RUNTIME_LOST)
+        .await;
+    let runtime = fixture
+        .inspect(&session)
+        .await
+        .runtime
+        .expect("the lost session keeps its runtime");
+    assert_eq!(runtime.exit, None, "nothing watched the worker's end");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
@@ -450,6 +491,9 @@ async fn crashed_worker_is_lost_swept_and_never_restarted() {
     fixture
         .wait_reason(&crashed, RuntimeState::Lost, RUNTIME_LOST)
         .await;
+
+    #[cfg(target_os = "macos")]
+    assert_killed_by_sigkill(&fixture, &crashed).await;
 
     // A complete sweep is what `runtime_lost` records; on Linux the unit's
     // control-group kill may have ended the descendant first.

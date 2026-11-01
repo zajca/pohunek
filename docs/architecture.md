@@ -1923,16 +1923,24 @@ Durability tiers (honest about limits):
    records it as `runtime.exit`: an open cause string mapped from the manager's
    result (`oom_kill`, `signal`, `exit_code`, `core_dump`, `timeout`,
    `watchdog`, `resources`, `other`) with the signal or exit code of the worker
-   process. Only the Linux systemd backend implements the read
-   (`Supervisor::exit_evidence`); the launchd backend returns none (#1343), and a
-   failed read never blocks the classification. The systemd read also carries
-   optional detail from the same bracketed read: the kernel and `systemd-oomd`
-   kill counters (`OOMKills`, `ManagedOOMKills`, systemd 259+), the unit's
-   `MemoryPeak` (255+) and `ExecMainExitTimestamp`. A value the manager does
-   not report (an older manager, an undelegated memory controller, the
-   manager's `UINT64_MAX`) is absent, never zero, and never loses the verdict.
-   Since systemd 251 a `systemd-oomd` kill also ends the unit with
-   `Result=oom-kill`, so the counters, not the result, tell the killers apart. A lost runtime that is
+   process. The systemd backend reads the failed unit
+   (`Supervisor::exit_evidence`) and also carries optional detail from the same
+   bracketed read: the kernel and `systemd-oomd` kill counters (`OOMKills`,
+   `ManagedOOMKills`, systemd 259+), the unit's `MemoryPeak` (255+) and
+   `ExecMainExitTimestamp`. A value the manager does not report (an older
+   manager, an undelegated memory controller, the manager's `UINT64_MAX`) is
+   absent, never zero, and never loses the verdict. Since systemd 251 a
+   `systemd-oomd` kill also ends the unit with `Result=oom-kill`, so the
+   counters, not the result, tell the killers apart. The launchd backend keeps no verdict, so the
+   daemon arms a kernel exit watch on the worker process when the runtime
+   becomes live (`Supervisor::watch_exit`, a kqueue `EVFILT_PROC` filter with
+   `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXIT_DETAIL`; `launchctl print` is never
+   parsed) and maps the `wait(2)` status to the same vocabulary: a non-zero
+   exit is `exit_code`, a signal `signal` (`core_dump` with a core), and a
+   memory-pressure kill by the kernel (jetsam) `oom_kill` with the kill signal.
+   A clean exit is no evidence. The evidence exists only for a process that
+   ended while the daemon watched it; a worker that died while the daemon was
+   down leaves none. A failed read never blocks the classification. A lost runtime that is
    classified again without a verdict keeps the one it has; any other
    classification of the runtime drops it. A user-requested stop ends the
    runtime `terminal` and carries no exit. The field is additive on the wire

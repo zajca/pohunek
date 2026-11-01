@@ -757,6 +757,24 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
     fn exit_evidence<'a>(&'a self, _id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
         Box::pin(async { Ok(None) })
     }
+
+    /// Starts recording how the main process of one job ends, where the
+    /// backend cannot read that afterwards.
+    ///
+    /// Called once the generation's worker is live, with the worker's
+    /// process identity. The record then backs [`Supervisor::exit_status`] and
+    /// [`Supervisor::exit_evidence`] until the job is retired. Only a process
+    /// that ended while the record was armed has evidence; a process that
+    /// ended before leaves none. Calling it again for a job that already has a
+    /// record keeps that record. The default records nothing, because the
+    /// backend's manager keeps the verdict itself.
+    fn watch_exit<'a>(
+        &'a self,
+        _id: &'a ServiceId,
+        _process: ProcessIdentity,
+    ) -> Operation<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Manages the single long-lived daemon job of one installation.

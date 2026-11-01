@@ -1933,8 +1933,10 @@ Important fields:
   and `code` are the optional signal number or exit code of the worker process
   (for `oom_kill` they describe how the worker process died, usually the stop
   signal, and the cause comes from the manager's verdict alone). It is absent
-  after a host restart, on macOS (launchd keeps no verdict; tracked in #1343),
-  for a worker started directly by the daemon, when the manager held no failed
+  after a host restart, for a macOS worker that ended while the daemon was not
+  watching it (the daemon records launchd workers through a kernel exit watch
+  armed when the runtime becomes live), for a worker started directly by the
+  daemon, when the manager held no failed
   job, and when the read failed; it is kept while the runtime stays `lost` and
   cleared when the runtime becomes anything else (a stop the user requested
   ends the runtime `terminal`, without an exit). It is diagnostic: it does not

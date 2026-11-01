@@ -1,13 +1,15 @@
 //! launchd worker supervisor, daemon agent, and workflow plugin unit backends.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::super::{
-    DaemonSupervisor, Error, JobDefinition, JobLogs, Namespace, Operation, PluginUnitDefinition,
-    PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId, ServiceObservation,
-    ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
+    DaemonSupervisor, Error, ExitEvidence, JobDefinition, JobExit, JobLogs, Namespace, Operation,
+    PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId,
+    ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
 };
 use super::discovery::{classify, refuse_rejected, set_aside_loaded};
 use super::launchctl::{Launchctl, Status};
@@ -18,7 +20,8 @@ use super::registration::{
 use super::{run_error, status_error, Presence};
 use crate::filesystem::{EntryKind, TrustedDir};
 use crate::process::{
-    environment_entry_is, DarwinInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector as _,
+    environment_entry_is, DarwinInspector, ExitReportWatch, Pid, ProcessExit, ProcessFact,
+    ProcessIdentity, ProcessInspector as _,
 };
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
@@ -76,6 +79,29 @@ const SESSION_ID_ARGUMENT: &str = "--session-id";
 /// Worker argument introducing the runtime generation.
 const GENERATION_ARGUMENT: &str = "--worker-generation";
 
+/// Longest wait for the kernel's exit event of a process that is already
+/// proven gone.
+///
+/// The event is queued on the registration when the process ends; the wait only
+/// absorbs the gap between the process leaving the process table and the
+/// kernel posting the event. It is bounded by the `launchctl` command
+/// deadline, and kept short because a caller that reads the exit of a job whose
+/// process still runs waits the whole span.
+const EXIT_EVENT_GRACE: Duration = Duration::from_secs(2);
+
+/// What the supervisor knows about the end of one worker's main process.
+#[derive(Debug)]
+enum ExitRecord {
+    /// The registration is armed and no event has been read yet.
+    Armed(ExitReportWatch),
+    /// The event was read; the kernel delivers it only once, so the decoded
+    /// result is kept for every later read.
+    Ended(ProcessExit),
+}
+
+/// Exit records of the workers whose watch is armed, keyed by generation.
+type ExitRecords = Mutex<HashMap<ServiceId, Arc<tokio::sync::Mutex<ExitRecord>>>>;
+
 /// Result of [`LaunchdSupervisor::discover_definitions`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
@@ -107,6 +133,8 @@ pub struct LaunchdSupervisor {
     jobs: Jobs,
     definitions: PathBuf,
     logs: PathBuf,
+    exits: ExitRecords,
+    exit_grace: Duration,
 }
 
 impl LaunchdSupervisor {
@@ -135,6 +163,8 @@ impl LaunchdSupervisor {
             jobs: Jobs::new(uid, command_deadline)?,
             definitions,
             logs,
+            exits: Mutex::new(HashMap::new()),
+            exit_grace: command_deadline.min(EXIT_EVENT_GRACE),
         })
     }
 
@@ -284,7 +314,72 @@ impl LaunchdSupervisor {
             .await
     }
 
+    fn exit_records(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ServiceId, Arc<tokio::sync::Mutex<ExitRecord>>>> {
+        // The map holds no invariant a panicking holder could break.
+        self.exits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn watch_worker_exit(&self, id: &ServiceId, process: ProcessIdentity) -> Result<(), Error> {
+        const OPERATION: &str = "watch_exit";
+
+        WorkerKey::from_service_id(id)?;
+        if self.exit_records().contains_key(id) {
+            return Ok(());
+        }
+        let watch = DarwinInspector::new()
+            .exit_report(process)
+            .map_err(|error| process_error(OPERATION, error))?;
+        self.exit_records()
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(ExitRecord::Armed(watch))));
+        Ok(())
+    }
+
+    /// Reads how the worker's main process ended from its armed watch.
+    ///
+    /// `None` when no watch was armed or no exit event arrived within the
+    /// grace period. An absent label is [`Error::NotFound`] and drops the
+    /// record.
+    async fn worker_exit(
+        &self,
+        id: &ServiceId,
+        operation: &'static str,
+    ) -> Result<Option<ProcessExit>, Error> {
+        let key = WorkerKey::from_service_id(id)?;
+        let label = self.namespace.worker_label(&key);
+        if self.jobs.presence(operation, &label).await? == Presence::Absent {
+            self.exit_records().remove(id);
+            return Err(Error::NotFound(id.clone()));
+        }
+        let Some(record) = self.exit_records().get(id).cloned() else {
+            return Ok(None);
+        };
+        let mut record = record.lock().await;
+        if let ExitRecord::Armed(watch) = &*record {
+            match tokio::time::timeout(self.exit_grace, watch.report()).await {
+                Ok(Ok(exit)) => *record = ExitRecord::Ended(exit),
+                Ok(Err(error)) => return Err(process_error(operation, error)),
+                Err(_elapsed) => return Ok(None),
+            }
+        }
+        Ok(match &*record {
+            ExitRecord::Ended(exit) => Some(*exit),
+            ExitRecord::Armed(_) => None,
+        })
+    }
+
     async fn retire_worker(&self, id: &ServiceId) -> Result<(), Error> {
+        let retired = self.end_worker(id).await;
+        // A job that is still loaded keeps its record for a later read.
+        if matches!(retired, Ok(()) | Err(Error::NotFound(_))) {
+            self.exit_records().remove(id);
+        }
+        retired
+    }
+
+    async fn end_worker(&self, id: &ServiceId) -> Result<(), Error> {
         const OPERATION: &str = "retire";
 
         let key = WorkerKey::from_service_id(id)?;
@@ -405,6 +500,60 @@ impl Supervisor for LaunchdSupervisor {
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
         Box::pin(self.retire_worker(id))
     }
+
+    /// Reports how the worker's main process ended, from the kernel watch
+    /// [`Supervisor::watch_exit`] armed.
+    ///
+    /// launchd keeps no exit record that is readable without parsing `print`
+    /// output, so only a process that ended while the watch was armed has one.
+    /// A clean exit is `Code(0)`; a memory kill by the kernel is the signal
+    /// that ended the process.
+    fn exit_status<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<JobExit>> {
+        Box::pin(async move { Ok(self.worker_exit(id, "exit_status").await?.map(job_exit)) })
+    }
+
+    /// Reports the end of a failed worker in the systemd vocabulary:
+    /// `exit-code`, `signal`, `core-dump`, or `oom-kill` for a kill under
+    /// memory pressure (jetsam). A clean exit is no evidence.
+    fn exit_evidence<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
+        Box::pin(async move {
+            Ok(self
+                .worker_exit(id, "exit_evidence")
+                .await?
+                .and_then(evidence))
+        })
+    }
+
+    /// Arms the kernel exit watch for the worker's main process.
+    ///
+    /// A second call for a generation that has a record keeps it: the watch
+    /// of an exited process cannot be armed again, and the queued event must
+    /// not be lost.
+    fn watch_exit<'a>(&'a self, id: &'a ServiceId, process: ProcessIdentity) -> Operation<'a, ()> {
+        Box::pin(std::future::ready(self.watch_worker_exit(id, process)))
+    }
+}
+
+fn job_exit(exit: ProcessExit) -> JobExit {
+    match exit {
+        ProcessExit::Code(code) => JobExit::Code(code),
+        ProcessExit::Signal { signal, .. } | ProcessExit::MemoryPressure { signal } => {
+            JobExit::Signal(signal)
+        }
+    }
+}
+
+fn evidence(exit: ProcessExit) -> Option<ExitEvidence> {
+    let result = match exit {
+        ProcessExit::Code(0) => return None,
+        ProcessExit::Code(_) => "exit-code",
+        ProcessExit::Signal {
+            core_dumped: true, ..
+        } => "core-dump",
+        ProcessExit::Signal { .. } => "signal",
+        ProcessExit::MemoryPressure { .. } => "oom-kill",
+    };
+    Some(ExitEvidence::new(result.to_owned(), Some(job_exit(exit))))
 }
 
 /// Manages the daemon login agent of one installation namespace.

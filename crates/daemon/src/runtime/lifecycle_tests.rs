@@ -472,6 +472,15 @@ impl Supervisor for ScriptedSupervisor {
         })
     }
 
+    fn watch_exit<'a>(&'a self, id: &'a ServiceId, process: ProcessIdentity) -> Operation<'a, ()> {
+        Box::pin(async move {
+            match &self.delegate {
+                Some(delegate) => delegate.watch_exit(id, process).await,
+                None => Ok(()),
+            }
+        })
+    }
+
     fn exit_evidence<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
         Box::pin(async move {
             let scripted = self.evidence.lock().expect("evidence").get(id).cloned();

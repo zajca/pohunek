@@ -1,0 +1,3 @@
+## Unreleased (2026-11-02, launchd exit evidence, #1343)
+
+- `runtime.exit` of a lost runtime is now recorded on macOS too. The daemon arms a kernel exit watch (kqueue `EVFILT_PROC` with `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXIT_DETAIL`) on the worker process through `Supervisor::watch_exit` when the runtime becomes live, including adoption at daemon start, and maps the wait status to the existing causes: `exit_code`, `signal`, `core_dump`, and `oom_kill` for a kernel memory-pressure (jetsam) kill. A clean exit is no evidence. A worker that ended while the daemon was down still has no exit. `launchctl print` is never parsed. No wire, protocol or store change. Documented in `docs/public-api.md` and `docs/architecture.md`.

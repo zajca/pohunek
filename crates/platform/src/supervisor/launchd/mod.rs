@@ -17,6 +17,12 @@
 //! its journaled process identity, and bound a job that never produces a
 //! worker by their own initialization deadline.
 //!
+//! How a worker's process ended is the exception: `Supervisor::watch_exit`
+//! arms a kqueue `EVFILT_PROC` filter (`NOTE_EXIT | NOTE_EXITSTATUS |
+//! NOTE_EXIT_DETAIL`) on the worker process, and `exit_status` and
+//! `exit_evidence` report the kernel's `wait(2)` status from it. A process that
+//! ended before the filter was armed has no record.
+//!
 //! Worker definitions live only in the private `<state>/pohunek/launchd/`
 //! directory, never in `~/Library/LaunchAgents`, so launchd never resurrects a
 //! worker at login. Only the daemon agent and the workflow plugin units, which
