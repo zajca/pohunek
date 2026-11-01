@@ -59,8 +59,8 @@ class Reporter:
     """Send fixed-shape reports without affecting the owning agent's turn.
 
     The deadline protects the agent's turn, not the outcome of a report: once a
-    request is fully written, the worker applies it whether or not the reply
-    arrives in time, so a missing reply is not a failure.
+    request to the worker is fully written, the worker applies it whether or
+    not the reply arrives in time, so a missing worker reply is not a failure.
     """
 
     def __init__(self, provider: str, environ: dict[str, str] | None = None) -> None:
@@ -88,7 +88,7 @@ class Reporter:
         return bool(self._session_id and self._worker_instance_id and self._start_identity is not None)
 
     def identity(self, reference: str | None) -> None:
-        """Report a bounded native reference to the worker, then public API."""
+        """Report a bounded native reference to the worker."""
         if not self.active or not isinstance(reference, str) or not 0 < len(reference) <= _MAX_NATIVE_ID_CHARS:
             return
         self._native_id = reference
@@ -133,6 +133,9 @@ class Reporter:
         }
         # The worker is the only identity route: Hermes sessions run under a
         # frozen-root schema, so the daemon refuses a public native-id report.
+        if not self._worker_socket:
+            self._record_failure()
+            return
         self._safe_worker(private)
 
     def _report_activity(self, state: str) -> None:

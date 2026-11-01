@@ -8451,31 +8451,19 @@ mod tests {
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
 
-        // The state lock stands in for a durable write in flight under it; the
-        // reporter has closed its end of the connection before the report runs.
-        let held = server.shared.state.lock().await;
+        // The reporter has closed its end of the connection before the report
+        // runs, so the reply cannot be delivered.
         let (reporter_end, mut worker_end) = tokio::io::duplex(1);
         drop(reporter_end);
-        let report = tokio::spawn({
-            let shared = std::sync::Arc::clone(&server.shared);
-            let peer = subject_peer(&pty);
-            let claim = launch_report(&pty, 1, "ref-late-reply");
-            async move {
-                super::serve_identity_hook_with_probe(
-                    shared,
-                    &mut super::ControlWriter::new(&mut worker_end),
-                    claim,
-                    &peer,
-                    |_| Ok(true),
-                )
-                .await
-            }
-        });
-        drop(held);
-        assert!(
-            report.await.expect("the report task ends").is_err(),
-            "the reply to a closed connection fails"
-        );
+        let reply = super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut worker_end),
+            launch_report(&pty, 1, "ref-late-reply"),
+            &subject_peer(&pty),
+            |_| Ok(true),
+        )
+        .await;
+        assert!(reply.is_err(), "the reply to a closed connection fails");
         drop(guard);
 
         let committed = server.shared.journal.load().expect("journal on disk");

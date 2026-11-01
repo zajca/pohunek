@@ -989,14 +989,15 @@ class HookTests(unittest.TestCase):
 
     def _report_through_socket(self, reporter: Reporter, connected: list[str], *, connect: object = None,
                                sendall: object = None, recv: object = None) -> None:
-        """Runs identity() and release() over a scripted socket that records every endpoint."""
+        """Runs identity() over a scripted socket that records every endpoint, on a frozen clock."""
         client = mock.MagicMock()
         client.__enter__.return_value = client
         client.connect.side_effect = lambda endpoint: connected.append(endpoint) or connect
         if sendall is not None:
             client.sendall.side_effect = sendall
         client.recv.side_effect = recv
-        with mock.patch("pohunek._pohunek_reporter.socket.socket", return_value=client):
+        with mock.patch("pohunek._pohunek_reporter.socket.socket", return_value=client), \
+                mock.patch("pohunek._pohunek_reporter.time.monotonic", return_value=100.0):
             reporter.identity("native-session")
 
     def test_a_delivered_identity_report_without_a_reply_is_unanswered_not_a_failure(self) -> None:
@@ -1031,6 +1032,17 @@ class HookTests(unittest.TestCase):
         self.assertEqual(reporter.failures, 1)
         self.assertEqual(reporter.worker_sends["identity_report"]["outcome"], "rejected")
 
+    def test_an_identity_report_without_a_worker_socket_is_a_failure(self) -> None:
+        reporter = Reporter("hermes", environ={
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
+            "POHUNEK_SOCKET_PATH": "/tmp/daemon", "POHUNEK_PROTOCOL_VERSION": "1",
+        })
+        reporter._start_identity = 1
+        with mock.patch.object(reporter, "_send") as send:
+            reporter.identity("native-session")
+        send.assert_not_called()
+        self.assertEqual(reporter.failures, 1)
+
     def test_an_unanswered_or_refused_release_still_falls_back_to_the_public_release(self) -> None:
         for name, recv in (("unanswered", socket.timeout("report deadline exceeded")), ("refused", [b'{"ok":false}\n'])):
             with self.subTest(name):
@@ -1039,6 +1051,7 @@ class HookTests(unittest.TestCase):
                 client.__enter__.return_value = client
                 client.recv.side_effect = recv
                 with mock.patch("pohunek._pohunek_reporter.socket.socket", return_value=client), \
+                        mock.patch("pohunek._pohunek_reporter.time.monotonic", return_value=100.0), \
                         mock.patch.object(reporter, "_send_public") as public:
                     reporter.release()
                 public.assert_called_once()

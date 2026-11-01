@@ -1564,13 +1564,14 @@ only origin-session exceptions are the lifecycle reports
 `session.report_native_id`; the daemon remains authoritative.
 
 Hooks run only in a Pohunek-managed Hermes process. They use a short bounded
-local Unix-socket attempt, prefer worker-private identity reporting, and fall
-back to the local public native-ID method, which accepts a report only from the
-session's PTY root (see the attestation rule in the public API); the Hermes
-reporter runs in the agent process, but its `identity-v1` session refuses that
-method for every report, so the worker socket records the reference. They never start a
+local Unix-socket attempt, which protects the agent's turn and not the outcome of a report. The
+reporter sends an identity report to the worker only: the Hermes reporter runs in the agent
+process, but its `identity-v1` session makes the daemon refuse the public native-ID method for every
+report, so the worker socket records the reference. A report that was fully written is applied and
+persisted by the worker whether or not its reply arrives in time, and a missing reply is not counted
+as a failure. They never start a
 subprocess, access the network or Hermes `state.db`, emit terminal output, or
-copy prompt/tool/output payloads. A failed hook is counted and swallowed, so
+copy prompt/tool/output payloads. A hook that fails before its report is delivered, or whose report is refused, is counted and swallowed, so
 process and screen detection remain the daemon's fallback. `on_session_end` is
 not a process-exit signal. A higher-sequence continuation identity reported by
 `pre_llm_call` supersedes the launch identity for a later native resume.
