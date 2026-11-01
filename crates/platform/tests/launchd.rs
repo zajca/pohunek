@@ -50,6 +50,10 @@ const ABSENCE_MARGIN: Duration = Duration::from_secs(5);
 /// Delay between observation polls.
 const POLL: Duration = Duration::from_millis(100);
 
+/// Start, inspect and retire cycles that give a concurrent inspection repeated
+/// chances to land between a job's bootout and its definition removal.
+const RETIRE_RACE_CYCLES: usize = 20;
+
 /// uid far outside the range macOS assigns, so `gui/<uid>` never exists.
 const ABSENT_UID: u32 = 4_000_000;
 
@@ -350,6 +354,49 @@ async fn start_inspect_and_retire_one_worker() {
         fixture.supervisor.retire(&id).await,
         Err(Error::NotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn inspecting_a_worker_while_it_retires_never_reports_invalid_data() {
+    let fixture = Fixture::new();
+    let key = key("s-1002", "abcd2345");
+    let id = key.service_id();
+    let definition = fixture.worker(&key, SLEEPING_WORKER, Duration::from_secs(5));
+
+    // Retirement boots the job out before it removes the definition, so an
+    // inspection between the two sees a vanished job, never an invalid one.
+    // Each cycle gives the inspection another chance to land in that window.
+    for _ in 0..RETIRE_RACE_CYCLES {
+        fixture
+            .supervisor
+            .start(&id, &definition)
+            .await
+            .expect("worker starts");
+        wait_for(|| fixture.supervisor.inspect(&id), running).await;
+
+        let inspecting = async {
+            loop {
+                match fixture.supervisor.inspect(&id).await {
+                    Ok(_) | Err(Error::Race { .. }) => {}
+                    Err(Error::NotFound(missing)) => {
+                        assert_eq!(missing, id);
+                        return;
+                    }
+                    Err(error) => panic!("inspection during retirement failed: {error}"),
+                }
+            }
+        };
+        // A failed retire panics inside the join instead of leaving the
+        // inspection loop waiting for a job that never goes away.
+        let retiring = async {
+            fixture
+                .supervisor
+                .retire(&id)
+                .await
+                .expect("worker retires");
+        };
+        tokio::join!(retiring, inspecting);
+    }
 }
 
 #[tokio::test]
