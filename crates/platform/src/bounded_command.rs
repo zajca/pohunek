@@ -38,16 +38,16 @@ const SHELL: &str = "/bin/sh";
 ///
 /// Its own stdin is a pipe held by the caller: a watcher kills the whole
 /// process group of this shell, `$$`, when that pipe reaches end of file, which
-/// happens when the caller exits for any reason.
+/// happens when the caller exits for any reason, or closes the pipe after the
+/// shell exited. The watcher outlives the shell so a helper that keeps the
+/// output open is still reaped while the caller drains it; it holds no output
+/// pipe itself.
 const SUPERVISOR: &str = r#"exec 3<&0
 "$@" </dev/null 3<&- &
 child=$!
-(while read -r _ <&3; do :; done; kill -s KILL -- "-$$") 2>/dev/null &
-watcher=$!
+(while read -r _ <&3; do :; done; kill -s KILL -- "-$$") >/dev/null 2>&1 &
 wait "$child"
-status=$?
-kill "$watcher" 2>/dev/null
-exit "$status"
+exit "$?"
 "#;
 
 /// Why a bounded command produced no output.

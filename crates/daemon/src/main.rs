@@ -1694,9 +1694,18 @@ mod tests {
         alive
     }
 
-    /// Blocks until every holder of the write end of the pipe is gone.
+    /// Blocks until every holder of the write end of the pipe is gone, for at
+    /// most [`pohunek_test_support::wait::HANG_GUARD`].
     fn read_until_released(mut alive: std::fs::File) {
-        std::io::copy(&mut alive, &mut std::io::sink()).expect("read the liveness pipe");
+        let (done, released) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = std::io::copy(&mut alive, &mut std::io::sink());
+            let _ = done.send(read.map(|_bytes| ()));
+        });
+        released
+            .recv_timeout(pohunek_test_support::wait::HANG_GUARD)
+            .expect("a process of the hung CLI still holds the liveness pipe")
+            .expect("read the liveness pipe");
     }
 
     /// A status probe that never answers ends at its deadline as a retryable

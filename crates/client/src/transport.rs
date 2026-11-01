@@ -1993,13 +1993,16 @@ pub fn is_local_host(host: &str) -> bool {
 /// overlay; [`is_local_host`] covers them. A route with an explicit `@port`
 /// always selects TCP. A name that resolves to no peer but to this machine on
 /// one or more overlays is this machine. A name that names this machine and a
-/// peer is the typed ambiguous-host error. An unknown name, an unavailable
-/// provider, or a missing overlay configuration answers `false`, so the
-/// connection that follows reports what it reports today.
+/// peer is the typed ambiguous-host error. A name no provider could look up
+/// because every probe failed is the typed host-unavailable error, so one
+/// failing probe is not repeated by the connection that follows. An unknown
+/// name or a missing overlay configuration answers `false`, and the connection
+/// that follows reports what it reports today.
 ///
 /// # Errors
 ///
-/// Returns [`ClientError`] for an ambiguous selector and for an invalid route.
+/// Returns [`ClientError`] for an ambiguous selector, an unavailable provider
+/// and an invalid route.
 pub async fn names_this_machine(
     host: &str,
     connect_timeout: Duration,
@@ -2017,7 +2020,8 @@ pub async fn names_this_machine(
 ///
 /// # Errors
 ///
-/// Returns [`ClientError`] for an ambiguous selector and for an invalid route.
+/// Returns [`ClientError`] for an ambiguous selector, an unavailable provider
+/// and an invalid route.
 pub async fn names_this_machine_in(
     host: &str,
     connect_timeout: Duration,
@@ -2037,7 +2041,9 @@ pub async fn names_this_machine_in(
     .await
     {
         Ok(Ok(HostTarget::Local)) => Ok(true),
-        Ok(Err(error @ RegistryError::AmbiguousHost { .. })) => Err(ClientError::from(error)),
+        Ok(Err(
+            error @ (RegistryError::AmbiguousHost { .. } | RegistryError::HostUnavailable { .. }),
+        )) => Err(ClientError::from(error)),
         Ok(Ok(HostTarget::Remote(_)) | Err(_)) | Err(_) => Ok(false),
     }
 }

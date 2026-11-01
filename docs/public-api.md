@@ -5271,7 +5271,10 @@ Connection APIs:
   a peer's, so a name both carry is `overlay_host_ambiguous`, whose message
   lists every matching host and whose `recover` text names the
   selector of each: provider-qualified for a peer, `local` for this machine. `local`, an
-  unknown name, an unavailable provider, and a `@<port>` route answer `false`.
+  unknown name, and a `@<port>` route answer `false`; a name that no provider
+  could look up because its status probe failed is the typed
+  `<overlay>_state_unavailable` error, so a failing probe costs one status
+  deadline per command.
   `Client::connect` applies the same rule, so the CLI's alias table only saves
   a lookup (see `docs/cli.md`, host resolution).
 - `resolve_host_target(host, connect_timeout)` and `resolve_host_target_in(host,

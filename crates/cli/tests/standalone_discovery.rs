@@ -707,6 +707,7 @@ fn this_machine_and_its_peers_come_from_one_netbird_run() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_netbird_probe_that_never_answers_is_bounded_and_killed() {
+    // timing-allowed: #1565 the one-second status deadline expiring is the behaviour under test.
     let env = TestEnv::new().expect("create the hermetic test environment");
     let dir = env.config_home().join("pohunek");
     fs::create_dir_all(&dir).expect("create the config directory");

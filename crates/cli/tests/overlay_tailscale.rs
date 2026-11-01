@@ -681,6 +681,7 @@ fn assert_not_running(file: &std::path::Path) {
 #[test]
 fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     let fixture = Fixture::new(&tailnet());
+    // timing-allowed: #1565 the one-second status deadline expiring is the behaviour under test.
     fixture.configure("status_timeout_secs = 1");
     let pid = install_hanging_cli(&fixture);
 
@@ -698,11 +699,13 @@ fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     // A CLI that exits but leaves a helper holding its output is bounded and
     // its helper is killed too.
     let helper = fixture.env.root().join("tailscale.helper");
+    let runs = fixture.env.root().join("tailscale.runs");
     pohunek_test_support::fs::write_executable(
         fixture.fake.bin_dir().join("tailscale"),
         format!(
-            "#!/bin/sh\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
-            helper.display()
+            "#!/bin/sh\nprintf x >> '{runs}'\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{helper}'\nexit 0\n",
+            runs = runs.display(),
+            helper = helper.display()
         ),
     )
     .expect("write the leaking fake");
@@ -710,9 +713,14 @@ fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     assert_eq!(error_code(&output), "tailscale_state_unavailable");
     assert_not_running(&helper);
 
+    // One `--host` command probes the provider once, so it waits for one
+    // status deadline.
+    let before = fs::read_to_string(&runs).expect("runs so far").len();
     let (output, targets) = fixture.dial("alpha");
     assert_eq!(error_code(&output), "tailscale_state_unavailable");
     assert!(targets.is_empty(), "{targets:?}");
+    let after = fs::read_to_string(&runs).expect("runs so far").len();
+    assert_eq!(after - before, 1, "the status probe ran once per command");
 }
 
 /// The deadline is a strict, range-checked `overlays.toml` key.
@@ -806,9 +814,18 @@ fn install_pipe_holding_cli(fixture: &Fixture) -> PathBuf {
     alive
 }
 
-/// Blocks until every holder of the write end of `alive` is gone.
-fn read_until_released(alive: &mut fs::File) {
-    std::io::copy(alive, &mut std::io::sink()).expect("read the liveness pipe to its end");
+/// Blocks until every holder of the write end of `alive` is gone, for at most
+/// [`pohunek_test_support::wait::HANG_GUARD`].
+fn read_until_released(mut alive: fs::File) {
+    let (done, released) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read = std::io::copy(&mut alive, &mut std::io::sink());
+        let _ = done.send(read.map(|_bytes| ()));
+    });
+    released
+        .recv_timeout(pohunek_test_support::wait::HANG_GUARD)
+        .expect("a process of the hung CLI still holds the liveness pipe")
+        .expect("read the liveness pipe to its end");
 }
 
 /// A status deadline longer than the 5 s connect timeout ends the probe as
@@ -834,12 +851,49 @@ fn an_interrupted_command_leaves_no_provider_process() {
     let alive = install_pipe_holding_cli(&fixture);
     let mut child = fixture.spawn(&["host", "list", "--refresh", "--json"]);
     // Opening the read end returns once the fake holds the write end.
-    let mut reader = fs::File::open(&alive).expect("open the liveness pipe");
+    let reader = fs::File::open(&alive).expect("open the liveness pipe");
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
         nix::sys::signal::Signal::SIGINT,
     )
     .expect("interrupt the CLI");
     child.wait().expect("the CLI ends");
-    read_until_released(&mut reader);
+    read_until_released(reader);
+}
+
+/// A CLI that exited and left a helper holding its output does not outlive an
+/// interrupted command: the helper is still running while the command drains
+/// that output, and goes down with the command.
+#[test]
+fn an_interrupted_command_reaps_a_helper_that_outlives_the_provider() {
+    let fixture = Fixture::new(&tailnet());
+    fixture.configure("status_timeout_secs = 120");
+    let exited = fixture.env.root().join("tailscale.exited");
+    let alive = fixture.env.root().join("tailscale.alive");
+    for pipe in [&exited, &alive] {
+        nix::unistd::mkfifo(pipe, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("create a liveness pipe");
+    }
+    // `exited` is held by the CLI alone, `alive` by the CLI and its helper.
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nexec 8> '{exited}'\nexec 9> '{alive}'\n/bin/sleep 3600 8>&- &\nexit 0\n",
+            exited = exited.display(),
+            alive = alive.display()
+        ),
+    )
+    .expect("write the leaking fake");
+    let mut child = fixture.spawn(&["host", "list", "--refresh", "--json"]);
+    // Each open returns once the fake holds the write end.
+    let exited_reader = fs::File::open(&exited).expect("open the exit pipe");
+    let alive_reader = fs::File::open(&alive).expect("open the liveness pipe");
+    read_until_released(exited_reader);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("interrupt the CLI");
+    child.wait().expect("the CLI ends");
+    read_until_released(alive_reader);
 }

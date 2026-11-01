@@ -2956,8 +2956,9 @@ const PIN_WRONG_PORT: &str = "1";
 #[cfg(target_os = "linux")]
 const PIN_STALL: &str = "stall";
 
-/// How long a stalled fake `netbird` hangs: beyond the default 10 s status
-/// deadline, so only a bounded lookup finishes.
+/// How long a stalled fake `netbird` hangs: beyond the one-second status
+/// deadline [`write_status_deadline`] configures, so only a bounded lookup
+/// finishes.
 #[cfg(target_os = "linux")]
 const PIN_STALL_SECONDS: u32 = 30;
 
@@ -3009,6 +3010,22 @@ struct PinnedRun {
     requests: Vec<Request>,
 }
 
+/// Configures a one-second provider status deadline for `home`, so a stalled
+/// fake `netbird` ends the lookup quickly.
+#[cfg(target_os = "linux")]
+fn write_status_deadline(home: &TestHome) {
+    let dir = home.env.config_home().join("pohunek");
+    fs::create_dir_all(&dir).expect("create the config directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("private config dir");
+    let file = dir.join("overlays.toml");
+    fs::write(
+        &file,
+        "providers = [\"netbird\"]\nstatus_timeout_secs = 1\n",
+    )
+    .expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("private file");
+}
+
 /// Runs `pohunek --host <host> <args>` against a fake `NetBird` whose table
 /// changes from `before` to `after` once the first connection was dialed.
 /// `host` may contain [`PORT_PLACEHOLDER`]; `env_port` is the configured
@@ -3027,6 +3044,9 @@ fn run_pinned(
     let fixture_port = tcp_fixture.address.port().to_string();
     let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
     let bin = home.root.join("bin");
+    if after == PIN_STALL {
+        write_status_deadline(&home);
+    }
     let path = if after == PIN_STALL {
         pin_overlay::install_stalling(&bin, &connect_capture, before, PIN_STALL_SECONDS)
     } else {
@@ -3261,6 +3281,7 @@ fn pinned_operations_of_the_machines_own_overlay_name_stay_on_the_local_daemon()
 #[test]
 #[cfg(target_os = "linux")]
 fn a_stalled_lookup_of_a_pinned_peer_fails_under_the_typed_name() {
+    // timing-allowed: #1565 the one-second status deadline expiring is the behaviour under test.
     for command in PINNED_SESSION_COMMANDS {
         let run = run_pinned("peer-a", command, &pin_before(), PIN_STALL, None);
         let document = assert_json_error(&run.output, "netbird_state_unavailable");
