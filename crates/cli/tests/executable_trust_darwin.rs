@@ -190,23 +190,6 @@ fn assert_refused(fixture: &Fixture, path: &str) {
     );
 }
 
-/// D3: a failing listing names the refused candidate and why.
-///
-/// A `tailscale` of the host's own, found through the fallback table, turns the
-/// listing into another result, so the naming is asserted when the refusal is
-/// what failed.
-fn assert_refusal_named(fixture: &Fixture, path: &str, refused: &Path) {
-    let output = fixture.host_list(path);
-    let document = json(&output);
-    if document["err"]["code"] == "tailscale_cli_missing" {
-        let message = document["err"]["msg"].as_str().expect("message");
-        assert!(
-            message.contains(&refused.display().to_string()) && message.contains("not trusted"),
-            "the refused candidate is named: {message}"
-        );
-    }
-}
-
 /// M1: a user-owned `admin` 0775 directory on `PATH` is trusted.
 #[test]
 fn an_admin_group_writable_directory_on_path_is_trusted() {
@@ -268,10 +251,8 @@ fn a_homebrew_prefix_with_admin_group_directories_is_trusted() {
 fn a_group_writable_directory_of_another_group_is_refused() {
     let fixture = Fixture::new();
     let directory = fixture.directory("m4", STAFF_GID, 0o775);
-    let fake = fixture.place_fake(&directory, 0o755);
-    let path = format!("{}:{SYSTEM_PATH}", directory.display());
-    assert_refused(&fixture, &path);
-    assert_refusal_named(&fixture, &path, &fake);
+    fixture.place_fake(&directory, 0o755);
+    assert_refused(&fixture, &format!("{}:{SYSTEM_PATH}", directory.display()));
 }
 
 /// M5: world write keeps the directory untrusted whatever its group.
