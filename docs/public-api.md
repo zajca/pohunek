@@ -1941,7 +1941,15 @@ Important fields:
   `resources`, `other`; a client treats any other value as unknown), `signal`
   and `code` are the optional signal number or exit code of the worker process
   (for `oom_kill` they describe how the worker process died, usually the stop
-  signal, and the cause comes from the manager's verdict alone). It is absent
+  signal, and the cause comes from the manager's verdict alone). For an
+  `oom_kill`, `oom_killer` names the memory killer when the manager's kill
+  counters evidence exactly one (`kernel` or `systemd_oomd`; `jetsam` is
+  reserved for macOS; an open string, absent otherwise, because a
+  `systemd-oomd` kill also ends the unit with the `oom_kill` result).
+  `memory_peak_bytes` is the highest memory use of the worker's unit in bytes
+  and `ended_at` is when its main process ended (RFC 3339); both are absent when
+  the manager does not report them (systemd before 255 reports no peak, before
+  259 no kill counters). `exit` is absent
   after a host restart, for a macOS worker that ended while the daemon was not
   watching it (the daemon records launchd workers through a kernel exit watch
   armed when the runtime becomes live), for a worker started directly by the
@@ -1950,7 +1958,15 @@ Important fields:
   cleared when the runtime becomes anything else (a stop the user requested
   ends the runtime `terminal`, without an exit). It is diagnostic: it does not
   change `state` or the proof of the loss, and an unproven loss records it too.
-  Peers on protocol 3 never see it, and a 0.35 client ignores it. Daemon
+  Peers on protocol 3 never see it, and a 0.35 client ignores it.
+  `loss_cause` (optional, an open string) says why a `lost` runtime has no
+  manager verdict: `user_manager_lost` (the journal named the user service
+  manager that held the worker, and that process is gone within the same
+  boot) or `host_restarted` (the host booted again after the worker started).
+  It is set only while `exit` is absent, kept while the runtime stays `lost`,
+  cleared with `exit`, and absent when the journal proves neither (a worker
+  that was not a unit of a user manager, an older worker, or an unreadable
+  manager identity). Peers on protocol 3 never see it. Daemon
   reconnection preserves both identities;
   explicit native recovery changes them. A `lost` runtime whose end the daemon
   observed (the worker's job ended and was retired, a host restart, or an

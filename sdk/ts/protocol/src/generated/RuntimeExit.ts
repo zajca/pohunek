@@ -20,4 +20,19 @@ export type RuntimeExit = {
    * Exit code of the worker process, when it exited by itself.
    */
   code?: number;
+  /**
+   * Which memory killer ended the worker when `cause` is `oom_kill`. Open
+   * string; clients must tolerate a value they do not know. The
+   * documented values are `kernel`, `systemd_oomd` and `jetsam`. Absent
+   * when the evidence does not name exactly one killer.
+   */
+  oom_killer?: string;
+  /**
+   * Highest memory use of the worker's unit in bytes, children included.
+   */
+  memory_peak_bytes?: number;
+  /**
+   * When the worker's main process ended (RFC 3339), per the manager.
+   */
+  ended_at?: string;
 };

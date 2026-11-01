@@ -28,7 +28,7 @@ use protocol::{
 };
 
 use super::reconcile::JournalEvidence;
-use super::{SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
+use super::{LossCause, SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
 use crate::runtime::lifecycle::{
     self, observation_live, observation_unproven, Generation, Lifecycle, SUPERVISION_AMBIGUOUS,
     SUPERVISION_UNAVAILABLE,
@@ -230,6 +230,15 @@ pub(super) async fn observe(
     }
 }
 
+/// The user service manager a worker journaled as the holder of its unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ManagerRecord<'a> {
+    /// Manager process identifier.
+    pub(super) pid: u32,
+    /// Manager process start identity, as recorded.
+    pub(super) start_identity: &'a str,
+}
+
 /// Journal facts that identify one generation's worker process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct JournalWorker<'a> {
@@ -256,6 +265,9 @@ pub(super) struct JournalWorker<'a> {
     /// Identifier of the boot the worker ran in, as recorded; absent when the
     /// worker's host could not name one or the journal predates the field.
     pub(super) boot_session_id: Option<&'a str>,
+    /// The user service manager that held the worker as its unit; absent when
+    /// the worker was not one or the journal predates the field.
+    pub(super) manager: Option<ManagerRecord<'a>>,
     /// Runtime (PTY) identifier after initialization; its processes carry it
     /// as their ownership marker.
     pub(super) worker_instance_id: Option<&'a str>,
@@ -470,6 +482,9 @@ pub(super) enum Unreachable {
         /// unreadable-marker processes with it, so long-lived non-dumpable
         /// bystanders are provably not descendants of the runtime.
         bounds: WorkerBounds,
+        /// Why the runtime was lost when the service manager gave no verdict;
+        /// set only when the journal proves it.
+        loss_cause: Option<LossCause>,
     },
 }
 
@@ -511,6 +526,7 @@ pub(super) fn classify_unreachable(
             journaled: false,
             worker_instance_id: None,
             bounds: WorkerBounds::NONE,
+            loss_cause: None,
         };
     };
     let identity = match worker.identity() {
@@ -518,11 +534,15 @@ pub(super) fn classify_unreachable(
         Err(detail) => return Unreachable::Mismatch(detail),
     };
     match inspector.is_running(identity) {
-        Ok(false) => Unreachable::Ended {
-            journaled: true,
-            worker_instance_id: worker.worker_instance_id.map(ToOwned::to_owned),
-            bounds: worker.bounds(),
-        },
+        Ok(false) => {
+            let bounds = worker.bounds();
+            Unreachable::Ended {
+                journaled: true,
+                worker_instance_id: worker.worker_instance_id.map(ToOwned::to_owned),
+                loss_cause: loss_cause(worker, &bounds, inspector),
+                bounds,
+            }
+        }
         Ok(true) => Unreachable::Ambiguous(format!(
             "worker process {} is running but its socket is not reachable",
             identity.pid
@@ -531,6 +551,39 @@ pub(super) fn classify_unreachable(
             "worker process {} cannot be inspected: {error}",
             identity.pid
         )),
+    }
+}
+
+/// What the journal proves about why a worker that is gone was lost.
+///
+/// A host that booted again proves [`LossCause::HostRestarted`]. Within the
+/// boot the worker recorded, a journaled manager process that is no longer
+/// running with its recorded start identity (a reused pid counts as gone)
+/// proves [`LossCause::UserManagerLost`]. A worker that journaled no manager,
+/// a manager identity that cannot be read, or a boot the host cannot compare
+/// proves neither.
+fn loss_cause(
+    worker: &JournalWorker<'_>,
+    bounds: &WorkerBounds,
+    inspector: &dyn ProcessInspector,
+) -> Option<LossCause> {
+    if bounds.previous_boot {
+        return Some(LossCause::HostRestarted);
+    }
+    let manager = worker.manager?;
+    let same_boot = HostInspector::new()
+        .boot_identity()
+        .is_ok_and(|current| current.as_str() == worker.boot_identity);
+    if !same_boot {
+        return None;
+    }
+    let identity = ProcessIdentity {
+        pid: manager.pid,
+        start_identity: manager.start_identity.parse::<StartIdentity>().ok()?,
+    };
+    match inspector.is_running(identity) {
+        Ok(false) => Some(LossCause::UserManagerLost),
+        Ok(true) | Err(_) => None,
     }
 }
 

@@ -27,9 +27,9 @@ use super::settle::RescanSignal;
 use super::supervision::{
     classify_unreachable, count_unaccepted, describe_unreadable_candidates, job_identity_mismatch,
     observe, record_accepted_process, with_settle_window, Cleanup, JobEvidence, JournalWorker,
-    Unreachable, WorkerBounds, CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES,
-    RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER,
-    UNSUPERVISED_WORKER,
+    ManagerRecord, Unreachable, WorkerBounds, CREATE_COMPENSATION_PENDING,
+    MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+    UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::tmpdir::TmpdirOwners;
 use super::{
@@ -37,10 +37,10 @@ use super::{
     present_lost_runtime, preserve_durable_worker_metadata, preserve_newer_updated_at,
     runtime_error, sort_subagents, terminalize_running_subagents, timestamp_now, watch,
     ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate,
-    DetectorInputs, DetectorScope, LossProof, Mutex, ObservedAgent, ProtocolError, ResumeSnapshot,
-    RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord,
-    SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource,
-    TurnEvents, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
+    DetectorInputs, DetectorScope, LossCause, LossProof, Mutex, ObservedAgent, ProtocolError,
+    ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId,
+    SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
+    StateSource, TurnEvents, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
     WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::agent::host::RuntimeDefinition;
@@ -201,6 +201,11 @@ pub(super) struct JournalEvidence {
     /// worker of the previous release.
     #[serde(default)]
     worker_control_group: Option<String>,
+    /// The user service manager that held the worker as its unit, valid within
+    /// `boot_identity`; absent for a worker that was not a unit of a user
+    /// manager and for a worker of the previous release.
+    #[serde(default)]
+    worker_manager: Option<JournalManager>,
     /// Identifier of the boot the worker ran in; absent for a worker that did
     /// not record one.
     #[serde(default)]
@@ -311,10 +316,22 @@ impl JournalEvidence {
             spawn_id: self.worker_spawn_id.as_deref(),
             coalitions: self.worker_coalitions.as_deref(),
             control_group: self.worker_control_group.as_deref(),
+            manager: self.worker_manager.as_ref().map(|manager| ManagerRecord {
+                pid: manager.pid,
+                start_identity: &manager.start_identity,
+            }),
             boot_session_id: self.boot_session_id.as_deref(),
             worker_instance_id: self.worker_instance_id.as_deref(),
         }
     }
+}
+
+/// The service-manager process a worker journaled.
+#[derive(Debug, Clone, Deserialize)]
+struct JournalManager {
+    pid: u32,
+    /// Platform start identity, as the worker recorded it.
+    start_identity: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1803,6 +1820,7 @@ impl SessionRegistry {
                 journaled,
                 worker_instance_id,
                 bounds,
+                loss_cause,
             } => {
                 // The removal finalizer sweeps every runtime of the
                 // generation itself and finishes only on a confirmed sweep.
@@ -1885,7 +1903,9 @@ impl SessionRegistry {
                         .await;
                 }
                 let (proof, reason) = ended_loss(journaled, cleanup);
-                let committed = self.insert_lost_record(record, reason, proof, exit).await;
+                let committed = self
+                    .insert_ended_record(record, reason, proof, exit, loss_cause)
+                    .await;
                 if committed {
                     self.forget_exit(&id.0);
                 }
@@ -2304,6 +2324,7 @@ impl SessionRegistry {
                 journaled,
                 worker_instance_id,
                 bounds,
+                loss_cause,
             } => {
                 // Only a journaled worker whose process is proven gone proves
                 // which runtime died. Without a journal nothing proves what
@@ -2326,7 +2347,10 @@ impl SessionRegistry {
                     (RECONNECTING, SUPERVISION_UNAVAILABLE)
                 } else {
                     let (proof, reason) = ended_loss(journaled, cleanup);
-                    (Unavailability::lost(proof, exit), reason)
+                    (
+                        Unavailability::lost(proof, exit).with_loss_cause(loss_cause),
+                        reason,
+                    )
                 }
             }
         };
@@ -3500,6 +3524,7 @@ impl SessionRegistry {
             last_connected_at: None,
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         });
         self.insert_unavailable_record(record, RuntimeState::Terminal, "worker_journal_terminal")
             .await
@@ -4090,6 +4115,7 @@ impl SessionRegistry {
             last_connected_at: Some(now.clone()),
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         });
         record.info.updated_at = now;
         record.transaction = None;
@@ -4297,6 +4323,21 @@ impl SessionRegistry {
             .await
     }
 
+    /// [`Self::insert_lost_record`] for a worker generation proven ended,
+    /// with the journal's explanation of a loss that has no manager verdict.
+    #[must_use = "an uncommitted classification must keep the session pending"]
+    async fn insert_ended_record(
+        &self,
+        record: SessionRecord,
+        reason: &str,
+        proof: LossProof,
+        exit: Option<protocol::RuntimeExit>,
+        loss_cause: Option<LossCause>,
+    ) -> bool {
+        let classification = Unavailability::lost(proof, exit).with_loss_cause(loss_cause);
+        Box::pin(self.insert_classified_record(record, classification, reason)).await
+    }
+
     #[must_use = "an uncommitted classification must keep the session pending"]
     async fn insert_classified_record(
         &self,
@@ -4418,6 +4459,7 @@ impl SessionRegistry {
             last_connected_at: None,
             loss_reason: Some(reason.to_owned()),
             exit: None,
+            loss_cause: None,
         });
         classification.apply_exit(runtime);
         runtime.state = state;
@@ -4591,6 +4633,7 @@ impl SessionRegistry {
                         last_connected_at: None,
                         loss_reason: None,
                         exit: None,
+                        loss_cause: None,
                     })
                     .state = RuntimeState::Terminal;
                 let imported = self
@@ -6782,6 +6825,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
             last_connected_at: None,
             loss_reason: live.then(|| "legacy_runtime_not_transferable".to_owned()),
             exit: None,
+            loss_cause: None,
         });
         let recovery = resume
             .iter()
@@ -8539,6 +8583,7 @@ while os.getppid() == parent:
             worker_spawn_id: None,
             worker_coalitions: None,
             worker_control_group: None,
+            worker_manager: None,
             boot_session_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
@@ -8734,6 +8779,7 @@ while os.getppid() == parent:
             worker_spawn_id: None,
             worker_coalitions: None,
             worker_control_group: None,
+            worker_manager: None,
             boot_session_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
@@ -9646,6 +9692,7 @@ while os.getppid() == parent:
                 last_connected_at: Some(created_at.clone()),
                 loss_reason: None,
                 exit: None,
+                loss_cause: None,
             }),
             cols: 80,
             rows: 24,
@@ -9742,6 +9789,7 @@ while os.getppid() == parent:
                         last_connected_at: None,
                         loss_reason: None,
                         exit: None,
+                        loss_cause: None,
                     }),
                     ..info
                 },
@@ -11224,6 +11272,7 @@ while os.getppid() == parent:
                     last_connected_at: Some(created_at.clone()),
                     loss_reason: None,
                     exit: None,
+                    loss_cause: None,
                 }),
                 cols: 80,
                 rows: 24,
@@ -14378,6 +14427,9 @@ handler = "codex-hook-v1"
                 cause: "oom_kill".to_owned(),
                 signal: None,
                 code: None,
+                oom_killer: None,
+                memory_peak_bytes: None,
+                ended_at: None,
             }
         }
 
@@ -14421,6 +14473,75 @@ handler = "codex-hook-v1"
                 stored.info.runtime.and_then(|runtime| runtime.exit),
                 Some(oom_exit())
             );
+        }
+
+        /// The killer, the peak and the end time the manager recorded reach
+        /// the session and its stored record, whichever memory killer ended
+        /// the unit.
+        #[tokio::test]
+        async fn the_memory_killer_and_peak_of_a_failed_job_reach_the_session() {
+            use pohunek_platform::supervisor::{ExitEvidence, JobExit};
+            use std::time::{Duration, SystemTime};
+
+            let ended = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+            let kills = [
+                ("s-4226", Some(1), Some(0), Some("kernel")),
+                ("s-4227", Some(0), Some(1), Some("systemd_oomd")),
+                ("s-4228", Some(1), Some(1), None),
+            ];
+            for (session, oom_kills, managed, killer) in kills {
+                let fixture = fixture(Arc::new(RetryInspector::default()));
+                let runtime_id = format!("runtime-{session}");
+                Marked::spawn(&fixture.root, &runtime_id);
+                persist_record(&fixture.root, session, Some(&runtime_id));
+                write_live_journal(
+                    &fixture.root,
+                    session,
+                    dead_worker_with_realistic_start(),
+                    Some(&runtime_id),
+                );
+                let id = service_id(session, TEST_GENERATION);
+                fixture
+                    .supervisor
+                    .script_job(id.clone(), present(ServiceState::Failed, None));
+                fixture.supervisor.script_exit_evidence(
+                    id,
+                    crate::runtime::lifecycle::tests::EvidenceScript::Failed(
+                        ExitEvidence::new("oom-kill".to_owned(), Some(JobExit::Signal(9)))
+                            .with_oom_kills(oom_kills, managed)
+                            .with_memory_peak(Some(26_300_000_000))
+                            .with_exited_at(Some(ended)),
+                    ),
+                );
+
+                Box::pin(fixture.registry.reconcile_workers())
+                    .await
+                    .expect("reconcile");
+
+                let expected = protocol::RuntimeExit {
+                    cause: "oom_kill".to_owned(),
+                    signal: Some(9),
+                    code: None,
+                    oom_killer: killer.map(str::to_owned),
+                    memory_peak_bytes: Some(26_300_000_000),
+                    ended_at: Some("1970-01-02T00:00:00Z".to_owned()),
+                };
+                let runtime = runtime_of(&fixture.registry, session).await;
+                assert_eq!(runtime.state, RuntimeState::Lost, "{session}");
+                assert_eq!(runtime.exit, Some(expected.clone()), "{session}");
+                assert_eq!(runtime.loss_cause, None, "{session}");
+                let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                    .load_sessions()
+                    .expect("load store")
+                    .into_iter()
+                    .find(|record| record.session_id == session)
+                    .expect("record");
+                assert_eq!(
+                    stored.info.runtime.and_then(|runtime| runtime.exit),
+                    Some(expected),
+                    "{session}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -15463,6 +15584,126 @@ generation "$1"
                 runtime.loss_reason.as_deref(),
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
+        }
+
+        /// Reconciles a lost worker whose journal names the given boot and
+        /// manager and returns the lost runtime.
+        async fn lost_runtime_of_manager(
+            tag: &str,
+            boot_identity: Option<String>,
+            boot_session_id: Option<String>,
+            manager: Option<(u32, u64)>,
+        ) -> protocol::SessionRuntime {
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            let runtime_id = format!("runtime-{tag}");
+            persist_record(&fixture.root, tag, Some(&runtime_id));
+            write_journal_record(
+                &fixture.root,
+                tag,
+                &format!("worker-{tag}"),
+                TEST_GENERATION,
+                dead_worker(),
+                Some(&runtime_id),
+                |journal| {
+                    if let Some(boot_identity) = boot_identity {
+                        journal.boot_identity = boot_identity;
+                    }
+                    journal.boot_session_id = boot_session_id;
+                    journal.worker_manager =
+                        manager.map(|(pid, start)| pohunek_session_worker::WorkerManager {
+                            pid,
+                            start_identity: start.to_string(),
+                        });
+                },
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            runtime_of(&fixture.registry, tag).await
+        }
+
+        fn current_boot_identity() -> String {
+            HostInspector::new()
+                .boot_identity()
+                .expect("the host names its boot")
+                .to_string()
+        }
+
+        /// The user manager that held a journaled worker is gone within the
+        /// boot the worker recorded, and no manager verdict exists.
+        #[tokio::test]
+        async fn a_user_manager_gone_within_the_boot_is_the_cause_of_the_loss() {
+            let runtime = lost_runtime_of_manager(
+                "s-4221",
+                Some(current_boot_identity()),
+                HostInspector::new().boot_session_id().ok(),
+                Some(dead_worker()),
+            )
+            .await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
+            assert_eq!(runtime.exit, None, "a loss cause never rides with an exit");
+        }
+
+        /// A manager that still runs explains nothing, so the loss stays
+        /// unexplained rather than blamed on it.
+        #[tokio::test]
+        async fn a_running_user_manager_leaves_the_loss_unexplained() {
+            let runtime = lost_runtime_of_manager(
+                "s-4222",
+                Some(current_boot_identity()),
+                HostInspector::new().boot_session_id().ok(),
+                Some(own_identity()),
+            )
+            .await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_cause, None);
+        }
+
+        /// A journal without a manager (an older worker, launchd, a direct
+        /// child) and a manager identity from another boot prove nothing.
+        #[tokio::test]
+        async fn a_journal_without_a_usable_manager_leaves_the_loss_unexplained() {
+            let without = lost_runtime_of_manager(
+                "s-4223",
+                Some(current_boot_identity()),
+                HostInspector::new().boot_session_id().ok(),
+                None,
+            )
+            .await;
+            assert_eq!(without.state, RuntimeState::Lost);
+            assert_eq!(without.loss_cause, None);
+
+            let other_boot = lost_runtime_of_manager(
+                "s-4224",
+                Some("another-boot".to_owned()),
+                None,
+                Some(dead_worker()),
+            )
+            .await;
+            assert_eq!(other_boot.state, RuntimeState::Lost);
+            assert_eq!(
+                other_boot.loss_cause, None,
+                "a manager pid of another boot could name an unrelated process"
+            );
+        }
+
+        /// The host booted again after the worker started, so the whole user
+        /// manager went with it.
+        #[tokio::test]
+        async fn a_host_that_booted_again_is_the_cause_of_the_loss() {
+            let runtime = lost_runtime_of_manager(
+                "s-4225",
+                None,
+                Some("00000000-0000-4000-8000-00000000dead".to_owned()),
+                Some(dead_worker()),
+            )
+            .await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_cause.as_deref(), Some("host_restarted"));
+            assert_eq!(runtime.exit, None);
         }
 
         /// A sweep that settles for many polls logs one `info` summary, however
@@ -21245,6 +21486,9 @@ generation "$1"
                 cause: "oom_kill".to_owned(),
                 signal: None,
                 code: None,
+                oom_killer: None,
+                memory_peak_bytes: None,
+                ended_at: None,
             };
             assert_eq!(info.state, protocol::SessionState::Failed);
             assert_eq!(info.activity, None);
@@ -21307,6 +21551,9 @@ generation "$1"
                     cause: "exit_code".to_owned(),
                     signal: None,
                     code: Some(3),
+                    oom_killer: None,
+                    memory_peak_bytes: None,
+                    ended_at: None,
                 })
             );
             wait_gone(descendant).await;
@@ -21330,6 +21577,9 @@ generation "$1"
                     cause: "signal".to_owned(),
                     signal: Some(9),
                     code: None,
+                    oom_killer: None,
+                    memory_peak_bytes: None,
+                    ended_at: None,
                 })
             );
             wait_gone(descendant).await;
@@ -21347,6 +21597,9 @@ generation "$1"
                     cause: "other".to_owned(),
                     signal: None,
                     code: None,
+                    oom_killer: None,
+                    memory_peak_bytes: None,
+                    ended_at: None,
                 })
             );
             wait_gone(descendant).await;
@@ -21624,6 +21877,9 @@ generation "$1"
                     cause: "oom_kill".to_owned(),
                     signal: None,
                     code: None,
+                    oom_killer: None,
+                    memory_peak_bytes: None,
+                    ended_at: None,
                 }),
                 "the pass that wrote the loss found the job already retired"
             );
@@ -21649,6 +21905,9 @@ generation "$1"
                     cause: "oom_kill".to_owned(),
                     signal: None,
                     code: None,
+                    oom_killer: None,
+                    memory_peak_bytes: None,
+                    ended_at: None,
                 }),
                 "the failed retirement did not reset the verdict"
             );
@@ -24644,7 +24903,11 @@ generation "$1"
                     cause: "oom_kill".to_owned(),
                     signal: None,
                     code: None,
+                    oom_killer: None,
+                    memory_peak_bytes: None,
+                    ended_at: None,
                 }),
+                loss_cause: None,
             });
             store.record_session(&record).expect("store failed+lost");
             let registry = upgraded_registry(

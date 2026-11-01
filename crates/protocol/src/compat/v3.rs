@@ -355,6 +355,7 @@ fn session_info(
         rename_in(runtime, site, direction)?;
         if let (Direction::ToLegacy, Value::Object(runtime)) = (direction, runtime) {
             runtime.remove("exit");
+            runtime.remove("loss_cause");
         }
     }
     if matches!(direction, Direction::ToLegacy) {

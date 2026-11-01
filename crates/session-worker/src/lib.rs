@@ -49,7 +49,7 @@ pub use input::{
 pub use journal::{
     ActiveIdentity, ChildIdentity, Journal, JournalError, JournalRecord, LaunchIdentity,
     LoadedJournal, NativeReferenceClaim, OutdatedJournal, PendingLaunchClaim, ReleasedIdentity,
-    RuntimeOutcome, RuntimePhase, WorkerOrigin, JOURNAL_SCHEMA_VERSION,
+    RuntimeOutcome, RuntimePhase, WorkerManager, WorkerOrigin, JOURNAL_SCHEMA_VERSION,
 };
 #[doc(inline)]
 pub use lease::{ControllerLease, LeaseError, LeaseOwner};

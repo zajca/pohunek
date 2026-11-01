@@ -808,6 +808,7 @@ impl Installation {
                 last_connected_at: Some(now.clone()),
                 loss_reason: runtime.reason.clone(),
                 exit: None,
+                loss_cause: None,
             }),
             cols: 80,
             rows: 24,

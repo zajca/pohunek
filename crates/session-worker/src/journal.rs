@@ -37,6 +37,21 @@ impl Debug for BackgroundOwner {
     }
 }
 
+/// The service-manager process that held the worker, as the worker saw it at
+/// initialization.
+///
+/// Valid only within the journal's `boot_identity`. A daemon that finds this
+/// process gone while the boot is unchanged knows the manager that held the
+/// worker is lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerManager {
+    /// Service-manager process identifier.
+    pub pid: u32,
+    /// Service-manager process start identity, as the decimal string the
+    /// journal stores.
+    pub start_identity: String,
+}
+
 /// Worker journal schema this crate writes and the daemon reads as current.
 pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
 /// Owner-only directory permissions.
@@ -436,6 +451,12 @@ pub struct JournalRecord {
     /// host reports no unified control group or the worker could not read it.
     #[serde(default)]
     pub worker_control_group: Option<String>,
+    /// The service-manager process that started the worker as its unit, valid
+    /// only within the boot named by `boot_identity`. Absent when the worker
+    /// was not started by a user service manager (launchd, a direct child, a
+    /// separate process-id namespace) or the manager could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_manager: Option<WorkerManager>,
     /// Identifier of the boot the worker ran in, which changes at every reboot
     /// and at no other time (the boot session UUID on macOS, the kernel boot id
     /// on Linux). A daemon that finds another one on its host knows no process
@@ -522,6 +543,7 @@ impl Debug for JournalRecord {
             .field("worker_spawn_id", &self.worker_spawn_id)
             .field("worker_coalitions", &self.worker_coalitions)
             .field("worker_control_group", &self.worker_control_group)
+            .field("worker_manager", &self.worker_manager)
             .field("boot_session_id", &self.boot_session_id)
             .field("child", &self.child)
             .field("pty_created_at", &self.pty_created_at)
@@ -583,6 +605,7 @@ impl JournalRecord {
             worker_spawn_id: None,
             worker_coalitions: None,
             worker_control_group: None,
+            worker_manager: None,
             boot_session_id: None,
             child: None,
             pty_created_at: None,

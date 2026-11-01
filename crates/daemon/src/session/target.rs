@@ -870,6 +870,7 @@ impl SessionRegistry {
             last_connected_at: None,
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         };
         let preparing_info = SessionInfo {
             id: id.clone(),
@@ -1393,6 +1394,7 @@ impl SessionRegistry {
                 last_connected_at: Some(connected_at),
                 loss_reason: None,
                 exit: None,
+                loss_cause: None,
             }),
         })
     }
