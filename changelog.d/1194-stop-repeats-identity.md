@@ -1,0 +1,4 @@
+---
+kind: fixed
+---
+A Claude session whose `SessionStart` hook was killed before it reported (the agent's 10 s hook timeout) now gets its native reference at the end of its next turn, so resume and fork no longer refuse it: the Claude state hook repeats the identity report on `Stop`. The `SessionStart` hook also leaves `hook_started` and `hook_finished` lines in the hook failure trace, so a hook killed after the interpreter began shows as started without a finish. The managed hook assets are integration version 16: existing installs keep the old behaviour until the integration is reinstalled (`pohunek service upgrade` or `pohunek integration install`), and `integration status` reports them `outdated` until then. A hook killed while `python3` itself is still starting, as on the first start through the Xcode shim, still leaves no line; pinning the interpreter is #1810.

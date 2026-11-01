@@ -289,7 +289,7 @@ daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` and `prompt_accepted` hook requests are additive to the private
-worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=15`; an asset of
+worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=16`; an asset of
 an earlier version still sends the old key, which the daemon accepts only from a
 session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
@@ -3386,7 +3386,7 @@ worker instance key `runtime_id` in `session.report_native_id`, which the
 daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=15`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=16`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
@@ -3769,7 +3769,11 @@ the failure in the hook failure trace (see "Hook failure trace" below). They cop
 lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
 start is not a subagent and adds no row, while a Codex one records a completed
 child; see `subagents` under `SessionInfo`. The Claude integration handler also
-registers the state hook on the main-agent `Stop` (action `stop`): it sends the worker one
+registers the state hook on the main-agent `Stop` (action `stop`): when the input names a
+`session_id` it first repeats the `identity_report` claim of `SessionStart` (the same
+`session_id` and `transcript_path` fields; the claim is idempotent and ordered by `sequence`),
+which recovers a native reference whose `SessionStart` hook the agent killed before it
+reported, and the report does not depend on the task list. It then sends the worker one
 `subagent_snapshot` claim with, for each entry of `background_tasks`, the
 required `id`, `type` and `status`, and the optional fields that sanitize:
 `label` from `description` (every type; control and format characters removed,
@@ -3927,6 +3931,14 @@ Reason codes, with their `detail` values:
 - `worker_closed`: no usable answer line; `detail` is an errno name, `empty`
   or `malformed`;
 - `worker_refused`: the worker answered without `ok: true`;
+- `hook_started` and `hook_finished`: written only by the `session` action.
+  `hook_started` is written as soon as the interpreter runs the hook, before it
+  reads its input; `hook_finished` is the last line of a run that reaches its
+  normal exit. A `hook_started` without a later `hook_finished` for the same
+  session names a run the agent killed after that point (the hook timeout is
+  10 s). A run killed while the interpreter itself is still starting, such as a
+  first `python3` start through the Xcode shim, writes nothing, because a
+  POSIX shell cannot open the trace without following a symlink;
 - `prompt_report_failed`: the Claude `prompt-submit` action raised an
   unexpected error while building or sending its report; the hook still exits 0
   with no output, so the prompt is never delayed or altered;
@@ -3946,10 +3958,12 @@ A line never carries provider payload content, ids taken from the input
 the only identifier is the Pohunek session id. One hook run can write more than
 one line: a `session` or `release` report that the worker does not accept and
 the daemon fallback then delivers keeps the worker's line, and a run whose
-first route succeeds writes none.
+first route succeeds writes none, except that every `session` run writes
+`hook_started` and `hook_finished`.
 
 The hook queues its lines and writes them when it exits, after every exchange
-with the worker or the daemon, so tracing adds no delay to a report. It opens
+with the worker or the daemon, so tracing adds no delay to a report; the
+`session` action's `hook_started` line is the one written at once. It opens
 the trace with `O_APPEND`, `O_CREAT`, `O_NOFOLLOW` and `O_NONBLOCK` and mode
 `0600`, so a symlink at the path is never followed and a new file is
 owner-private, and takes an exclusive lock on the opened file for each line

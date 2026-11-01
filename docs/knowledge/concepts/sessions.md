@@ -592,7 +592,9 @@ closed or refusing) as one line with `ts`, `session`, `provider`, `action`,
 ids, paths or environment values, in the owner-private `pohunek-hooks.jsonl`
 of the pohunek log directory (path from `POHUNEK_HOOK_TRACE_PATH`, rotated
 once into `.1` at `POHUNEK_HOOK_TRACE_MAX_BYTES`, so at most twice that in
-total), and still exits 0; the reason codes are in the
+total), and still exits 0; a `session` run also writes `hook_started` and
+`hook_finished`, so a hook the agent killed shows as started without a finish;
+the reason codes are in the
 [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook.
 
 This collection does not change the parent session's

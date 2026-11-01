@@ -3444,7 +3444,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Version header every managed state hook asset carries.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=15";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=16";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4856,7 +4856,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_removal_cover_the_claude_prompt_submit_hook_and_version_fifteen() {
+    fn status_and_removal_cover_the_claude_prompt_submit_hook_and_the_current_version() {
         if !pohunek_test_support::process_env::in_own_process() {
             return;
         }
@@ -4864,7 +4864,10 @@ mod tests {
         install_claude(&claude).expect("install Claude fixture");
         let installed = explicit_status(&claude, RuntimeRef::claude());
         assert_eq!(installed.state, protocol::IntegrationInstallState::Current);
-        assert_eq!(installed.installed_version, Some(15));
+        assert_eq!(
+            installed.installed_version,
+            Some(protocol::EXPECTED_INTEGRATION_VERSION)
+        );
 
         let settings_path = claude.join("settings.json");
         let mut settings = read_json(&settings_path);

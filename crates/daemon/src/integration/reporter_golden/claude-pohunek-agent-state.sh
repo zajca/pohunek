@@ -3,17 +3,22 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=15
+# POHUNEK_INTEGRATION_VERSION=16
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent
-# state on clean session exit, journal sanitized child state, and report the
+# state on clean session exit, journal sanitized child state, report the
 # main agent's background task list at the end of each turn, and report that a
-# submitted prompt was accepted.
+# submitted prompt was accepted. The end of a turn also repeats the identity
+# report, so a SessionStart hook the agent killed before it reported is
+# recovered at the next turn.
 # Fire-and-forget: every failure exits 0 without output so the hook can never
 # break the agent. Inside a pohunek session with python3 available, a run that
 # does not deliver its report appends one bounded line per reason to the hook
-# trace named by POHUNEK_HOOK_TRACE_PATH, when the worker provides one.
+# trace named by POHUNEK_HOOK_TRACE_PATH, when the worker provides one. The
+# SessionStart run also leaves `hook_started` as soon as the interpreter runs
+# its script and `hook_finished` when it ends, so a hook the agent killed after
+# that shows as started without a finish.
 
 set -eu
 
@@ -301,6 +306,15 @@ def flush_trace():
 if not session_id:
     raise SystemExit(0)
 atexit.register(flush_trace)
+if action == ACTION_SESSION:
+    # Written before any other work, because a hook the agent kills never
+    # reaches the exit handler. Handlers run last-in first-out, so the second
+    # one queues `hook_finished` after every reason of the run and before the
+    # flush; `hook_started` without it names a killed run.
+    trace("hook_started")
+    flush_trace()
+    trace_lines.clear()
+    atexit.register(lambda: trace("hook_finished"))
 
 if not worker_socket_path and not socket_path:
     trace("worker_socket_missing", "unset")
@@ -533,10 +547,13 @@ def read_hook_input():
     if not isinstance(parsed, dict):
         return {}, ("input_invalid", "not_object")
     if action == ACTION_STOP:
+        # The identity fields are returned even when the task list is void, so
+        # an unusable snapshot never costs the turn's identity report.
+        identity = {field: parsed.get(field) for field in ("session_id", "transcript_path")}
         tasks, no_snapshot = snapshot_tasks(parsed)
         if tasks is None:
-            return {}, ("no_snapshot", no_snapshot)
-        return {"tasks": tasks}, None
+            return identity, ("no_snapshot", no_snapshot)
+        return {**identity, "tasks": tasks}, None
     fields = (
         ("agent_id", "agent_type", "parent_agent_id")
         if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
@@ -885,6 +902,11 @@ if action == ACTION_PROMPT_SUBMIT:
     raise SystemExit(0)
 
 if action == ACTION_STOP:
+    # The end of a turn repeats the identity report: it is idempotent and
+    # ordered by `sequence`, and it recovers a SessionStart report that was lost
+    # because the agent killed that hook. The worker is the only route.
+    if native_session_id:
+        send_worker_hook("identity_report")
     if input_problem is not None:
         trace(*input_problem)
         raise SystemExit(0)

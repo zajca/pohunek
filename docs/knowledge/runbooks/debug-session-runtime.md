@@ -261,6 +261,12 @@ The `reason` codes:
 - `worker_refused`: the worker answered without `ok: true`; match it with the
   `worker.identity.rejected` or `worker.subagent.claim.refused` line of the
   same moment in the worker log;
+- `hook_started` and `hook_finished` (the `session` action only): a
+  `hook_started` with no later `hook_finished` for the session is a
+  `SessionStart` run the agent killed after the interpreter began, so the
+  session has no native reference until the next turn ends (the Claude `stop`
+  action repeats the identity report) or never, on a hook older than integration
+  version 16. A run killed while the interpreter starts leaves no line;
 - `daemon_socket_missing`, `daemon_unreachable`, `daemon_timeout`,
   `daemon_closed`, `daemon_refused` (the daemon answered an error) and
   `daemon_protocol_invalid` (no worker socket and no usable

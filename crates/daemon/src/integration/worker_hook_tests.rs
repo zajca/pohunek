@@ -1714,6 +1714,14 @@ mod subagent_sequences {
     /// claim and the stub daemon socket. Returns the raw claim lines the
     /// worker socket received and the daemon stub.
     async fn stop_hook_claims(input: &Value) -> (Vec<String>, DaemonStub) {
+        stop_hook_claims_with(input, &[]).await
+    }
+
+    /// [`stop_hook_claims`] with `extra_env` added to the hook's environment.
+    async fn stop_hook_claims_with(
+        input: &Value,
+        extra_env: &[(&str, &str)],
+    ) -> (Vec<String>, DaemonStub) {
         let root = crate::test_support::scoped_dir("ph-snapshot-claim-");
         let notifications = crate::test_support::scoped_dir("ph-snapshot-claim-data-");
         let daemon = DaemonStub::spawn(&root, &notifications);
@@ -1754,6 +1762,7 @@ mod subagent_sequences {
                 "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
                 pohunek_worker_protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string(),
             )
+            .envs(extra_env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("run the state hook");
@@ -1767,6 +1776,166 @@ mod subagent_sequences {
         assert!(status.success(), "the hook exits 0: {status}");
         let claims = claims.lock().expect("claims lock").clone();
         (claims, daemon)
+    }
+
+    /// Environment that makes the hook name the provider session id as the
+    /// native reference, as a Claude launch does.
+    const ID_REFERENCE: [(&str, &str); 1] = [("POHUNEK_NATIVE_REFERENCE_KIND", "id")];
+
+    fn claim_types(claims: &[String]) -> Vec<String> {
+        claims
+            .iter()
+            .map(|line| {
+                let claim: Value = serde_json::from_str(line).expect("a JSON claim");
+                claim["type"].as_str().expect("a claim type").to_owned()
+            })
+            .collect()
+    }
+
+    /// The end of a turn repeats the identity report before its snapshot, from
+    /// the session id and transcript path of the Stop input, so a `SessionStart`
+    /// report the agent killed is recovered by the next turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_stop_hook_reports_the_identity_before_the_snapshot() {
+        let input = json!({
+            "hook_event_name": "Stop",
+            "session_id": "native-recovered",
+            "transcript_path": "/work/transcript.jsonl",
+            "background_tasks": [],
+        });
+        let (claims, _daemon) = stop_hook_claims_with(&input, &ID_REFERENCE).await;
+
+        assert_eq!(
+            claim_types(&claims),
+            ["identity_report", "subagent_snapshot"],
+            "{claims:?}"
+        );
+        let report: Value = serde_json::from_str(&claims[0]).expect("the identity claim");
+        assert_eq!(report["reference_kind"], "id", "{report}");
+        assert_eq!(report["native_reference"], "native-recovered", "{report}");
+        assert_eq!(report["provider"], "claude", "{report}");
+        assert!(report.get("session_source").is_none(), "{report}");
+    }
+
+    /// A Stop whose task list cannot be used still reports the identity, and a
+    /// Stop without a session id sends the snapshot alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_stop_identity_report_does_not_depend_on_the_snapshot() {
+        let unusable = json!({
+            "hook_event_name": "Stop",
+            "session_id": "native-recovered",
+            "background_tasks": "not a list",
+        });
+        let (claims, _daemon) = stop_hook_claims_with(&unusable, &ID_REFERENCE).await;
+        assert_eq!(claim_types(&claims), ["identity_report"], "{claims:?}");
+
+        let anonymous = json!({"hook_event_name": "Stop", "background_tasks": []});
+        let (claims, _daemon) = stop_hook_claims_with(&anonymous, &ID_REFERENCE).await;
+        assert_eq!(claim_types(&claims), ["subagent_snapshot"], "{claims:?}");
+    }
+
+    /// The `SessionStart` hook with the worker socket absent and the hook trace
+    /// under `root`, reading its input from `stdin`.
+    fn session_hook_command(root: &Path, stdin: std::fs::File) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg(state_asset(CLAUDE))
+            .arg("session")
+            .env_clear()
+            .env("PATH", crate::integration::tests::inherited_path())
+            .env("TMPDIR", root)
+            .env("POHUNEK_ENV", "1")
+            .env("POHUNEK_SESSION_ID", SESSION_ID)
+            .env(
+                "POHUNEK_WORKER_SOCKET_PATH",
+                root.join("absent-worker.sock"),
+            )
+            .env("POHUNEK_WORKER_INSTANCE_ID", SCRIPTED_INSTANCE)
+            .env("POHUNEK_HOOK_TRACE_PATH", super::hook_trace_path(root))
+            .env("POHUNEK_HOOK_TRACE_MAX_BYTES", "65536")
+            .stdin(stdin)
+            .process_group(0)
+            .kill_on_drop(true);
+        command
+    }
+
+    /// The reasons of the `SessionStart` trace lines under `root`, in order.
+    fn trace_reasons(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(super::hook_trace_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let entry: Value = serde_json::from_str(line).expect("a JSON trace line");
+                assert_eq!(entry["action"], "session", "{entry}");
+                entry["reason"].as_str().expect("a reason").to_owned()
+            })
+            .collect()
+    }
+
+    /// A `SessionStart` run leaves `hook_started` before it reads its input and
+    /// `hook_finished` after every other reason of the run, so a run the agent
+    /// kills while it works shows as started without a finish.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_start_hook_traces_its_start_and_its_finish() {
+        let root = crate::test_support::scoped_dir("ph-hook-started-");
+
+        // A run that ends normally.
+        let input = root.join("session-start.json");
+        std::fs::write(
+            &input,
+            json!({"hook_event_name": "SessionStart", "session_id": "native-1"}).to_string(),
+        )
+        .expect("write the SessionStart input");
+        let status = session_hook_command(&root, std::fs::File::open(&input).expect("input"))
+            .status()
+            .await
+            .expect("run the SessionStart hook");
+        assert!(status.success(), "{status}");
+        let reasons = trace_reasons(&root);
+        assert_eq!(
+            reasons.first().map(String::as_str),
+            Some("hook_started"),
+            "{reasons:?}"
+        );
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some("hook_finished"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.len() > 2,
+            "the undelivered report is traced between: {reasons:?}"
+        );
+
+        // A run that blocks on its input and is killed there.
+        std::fs::remove_file(super::hook_trace_path(&root)).expect("reset the trace");
+        let gate = root.join("input.fifo");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).expect("create the input pipe");
+        // Opened read-write, so the hook's read blocks instead of ending.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .expect("hold the input pipe");
+        let mut hook = session_hook_command(&root, held.try_clone().expect("share the pipe"))
+            .spawn()
+            .expect("start the SessionStart hook");
+        pohunek_test_support::wait::wait_until("the hook's start line", || async {
+            (trace_reasons(&root) == ["hook_started"]).then_some(())
+        })
+        .await;
+        // The interpreter is a child of the hook's shell, so the whole group goes.
+        let group = nix::unistd::Pid::from_raw(
+            i32::try_from(hook.id().expect("the hook's pid")).expect("a pid"),
+        );
+        nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
+            .expect("kill the SessionStart hook");
+        hook.wait().await.expect("reap the SessionStart hook");
+        assert_eq!(
+            trace_reasons(&root),
+            ["hook_started"],
+            "a killed run has a start and no finish"
+        );
     }
 
     /// Secret-shaped command of a background shell: a secret after a variable
