@@ -2408,7 +2408,13 @@ fn assert_drain_descriptors(holder: rustix::process::Pid, drain: rustix::process
     // drain keeps or one it opens and closes itself.
     let program = fs::canonicalize("/bin/cat").expect("resolve the drain program");
     pohunek_test_support::wait::poll_until("the drain has exec'd its program", || {
-        let maps = fs::read_to_string(format!("/proc/{}/maps", drain.as_raw_nonzero())).ok()?;
+        let Ok(maps) = fs::read_to_string(format!("/proc/{}/maps", drain.as_raw_nonzero())) else {
+            assert!(
+                rustix::process::test_kill_process(drain).is_ok(),
+                "the drain exited before it was inspected"
+            );
+            return None;
+        };
         maps.lines()
             .any(|line| line.ends_with(&program.display().to_string()))
             .then_some(())
