@@ -399,11 +399,10 @@ fn integration_checks(
         all_profiles: include_profile_homes,
     };
     let homes = crate::integration::ConfigHomes::new(profiles.clone(), base_env.clone());
-    let mut checks = match crate::integration::doctor_in(&homes, params) {
+    let mut checks = match crate::integration::doctor_in_noted(&homes, params) {
         Ok(report) => report
-            .agents
             .iter()
-            .map(integration_agent_check)
+            .map(|(diagnosis, note)| integration_agent_check(diagnosis, *note))
             .collect(),
         Err(_) => vec![check(
             "agent_integrations",
@@ -423,11 +422,11 @@ fn integration_checks(
     checks
 }
 
-/// First Claude integration version whose `Stop` hook repeats the identity report.
-const STOP_IDENTITY_INTEGRATION_VERSION: u32 = 16;
-
 /// Convert one typed integration diagnosis without exposing inspected paths or prose.
-fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> DoctorCheck {
+fn integration_agent_check(
+    diagnosis: &protocol::IntegrationAgentDoctor,
+    note: Option<&str>,
+) -> DoctorCheck {
     let runtime = diagnosis.agent.as_wire();
     let selector = diagnosis
         .home
@@ -501,18 +500,10 @@ fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> Doct
             } else {
                 format!(" This home is shared with {shared_profiles} other configured profile(s).")
             };
-            let stop_recovery = if runtime == "claude"
-                && status
-                    .installed_version
-                    .is_some_and(|version| version < STOP_IDENTITY_INTEGRATION_VERSION)
-            {
-                format!(" Until then a Claude session whose SessionStart hook was killed before it reported keeps no native reference, so resume and fork refuse it; hooks of integration version {STOP_IDENTITY_INTEGRATION_VERSION} or newer recover it at the end of the next turn.")
-            } else {
-                String::new()
-            };
+            let note = note.map(|note| format!(" {note}")).unwrap_or_default();
             (
                 DoctorStatus::Warn,
-                format!("Managed integration is {state}; repair provider configuration if needed, then run `{recovery}`.{shared}{stop_recovery}"),
+                format!("Managed integration is {state}; repair provider configuration if needed, then run `{recovery}`.{shared}{note}"),
             )
         }
     };
@@ -922,28 +913,19 @@ mod tests {
         }
     }
 
-    /// An outdated Claude integration that predates the `Stop` identity report
-    /// tells the operator what the reinstall restores; a current-enough marker
-    /// or another runtime gets the generic text.
+    /// The sentence a handler adds for an outdated install reaches the doctor
+    /// text; without one the text is the generic one.
     #[test]
-    fn an_outdated_claude_integration_names_the_lost_identity_recovery() {
-        let old = integration_agent_check(&outdated_diagnosis(protocol::RuntimeRef::claude(), 15));
+    fn an_outdated_integration_appends_the_note_of_its_handler() {
+        let diagnosis = outdated_diagnosis(protocol::RuntimeRef::codex(), 15);
+        let noted = integration_agent_check(&diagnosis, Some("The handler's note."));
         assert!(
-            old.detail.contains("keeps no native reference"),
+            noted.detail.ends_with(" The handler's note."),
             "{}",
-            old.detail
+            noted.detail
         );
-        for diagnosis in [
-            outdated_diagnosis(protocol::RuntimeRef::claude(), 16),
-            outdated_diagnosis(protocol::RuntimeRef::codex(), 15),
-        ] {
-            let check = integration_agent_check(&diagnosis);
-            assert!(
-                !check.detail.contains("native reference"),
-                "{}",
-                check.detail
-            );
-        }
+        let plain = integration_agent_check(&diagnosis, None);
+        assert!(plain.detail.ends_with("`."), "{}", plain.detail);
     }
 
     fn paths_at(root: &Path) -> Paths {

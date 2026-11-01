@@ -153,6 +153,7 @@ const ALLOW_LIST: &[Entry] = &[
     (
         "crates/daemon/src/integration/provider_handlers.rs",
         Approved::Lines(&[
+    "const STOP_IDENTITY_NOTE: &str = \"Until then a Claude session whose SessionStart hook was killed before it reported keeps no native reference, so resume and fork refuse it; hooks of integration version 16 or newer recover it at the end of the next turn.\";",
     "\"claude-hook-v1\"",
     "\"codex-hook-v1\"",
     "CLAUDE_REPORTED_ACTIONS",

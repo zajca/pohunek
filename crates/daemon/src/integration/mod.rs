@@ -52,9 +52,9 @@ mod uninstall;
 #[cfg(all(test, unix))]
 pub use doctor::doctor;
 #[cfg(unix)]
-pub use doctor::doctor_in;
-#[cfg(unix)]
 pub(crate) use doctor::is_ambiguous_owner;
+#[cfg(unix)]
+pub use doctor::{doctor_in, doctor_in_noted};
 pub(crate) use handler::{hook_runtime_ids, launch_contributor};
 pub use handler::{
     install_in, serves_retired, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
