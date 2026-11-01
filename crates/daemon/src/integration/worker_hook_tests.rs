@@ -1427,8 +1427,12 @@ mod subagent_sequences {
             "{name}: the row keeps its first start"
         );
         assert!(
-            second_turn.updated_at_ms >= first_turn.updated_at_ms,
-            "{name}: {first_turn:?} {second_turn:?}"
+            second_turn.updated_at_ms > first_turn.updated_at_ms,
+            "{name}: the second stop's arrival time is the update time: {first_turn:?} {second_turn:?}"
+        );
+        assert!(
+            second_turn.finished_at_ms > first_turn.finished_at_ms,
+            "{name}: the second turn finishes later than the first: {first_turn:?} {second_turn:?}"
         );
         assert_eq!(
             second_turn.finished_at_ms,
@@ -1477,12 +1481,84 @@ mod subagent_sequences {
             second_turn.revision > first_turn.revision,
             "{first_turn:?} {second_turn:?}"
         );
+        assert!(
+            second_turn.updated_at_ms > first_turn.updated_at_ms,
+            "the second stop's arrival time is the update time: {first_turn:?} {second_turn:?}"
+        );
         assert_eq!(
             second_turn.finished_at_ms,
             Some(second_turn.updated_at_ms),
             "{second_turn:?}"
         );
         run.finish().await;
+    }
+
+    /// The one Codex child `id` running.
+    fn codex_running(id: &str) -> Rows {
+        Rows::from([((CODEX.to_owned(), id.to_owned()), SubagentPhase::Running)])
+    }
+
+    /// A Codex child whose turn was interrupted fires no stop for it, and
+    /// neither does a child closed while it runs (`interrupt_agent`,
+    /// `send_input` with `interrupt`, `close_agent`). Its row stays running
+    /// until the runtime ends, which retires it as lost (#916 D2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_codex_child_without_a_stop_stays_running_until_its_runtime_ends() {
+        for name in ["interrupted_v2", "close_running_v1"] {
+            let events = codex_lifecycle(name);
+            assert_eq!(events, ["SubagentStart"], "{name}: a start and no stop");
+            let root = crate::test_support::scoped_dir("ph-subagent-codex-unstopped-");
+            let run = replay(
+                &root,
+                vec![codex_hook(&events[0], CODEX_CHILD)],
+                &codex_running(CODEX_CHILD),
+            )
+            .await;
+
+            run.stop_runtime().await;
+            let worker = &run.worker;
+            let snapshot = Box::pin(wait_until(
+                "the runtime end settles every running row",
+                || async move {
+                    let snapshot = worker.inspect().await.expect("inspect");
+                    snapshot
+                        .subagents
+                        .iter()
+                        .all(|row| row.phase != SubagentPhase::Running)
+                        .then_some(snapshot)
+                },
+            ))
+            .await;
+            let lost = Rows::from([(
+                (CODEX.to_owned(), CODEX_CHILD.to_owned()),
+                SubagentPhase::Lost,
+            )]);
+            assert_eq!(
+                journaled_rows(&snapshot),
+                lost,
+                "{name}: {:?}",
+                snapshot.subagents
+            );
+            run.close();
+        }
+    }
+
+    /// An interrupted first turn leaves its child running; the stop of the
+    /// turn that follows completes it (#916 D2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interrupted_codex_child_completes_at_its_later_stop() {
+        let events = codex_lifecycle("interrupted_v1");
+        assert_eq!(events, ["SubagentStart", "SubagentStop"]);
+        let root = crate::test_support::scoped_dir("ph-subagent-codex-interrupted-");
+        let steps = vec![
+            codex_hook(&events[0], CODEX_CHILD),
+            Step::Checkpoint(codex_running(CODEX_CHILD)),
+            codex_hook(&events[1], CODEX_CHILD),
+        ];
+        replay(&root, steps, &codex_completed(CODEX_CHILD))
+            .await
+            .finish()
+            .await;
     }
 
     /// `input` with a `padding` field that makes its JSON text exactly
@@ -3532,8 +3608,9 @@ mod subagent_sequences {
         /// Synthetic subagent id of the recorded Claude shape.
         const REORDERED: &str = "a1b3d5f7c9e0a2b4d";
 
-        /// Subagents the worker runs at once: `ACTIVE_SUBAGENT_CAPACITY` in
-        /// `crates/session-worker/src/server.rs`, which is private to the worker.
+        /// Subagents of one provider the worker runs at once:
+        /// `ACTIVE_SUBAGENT_CAPACITY` in `crates/session-worker/src/server.rs`,
+        /// which is private to the worker.
         const ACTIVE_CAPACITY: usize = 64;
 
         /// Longest snapshot task id the worker accepts: `MAX_SUBAGENT_ID_BYTES`.
@@ -3620,7 +3697,11 @@ for claim in plan:
         "sequence": sequence,
     }
     if action == "subagent_start":
-        request.update({"subagent_id": claim["id"], "agent_type": "general-purpose", "parent_id": None})
+        request.update({
+            "subagent_id": claim["id"],
+            "agent_type": claim.get("agent_type", "general-purpose"),
+            "parent_id": claim.get("parent_id"),
+        })
     elif action == "subagent_stop":
         request.update({"subagent_id": claim["id"], "outcome": "completed"})
     elif action == "identity_report":
@@ -3722,6 +3803,48 @@ for claim in plan:
                     quoted(&self.results),
                     quoted(&path)
                 ))
+            }
+
+            /// A step sending, as `provider` from one process, a start and a
+            /// stop of every id in `ids`, each start carrying `parent_id` and
+            /// `agent_type`.
+            fn finished_wide(
+                &self,
+                provider: &str,
+                ids: &[String],
+                (parent_id, agent_type): (&str, &str),
+            ) -> Step {
+                let claims = ids
+                    .iter()
+                    .zip(((1_u64 << 62)..).step_by(2))
+                    .flat_map(|(id, sequence)| {
+                        [
+                            json!({"type": START, "sequence": sequence, "id": id,
+                                "parent_id": parent_id, "agent_type": agent_type}),
+                            json!({"type": STOP, "sequence": sequence + 1, "id": id}),
+                        ]
+                    })
+                    .collect();
+                self.send(provider, &Value::Array(claims))
+            }
+
+            /// A step sending a start of every id in `ids` as `provider` from
+            /// one process, each carrying `parent_id` and `agent_type`.
+            fn started_wide(
+                &self,
+                provider: &str,
+                ids: &[String],
+                (parent_id, agent_type): (&str, &str),
+            ) -> Step {
+                let claims = ids
+                    .iter()
+                    .zip((1_u64 << 62)..)
+                    .map(|(id, sequence)| {
+                        json!({"type": START, "sequence": sequence, "id": id,
+                            "parent_id": parent_id, "agent_type": agent_type})
+                    })
+                    .collect();
+                self.send(provider, &Value::Array(claims))
             }
 
             /// A step sending one main-`Stop` snapshot of `tasks` as Claude
@@ -4205,6 +4328,232 @@ for claim in plan:
                     overflow,
                     false
                 )]
+            );
+            assert_eq!(
+                log.events(),
+                [Logged::new(REFUSED_EVENT, "start", overflow, "capacity")]
+            );
+            run.finish().await;
+        }
+
+        /// `text` of exactly `bytes` bytes: `prefix`, then quotes, the widest
+        /// accepted character once JSON-escaped.
+        fn escaped_text(prefix: &str, bytes: usize) -> String {
+            let mut text = prefix.to_owned();
+            text.extend(std::iter::repeat_n('"', bytes - text.len()));
+            text
+        }
+
+        /// The largest subagent state the worker keeps fits what carries it:
+        /// every subagent provider at its running capacity, 32 terminal rows,
+        /// every id, parent and type at its longest and made of quotes, and a
+        /// full background snapshot. The journal stays under its one-MiB read
+        /// limit, and the worker answers `inspect` in one control line (#916 D2).
+        #[tokio::test]
+        async fn the_largest_subagent_state_fits_the_journal_and_the_inspect_line() {
+            /// Subagent providers: `SUBAGENT_PROVIDERS` in
+            /// `crates/worker-protocol/src/hook_schema.rs`.
+            const PROVIDERS: [&str; 3] = ["codex", "claude", "muse"];
+            /// Terminal rows the worker keeps: `TERMINAL_SUBAGENT_CAPACITY` in
+            /// `crates/session-worker/src/server.rs`.
+            const TERMINAL_ROWS: usize = 32;
+            /// Terminal rows started before the kept ones are pruned.
+            const FINISHED: usize = TERMINAL_ROWS + 8;
+            /// Longest parent id: the id bound.
+            const PARENT_BOUND: usize = TASK_ID_BOUND;
+            /// Longest agent type: `BACKGROUND_AGENT_TYPE_MAX_BYTES`.
+            const AGENT_TYPE_BOUND: usize = 128;
+            /// Longest background label: `BACKGROUND_LABEL_MAX_BYTES`.
+            const LABEL_BOUND: usize = 160;
+            /// Most background items one snapshot carries:
+            /// `BACKGROUND_MAX_ITEMS`.
+            const BACKGROUND_ITEMS: usize = 64;
+            /// Journal read limit: `MAX_JOURNAL_BYTES` in
+            /// `crates/session-worker/src/journal.rs`.
+            const JOURNAL_BOUND: usize = 1024 * 1024;
+            /// Sequence of the background snapshot, after every start; the
+            /// starts and stops count from `1 << 62`, a 19-digit sequence like a
+            /// monotonic clock reading.
+            const SNAPSHOT_SEQUENCE: u64 = 1 << 63;
+
+            let root = crate::test_support::scoped_dir("ph-subagent-largest-state-");
+            let client = Client::new(&root);
+            let wide = |prefix: &str, count: usize| -> Vec<String> {
+                (0..count)
+                    .map(|index| escaped_text(&format!("{prefix}{index:03}"), TASK_ID_BOUND))
+                    .collect()
+            };
+            let parent = escaped_text("p", PARENT_BOUND);
+            let agent_type = escaped_text("t", AGENT_TYPE_BOUND);
+            let fields = (parent.as_str(), agent_type.as_str());
+            let finished = wide("f", FINISHED);
+            let tasks: Vec<Value> = (0..BACKGROUND_ITEMS)
+                .map(|index| {
+                    json!({
+                        "id": escaped_text(&format!("b{index:03}"), TASK_ID_BOUND),
+                        "type": "subagent",
+                        "status": "running",
+                        "label": escaped_text("l", LABEL_BOUND),
+                        "agent_type": escaped_text("t", AGENT_TYPE_BOUND),
+                    })
+                })
+                .collect();
+            let mut steps = vec![client.finished_wide(CODEX, &finished, fields)];
+            let mut running = Rows::new();
+            for provider in PROVIDERS {
+                let ids = wide(provider, ACTIVE_CAPACITY);
+                steps.push(client.started_wide(provider, &ids, fields));
+                running.extend(running_of(provider, &ids));
+            }
+            steps.push(client.snapshot(SNAPSHOT_SEQUENCE, &tasks));
+            let run = replay_checking(&root, steps, None).await;
+
+            let snapshot = run.snapshots.last().expect("the final snapshot");
+            let rows = journaled_rows(snapshot);
+            let running_now: Rows = rows
+                .iter()
+                .filter(|(_, phase)| **phase == SubagentPhase::Running)
+                .map(|(key, phase)| (key.clone(), *phase))
+                .collect();
+            assert_eq!(running_now, running, "every provider holds its capacity");
+            assert_eq!(
+                rows.len(),
+                PROVIDERS.len() * ACTIVE_CAPACITY + TERMINAL_ROWS,
+                "{:?}",
+                snapshot.subagents
+            );
+            let items = &background_of(snapshot).items;
+            assert_eq!(items.len(), BACKGROUND_ITEMS);
+            assert!(
+                items.iter().all(|item| {
+                    item.label.as_ref().map(String::len) == Some(LABEL_BOUND)
+                        && item.agent_type.as_ref().map(String::len) == Some(AGENT_TYPE_BOUND)
+                }),
+                "every item keeps its longest label and agent type"
+            );
+
+            let inspect_line = serde_json::to_vec(snapshot).expect("the inspect snapshot as JSON");
+            assert!(
+                inspect_line.len() < pohunek_worker_protocol::MAX_CONTROL_LINE_BYTES,
+                "{} inspect bytes",
+                inspect_line.len()
+            );
+            let journal = std::fs::metadata(root.join("journal/worker.json"))
+                .expect("the worker journal")
+                .len();
+            assert!(
+                journal < u64::try_from(JOURNAL_BOUND).expect("the bound fits u64"),
+                "{journal} journal bytes"
+            );
+            run.finish().await;
+        }
+
+        /// `count` distinct subagent ids that start with `prefix`.
+        fn ids_of(prefix: &str, count: usize) -> Vec<String> {
+            (0..count)
+                .map(|index| format!("{prefix}{index:014x}"))
+                .collect()
+        }
+
+        /// Start claims, one per id, numbered from `first`.
+        fn starts_of(ids: &[String], first: u64) -> Vec<(&'static str, u64, &str)> {
+            ids.iter()
+                .zip(first..)
+                .map(|(id, sequence)| (START, sequence, id.as_str()))
+                .collect()
+        }
+
+        /// Rows of `provider` running `ids`.
+        fn running_of(provider: &str, ids: &[String]) -> Rows {
+            ids.iter()
+                .map(|id| ((provider.to_owned(), id.clone()), SubagentPhase::Running))
+                .collect()
+        }
+
+        /// The active capacity counts the running subagents of one provider.
+        /// Codex children that never report a stop fill their own bound and
+        /// leave Claude's untouched, and Claude's bound still refuses its own
+        /// 65th start (#916 D2).
+        #[tokio::test]
+        async fn the_active_capacity_is_counted_per_provider() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-provider-capacity-");
+            let client = Client::new(&root);
+            let codex = ids_of("c", ACTIVE_CAPACITY);
+            let claude = ids_of("a", ACTIVE_CAPACITY + 1);
+            let (claude_running, claude_overflow) = claude.split_at(ACTIVE_CAPACITY);
+            let mut both = running_of(CODEX, &codex);
+            both.extend(running_of(CLAUDE, claude_running));
+            let steps = vec![
+                client.step(CODEX, &starts_of(&codex, 1)),
+                client.step(CLAUDE, &starts_of(claude_running, 1)),
+                Step::Checkpoint(both.clone()),
+                client.step(
+                    CLAUDE,
+                    &starts_of(claude_overflow, u64::try_from(ACTIVE_CAPACITY).unwrap() + 1),
+                ),
+            ];
+            let run = replay(&root, steps, &both).await;
+            let answers = client.answers();
+            let (accepted, refused) = answers.split_at(2 * ACTIVE_CAPACITY);
+            assert!(accepted.iter().all(|answer| answer.ok), "{accepted:?}");
+            assert_eq!(
+                refused,
+                [Answer::new(
+                    START,
+                    u64::try_from(ACTIVE_CAPACITY).unwrap() + 1,
+                    &claude_overflow[0],
+                    false
+                )]
+            );
+            assert_eq!(
+                log.events(),
+                [Logged::new(
+                    REFUSED_EVENT,
+                    "start",
+                    &claude_overflow[0],
+                    "capacity"
+                )]
+            );
+            run.finish().await;
+        }
+
+        /// The Codex start beyond its provider's capacity is refused, and
+        /// the stop that follows records the child as completed, as a Codex
+        /// stop without a recorded start does (#916 D2).
+        #[tokio::test]
+        async fn a_codex_start_beyond_its_capacity_is_refused_and_its_stop_is_recorded() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-codex-capacity-");
+            let client = Client::new(&root);
+            let ids = ids_of("c", ACTIVE_CAPACITY + 1);
+            let (running_ids, overflow) = ids.split_at(ACTIVE_CAPACITY);
+            let overflow = overflow[0].as_str();
+            let beyond = u64::try_from(ACTIVE_CAPACITY).unwrap() + 1;
+            let running = running_of(CODEX, running_ids);
+            let mut settled = running.clone();
+            settled.insert(
+                (CODEX.to_owned(), overflow.to_owned()),
+                SubagentPhase::Completed,
+            );
+            let steps = vec![
+                client.step(CODEX, &starts_of(running_ids, 1)),
+                client.step(CODEX, &[(START, beyond, overflow)]),
+                Step::Checkpoint(running),
+                client.step(CODEX, &[(STOP, beyond + 1, overflow)]),
+            ];
+            let run = replay(&root, steps, &settled).await;
+            let answers = client.answers();
+            let (accepted, tail) = answers.split_at(ACTIVE_CAPACITY);
+            assert!(accepted.iter().all(|answer| answer.ok), "{accepted:?}");
+            assert_eq!(
+                tail,
+                [
+                    Answer::new(START, beyond, overflow, false),
+                    Answer::new(STOP, beyond + 1, overflow, true),
+                ]
             );
             assert_eq!(
                 log.events(),

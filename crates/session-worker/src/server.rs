@@ -80,7 +80,11 @@ const LEASE_PEER_RECHECK: Duration = Duration::from_secs(5);
 
 /// Number of worker events buffered per control connection.
 const EVENT_BUFFER: usize = 256;
-/// Maximum simultaneously running subagents accepted from provider hooks.
+/// Maximum simultaneously running subagents accepted from one provider's hooks.
+///
+/// The bound is per provider: a provider whose interrupted or closed children
+/// never report a stop leaves its rows running until the runtime ends, and
+/// those rows must not refuse another provider's starts.
 const ACTIVE_SUBAGENT_CAPACITY: usize = 64;
 /// Recent terminal subagents retained for reconnecting clients.
 const TERMINAL_SUBAGENT_CAPACITY: usize = 32;
@@ -122,7 +126,8 @@ const MAX_SUBAGENT_ID_BYTES: usize = protocol::BACKGROUND_TASK_ID_MAX_BYTES;
 /// Maximum tasks accepted in one subagent snapshot.
 ///
 /// Claude Code does not cap its main-`Stop` `background_tasks` list. Four
-/// times [`ACTIVE_SUBAGENT_CAPACITY`] leaves room for the shells and monitors
+/// times [`ACTIVE_SUBAGENT_CAPACITY`], the bound of the one provider that
+/// lists background tasks, leaves room for the shells and monitors
 /// listed beside the agents. The Claude state hook mirrors this value and
 /// sends no snapshot for a longer list; a longer claim is rejected whole,
 /// because a truncated list would read as finished agents.
@@ -6636,7 +6641,7 @@ fn subagent_mark(sequence: u64) -> u64 {
 /// start for an unknown subagent opens a new run unless `orphan_stop`, the
 /// sequence of a remembered stop without a start, is not ordered before it.
 /// Opening or reopening a run is refused once [`ACTIVE_SUBAGENT_CAPACITY`]
-/// subagents are running.
+/// subagents of the claim's provider are running.
 fn start_subagent(
     journal: &mut JournalRecord,
     rule: SubagentSequence,
@@ -6675,7 +6680,9 @@ fn start_subagent(
     if journal
         .subagents
         .iter()
-        .filter(|item| item.phase == JournalSubagentPhase::Running)
+        .filter(|item| {
+            item.provider == claim.provider && item.phase == JournalSubagentPhase::Running
+        })
         .count()
         >= ACTIVE_SUBAGENT_CAPACITY
     {
