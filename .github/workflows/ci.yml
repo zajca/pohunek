@@ -1910,6 +1910,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Deliberate failure (probe for #1075 D1)
+        run: exit 1
+
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         with:
