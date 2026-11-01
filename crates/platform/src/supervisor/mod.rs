@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::process::ProcessIdentity;
 
@@ -265,11 +265,19 @@ impl std::fmt::Display for JobExit {
 /// newer manager can add one. `exit` describes how the main process died,
 /// which is not always the cause: the manager ends a job it killed for memory
 /// with `oom-kill` while the main process shows the signal that stopped it.
+///
+/// The memory counters and the end time are optional detail. An absent value
+/// means the manager does not report it (an older manager, an undelegated
+/// memory controller, a control group that was never realized), never zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExitEvidence {
     result: String,
     exit: Option<JobExit>,
+    oom_kills: Option<u64>,
+    managed_oom_kills: Option<u64>,
+    memory_peak: Option<u64>,
+    exited_at: Option<SystemTime>,
 }
 
 impl ExitEvidence {
@@ -277,7 +285,42 @@ impl ExitEvidence {
     /// `exit`, when one was recorded.
     #[must_use]
     pub fn new(result: String, exit: Option<JobExit>) -> Self {
-        Self { result, exit }
+        Self {
+            result,
+            exit,
+            oom_kills: None,
+            managed_oom_kills: None,
+            memory_peak: None,
+            exited_at: None,
+        }
+    }
+
+    /// Adds the kill counters of the job's control group: processes the
+    /// kernel OOM killer killed, and processes the userspace OOM killer
+    /// (`systemd-oomd`) killed.
+    #[must_use]
+    pub fn with_oom_kills(
+        mut self,
+        oom_kills: Option<u64>,
+        managed_oom_kills: Option<u64>,
+    ) -> Self {
+        self.oom_kills = oom_kills;
+        self.managed_oom_kills = managed_oom_kills;
+        self
+    }
+
+    /// Adds the highest memory use of the job, in bytes, children included.
+    #[must_use]
+    pub fn with_memory_peak(mut self, memory_peak: Option<u64>) -> Self {
+        self.memory_peak = memory_peak;
+        self
+    }
+
+    /// Adds the wall-clock time the main process ended.
+    #[must_use]
+    pub fn with_exited_at(mut self, exited_at: Option<SystemTime>) -> Self {
+        self.exited_at = exited_at;
+        self
     }
 
     /// The manager's verdict on the job.
@@ -290,6 +333,30 @@ impl ExitEvidence {
     #[must_use]
     pub fn exit(&self) -> Option<JobExit> {
         self.exit
+    }
+
+    /// Processes the kernel OOM killer killed in the job's control group.
+    #[must_use]
+    pub fn oom_kills(&self) -> Option<u64> {
+        self.oom_kills
+    }
+
+    /// Processes `systemd-oomd` killed in the job's control group.
+    #[must_use]
+    pub fn managed_oom_kills(&self) -> Option<u64> {
+        self.managed_oom_kills
+    }
+
+    /// Highest memory use of the job in bytes, children included.
+    #[must_use]
+    pub fn memory_peak(&self) -> Option<u64> {
+        self.memory_peak
+    }
+
+    /// When the main process ended, per the manager.
+    #[must_use]
+    pub fn exited_at(&self) -> Option<SystemTime> {
+        self.exited_at
     }
 }
 

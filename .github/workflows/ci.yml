@@ -1464,6 +1464,17 @@ jobs:
           systemctl show -p Delegate -p DelegateControllers user@"$(id -u)".service || true
           cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" || true
 
+      # The exit-evidence scenario for a worker that systemd-oomd kills needs
+      # the daemon running on the host; the scenario fails with a stated
+      # precondition when it is not.
+      - name: Install and start systemd-oomd
+        timeout-minutes: 10
+        run: |
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y systemd-oomd
+          sudo systemctl enable --now systemd-oomd
+          systemctl is-active systemd-oomd
+
       - name: Build daemon, worker, and CLI binaries
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
 

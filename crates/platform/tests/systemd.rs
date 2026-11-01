@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use pohunek_platform::supervisor::systemd::{
     render_daemon_unit, render_sessions_slice, unit_environment, user_manager_environment,
@@ -52,6 +52,20 @@ const FIXTURE_LIFETIME: Duration = Duration::from_secs(300);
 const ALLOCATE_TRIGGER: &str = "allocate-now";
 /// Memory limit injected into the unit of the out-of-memory scenario.
 const OOM_MEMORY_MAX: &str = "64M";
+/// [`OOM_MEMORY_MAX`] in bytes.
+const OOM_MEMORY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Memory use above which the kernel throttles and reclaims the unit of the
+/// `systemd-oomd` scenario instead of killing it.
+const OOMD_MEMORY_HIGH: &str = "64M";
+/// Memory pressure (share of time stalled) above which `systemd-oomd` kills
+/// the units of the test slice; low so the throttled unit crosses it at once.
+const OOMD_PRESSURE_LIMIT: &str = "1%";
+/// How long the pressure must hold before `systemd-oomd` acts; short so the
+/// scenario ends well inside [`OOMD_TIMEOUT`].
+const OOMD_PRESSURE_DURATION: &str = "2s";
+/// Bound on waiting for `systemd-oomd`, which samples pressure once a second
+/// and then waits out [`OOMD_PRESSURE_DURATION`].
+const OOMD_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bytes the `allocate` fixture touches after its trigger; well above
 /// [`OOM_MEMORY_MAX`].
 const ALLOCATE_BYTES: usize = 512 * 1024 * 1024;
@@ -264,12 +278,16 @@ fn notify_ready() {
 /// Stops, resets, disables, and removes everything a test created.
 struct Cleanup {
     patterns: Vec<String>,
+    /// Sessions slice whose runtime drop-ins (resource-control properties a
+    /// scenario set on it) are removed.
+    slice: String,
     unit_dir: Option<(PathBuf, Vec<String>)>,
 }
 
 impl Cleanup {
     fn new(namespace: &Namespace) -> Self {
         Self {
+            slice: namespace.sessions_slice(),
             // Children first: the sessions slice nests under the implicit
             // `pohunek-<ns>.slice`, which lingers once created.
             patterns: vec![
@@ -287,6 +305,7 @@ impl Drop for Cleanup {
             systemctl(&["stop", pattern]);
             systemctl(&["reset-failed", pattern]);
         }
+        systemctl(&["revert", &self.slice]);
         if let Some((directory, units)) = &self.unit_dir {
             for unit in units {
                 systemctl(&["disable", unit]);
@@ -758,7 +777,16 @@ async fn a_failed_worker_is_observed_and_reset_by_retire() {
 
 /// Polls `exit_evidence` until the failed unit reports a verdict.
 async fn failed_evidence(supervisor: &SystemdSupervisor, id: &ServiceId) -> ExitEvidence {
-    let deadline = Instant::now() + STATE_TIMEOUT;
+    failed_evidence_within(supervisor, id, STATE_TIMEOUT).await
+}
+
+/// [`failed_evidence`] with an explicit bound.
+async fn failed_evidence_within(
+    supervisor: &SystemdSupervisor,
+    id: &ServiceId,
+    bound: Duration,
+) -> ExitEvidence {
+    let deadline = Instant::now() + bound;
     loop {
         match supervisor.exit_evidence(id).await {
             Ok(Some(evidence)) => return evidence,
@@ -769,6 +797,39 @@ async fn failed_evidence(supervisor: &SystemdSupervisor, id: &ServiceId) -> Exit
         // timing-allowed: #326 polls the real manager, which publishes the failed state asynchronously; bounded by STATE_TIMEOUT
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Whether the memory controller is delegated to the user manager, which is
+/// what lets the manager account a unit's memory and report `MemoryPeak`.
+fn memory_controller_delegated() -> bool {
+    let uid = nix::unistd::getuid().as_raw();
+    let controllers = Path::new("/sys/fs/cgroup/user.slice")
+        .join(format!("user-{uid}.slice"))
+        .join(format!("user@{uid}.service"))
+        .join("cgroup.controllers");
+    std::fs::read_to_string(controllers)
+        .is_ok_and(|controllers| controllers.split_whitespace().any(|name| name == "memory"))
+}
+
+/// Asserts the detail every ended worker reports: when the main process ended
+/// and, with the memory controller delegated, the peak memory. No kill counter
+/// is non-zero for a worker that no memory killer touched.
+fn assert_ended_detail(evidence: &ExitEvidence, before: SystemTime) {
+    let exited_at = evidence
+        .exited_at()
+        .unwrap_or_else(|| panic!("an ended worker reports when it ended: {evidence:?}"));
+    assert!(
+        exited_at >= before - Duration::from_secs(1),
+        "the main process ended after the test began: {exited_at:?} < {before:?}"
+    );
+    if memory_controller_delegated() {
+        assert!(
+            evidence.memory_peak().is_some_and(|peak| peak > 0),
+            "a delegated memory controller reports a peak: {evidence:?}"
+        );
+    }
+    assert_eq!(evidence.oom_kills().unwrap_or(0), 0, "{evidence:?}");
+    assert_eq!(evidence.managed_oom_kills().unwrap_or(0), 0, "{evidence:?}");
 }
 
 #[tokio::test]
@@ -807,6 +868,7 @@ async fn a_failed_worker_reports_its_exit_code_until_it_is_retired() {
     let installation = Installation::new();
     let supervisor = installation.supervisor().await;
     let id = worker_id("verdict2");
+    let began = SystemTime::now();
 
     supervisor
         .start(&id, &fixture(installation.root.path(), "ready-then-fail"))
@@ -816,6 +878,7 @@ async fn a_failed_worker_reports_its_exit_code_until_it_is_retired() {
 
     assert_eq!(evidence.result(), "exit-code");
     assert_eq!(evidence.exit(), Some(JobExit::Code(3)));
+    assert_ended_detail(&evidence, began);
     assert_eq!(
         supervisor.exit_status(&id).await.expect("exit status"),
         Some(JobExit::Code(3))
@@ -835,6 +898,7 @@ async fn a_worker_killed_by_a_signal_reports_the_signal() {
     let installation = Installation::new();
     let supervisor = installation.supervisor().await;
     let id = worker_id("verdict3");
+    let began = SystemTime::now();
 
     supervisor
         .start(
@@ -846,6 +910,7 @@ async fn a_worker_killed_by_a_signal_reports_the_signal() {
     let evidence = failed_evidence(&supervisor, &id).await;
 
     assert_eq!(evidence.result(), "signal");
+    assert_ended_detail(&evidence, began);
     assert_eq!(
         evidence.exit(),
         Some(JobExit::Signal(nix::sys::signal::Signal::SIGKILL as i32))
@@ -871,10 +936,10 @@ async fn a_worker_that_never_becomes_ready_reports_a_timeout() {
     assert_eq!(evidence.result(), "timeout");
 }
 
-/// Fails with a stated precondition unless the unit's cgroup enforces a
-/// memory limit, which needs the memory controller delegated to the user
-/// manager.
-fn require_memory_controller(unit: &str) {
+/// Fails with a stated precondition unless the unit's cgroup enforces the
+/// memory limit `file` (`memory.max` or `memory.high`), which needs the memory
+/// controller delegated to the user manager.
+fn require_memory_controller(unit: &str, file: &str) {
     let properties = show(unit, &["ControlGroup"]);
     let group = properties
         .get("ControlGroup")
@@ -882,11 +947,11 @@ fn require_memory_controller(unit: &str) {
         .unwrap_or_else(|| panic!("precondition: {unit} has no control group"));
     let limit = Path::new("/sys/fs/cgroup")
         .join(group.trim_start_matches('/'))
-        .join("memory.max");
+        .join(file);
     let value = std::fs::read_to_string(&limit).unwrap_or_default();
     assert!(
         value.trim() != "" && value.trim() != "max",
-        "precondition: the systemd user manager does not enforce MemoryMax for {unit}; \
+        "precondition: the systemd user manager does not enforce {file} for {unit}; \
          delegate the memory controller to the user manager (Delegate=memory on \
          user@.service) before running this scenario"
     );
@@ -920,7 +985,7 @@ async fn a_worker_under_memory_pressure_reports_an_oom_kill() {
         &format!("MemoryMax={OOM_MEMORY_MAX}"),
         "MemorySwapMax=0",
     ]);
-    require_memory_controller(&unit);
+    require_memory_controller(&unit, "memory.max");
     std::fs::write(&trigger, b"go").expect("trigger the allocation");
 
     let evidence = failed_evidence(&supervisor, &id).await;
@@ -930,6 +995,97 @@ async fn a_worker_under_memory_pressure_reports_an_oom_kill() {
         matches!(evidence.exit(), Some(JobExit::Signal(_))),
         "the main process died of a signal: {evidence:?}"
     );
+    assert!(
+        evidence.oom_kills().is_some_and(|kills| kills > 0),
+        "the kernel killed a process of the unit: {evidence:?}"
+    );
+    assert_eq!(
+        evidence.managed_oom_kills(),
+        Some(0),
+        "systemd-oomd killed nothing: {evidence:?}"
+    );
+    assert!(
+        evidence
+            .memory_peak()
+            .is_some_and(|peak| peak >= OOM_MEMORY_MAX_BYTES / 2),
+        "the peak reached the limit the unit was killed at: {evidence:?}"
+    );
+    assert!(evidence.exited_at().is_some(), "{evidence:?}");
+}
+
+/// Fails with a stated precondition unless `systemd-oomd` runs on the host
+/// and the kernel exposes memory pressure, which it samples.
+fn require_oomd() {
+    let output = Command::new("systemctl")
+        .args(["is-active", "systemd-oomd"])
+        .output()
+        .expect("run systemctl");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "active",
+        "precondition: systemd-oomd is not running; install and start it \
+         (`systemctl enable --now systemd-oomd`) before running this scenario"
+    );
+    assert!(
+        Path::new("/proc/pressure/memory").exists(),
+        "precondition: the kernel exposes no memory pressure (PSI), which systemd-oomd samples"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager with the memory controller, and a running systemd-oomd"]
+async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
+    require_e2e();
+    require_oomd();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("verdict6");
+    let trigger = installation.root.path().join(ALLOCATE_TRIGGER);
+    let mut spec = fixture_spec(installation.root.path(), "allocate");
+    spec.arguments
+        .push(format!("{ALLOCATE_TRIGGER_ARGUMENT}{}", trigger.display()));
+
+    supervisor
+        .start(&id, &JobDefinition::new(spec).expect("valid definition"))
+        .await
+        .expect("start transient worker");
+    wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+    let unit = installation.unit(&id);
+    // The slice is the monitored cgroup, the unit its candidate; MemoryHigh
+    // throttles the allocation so the kernel never reaches an OOM kill.
+    systemctl_checked(&[
+        "set-property",
+        "--runtime",
+        &installation.namespace.sessions_slice(),
+        "ManagedOOMMemoryPressure=kill",
+        &format!("ManagedOOMMemoryPressureLimit={OOMD_PRESSURE_LIMIT}"),
+        &format!("ManagedOOMMemoryPressureDurationSec={OOMD_PRESSURE_DURATION}"),
+    ]);
+    systemctl_checked(&[
+        "set-property",
+        "--runtime",
+        &unit,
+        &format!("MemoryHigh={OOMD_MEMORY_HIGH}"),
+    ]);
+    require_memory_controller(&unit, "memory.high");
+    std::fs::write(&trigger, b"go").expect("trigger the allocation");
+
+    let evidence = failed_evidence_within(&supervisor, &id, OOMD_TIMEOUT).await;
+
+    assert_eq!(evidence.result(), "oom-kill", "{evidence:?}");
+    assert!(
+        evidence.managed_oom_kills().is_some_and(|kills| kills > 0),
+        "systemd-oomd killed the unit: {evidence:?}"
+    );
+    assert_eq!(
+        evidence.oom_kills(),
+        Some(0),
+        "the kernel killed nothing: {evidence:?}"
+    );
+    assert!(evidence.memory_peak().is_some(), "{evidence:?}");
 }
 
 #[tokio::test]

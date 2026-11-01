@@ -1925,7 +1925,14 @@ Durability tiers (honest about limits):
    `watchdog`, `resources`, `other`) with the signal or exit code of the worker
    process. Only the Linux systemd backend implements the read
    (`Supervisor::exit_evidence`); the launchd backend returns none (#1343), and a
-   failed read never blocks the classification. A lost runtime that is
+   failed read never blocks the classification. The systemd read also carries
+   optional detail from the same bracketed read: the kernel and `systemd-oomd`
+   kill counters (`OOMKills`, `ManagedOOMKills`, systemd 259+), the unit's
+   `MemoryPeak` (255+) and `ExecMainExitTimestamp`. A value the manager does
+   not report (an older manager, an undelegated memory controller, the
+   manager's `UINT64_MAX`) is absent, never zero, and never loses the verdict.
+   Since systemd 251 a `systemd-oomd` kill also ends the unit with
+   `Result=oom-kill`, so the counters, not the result, tell the killers apart. A lost runtime that is
    classified again without a verdict keeps the one it has; any other
    classification of the runtime drops it. A user-requested stop ends the
    runtime `terminal` and carries no exit. The field is additive on the wire
