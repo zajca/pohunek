@@ -149,7 +149,7 @@ and `overlay_config`, and names the reason a node has no usable address.
 
 | Code or check | Cause | Fix |
 |---|---|---|
-| `tailscale_cli_missing` | no trusted `tailscale` on the search path | install the client; on Linux put it on the daemon's `PATH`; macOS is not supported in 0.37 |
+| `tailscale_cli_missing` | no trusted `tailscale` on the search path; the message reads "not found on PATH" when none exists, or names the first candidate that was found and refused (`found <path> but not trusted: <reason>`), and the doctor `tailscale_cli` detail says the same | install the client, or fix the ownership and permissions the reason names; on Linux put it on the daemon's `PATH`; macOS is not supported in 0.37 |
 | `tailscale_state_unavailable` | `tailscale status` failed, did not answer within `status_timeout_secs`, printed something unreadable, or the node is not running on a kernel interface | read the message: start `tailscaled`, log in, or stop using userspace networking |
 | `tailscale_listener_address_missing` | the node has no IPv4 address Pohunek may bind | the same causes; the message names the reason |
 | `host_unknown` | the peer is expired, not in the network map or a `ShareeNode` | check `tailscale status` on this host |

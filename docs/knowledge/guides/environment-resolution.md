@@ -101,7 +101,12 @@ removes the exposure with `chmod g-w` on the Homebrew directories (`bin`,
 `sbin`, `Cellar` and the others the prefix lists as group-writable): the strict
 rule then accepts them and Homebrew works as a single-user install.
 
-A refused configured
+A bare name that
+finds no trusted executable but finds a candidate that failed a check reports
+the first such candidate and the check (`found <path> but not trusted:
+<reason>`); a name found nowhere reports that none exists. On macOS a directory
+dropped from the recorded `PATH` says which write right made it unsafe: "writable
+by others", or "writable by a group other than admin (gid 80)". A refused configured
 executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
 untrusted chain directory, or the errno of the open or execute check) so a
 rejection is diagnosable. On macOS an ACL counts only when an allow entry

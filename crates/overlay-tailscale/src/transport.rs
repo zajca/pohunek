@@ -146,7 +146,10 @@ impl OverlayTransport for TailscaleTransport {
 
 fn map_error(error: TailscaleError, id: &OverlayId) -> OverlayError {
     match error {
-        TailscaleError::CliMissing => OverlayError::CliMissing(id.clone()),
+        TailscaleError::CliMissing { refused } => OverlayError::CliMissing {
+            overlay: id.clone(),
+            refused,
+        },
         TailscaleError::StateUnavailable(detail) | TailscaleError::Parse(detail) => {
             OverlayError::StateUnavailable {
                 overlay: id.clone(),

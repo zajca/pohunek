@@ -548,10 +548,13 @@ impl ClientError {
 fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
     let overlay = error.overlay().as_str();
     match error {
-        overlay::OverlayError::CliMissing(_) => ProtocolError::new(
+        overlay::OverlayError::CliMissing { refused, .. } => ProtocolError::new(
             ErrorClass::Discovery,
             format!("{overlay}_cli_missing"),
-            format!("the {overlay} CLI was not found on PATH"),
+            refused.as_ref().map_or_else(
+                || format!("the {overlay} CLI was not found on PATH"),
+                |refused| format!("the {overlay} CLI is unusable: {refused}"),
+            ),
             Some(format!(
                 "install the {overlay} CLI and ensure it is on PATH; run `pohunek doctor` to verify"
             )),
@@ -806,7 +809,10 @@ mod tests {
             ),
             (
                 "overlay CLI missing",
-                ClientError::Overlay(OverlayError::CliMissing(netbird_id())),
+                ClientError::Overlay(OverlayError::CliMissing {
+                    overlay: netbird_id(),
+                    refused: None,
+                }),
                 ErrorClass::Discovery,
                 "netbird_cli_missing",
                 vec![],

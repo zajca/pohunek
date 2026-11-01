@@ -1427,7 +1427,7 @@ where
     let transport = Arc::clone(configured.transport());
     let address = match transport.listener_addr().await {
         Ok(address) => address,
-        Err(overlay::OverlayError::CliMissing(_)) => {
+        Err(overlay::OverlayError::CliMissing { .. }) => {
             return match missing_cli {
                 MissingCli::Disable => {
                     info!(overlay = %overlay_id, port, "overlay CLI missing; listener disabled");

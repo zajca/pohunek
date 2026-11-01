@@ -287,8 +287,16 @@ fn configured_profile_result(
         ),
         Err(RuntimeFailure::Executable) => (
             DoctorStatus::Fail,
-            "The configured executable is missing or not trusted; install it or repair the profile.",
+            "The configured executable is missing; install it or repair the profile.",
         ),
+        Err(RuntimeFailure::ExecutableRefused(detail)) => {
+            return (
+                DoctorStatus::Fail,
+                Cow::Owned(format!(
+                    "The configured executable cannot be used: {detail}; install it in a trusted location or repair the profile."
+                )),
+            );
+        }
         Err(RuntimeFailure::Refused(refusal)) => {
             return (
                 DoctorStatus::Fail,
@@ -356,6 +364,14 @@ fn optional_runtime_result(
             DoctorStatus::Warn,
             "Optional provider executable is missing; install it only if you use this agent.",
         ),
+        Err(RuntimeFailure::ExecutableRefused(detail)) => {
+            return (
+                DoctorStatus::Warn,
+                Cow::Owned(format!(
+                    "Optional provider executable cannot be used: {detail}; repair it only if you use this agent."
+                )),
+            );
+        }
         Err(RuntimeFailure::Refused(refusal)) => {
             return (
                 DoctorStatus::Fail,
@@ -570,12 +586,14 @@ fn manifest_override_checks(profiles: &crate::agent::ProfileRegistry) -> Vec<Doc
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RuntimeFailure {
     OptionalMissing,
     Profile,
     PinnedRuntime,
     Executable,
+    /// A candidate was found and refused; the detail names it and the check.
+    ExecutableRefused(String),
     /// The probe ran and its output names no supported release.
     Refused(VersionRefusal),
     /// The probe failed or its parser is not compiled in.
@@ -601,7 +619,10 @@ fn profile_runtime_check(
     let launch_path =
         crate::runtime::environment::effective_variable(base_env, profile_env, "PATH");
     if crate::agent::which_executable(agent.program()).is_none() {
-        return Err(RuntimeFailure::Executable);
+        return Err(crate::agent::executable_refusal(agent.program()).map_or(
+            RuntimeFailure::Executable,
+            RuntimeFailure::ExecutableRefused,
+        ));
     }
     let probe_timeout = if agent.definition.version_probe_parser().is_some() {
         hostcheck::AGENT_RUNTIME_PROBE_BUDGET.saturating_sub(probe_started.elapsed())
@@ -618,7 +639,12 @@ fn profile_runtime_check(
         probe_timeout,
     )
     .map_err(|error| match error {
-        crate::capabilities::LaunchValidationFailure::Missing => RuntimeFailure::Executable,
+        crate::capabilities::LaunchValidationFailure::Missing => {
+            crate::agent::executable_refusal(agent.program()).map_or(
+                RuntimeFailure::Executable,
+                RuntimeFailure::ExecutableRefused,
+            )
+        }
         crate::capabilities::LaunchValidationFailure::ProbeTimedOut => RuntimeFailure::ProbeBudget,
         crate::capabilities::LaunchValidationFailure::Refused(refusal) => {
             RuntimeFailure::Refused(refusal)

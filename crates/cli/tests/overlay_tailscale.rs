@@ -103,6 +103,16 @@ impl Fixture {
             .expect("run the pohunek CLI")
     }
 
+    /// Runs the CLI with `path` as its whole `PATH`.
+    fn run_on_path(&self, path: &std::path::Path, args: &[&str]) -> Output {
+        self.env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .env("PATH", path)
+            .args(args)
+            .output()
+            .expect("run the pohunek CLI")
+    }
+
     /// Runs `--host <selector> session list` and returns the output with the
     /// overlay targets the run dialed, then forgets them.
     fn dial(&self, selector: &str) -> (Output, Vec<String>) {
@@ -575,9 +585,45 @@ fn a_missing_or_failing_cli_is_reported_by_cause() {
     fs::remove_file(fixture.fake.bin_dir().join("tailscale")).expect("remove the fake");
     let output = fixture.run(&["host", "list", "--refresh", "--json"]);
     assert_eq!(error_code(&output), "tailscale_cli_missing");
+    let message = error_message(&output);
+    assert!(message.contains("not found on PATH"), "{message}");
+    assert!(!message.contains("not trusted"), "{message}");
     let (output, targets) = fixture.dial("alpha");
     assert_eq!(error_code(&output), "tailscale_cli_missing");
     assert!(targets.is_empty(), "{targets:?}");
+
+    // A candidate that exists in a directory others can write is named, with
+    // the reason, while the code stays the same.
+    let loose = fixture.env.root().join("loose");
+    fs::create_dir(&loose).expect("create the loose directory");
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o775))
+        .expect("make the directory group-writable");
+    let candidate = loose.join("tailscale");
+    pohunek_test_support::fs::write_executable(&candidate, "#!/bin/sh\nexit 0\n")
+        .expect("write the candidate");
+    let output = fixture.run_on_path(&loose, &["host", "list", "--refresh", "--json"]);
+    assert_eq!(error_code(&output), "tailscale_cli_missing");
+    let message = error_message(&output);
+    assert!(
+        message.contains(&candidate.display().to_string()) && message.contains("not trusted"),
+        "the untrusted candidate is named: {message}"
+    );
+    let output = fixture.run_on_path(&loose, &["doctor", "--json"]);
+    let document = json(&output);
+    let detail = document["ok"]["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "tailscale_cli")
+        .expect("tailscale_cli check")["detail"]
+        .as_str()
+        .expect("detail")
+        .to_owned();
+    assert!(
+        detail.contains(&candidate.display().to_string()) && detail.contains("not trusted"),
+        "the doctor names the candidate: {detail}"
+    );
+    fs::remove_dir_all(&loose).expect("remove the loose directory");
 
     pohunek_test_support::fs::write_executable(
         fixture.fake.bin_dir().join("tailscale"),

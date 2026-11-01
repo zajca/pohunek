@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use pohunek_platform::bounded_command::BoundedError;
 use pohunek_platform::shell_env::{
-    fallback_search_path, resolve_executable, resolve_executable_in_path_value,
+    fallback_search_path, resolve_executable, resolve_executable_in_path_value, ExecutableError,
     DARWIN_FALLBACK_DIRECTORIES,
 };
 use serde::Deserialize;
@@ -54,9 +54,13 @@ const KNOWN_BACKEND_STATES: [&str; 7] = [
 #[derive(Debug, thiserror::Error)]
 pub enum TailscaleError {
     /// No executable `tailscale` that the shared trusted-executable policy
-    /// accepts was found on `PATH`.
-    #[error("the `tailscale` CLI was not found on PATH")]
-    CliMissing,
+    /// accepts was found. `refused` names the candidate that was found and
+    /// failed a check, when there was one.
+    #[error("{}", .refused.as_deref().unwrap_or("the `tailscale` CLI was not found on PATH"))]
+    CliMissing {
+        /// The refused candidate and the check it failed.
+        refused: Option<String>,
+    },
     /// Tailscale is installed but its local state could not be read or is not
     /// usable (daemon down, not logged in, userspace networking, or a non-zero
     /// exit). Carries a short, bounded detail.
@@ -304,13 +308,23 @@ fn resolve_program(
     home: Option<&Path>,
 ) -> Result<PathBuf, TailscaleError> {
     let program = OsStr::new(TAILSCALE_PROGRAM);
-    if let Ok(found) = resolve_executable_in_path_value(program, path) {
-        return Ok(found);
-    }
+    let path_refusal = match resolve_executable_in_path_value(program, path) {
+        Ok(found) => return Ok(found),
+        Err(error) => refused_detail(&error),
+    };
     let search = fallback_search_path(fallback, home)
-        .map_err(|_unresolved| TailscaleError::CliMissing)?
+        .map_err(|_unresolved| TailscaleError::CliMissing {
+            refused: path_refusal.clone(),
+        })?
         .path;
-    resolve_executable(program, &search).map_err(|_unresolved| TailscaleError::CliMissing)
+    resolve_executable(program, &search).map_err(|error| TailscaleError::CliMissing {
+        refused: path_refusal.or_else(|| refused_detail(&error)),
+    })
+}
+
+/// The detail of a candidate that was found and refused, if `error` names one.
+fn refused_detail(error: &ExecutableError) -> Option<String> {
+    matches!(error, ExecutableError::Refused { .. }).then(|| error.to_string())
 }
 
 async fn run_status_at(
@@ -331,7 +345,7 @@ async fn run_status_at(
 
 fn command_error(program: &Path, error: &std::io::Error) -> TailscaleError {
     match error.kind() {
-        std::io::ErrorKind::NotFound => TailscaleError::CliMissing,
+        std::io::ErrorKind::NotFound => TailscaleError::CliMissing { refused: None },
         _ => TailscaleError::StateUnavailable(format!(
             "failed to run `{} status`: {error}",
             program.display()

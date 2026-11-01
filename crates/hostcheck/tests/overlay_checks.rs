@@ -51,7 +51,10 @@ fn each_configured_overlay_gets_a_cli_check_in_the_probe_list() {
         failed(
             "tailscale",
             18722,
-            OverlayError::CliMissing(id("tailscale")),
+            OverlayError::CliMissing {
+                overlay: id("tailscale"),
+                refused: None,
+            },
         ),
     ];
 
@@ -93,7 +96,10 @@ fn a_missing_cli_fails_only_for_an_overlay_the_file_lists() {
         failed(
             "tailscale",
             18722,
-            OverlayError::CliMissing(id("tailscale")),
+            OverlayError::CliMissing {
+                overlay: id("tailscale"),
+                refused: None,
+            },
         ),
         failed(
             "headscale",

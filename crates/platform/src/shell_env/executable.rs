@@ -19,7 +19,7 @@ const DARWIN_SYSTEM_GROUPS: [u32; 2] = [0, 1];
 
 /// macOS reserves gid 80 for the `admin` group, the group of a stock
 /// Homebrew prefix's `bin` and `Cellar`.
-const DARWIN_ADMIN_GROUP: u32 = 80;
+pub(super) const DARWIN_ADMIN_GROUP: u32 = 80;
 
 /// The group whose write access to a user-owned lookup directory is accepted.
 ///
@@ -74,6 +74,19 @@ pub enum ExecutableError {
     /// says which check failed.
     #[error("the configured executable is not trusted: {0}")]
     NotExecutable(Refusal),
+    /// No searched directory holds a trusted executable of that name, but a
+    /// candidate exists and failed a check; the first such candidate in search
+    /// order is named.
+    #[error(
+        "found {candidate} but not trusted: {refusal}; see the environment resolution guide",
+        candidate = .candidate.display()
+    )]
+    Refused {
+        /// The first candidate that failed a check.
+        candidate: PathBuf,
+        /// The check it failed.
+        refusal: Refusal,
+    },
     /// No searched directory holds an executable of that name.
     #[error("no executable of that name exists in the search path")]
     NotFound,
@@ -137,7 +150,7 @@ pub enum Refusal {
     },
     /// A directory others can write holds a chain entry that is not ours.
     #[error(
-        "directory {dir} is writable by others and holds an entry owned by uid {owner}",
+        "directory {dir} is writable by group or others and holds an entry owned by uid {owner}",
         dir = .dir.display()
     )]
     ChainSharedDirectory {
@@ -245,10 +258,35 @@ fn resolve_in_with_profile<'a>(
         return inspect_executable_with_profile(path, owners, profile)
             .map_err(ExecutableError::NotExecutable);
     }
-    directories
-        .map(|directory| directory.join(program))
-        .find_map(|candidate| inspect_executable_with_profile(&candidate, owners, profile).ok())
-        .ok_or(ExecutableError::NotFound)
+    let mut first_refusal: Option<(PathBuf, Refusal)> = None;
+    for candidate in directories.map(|directory| directory.join(program)) {
+        match inspect_executable_with_profile(&candidate, owners, profile) {
+            Ok(found) => return Ok(found),
+            Err(refusal) if is_absent(&refusal) => {}
+            Err(refusal) => {
+                first_refusal.get_or_insert((candidate, refusal));
+            }
+        }
+    }
+    Err(
+        first_refusal.map_or(ExecutableError::NotFound, |(candidate, refusal)| {
+            ExecutableError::Refused { candidate, refusal }
+        }),
+    )
+}
+
+/// Whether a refusal only says the candidate does not exist or is no file at
+/// all (a directory named like the program), so it is not worth reporting.
+const fn is_absent(refusal: &Refusal) -> bool {
+    /// `ENOENT`: no such file or directory.
+    const NO_ENTRY: i32 = 2;
+    /// `ENOTDIR`: a path component is not a directory.
+    const NOT_A_DIRECTORY: i32 = 20;
+
+    matches!(
+        refusal,
+        Refusal::Unresolvable(NO_ENTRY | NOT_A_DIRECTORY) | Refusal::NotRegular
+    )
 }
 
 /// Users whose files may be executed: the effective user and root.
@@ -703,9 +741,15 @@ mod tests {
             ),
             "refused"
         );
-        assert_eq!(
-            resolve_executable(OsStr::new("plain"), &search),
-            Err(ExecutableError::NotFound)
+        assert!(
+            matches!(
+                resolve_executable(OsStr::new("plain"), &search),
+                Err(ExecutableError::Refused {
+                    refusal: Refusal::ExecuteDenied(_),
+                    ..
+                })
+            ),
+            "a candidate the kernel will not execute is named"
         );
         assert_eq!(
             resolve_executable(OsStr::new(""), &search),
@@ -868,10 +912,13 @@ mod tests {
             effective: u32::MAX - 1,
             root: u32::MAX - 2,
         };
-        assert_eq!(
+        assert!(matches!(
             resolve_in(OsStr::new("agent"), dirs.into_iter(), strangers),
-            Err(ExecutableError::NotFound)
-        );
+            Err(ExecutableError::Refused {
+                refusal: Refusal::Owner { .. },
+                ..
+            })
+        ));
         assert!(
             matches!(
                 resolve_in(mine.as_os_str(), std::iter::empty(), strangers),
@@ -908,10 +955,13 @@ mod tests {
             Ok(link.clone())
         );
         fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).expect("chmod");
-        assert_eq!(
+        assert!(matches!(
             resolve_executable(OsStr::new("tool"), &search),
-            Err(ExecutableError::NotFound)
-        );
+            Err(ExecutableError::Refused {
+                refusal: Refusal::Writable { .. },
+                ..
+            })
+        ));
         // A dangling link is no executable either.
         fs::remove_file(&real).expect("remove target");
         assert_eq!(
@@ -972,10 +1022,13 @@ mod tests {
         std::os::unix::fs::symlink(&real, wild.join("tool")).expect("symlink");
         let search = SearchPath::new(vec![wild]).expect("search");
         // The target is trusted; the directory holding the link is not.
-        assert_eq!(
+        assert!(matches!(
             resolve_executable(OsStr::new("tool"), &search),
-            Err(ExecutableError::NotFound)
-        );
+            Err(ExecutableError::Refused {
+                refusal: Refusal::ChainSharedDirectory { .. } | Refusal::ChainDirectory { .. },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1138,15 +1191,18 @@ mod tests {
             ),
             Ok(original.clone())
         );
-        assert_eq!(
+        assert!(matches!(
             resolve_in_with_profile(
                 OsStr::new("other"),
                 [bin.as_path()].into_iter(),
                 owners,
                 Some(profile)
             ),
-            Err(ExecutableError::NotFound)
-        );
+            Err(ExecutableError::Refused {
+                refusal: Refusal::ChainSharedDirectory { .. },
+                ..
+            })
+        ));
         let verified = resolve_in_with_profile(
             OsStr::new("netbird"),
             [bin.as_path()].into_iter(),
@@ -1260,7 +1316,7 @@ mod tests {
         );
         // The message stays short and carries only ids, modes, and paths.
         assert!(
-            reason.to_string().contains("writable by others"),
+            reason.to_string().contains("writable by group or others"),
             "{reason}"
         );
     }

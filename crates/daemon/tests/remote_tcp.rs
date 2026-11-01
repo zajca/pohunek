@@ -2420,7 +2420,10 @@ async fn bind_requires_the_address_the_overlay_reports_now() {
             overlay: transport.id.clone(),
             reason: None,
         },
-        overlay::OverlayError::CliMissing(transport.id.clone()),
+        overlay::OverlayError::CliMissing {
+            overlay: transport.id.clone(),
+            refused: None,
+        },
         overlay::OverlayError::StateUnavailable {
             overlay: transport.id.clone(),
             detail: "down".to_owned(),

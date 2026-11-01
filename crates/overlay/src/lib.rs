@@ -70,9 +70,16 @@ pub enum OverlayError {
         /// report them.
         candidates: Vec<CandidateIdentity>,
     },
-    /// The provider CLI is unavailable.
-    #[error("overlay CLI for {0} is not installed")]
-    CliMissing(OverlayId),
+    /// The provider CLI is unavailable: it is not installed, or a candidate was
+    /// found and refused by the trusted-executable policy.
+    #[error("{}", cli_missing_message(overlay, refused.as_deref()))]
+    CliMissing {
+        /// Stable overlay identifier.
+        overlay: OverlayId,
+        /// The refused candidate and the check it failed, when one was found
+        /// but not trusted; `None` when no candidate exists.
+        refused: Option<String>,
+    },
     /// Provider state could not be loaded or parsed.
     #[error("overlay {overlay} state unavailable: {detail}")]
     StateUnavailable {
@@ -112,10 +119,18 @@ impl OverlayError {
             | Self::PeerCollision { overlay, .. }
             | Self::StateUnavailable { overlay, .. }
             | Self::InvalidConfig { overlay, .. }
-            | Self::CliMissing(overlay)
+            | Self::CliMissing { overlay, .. }
             | Self::ListenerAddressMissing { overlay, .. } => overlay,
         }
     }
+}
+
+/// The message of [`OverlayError::CliMissing`].
+fn cli_missing_message(overlay: &OverlayId, refused: Option<&str>) -> String {
+    refused.map_or_else(
+        || format!("overlay CLI for {overlay} is not installed"),
+        |refused| format!("overlay CLI for {overlay}: {refused}"),
+    )
 }
 
 /// Renders an optional reason as the `: <reason>` tail of an error message.

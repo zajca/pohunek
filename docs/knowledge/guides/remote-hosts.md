@@ -212,9 +212,10 @@ macOS-specific routing, bridging, or relay mode.
   can write, such as the stock Homebrew `bin`, is accepted (see
   [environment resolution](environment-resolution.md)). `pohunek doctor` reports `netbird_cli`
   through the same lookup. Its warning has several causes: read the detail. A
-  "not installed or not trusted" detail means no trusted `netbird` was located;
-  install NetBird or fix the ownership and permissions of the directory holding
-  it. A "local netbird state is unavailable" or "no netbird address resolved"
+  "not installed" detail means no `netbird` exists on the search path; an
+  "unusable: found <path> but not trusted: <reason>" detail means a candidate
+  was found and refused, so fix the ownership and permissions the reason
+  names. A "local netbird state is unavailable" or "no netbird address resolved"
   detail means the CLI was found but is not logged in, its daemon is down or it
   did not answer in time. When the daemon answers, the entry reads
   `local: ...; daemon: ...` and the worse status wins: read each side, because

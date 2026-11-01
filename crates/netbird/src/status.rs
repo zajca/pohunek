@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use pohunek_platform::bounded_command::BoundedError;
 use pohunek_platform::shell_env::{
-    fallback_search_path, resolve_executable, resolve_executable_in_path_value,
+    fallback_search_path, resolve_executable, resolve_executable_in_path_value, ExecutableError,
     DARWIN_FALLBACK_DIRECTORIES,
 };
 use serde::de::Deserializer;
@@ -45,9 +45,13 @@ const MAX_ERROR_DETAIL_BYTES: usize = 512;
 #[derive(Debug, thiserror::Error)]
 pub enum NetbirdError {
     /// No executable `netbird` that the shared trusted-executable policy accepts
-    /// was found on `PATH`.
-    #[error("the `netbird` CLI was not found on PATH")]
-    CliMissing,
+    /// was found. `refused` names the candidate that was found and failed a
+    /// check, when there was one.
+    #[error("{}", .refused.as_deref().unwrap_or("the `netbird` CLI was not found on PATH"))]
+    CliMissing {
+        /// The refused candidate and the check it failed.
+        refused: Option<String>,
+    },
     /// `NetBird` is installed but its local state could not be read (daemon down,
     /// not logged in, or a non-zero exit). Carries a short, bounded detail.
     #[error("NetBird local state is unavailable: {0}")]
@@ -344,13 +348,23 @@ fn resolve_program(
     home: Option<&Path>,
 ) -> Result<PathBuf, NetbirdError> {
     let program = OsStr::new(NETBIRD_PROGRAM);
-    if let Ok(found) = resolve_executable_in_path_value(program, path) {
-        return Ok(found);
-    }
+    let path_refusal = match resolve_executable_in_path_value(program, path) {
+        Ok(found) => return Ok(found),
+        Err(error) => refused_detail(&error),
+    };
     let search = fallback_search_path(fallback, home)
-        .map_err(|_unresolved| NetbirdError::CliMissing)?
+        .map_err(|_unresolved| NetbirdError::CliMissing {
+            refused: path_refusal.clone(),
+        })?
         .path;
-    resolve_executable(program, &search).map_err(|_unresolved| NetbirdError::CliMissing)
+    resolve_executable(program, &search).map_err(|error| NetbirdError::CliMissing {
+        refused: path_refusal.or_else(|| refused_detail(&error)),
+    })
+}
+
+/// The detail of a candidate that was found and refused, if `error` names one.
+fn refused_detail(error: &ExecutableError) -> Option<String> {
+    matches!(error, ExecutableError::Refused { .. }).then(|| error.to_string())
 }
 
 async fn run_status_async_at(
@@ -388,7 +402,7 @@ fn run_status_at(program: &Path) -> Result<NetbirdStatus, NetbirdError> {
 
 fn command_error(program: &Path, err: &std::io::Error) -> NetbirdError {
     match err.kind() {
-        std::io::ErrorKind::NotFound => NetbirdError::CliMissing,
+        std::io::ErrorKind::NotFound => NetbirdError::CliMissing { refused: None },
         _ => NetbirdError::StateUnavailable(format!(
             "failed to run `{} status`: {err}",
             program.display()
@@ -466,7 +480,7 @@ mod tests {
                 move || {
                     // Stands in for a lookup stuck in a filesystem call.
                     let _ = stalled.recv_timeout(LOOKUP_STALL);
-                    Err(NetbirdError::CliMissing)
+                    Err(NetbirdError::CliMissing { refused: None })
                 },
                 overlay::DEFAULT_STATUS_DEADLINE,
             );
@@ -479,7 +493,7 @@ mod tests {
                 DEADLINE,
                 run_status_async_resolving(
                     &GATE,
-                    || Err(NetbirdError::CliMissing),
+                    || Err(NetbirdError::CliMissing { refused: None }),
                     overlay::DEFAULT_STATUS_DEADLINE,
                 ),
             )
