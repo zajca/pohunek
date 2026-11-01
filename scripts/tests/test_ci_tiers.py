@@ -1374,16 +1374,23 @@ class FailFastTests(unittest.TestCase):
                 self.assertEqual(last_name, FAIL_FAST_STEP)
                 self.assertEqual([n for n, _ in steps].count(FAIL_FAST_STEP), 1)
                 self.assertIn(f"        if: {FAIL_FAST_CONDITION}\n", last)
-                self.assertRegex(last, r"(?m)^        uses: \./(relocated/)?\.github/actions/cancel-run$")
                 self.assertEqual(self.permissions(job).get("actions"), "write")
-                self.assertNotIn("continue-on-error", job)
+                self.assertNotRegex(job, r"(?m)^    continue-on-error:")
 
-    def test_a_job_that_checks_out_into_relocated_uses_the_action_from_there(self):
+    def test_a_job_with_a_sparse_test_tree_cancels_inline_and_the_others_use_the_action(self):
+        # The sparse test tree drops .github/actions, so the jobs that may run from it cannot use the local action.
+        sparse_capable = {"fast-tests", "integration", "integration-relay", "test-selection-check"}
         for name, job in self.direct_jobs().items():
-            relocated = bool(re.search(r"uses: actions/checkout@\S+\n\s+with:\n(?:\s+\S.*\n)*?\s+path: relocated\n", job))
             last = list(job_steps(job).values())[-1]
             with self.subTest(job=name):
-                self.assertEqual("uses: ./relocated/" in last, relocated)
+                if name in sparse_capable:
+                    self.assertNotIn(".github/actions/cancel-run", last)
+                    self.assertIn("        continue-on-error: true\n", last)
+                    self.assertIn('gh run cancel "$RUN_ID" --repo "$REPOSITORY"', last)
+                    self.assertIn("::error title=Fail fast::", last)
+                else:
+                    self.assertRegex(last, r"(?m)^        uses: \./\.github/actions/cancel-run$")
+                    self.assertNotIn("relocated", last)
 
     def test_the_advisory_audit_the_verdict_and_the_fail_open_selectors_do_not_carry_the_step_or_the_scope(self):
         jobs = workflow_jobs()

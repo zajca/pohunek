@@ -290,7 +290,8 @@ The `test selection verdict` check still runs after the cancel and is red when
 a job it waits for failed or was cancelled; for a job that decides the pull
 request outside the verdict, look for the `Fail fast` annotation. A job that
 hits its `timeout-minutes` is cancelled by GitHub and does not trigger the
-step, and the two selector jobs (`test selection`, `runtime package selection`)
+step (a called workflow's watcher fires only when the call ends as failed, which
+a timeout inside it does not guarantee), and the two selector jobs (`test selection`, `runtime package selection`)
 do not carry it, because a failed selection runs everything instead of
 ending the run. A fork or Dependabot pull request has a read-only token, so the
 cancel call is refused and the run keeps its real failure.
