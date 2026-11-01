@@ -869,6 +869,10 @@ mod native {
     /// holds its exited child unreaped to pin a process group relies on that.
     const INCLUDE_ZOMBIES: u64 = 1;
 
+    /// Bits of the kqueue `data` word that hold the `wait(2)` status; the exit
+    /// detail flags sit above them.
+    const WAIT_STATUS_MASK: u32 = 0xffff;
+
     /// Caps kqueue events drained in one pass.
     ///
     /// One filter is registered per watch, so a small buffer always drains the
@@ -1546,9 +1550,15 @@ mod native {
                 return Err(io::Error::from_raw_os_error(errno));
             }
             if event.fflags & libc::NOTE_EXIT != 0 {
+                // With `NOTE_EXITSTATUS | NOTE_EXIT_DETAIL` the kernel puts the
+                // wait status in the low bits of `data` and the exit detail
+                // (`NOTE_EXIT_MEMORY`) above it, not in `fflags`.
+                let data = u32::try_from(event.data)
+                    .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?;
                 return Ok(Some(ExitEvent {
-                    wait_status: i32::try_from(event.data).unwrap_or(0),
-                    memory_pressure: event.fflags & libc::NOTE_EXIT_MEMORY != 0,
+                    wait_status: i32::try_from(data & WAIT_STATUS_MASK)
+                        .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?,
+                    memory_pressure: data & libc::NOTE_EXIT_MEMORY != 0,
                 }));
             }
         }
