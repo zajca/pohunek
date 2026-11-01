@@ -188,7 +188,7 @@ fn prompt_contract_joins_continuation_lines_into_one_item() {
     let contract = knowledge::PromptContract::parse(&text).expect("well-formed contract");
     assert_eq!(
         contract.safety,
-        ["Never print secrets. Continue on an indented line."]
+        ["Never print secrets. Continue on an indented line. And on a tab-indented line."]
     );
     assert_eq!(contract.navigation, ["Start at the index."]);
 }
@@ -211,6 +211,18 @@ fn docs_check_rejects_nested_list_in_prompt_contract() {
         .expect_err("a nested list in the contract must be rejected");
     assert_bundle_issue(
         "prompt-contract-nested",
+        &error,
+        "prompt_contract",
+        "line 15: `Safety` holds a nested list or heading",
+    );
+}
+
+#[test]
+fn docs_check_rejects_tab_nested_list_in_prompt_contract() {
+    let error = validate_docs(source_fixture("prompt-contract-tab-nested"))
+        .expect_err("a tab-nested list in the contract must be rejected");
+    assert_bundle_issue(
+        "prompt-contract-tab-nested",
         &error,
         "prompt_contract",
         "line 15: `Safety` holds a nested list or heading",
