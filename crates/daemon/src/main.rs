@@ -1659,6 +1659,87 @@ mod tests {
             .expect("remote supervisor exits after shutdown");
     }
 
+    /// Asserts that the process whose pid `file` records no longer exists.
+    #[cfg(target_os = "linux")]
+    fn assert_gone(file: &std::path::Path) {
+        let pid = std::fs::read_to_string(file).expect("the fake recorded its pid");
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "the hung CLI was killed and reaped"
+        );
+    }
+
+    /// A status probe that never answers ends at its deadline as a retryable
+    /// bind outcome, the hung CLI is killed and reaped while the daemon runs,
+    /// and the next attempt, with the CLI answering, binds the listener.
+    #[tokio::test]
+    async fn a_hung_status_probe_is_retried_and_the_next_attempt_binds() {
+        const SELF_ADDRESS: &str = "100.64.0.7";
+        let (_state_root, governance) = governance_service().await;
+        let scripts = pohunek_test_support::tempdir().expect("create the fake CLI root");
+        std::fs::set_permissions(scripts.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make the fake CLI root owner-private");
+        let bin = scripts.path().join("bin");
+        std::fs::create_dir(&bin).expect("create the fake CLI directory");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))
+            .expect("make the fake CLI directory owner-private");
+        let pid = scripts.path().join("netbird.pid");
+        let hung = scripts.path().join("hung");
+        // The first run hangs; every later run answers.
+        pohunek_test_support::fs::write_executable(
+            bin.join("netbird"),
+            format!(
+                "#!/bin/sh\nif [ ! -e '{hung}' ]; then\n: > '{hung}'\nprintf '%s' \"$$\" > '{pid}'\nexec /bin/sleep 3600\nfi\nprintf '%s\\n' '{{\"netbirdIp\":\"{SELF_ADDRESS}\",\"peers\":[]}}'\n",
+                hung = hung.display(),
+                pid = pid.display(),
+            ),
+        )
+        .expect("write the fake netbird");
+        let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+        process_env.set("PATH", &bin);
+
+        let transport = Arc::new(netbird::NetbirdTransport::with_status_deadline(
+            Duration::from_secs(1),
+        ));
+        let configured = ConfiguredTransport::new(transport, pohunek_client::DEFAULT_REMOTE_PORT)
+            .expect("configured NetBird overlay");
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::default(),
+            governance,
+            netbird_registry(),
+            pohunek_daemon::api::OverlaySource::Default,
+        );
+        let opener = |listener: TcpListener| {
+            move |_addr: std::net::SocketAddr| async move { Ok(OpenedListener::os_bound(listener)) }
+        };
+
+        let unused = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let first = bind_remote_server(
+            state.clone(),
+            configured.clone(),
+            MissingCli::Retry,
+            None,
+            opener(unused),
+        )
+        .await;
+        assert!(
+            matches!(first, RemoteBind::Retry),
+            "a hung probe is retried"
+        );
+        #[cfg(target_os = "linux")]
+        assert_gone(&pid);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let second =
+            bind_remote_server(state, configured, MissingCli::Retry, None, opener(listener)).await;
+        assert!(matches!(second, RemoteBind::Bound(_)), "the retry binds");
+    }
+
     #[derive(Debug)]
     struct MutableListenerTransport {
         id: OverlayId,

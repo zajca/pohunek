@@ -381,6 +381,9 @@ async fn classify_local(
     (HostClass::Unreachable, Some(reason))
 }
 
+/// The `reason` of a record whose address another peer lists too.
+const ADDRESS_AMBIGUOUS_REASON: &str = "address_ambiguous";
+
 /// Classify aggregated overlay peer snapshots.
 #[must_use]
 async fn discover_peers(
@@ -415,7 +418,9 @@ async fn discover_peers(
                 overlay: peer.overlay.to_string(),
                 peer_id: peer.peer_id,
                 local: false,
-                reason: None,
+                reason: peer
+                    .address_ambiguous
+                    .then(|| ADDRESS_AMBIGUOUS_REASON.to_owned()),
                 class,
             }
         })
@@ -1033,6 +1038,7 @@ mod tests {
                 display_name: None,
                 fqdn: Some("first.example".to_owned()),
                 addr: Some("100.64.0.1:1".parse().expect("safe socket address")),
+                address_ambiguous: false,
                 port: 1,
             },
             RoutedPeer {
@@ -1041,6 +1047,7 @@ mod tests {
                 display_name: None,
                 fqdn: Some("second.example".to_owned()),
                 addr: None,
+                address_ambiguous: false,
                 port: 1,
             },
         ];
@@ -1083,6 +1090,7 @@ mod tests {
             display_name: Some("addressless".to_owned()),
             fqdn: Some("addressless.example".to_owned()),
             address: None,
+            address_ambiguous: false,
         };
         let registry = OverlayRegistry::new(vec![
             configured(TestTransport::unavailable("broken"), 17001),
@@ -1167,6 +1175,7 @@ mod tests {
             display_name: Some("healthy-peer".to_owned()),
             fqdn: Some("healthy-peer.example".to_owned()),
             address: None,
+            address_ambiguous: false,
         };
         let registry = OverlayRegistry::new(vec![
             pending,

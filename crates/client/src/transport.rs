@@ -2457,6 +2457,7 @@ mod tests {
                 display_name: Some("member".to_owned()),
                 fqdn: Some("member.test".to_owned()),
                 address: Some(self.member),
+                address_ambiguous: false,
             };
             Box::pin(async move { Ok(vec![peer]) })
         }

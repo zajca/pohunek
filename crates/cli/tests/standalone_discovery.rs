@@ -701,3 +701,93 @@ fn this_machine_and_its_peers_come_from_one_netbird_run() {
     assert_eq!(records[0]["fqdn"], SELF_FQDN);
     assert_eq!(records[1]["peer_id"], "remote-key");
 }
+
+/// A `netbird status` that never answers ends at the configured deadline as
+/// `netbird_state_unavailable`, and the CLI it started is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_netbird_probe_that_never_answers_is_bounded_and_killed() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&dir).expect("create the config directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .expect("make the config directory private");
+    let file = dir.join("overlays.toml");
+    fs::write(
+        &file,
+        "providers = [\"netbird\"]\nstatus_timeout_secs = 1\n",
+    )
+    .expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+        .expect("make overlays.toml private");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let pid = env.root().join("netbird.pid");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 3600\n",
+            pid.display()
+        ),
+    )
+    .expect("write the hanging fake netbird");
+
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .expect("run CLI discovery");
+    assert!(!output.status.success());
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+    assert_eq!(document["err"]["code"], "netbird_state_unavailable");
+    assert!(document["err"]["msg"]
+        .as_str()
+        .is_some_and(|message| message.contains("did not answer within")));
+    let pid = fs::read_to_string(&pid).expect("the fake recorded its pid");
+    assert!(
+        !std::path::Path::new("/proc").join(pid.trim()).exists(),
+        "the hung CLI was killed and reaped"
+    );
+}
+
+/// A `NetBird` address that two peers list is no route: the listing keeps both
+/// peers as candidates and names why, the selectors that reach it are
+/// ambiguous, and a peer with its own address is unaffected.
+#[test]
+fn an_address_listed_for_two_netbird_peers_is_not_used_for_routing() {
+    let status = r#"{"peers":{"details":[
+        {"fqdn":"one.example","netbirdIp":"100.64.0.2","publicKey":"key-one","status":"Connected"},
+        {"fqdn":"two.example","netbirdIp":"100.64.0.2","publicKey":"key-two","status":"Connected"},
+        {"fqdn":"solo.example","netbirdIp":"100.64.0.3","publicKey":"key-solo","status":"Connected"},
+        {"fqdn":"echo.example","netbirdIp":"100.64.0.7","publicKey":"key-echo","status":"Connected"}
+    ]},"netbirdIp":"100.64.0.7","fqdn":"self.example"}"#;
+    let peers = discover_with_status(status);
+    for name in ["one", "two", "echo"] {
+        let entry = peers
+            .iter()
+            .find(|peer| peer["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {peers:?}"));
+        assert!(entry["address"].is_null(), "{name}: {entry}");
+        assert_eq!(entry["classification"], "candidate", "{name}");
+        assert_eq!(entry["reason"], "address_ambiguous", "{name}");
+    }
+    let solo = peers
+        .iter()
+        .find(|peer| peer["name"] == "solo")
+        .expect("solo is listed");
+    assert_eq!(solo["address"], "100.64.0.3");
+    assert!(solo["reason"].is_null(), "{solo}");
+
+    for selector in ["one", "two.example", "100.64.0.2", "echo"] {
+        let output = inspect_output(status, selector);
+        assert!(!output.status.success(), "{selector}");
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+        assert_eq!(
+            document["err"]["code"], "overlay_host_ambiguous",
+            "{selector}"
+        );
+    }
+}

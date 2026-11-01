@@ -63,6 +63,7 @@ impl OverlayTransport for StalledIdentity {
             display_name: Some("peer-b".to_owned()),
             fqdn: Some("peer-b.overlay.test".to_owned()),
             address: None,
+            address_ambiguous: false,
         };
         Box::pin(async move { Ok(vec![peer]) })
     }

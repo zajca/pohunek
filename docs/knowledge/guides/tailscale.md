@@ -24,6 +24,7 @@ mode `0600`, in a directory only you can write:
 ```toml
 providers = ["tailscale"]
 port = 18722              # optional, 1..=65535
+status_timeout_secs = 10  # optional, 1..=120
 ```
 
 The daemon reads the file at start. Restart it after a change: restart the
@@ -147,10 +148,10 @@ and `overlay_config`, and names the reason a node has no usable address.
 | Code or check | Cause | Fix |
 |---|---|---|
 | `tailscale_cli_missing` | no trusted `tailscale` on the search path | install the client; on Linux put it on the daemon's `PATH`; macOS is not supported in 0.37 |
-| `tailscale_state_unavailable` | `tailscale status` failed, printed something unreadable, or the node is not running on a kernel interface | read the message: start `tailscaled`, log in, or stop using userspace networking |
+| `tailscale_state_unavailable` | `tailscale status` failed, did not answer within `status_timeout_secs`, printed something unreadable, or the node is not running on a kernel interface | read the message: start `tailscaled`, log in, or stop using userspace networking |
 | `tailscale_listener_address_missing` | the node has no IPv4 address Pohunek may bind | the same causes; the message names the reason |
 | `host_unknown` | the peer is expired, not in the network map or a `ShareeNode` | check `tailscale status` on this host |
-| `overlay_host_ambiguous` | two peers match the name | use the node ID or the full name |
+| `overlay_host_ambiguous` | two peers match the name, or two peers list the same address | use the node ID or the full name; a shared address is withheld from `host list` (`reason = address_ambiguous`) until the tailnet lists it for one node |
 | `host_unreachable` | the peer was resolved but its daemon port did not answer | start the daemon on the peer, check the peer's `overlays.toml` port and the tailnet policy |
 | `overlay_configuration_invalid` | `overlays.toml` is unsafe or malformed | the message names the file and the line |
 | `overlay_config` warning | the running daemon uses another overlay or port than the file | restart the daemon |

@@ -140,6 +140,7 @@ fn resolve_staged<'a>(
     ];
     for (matches_peer, matches_own) in stages {
         let peer = match unique_peer(
+            status,
             status.peers().iter().filter(|peer| matches_peer(peer)),
             name,
         ) {
@@ -179,10 +180,12 @@ pub(crate) fn resolve_peer_identity<'a>(
     let peers = status.peers().iter();
     let peer = match identity.kind() {
         ExternalIdentityKind::PeerId => unique_peer(
+            status,
             peers.filter(|peer| peer.peer_id() == Some(identity.value())),
             identity.value(),
         )?,
         ExternalIdentityKind::Fqdn => unique_peer(
+            status,
             peers.filter(|peer| {
                 peer.fqdn
                     .as_deref()
@@ -194,21 +197,49 @@ pub(crate) fn resolve_peer_identity<'a>(
     peer.ok_or_else(|| NetbirdError::HostUnknown(identity.value().to_owned()))
 }
 
+/// The single in-range peer among `peers`, if any.
+///
+/// A peer whose address this machine or another current peer lists too is not
+/// a route: the address does not name one host, so the selector is ambiguous
+/// between every host that lists it.
 fn unique_peer<'a>(
+    status: &'a NetbirdStatus,
     peers: impl Iterator<Item = &'a crate::Peer>,
     name: &str,
 ) -> Result<Option<&'a crate::Peer>, NetbirdError> {
     let peers = peers
         .filter(|peer| peer.ip().is_some_and(is_netbird_ip))
         .collect::<Vec<_>>();
-    match peers.as_slice() {
-        [] => Ok(None),
-        [peer] => Ok(Some(*peer)),
-        _ => Err(NetbirdError::HostAmbiguous {
-            host: name.to_owned(),
-            candidates: peers.iter().map(|peer| peer_candidate(peer)).collect(),
-        }),
-    }
+    let candidates = match peers.as_slice() {
+        [] => return Ok(None),
+        [peer] => {
+            let sharers = status
+                .peers()
+                .iter()
+                .filter(|other| other.ip() == peer.ip())
+                .collect::<Vec<_>>();
+            let own = status
+                .self_netbird_ip()
+                .filter(|own| Some(*own) == peer.ip());
+            if sharers.len() == 1 && own.is_none() {
+                return Ok(Some(*peer));
+            }
+            let mut candidates = Vec::new();
+            if own.is_some() {
+                candidates.push(CandidateIdentity::this_machine(status.self_fqdn()));
+            }
+            candidates.extend(sharers.iter().map(|peer| peer_candidate(peer)));
+            return Err(NetbirdError::HostAmbiguous {
+                host: name.to_owned(),
+                candidates,
+            });
+        }
+        _ => peers,
+    };
+    Err(NetbirdError::HostAmbiguous {
+        host: name.to_owned(),
+        candidates: candidates.iter().map(|peer| peer_candidate(peer)).collect(),
+    })
 }
 
 fn peer_candidate(peer: &crate::Peer) -> CandidateIdentity {

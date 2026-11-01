@@ -5155,6 +5155,7 @@ the CLI, the daemon and external Rust clients share. It reads
 ```toml
 providers = ["netbird"]   # exactly one overlay provider per host: "netbird" or "tailscale"
 port = 18722              # optional; TCP port of the remote control listener
+status_timeout_secs = 10  # optional; longest a provider status probe may run, 1..=120
 ```
 
 The file is optional. When it or its directory is absent the host works over
@@ -5166,7 +5167,18 @@ exists there, every component of the directory path must be a real directory
 (no symlink) owned by the user or root and not writable by other accounts, and
 the file must be
 a regular file owned by the user with mode `0600` and at most 64 KiB, in
-UTF-8. Parsing is strict: unknown keys and wrong types fail. `providers` takes
+UTF-8. Parsing is strict: unknown keys and wrong types fail. `status_timeout_secs`
+is one deadline for the provider status command of either provider (`netbird
+status --json`, `tailscale status --json`); it defaults to 10 and a value
+outside `1..=120` fails. A command still running at the deadline is killed and
+reaped together with any process it started, and the probe fails as `<overlay>_state_unavailable` with the message
+"did not answer within"; host listing, discovery, `--host` resolution and the
+daemon's remote-listener retry all end at that deadline. A peer address that
+the status lists for another peer, for this machine, or in any of the peer's
+addresses (a Tailscale node lists several) is never a route: a selector that reaches
+it fails as `overlay_host_ambiguous` naming every peer that lists it, and
+`host list` and `host discover` keep those peers as `candidate` records without
+an address and with `reason = "address_ambiguous"`. `providers` takes
 exactly one known id (`netbird` or `tailscale`); several providers on one host are not
 supported yet and fail with a message that points to
 [#1113](https://github.com/zajca/pohunek/issues/1113). The environment variable

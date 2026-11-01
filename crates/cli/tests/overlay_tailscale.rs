@@ -68,6 +68,16 @@ impl Fixture {
         }
     }
 
+    /// Rewrites `overlays.toml` with the provider, the port and `extra` keys.
+    fn configure(&self, extra: &str) {
+        let file = self.env.config_home().join("pohunek").join("overlays.toml");
+        fs::write(
+            &file,
+            format!("providers = [\"tailscale\"]\nport = {PORT}\n{extra}\n"),
+        )
+        .expect("rewrite overlays.toml");
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.env
             .command(pohunek_test_support::bin_exe("pohunek"))
@@ -615,4 +625,142 @@ fn a_name_shared_with_this_machine_is_ambiguous() {
     let (output, targets) = fixture.dial("self-box");
     assert_eq!(error_code(&output), "overlay_host_ambiguous");
     assert!(targets.is_empty(), "{targets:?}");
+}
+
+/// Replaces the fake CLI with one that records its pid and never answers.
+fn install_hanging_cli(fixture: &Fixture) -> PathBuf {
+    let pid = fixture.env.root().join("tailscale.pid");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{pid}.child'\nwait\n",
+            pid = pid.display()
+        ),
+    )
+    .expect("write the hanging fake");
+    pid
+}
+
+/// Asserts that the process whose pid `file` records is gone or only a zombie
+/// awaiting its reaper.
+fn assert_not_running(file: &std::path::Path) {
+    let recorded = fs::read_to_string(file).expect("the fake recorded its pid");
+    let stat = fs::read_to_string(
+        std::path::Path::new("/proc")
+            .join(recorded.trim())
+            .join("stat"),
+    );
+    let state = stat
+        .ok()
+        .and_then(|text| text.rsplit(')').next().map(str::to_owned))
+        .and_then(|rest| rest.split_whitespace().next().map(str::to_owned));
+    assert!(
+        state.is_none_or(|state| state == "Z"),
+        "{}: the process of the hung CLI is still running",
+        file.display()
+    );
+}
+
+/// A status probe that never answers ends at the configured deadline as
+/// `tailscale_state_unavailable` for listing and for `--host` resolution, and
+/// the CLI it started is gone.
+#[test]
+fn a_status_probe_that_never_answers_is_bounded_and_killed() {
+    let fixture = Fixture::new(&tailnet());
+    fixture.configure("status_timeout_secs = 1");
+    let pid = install_hanging_cli(&fixture);
+
+    let output = fixture.run(&["host", "list", "--refresh", "--json"]);
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert!(
+        error_message(&output).contains("did not answer within"),
+        "{}",
+        error_message(&output)
+    );
+    for file in [pid.clone(), pid.with_extension("pid.child")] {
+        assert_not_running(&file);
+    }
+
+    // A CLI that exits but leaves a helper holding its output is bounded and
+    // its helper is killed too.
+    let helper = fixture.env.root().join("tailscale.helper");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+            helper.display()
+        ),
+    )
+    .expect("write the leaking fake");
+    let output = fixture.run(&["host", "list", "--refresh", "--json"]);
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert_not_running(&helper);
+
+    let (output, targets) = fixture.dial("alpha");
+    assert_eq!(error_code(&output), "tailscale_state_unavailable");
+    assert!(targets.is_empty(), "{targets:?}");
+}
+
+/// The deadline is a strict, range-checked `overlays.toml` key.
+#[test]
+fn an_unusable_status_deadline_is_refused_before_any_probe() {
+    let fixture = Fixture::new(&tailnet());
+    for value in ["0", "121", "-1", "\"fast\"", "1.5"] {
+        fixture.configure(&format!("status_timeout_secs = {value}"));
+        let output = fixture.run(&["host", "list", "--refresh", "--json"]);
+        assert_eq!(
+            error_code(&output),
+            "overlay_configuration_invalid",
+            "{value}"
+        );
+        assert!(
+            error_message(&output).contains("status_timeout_secs")
+                || error_message(&output).contains("schema"),
+            "{value}: {}",
+            error_message(&output)
+        );
+        assert_eq!(fixture.fake.invocations(), 0, "{value}");
+    }
+}
+
+/// A node address that two peers list is no route: the selectors that reach it
+/// are ambiguous between both peers, the listing keeps both as candidates and
+/// names why, and a peer with its own address is unaffected.
+#[test]
+fn an_address_listed_for_two_peers_is_not_used_for_routing() {
+    let status = Status::running(
+        SELF_ADDRESS,
+        vec![
+            Node::peer("alpha", "nALPHA00001CNTRL", &["100.64.0.10"]),
+            Node::peer("bravo", "nBRAVO00001CNTRL", &["100.64.0.10"]),
+            Node::peer("charlie", "nCHARL00001CNTRL", &["100.64.0.30"]),
+            // Shares only its IPv6 address with `echo`, and the address of
+            // this machine with `foxtrot`.
+            Node::peer(
+                "delta",
+                "nDELTA00001CNTRL",
+                &["100.64.0.40", "fd7a:115c:a1e0::40"],
+            ),
+            Node::peer("echo", "nECHO000001CNTRL", &["fd7a:115c:a1e0::40"]),
+            Node::peer("foxtrot", "nFOXTR00001CNTRL", &[SELF_ADDRESS]),
+        ],
+    );
+    let fixture = Fixture::new(&status);
+    let (peers, _) = records(&fixture.run(&["host", "list", "--refresh", "--json"]));
+    for name in ["alpha", "bravo", "delta", "echo", "foxtrot"] {
+        let entry = record(&peers, name);
+        assert!(entry["address"].is_null(), "{name}: {entry}");
+        assert_eq!(entry["classification"], "candidate", "{name}");
+        assert_eq!(entry["reason"], "address_ambiguous", "{name}");
+    }
+    assert_eq!(record(&peers, "charlie")["address"], "100.64.0.30");
+
+    for selector in ["alpha", "bravo", "100.64.0.10", "echo", "delta", "foxtrot"] {
+        let (output, targets) = fixture.dial(selector);
+        assert_eq!(error_code(&output), "overlay_host_ambiguous", "{selector}");
+        assert!(targets.is_empty(), "{selector}: {targets:?}");
+    }
+    let (output, targets) = fixture.dial("charlie");
+    assert_eq!(error_code(&output), "host_unreachable");
+    assert_eq!(targets, ["100.64.0.30:9100"]);
 }

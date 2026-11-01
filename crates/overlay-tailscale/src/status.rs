@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use pohunek_platform::bounded_command::BoundedError;
 use pohunek_platform::shell_env::{
     fallback_search_path, resolve_executable, resolve_executable_in_path_value,
     DARWIN_FALLBACK_DIRECTORIES,
@@ -241,7 +243,10 @@ pub fn parse_status(json: &str) -> Result<TailscaleStatus, TailscaleError> {
 /// - [`TailscaleError::StateUnavailable`] on a non-zero exit (daemon down),
 ///   carrying a short trimmed detail from stderr or stdout.
 /// - [`TailscaleError::Parse`] when the output is not valid status JSON.
-pub async fn run_status_async() -> Result<TailscaleStatus, TailscaleError> {
+///
+/// A command still running after `deadline` is killed and reaped, and the call
+/// fails with [`TailscaleError::StateUnavailable`].
+pub async fn run_status_async(deadline: Duration) -> Result<TailscaleStatus, TailscaleError> {
     let permit = LOOKUP_GATE.acquire().await.map_err(|_closed| {
         TailscaleError::StateUnavailable("the tailscale lookup gate is closed".to_owned())
     })?;
@@ -266,7 +271,7 @@ pub async fn run_status_async() -> Result<TailscaleStatus, TailscaleError> {
     let program = receiver.await.map_err(|_closed| {
         TailscaleError::StateUnavailable("the tailscale lookup ended without a result".to_owned())
     })??;
-    run_status_at(&program).await
+    run_status_at(&program, deadline).await
 }
 
 /// Admits one lookup thread at a time.
@@ -308,15 +313,19 @@ fn resolve_program(
     resolve_executable(program, &search).map_err(|_unresolved| TailscaleError::CliMissing)
 }
 
-async fn run_status_at(program: &Path) -> Result<TailscaleStatus, TailscaleError> {
-    let output = tokio::process::Command::new(program)
-        .args(TAILSCALE_STATUS_ARGS)
-        // The daemon may cancel this future while shutting down. Killing the
-        // child prevents an unresponsive CLI from extending that shutdown.
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|error| command_error(program, &error))?;
+async fn run_status_at(
+    program: &Path,
+    deadline: Duration,
+) -> Result<TailscaleStatus, TailscaleError> {
+    let output =
+        pohunek_platform::bounded_command::run_bounded(program, &TAILSCALE_STATUS_ARGS, deadline)
+            .await
+            .map_err(|error| match error {
+                BoundedError::Io(error) => command_error(program, &error),
+                BoundedError::Expired(deadline) => TailscaleError::StateUnavailable(format!(
+                    "`tailscale status` did not answer within {deadline:?}"
+                )),
+            })?;
     status_from_output(&output)
 }
 

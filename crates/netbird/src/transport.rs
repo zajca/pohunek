@@ -1,6 +1,7 @@
 //! `NetBird` implementation of the generic overlay contract.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use overlay::{
     BindAddrError, DiscoveredPeer, ExternalIdentity, LocalIdentity, OverlayError, OverlayFuture,
@@ -16,16 +17,31 @@ pub const NETBIRD_OVERLAY_ID: &str = "netbird";
 #[derive(Debug)]
 pub struct NetbirdTransport {
     id: OverlayId,
+    status_deadline: Duration,
 }
 
 impl NetbirdTransport {
-    /// Create the `NetBird` provider adapter.
+    /// Create the `NetBird` provider adapter with the default status deadline.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_status_deadline(overlay::DEFAULT_STATUS_DEADLINE)
+    }
+
+    /// Create the adapter with `status_deadline` as the longest a status probe
+    /// may run.
+    #[must_use]
+    pub fn with_status_deadline(status_deadline: Duration) -> Self {
         Self {
             id: OverlayId::new(NETBIRD_OVERLAY_ID)
                 .expect("the static NetBird overlay identifier is valid"),
+            status_deadline,
         }
+    }
+
+    async fn load_status(&self) -> Result<NetbirdStatus, OverlayError> {
+        crate::run_status_async(self.status_deadline)
+            .await
+            .map_err(|error| map_error(error, &self.id))
     }
 }
 
@@ -49,7 +65,7 @@ impl OverlayTransport for NetbirdTransport {
 
     fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             status
                 .self_netbird_ip()
                 .ok_or_else(|| OverlayError::ListenerAddressMissing {
@@ -61,7 +77,7 @@ impl OverlayTransport for NetbirdTransport {
 
     fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             resolve_from_status(&status, host, self.id())
         })
     }
@@ -71,21 +87,21 @@ impl OverlayTransport for NetbirdTransport {
         identity: &'a ExternalIdentity,
     ) -> OverlayFuture<'a, ResolvedPeer> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             resolve_identity_from_status(&status, identity, self.id())
         })
     }
 
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             Ok(discover_from_status(&status))
         })
     }
 
     fn discover_snapshot(&self) -> OverlayFuture<'_, OverlaySnapshot> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             Ok(OverlaySnapshot {
                 peers: discover_from_status(&status),
                 local: local_identity_from_status(&status, self.id()),
@@ -95,23 +111,17 @@ impl OverlayTransport for NetbirdTransport {
 
     fn resolve_selector<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedSelector> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             selector_from_status(&status, host, self.id())
         })
     }
 
     fn local_identity(&self) -> OverlayFuture<'_, Option<LocalIdentity>> {
         Box::pin(async move {
-            let status = load_status(self.id()).await?;
+            let status = self.load_status().await?;
             Ok(local_identity_from_status(&status, self.id()))
         })
     }
-}
-
-async fn load_status(id: &OverlayId) -> Result<NetbirdStatus, OverlayError> {
-    crate::run_status_async()
-        .await
-        .map_err(|error| map_error(error, id))
 }
 
 fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
@@ -190,7 +200,17 @@ fn resolved_peer(peer: &Peer) -> ResolvedPeer {
 }
 
 fn discover_from_status(status: &NetbirdStatus) -> Vec<DiscoveredPeer> {
-    status.peers().iter().map(map_peer).collect()
+    let mut peers = status.peers().iter().map(map_peer).collect::<Vec<_>>();
+    overlay::withhold_shared_addresses(&mut peers);
+    // A peer that lists this machine's own address is no route either.
+    let own = status.self_netbird_ip();
+    for peer in &mut peers {
+        if own.is_some() && peer.address == own {
+            peer.address = None;
+            peer.address_ambiguous = true;
+        }
+    }
+    peers
 }
 
 fn map_peer(peer: &Peer) -> DiscoveredPeer {
@@ -200,6 +220,7 @@ fn map_peer(peer: &Peer) -> DiscoveredPeer {
         display_name: short_name(peer),
         fqdn: peer.fqdn.clone(),
         address: parsed.filter(|address| crate::is_netbird_ip(*address)),
+        address_ambiguous: false,
     }
 }
 
