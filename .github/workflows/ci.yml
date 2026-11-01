@@ -272,24 +272,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --doc -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck
 
-      - name: Test APFS foreign-owner rejection
+      - name: Test the root-only trust rejections
         if: ${{ !cancelled() }}
-        # The foreign-owned directory needs root. The lane's lib test binary is
-        # run from the archive extracted by the steps above, so no root-owned
-        # file is written under target/, which rust-cache saves.
+        # The foreign-owned and root-owned fixtures need root. The lane's test
+        # binaries are run from the archive extracted by the steps above, so no
+        # root-owned file is written under target/, which rust-cache saves.
         shell: bash
         run: |
           set -euo pipefail
           metadata="$PWD/target/nextest/binaries-metadata.json"
           test -f "$metadata" || { echo "archive metadata missing: $metadata" >&2; exit 1; }
-          bin="$(python3 -I -c "
+          extracted_binary() {
+            python3 -I -c "
           import json, os, sys
-          metadata, root = sys.argv[1], sys.argv[2]
+          metadata, root, binary_id = sys.argv[1], sys.argv[2], sys.argv[3]
           summary = json.load(open(metadata))
           target_dir = summary['rust-build-meta']['target-directory'].rstrip('/')
-          entry = summary['rust-binaries'].get('pohunek-platform')
+          entry = summary['rust-binaries'].get(binary_id)
           if entry is None:
-              sys.exit('no pohunek-platform lib test binary in the archive metadata')
+              sys.exit(f'no {binary_id} test binary in the archive metadata')
           path = entry['binary-path']
           # The archive records the build-time target directory; extraction
           # places the binaries under <root>/target. Only that extracted copy
@@ -300,15 +301,23 @@ jobs:
               path = os.path.relpath(path, target_dir)
           extracted = os.path.join(root, 'target', path)
           if not os.path.isfile(extracted):
-              sys.exit(f'pohunek-platform lib test binary not extracted at {extracted}')
+              sys.exit(f'{binary_id} test binary not extracted at {extracted}')
           print(extracted)
-          " "$metadata" "$PWD")"
-          output="$RUNNER_TEMP/apfs-root-test.txt"
-          (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$bin" filesystem::tests::apfs_foreign_owned_private_directory_is_rejected shell_env::executable::tests::root_never_trusts_an_admin_group_writable_directory --ignored --exact) | tee "$output"
-          # libtest exits 0 when the filter matches nothing, so require that
-          # exactly these two tests ran and passed.
-          grep -qx 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]* filtered out; finished in .*' "$output" \
-            || { echo "the root tests did not run exactly once" >&2; exit 1; }
+          " "$metadata" "$PWD" "$1"
+          }
+          run_as_root() {
+            local binary test_name output
+            binary="$(extracted_binary "$1")"
+            test_name="$2"
+            output="$RUNNER_TEMP/root-test-$test_name.txt"
+            (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$binary" "$test_name" --ignored --exact) | tee "$output"
+            # libtest exits 0 when the filter matches nothing, so require that
+            # exactly this one test ran and passed.
+            grep -qx 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]* filtered out; finished in .*' "$output" \
+              || { echo "the root test $test_name did not run exactly once" >&2; exit 1; }
+          }
+          run_as_root pohunek-platform filesystem::tests::apfs_foreign_owned_private_directory_is_rejected
+          run_as_root pohunek-platform::executable_trust_root root_never_trusts_an_admin_group_writable_directory
 
       - name: Summarize flaky tests
         if: always()

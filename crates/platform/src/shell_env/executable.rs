@@ -621,48 +621,6 @@ mod tests {
     use super::*;
     use crate::shell_env::test_support::{fixture, make_dir};
 
-    /// Runs as root in the sudo step of the macOS lane. Root-owned `admin`
-    /// directories and a symlink of a foreign account stay untrusted.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "native macOS CI runs this test as root to create root-owned fixtures"]
-    fn root_never_trusts_an_admin_group_writable_directory() {
-        use std::os::unix::fs::symlink;
-
-        assert_eq!(rustix::process::geteuid().as_raw(), 0, "test requires root");
-        let root = fixture();
-        let admin = root.path().join("admin");
-        make_dir(root.path(), &admin);
-        std::os::unix::fs::chown(&admin, None, Some(DARWIN_ADMIN_GROUP)).expect("chgrp admin");
-        fs::set_permissions(&admin, fs::Permissions::from_mode(0o775)).expect("chmod");
-        let program = executable(&admin, "agent");
-        assert!(
-            matches!(
-                inspect_executable(&program, Owners::current()),
-                Err(Refusal::ChainDirectory { .. } | Refusal::ChainSharedDirectory { .. })
-            ),
-            "a root-owned admin-writable directory is refused for root"
-        );
-        assert!(
-            super::super::search_path::trusted_directory(&admin).is_err(),
-            "the same directory is not a trusted search directory for root"
-        );
-
-        let plain = root.path().join("plain");
-        make_dir(root.path(), &plain);
-        let target = executable(&plain, "agent");
-        let link = plain.join("link");
-        symlink(&target, &link).expect("symlink");
-        std::os::unix::fs::lchown(&link, Some(1), None).expect("chown the link to daemon");
-        assert!(
-            matches!(
-                inspect_executable(&link, Owners::current()),
-                Err(Refusal::ChainSymlinkOwner { owner: 1 })
-            ),
-            "a symlink owned by another account is refused"
-        );
-    }
-
     fn executable(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "#!/bin/sh\n").expect("write");

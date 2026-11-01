@@ -91,7 +91,8 @@ MACOS_BUCKETS = {
         ("pohunek-platform",),
         "package(=pohunek-platform) and "
         "(test(=filesystem::tests::apfs_foreign_owned_private_directory_is_rejected) or "
-        "test(=shell_env::executable::tests::root_never_trusts_an_admin_group_writable_directory))",
+        "(binary(=executable_trust_root) and "
+        "test(=root_never_trusts_an_admin_group_writable_directory)))",
     ),
     # Child images that only a parent test starts with `--ignored --exact`.
     "fixture": Bucket(
