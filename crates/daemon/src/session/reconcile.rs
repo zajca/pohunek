@@ -12438,6 +12438,7 @@ handler = "codex-hook-v1"
             subagent_fields: &[],
             subagent_sequence: Some(SubagentSequence::StopAfterStart),
             stop_requires_start: &[],
+            turn_stop_providers: &[],
         };
         static WITH_FIELDS: HookSchema = HookSchema {
             subagent_fields: &[SubagentField::ParentId, SubagentField::AgentType],
@@ -12526,6 +12527,7 @@ handler = "codex-hook-v1"
             subagent_fields: &[],
             subagent_sequence: None,
             stop_requires_start: &[],
+            turn_stop_providers: &[],
         };
         static NESTED: HookSchema = HookSchema {
             nested_active: true,
@@ -12586,6 +12588,7 @@ handler = "codex-hook-v1"
             subagent_fields: &[],
             subagent_sequence: None,
             stop_requires_start: &[],
+            turn_stop_providers: &[],
         };
         static ID_ONLY: HookSchema = HookSchema {
             reference_kinds: &[ReferenceKind::Id],

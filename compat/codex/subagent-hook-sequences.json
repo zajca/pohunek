@@ -5,7 +5,7 @@
     "key_sets": "The sorted top-level keys of each hook input the probe saw. `UserPromptSubmit (child)` is a UserPromptSubmit that carries an agent_id.",
     "path_relations": "How the transcript paths of the hook inputs relate, checked in every flow that records the events: the SubagentStart transcript_path is the child's own (it differs from the root session's), the SubagentStop transcript_path is the root session's and its agent_transcript_path is the child's.",
     "sequences": "One entry per flow. `root_events` is the hook events of the root agent in order, `child_events` those that carry the child's agent_id, in order. The two lists are not ordered against each other. Every child event of a flow carries the same agent_id. `events` is the SubagentStart and SubagentStop inputs of the flow in order, reduced to hook_event_name, agent_id and agent_type, with the synthetic id `agent-child-1` for the one child. No transcript, prompt, path or real id is kept.",
-    "tools": "The multi-agent tool family the flow drives: multi_agent_v1 (spawn_agent, send_input, wait_agent, close_agent, resume_agent) or multi_agent_v2 (spawn_agent, followup_task, interrupt_agent, wait_agent; `multi_agent_v2 = true` under [features])."
+    "tools": "The multi-agent tool family the flow drives: multi_agent_v1 (spawn_agent, send_input, wait_agent, close_agent, resume_agent) or multi_agent_v2 (spawn_agent, followup_task, interrupt_agent, list_agents, wait_agent; `multi_agent_v2 = true` under [features])."
   },
   "key_sets": {
     "SessionStart": [

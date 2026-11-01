@@ -188,7 +188,10 @@ pub enum SubagentSequence {
     /// when its sequence is greater than the recorded claim. A stop with no
     /// recorded claim is admitted only for a provider whose stop does not
     /// require a start ([`HookSchema::stop_requires_start`]); such a stop
-    /// records a subagent that is already terminal.
+    /// records a subagent that is already terminal. A stop ordered after the
+    /// recorded claim of a terminal subagent of a provider that reports every
+    /// completed turn ([`HookSchema::stop_is_turn`]) records one more completed
+    /// turn; for any other provider it only raises the recorded sequence.
     StopAfterStart,
 }
 
@@ -319,6 +322,14 @@ pub struct HookSchema {
     /// provider outside this list may report a stop without a start for a
     /// real subagent, which is then recorded as terminal.
     pub stop_requires_start: &'static [&'static str],
+    /// Subagent providers whose every stop is one completed turn of the
+    /// subagent.
+    ///
+    /// Such a provider sends a stop after each turn of a child, including the
+    /// turns of a follow-up or of a resumed child, which send no start. A stop
+    /// ordered after a terminal record of the subagent is then a new completed
+    /// turn and not a repeat.
+    pub turn_stop_providers: &'static [&'static str],
 }
 
 impl HookSchema {
@@ -375,6 +386,12 @@ impl HookSchema {
         self.stop_requires_start.contains(&provider)
     }
 
+    /// Whether every stop of `provider` is one completed turn of its subagent.
+    #[must_use]
+    pub fn stop_is_turn(&self, provider: &str) -> bool {
+        self.turn_stop_providers.contains(&provider)
+    }
+
     /// Whether the schema admits the optional subagent `field`.
     #[must_use]
     pub fn admits_subagent_field(&self, field: SubagentField) -> bool {
@@ -402,6 +419,14 @@ const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude", "muse"];
 /// prompt-suggestion helper after every main-agent turn, which is not a
 /// subagent. Codex reports a resumed child with a stop alone, so it is absent.
 const STOP_REQUIRES_START_PROVIDERS: &[&str] = &["claude", "muse"];
+
+/// Subagent providers whose every stop is one completed turn of the subagent.
+///
+/// Codex fires `SubagentStop` once per completed child turn: after the first
+/// turn, after each follow-up and after each turn of a resumed child, which
+/// sends no `SubagentStart`. Claude Code and Muse stop a helper once per run,
+/// so a later stop for a finished one carries no turn.
+const TURN_STOP_PROVIDERS: &[&str] = &["codex"];
 
 /// Provider ids whose hooks report prompt acceptance.
 const PROMPT_PROVIDERS: &[&str] = &["claude"];
@@ -442,6 +467,7 @@ const IDENTITY_V1: HookSchema = HookSchema {
     subagent_fields: &[],
     subagent_sequence: None,
     stop_requires_start: &[],
+    turn_stop_providers: &[],
 };
 
 /// Identity, release, notification, and subagent lifecycle reports.
@@ -463,6 +489,7 @@ const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
     ],
     subagent_sequence: Some(SubagentSequence::StopAfterStart),
     stop_requires_start: STOP_REQUIRES_START_PROVIDERS,
+    turn_stop_providers: TURN_STOP_PROVIDERS,
 };
 
 /// The closed set of hook schemas, in a stable order.

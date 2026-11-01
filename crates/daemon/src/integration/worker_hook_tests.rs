@@ -645,10 +645,7 @@ mod subagent_sequences {
     use tokio::net::UnixListener;
     use tracing_subscriber::layer::SubscriberExt;
 
-    use super::{
-        initialize, start_worker_initialized, start_worker_with_schema, state_asset, DaemonStub,
-        SESSION_ID,
-    };
+    use super::{initialize, start_worker_initialized, state_asset, DaemonStub, SESSION_ID};
     use crate::runtime::Worker;
 
     /// Claude Code subagent hook sequences recorded on #883.
@@ -981,6 +978,17 @@ mod subagent_sequences {
         final_rows: Option<&Rows>,
         schema: &str,
     ) -> HookRun {
+        replay_launched_as(root, steps, final_rows, (schema, "claude")).await
+    }
+
+    /// [`replay_with_schema`] for a session launched as the agent `launch_agent`
+    /// (the second element), whose runtime is its own base.
+    async fn replay_launched_as(
+        root: &Path,
+        steps: Vec<Step>,
+        final_rows: Option<&Rows>,
+        (schema, launch_agent): (&str, &str),
+    ) -> HookRun {
         let gate_path = root.join("replay.gate");
         nix::unistd::mkfifo(&gate_path, nix::sys::stat::Mode::S_IRWXU).expect("create the gate");
         // Opened read-write so the test never blocks on a reader and the
@@ -1012,13 +1020,15 @@ mod subagent_sequences {
         }
         let checkpoints = script.checkpoints;
 
-        let (worker, task, _socket) = start_worker_with_schema(
+        let mut launch = initialize(
             root,
             &lines.join("\n"),
             protocol::PROTOCOL_VERSION.get(),
             schema,
-        )
-        .await;
+        );
+        launch_agent.clone_into(&mut launch.launch.agent);
+        launch_agent.clone_into(&mut launch.launch.agent_base);
+        let (worker, task, _socket) = start_worker_initialized(root, launch).await;
         let mut run = HookRun {
             worker,
             task,
@@ -1322,6 +1332,157 @@ mod subagent_sequences {
         }];
         let completed = Rows::from([((CODEX.to_owned(), id), SubagentPhase::Completed)]);
         replay(&root, steps, &completed).await.finish().await;
+    }
+
+    /// Codex 0.164 hook sequences captured from the real `codex`
+    /// (`compat/codex/subagent-hook-sequences.json`, #916).
+    const CODEX_RECORDED: &str =
+        include_str!("../../../../compat/codex/subagent-hook-sequences.json");
+
+    /// The id the Codex recordings give their one child.
+    const CODEX_CHILD: &str = "agent-child-1";
+
+    /// The subagent lifecycle events of the recorded Codex flow `name`: the
+    /// names of its `SubagentStart` and `SubagentStop` inputs in order.
+    fn codex_lifecycle(name: &str) -> Vec<String> {
+        let recording: Value =
+            serde_json::from_str(CODEX_RECORDED).expect("the Codex sequences parse");
+        recording["sequences"][name]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no recorded Codex flow {name}"))
+            .iter()
+            .map(|event| {
+                assert_eq!(event["agent_id"], CODEX_CHILD, "{name}: one recorded child");
+                event["hook_event_name"]
+                    .as_str()
+                    .expect("event name")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// `event` (`SubagentStart` or `SubagentStop`) delivered through the real
+    /// Codex state hook, with the Codex hook input of the compatibility fixture
+    /// naming `id`.
+    fn codex_hook(event: &str, id: &str) -> Step {
+        let fixture: Value =
+            serde_json::from_str(crate::integration::CODEX_SUBAGENT_COMPATIBILITY_FIXTURE)
+                .expect("the Codex hook fixture parses");
+        let (action, key) = match event {
+            "SubagentStart" => ("subagent-start", "start"),
+            "SubagentStop" => ("subagent-stop", "stop"),
+            other => panic!("not a subagent lifecycle event: {other}"),
+        };
+        let mut payload = fixture[key].clone();
+        payload["agent_id"] = json!(id);
+        Step::Hook {
+            asset: state_asset(CODEX),
+            action,
+            payload,
+        }
+    }
+
+    /// The one Codex child `id` completed.
+    fn codex_completed(id: &str) -> Rows {
+        Rows::from([((CODEX.to_owned(), id.to_owned()), SubagentPhase::Completed)])
+    }
+
+    /// Replays the lifecycle of the recorded Codex flow `name` through the real
+    /// state hook in a session launched as `launch_agent`, pausing after the
+    /// first stop, and checks the second stop records one more completed turn:
+    /// a higher revision, the stop's time as the update and finish time, and
+    /// the first start unchanged.
+    async fn a_second_codex_stop_is_another_completed_turn(name: &str, launch_agent: &str) {
+        let events = codex_lifecycle(name);
+        assert_eq!(
+            events,
+            ["SubagentStart", "SubagentStop", "SubagentStop"],
+            "{name}: the recording is a start and two completed turns"
+        );
+        let root = crate::test_support::scoped_dir("ph-subagent-codex-turn-");
+        let steps = vec![
+            codex_hook(&events[0], CODEX_CHILD),
+            codex_hook(&events[1], CODEX_CHILD),
+            Step::Checkpoint(codex_completed(CODEX_CHILD)),
+            codex_hook(&events[2], CODEX_CHILD),
+        ];
+        let run = replay_launched_as(
+            &root,
+            steps,
+            Some(&codex_completed(CODEX_CHILD)),
+            (SCHEMA, launch_agent),
+        )
+        .await;
+        let [first_turn, second_turn] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        let (first_turn, second_turn) =
+            (row(first_turn, CODEX_CHILD), row(second_turn, CODEX_CHILD));
+        assert!(
+            second_turn.revision > first_turn.revision,
+            "{name}: the second turn is a new revision: {first_turn:?} {second_turn:?}"
+        );
+        assert_eq!(
+            second_turn.started_at_ms, first_turn.started_at_ms,
+            "{name}: the row keeps its first start"
+        );
+        assert!(
+            second_turn.updated_at_ms >= first_turn.updated_at_ms,
+            "{name}: {first_turn:?} {second_turn:?}"
+        );
+        assert_eq!(
+            second_turn.finished_at_ms,
+            Some(second_turn.updated_at_ms),
+            "{name}: the second turn finishes when it is recorded: {second_turn:?}"
+        );
+        run.finish().await;
+    }
+
+    /// A Codex child that finished its first turn and is given a follow-up
+    /// task (`send_input`, or `followup_task` of `multi_agent_v2`) fires a
+    /// second `SubagentStop` and no second start. The stop is a completed turn
+    /// of the child, so its row takes a new revision and finish time (#916 D1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_codex_followup_turn_is_recorded_as_another_completed_turn() {
+        for name in ["followup_v1", "followup_v2", "resume_after_close"] {
+            a_second_codex_stop_is_another_completed_turn(name, "claude").await;
+        }
+    }
+
+    /// The turn rule belongs to the reporting provider, so a session launched
+    /// as a plain shell that hosts Codex in the foreground gets it too (#916 D1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shell_session_hosting_codex_records_its_followup_turns() {
+        a_second_codex_stop_is_another_completed_turn("followup_v1", "shell").await;
+    }
+
+    /// A resumed Codex child fires no start. Its first stop records a completed
+    /// row and its next turn's stop is another completed turn of that row, with
+    /// a new revision (#916 D1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_codex_child_records_each_turn_that_has_no_start() {
+        let root = crate::test_support::scoped_dir("ph-subagent-codex-resumed-");
+        let steps = vec![
+            codex_hook("SubagentStop", CODEX_CHILD),
+            Step::Checkpoint(codex_completed(CODEX_CHILD)),
+            codex_hook("SubagentStop", CODEX_CHILD),
+        ];
+        let run = replay(&root, steps, &codex_completed(CODEX_CHILD)).await;
+        let [first_turn, second_turn] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        let (first_turn, second_turn) =
+            (row(first_turn, CODEX_CHILD), row(second_turn, CODEX_CHILD));
+        assert!(
+            second_turn.revision > first_turn.revision,
+            "{first_turn:?} {second_turn:?}"
+        );
+        assert_eq!(
+            second_turn.finished_at_ms,
+            Some(second_turn.updated_at_ms),
+            "{second_turn:?}"
+        );
+        run.finish().await;
     }
 
     /// `input` with a `padding` field that makes its JSON text exactly
@@ -3888,6 +4049,83 @@ for claim in plan:
             };
             assert_eq!(row(after, CHILD).revision, row(journaled, CHILD).revision);
             run.finish().await;
+        }
+
+        /// A Codex stop older than the recorded claim of a finished child is a
+        /// delayed hook of an earlier turn: it changes nothing, and the next
+        /// stop in order still records a turn (#916 D1).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_delayed_older_codex_stop_changes_nothing() {
+            /// Synthetic Codex child thread id.
+            const CHILD: &str = "agent-child-delayed";
+            let root = crate::test_support::scoped_dir("ph-subagent-codex-delayed-");
+            let client = Client::new(&root);
+            let completed = Rows::from([(
+                (CODEX.to_owned(), CHILD.to_owned()),
+                SubagentPhase::Completed,
+            )]);
+            let steps = vec![
+                client.step(CODEX, &[(START, 10, CHILD), (STOP, 30, CHILD)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CODEX, &[(STOP, 20, CHILD)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CODEX, &[(STOP, 40, CHILD)]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            let [after_turn, after_delayed, after_next] = run.snapshots.as_slice() else {
+                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            assert_eq!(
+                row(after_delayed, CHILD),
+                row(after_turn, CHILD),
+                "the delayed stop changes nothing"
+            );
+            assert!(
+                row(after_next, CHILD).revision > row(after_turn, CHILD).revision,
+                "the stop in order records a turn"
+            );
+            run.finish().await;
+        }
+
+        /// A turn update makes a finished Codex row the newest terminal row, so
+        /// the terminal history drops the oldest other row and keeps the one
+        /// that just ran (#916 D1).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_codex_turn_keeps_its_row_in_the_terminal_history() {
+            let root = crate::test_support::scoped_dir("ph-subagent-codex-history-");
+            let client = Client::new(&root);
+            let ids: Vec<String> = (0..=TERMINAL_HISTORY)
+                .map(|index| format!("agent-child-{index:03}"))
+                .collect();
+            let (full, overflow) = ids.split_at(TERMINAL_HISTORY);
+            let sequence = |index: usize| u64::try_from(index).expect("index fits u64") * 10 + 10;
+            let finish_all: Vec<(&str, u64, &str)> = full
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (STOP, sequence(index), id.as_str()))
+                .collect();
+            let completed = |ids: &[&String]| -> Rows {
+                ids.iter()
+                    .map(|id| ((CODEX.to_owned(), (*id).clone()), SubagentPhase::Completed))
+                    .collect()
+            };
+            let oldest = &full[0];
+            let steps = vec![
+                client.step(CODEX, &finish_all),
+                Step::Checkpoint(completed(&full.iter().collect::<Vec<_>>())),
+                // The oldest row runs another turn, then one more child ends.
+                client.step(CODEX, &[(STOP, sequence(TERMINAL_HISTORY), oldest)]),
+                client.step(
+                    CODEX,
+                    &[(STOP, sequence(TERMINAL_HISTORY + 1), overflow[0].as_str())],
+                ),
+            ];
+            // The second-oldest row is the one dropped, not the row that ran.
+            let kept: Vec<&String> = std::iter::once(oldest)
+                .chain(full[2..].iter())
+                .chain(overflow.iter())
+                .collect();
+            replay(&root, steps, &completed(&kept)).await.finish().await;
         }
 
         /// With the active capacity of running subagents reached, one more

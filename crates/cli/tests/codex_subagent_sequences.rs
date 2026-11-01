@@ -59,15 +59,19 @@ fn hook_timeout_secs() -> u64 {
 
 /// What the outputs of a flow's tool calls must hold, so a call that Codex
 /// refused (an unknown target, an unsupported tool) cannot pass for the
-/// behavior the flow records: a task that reached the child, and a close or an
-/// interrupt that found the child's turn running.
-const TOOL_EVIDENCE: [(&str, &str); 6] = [
+/// behavior the flow records: a task that reached the child, a close or an
+/// interrupt that found the child's turn running, and the child's state at the
+/// end of the flow.
+const TOOL_EVIDENCE: [(&str, &str); 8] = [
     ("followup_v1", "submission_id"),
     ("resume_after_close", "submission_id"),
     ("interrupted_v1", "submission_id"),
     ("interrupted_v2", "\"previous_status\":\"running\""),
     ("close_running_v1", "\"previous_status\":\"running\""),
     ("resume_after_close", "pending_init"),
+    // The settle step that ends each flow shows the child where the flow left it.
+    ("interrupted_v2", "\"agent_status\":\"interrupted\""),
+    ("close_running_v1", "not_found"),
 ];
 
 /// Flows that need the `multi_agent_v2` tools.

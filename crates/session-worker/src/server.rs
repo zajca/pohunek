@@ -4673,7 +4673,10 @@ where
                 let effect = stop_subagent(
                     &mut journal,
                     rule,
-                    schema.stop_requires_start(&provider),
+                    StopPolicy {
+                        requires_start: schema.stop_requires_start(&provider),
+                        is_turn: schema.stop_is_turn(&provider),
+                    },
                     claim,
                     outcome.unwrap_or(JournalSubagentPhase::Completed),
                     occurred_at_ms,
@@ -6718,11 +6721,25 @@ fn start_subagent(
     SubagentOutcome::Applied
 }
 
+/// What a provider's stops mean, from the hook schema.
+#[derive(Clone, Copy)]
+struct StopPolicy {
+    /// A stop for an unknown subagent creates no record
+    /// ([`HookSchema::stop_requires_start`]).
+    requires_start: bool,
+    /// Every stop is one completed turn of the subagent
+    /// ([`HookSchema::stop_is_turn`]).
+    is_turn: bool,
+}
+
 /// Applies a subagent stop to `journal` under `rule`.
 ///
 /// A stop ordered after a running subagent's recorded claim moves it to
-/// `phase`. A stop ordered after a terminal subagent's recorded claim only
-/// raises the record's sequence to its own, so a start of the earlier run
+/// `phase`. A stop ordered after a terminal subagent's recorded claim records
+/// one more completed turn when the provider reports every turn (`is_turn`):
+/// the record takes `phase`, a new revision and the stop's time as its update
+/// and finish time, and keeps its start time. For any other provider the stop
+/// only raises the record's sequence to its own, so a start of the earlier run
 /// delivered later is stale. A stop not ordered after the recorded claim
 /// changes nothing. A stop for an unknown subagent creates no record when
 /// `requires_start` holds for its provider, and otherwise records a subagent
@@ -6730,7 +6747,7 @@ fn start_subagent(
 fn stop_subagent(
     journal: &mut JournalRecord,
     rule: SubagentSequence,
-    requires_start: bool,
+    policy: StopPolicy,
     claim: SubagentClaim<'_>,
     phase: JournalSubagentPhase,
     occurred_at_ms: u64,
@@ -6740,7 +6757,7 @@ fn stop_subagent(
         .iter()
         .position(|item| item.provider == claim.provider && item.id == claim.id);
     let recorded = index.map(|index| journal.subagents[index].sequence);
-    if index.is_none() && requires_start {
+    if index.is_none() && policy.requires_start {
         return SubagentOutcome::Ignored {
             reason: SubagentReason::StopWithoutStart,
             recorded,
@@ -6756,7 +6773,7 @@ fn stop_subagent(
     }
     if let Some(index) = index {
         let record = &mut journal.subagents[index];
-        if record.phase != JournalSubagentPhase::Running {
+        if record.phase != JournalSubagentPhase::Running && !policy.is_turn {
             record.sequence = subagent_mark(claim.sequence);
             return SubagentOutcome::Ignored {
                 reason: SubagentReason::NotRunning,
@@ -8778,6 +8795,7 @@ mod tests {
             subagent_fields: &[protocol::SubagentField::ParentId],
             subagent_sequence: Some(protocol::SubagentSequence::StopAfterStart),
             stop_requires_start: &[],
+            turn_stop_providers: &[],
         };
         let (server, pty, _directory) = launch_claim_fixture().await;
         server.shared.state.lock().await.hook_schema = Some(&NO_TYPE);
@@ -8816,6 +8834,7 @@ mod tests {
             subagent_fields: &[protocol::SubagentField::Outcome],
             subagent_sequence: None,
             stop_requires_start: &[],
+            turn_stop_providers: &[],
         };
         let (server, pty, _directory) = launch_claim_fixture().await;
         server.shared.state.lock().await.hook_schema = Some(&UNORDERED);
@@ -9227,6 +9246,7 @@ mod tests {
             subagent_fields: &[],
             subagent_sequence: None,
             stop_requires_start: &[],
+            turn_stop_providers: &[],
         };
         admit_hook(
             Some(&PINNED),
