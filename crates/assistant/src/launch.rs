@@ -310,6 +310,7 @@ pub async fn prepare_with_options(
     };
 
     let session_params = SessionNewParams {
+        client_request_id: None,
         agent: selection.name.clone(),
         name: None,
         cwd: None,

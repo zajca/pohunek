@@ -117,6 +117,7 @@ impl DaemonStub {
         let created = self
             .sessions
             .create(protocol::SessionNewParams {
+                client_request_id: None,
                 agent: "shell".to_owned(),
                 name: None,
                 cwd: Some(cwd),

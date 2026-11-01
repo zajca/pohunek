@@ -123,6 +123,7 @@ fn create_params() -> NotificationCreateParams {
 
 fn shell_session(cwd: &Path) -> SessionNewParams {
     SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: "shell".to_owned(),
         cwd: Some(cwd.to_path_buf()),

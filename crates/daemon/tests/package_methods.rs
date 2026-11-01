@@ -1280,6 +1280,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let params = protocol::SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: RUNTIME.to_owned(),
         cwd: Some(cwd.to_path_buf()),
@@ -1912,6 +1913,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let params = protocol::SessionNewParams {
+        client_request_id: None,
         name: name.map(str::to_owned),
         agent: agent.to_owned(),
         cwd: Some(cwd.to_path_buf()),

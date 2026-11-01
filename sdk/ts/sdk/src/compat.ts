@@ -117,6 +117,11 @@ export function carriesSecretEnv(params: unknown): boolean {
   return !(isObject(value) && !Array.isArray(value) && Object.keys(value).length === 0);
 }
 
+/** Whether `params` carries a `client_request_id` the daemon must honor. */
+export function carriesClientRequestId(params: unknown): boolean {
+  return isObject(params) && isSet(params["client_request_id"]);
+}
+
 function adapted(version: number): "current" | "v3" {
   if (version === PROTOCOL_VERSION) {
     return "current";
@@ -197,6 +202,7 @@ export function downgradeRequestParams(version: number, method: string, params: 
     (isSet(params["branch_source"]) ||
       isSet(params["on_diverged"]) ||
       isSet(params["input_ack_timeout_ms"]) ||
+      carriesClientRequestId(params) ||
       carriesSecretEnv(params))
   ) {
     throw new CompatError({ kind: "methodNotDefined", method });

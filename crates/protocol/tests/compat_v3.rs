@@ -406,6 +406,29 @@ fn session_new_input_ack_is_refused_for_protocol_3_and_other_requests_pass() {
 }
 
 #[test]
+fn session_new_client_request_id_is_refused_for_protocol_3() {
+    let keyed = json!({
+        "agent": "shell", "cols": 80, "rows": 24, "client_request_id": "req-1"
+    });
+    assert!(
+        downgrade_request_params(v3(), method::SESSION_NEW, keyed.clone()).is_err(),
+        "a protocol 3 daemon would drop the key and a retry would create a second session"
+    );
+    assert_eq!(
+        downgrade_request_params(PROTOCOL_VERSION, method::SESSION_NEW, keyed.clone())
+            .expect("the current protocol keeps it"),
+        keyed
+    );
+    let absent = json!({
+        "agent": "shell", "cols": 80, "rows": 24, "client_request_id": null
+    });
+    assert!(
+        downgrade_request_params(v3(), method::SESSION_NEW, absent).is_ok(),
+        "a null key is no key"
+    );
+}
+
+#[test]
 fn session_input_prompt_opt_in_is_dropped_for_protocol_3_not_refused() {
     let golden = json!({
         "session_id": "s-42", "text": "hi",

@@ -610,8 +610,7 @@ impl SessionRegistry {
             Arc::clone(&entry.identity_commit)
         };
         let _held = commit.lock().await;
-        self.apply_worker_metadata_snapshot_locked(id, snapshot)
-            .await
+        Box::pin(self.apply_worker_metadata_snapshot_locked(id, snapshot)).await
     }
 
     /// [`Self::apply_worker_metadata_snapshot`] for a caller that holds the
@@ -4212,6 +4211,7 @@ impl SessionRegistry {
             reference_launch: None,
             activity_since: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
+            create_request: record.create_request.clone(),
         };
         let listed = record.clone();
         match self.write_record_and_install(&id, record, entry).await {
@@ -4518,6 +4518,7 @@ impl SessionRegistry {
             reference_launch: None,
             activity_since: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
+            create_request: record.create_request.clone(),
         };
         (record, entry)
     }
@@ -6800,6 +6801,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
                 info,
                 recovery,
                 active_agent_origin: None,
+                create_request: None,
                 native_identity_ordering: None,
                 runtime: crate::store::RuntimeRecord {
                     state: runtime_state,
@@ -9708,6 +9710,7 @@ while os.getppid() == parent:
         };
         store
             .record_session(&SessionRecord {
+                create_request: None,
                 schema_version: 1,
                 session_id: session_id.to_owned(),
                 desired_state: DesiredState::Running,
@@ -10129,6 +10132,7 @@ while os.getppid() == parent:
             .expect("replacement daemon reconciles store");
         let created = replacement
             .create(SessionNewParams {
+                client_request_id: None,
                 name: None,
                 agent: "shell".to_owned(),
                 cwd: Some(root.to_path_buf()),
@@ -11194,6 +11198,7 @@ while os.getppid() == parent:
     fn identity_record() -> SessionRecord {
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         SessionRecord {
+            create_request: None,
             schema_version: 1,
             session_id: "s-identity".to_owned(),
             desired_state: DesiredState::Running,
@@ -13427,6 +13432,7 @@ handler = "codex-hook-v1"
     /// A plain-shell `session.new` launched in `cwd`.
     fn shell_params(cwd: &Path) -> SessionNewParams {
         SessionNewParams {
+            client_request_id: None,
             name: None,
             agent: "shell".to_owned(),
             cwd: Some(cwd.to_path_buf()),
@@ -20964,6 +20970,7 @@ generation "$1"
                 let created = self
                     .registry
                     .create(protocol::SessionNewParams {
+                        client_request_id: None,
                         name: None,
                         agent: agent.to_owned(),
                         cwd: Some(self.root.clone()),

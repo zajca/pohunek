@@ -45,6 +45,7 @@ export const ClientErrorCode = {
   VersionTranslationFailed: "version_translation_failed",
   SessionNewSecretEnvUnsupported: "session_new_secret_env_unsupported",
   SessionNewSecretEnvRelayRefused: "session_new_secret_env_relay_refused",
+  SessionNewRequestIdUnsupported: "session_new_request_id_unsupported",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
@@ -69,6 +70,7 @@ export type ClientErrorKind =
   | "versionTranslation"
   | "sessionNewSecretEnvUnsupported"
   | "sessionNewSecretEnvRelayRefused"
+  | "sessionNewRequestIdUnsupported"
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
 
@@ -323,6 +325,26 @@ export class ClientError extends Error {
       protocolError(
         ClientErrorClass.Daemon,
         ClientErrorCode.SessionNewSecretEnvUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_new_request_id_supported`, so it
+   * would drop `client_request_id` silently and a retry would create a second
+   * session.
+   */
+  public static sessionNewRequestIdUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates client_request_id and would drop it silently; nothing was sent`;
+    return new ClientError(
+      "sessionNewRequestIdUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionNewRequestIdUnsupported,
         msg,
         "upgrade the daemon, then retry",
       ),

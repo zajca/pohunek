@@ -294,6 +294,7 @@ impl Fixture {
         process_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
         self.registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: None,
                 agent: profile.to_owned(),
                 cwd: Some(self.env.cwd().to_path_buf()),
@@ -591,6 +592,7 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
         fixture
             .registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: None,
                 agent: "shell".to_owned(),
                 cwd: Some(fixture.env.cwd().to_path_buf()),

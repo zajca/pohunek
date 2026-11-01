@@ -2212,6 +2212,7 @@ mod tests {
 
     fn persist_terminal_source(store: &crate::store::Store, info: &SessionInfo) {
         let record = crate::store::SessionRecord {
+            create_request: None,
             schema_version: crate::store::STORE_SCHEMA_VERSION,
             session_id: info.id.0.clone(),
             desired_state: crate::store::DesiredState::Stopped,

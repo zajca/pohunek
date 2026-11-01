@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 13;
+pub const STORE_SCHEMA_VERSION: u32 = 14;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -102,6 +102,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 12,
         apply: migrate_v12_to_v13,
+    },
+    Migration {
+        from: 13,
+        apply: migrate_v13_to_v14,
     },
 ];
 
@@ -197,6 +201,13 @@ fn migrate_v11_to_v12(_record: &mut Map<String, Value>) {}
 /// A record written without the field has no recorded spawner, which is how
 /// every schema 12 session reads, so no record needs rewriting.
 fn migrate_v12_to_v13(_record: &mut Map<String, Value>) {}
+
+/// Schema 13 to 14: a session record may carry the idempotency key of its
+/// creating request (`create_request.id`, `create_request.fingerprint`).
+///
+/// A record written without the field was created without a key, which is how
+/// every schema 13 session reads, so no record needs rewriting.
+fn migrate_v13_to_v14(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

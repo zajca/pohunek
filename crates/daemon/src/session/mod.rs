@@ -62,8 +62,9 @@ use crate::runtime::{
     DimensionUpdate, StopWaits, SupervisionConfig, Worker, WorkerError, WorkerLauncher,
 };
 use crate::store::{
-    ActiveAgentOrigin, DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord,
-    SessionRecord, SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
+    ActiveAgentOrigin, CreateRequest, DesiredState, ProjectRecord, ReportTransport, ResumeBinding,
+    RuntimeRecord, SessionRecord, SessionTransaction, SessionWriteOutcome, Store, TransactionKind,
+    WorktreeStatus,
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
@@ -77,6 +78,7 @@ mod attach;
 mod background;
 mod claim;
 mod conflict_stop;
+mod create_request;
 mod detector;
 mod diff;
 mod forward;
@@ -704,6 +706,8 @@ pub struct SessionRegistry {
 struct SessionRegistryInner {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     runtime_inventory: Mutex<Vec<RuntimeInventoryEntry>>,
+    /// Idempotency keys whose `session.new` is running.
+    create_claims: create_request::CreateClaims,
     /// Sessions shown only by an in-memory placeholder because the write of
     /// their classification failed, with the state and reason shown.
     unpersisted_classifications: std::sync::Mutex<HashMap<String, (RuntimeState, String)>>,
@@ -1083,6 +1087,9 @@ struct SessionEntry {
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
     initial_input_owner: Option<String>,
+    /// The idempotency key and fingerprint of the creating `session.new`,
+    /// written to every record of the session and never reported to clients.
+    create_request: Option<Box<CreateRequest>>,
 }
 
 /// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
@@ -1773,6 +1780,22 @@ pub struct CreateOutcome {
     pub worktree_source: Option<protocol::WorktreeSource>,
     /// Whether the initial input was acknowledged, when asked for.
     pub prompt_delivered: Option<bool>,
+    /// Whether the request's key named a session an earlier request created;
+    /// nothing was created.
+    pub replayed: bool,
+}
+
+impl CreateOutcome {
+    /// The outcome of a keyed request that named `session`: nothing was
+    /// created, so the facts of the first response are absent.
+    fn replay(session: SessionInfo) -> Self {
+        Self {
+            session,
+            worktree_source: None,
+            prompt_delivered: None,
+            replayed: true,
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -2198,6 +2221,7 @@ impl SessionRegistry {
             native_identity_ordering: entry.last_native_report.clone(),
             runtime,
             active_agent_origin: active_agent_origin(entry),
+            create_request: entry.create_request.clone(),
         }
     }
 
@@ -2462,6 +2486,7 @@ impl SessionRegistry {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
                 runtime_inventory: Mutex::new(Vec::new()),
+                create_claims: std::sync::Mutex::new(HashMap::new()),
                 unpersisted_classifications: std::sync::Mutex::new(HashMap::new()),
                 unrecorded_exits: std::sync::Mutex::new(HashMap::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
@@ -3293,13 +3318,29 @@ impl SessionRegistry {
         spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<CreateOutcome, ProtocolError> {
         self.ensure_migration_settled()?;
+        // Taken before the secret values are removed, so the fingerprint covers
+        // the slot names and never a value.
+        let fingerprint = create_request::request_fingerprint(&params)?;
         // Taken before anything clones the params, so the secret values live
         // only in the launch carrier and never reach a record, hook or event.
         let secret_env = std::mem::take(&mut params.secret_env);
         validate_new_params(&params)?;
         idle_stop::validate_opt_in(&params.metadata, self.inner.config.idle_stop_min_secs)?;
-        // Resolve and validate the runtime before allocating a logical id or
-        // resolving a target: target resolution may bind a git worktree.
+        let id = Self::allocate_session_id();
+        // Claimed before agent resolution and the executable probe, so an exact
+        // replay never fails because a profile changed or a binary went missing.
+        let (claim, create_request) = match self
+            .claim_create_request(params.client_request_id.as_deref(), fingerprint, &id)
+            .await?
+        {
+            create_request::KeyedCreate::Unkeyed => (None, None),
+            create_request::KeyedCreate::Fresh { claim, request } => (Some(claim), Some(request)),
+            create_request::KeyedCreate::Replay(session) => {
+                return Ok(CreateOutcome::replay(*session));
+            }
+        };
+        // Resolve and validate the runtime before resolving a target: target
+        // resolution may bind a git worktree.
         let resolved = host::LaunchSource::OwnerLocal {
             name: params.agent.clone(),
         }
@@ -3334,7 +3375,6 @@ impl SessionRegistry {
             })?,
         };
 
-        let id = Self::allocate_session_id();
         // Refused before the worker socket, the record or any worktree exists.
         if !secret_env.is_empty() {
             let contributed = self.contributed_env_names(
@@ -3360,6 +3400,9 @@ impl SessionRegistry {
         // daemon shutdown drains it.
         let registry = self.clone();
         self.spawn_create(async move {
+            // Released when the create has committed its session or compensated
+            // what it made.
+            let _claim = claim;
             let extended_input_ready_wait = params.extended_input_ready_wait.unwrap_or(false);
             let branch = params.branch.clone();
             let input_ack_timeout = params.input_ack_timeout_ms;
@@ -3372,6 +3415,7 @@ impl SessionRegistry {
                 fallback_cwd,
                 secret_env,
                 spawned_by,
+                create_request,
             ))
             .await?;
             let (session, prompt_delivered) = registry
@@ -3387,6 +3431,7 @@ impl SessionRegistry {
                 session,
                 worktree_source: source,
                 prompt_delivered,
+                replayed: false,
             })
         })?
         .await
@@ -3782,6 +3827,7 @@ impl SessionRegistry {
         fallback_cwd: PathBuf,
         secret_env: LaunchEnv,
         spawned_by: Option<protocol::SpawnedBy>,
+        create_request: Option<Box<CreateRequest>>,
     ) -> Result<
         (
             SessionInfo,
@@ -3794,8 +3840,14 @@ impl SessionRegistry {
         // fails verification launches nothing and leaves no record.
         let _package_launch = self.guard_package_launch(&resolved.definition).await?;
         let guard = self.lock_lifecycle(&id).await;
-        let intent =
-            create_intent_record(&id, &params, &resolved, &fallback_cwd, spawned_by.as_ref())?;
+        let intent = create_intent_record(
+            &id,
+            &params,
+            &resolved,
+            &fallback_cwd,
+            spawned_by.as_ref(),
+            create_request.as_deref(),
+        )?;
         self.write_session_record(intent).await?;
         let mut hook_stderr_tails = Vec::new();
         let mut worktree_source = None;
@@ -3828,6 +3880,7 @@ impl SessionRegistry {
                         secret_env,
                         target,
                         spawned_by,
+                        create_request,
                     )
                 }
             }
@@ -4257,6 +4310,7 @@ impl SessionRegistry {
         secret_env: LaunchEnv,
         target: TargetResolution,
         spawned_by: Option<protocol::SpawnedBy>,
+        create_request: Option<Box<CreateRequest>>,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
         let reference_launch = target.reference_launch();
         let TargetResolution {
@@ -4375,6 +4429,7 @@ impl SessionRegistry {
             worktree_path,
             metadata: params.metadata.clone(),
             spawned_by,
+            create_request,
             warnings,
             reference_launch,
             initial_input_pending: plan.pending_initial_input.is_some(),
@@ -8303,6 +8358,14 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
             return Err(ProtocolError::session_wait_limit_exceeded());
         }
     }
+    if let Some(key) = &params.client_request_id {
+        if !protocol::is_valid_client_request_id(key) {
+            return Err(ProtocolError::bad_request(format!(
+                "session.new: client_request_id must be 1..={} bytes of [A-Za-z0-9._:-]",
+                protocol::MAX_CLIENT_REQUEST_ID_BYTES
+            )));
+        }
+    }
     validate_session_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;
     Ok(())
@@ -8327,6 +8390,7 @@ fn create_intent_record(
     resolved: &ResolvedAgent,
     cwd: &Path,
     spawned_by: Option<&protocol::SpawnedBy>,
+    create_request: Option<&CreateRequest>,
 ) -> Result<SessionRecord, ProtocolError> {
     let native = resolved.native_launch();
     let created_at = timestamp_now();
@@ -8401,6 +8465,7 @@ fn create_intent_record(
         info,
         native_identity_ordering: None,
         active_agent_origin: None,
+        create_request: create_request.cloned().map(Box::new),
         recovery: None,
         runtime: RuntimeRecord {
             state: RuntimeState::Starting,

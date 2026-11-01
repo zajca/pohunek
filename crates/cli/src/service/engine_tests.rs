@@ -7872,6 +7872,7 @@ fn seed_live_session_at(paths: &BasePaths, executable: &Path, session_id: &str, 
     let mut info = session(session_id, None);
     info.runtime.as_mut().expect("runtime").worker_id = Some(worker.to_owned());
     let record = SessionRecord {
+        create_request: None,
         schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         desired_state: DesiredState::Running,

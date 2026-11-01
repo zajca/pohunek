@@ -200,6 +200,7 @@ impl ProtocolError {
     pub fn command_failed(exit: ProcessExit) -> Self {
         Self::from(CommandErrorKind::Failed).with_details(ErrorDetails {
             process_exit: Some(exit),
+            ..ErrorDetails::default()
         })
     }
 }

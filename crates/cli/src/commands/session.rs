@@ -2144,6 +2144,7 @@ fn render_sweep_human(host: &str, result: &SessionRetentionResult) -> String {
 
 fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
     Ok(SessionNewParams {
+        client_request_id: None,
         agent: args.agent.clone(),
         name: args.name.clone(),
         cwd: args.cwd.clone(),

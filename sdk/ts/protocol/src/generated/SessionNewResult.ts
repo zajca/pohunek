@@ -52,6 +52,14 @@ export type SessionNewResult = {
    */
   prompt_delivered?: boolean;
   /**
+   * `true` when the request's [`SessionNewParams::client_request_id`] named a
+   * session an earlier request created: nothing was created, no hook ran and
+   * no input was injected. `session` is that session as it is now.
+   * `worktree_source` and `prompt_delivered` are facts of the first response
+   * and are absent on a replay. Absent otherwise.
+   */
+  replayed?: boolean;
+  /**
    * Stable session identifier.
    */
   id: SessionId;

@@ -322,6 +322,10 @@ pub struct WorktreeSource {
 }
 
 /// Parameters for `session.new`.
+///
+/// The daemon fingerprints a keyed request (`client_request_id`) from these
+/// fields, so a new field must leave the fingerprint unchanged when unset, or
+/// the fingerprint version must change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionNewParams.ts"))]
@@ -426,6 +430,36 @@ pub struct SessionNewParams {
     /// Owner-controlled metadata for the session. Must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    /// Idempotency key of the request: 1..=[`MAX_CLIENT_REQUEST_ID_BYTES`]
+    /// bytes of `[A-Za-z0-9._:-]`, scoped to the daemon.
+    ///
+    /// The daemon persists the key with the session it creates. A later
+    /// `session.new` with the same key and the same parameters returns that
+    /// session with [`SessionNewResult::replayed`] instead of creating another;
+    /// the same key with other parameters fails with `session_request_conflict`,
+    /// and a key whose create has not settled fails with
+    /// `session_request_in_progress`. A removed session frees its key, and so
+    /// does a create that was rolled back. A daemon that does not advertise
+    /// `HostCapabilities::session_new_request_id_supported` would drop the field
+    /// silently, so a client checks the flag before sending it (the protocol 3
+    /// client adapter refuses it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub client_request_id: Option<String>,
+}
+
+/// Most bytes a [`SessionNewParams::client_request_id`] may hold.
+pub const MAX_CLIENT_REQUEST_ID_BYTES: usize = 128;
+
+/// Whether `id` is a valid [`SessionNewParams::client_request_id`]:
+/// 1..=[`MAX_CLIENT_REQUEST_ID_BYTES`] bytes of `[A-Za-z0-9._:-]`.
+#[must_use]
+pub fn is_valid_client_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CLIENT_REQUEST_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 /// Working-directory policy for `session.fork`.
@@ -3253,6 +3287,14 @@ pub struct SessionNewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub prompt_delivered: Option<bool>,
+    /// `true` when the request's [`SessionNewParams::client_request_id`] named a
+    /// session an earlier request created: nothing was created, no hook ran and
+    /// no input was injected. `session` is that session as it is now.
+    /// `worktree_source` and `prompt_delivered` are facts of the first response
+    /// and are absent on a replay. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub replayed: Option<bool>,
 }
 
 /// Result returned by `session.fork`.

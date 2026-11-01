@@ -490,6 +490,22 @@ requested. The daemon owns the stable session id, launch snapshot, project and
 worktree association, native recovery reference, desired state, and lifecycle
 transaction.
 
+A `session.new` that carries a `client_request_id` is idempotent. A running
+create holds a registry-wide claim on its key from the moment the parameters
+validate, before any host-dependent work, so two requests that share a key
+cannot both create and an exact repeat does not depend on the agent's profile or
+executable still resolving. The key and a fingerprint of the request are written
+with the durable create intent into `SessionRecord.create_request`, carried by
+every later rewrite of the record, and removed with it; they are never part of
+the client-facing `SessionInfo`. A repeated key is answered from the registry's
+own sessions, and from the store for a record that has no live session: a
+settled session with the same fingerprint is replayed, another fingerprint is
+`session_request_conflict`, and a create that has not settled (the running create
+task, an undelivered initial input, a pending compensation, a record whose
+session is not live) is `session_request_in_progress`. Because the lookup reads
+the sessions themselves, `session.remove`, retention and create compensation free
+the key when they drop the session, with no separate index to maintain.
+
 Disconnecting or killing `pohunekd` releases only the private controller lease.
 The worker continues draining output and running the unchanged child. A
 replacement daemon joins the service manager's worker jobs with worker journals

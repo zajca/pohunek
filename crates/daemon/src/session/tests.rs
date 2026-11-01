@@ -193,6 +193,7 @@ pub(super) fn hermetic_shell() -> ShellCommand {
 
 pub(super) fn params() -> SessionNewParams {
     SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: "shell".to_owned(),
         cwd: Some(crate::test_support::thread_scoped_dir("pohunek-cwd-")),

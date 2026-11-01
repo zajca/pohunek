@@ -853,17 +853,24 @@ impl Client {
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;
         // A daemon that predates `secret_env` drops the field and would start the
-        // agent without its credential, so the flag is checked on the same
-        // connection before the secret leaves the process.
-        if !params.secret_env.is_empty() {
+        // agent without its credential, and one that predates `client_request_id`
+        // would create a second session on a retry, so the flags are checked on
+        // the same connection before either leaves the process.
+        if !params.secret_env.is_empty() || params.client_request_id.is_some() {
             let capabilities = client
                 .host_inspect_with(protocol::HostInspectParams {
                     skip_runtime_probes: Some(true),
                 })
                 .await?;
-            if !capabilities.session_new_secret_env_supported {
+            if !params.secret_env.is_empty() && !capabilities.session_new_secret_env_supported {
                 return Err(ClientError::Protocol(
                     ProtocolError::session_new_secret_env_unsupported(self.remote_host()),
+                ));
+            }
+            if params.client_request_id.is_some() && !capabilities.session_new_request_id_supported
+            {
+                return Err(ClientError::Protocol(
+                    ProtocolError::session_new_request_id_unsupported(self.remote_host()),
                 ));
             }
         }

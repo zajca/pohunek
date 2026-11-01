@@ -971,6 +971,7 @@ impl Fixture {
         let store = Store::new(self.data_home.join("pohunek/metadata.jsonl"));
         store
             .record_session(&SessionRecord {
+                create_request: None,
                 schema_version: 1,
                 session_id: session_id.to_owned(),
                 desired_state: DesiredState::Running,

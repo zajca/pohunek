@@ -296,6 +296,7 @@ fn ok_payload(response: Response) -> Value {
 
 fn session_params(socket: &Path) -> SessionNewParams {
     SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: "shell".to_owned(),
         cwd: Some(work_dir(socket)),

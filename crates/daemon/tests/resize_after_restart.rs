@@ -158,6 +158,7 @@ async fn create_session(registry: &SessionRegistry, env: &TestEnv) -> SessionInf
     process_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
     registry
         .create(SessionNewParams {
+            client_request_id: None,
             name: Some("resize-restart".to_owned()),
             agent: "shell".to_owned(),
             cwd: Some(env.cwd().to_path_buf()),

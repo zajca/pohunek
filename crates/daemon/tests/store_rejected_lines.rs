@@ -255,6 +255,7 @@ async fn a_daemon_started_over_rejected_lines_keeps_them_through_write_rpcs() {
 
     let created = client
         .session_new(SessionNewParams {
+            client_request_id: None,
             name: None,
             agent: "shell".to_owned(),
             cwd: Some(env.root().to_path_buf()),

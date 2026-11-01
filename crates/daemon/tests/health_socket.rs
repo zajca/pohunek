@@ -29,6 +29,8 @@ mod required_hooks;
 mod root_reporter;
 #[path = "health_socket/session_metadata.rs"]
 mod session_metadata;
+#[path = "health_socket/session_request.rs"]
+mod session_request;
 #[path = "health_socket/spawned_by.rs"]
 mod spawned_by;
 #[path = "health_socket/store_memo.rs"]
@@ -895,6 +897,7 @@ fn session_params(socket: &TestSocket) -> SessionNewParams {
 
 fn session_params_in(cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: "shell".to_owned(),
         cwd: Some(cwd),
@@ -916,6 +919,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
 
 fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: agent_name(agent).to_owned(),
         cwd: Some(cwd),
@@ -942,6 +946,7 @@ fn session_params_for_worktree(
     branch: &str,
 ) -> SessionNewParams {
     SessionNewParams {
+        client_request_id: None,
         name: None,
         agent: agent_name(agent).to_owned(),
         cwd: None,

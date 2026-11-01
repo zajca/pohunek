@@ -1319,6 +1319,7 @@ async fn start_agent(installation: &Installation, profile: &str, cwd: &Path) -> 
         .client()
         .await
         .call::<method::SessionNew>(SessionNewParams {
+            client_request_id: None,
             agent: profile.to_owned(),
             name: Some(profile.to_owned()),
             cwd: Some(cwd.to_path_buf()),

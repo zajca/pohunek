@@ -2040,6 +2040,7 @@ mod tests {
         let cwd = pohunek_test_support::tempdir().expect("private session cwd");
         let created = registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: None,
                 agent: "shell".to_owned(),
                 cwd: Some(cwd.path().to_path_buf()),

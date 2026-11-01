@@ -857,6 +857,7 @@ fn notification_deleted_event_carries_id_in_flattened_payload() {
 #[test]
 fn session_new_params_json_shape_roundtrips() {
     let params = SessionNewParams {
+        client_request_id: None,
         agent: "shell".to_owned(),
         name: None,
         cwd: Some(PathBuf::from("/workspace/project")),
@@ -893,6 +894,7 @@ fn session_new_params_json_shape_roundtrips() {
 #[test]
 fn session_new_params_roundtrips_with_metadata() {
     let params = SessionNewParams {
+        client_request_id: None,
         agent: "shell".to_owned(),
         name: None,
         cwd: Some(PathBuf::from("/workspace/project")),
@@ -933,6 +935,7 @@ fn session_new_params_roundtrips_with_metadata() {
 #[test]
 fn session_new_params_roundtrips_with_worktree_fields() {
     let params = SessionNewParams {
+        client_request_id: None,
         agent: "claude".to_owned(),
         name: None,
         cwd: None,
@@ -971,6 +974,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
 #[test]
 fn session_new_params_roundtrips_with_initial_input() {
     let params = SessionNewParams {
+        client_request_id: None,
         agent: "shell".to_owned(),
         name: None,
         cwd: Some(PathBuf::from("/workspace/project")),
@@ -3509,6 +3513,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_cwd_supported: true,
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
+        session_new_request_id_supported: true,
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
@@ -3545,6 +3550,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_branch_source_supported": true,
             "session_new_input_ack_supported": true,
             "session_new_secret_env_supported": true,
+            "session_new_request_id_supported": true,
             "session_idle_stop_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true
@@ -3590,6 +3596,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.session_new_secret_env_supported,
         "a host that omits the secret_env flag drops secret_env"
+    );
+    assert!(
+        !caps.session_new_request_id_supported,
+        "a host that omits the request-id flag drops client_request_id"
     );
     assert!(
         !caps.session_idle_stop_supported,
@@ -5596,7 +5606,8 @@ fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
             process_exit: Some(ProcessExit {
                 exit_code: Some(1),
                 signal: None
-            })
+            }),
+            session_id: None,
         }))
     );
 }
@@ -6048,4 +6059,65 @@ fn unknown_regions_are_dropped_and_an_unknown_hold_stays_a_hold() {
     }))
     .expect("tolerant decode");
     assert_eq!(candidate.hold, Some(SessionRetentionHold::Unknown));
+}
+
+#[test]
+fn client_request_id_and_its_outcomes_have_the_documented_wire_shape() {
+    let params: SessionNewParams = serde_json::from_value(json!({
+        "agent": "shell", "cols": 80, "rows": 24, "client_request_id": "req-1"
+    }))
+    .expect("params with a key");
+    assert_eq!(params.client_request_id.as_deref(), Some("req-1"));
+    let unkeyed: SessionNewParams =
+        serde_json::from_value(json!({ "agent": "shell", "cols": 80, "rows": 24 }))
+            .expect("params without a key");
+    assert!(
+        serde_json::to_value(&unkeyed)
+            .expect("serialize")
+            .get("client_request_id")
+            .is_none(),
+        "an unset key is absent on the wire"
+    );
+
+    for (id, valid) in [
+        ("a", true),
+        ("Req_1.2:3-4", true),
+        (&"k".repeat(128), true),
+        ("", false),
+        (&"k".repeat(129), false),
+        ("with space", false),
+        ("slash/id", false),
+        ("naïve", false),
+    ] {
+        assert_eq!(protocol::is_valid_client_request_id(id), valid, "{id:?}");
+    }
+
+    let result: protocol::SessionNewResult = serde_json::from_value(json!({
+        "id": "s-1", "agent": "shell", "agent_base": "shell",
+        "capabilities": {"fork": false, "resume": false},
+        "cwd": "/work", "pid": 1, "state": "running", "state_source": "process",
+        "cols": 80, "rows": 24,
+        "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:01Z",
+        "replayed": true
+    }))
+    .expect("a replayed result");
+    assert_eq!(result.replayed, Some(true));
+
+    let conflict = serde_json::to_value(ProtocolError::session_request_conflict(&SessionId(
+        "s-1".to_owned(),
+    )))
+    .expect("serialize");
+    assert_eq!(conflict["class"], "runtime");
+    assert_eq!(conflict["code"], "session_request_conflict");
+    assert_eq!(conflict["details"], json!({ "session_id": "s-1" }));
+    assert!(conflict["msg"]
+        .as_str()
+        .is_some_and(|msg| msg.contains("s-1")));
+    let in_progress = serde_json::to_value(ProtocolError::session_request_in_progress(&SessionId(
+        "s-2".to_owned(),
+    )))
+    .expect("serialize");
+    assert_eq!(in_progress["code"], "session_request_in_progress");
+    assert_eq!(in_progress["details"], json!({ "session_id": "s-2" }));
+    assert_eq!(in_progress["recover"], "retry the same request");
 }

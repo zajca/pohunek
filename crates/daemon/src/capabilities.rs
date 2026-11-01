@@ -327,6 +327,7 @@ fn capability_snapshot(
         session_new_cwd_supported: true,
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
+        session_new_request_id_supported: true,
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
