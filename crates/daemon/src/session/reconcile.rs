@@ -14483,7 +14483,7 @@ handler = "codex-hook-v1"
             use pohunek_platform::supervisor::{ExitEvidence, JobExit};
             use std::time::{Duration, SystemTime};
 
-            let ended = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+            let ended = SystemTime::UNIX_EPOCH + Duration::from_hours(24);
             let kills = [
                 ("s-4226", Some(1), Some(0), Some("kernel")),
                 ("s-4227", Some(0), Some(1), Some("systemd_oomd")),

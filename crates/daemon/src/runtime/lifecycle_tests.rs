@@ -2631,7 +2631,7 @@ fn the_kill_counters_name_exactly_one_killer_and_the_detail_rides_along() {
     let detailed = super::runtime_exit(
         &ExitEvidence::new("oom-kill".to_owned(), None)
             .with_memory_peak(Some(26_300_000_000))
-            .with_exited_at(Some(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))),
+            .with_exited_at(Some(SystemTime::UNIX_EPOCH + Duration::from_hours(24))),
     );
     assert_eq!(detailed.memory_peak_bytes, Some(26_300_000_000));
     assert_eq!(detailed.ended_at.as_deref(), Some("1970-01-02T00:00:00Z"));
