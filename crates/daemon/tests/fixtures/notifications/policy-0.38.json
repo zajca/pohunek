@@ -1,0 +1,31 @@
+{
+  "attention_dedupe_window_secs": 90,
+  "attention_debounce_secs": 7,
+  "enabled": {
+    "agent_blocked": true,
+    "approval_required": true,
+    "turn_completed": false,
+    "session_finished": false,
+    "error": true,
+    "system": true
+  },
+  "providers": {
+    "codex": {
+      "agent_blocked": true,
+      "approval_required": false,
+      "turn_completed": true,
+      "session_finished": false,
+      "error": true,
+      "system": false
+    }
+  },
+  "retention": {
+    "sweep_interval_secs": 60,
+    "info_ttl_secs": 10,
+    "warning_ttl_secs": 20,
+    "resolved_attention_ttl_secs": 30,
+    "resolved_error_ttl_secs": 40,
+    "archived_ttl_secs": 50,
+    "compaction_min_actions": 1
+  }
+}

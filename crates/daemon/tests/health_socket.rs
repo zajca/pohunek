@@ -1246,6 +1246,7 @@ fn all_enabled_notification_policy() -> NotificationPolicy {
         },
         providers: BTreeMap::new(),
         retention: protocol::NotificationRetentionPolicy::default(),
+        unknown_fields: protocol::tolerant::UnknownFields::default(),
     }
 }
 

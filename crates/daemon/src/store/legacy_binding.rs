@@ -172,6 +172,7 @@ fn migrate_session(record: &mut Map<String, Value>) -> RecoveryOutcome {
     let capabilities = SessionCapabilities {
         resume: true,
         fork: launch.supports_fork(),
+        ..SessionCapabilities::default()
     };
     if let (Some(Value::Object(info)), Ok(capabilities)) =
         (record.get_mut("info"), serde_json::to_value(capabilities))

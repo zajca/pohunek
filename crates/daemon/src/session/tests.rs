@@ -16080,7 +16080,7 @@ async fn journal_projected_claim_requests_a_rescan_that_binds_it() {
     let rescan = Arc::clone(&registry.inner.sessions.lock().await[&created.id].procwatch_rescan);
     let _ = tokio::time::timeout(Duration::ZERO, rescan.requested()).await;
 
-    project_journal_descendant_claim(&registry, &created.id).await;
+    Box::pin(project_journal_descendant_claim(&registry, &created.id)).await;
     let _ = guard("the projection requested a rescan", rescan.requested()).await;
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
@@ -16104,7 +16104,7 @@ async fn new_journal_claim_survives_a_failed_collection_until_the_claim_ttl() {
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
-    project_journal_descendant_claim(&registry, &created.id).await;
+    Box::pin(project_journal_descendant_claim(&registry, &created.id)).await;
     let reported_at = {
         let sessions = registry.inner.sessions.lock().await;
         sessions[&created.id]
@@ -21361,6 +21361,7 @@ fn sweep_policy() -> SessionRetentionPolicy {
         terminal_ttl_secs: 3_600,
         lost_ttl_secs: 3_600,
         max_removals_per_sweep: 25,
+        ..Default::default()
     }
 }
 

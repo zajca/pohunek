@@ -9675,6 +9675,7 @@ while os.getppid() == parent:
             capabilities: protocol::SessionCapabilities {
                 resume: true,
                 fork: true,
+                ..Default::default()
             },
         };
         let store_path = root.join("data/metadata.jsonl");
@@ -10017,6 +10018,7 @@ while os.getppid() == parent:
         record.info.capabilities = protocol::SessionCapabilities {
             resume: true,
             fork: false,
+            ..Default::default()
         };
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
@@ -10072,6 +10074,7 @@ while os.getppid() == parent:
             protocol::SessionCapabilities {
                 resume: true,
                 fork: false,
+                ..Default::default()
             }
         );
 
@@ -11245,6 +11248,7 @@ while os.getppid() == parent:
                 capabilities: protocol::SessionCapabilities {
                     resume: true,
                     fork: false,
+                    ..Default::default()
                 },
             },
             recovery: Some(ResumeBinding {
@@ -22692,7 +22696,7 @@ generation "$1"
             );
             drop(stopped);
 
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert_eq!(
                 claim_state(&fixture, &created.id).await,
@@ -22757,7 +22761,7 @@ generation "$1"
             );
             drop(stopped);
 
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert_eq!(
                 claim_state(&fixture, &created.id).await,
@@ -22990,7 +22994,7 @@ generation "$1"
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
 
             allow_imports(&fixture, true);
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert_eq!(
                 claim_state(&fixture, &created.id).await,
@@ -23028,7 +23032,7 @@ generation "$1"
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
 
             allow_imports(&fixture, true);
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert_eq!(
                 claim_state(&fixture, &created.id).await,
@@ -23072,7 +23076,7 @@ generation "$1"
 
             assert!(released.released);
             allow_imports(&fixture, true);
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
             assert_eq!(active_agent_name(&fixture, &created.id).await, None);
             fixture
                 .registry
@@ -23103,7 +23107,7 @@ generation "$1"
             );
             allow_imports(&fixture, true);
 
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert!(claim_is_journaled(&fixture, &created.id).await);
             assert_eq!(
@@ -23138,7 +23142,7 @@ generation "$1"
             );
 
             allow_imports(&fixture, true);
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert!(
                 !memory_report_is_recorded(&fixture, unbound_report(&created, 2_005)).await,
@@ -23265,7 +23269,7 @@ generation "$1"
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_020)).await);
             drop(stopped);
 
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert_eq!(
                 claim_state(&fixture, &created.id).await,
@@ -23312,7 +23316,7 @@ generation "$1"
             drop(stopped);
             let _ = busy.await;
 
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
 
             assert_eq!(
                 claim_state(&fixture, &created.id).await,
@@ -23590,7 +23594,7 @@ generation "$1"
             assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
             assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_015)).await);
             allow_imports(&fixture, true);
-            sync_after_continue(&fixture, &created).await;
+            Box::pin(sync_after_continue(&fixture, &created)).await;
             assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
             assert_eq!(
                 journaled_claim_sequence(&fixture, &created.id).await,

@@ -190,6 +190,20 @@ fn unavailable_cases() -> Vec<UnavailableCase> {
             "rejected policy key",
             vec![("policy.json", b"{\"a_key_from_a_newer_daemon\":1}\n")],
         ),
+        (
+            "valid policy with a key this build does not know",
+            vec![(
+                "policy.json",
+                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"approval_required\":true,\"turn_completed\":true,\"session_finished\":true,\"error\":true,\"system\":true},\"a_key_from_a_newer_daemon\":1}\n",
+            )],
+        ),
+        (
+            "valid policy with a retention key this build does not know",
+            vec![(
+                "policy.json",
+                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"approval_required\":true,\"turn_completed\":true,\"session_finished\":true,\"error\":true,\"system\":true},\"retention\":{\"sweep_interval_secs\":60,\"info_ttl_secs\":1,\"warning_ttl_secs\":1,\"resolved_attention_ttl_secs\":1,\"resolved_error_ttl_secs\":1,\"archived_ttl_secs\":1,\"compaction_min_actions\":1,\"a_key_from_a_newer_daemon\":1}}\n",
+            )],
+        ),
     ]
 }
 

@@ -789,6 +789,7 @@ impl Installation {
             capabilities: SessionCapabilities {
                 resume: true,
                 fork: false,
+                ..Default::default()
             },
             name: Some(format!("seeded {session_id}")),
             agent: "claude".to_owned(),

@@ -115,6 +115,40 @@ fn every_rewrite_keeps_the_lines_no_loader_accepts() {
     assert!(store.load_sessions().expect("load sessions").is_empty());
 }
 
+/// A current-schema session line whose `capabilities` carry a key this build
+/// does not know.
+fn unknown_capability_key_line(path: &std::path::Path) -> String {
+    let stored = std::fs::read_to_string(path).expect("read current store");
+    let mut line: serde_json::Value =
+        serde_json::from_str(stored.trim_end()).expect("one stored JSON line");
+    line["session_id"] = "s-with-a-capability-key-from-a-newer-daemon".into();
+    line["info"]["id"] = line["session_id"].clone();
+    line["info"]["capabilities"]["a_key_from_a_newer_daemon"] = true.into();
+    serde_json::to_string(&line).expect("serialize rejected line")
+}
+
+#[test]
+fn a_line_with_an_unknown_capability_key_is_rejected_by_the_loader_and_kept_verbatim() {
+    let root = pohunek_test_support::tempdir().expect("private fixture root");
+    let (store, path) = fixture_store(root.path());
+    let rejected = unknown_capability_key_line(&path);
+    let mut content = std::fs::read_to_string(&path).expect("read current store");
+    content.push_str(&rejected);
+    content.push('\n');
+    std::fs::write(&path, content).expect("append the rejected line");
+
+    let sessions = store.load_sessions().expect("load sessions");
+    assert_eq!(sessions.len(), 1, "only the fixture session loads");
+    assert_eq!(sessions[0].session_id, FIXTURE_SESSION);
+
+    store
+        .record_session(&sessions[0])
+        .expect("rewrite the session");
+    let lines = store_lines(&path);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[1], rejected, "the rejected line is kept unchanged");
+}
+
 #[test]
 fn a_store_without_rejected_lines_gains_none() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");

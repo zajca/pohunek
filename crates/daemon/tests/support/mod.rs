@@ -123,6 +123,10 @@ pub(crate) fn hermetic_registry_config() -> SessionRegistryConfig {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "each test binary using this module needs a different subset of its helpers"
+)]
 pub(crate) fn overlay_registry() -> OverlayRegistry {
     registry_reporting(None)
 }

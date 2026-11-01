@@ -165,6 +165,7 @@ pub(super) fn repair_native_recovery(
         record.info.capabilities = SessionCapabilities {
             resume: launch.is_some(),
             fork: launch.is_some_and(crate::agent::NativeSessionLaunch::supports_fork),
+            ..SessionCapabilities::default()
         };
     }
     None

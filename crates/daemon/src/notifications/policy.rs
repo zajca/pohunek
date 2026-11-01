@@ -44,6 +44,7 @@ pub fn default_policy() -> NotificationPolicy {
         enabled: default_enabled_kinds(),
         providers: BTreeMap::new(),
         retention: NotificationRetentionPolicy::default(),
+        unknown_fields: protocol::tolerant::UnknownFields::default(),
     }
 }
 
@@ -321,6 +322,7 @@ mod tests {
             resolved_error_ttl_secs: 40,
             archived_ttl_secs: 50,
             compaction_min_actions: 1,
+            ..Default::default()
         };
 
         let matched = records_matching_auto_retention(

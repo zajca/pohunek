@@ -5528,7 +5528,8 @@ async fn damaged_profile_session_loss(installed: bool) {
         at_rest.info.capabilities,
         protocol::SessionCapabilities {
             resume: false,
-            fork: false
+            fork: false,
+            ..Default::default()
         },
         "the migration leaves the unresolved binding's flags false"
     );

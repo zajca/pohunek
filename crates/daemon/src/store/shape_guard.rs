@@ -454,7 +454,13 @@ fn assert_every_field_is_reviewed(
     let _: &SessionState = state;
     let _: &StateSource = state_source;
     let _: &Option<AgentActivity> = activity;
-    let protocol::SessionCapabilities { resume: _, fork: _ } = capabilities;
+    // `unknown_fields` serializes no key while it is empty, so the shape is the
+    // two flags.
+    let protocol::SessionCapabilities {
+        resume: _,
+        fork: _,
+        unknown_fields: _,
+    } = capabilities;
     if let Some(protocol::SessionRuntime {
         state: runtime_state,
         runtime_generation: _,

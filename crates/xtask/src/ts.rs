@@ -724,6 +724,7 @@ fn notification_policy() -> NotificationPolicy {
         enabled,
         providers,
         retention: protocol::NotificationRetentionPolicy::default(),
+        unknown_fields: protocol::tolerant::UnknownFields::default(),
     }
 }
 
@@ -798,6 +799,7 @@ fn session_full() -> SessionInfo {
         capabilities: SessionCapabilities {
             resume: true,
             fork: true,
+            ..SessionCapabilities::default()
         },
         name: Some("TypeScript SDK phase 1".to_owned()),
         agent: "codex".to_owned(),

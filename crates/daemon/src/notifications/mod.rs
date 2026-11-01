@@ -2540,6 +2540,7 @@ mod tests {
             },
             providers: BTreeMap::new(),
             retention: protocol::NotificationRetentionPolicy::default(),
+            unknown_fields: protocol::tolerant::UnknownFields::default(),
         };
 
         service.set_policy(policy.clone()).expect("set policy");

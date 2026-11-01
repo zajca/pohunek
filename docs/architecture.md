@@ -2302,9 +2302,10 @@ those.
 
 A client decodes a daemon result, event or error with `protocol::tolerant`, and
 a key a newer daemon added to a result type must not fail the call. The
-daemon-side types that carry `deny_unknown_fields` stay strict: the strict
-params, the capabilities inside the session store, the notification policy
-file and governance state refuse a key they do not know.
+daemon's own decodes stay strict: the strict params, governance state and the
+envelope carry `deny_unknown_fields`, and the session store, the policy files
+and the policy params refuse a key they do not know through the scoped
+decode below.
 Each protocol type has one field policy, kept in the table of
 `crates/protocol/tests/field_policy.rs`:
 
@@ -2320,8 +2321,20 @@ Each protocol type has one field policy, kept in the table of
   status, transfer outcomes, `PackageIdentity`, `LaunchBinding`), the client
   params that deny unknown keys (including the `runtime` identity nested in
   `session.output` and `session.wait` params, which has its own strict decode),
-  and the types the daemon also persists or accepts as params until they gain a
-  scoped decode.
+  and `NotificationKindPolicy`, which the daemon also persists and accepts as
+  params and which has no scoped decode yet.
+- **scoped**: a type the daemon persists or accepts as params and a client
+  reads (and, for the policies, sends back) (`SessionCapabilities`, `SessionRetentionPolicy`,
+  `NotificationPolicy`, `NotificationRetentionPolicy`). It carries one hidden
+  `UnknownFields` member (`protocol::tolerant::UnknownFields`, skipped in the
+  generated TypeScript). A plain decode, which is the daemon's, refuses an
+  unknown key as strictly as `deny_unknown_fields`, so the store, the policy
+  files and params stay strict. A decode inside `protocol::tolerant` keeps the
+  keys and serialization writes them back, so `notifications policy set` and
+  `session policy set` return every key they decoded and never reset a
+  setting they do not know. An empty member serializes nothing, so the store
+  shape, `policy.json` and every recorded document keep their bytes. `--json`
+  prints the kept keys of a scoped type.
 - **lenient**: the type carries no `deny_unknown_fields` and no hand-written
   refusal, so both decodes ignore an unknown key. Most param, result and event
   types are lenient; a daemon does not refuse a key of that kind in params, so
