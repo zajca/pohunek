@@ -26,7 +26,6 @@ _PROVIDER_LABELS = {
     "shell": "Shell",
 }
 _PUBLIC_METHODS = frozenset((
-    "session.report_native_id",
     "session.report_agent",
     "notification.create",
     "session.release_agent",
@@ -51,8 +50,20 @@ _MICROSECONDS_PER_SECOND = 1_000_000
 _START_IDENTITY_LIMIT = 1 << 64
 
 
+class _Unanswered(socket.timeout):
+    """The deadline passed after the request was fully written to the endpoint."""
+
+
 class Reporter:
-    """Send fixed-shape reports without affecting the owning agent's turn."""
+    """Send fixed-shape reports without affecting the owning agent's turn.
+
+    The deadline protects the agent's turn, not the outcome of a report. A report
+    whose request was fully written to the worker is applied whether or not its
+    reply arrives in time, so a deadline that passes after that point is recorded
+    as `unanswered` and is not counted as a failure. A worker that closes the
+    connection without a reply is a rejected report and is counted, like a
+    refusal or a failure to connect or write.
+    """
 
     def __init__(self, provider: str, environ: dict[str, str] | None = None) -> None:
         if not isinstance(provider, str) or provider not in _PROVIDER_LABELS:
@@ -79,7 +90,7 @@ class Reporter:
         return bool(self._session_id and self._worker_instance_id and self._start_identity is not None)
 
     def identity(self, reference: str | None) -> None:
-        """Report a bounded native reference to the worker, then public API."""
+        """Report a bounded native reference to the worker."""
         if not self.active or not isinstance(reference, str) or not 0 < len(reference) <= _MAX_NATIVE_ID_CHARS:
             return
         self._native_id = reference
@@ -122,13 +133,12 @@ class Reporter:
             "pid": self._pid, "start_identity": self._start_identity, "sequence": sequence,
             "expires_at": expires, "reference_kind": "id", "native_reference": native_id,
         }
-        if self._safe_worker(private):
+        # The worker is the only identity route: Hermes sessions run under a
+        # frozen-root schema, so the daemon refuses a public native-id report.
+        if not self._worker_socket:
+            self._record_failure()
             return
-        self._safe(self._send_public, "session.report_native_id", {
-            "session_id": self._session_id, "worker_instance_id": self._worker_instance_id,
-            "agent": self._provider, "pid": self._pid, "pid_start_identity": str(self._start_identity),
-            "sequence": str(sequence), "expires_at": expires, "native_session_id": native_id,
-        })
+        self._safe_worker(private)
 
     def _report_activity(self, state: str) -> None:
         sequence = self._next_sequence()
@@ -169,6 +179,10 @@ class Reporter:
                 return True
             outcome = "rejected"
             self._record_failure()
+            return False
+        except _Unanswered:
+            # The worker owns a fully written request; only the reply is missing.
+            outcome = "unanswered"
             return False
         except Exception as error:
             outcome = type(error).__name__
@@ -216,14 +230,17 @@ class Reporter:
             client.settimeout(self._remaining(deadline))
             client.sendall(encoded)
             response = bytearray()
-            while len(response) < _RESPONSE_BYTES:
-                client.settimeout(self._remaining(deadline))
-                chunk = client.recv(_RESPONSE_BYTES - len(response))
-                if not chunk:
-                    break
-                response.extend(chunk)
-                if b"\n" in chunk:
-                    break
+            try:
+                while len(response) < _RESPONSE_BYTES:
+                    client.settimeout(self._remaining(deadline))
+                    chunk = client.recv(_RESPONSE_BYTES - len(response))
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                    if b"\n" in chunk:
+                        break
+            except socket.timeout as error:
+                raise _Unanswered(str(error)) from error
         return json.loads(bytes(response).split(b"\n", 1)[0]) if response else None
 
     @staticmethod

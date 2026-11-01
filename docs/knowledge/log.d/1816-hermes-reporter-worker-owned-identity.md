@@ -1,0 +1,4 @@
+## Unreleased (2026-11-01, Hermes identity report owned by the worker, #1816)
+
+- The Hermes hook reporter (`_pohunek_reporter.py`) sends an identity report to the session worker only. Hermes sessions run under a frozen-root hook schema, so the daemon refused the public `session.report_native_id` fallback as unattested and logged a false `session.native_report.unattested` warning after every worker timeout or refusal.
+- A report whose request was fully written to the worker is applied whether or not its reply arrives in time, so a deadline that passes after that point is recorded as `unanswered` and is not counted as a failure. A worker that closes the connection without a reply is a rejected report and is counted, like a refusal or a failure to connect or write. `release()` keeps its `session.release_agent` fallback.

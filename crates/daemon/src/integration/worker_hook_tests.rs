@@ -2423,8 +2423,20 @@ mod subagent_sequences {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_trace_in_a_directory_of_another_owner_gets_no_start_marker() {
+        // The scenario needs a directory the user does not own, which only a
+        // shared directory of the host provides.
+        // hermetic-allowed: #1818 the scenario needs a directory of another owner
+        let shared = std::fs::metadata("/dev/shm");
+        let foreign = shared.as_ref().is_ok_and(|metadata| {
+            std::os::unix::fs::MetadataExt::uid(metadata) != rustix::process::geteuid().as_raw()
+        });
+        if !foreign {
+            eprintln!("skipped: /dev/shm is absent or owned by the effective user");
+            return;
+        }
         let root = crate::test_support::scoped_dir("ph-hook-marker-foreign-");
         let trace = PathBuf::from(format!(
+            // hermetic-allowed: #1818 the scenario needs a directory of another owner
             "/dev/shm/ph-hook-foreign-{}-{}.jsonl",
             std::process::id(),
             SystemTime::now()
@@ -2447,6 +2459,7 @@ mod subagent_sequences {
                 .and_then(|name| name.to_str())
                 .expect("a name")
         );
+        // hermetic-allowed: #1818 the scenario needs a directory of another owner
         let leftovers: Vec<_> = std::fs::read_dir("/dev/shm")
             .expect("read /dev/shm")
             .filter_map(Result::ok)

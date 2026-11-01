@@ -328,7 +328,7 @@ such as the relocatable Python the compatibility provisioner uses.
 
 Hooks do not start subprocesses, use the network, open a Hermes database, or
 copy prompt, tool, or terminal payloads. They use local bounded reporting only;
-failures are swallowed, counted, payload-free, and must not fail a Hermes turn.
+counted failures are swallowed, payload-free, and must not fail a Hermes turn. A report whose request was fully written to the worker is applied whether or not its reply arrives in time, so a deadline that passes after that point is recorded as `unanswered` and is not counted as a failure. A worker that closes the connection without a reply is a rejected report and is counted, like a refusal or a failure to connect or write.
 Outside Pohunek-managed sessions they report nothing. Doctor performs the
 corresponding payload-free hook dry run and returns typed findings for missing
 files, policy, permissions, version compatibility, registration, host policy,
