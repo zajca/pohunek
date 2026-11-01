@@ -39,6 +39,7 @@ fn issue_kind(issue: &BundleValidationIssue) -> &'static str {
         BundleValidationIssue::BrokenLink { .. } => "broken_link",
         BundleValidationIssue::ReservedFrontmatter { .. } => "reserved_frontmatter",
         BundleValidationIssue::LogFragment { .. } => "log_fragment",
+        BundleValidationIssue::PromptContract { .. } => "prompt_contract",
         BundleValidationIssue::UnsupportedFileType { .. } => "unsupported_file_type",
     }
 }
@@ -170,6 +171,50 @@ fn docs_build_rejects_absolute_markdown_link() {
 #[test]
 fn docs_build_rejects_parent_escape_markdown_link() {
     rejected_fixture("parent-escape-link", "broken_link", "../outside.md");
+}
+
+#[test]
+fn docs_check_accepts_well_formed_prompt_contract() {
+    let summary = validate_docs(source_fixture("prompt-contract-good"))
+        .expect("a well-formed prompt contract validates");
+    assert_eq!(summary.concept_count, 1);
+}
+
+#[test]
+fn prompt_contract_joins_continuation_lines_into_one_item() {
+    let text =
+        std::fs::read_to_string(source_fixture("prompt-contract-good").join("assistant/system.md"))
+            .expect("read the fixture contract");
+    let contract = knowledge::PromptContract::parse(&text).expect("well-formed contract");
+    assert_eq!(
+        contract.safety,
+        ["Never print secrets. Continue on an indented line."]
+    );
+    assert_eq!(contract.navigation, ["Start at the index."]);
+}
+
+#[test]
+fn docs_check_rejects_prose_in_prompt_contract() {
+    let error = validate_docs(source_fixture("prompt-contract-prose"))
+        .expect_err("prose in the contract must be rejected");
+    assert_bundle_issue(
+        "prompt-contract-prose",
+        &error,
+        "prompt_contract",
+        "line 15: `Safety` holds a line that is not a `- ` or `N. ` list item",
+    );
+}
+
+#[test]
+fn docs_check_rejects_nested_list_in_prompt_contract() {
+    let error = validate_docs(source_fixture("prompt-contract-nested"))
+        .expect_err("a nested list in the contract must be rejected");
+    assert_bundle_issue(
+        "prompt-contract-nested",
+        &error,
+        "prompt_contract",
+        "line 15: `Safety` holds a nested list or heading",
+    );
 }
 
 #[cfg(unix)]

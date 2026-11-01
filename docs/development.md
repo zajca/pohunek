@@ -218,7 +218,7 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spa
 cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
-cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks, doc commands vs the clap tree, crate table, package lists, doc index
+cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks/prompt-contract shape, doc commands vs the clap tree, crate table, package lists, doc index
 ```
 
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see the

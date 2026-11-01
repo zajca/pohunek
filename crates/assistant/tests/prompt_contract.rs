@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use knowledge::PromptContract;
 use pohunek_assistant::launch::{
     prepare_with_options, AssistantPaths, Intent, LaunchParams, PreparedLaunch,
 };
@@ -25,40 +26,17 @@ use tokio::net::{UnixListener, UnixStream};
 /// The prompt contract file, relative to this crate's manifest directory.
 const SYSTEM_CONTRACT: &str = "../../docs/knowledge/assistant/system.md";
 
-/// Items (`- ` bullets or `N. ` steps) of the `## <heading>` section of the
-/// contract, with continuation lines joined by single spaces.
+/// Items (`- ` bullets or `N. ` steps) of the contract section `heading`,
+/// parsed by the same rules as the launch.
 fn contract_items(heading: &str) -> Vec<String> {
     let path = pohunek_test_support::manifest_dir().join(SYSTEM_CONTRACT);
     let text = std::fs::read_to_string(&path).expect("read the prompt contract");
-    let wanted = format!("## {heading}");
-    let mut in_section = false;
-    let mut items: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if line.starts_with("## ") {
-            in_section = line.trim_end() == wanted;
-            continue;
-        }
-        let trimmed = line.trim();
-        if !in_section || trimmed.is_empty() {
-            continue;
-        }
-        let item = trimmed.strip_prefix("- ").or_else(|| {
-            let (number, rest) = trimmed.split_once(". ")?;
-            number
-                .chars()
-                .all(|character| character.is_ascii_digit())
-                .then_some(rest)
-        });
-        match (item, items.last_mut()) {
-            (Some(item), _) => items.push(item.to_owned()),
-            (None, Some(last)) => {
-                last.push(' ');
-                last.push_str(trimmed);
-            }
-            (None, None) => {}
-        }
+    let contract = PromptContract::parse(&text).expect("the prompt contract is well-formed");
+    match heading {
+        "Safety" => contract.safety,
+        "Navigation" => contract.navigation,
+        other => panic!("`{other}` is not a prompt contract section"),
     }
-    items
 }
 
 /// Serves `daemon.health` and `host.inspect` on one connection until the client

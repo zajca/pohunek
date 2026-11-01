@@ -1,0 +1,3 @@
+## Unreleased (2026-11-01, knowledge validation checks the shape of the assistant prompt contract, #1860)
+
+- `cargo xtask docs check` (knowledge validation) now refuses an `assistant/system.md` whose `## Safety` or `## Navigation` section holds prose, a sub-heading, a nested or `*` list item, an orphan continuation line or no item at all, naming the line. The launch of `pohunek assistant` and the `prompt_contract` scenario parse the contract with the same `PromptContract::parse` of the knowledge crate, so a malformed contract fails knowledge validation (`cargo xtask docs check`) instead of every launch. See [system.md](assistant/system.md).
