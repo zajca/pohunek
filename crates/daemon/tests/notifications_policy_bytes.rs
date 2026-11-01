@@ -130,24 +130,23 @@ struct Policy0_38 {
 }
 
 #[test]
-fn the_earlier_release_decodes_the_policy_this_build_returns() {
+fn the_earlier_release_decodes_a_loaded_partial_policy_after_the_daemon_completes_it() {
     let root = pohunek_test_support::tempdir().expect("private data root");
     let data_dir = root.path().join("data");
-    let service = NotificationService::open(&data_dir).expect("open the service");
-    let mut partial = policy();
-    partial.enabled =
-        NotificationKindPolicy::from_flags([(protocol::NotificationKind::System, true)]);
-    partial
-        .providers
-        .insert("codex".to_owned(), NotificationKindPolicy::default());
-    service.set_policy(partial).expect("persist the policy");
+    NotificationService::open(&data_dir)
+        .expect("open the service")
+        .set_policy(policy())
+        .expect("create the store files");
+    let document = serde_json::json!({
+        "attention_dedupe_window_secs": 300,
+        "enabled": {"system": true},
+        "providers": {"codex": {}},
+    });
+    std::fs::write(policy_path(&data_dir), format!("{document}\n")).expect("write policy.json");
 
-    let result = serde_json::to_value(protocol::NotificationPolicyResult {
-        policy: service.policy(),
-    })
-    .expect("encode the result");
+    let service = NotificationService::open(&data_dir).expect("reopen the service");
 
-    let decoded: serde_json::Value = result["policy"].clone();
-    serde_json::from_value::<Policy0_38>(decoded)
+    let returned = serde_json::to_value(service.policy()).expect("encode the policy");
+    serde_json::from_value::<Policy0_38>(returned)
         .expect("the earlier release decodes the policy this build returns");
 }

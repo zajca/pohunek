@@ -238,6 +238,8 @@ async fn policy_set_returns_the_completed_policy() {
     }
     let mut expected = documented_default_kinds();
     expected["system"] = json!(true);
+    let returned = serde_json::to_value(&result.policy).expect("encode the result");
+    assert_eq!(returned["enabled"], expected, "{returned}");
     let policy = policy_get(&harness).await;
     assert_eq!(policy["enabled"], expected, "{policy}");
 
