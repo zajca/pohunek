@@ -192,14 +192,15 @@ connection in `protocol_version`.
 
 A protocol 3 connection is answered `method_not_found` for any method added after
 protocol 3 (today the `package.*` methods), and never receives their results.
-The `session.list` metadata predicates `metadata_eq` and `metadata_has` are also
+The `session.list` predicates `metadata_eq`, `metadata_has` and `spawned_by` are also
 current-protocol-only request shapes. Because an older daemon knows the method
 but cannot apply these predicates, current Rust and TypeScript clients probe
 the negotiated version and return `daemon/daemon_protocol_too_old` before
 sending the filtered request.
 
-The CLI exposes these predicates as repeatable `session list --meta-eq
-key=value` and `--meta-has key` options. They combine with `--filter` and each
+The CLI exposes the metadata predicates as repeatable `session list --meta-eq
+key=value` and `--meta-has key` options and the spawner predicate as
+`--spawned-by <session-id>`. They combine with `--filter` and each
 other using AND semantics; equality splits at the first `=` and opaque keys or
 values may be empty. A CLI targeting a protocol-3 daemon fails before sending
 a metadata-filtered request, while an unfiltered `session list` remains
@@ -2019,6 +2020,25 @@ Important fields:
   `link.kind`, `link.id`, `link.url`, `link.branch`) written by external clients
   (such as the native GUI) and the launch scripts to tie a session to a work item — no protocol surface
   is dedicated to it.
+- `spawned_by`: optional `{session_id, daemon_id}`, omitted when absent. When a
+  `session.new` or `session.fork` request carries the request origin pair
+  (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`), the daemon records that pair
+  on the new session. The CLI and the Rust client send the inherited pair
+  unless the Rust client selects `OriginSource::Omitted`; the TypeScript SDK
+  sends it only when `ConnectOptions.origin` is set and never reads the
+  variables itself. It is not a request parameter: the daemon copies it from the request
+  envelope, and a `spawned_by` key in the params is ignored like any unknown
+  param key. The record is
+  immutable, survives a daemon restart, a resume and a native recovery, and a
+  fork never inherits the source session's value. A request without an origin
+  records nothing. `daemon_id` names the daemon instance that launched the
+  spawner's runtime: a worker keeps its launch daemon id across daemon restarts,
+  so it can be an earlier instance on this host or another host. It is stored
+  and reported as received; the pair is a reference and is never resolved
+  against the sessions of this daemon. The link is host-recorded attribution, not a security
+  boundary: a process of the same user can omit the origin variables, and then no
+  spawner is recorded. It is additive in protocol 4; the protocol 3 adapter drops
+  it.
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
 
@@ -3491,6 +3511,19 @@ empty string. Their tagged shapes are:
 {"key":"metadata_eq","value":{"key":"ticket","value":"ABC-1"}}
 {"key":"metadata_has","value":{"key":"ticket"}}
 ```
+
+The `spawned_by` predicate carries a session id and matches the sessions whose
+recorded `spawned_by.session_id` equals it:
+
+```json
+{"key":"spawned_by","value":"s-parent"}
+```
+
+The recorded `daemon_id` is not compared, because a session id is unique on its
+own and the daemon id of a spawner can be an earlier instance. A daemon that predates the predicate
+refuses the unknown tag with a typed `bad_request`, never an unfiltered list, so
+a caller that stops the children of a session cannot act on every session of an
+older host.
 
 Metadata predicates combine with each other and all other session predicates
 using AND semantics. The daemon applies the same key and value validation used

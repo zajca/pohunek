@@ -116,6 +116,8 @@ mod session_new_input_ack;
 mod session_new_outcome;
 #[path = "session_process_api.rs"]
 mod session_process_api;
+#[path = "session_spawned_by.rs"]
+mod session_spawned_by;
 #[path = "session_wait_turn.rs"]
 mod session_wait_turn;
 #[path = "setup_host.rs"]

@@ -784,6 +784,7 @@ impl Installation {
         let now = "2026-09-24T00:00:00Z".to_owned();
         let live = runtime.state == RuntimeState::Live;
         let info = SessionInfo {
+            spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities {
@@ -859,6 +860,7 @@ impl Installation {
     /// Claude session launched from the official package.
     fn seeded_binding(&self, session_id: &str) -> ResumeBinding {
         ResumeBinding {
+            spawned_by: None,
             session_id: session_id.to_owned(),
             name: Some(format!("seeded {session_id}")),
             agent: "claude".to_owned(),

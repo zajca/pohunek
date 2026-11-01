@@ -74,6 +74,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (10, include_str!("fixtures/shape/schema-10.txt")),
     (11, include_str!("fixtures/shape/schema-11.txt")),
     (12, include_str!("fixtures/shape/schema-12.txt")),
+    (13, include_str!("fixtures/shape/schema-13.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -97,6 +98,7 @@ fn resume_builtin_json() -> Value {
         "project_id": "p-1",
         "is_linked_worktree": true,
         "metadata": {"key": "value"},
+        "spawned_by": {"session_id": "s-0", "daemon_id": "d-0"},
         "program": "claude",
         "args": ["--flag"],
         "input_rules": {"bracketed_paste": true, "submit_delay_ms": 5, "restricted": true, "refuse_while_blocked": true},
@@ -269,6 +271,7 @@ fn session_json_with(recovery: &Value) -> Value {
             "worktree_path": "/data/worktrees/s-1",
             "warnings": [{"kind": "fetch", "message": "fetch failed", "detail": "offline"}],
             "metadata": {"key": "value"},
+            "spawned_by": {"session_id": "s-0", "daemon_id": "d-0"},
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:01Z",
             "exit_code": 0
@@ -323,6 +326,7 @@ fn assert_every_field_is_reviewed(
             project_id: _,
             is_linked_worktree: _,
             metadata: _,
+            spawned_by: _,
             program: _,
             args: _,
             input_rules,
@@ -446,6 +450,7 @@ fn assert_every_field_is_reviewed(
         capability_refusals: _,
         output_force_closed: _,
         metadata: _,
+        spawned_by: _,
         created_at: _,
         updated_at: _,
         exit_code: _,
@@ -747,6 +752,8 @@ const RESUME_FREE: &[&str] = &[
     "native_session_path",
     "project_id",
     "metadata.*",
+    "spawned_by.session_id",
+    "spawned_by.daemon_id",
     "program",
     "args[]",
     "native_launch.resume_args[].literal",
@@ -824,6 +831,8 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.info.warnings[].message",
     "session.info.warnings[].detail",
     "session.info.metadata.*",
+    "session.info.spawned_by.session_id",
+    "session.info.spawned_by.daemon_id",
     "session.info.created_at",
     "session.info.updated_at",
     "session.info.background.revision",

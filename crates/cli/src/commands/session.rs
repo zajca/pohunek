@@ -478,6 +478,8 @@ pub(crate) enum ListFilter {
     MetadataEq { key: String, value: String },
     /// Match the presence of an opaque metadata key.
     MetadataHas { key: String },
+    /// Match the sessions the given session spawned.
+    SpawnedBy(String),
 }
 
 impl ListFilter {
@@ -499,6 +501,7 @@ impl ListFilter {
                 value: value.clone(),
             },
             ListFilter::MetadataHas { key } => SessionListFilter::MetadataHas { key: key.clone() },
+            ListFilter::SpawnedBy(id) => SessionListFilter::SpawnedBy(id.clone()),
         }
     }
 }
@@ -512,6 +515,17 @@ pub(crate) fn parse_metadata_eq_filter(input: &str) -> Result<(String, String), 
         .split_once('=')
         .ok_or_else(|| format!("invalid metadata equality filter {input:?}: expected key=value"))?;
     Ok((key.to_owned(), value.to_owned()))
+}
+
+/// Parse the `session list --spawned-by <session-id>` argument.
+///
+/// The value is the spawning session's id, so an empty one can match nothing and
+/// is a usage error instead of an empty list.
+pub(crate) fn parse_spawned_by_filter(input: &str) -> Result<String, String> {
+    if input.is_empty() {
+        return Err("invalid spawned-by filter: session id cannot be empty".to_owned());
+    }
+    Ok(input.to_owned())
 }
 
 /// Parse one `session list --filter key=value` argument.
@@ -3216,6 +3230,7 @@ mod tests {
 
     fn running_session(id: &str) -> SessionInfo {
         SessionInfo {
+            spawned_by: None,
             name: None,
             id: protocol::SessionId(id.to_owned()),
             external: Some(false),

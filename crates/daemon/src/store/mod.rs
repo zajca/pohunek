@@ -142,6 +142,10 @@ pub struct ResumeBinding {
     /// limits but does not classify values; callers must not store secrets here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    /// The creating request's origin ([`protocol::SessionInfo::spawned_by`]),
+    /// kept so a relaunch of the session reports the same spawner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<protocol::SpawnedBy>,
     /// Structural relaunch snapshot (C.4): the resolved launch program, frozen at
     /// creation so a host profile's `program` override survives a restart even if
     /// the profile is later edited or deleted. Serde default (`""`) for a legacy
@@ -238,6 +242,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             #[serde(default)]
             metadata: BTreeMap<String, String>,
             #[serde(default)]
+            spawned_by: Option<protocol::SpawnedBy>,
+            #[serde(default)]
             program: String,
             #[serde(default)]
             args: Vec<String>,
@@ -281,6 +287,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             project_id: raw.project_id,
             is_linked_worktree: raw.is_linked_worktree,
             metadata: raw.metadata,
+            spawned_by: raw.spawned_by,
             program: raw.program,
             args: raw.args,
             input_rules: raw.input_rules,
@@ -2715,6 +2722,7 @@ mod tests {
 
     fn resume(session_id: &str, native: &str) -> ResumeBinding {
         ResumeBinding {
+            spawned_by: None,
             session_id: session_id.to_owned(),
             name: None,
             agent: "claude".to_owned(),
@@ -2824,7 +2832,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":12,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":13,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2840,7 +2848,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":12,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":13,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2952,7 +2960,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":12,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":13,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3075,7 +3083,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":12,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":13,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),

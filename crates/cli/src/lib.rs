@@ -1299,6 +1299,11 @@ enum SessionAction {
         /// May be repeated; filters are `ANDed`.
         #[arg(long = "meta-has", value_name = "key")]
         metadata_has: Vec<String>,
+        /// Match the sessions that the given session spawned: the daemon
+        /// recorded its id from the request origin when it created them.
+        /// `ANDed` with the other filters.
+        #[arg(long = "spawned-by", value_name = "session-id", value_parser = commands::session::parse_spawned_by_filter)]
+        spawned_by: Option<String>,
     },
 
     /// Inspect one session.
@@ -2115,7 +2120,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     mut filters,
                     metadata_eq,
                     metadata_has,
+                    spawned_by,
                 } => {
+                    filters.extend(spawned_by.map(commands::session::ListFilter::SpawnedBy));
                     filters.extend(metadata_eq.into_iter().map(|(key, value)| {
                         commands::session::ListFilter::MetadataEq { key, value }
                     }));

@@ -32,7 +32,10 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
     // set means the input was applied. Echoing this lets a client detect an
     // older daemon that silently ignored `input` (which returns no flag).
     let requested_input = params.input.is_some();
-    match sessions.create_outcome(params).await {
+    match sessions
+        .create_outcome_spawned_by(params, request_spawned_by(request))
+        .await
+    {
         Ok(outcome) => {
             let result = SessionNewResult {
                 session: outcome.session,
@@ -44,6 +47,17 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
         }
         Err(err) => error_value(request, err),
     }
+}
+
+/// The origin pair of `request` as the record a created session keeps.
+///
+/// The envelope validates the pair as a whole, so either both halves are
+/// present or neither is.
+fn request_spawned_by(request: &Request) -> Option<protocol::SpawnedBy> {
+    Some(protocol::SpawnedBy {
+        session_id: request.origin_session_id()?.clone(),
+        daemon_id: request.origin_daemon_id()?.to_owned(),
+    })
 }
 
 pub(super) async fn handle_session_list(request: &Request, sessions: &SessionRegistry) -> Response {
@@ -149,7 +163,11 @@ pub(super) async fn handle_session_fork(request: &Request, state: &DaemonState) 
     if let Err(err) = profile_change(state, params.accept_profile_change) {
         return error_value(request, err);
     }
-    match state.sessions.fork(params).await {
+    match state
+        .sessions
+        .fork_spawned_by(params, request_spawned_by(request))
+        .await
+    {
         Ok(session) => ok_value(
             request,
             &SessionForkResult {

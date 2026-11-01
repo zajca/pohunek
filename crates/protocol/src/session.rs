@@ -567,6 +567,12 @@ pub enum SessionListFilter {
     MetadataEq { key: String, value: String },
     /// Match sessions that contain an owner-controlled metadata key.
     MetadataHas { key: String },
+    /// Match the sessions whose [`SessionInfo::spawned_by`] names this session id.
+    ///
+    /// The daemon id of the recorded origin is not compared: a session id is
+    /// unique on its own, and a cross-host origin is a reference, not a
+    /// session this daemon resolves.
+    SpawnedBy(String),
 }
 
 impl SessionListFilter {
@@ -592,6 +598,10 @@ impl SessionListFilter {
             }
             Self::MetadataEq { key, value } => session.metadata.get(key) == Some(value),
             Self::MetadataHas { key } => session.metadata.contains_key(key),
+            Self::SpawnedBy(id) => session
+                .spawned_by
+                .as_ref()
+                .is_some_and(|spawned_by| spawned_by.session_id.0 == *id),
         }
     }
 }
@@ -2811,6 +2821,26 @@ impl SessionCapabilityRefusals {
     }
 }
 
+/// The origin pair of the request that created a session.
+///
+/// The daemon copies the pair from the request envelope when it handles
+/// `session.new` or `session.fork`; a client cannot supply it as a parameter.
+/// The record is attribution, not a security boundary: a process of the same
+/// user can omit the origin variables, and then nothing is recorded. The pair
+/// is kept as received and is never resolved against the sessions of this
+/// daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SpawnedBy.ts"))]
+pub struct SpawnedBy {
+    /// Session that sent the creating request.
+    pub session_id: SessionId,
+    /// Daemon instance that launched `session_id`'s runtime: an earlier
+    /// instance on this host or another host, since a worker keeps its launch
+    /// daemon id across daemon restarts.
+    pub daemon_id: String,
+}
+
 /// Summary returned by session lifecycle methods and published by events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2990,6 +3020,13 @@ pub struct SessionInfo {
     /// Owner-controlled; must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    /// The session whose request created this one, recorded by the daemon from
+    /// the request origin and never changed afterwards. `None` when the
+    /// creating request carried no origin. See [`SpawnedBy`] for what the
+    /// record does and does not prove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub spawned_by: Option<SpawnedBy>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.
@@ -3673,6 +3710,7 @@ mod tests {
     /// the daemon's socket/TCP integration tests.
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
+            spawned_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities::default(),

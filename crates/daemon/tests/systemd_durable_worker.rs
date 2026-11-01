@@ -915,6 +915,7 @@ impl Fixture {
     ) {
         let now = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
+            spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities {
@@ -976,6 +977,7 @@ impl Fixture {
                 transaction: None,
                 info,
                 recovery: Some(ResumeBinding {
+                    spawned_by: None,
                     session_id: session_id.to_owned(),
                     name: Some("systemd durability e2e".to_owned()),
                     agent: "claude".to_owned(),

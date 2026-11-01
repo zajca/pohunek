@@ -162,7 +162,7 @@ fn translate_request(
     reject_introduced(method)?;
     if matches!(direction, Direction::ToLegacy)
         && method == method::SESSION_LIST
-        && has_metadata_list_filter(&params)
+        && has_current_only_list_filter(&params)
     {
         return Err(CompatError::MethodNotDefined {
             method: method.to_owned(),
@@ -211,7 +211,7 @@ fn has_session_new_option(params: &Value) -> bool {
     .any(|key| params.get(key).is_some_and(|value| !value.is_null()))
 }
 
-fn has_metadata_list_filter(params: &Value) -> bool {
+fn has_current_only_list_filter(params: &Value) -> bool {
     params
         .get("filters")
         .and_then(Value::as_array)
@@ -219,7 +219,7 @@ fn has_metadata_list_filter(params: &Value) -> bool {
             filters.iter().any(|filter| {
                 matches!(
                     filter.get("key").and_then(Value::as_str),
-                    Some("metadata_eq" | "metadata_has")
+                    Some("metadata_eq" | "metadata_has" | "spawned_by")
                 )
             })
         })
@@ -361,6 +361,7 @@ fn session_info(
         object.remove("background");
         object.remove("output_force_closed");
         object.remove("capability_refusals");
+        object.remove("spawned_by");
         if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
             warnings.retain(|warning| {
                 warning

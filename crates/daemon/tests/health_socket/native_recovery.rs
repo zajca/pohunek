@@ -8,6 +8,8 @@ const LAUNCH: &str = "fixture-claude-launch";
 const CLEAR: &str = "fixture-claude-clear";
 const SELECTED: &str = "fixture-claude-selected";
 const FORKED: &str = "fixture-claude-forked";
+const SOURCE_SPAWNER_SESSION: &str = "s-source-spawner";
+const SOURCE_SPAWNER_DAEMON: &str = "d-source-spawner";
 
 async fn listed_sessions(control: &mut Framed<UnixStream, LinesCodec>) -> Vec<SessionInfo> {
     serde_json::from_value(ok_payload(
@@ -88,6 +90,10 @@ impl ClaudeRig {
         std::fs::write(&self.store_path, rewritten).expect("rewrite durable session store");
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the rig assembles the fixture agent, profile, hooks and daemon in one place"
+    )]
     async fn new(tag: &str) -> Self {
         let bin = temp_dir(&format!("{tag}-bin"));
         let state = temp_dir(&format!("{tag}-state"));
@@ -162,10 +168,21 @@ impl ClaudeRig {
         let mut control = connect(&socket).await;
         let mut params = session_params_in(cwd.to_path_buf());
         "claude-fixture".clone_into(&mut params.agent);
-        let session: SessionInfo = serde_json::from_value(ok_payload(
-            create_session_with_params(&mut control, params).await,
-        ))
-        .expect("create fixture Claude session");
+        // The source session has a spawner of its own, so a fork that copied it
+        // would show.
+        let create = Request::make(
+            "claude-fixture-new",
+            method::SESSION_NEW,
+            serde_json::to_value(params).expect("serialize params"),
+        )
+        .with_origin(
+            Some(SessionId(SOURCE_SPAWNER_SESSION.to_owned())),
+            Some(SOURCE_SPAWNER_DAEMON.to_owned()),
+        )
+        .expect("valid origin pair");
+        let session: SessionInfo =
+            serde_json::from_value(ok_payload(exchange(&mut control, &create).await))
+                .expect("create fixture Claude session");
         wait_until("fixture agent to start reading its PTY", || async {
             argv_log.exists().then_some(())
         })
@@ -1525,6 +1542,89 @@ async fn claude_fork_child_records_its_own_conversation_and_resumes_it() {
         Some(FORKED),
         "the resumed fork keeps its own target"
     );
+}
+
+/// A fork records the origin of the forking request on the child, never the
+/// source's, and the child keeps it through a stop, a resume and a daemon
+/// restart.
+#[tokio::test]
+async fn a_fork_records_the_forking_request_origin_and_keeps_it_through_resume_and_restart() {
+    let mut rig = ClaudeRig::new("claude-fork-spawned-by").await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let origin = protocol::SpawnedBy {
+        session_id: SessionId("s-forking-parent".to_owned()),
+        daemon_id: "d-forking-parent".to_owned(),
+    };
+    let fork_request = |request_id: &str| {
+        Request::make(
+            request_id,
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": rig.session.id,
+                "cwd_mode": "same",
+                "cols": 80,
+                "rows": 24
+            }),
+        )
+    };
+    let with_origin = fork_request("fork-with-origin")
+        .with_origin(
+            Some(origin.session_id.clone()),
+            Some(origin.daemon_id.clone()),
+        )
+        .expect("valid origin pair");
+    let without_origin = fork_request("fork-without-origin");
+    let forked: protocol::SessionForkResult =
+        serde_json::from_value(ok_payload(exchange(&mut rig.control, &with_origin).await))
+            .expect("fork with an origin");
+    let plain: protocol::SessionForkResult = serde_json::from_value(ok_payload(
+        exchange(&mut rig.control, &without_origin).await,
+    ))
+    .expect("fork without an origin");
+    let child = forked.session.id.clone();
+    rig.additional_sessions.push(plain.session.id.clone());
+
+    rig.transcript(FORKED);
+    rig.report_for(&child, "fork", FORKED).await;
+    let source_id = rig.session.id.clone();
+    let source = inspect_session(&mut rig.control, &source_id).await;
+    rig.stop(&child).await;
+    ok_payload(rig.resume_session(&child).await);
+    let resumed = inspect_session(&mut rig.control, &child).await;
+    for id in [child.clone(), plain.session.id.clone(), source_id.clone()] {
+        rig.stop(&id).await;
+    }
+
+    let mut rig = rig.restarted().await;
+    let restarted_child = inspect_session(&mut rig.control, &child).await;
+    let restarted_plain = inspect_session(&mut rig.control, &plain.session.id).await;
+    rig.stop_daemon().await;
+
+    assert_eq!(forked.session.spawned_by.as_ref(), Some(&origin));
+    assert_eq!(
+        plain.session.spawned_by, None,
+        "a fork without an origin does not inherit its source's spawner"
+    );
+    assert_eq!(
+        source.spawned_by,
+        Some(protocol::SpawnedBy {
+            session_id: SessionId(SOURCE_SPAWNER_SESSION.to_owned()),
+            daemon_id: SOURCE_SPAWNER_DAEMON.to_owned(),
+        }),
+        "the source keeps its own spawner and never gains the fork's origin"
+    );
+    assert_eq!(
+        resumed.spawned_by.as_ref(),
+        Some(&origin),
+        "a resume keeps the spawner"
+    );
+    assert_eq!(
+        restarted_child.spawned_by.as_ref(),
+        Some(&origin),
+        "a daemon restart keeps the spawner"
+    );
+    assert_eq!(restarted_plain.spawned_by, None);
 }
 
 impl ClaudeRig {

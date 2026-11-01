@@ -535,6 +535,67 @@ fn protocol_3_session_results_omit_capability_refusals() {
 }
 
 #[test]
+fn protocol_3_session_results_and_events_omit_the_spawner() {
+    let previous = fixtures(RESULTS, "results.json")
+        .entries
+        .into_iter()
+        .find(|entry| entry["method"] == method::SESSION_INSPECT)
+        .expect("recorded session.inspect result")["result"]
+        .clone();
+    let mut current =
+        upgrade_result(v3(), method::SESSION_INSPECT, previous).expect("upgrade recorded result");
+    current["spawned_by"] = json!({"session_id": "s-parent", "daemon_id": "d-parent"});
+    let decoded: protocol::SessionInfo =
+        serde_json::from_value(current.clone()).expect("current type decodes the spawner");
+    assert_eq!(
+        decoded.spawned_by,
+        Some(protocol::SpawnedBy {
+            session_id: protocol::SessionId("s-parent".to_owned()),
+            daemon_id: "d-parent".to_owned(),
+        })
+    );
+
+    for method_name in [method::SESSION_INSPECT, method::SESSION_LIST] {
+        let carried = if method_name == method::SESSION_LIST {
+            json!([current.clone(), current.clone()])
+        } else {
+            current.clone()
+        };
+        let legacy = result(v3(), method_name, carried).expect("downgrade result");
+        let sessions = match legacy {
+            serde_json::Value::Array(sessions) => sessions,
+            single => vec![single],
+        };
+        for session in sessions {
+            assert!(
+                session.get("spawned_by").is_none(),
+                "{method_name}: {session}"
+            );
+            assert!(session.get("id").is_some());
+        }
+    }
+
+    let lost = event_payload(
+        v3(),
+        event::SESSION_RUNTIME_LOST,
+        json!({"session": current}),
+    )
+    .expect("downgrade event")
+    .expect("protocol 3 knows the event");
+    assert!(lost["session"].get("spawned_by").is_none(), "{lost}");
+
+    let upgraded = upgrade_result(
+        v3(),
+        method::SESSION_INSPECT,
+        result(v3(), method::SESSION_INSPECT, current).expect("downgrade result"),
+    )
+    .expect("upgrade previous-release result");
+    let session: protocol::SessionInfo =
+        serde_json::from_value(upgraded).expect("current type accepts old result");
+    assert_eq!(session.spawned_by, None);
+}
+
+#[test]
 fn protocol_3_session_results_and_events_omit_the_runtime_exit() {
     let previous = fixtures(RESULTS, "results.json")
         .entries

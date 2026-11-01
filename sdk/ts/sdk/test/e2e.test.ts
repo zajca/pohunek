@@ -40,6 +40,8 @@ const READ_MARKER_TIMEOUT_MS = 10_000;
 const DAEMON_TERM_GRACE_MS = 5_000;
 const E2E_TEST_TIMEOUT_MS = 60_000;
 const MARKER = "pohunek-e2e-marker";
+const SPAWNER_SESSION_ID = "s-e2e-spawner";
+const SPAWNER_DAEMON_ID = "d-e2e-spawner";
 const encoder = new TextEncoder();
 
 interface DaemonHarness {
@@ -177,6 +179,52 @@ e2eTest(
       }
       if (cleanupErrors.length > 1) {
         throw new AggregateError(cleanupErrors, "metadata relay scenario cleanup failed");
+      }
+    });
+  },
+  E2E_TEST_TIMEOUT_MS,
+);
+
+e2eTest(
+  "real pohunekd reports the spawning session of a session created with a request origin",
+  async () => {
+    await withDaemon(async (daemon) => {
+      const plain = await connectLocal(daemon.socketPath, connectOptions());
+      const spawner = await connectLocal(daemon.socketPath, {
+        ...connectOptions(),
+        origin: { sessionId: SPAWNER_SESSION_ID, daemonId: SPAWNER_DAEMON_ID },
+      });
+      const sessionIds: string[] = [];
+      try {
+        const parent = await plain.call("session.new", {
+          agent: "shell",
+          cols: SESSION_COLS,
+          rows: SESSION_ROWS,
+        });
+        sessionIds.push(parent.id);
+        const child = await spawner.call("session.new", {
+          agent: "shell",
+          cols: SESSION_COLS,
+          rows: SESSION_ROWS,
+        });
+        sessionIds.push(child.id);
+
+        expect(parent.spawned_by).toBeUndefined();
+        expect(child.spawned_by).toEqual({
+          session_id: SPAWNER_SESSION_ID,
+          daemon_id: SPAWNER_DAEMON_ID,
+        });
+        const children = await plain.call("session.list", {
+          filters: [{ key: "spawned_by", value: SPAWNER_SESSION_ID }],
+        });
+        expect(children.map((session) => session.id)).toEqual([child.id]);
+      } finally {
+        for (const sessionId of sessionIds) {
+          await plain.call("session.stop", sessionId).catch(() => undefined);
+          await plain.call("session.remove", sessionId).catch(() => undefined);
+        }
+        await spawner.close();
+        await plain.close();
       }
     });
   },

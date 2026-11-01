@@ -13,9 +13,9 @@ use pohunek_daemon::store::STORE_SCHEMA_VERSION;
 const SCHEMA_10: &str = include_str!("../../src/store/fixtures/schema-10/metadata.jsonl");
 
 /// The stores the daemon built before the snapshot (main `4c7d2e9b8`) wrote after
-/// each request of [`api_golden_steps`], with only the schema 12 changes applied
-/// (`schema_version` 12 and `refuse_while_blocked` in a rewritten session's
-/// `input_rules`).
+/// each request of [`api_golden_steps`], with only the schema 12 and 13 changes
+/// applied (`schema_version` 13; `refuse_while_blocked` from schema 12 in a
+/// rewritten session's `input_rules`).
 const GOLDENS: [&str; 3] = [
     include_str!("../fixtures/store-memo/api-after-rename-1.jsonl"),
     include_str!("../fixtures/store-memo/api-after-rename-2.jsonl"),

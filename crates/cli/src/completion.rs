@@ -297,6 +297,9 @@ impl ValueCompleter for DigestCompleter {
 /// Id of the `--profile` argument of the `integration` lifecycle commands.
 const INTEGRATION_PROFILE_ARG: &str = "home_profile";
 
+/// Id of the `--spawned-by` argument of `session list`.
+const SPAWNED_BY_ARG: &str = "spawned_by";
+
 /// Completes the `<NAME>` argument of `pohunek plugin profile migrate` and the
 /// `--profile` value of the `integration` commands with the profile files in
 /// the agents directory.
@@ -409,6 +412,32 @@ impl ValueCompleter for HostCompleter {
 #[derive(Clone, Debug)]
 struct TargetCompleter {
     context: CompletionContext,
+}
+
+/// Completes the session id `session list --spawned-by` takes: a plain id of
+/// the selected host, never a `host/` qualified target.
+#[derive(Clone, Debug)]
+struct SpawnerCompleter {
+    context: CompletionContext,
+}
+
+impl ValueCompleter for SpawnerCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        let Some(current) = current.to_str() else {
+            return Vec::new();
+        };
+        let current = current.to_owned();
+        let host = self
+            .context
+            .explicit_host
+            .clone()
+            .unwrap_or_else(|| LOCAL_HOST.to_owned());
+        run_bounded(async move {
+            let sessions = query_sessions(&host).await?;
+            Some(session_candidates(&sessions, &current, None))
+        })
+        .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -594,6 +623,11 @@ fn dynamic_command(context: CompletionContext) -> Command {
                         .any(|arg| arg.get_id() == "target")
                     {
                         with_target_completer(subcommand, &context)
+                    } else if subcommand
+                        .get_arguments()
+                        .any(|arg| arg.get_id() == SPAWNED_BY_ARG)
+                    {
+                        with_spawner_completer(subcommand, &context)
                     } else {
                         subcommand
                     }
@@ -630,6 +664,18 @@ fn with_workflow_completers(command: Command, context: &CompletionContext) -> Co
             last_host: context.last_host.clone(),
         })),
         _ => arg,
+    })
+}
+
+fn with_spawner_completer(command: Command, context: &CompletionContext) -> Command {
+    command.mut_args(|arg| {
+        if arg.get_id() == SPAWNED_BY_ARG {
+            arg.add(ArgValueCompleter::new(SpawnerCompleter {
+                context: context.clone(),
+            }))
+        } else {
+            arg
+        }
     })
 }
 
@@ -1178,6 +1224,16 @@ mod tests {
             .is_some());
 
         let session = command.find_subcommand("session").expect("session command");
+        let list = session
+            .find_subcommand("list")
+            .expect("session list command");
+        assert!(
+            list.get_arguments()
+                .find(|arg| arg.get_id() == SPAWNED_BY_ARG)
+                .and_then(|arg| arg.get::<ArgValueCompleter>())
+                .is_some(),
+            "session list --spawned-by has no dynamic completer"
+        );
         for subcommand in session.get_subcommands() {
             if let Some(target) = subcommand
                 .get_arguments()

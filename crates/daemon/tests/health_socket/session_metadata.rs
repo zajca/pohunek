@@ -109,6 +109,46 @@ async fn metadata_set_on_a_session_without_a_native_id_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn metadata_set_on_an_ended_session_survives_a_restart() {
+    let socket = temp_socket("meta-ended-restart");
+    let store_path = socket.dir.join("metadata.jsonl");
+    let config = || SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
+        store_path: Some(store_path.clone()),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config()).await;
+    let mut control = connect(&socket).await;
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(
+            &mut control,
+            session_params_in(socket.dir.join(WORK_DIR_NAME)),
+        )
+        .await,
+    ))
+    .expect("session info");
+    wait_for_state(&mut control, &session.id, SessionState::Done).await;
+    set_edited_key(&mut control, &session.id).await;
+    drop(control);
+    let _ = shutdown.send(());
+    let _ = handle.await;
+
+    let (restarted, _worker_home) = worker_backed_registry(&socket, config());
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciles the ended session");
+    let adopted = restarted
+        .inspect(&session.id)
+        .await
+        .expect("the restarted daemon lists the ended session");
+
+    assert_eq!(adopted.state, SessionState::Done);
+    assert_edit_survived(&adopted);
+}
+
+#[tokio::test]
 async fn a_metadata_write_the_store_refuses_is_reported_and_changes_nothing() {
     use std::os::unix::fs::PermissionsExt;
 
