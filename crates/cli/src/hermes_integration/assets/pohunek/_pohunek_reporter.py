@@ -57,9 +57,12 @@ class _Unanswered(socket.timeout):
 class Reporter:
     """Send fixed-shape reports without affecting the owning agent's turn.
 
-    The deadline protects the agent's turn, not the outcome of a report: once a
-    request to the worker is fully written, the worker applies it whether or
-    not the reply arrives in time, so a missing worker reply is not a failure.
+    The deadline protects the agent's turn, not the outcome of a report. A report
+    whose request was fully written to the worker is applied whether or not its
+    reply arrives in time, so a deadline that passes after that point is recorded
+    as `unanswered` and is not counted as a failure. A worker that closes the
+    connection without a reply is a rejected report and is counted, like a
+    refusal or a failure to connect or write.
     """
 
     def __init__(self, provider: str, environ: dict[str, str] | None = None) -> None:
