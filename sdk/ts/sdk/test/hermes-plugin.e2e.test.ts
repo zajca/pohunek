@@ -54,6 +54,8 @@ const PLUGIN_FIXTURE_TIMEOUT_MS = 45_000;
 const REMOTE_READY_TIMEOUT_MS = 10_000;
 const REMOTE_PORT = 38_471;
 const REMOTE_SELF_IP = "100.64.0.10";
+// The fake peer has an address of its own: a peer that lists this machine's address is ambiguous.
+const REMOTE_PEER_IP = "100.64.0.11";
 const REMOTE_HOST = "plugin-remote.netbird.test";
 // The worker needs a short window to observe the spawned controlled executable before it
 // accepts its owner-private launch identity. This remains far below the fixture timeout.
@@ -79,7 +81,7 @@ const PLUGIN_NETBIRD_FIXTURE_SCRIPT = `#!/bin/sh
 if [ "$1" != "status" ] || [ "$2" != "--json" ]; then
   exit 2
 fi
-printf '%s\\n' '{"netbirdIp":"${REMOTE_SELF_IP}","daemonStatus":"Connected","peers":{"details":[{"fqdn":"${REMOTE_HOST}","netbirdIp":"${REMOTE_SELF_IP}","status":"Connected"}]}}'
+printf '%s\\n' '{"netbirdIp":"${REMOTE_SELF_IP}","daemonStatus":"Connected","peers":{"details":[{"fqdn":"${REMOTE_HOST}","netbirdIp":"${REMOTE_PEER_IP}","status":"Connected"}]}}'
 `;
 
 interface PluginDaemonHarness extends DaemonContext {
@@ -322,7 +324,11 @@ async function runHermesPluginScenario(
   expect(identityEvents.filter((event) => event === "response_read_eagain_injected").length).toBe(1);
   expect(identityEvents.filter((event) => event === "response_wait_timeout_injected").length).toBe(1);
   expect(identityEvents.filter((event) => event === "response_step_timeout").length).toBeGreaterThanOrEqual(1);
-  await assertRemoteTargets(daemon.remoteCapture, `${REMOTE_SELF_IP}:${REMOTE_PORT}`);
+  await assertRemoteTargets(
+    daemon.remoteCapture,
+    `${REMOTE_SELF_IP}:${REMOTE_PORT}`,
+    `${REMOTE_PEER_IP}:${REMOTE_PORT}`,
+  );
 }
 
 async function createPluginProject(daemon: PluginDaemonHarness, cli: string): Promise<string> {
@@ -473,10 +479,14 @@ async function waitForRemoteListener(capture: string): Promise<void> {
   throw new Error("controlled remote listener did not bind the original CGNAT target");
 }
 
-async function assertRemoteTargets(capture: string, target: string): Promise<void> {
+async function assertRemoteTargets(
+  capture: string,
+  bindTarget: string,
+  connectTarget: string,
+): Promise<void> {
   const lines = (await readFile(capture, "utf8")).trim().split("\n");
-  expect(lines.filter((line) => line === `bind ${target}`).length > 0).toBe(true);
-  expect(lines.filter((line) => line === `connect ${target}`).length > 2).toBe(true);
+  expect(lines.filter((line) => line === `bind ${bindTarget}`).length > 0).toBe(true);
+  expect(lines.filter((line) => line === `connect ${connectTarget}`).length > 2).toBe(true);
 }
 
 interface JsonEnvelope {
