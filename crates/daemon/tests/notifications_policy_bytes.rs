@@ -99,6 +99,10 @@ fn a_policy_document_of_the_earlier_release_is_read_and_rewritten_unchanged() {
     dead_code,
     reason = "decoding is the assertion; the fields are not read"
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the 0.38 wire policy has one enable flag per notification kind"
+)]
 struct Kinds0_38 {
     agent_blocked: bool,
     approval_required: bool,
