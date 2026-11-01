@@ -466,14 +466,22 @@ impl Scenario {
             .expect("one session directory")
             .expect("session directory entry")
             .path();
-        let journal = std::fs::read_dir(session)
+        let journal = std::fs::read_dir(&session)
             .expect("session journal directory")
             .map(|entry| entry.expect("journal entry").path())
             .find(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "json")
             })
-            .expect("a worker journal");
+            .unwrap_or_else(|| {
+                panic!(
+                    "a worker journal in {}: {:?}",
+                    session.display(),
+                    std::fs::read_dir(&session).map(|entries| entries
+                        .map(|entry| entry.map(|entry| entry.file_name()))
+                        .collect::<Vec<_>>())
+                )
+            });
         serde_json::from_slice(&std::fs::read(journal).expect("read the journal"))
             .expect("the journal is JSON")
     }
