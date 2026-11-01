@@ -30,6 +30,11 @@ env:
   # with release-build.yml and release.yml.
   SCCACHE_VERSION: "0.18.0"
   SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+  # Pinned mold release for .github/actions/setup-mold; the provenance of
+  # MOLD_SHA256 is documented in ci.yml. Bump together with ci.yml, upgrade.yml,
+  # gate-tests.yml, release.yml and release-build.yml.
+  MOLD_VERSION: "2.42.1"
+  MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
 
 jobs:
   tests:
@@ -56,7 +61,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust

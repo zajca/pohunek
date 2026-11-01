@@ -47,9 +47,11 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != 
 # `cancel-after-<job>` job does the same when a called workflow ends red. The
 # step needs `actions: write`, granted per job and never for the workflow.
 # Push runs, scheduled runs and the advisory audit job never cancel. The failing
-# job and the run end as `cancelled`; the `::error` annotation names the job that
-# failed first. The advisory audit, the two fail-open selectors and the verdict
-# do not carry the step.
+# job and the run end as `cancelled`, so no job shows `failure` on the run page;
+# the `::error` annotation on the failed job's check run (and its job summary)
+# names the job's display name, job id, link and failed step. The
+# advisory audit, the two fail-open selectors and the verdict do not carry the
+# step.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
 # drain (#1209): the running main run completes, and GitHub keeps only the
 # newest push pending behind it, replacing an older pending one. Each scheduled
@@ -112,7 +114,8 @@ env:
   # Pinned mold release for .github/actions/setup-mold. MOLD_SHA256 is the
   # sha256 GitHub publishes for the release asset
   # mold-2.42.1-x86_64-linux.tar.gz (`gh api repos/rui314/mold/releases/tags/v2.42.1`,
-  # asset `digest`), cross-checked against a local download. Bump both together.
+  # asset `digest`), cross-checked against a local download. Bump both together, and in
+  # upgrade.yml, gate-tests.yml, release.yml and release-build.yml.
   MOLD_VERSION: "2.42.1"
   MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
   # Pinned zig release for .github/actions/setup-zig, used only as the C compiler
@@ -628,6 +631,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -742,6 +746,7 @@ jobs:
       - name: Install mold linker
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -854,6 +859,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -915,6 +921,12 @@ jobs:
         with:
           path: relocated
           persist-credentials: false
+
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -987,21 +999,9 @@ jobs:
           name: nextest-junit-${{ matrix.shard }}
           path: relocated/target/nextest/ci/junit.xml
           if-no-files-found: warn
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
@@ -1225,6 +1225,7 @@ jobs:
               - 'packaging/**'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
+              - '.github/actions/setup-mold/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, the scripts the rows
@@ -1263,6 +1264,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
+              - '.github/actions/setup-mold/**'
               - '.github/actions/setup-uv/**'
             # The release gate's test steps (gate-tests.yml) run on a pull
             # request that changes what they run or how: the two workflows,
@@ -1277,6 +1279,7 @@ jobs:
               - 'scripts/junit-flaky-summary'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-mold/**'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
@@ -1323,6 +1326,12 @@ jobs:
         with:
           path: relocated
           persist-credentials: false
+
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1400,21 +1409,9 @@ jobs:
           name: nextest-junit-heavy
           path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
   # user manager (transient worker units, the namespaced daemon unit, the
@@ -1437,6 +1434,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -1606,6 +1604,12 @@ jobs:
           path: relocated
           persist-credentials: false
 
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -1671,21 +1675,9 @@ jobs:
           name: nextest-junit-relay-db
           path: relocated/target/nextest/relay-db/junit.xml
           if-no-files-found: warn
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
   # G3 of #1218: each package's tests run from a tree holding only the files
   # whose change selects that package, so a test that reads a path outside
@@ -1727,6 +1719,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -1811,6 +1804,12 @@ jobs:
           path: relocated
           persist-credentials: false
 
+      # The sparse test tree and the relocated checkout hold no .github/actions
+      # at the workspace root when the cancel step runs, so the action is copied
+      # out of the checkout next to it.
+      - name: Keep the fail-fast action
+        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -1829,21 +1828,9 @@ jobs:
 
       - name: Verify the planned shards hold every selected test
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
-      # Inline instead of .github/actions/cancel-run: the sparse test tree of
-      # these jobs holds no .github/actions, so the local action would be missing
-      # exactly when a narrowed run needs it.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./cancel-run-action
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
@@ -1912,6 +1899,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -1952,6 +1940,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2143,6 +2132,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2230,6 +2220,7 @@ jobs:
       # from source in this job, so a toolchain is still required here.
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2536,6 +2527,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2669,6 +2661,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2831,6 +2824,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -2970,6 +2964,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3122,6 +3117,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3554,7 +3550,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: scripts
+          sparse-checkout: |
+            scripts
+            .github/actions/cancel-run
           persist-credentials: false
 
       # Only this workflow's test jobs: the release rehearsal's reusable
@@ -3567,20 +3565,9 @@ jobs:
 
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
-      # Inline instead of .github/actions/cancel-run: the sparse checkout of
-      # this job holds only scripts/, so the local action would be missing.
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: ${{ github.job }}
-        run: |
-          set -eu
-          echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        uses: ./.github/actions/cancel-run
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).
@@ -3604,6 +3591,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3925,6 +3913,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
@@ -3975,6 +3964,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}

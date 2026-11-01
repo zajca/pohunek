@@ -57,7 +57,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Pinned mold release; the same pin as ci.yml (MOLD_SHA256 is the sha256
-  # GitHub publishes for mold-2.42.1-x86_64-linux.tar.gz). Bump both together.
+  # GitHub publishes for mold-2.42.1-x86_64-linux.tar.gz). Bump both together,
+  # and in gate-tests.yml, release.yml and release-build.yml.
   MOLD_VERSION: "2.42.1"
   MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
 
@@ -84,6 +85,7 @@ jobs:
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
         with:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}

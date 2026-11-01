@@ -3,7 +3,8 @@ description: >-
   Cancel the current workflow run after a required job failed, so the runners
   of the jobs that are still running are freed for other work. The failing job
   and the run end as cancelled (the failed step stays failed in the job log);
-  the `::error` annotation names the job that failed first. The caller decides
+  the `::error` annotation and the job summary name the failed job (display
+  name, job id, link) and the step that failed. The caller decides
   when this runs and must grant `actions: write` to its job. The call is
   allowed to fail: a token without that scope (a fork or Dependabot pull
   request) must not change the result of the run, which stays the real failure.
@@ -19,7 +20,5 @@ runs:
         RUN_ID: ${{ github.run_id }}
         REPOSITORY: ${{ github.repository }}
         FAILED_JOB: ${{ github.job }}
-      run: |
-        set -eu
-        echo "::error title=Fail fast::job ${FAILED_JOB} failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-        gh run cancel "$RUN_ID" --repo "$REPOSITORY"
+        JOB_ID: ${{ job.check_run_id }}
+      run: ${GITHUB_ACTION_PATH}/cancel-run.sh
