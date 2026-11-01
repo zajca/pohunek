@@ -796,9 +796,10 @@ fn an_address_listed_for_two_peers_is_not_used_for_routing() {
     assert_eq!(targets, ["100.64.0.30:9100"]);
 }
 
-/// Replaces the fake CLI with one that starts a helper, then holds the write
-/// end of the named pipe `alive` in both. The pipe reads as end of file once
-/// the CLI and its helper are gone, with no polling.
+/// Replaces the fake CLI with one that starts a helper holding the write end
+/// of the named pipe `alive`. Opening the pipe for reading returns once the
+/// helper exists, so a signal sent afterwards cannot miss it, and the pipe
+/// reads as end of file once the helper is gone, with no polling.
 fn install_pipe_holding_cli(fixture: &Fixture) -> PathBuf {
     let alive = fixture.env.root().join("tailscale.alive");
     nix::unistd::mkfifo(&alive, nix::sys::stat::Mode::from_bits_truncate(0o600))
@@ -806,7 +807,7 @@ fn install_pipe_holding_cli(fixture: &Fixture) -> PathBuf {
     pohunek_test_support::fs::write_executable(
         fixture.fake.bin_dir().join("tailscale"),
         format!(
-            "#!/bin/sh\nexec 9> '{alive}'\n/bin/sleep 3600 &\nwait\n",
+            "#!/bin/sh\n/bin/sleep 3600 9> '{alive}' &\nwait\n",
             alive = alive.display()
         ),
     )
@@ -850,7 +851,7 @@ fn an_interrupted_command_leaves_no_provider_process() {
     fixture.configure("status_timeout_secs = 120");
     let alive = install_pipe_holding_cli(&fixture);
     let mut child = fixture.spawn(&["host", "list", "--refresh", "--json"]);
-    // Opening the read end returns once the fake holds the write end.
+    // Opening the read end returns once the helper holds the write end.
     let reader = fs::File::open(&alive).expect("open the liveness pipe");
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
@@ -874,11 +875,11 @@ fn an_interrupted_command_reaps_a_helper_that_outlives_the_provider() {
         nix::unistd::mkfifo(pipe, nix::sys::stat::Mode::from_bits_truncate(0o600))
             .expect("create a liveness pipe");
     }
-    // `exited` is held by the CLI alone, `alive` by the CLI and its helper.
+    // `exited` is held by the CLI alone, `alive` by its helper alone.
     pohunek_test_support::fs::write_executable(
         fixture.fake.bin_dir().join("tailscale"),
         format!(
-            "#!/bin/sh\nexec 8> '{exited}'\nexec 9> '{alive}'\n/bin/sleep 3600 8>&- &\nexit 0\n",
+            "#!/bin/sh\nexec 8> '{exited}'\n/bin/sleep 3600 8>&- 9> '{alive}' &\nexit 0\n",
             exited = exited.display(),
             alive = alive.display()
         ),

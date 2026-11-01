@@ -1662,10 +1662,11 @@ mod tests {
     /// Installs a fake `netbird` in a fresh owner-private directory and puts it
     /// alone on `PATH`.
     ///
-    /// Its first run (marked by `hung`) opens the write end of the named pipe
-    /// `alive`, starts a helper that holds it too and never answers; every
-    /// later run prints `status`. The pipe reads as end of file once the CLI
-    /// and the helper are gone. Returns the pipe's path.
+    /// Its first run (marked by `hung`) starts a helper that opens the write
+    /// end of the named pipe `alive` and never answers; every later run prints
+    /// `status`. Opening the pipe for reading returns once the helper exists
+    /// and belongs to the CLI's process group, and the pipe reads as end of
+    /// file once the helper is gone. Returns the pipe's path.
     fn install_hanging_netbird(
         scripts: &std::path::Path,
         status: &str,
@@ -1684,7 +1685,7 @@ mod tests {
         pohunek_test_support::fs::write_executable(
             bin.join("netbird"),
             format!(
-                "#!/bin/sh\nif [ ! -e '{hung}' ]; then\n: > '{hung}'\nexec 9> '{alive}'\n/bin/sleep 3600 &\nwait\nfi\nprintf '%s\\n' '{status}'\n",
+                "#!/bin/sh\nif [ ! -e '{hung}' ]; then\n: > '{hung}'\n/bin/sleep 3600 9> '{alive}' &\nwait\nfi\nprintf '%s\\n' '{status}'\n",
                 hung = hung.display(),
                 alive = alive.display(),
             ),
@@ -1753,7 +1754,7 @@ mod tests {
             None,
             opener(unused),
         ));
-        // Opening the read end returns once the fake holds the write end.
+        // Opening the read end returns once the helper holds the write end.
         let reader = tokio::task::spawn_blocking(move || std::fs::File::open(alive))
             .await
             .expect("open task")
