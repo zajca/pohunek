@@ -262,7 +262,9 @@ impl WatchBackend for FsEventsBackend {
 
     /// Keeps the stream of every root that stays: each `watch` or `unwatch`
     /// stops and recreates the `FSEvents` stream, and events are not delivered
-    /// until the new stream runs.
+    /// until the new stream runs. After a callback error or lost events every
+    /// registration is dropped instead, so a stream that stopped delivering is
+    /// recreated.
     fn retain_roots(&mut self, roots: &[PathBuf]) {
         if self.suspect {
             self.suspect = false;
