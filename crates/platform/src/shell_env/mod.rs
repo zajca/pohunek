@@ -64,6 +64,7 @@ mod search_path;
 #[cfg(test)]
 mod test_support;
 
+pub(crate) use executable::lookup_admin_group;
 #[doc(inline)]
 pub use executable::{
     is_trusted_executable_file, resolve_executable, resolve_executable_in_path_value,

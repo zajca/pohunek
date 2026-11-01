@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use super::executable::{is_admin_group_directory, lookup_admin_group};
+use super::executable::is_admin_group_directory;
 use crate::filesystem::TrustedDir;
 
 /// Longest accepted joined `PATH` value in bytes.
@@ -171,9 +171,9 @@ pub fn trusted_directory(entry: &Path) -> Result<PathBuf, TrustError> {
     if metadata.mode() & GROUP_OTHER_WRITE != 0 && !admin_group_directory {
         return Err(TrustError::Refused("writable by group or others"));
     }
-    TrustedDir::open_absolute_lookup_ancestor(&canonical, lookup_admin_group()).map_err(
-        |_unsafe| TrustError::Refused("a path component is foreign-owned or writable by others"),
-    )?;
+    TrustedDir::open_absolute_lookup_ancestor(&canonical).map_err(|_unsafe| {
+        TrustError::Refused("a path component is foreign-owned or writable by others")
+    })?;
     Ok(canonical)
 }
 

@@ -27,7 +27,7 @@ const DARWIN_ADMIN_GROUP: u32 = 80;
 /// is root (a child could regain root through its real uid): a root process that trusted a
 /// group-writable directory would let any admin plant a binary that root runs.
 /// On other platforms, and for root, a group-writable directory stays untrusted.
-pub(super) fn lookup_admin_group() -> Option<u32> {
+pub(crate) fn lookup_admin_group() -> Option<u32> {
     let root_involved =
         rustix::process::geteuid().as_raw() == 0 || rustix::process::getuid().as_raw() == 0;
     (cfg!(target_os = "macos") && !root_involved).then_some(DARWIN_ADMIN_GROUP)
@@ -462,11 +462,12 @@ fn validate_lookup_directories(
             // policy cannot accept macOS's non-sticky root:daemon run directory.
             continue;
         }
-        crate::filesystem::TrustedDir::open_absolute_lookup_ancestor(dir, lookup_admin_group())
-            .map_err(|error| Refusal::ChainDirectory {
+        crate::filesystem::TrustedDir::open_absolute_lookup_ancestor(dir).map_err(|error| {
+            Refusal::ChainDirectory {
                 dir: dir.clone(),
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
     }
     Ok(())
 }

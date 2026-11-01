@@ -93,7 +93,8 @@ Intel Macs are outside the release scope.
 
 *Residual risk.* A process running as another admin account of the same Mac can
 rename or swap entries that the user or root owns in the user's Homebrew
-directories, and Pohunek then runs them as the user; no password is needed.
+directories, or hard-link a file the user or root owns (from the same volume)
+into them, and Pohunek then runs them as the user; no password is needed.
 Entries that account creates are owned by it and stay refused. On a Mac where
 the user is the only admin this adds no principal. A host with several admins
 removes the exposure with `chmod g-w` on the Homebrew directories (`bin`,

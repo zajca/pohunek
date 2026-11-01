@@ -318,6 +318,7 @@ jobs:
           }
           run_as_root pohunek-platform filesystem::tests::apfs_foreign_owned_private_directory_is_rejected
           run_as_root pohunek-platform::executable_trust_root root_never_trusts_an_admin_group_writable_directory
+          run_as_root pohunek-platform::executable_trust_root root_built_fixtures_are_judged_by_an_unprivileged_process
 
       - name: Summarize flaky tests
         if: always()

@@ -92,7 +92,7 @@ MACOS_BUCKETS = {
         "package(=pohunek-platform) and "
         "(test(=filesystem::tests::apfs_foreign_owned_private_directory_is_rejected) or "
         "(binary(=executable_trust_root) and "
-        "test(=root_never_trusts_an_admin_group_writable_directory)))",
+        "(test(=root_never_trusts_an_admin_group_writable_directory) or test(=root_built_fixtures_are_judged_by_an_unprivileged_process))))",
     ),
     # Child images that only a parent test starts with `--ignored --exact`.
     "fixture": Bucket(
@@ -100,6 +100,7 @@ MACOS_BUCKETS = {
          "pohunek-session-worker", "pohunek-cli", "xtask"),
         " or ".join((
             "(binary_id(=pohunek-platform) and test(/(^|::)hold$/))",
+            "(binary(=executable_trust_root) and test(=an_unprivileged_process_applies_the_admin_group_rule_to_the_fixtures))",
             "(package(=pohunek-daemon) and test(/(^|::)hold$/))",
             "(binary_id(=pohunek-cli) and test(/(^|::)hold$/))",
             "(binary(=launchd) and test(/(^|::)fixture_entry$/))",

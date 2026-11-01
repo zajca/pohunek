@@ -620,22 +620,20 @@ impl TrustedDir {
 
     /// Validates an executable-lookup directory like [`Self::open_absolute_ancestor`],
     /// except that an effective-user-owned component may be group-writable when
-    /// its group is `admin_group`.
+    /// its group is the one the lookup policy accepts.
     ///
-    /// Only the executable-lookup policy of `shell_env` calls this: the group
-    /// write is accepted for the one group the caller names (macOS `admin`, gid
-    /// 80), never for another group, never for others, and never for a
-    /// system-owned component. Every other caller keeps the strict policy of
+    /// Only the executable-lookup policy of `shell_env` calls this. The group
+    /// comes from [`crate::shell_env::lookup_admin_group`]: macOS `admin` (gid
+    /// 80) for a process that is not root, otherwise none. The group write is
+    /// never accepted for another group, for others, or for a system-owned
+    /// component. Every other caller keeps the strict policy of
     /// [`Self::open_absolute_ancestor`].
     ///
     /// # Errors
     ///
     /// Returns [`FsError`] when the path is invalid, missing, or unsafe.
-    pub fn open_absolute_lookup_ancestor(
-        path: impl AsRef<Path>,
-        admin_group: Option<u32>,
-    ) -> FsResult<Self> {
-        Self::open_absolute_ancestor_inner(path.as_ref(), admin_group)
+    pub(crate) fn open_absolute_lookup_ancestor(path: impl AsRef<Path>) -> FsResult<Self> {
+        Self::open_absolute_ancestor_inner(path.as_ref(), crate::shell_env::lookup_admin_group())
     }
 
     fn open_absolute_ancestor_inner(path: &Path, admin_group: Option<u32>) -> FsResult<Self> {
