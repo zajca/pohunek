@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 const SPAWNER_DAEMON: &str = "d-scenario-daemon";
 
 async fn create_session(harness: &Harness, name: &str, origin: Option<(&str, &str)>) -> Value {
-    let args = ["session", "new", "--agent", "shell", "--name", name, "--json"];
+    let args = [
+        "session", "new", "--agent", "shell", "--name", name, "--json",
+    ];
     let output = match origin {
         Some((session_id, daemon_id)) => {
             harness
@@ -38,7 +40,8 @@ async fn create_session(harness: &Harness, name: &str, origin: Option<(&str, &st
         String::from_utf8_lossy(&output.stdout)
     );
     let document: Value = serde_json::from_slice(&output.stdout).expect("session JSON envelope");
-    document["ok"]["session"].clone()
+    // `session.new` flattens the session into the result.
+    document["ok"].clone()
 }
 
 fn listed_ids(document: &Value) -> Vec<&str> {
@@ -61,8 +64,12 @@ async fn session_list_spawned_by_returns_exactly_the_children() {
     let child_id = child["id"].as_str().expect("child id").to_owned();
     let sibling = create_session(&harness, "sibling", Some((&parent_id, SPAWNER_DAEMON))).await;
     let sibling_id = sibling["id"].as_str().expect("sibling id").to_owned();
-    let stranger = create_session(&harness, "stranger", Some(("s-other-spawner", SPAWNER_DAEMON)))
-        .await;
+    let stranger = create_session(
+        &harness,
+        "stranger",
+        Some(("s-other-spawner", SPAWNER_DAEMON)),
+    )
+    .await;
     let stranger_id = stranger["id"].as_str().expect("stranger id").to_owned();
 
     assert!(
@@ -114,7 +121,11 @@ async fn session_list_spawned_by_returns_exactly_the_children() {
     let output = harness
         .run(&["session", "list", "--spawned-by", "", "--json"])
         .await;
-    assert_ne!(output.status.code(), Some(0), "an empty session id is a usage error");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "an empty session id is a usage error"
+    );
 
     harness.stop().await;
 }
