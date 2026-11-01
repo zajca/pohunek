@@ -177,6 +177,17 @@ loopback Messages stub, dummy key; scenario
   screen carry it, as they do for the plain title `Claude Code`.
   `named_screens_are_classified_like_unnamed_ones` pins that a named screen reads
   exactly as its unnamed counterpart on both releases.
+- Detection limit: Claude draws the name into the title, the rule label and the
+  collision banner, which the manifest reads. A name that starts with a turn
+  glyph (`◐ deploy`) is, on 2.1.309, a bare title the `◐`/`◑` title rule reads
+  as `working`. With the probe answered the program-status records outrank the
+  title and the session reads `idle`
+  (`a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`,
+  also for the name `esc to interrupt`); a Claude without records on that
+  release (the probe unanswered, as inside a shell session, or records switched
+  off) is screen-only and such a name makes an idle session read `working`
+  until the name changes. 2.1.289 puts its own glyph first (`✳ ◐ deploy`), so
+  the same name stays `idle` there.
 - Resume: the name of the `--name` argument is the one shown. After a
   `session rename` to `beta`, a resume runs `--name=beta --resume <id>` and
   Claude shows `beta`, although the conversation started as `alpha`.

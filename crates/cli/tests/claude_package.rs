@@ -3661,6 +3661,7 @@ async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
             .any(|pair| pair[0] == "--resume" && pair[1] == reference),
         "{argv:?}"
     );
+    fixture.wait_screen_line(&id, "beta").await;
     show_named_screen(&fixture, &id, "resume beta").await;
 
     // Fork: its own name, never the source's.
@@ -3678,6 +3679,17 @@ async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
     let argv = session_argv(&fixture, &fork_id).await;
     assert_eq!(name_argument(&argv), ["--name=gamma"], "{argv:?}");
     assert!(argv.iter().any(|argument| argument == "--fork-session"));
+    let (title, rows) = fixture.screen(&fork_id).await;
+    assert!(
+        title
+            .as_deref()
+            .is_some_and(|title| title.contains("gamma"))
+            && !title
+                .as_deref()
+                .is_some_and(|title| title.contains('\u{2442}')),
+        "the fork shows its own name and no fork suffix: {title:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("gamma")), "{rows:#?}");
     show_named_screen(&fixture, &fork_id, "fork gamma").await;
 
     // A fork without a name passes none.
@@ -3694,6 +3706,36 @@ async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
 
     for stopped in [&unnamed_id, &fork_id, &id] {
         fixture.stop(stopped).await;
+    }
+    fixture.finish().await;
+}
+
+/// Names that spell a detection marker: a title that starts with a turn glyph
+/// and a footer phrase. Claude draws the name in its title, its rule label and
+/// the collision banner, so the detector sees it; the session still reads idle.
+const MARKER_NAMES: [&str; 2] = ["\u{25D0} deploy", "esc to interrupt"];
+
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    for name in MARKER_NAMES {
+        let id = fixture.new_session_id(name).await;
+        fixture.wait_activity(&id, "idle").await;
+        fixture.wait_screen_line(&id, "for shortcuts").await;
+        // The daemon's own detection reads the program-status records of the
+        // locked release, which outrank the name drawn into the title.
+        let inspected = fixture.inspect(&id).await;
+        assert_eq!(inspected["activity"], "idle", "{name:?}: {inspected}");
+        assert!(
+            ["osc_progress", "screen", "osc_title"]
+                .contains(&json_scalar(&inspected["state_source"]).as_str()),
+            "{name:?}: {inspected}"
+        );
+        show_named_screen(&fixture, &id, name).await;
+        fixture.stop(&id).await;
     }
     fixture.finish().await;
 }
