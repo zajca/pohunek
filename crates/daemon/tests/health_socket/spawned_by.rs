@@ -49,6 +49,17 @@ async fn create_from(
     serde_json::from_value(ok_payload(exchange(control, &request).await)).expect("session info")
 }
 
+/// Creates a session whose params carry a `spawned_by` key and no origin.
+async fn create_with_forged_param(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    cwd: PathBuf,
+) -> SessionInfo {
+    let mut params = serde_json::to_value(session_params_in(cwd)).expect("serialize params");
+    params["spawned_by"] = serde_json::json!({ "session_id": "s-forged", "daemon_id": "d-forged" });
+    let request = Request::make("session-new-forged", method::SESSION_NEW, params);
+    serde_json::from_value(ok_payload(exchange(control, &request).await)).expect("session info")
+}
+
 /// The ids `session.list` returns for `filters`, sorted.
 async fn listed_ids(
     control: &mut Framed<UnixStream, LinesCodec>,
@@ -109,7 +120,15 @@ async fn the_spawner_is_recorded_from_the_request_origin_and_survives_a_restart(
         BTreeMap::new(),
     )
     .await;
-    let orphan = create_from(&mut control, cwd, Some(&gone_origin), BTreeMap::new()).await;
+    let orphan = create_from(
+        &mut control,
+        cwd.clone(),
+        Some(&gone_origin),
+        BTreeMap::new(),
+    )
+    .await;
+    let forged = create_with_forged_param(&mut control, cwd).await;
+    assert_eq!(forged.spawned_by, None, "params cannot set the spawner");
 
     assert_eq!(
         parent.spawned_by, None,

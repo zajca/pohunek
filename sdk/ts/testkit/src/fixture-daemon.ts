@@ -206,6 +206,8 @@ interface ControlRequest {
   readonly id: string;
   readonly method: string;
   readonly params: unknown;
+  /** The paired request origin, present only when both markers are strings. */
+  readonly origin?: { readonly session_id: string; readonly daemon_id: string };
 }
 
 type ControlResponse =
@@ -977,6 +979,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
 
     const session = this.buildSession(params, runtime.agent_base ?? agentBaseFor(params.agent));
+    if (request.origin !== undefined) session.spawned_by = { ...request.origin };
     this.sessions.set(session.id, session);
     const activityStream = ackTimeoutMs === undefined ? undefined : this.openActivityStream(session.id);
     this.emitSessionEvent(EVENT_SESSION_CREATED, session);
@@ -1139,6 +1142,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       source.agent_base,
     );
     if (source.metadata !== undefined) session.metadata = cloneValue(source.metadata);
+    if (request.origin !== undefined) session.spawned_by = { ...request.origin };
     this.sessions.set(session.id, session);
     this.emitSessionEvent(EVENT_SESSION_CREATED, session);
     return okResponse(request.id, cloneValue(session));
@@ -2436,11 +2440,16 @@ function parseRequest(line: string): ControlRequest | { readonly err: ProtocolEr
   if (!isProtocolVersionRange(version) || typeof id !== "string" || typeof method !== "string") {
     return { err: badRequest("invalid request envelope") };
   }
+  const originSession = parsed["origin_session_id"];
+  const originDaemon = parsed["origin_daemon_id"];
   return {
     v: version,
     id,
     method,
     params: Object.hasOwn(parsed, "params") ? parsed["params"] : null,
+    ...(typeof originSession === "string" && typeof originDaemon === "string"
+      ? { origin: { session_id: originSession, daemon_id: originDaemon } }
+      : {}),
   };
 }
 

@@ -1105,6 +1105,16 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(await client.call("session.list", {
         filters: [{ key: "spawned_by", value: "s-parent" }],
       })).toEqual([]);
+
+      const spawner = await connectLocal(requireUnixSocket(daemon), {
+        origin: { sessionId: "s-parent", daemonId: "d-parent" },
+      });
+      const child = await spawner.call("session.new", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
+      expect(child.spawned_by).toEqual({ session_id: "s-parent", daemon_id: "d-parent" });
+      expect((await client.call("session.list", {
+        filters: [{ key: "spawned_by", value: "s-parent" }],
+      })).map((session) => session.id)).toEqual([child.id]);
+      await spawner.close();
       await expectProtocolError(client.call("session.list", {
         filters: [{ key: "spawned_by", value: { session_id: "s-parent" } as unknown as string }],
       }), "bad_request");

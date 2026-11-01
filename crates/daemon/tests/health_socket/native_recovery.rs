@@ -8,6 +8,8 @@ const LAUNCH: &str = "fixture-claude-launch";
 const CLEAR: &str = "fixture-claude-clear";
 const SELECTED: &str = "fixture-claude-selected";
 const FORKED: &str = "fixture-claude-forked";
+const SOURCE_SPAWNER_SESSION: &str = "s-source-spawner";
+const SOURCE_SPAWNER_DAEMON: &str = "d-source-spawner";
 
 async fn listed_sessions(control: &mut Framed<UnixStream, LinesCodec>) -> Vec<SessionInfo> {
     serde_json::from_value(ok_payload(
@@ -88,6 +90,10 @@ impl ClaudeRig {
         std::fs::write(&self.store_path, rewritten).expect("rewrite durable session store");
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the rig assembles the fixture agent, profile, hooks and daemon in one place"
+    )]
     async fn new(tag: &str) -> Self {
         let bin = temp_dir(&format!("{tag}-bin"));
         let state = temp_dir(&format!("{tag}-state"));
@@ -162,10 +168,21 @@ impl ClaudeRig {
         let mut control = connect(&socket).await;
         let mut params = session_params_in(cwd.to_path_buf());
         "claude-fixture".clone_into(&mut params.agent);
-        let session: SessionInfo = serde_json::from_value(ok_payload(
-            create_session_with_params(&mut control, params).await,
-        ))
-        .expect("create fixture Claude session");
+        // The source session has a spawner of its own, so a fork that copied it
+        // would show.
+        let create = Request::make(
+            "claude-fixture-new",
+            method::SESSION_NEW,
+            serde_json::to_value(params).expect("serialize params"),
+        )
+        .with_origin(
+            Some(SessionId(SOURCE_SPAWNER_SESSION.to_owned())),
+            Some(SOURCE_SPAWNER_DAEMON.to_owned()),
+        )
+        .expect("valid origin pair");
+        let session: SessionInfo =
+            serde_json::from_value(ok_payload(exchange(&mut control, &create).await))
+                .expect("create fixture Claude session");
         wait_until("fixture agent to start reading its PTY", || async {
             argv_log.exists().then_some(())
         })
@@ -1587,11 +1604,15 @@ async fn a_fork_records_the_forking_request_origin_and_keeps_it_through_resume_a
     assert_eq!(forked.session.spawned_by.as_ref(), Some(&origin));
     assert_eq!(
         plain.session.spawned_by, None,
-        "a fork records no origin it was not sent"
+        "a fork without an origin does not inherit its source's spawner"
     );
     assert_eq!(
-        source.spawned_by, None,
-        "the source never gains the fork's origin"
+        source.spawned_by,
+        Some(protocol::SpawnedBy {
+            session_id: SessionId(SOURCE_SPAWNER_SESSION.to_owned()),
+            daemon_id: SOURCE_SPAWNER_DAEMON.to_owned(),
+        }),
+        "the source keeps its own spawner and never gains the fork's origin"
     );
     assert_eq!(
         resumed.spawned_by.as_ref(),
