@@ -2591,3 +2591,50 @@ fn every_documented_result_maps_to_its_cause_and_the_exit_rides_along() {
     ));
     assert_eq!((exited.signal, exited.code), (None, Some(3)));
 }
+
+#[test]
+fn the_kill_counters_name_exactly_one_killer_and_the_detail_rides_along() {
+    use pohunek_platform::supervisor::{ExitEvidence, JobExit};
+    use std::time::{Duration, SystemTime};
+
+    let oom = |oom_kills, managed| {
+        super::runtime_exit(
+            &ExitEvidence::new("oom-kill".to_owned(), Some(JobExit::Signal(9)))
+                .with_oom_kills(oom_kills, managed),
+        )
+    };
+    assert_eq!(oom(Some(1), Some(0)).oom_killer.as_deref(), Some("kernel"));
+    assert_eq!(
+        oom(Some(0), Some(2)).oom_killer.as_deref(),
+        Some("systemd_oomd")
+    );
+    assert_eq!(oom(Some(1), Some(1)).oom_killer, None, "both is ambiguous");
+    assert_eq!(oom(Some(0), Some(0)).oom_killer, None, "no kill is unnamed");
+    assert_eq!(
+        oom(None, None).oom_killer,
+        None,
+        "an old manager names none"
+    );
+    assert_eq!(
+        oom(Some(1), None).oom_killer.as_deref(),
+        Some("kernel"),
+        "one counter that is present decides"
+    );
+
+    // A killer is never named for a result that is not an OOM kill.
+    let signalled = super::runtime_exit(
+        &ExitEvidence::new("signal".to_owned(), Some(JobExit::Signal(9)))
+            .with_oom_kills(Some(1), Some(0)),
+    );
+    assert_eq!(signalled.oom_killer, None);
+
+    let detailed = super::runtime_exit(
+        &ExitEvidence::new("oom-kill".to_owned(), None)
+            .with_memory_peak(Some(26_300_000_000))
+            .with_exited_at(Some(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))),
+    );
+    assert_eq!(detailed.memory_peak_bytes, Some(26_300_000_000));
+    assert_eq!(detailed.ended_at.as_deref(), Some("1970-01-02T00:00:00Z"));
+    let bare = super::runtime_exit(&ExitEvidence::new("oom-kill".to_owned(), None));
+    assert_eq!((bare.memory_peak_bytes, bare.ended_at), (None, None));
+}

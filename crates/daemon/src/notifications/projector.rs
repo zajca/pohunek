@@ -2109,6 +2109,7 @@ mod tests {
                 last_connected_at: None,
                 loss_reason: None,
                 exit: None,
+                loss_cause: None,
             }),
             ..session_info(session_id, state, exit_code)
         }

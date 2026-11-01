@@ -389,15 +389,22 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .await;
     let isolation_runtime = lost_isolation.runtime.expect("isolation runtime");
     assert_eq!(isolation_runtime.state, RuntimeState::Lost);
+    let isolation_exit = isolation_runtime.exit.expect("the manager's verdict");
     assert_eq!(
-        isolation_runtime.exit,
-        Some(protocol::RuntimeExit {
-            cause: "signal".to_owned(),
-            signal: Some(9),
-            code: None,
-        }),
+        (
+            isolation_exit.cause.as_str(),
+            isolation_exit.signal,
+            isolation_exit.code,
+            isolation_exit.oom_killer.as_deref(),
+        ),
+        ("signal", Some(9), None, None),
         "the manager's verdict on the SIGKILLed worker reaches the session"
     );
+    assert!(
+        isolation_exit.ended_at.is_some(),
+        "the manager reports when the worker ended: {isolation_exit:?}"
+    );
+    assert_eq!(isolation_runtime.loss_cause, None);
     assert_eq!(
         Fixture::main_pid(&fixture.isolation_worker_unit),
         0,
@@ -424,23 +431,20 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     );
 }
 
-/// A worker unit OOM-killed under real memory pressure is a failed session
-/// whose runtime says why: the manager's verdict is read before the daemon
-/// retires the failed unit.
-#[tokio::test]
-#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
-async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
-    assert_eq!(
-        std::env::var("POHUNEK_SYSTEMD_E2E").as_deref(),
-        Ok("1"),
-        "set POHUNEK_SYSTEMD_E2E=1 explicitly"
-    );
-    require_memory_controller();
-    let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
-    let worker_bin = required_binary("POHUNEK_WORKER_BIN");
-    let fixture = Fixture::new(&worker_bin);
-    fixture.install_claude_package().await;
+/// Starts one initialized worker with a persisted session record, then the
+/// daemon, and waits until the daemon has adopted the session.
+async fn adopt_running_worker(fixture: &Fixture, daemon_bin: &Path) {
+    prepare_worker(fixture).await;
+    fixture.start_daemon(daemon_bin);
+    fixture
+        .wait_for_activity(&fixture.session_id, AgentActivity::Working)
+        .await;
+}
 
+/// Starts one initialized worker unit with a persisted session record and no
+/// daemon.
+async fn prepare_worker(fixture: &Fixture) {
+    fixture.install_claude_package().await;
     fixture.start_worker(&fixture.worker_key).await;
     let worker = fixture.connect_worker("fixture-controller").await;
     let worker_id = worker.worker_id().await;
@@ -467,10 +471,45 @@ async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
     drop(worker);
     // timing-allowed: #326 lets the worker settle after its controller is released, as the lifecycle scenario does
     tokio::time::sleep(CONNECT_DELAY).await;
-    fixture.start_daemon(&daemon_bin);
-    fixture
-        .wait_for_activity(&fixture.session_id, AgentActivity::Working)
-        .await;
+}
+
+/// Polls the real daemon until the session's runtime is lost, within `bound`.
+async fn wait_for_lost(fixture: &Fixture, bound: Duration, what: &str) -> SessionInfo {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        let info = fixture.inspect().await;
+        if info
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+        {
+            return info;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            fixture.print_status();
+            panic!("{what} was not classified lost in time");
+        }
+        // timing-allowed: #326 polls the real daemon for the loss, bounded by the explicit deadline above
+        tokio::time::sleep(CONNECT_DELAY).await;
+    }
+}
+
+/// A worker unit OOM-killed under real memory pressure is a failed session
+/// whose runtime says why: the manager's verdict is read before the daemon
+/// retires the failed unit.
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
+async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
+    assert_eq!(
+        std::env::var("POHUNEK_SYSTEMD_E2E").as_deref(),
+        Ok("1"),
+        "set POHUNEK_SYSTEMD_E2E=1 explicitly"
+    );
+    require_memory_controller();
+    let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
+    let worker_bin = required_binary("POHUNEK_WORKER_BIN");
+    let fixture = Fixture::new(&worker_bin);
+    adopt_running_worker(&fixture, &daemon_bin).await;
 
     let unit_pid = Fixture::main_pid(&fixture.worker_unit);
     assert_ne!(unit_pid, 0, "the worker unit runs");
@@ -484,31 +523,145 @@ async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
         "MemorySwapMax=0",
     ]);
 
-    let deadline = tokio::time::Instant::now() + SWEEP_GRACE + SYSTEMD_CALL_TIMEOUT + LOSS_MARGIN;
-    let lost = loop {
-        let info = fixture.inspect().await;
-        if info
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
-        {
-            break info;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            fixture.print_status();
-            panic!("the OOM-killed worker was not classified lost in time");
-        }
-        // timing-allowed: #326 polls the real daemon for the loss, bounded by the explicit deadline above
-        tokio::time::sleep(CONNECT_DELAY).await;
-    };
+    let lost = wait_for_lost(
+        &fixture,
+        SWEEP_GRACE + SYSTEMD_CALL_TIMEOUT + LOSS_MARGIN,
+        "the OOM-killed worker",
+    )
+    .await;
     assert_eq!(lost.state, protocol::SessionState::Failed);
     assert_eq!(lost.activity, None);
     let runtime = lost.runtime.expect("lost runtime");
+    let exit = runtime.exit.as_ref().expect("the manager's verdict");
+    assert_eq!(exit.cause, "oom_kill", "{runtime:?}");
     assert_eq!(
-        runtime.exit.as_ref().map(|exit| exit.cause.as_str()),
-        Some("oom_kill"),
+        exit.oom_killer.as_deref(),
+        Some("kernel"),
+        "the kernel killed the worker: {runtime:?}"
+    );
+    assert!(
+        exit.memory_peak_bytes.is_some_and(|peak| peak > 0),
+        "the unit's peak memory is reported: {runtime:?}"
+    );
+    assert!(exit.ended_at.is_some(), "{runtime:?}");
+    assert_eq!(runtime.loss_cause, None, "an exit explains the loss itself");
+}
+
+/// A worker unit an operator reset (`reset-failed`) while the user manager
+/// stayed alive leaves no verdict and no explanation: the loss stays plain.
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
+async fn a_reset_worker_unit_under_a_live_manager_is_lost_without_an_explanation() {
+    assert_eq!(
+        std::env::var("POHUNEK_SYSTEMD_E2E").as_deref(),
+        Ok("1"),
+        "set POHUNEK_SYSTEMD_E2E=1 explicitly"
+    );
+    let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
+    let worker_bin = required_binary("POHUNEK_WORKER_BIN");
+    let fixture = Fixture::new(&worker_bin);
+    prepare_worker(&fixture).await;
+
+    // The unit ends and is reset before any daemon runs, so no verdict is
+    // left to read.
+    Fixture::systemctl([
+        "kill",
+        "--kill-whom=main",
+        "--signal=KILL",
+        fixture.worker_unit.as_str(),
+    ]);
+    let deadline = tokio::time::Instant::now() + SYSTEMD_CALL_TIMEOUT;
+    while Fixture::main_pid(&fixture.worker_unit) != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the killed worker unit never ended"
+        );
+        // timing-allowed: #326 polls the real manager for the unit's end, bounded by the explicit deadline above
+        tokio::time::sleep(CONNECT_DELAY).await;
+    }
+    Fixture::systemctl(["reset-failed", fixture.worker_unit.as_str()]);
+    fixture.start_daemon(&daemon_bin);
+
+    let lost = wait_for_lost(
+        &fixture,
+        SWEEP_GRACE + SYSTEMD_CALL_TIMEOUT + LOSS_MARGIN,
+        "the reset worker",
+    )
+    .await;
+    let runtime = lost.runtime.expect("lost runtime");
+    assert_eq!(runtime.exit, None, "{runtime:?}");
+    assert_eq!(
+        runtime.loss_cause, None,
+        "the user manager that held the worker still runs: {runtime:?}"
+    );
+}
+
+/// The user manager that held the worker is killed and started again while
+/// the session runs; the restarted daemon finds the worker gone with no
+/// verdict and names the manager as the cause.
+///
+/// It kills the CI runner's own user manager through `sudo`, so it runs only
+/// where `POHUNEK_PRIVILEGED_E2E=1` and passwordless `sudo` are given; a
+/// local run adds `--skip privileged_`.
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, POHUNEK_PRIVILEGED_E2E=1 and passwordless sudo (CI only)"]
+async fn privileged_a_killed_user_manager_is_the_cause_of_a_lost_runtime() {
+    assert_eq!(
+        std::env::var("POHUNEK_SYSTEMD_E2E").as_deref(),
+        Ok("1"),
+        "set POHUNEK_SYSTEMD_E2E=1 explicitly"
+    );
+    assert_eq!(
+        std::env::var("POHUNEK_PRIVILEGED_E2E").as_deref(),
+        Ok("1"),
+        "set POHUNEK_PRIVILEGED_E2E=1 explicitly; this scenario kills the user manager"
+    );
+    let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
+    let worker_bin = required_binary("POHUNEK_WORKER_BIN");
+    let fixture = Fixture::new(&worker_bin);
+    adopt_running_worker(&fixture, &daemon_bin).await;
+
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let manager_unit = format!("user@{uid}.service");
+    for arguments in [
+        vec!["systemctl", "kill", "--signal=KILL", manager_unit.as_str()],
+        vec!["systemctl", "start", manager_unit.as_str()],
+    ] {
+        let output = Command::new("sudo")
+            .arg("--non-interactive")
+            .args(&arguments)
+            .output()
+            .expect("run sudo systemctl");
+        assert_success(&output);
+    }
+    let deadline = tokio::time::Instant::now() + SYSTEMD_CALL_TIMEOUT;
+    while !Fixture::systemctl_output(["is-system-running"])
+        .status
+        .success()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the user manager did not come back"
+        );
+        // timing-allowed: #326 polls the restarted real manager, bounded by the explicit deadline above
+        tokio::time::sleep(CONNECT_DELAY).await;
+    }
+    fixture.start_daemon(&daemon_bin);
+
+    let lost = wait_for_lost(
+        &fixture,
+        SWEEP_GRACE + SYSTEMD_CALL_TIMEOUT + LOSS_MARGIN,
+        "the worker of the killed user manager",
+    )
+    .await;
+    assert_eq!(lost.state, protocol::SessionState::Failed);
+    let runtime = lost.runtime.expect("lost runtime");
+    assert_eq!(
+        runtime.loss_cause.as_deref(),
+        Some("user_manager_lost"),
         "{runtime:?}"
     );
+    assert_eq!(runtime.exit, None, "no unit survived to give a verdict");
 }
 
 /// The OOM scenario needs the user manager to enforce `MemoryMax`, which
@@ -938,6 +1091,7 @@ impl Fixture {
                 last_connected_at: Some(now.clone()),
                 loss_reason: None,
                 exit: None,
+                loss_cause: None,
             }),
             cols: 80,
             rows: 24,

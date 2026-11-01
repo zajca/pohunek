@@ -890,6 +890,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
             last_connected_at: None,
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         }),
     }
 }

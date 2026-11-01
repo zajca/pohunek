@@ -97,6 +97,7 @@ impl Fixture {
             last_connected_at: None,
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         });
         db.record_session(&record)
             .expect("record supervised generation");

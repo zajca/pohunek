@@ -1633,7 +1633,10 @@ fn read_journal(
 ///
 /// The cause comes from the manager's `Result` token and never from the
 /// signal, because an OOM kill reports the stop signal as the main status.
-/// A token outside the documented set is `other`.
+/// A token outside the documented set is `other`. The killer is named only
+/// for an `oom_kill` and only when the counters evidence exactly one: a
+/// systemd-oomd kill also ends the unit with `Result=oom-kill`, so the
+/// counters, not the result, tell the killers apart.
 pub(crate) fn runtime_exit(evidence: &ExitEvidence) -> RuntimeExit {
     let cause = match evidence.result() {
         "oom-kill" => "oom_kill",
@@ -1654,7 +1657,33 @@ pub(crate) fn runtime_exit(evidence: &ExitEvidence) -> RuntimeExit {
         cause: cause.to_owned(),
         signal,
         code,
+        oom_killer: (cause == "oom_kill")
+            .then(|| oom_killer(evidence))
+            .flatten()
+            .map(str::to_owned),
+        memory_peak_bytes: evidence.memory_peak(),
+        ended_at: evidence.exited_at().and_then(format_rfc3339),
     }
+}
+
+/// The memory killer the kill counters evidence, when exactly one.
+fn oom_killer(evidence: &ExitEvidence) -> Option<&'static str> {
+    let kills = |count: Option<u64>| count.is_some_and(|count| count > 0);
+    match (
+        kills(evidence.oom_kills()),
+        kills(evidence.managed_oom_kills()),
+    ) {
+        (true, false) => Some("kernel"),
+        (false, true) => Some("systemd_oomd"),
+        _ => None,
+    }
+}
+
+/// Formats a wall-clock time as an RFC 3339 UTC string.
+fn format_rfc3339(time: std::time::SystemTime) -> Option<String> {
+    time::OffsetDateTime::from(time)
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 #[cfg(test)]

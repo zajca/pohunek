@@ -59,7 +59,7 @@ use crate::journal::{
     ActiveIdentity, BackgroundOwner, ChildIdentity, JournalRecord, LaunchIdentity,
     NativeReferenceClaim, PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome,
     RuntimePhase as JournalPhase, SubagentPhase as JournalSubagentPhase, SubagentRecord,
-    WorkerOrigin,
+    WorkerManager, WorkerOrigin,
 };
 use crate::launch::{self, LaunchClaimStatus};
 use crate::notification;
@@ -446,6 +446,7 @@ impl Server {
         record.worker_spawn_id = own_spawn_id();
         record.worker_coalitions = own_coalitions();
         record.worker_control_group = own_control_group();
+        record.worker_manager = own_manager();
         record.boot_session_id = HostInspector::new()
             .boot_session_id()
             .inspect_err(|error| {
@@ -7855,6 +7856,42 @@ fn own_control_group() -> Option<String> {
                 error.type = "process_inspection",
                 error.message = %error,
                 "worker control group could not be read; journaling none: {{error.message}}",
+            );
+            None
+        }
+    }
+}
+
+/// Environment variable a systemd user manager sets, for every service it
+/// starts, to its own process identifier.
+const MANAGER_PID_VARIABLE: &str = "MANAGERPID";
+
+/// Reads the user service manager that started this worker as its unit, for
+/// the journal.
+///
+/// The manager is recorded only when `MANAGERPID` names the worker's parent:
+/// a unit's main process is a direct child of its manager, while a worker
+/// started by a direct launcher inherits the variable from a daemon that is
+/// itself a unit and has the daemon as its parent. It is evidence for a later
+/// loss classification only, so every failure yields `None` and never stops
+/// the worker.
+fn own_manager() -> Option<WorkerManager> {
+    let pid = std::env::var(MANAGER_PID_VARIABLE)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0 && *pid == std::os::unix::process::parent_id())?;
+    match process_start(pid) {
+        Ok(start_identity) => Some(WorkerManager {
+            pid,
+            start_identity: start_identity.to_string(),
+        }),
+        Err(error) => {
+            event!(
+                name: "worker.manager.unreadable",
+                Level::WARN,
+                error.message = %error,
+                "worker manager could not be read; journaling none: {{error.message}}",
             );
             None
         }
