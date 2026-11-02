@@ -776,7 +776,10 @@ pub(crate) async fn run_new(
         .await
         .map_err(|error| match error {
             CliError::Client(source @ pohunek_client::ClientError::RequestTimeout { .. }) => {
-                CliError::SessionNewOutcomeUnknown(source)
+                CliError::SessionNewOutcomeUnknown {
+                    source: Box::new(source),
+                    request_id: args.request_id.clone(),
+                }
             }
             other => other,
         })?;

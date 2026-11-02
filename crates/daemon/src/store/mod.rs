@@ -1096,6 +1096,25 @@ impl Store {
             .map(|entry| (*entry.record).clone()))
     }
 
+    /// The durable records created under the client request key `key`, in
+    /// store order. Only the matching records are copied out of the store.
+    pub fn sessions_holding_request(&self, key: &str) -> io::Result<Vec<SessionRecord>> {
+        Ok(self
+            .snapshot()?
+            .records
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry
+                    .record
+                    .create_request
+                    .as_deref()
+                    .is_some_and(|held| held.id == key)
+            })
+            .map(|entry| (*entry.record).clone())
+            .collect())
+    }
+
     /// Read notification sources without treating rejected records as absence.
     ///
     /// `None` marks an incomplete snapshot, including a torn final line. Read

@@ -496,11 +496,20 @@ impl ResumeHint<'_> {
         error.msg = format!("{} (request id `{}`)", error.msg, self.request_id);
         let resume = self.recover_text();
         let recorded = RECORDED_CODES.contains(&error.code.as_str());
+        let conflict = !self.resumable && error.code == protocol::SESSION_REQUEST_CONFLICT_CODE;
         error.recover = match (unknown, recorded, error.recover.take()) {
-            (true, _, _) | (false, true, None) => Some(resume),
-            (false, true, Some(own)) => {
-                Some(format!("{own}; if a session was created anyway, {resume}"))
+            (true, _, Some(own)) => Some(format!(
+                "{own}; if the daemon created the session anyway, {resume}"
+            )),
+            (false, true, Some(own)) => Some(format!("{own}; to get the session back, {resume}")),
+            (true, _, None) | (false, true, None) => {
+                Some(format!("the daemon may have created the session: {resume}"))
             }
+            (false, false, Some(own)) if conflict => Some(format!(
+                "{own}; on a remote host a repeated launch of the same request lands here, \
+                 because its opening prompt differs: `details.session_id` names the session the \
+                 first request created, so do not start another"
+            )),
             (false, false, own) => own,
         };
         AssistantError::Protocol(error)
@@ -510,17 +519,19 @@ impl ResumeHint<'_> {
         let id = self.request_id;
         if self.resumable {
             format!(
-                "the daemon may have created the session: rerun the same command with \
-                 `--request-id {id}` to get it back (the daemon answers with the same session, \
-                 or with `session_request_in_progress` while it is still being created); the \
-                 request, target and `--meta` flags and the agent must be unchanged"
+                "rerun the same command with `--request-id {id}` to get it back (the daemon \
+                 answers with the same session, or with `session_request_in_progress` while it \
+                 is still being created); the request, target and `--meta` flags and the agent \
+                 must be unchanged"
             )
         } else {
             format!(
-                "the daemon may have created the session: look for it with `pohunek session \
-                 list`, filtered by the `--meta` key you passed; a new launch cannot replay \
-                 request id `{id}` on a remote host, because the opening prompt names a snapshot \
-                 path that host picks for every launch"
+                "a new launch cannot replay request id `{id}` on a remote host, because the \
+                 opening prompt names a snapshot path that host picks for every launch: if the \
+                 first request created the session, rerunning with `--request-id {id}` answers \
+                 `session_request_conflict` and its `details.session_id` names the session; \
+                 otherwise the rerun creates it. You can also look for it with `pohunek session \
+                 list`, filtered by the `--meta` key you passed"
             )
         }
     }

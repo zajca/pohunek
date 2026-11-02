@@ -25,8 +25,9 @@ const REQUEST_TIMEOUT_MS: &str = "200";
 /// Mode of the runtime directory the client expects to be owner-private.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
-#[test]
-fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
+/// Runs `session new` against a daemon that never answers it and returns the
+/// recovery hint of the timeout error.
+fn recover_after_no_reply(extra_args: &[&str]) -> String {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let root = env.root().to_path_buf();
     for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -54,6 +55,7 @@ fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
             REQUEST_TIMEOUT_MS,
             "--json",
         ])
+        .args(extra_args)
         .output()
         .expect("run pohunek session new");
 
@@ -61,12 +63,46 @@ fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
     let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON error document");
     let error = &document["err"];
     assert_eq!(error["code"], "request_timeout", "{document}");
-    let recover = error["recover"].as_str().expect("a recovery hint");
-    assert!(recover.contains("--request-id"), "{recover}");
+    error["recover"]
+        .as_str()
+        .expect("a recovery hint")
+        .to_owned()
+}
+
+#[test]
+fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
+    let recover = recover_after_no_reply(&[]);
+
+    assert!(
+        recover.contains("pass `--request-id <id>` on the first create"),
+        "{recover}"
+    );
+    assert!(
+        !recover.contains("retry with"),
+        "an unkeyed create cannot be matched by a keyed retry: {recover}"
+    );
     assert!(recover.contains("--meta-eq"), "{recover}");
     assert!(
         recover.contains("an empty list does not prove that nothing was created"),
         "{recover}"
+    );
+    assert!(
+        recover.contains("can create a second session"),
+        "an unkeyed create warns that a retry may duplicate: {recover}"
+    );
+}
+
+#[test]
+fn a_keyed_session_new_without_a_reply_names_its_request_id() {
+    let recover = recover_after_no_reply(&["--request-id", "launch-1014"]);
+
+    assert!(
+        recover.contains("retry with the same `--request-id launch-1014`"),
+        "{recover}"
+    );
+    assert!(
+        !recover.contains("can create a second session"),
+        "a keyed retry cannot duplicate: {recover}"
     );
 }
 
@@ -95,6 +131,18 @@ fn serve_connection(stream: UnixStream) {
                 "status": "ok",
                 "daemon_version": "fixture",
                 "protocol_version": PROTOCOL_VERSION.get()
+            }),
+            protocol::method::HOST_INSPECT => json!({
+                "daemon_version": "fixture",
+                "protocol_version": PROTOCOL_VERSION.get(),
+                "supported_agents": ["shell"],
+                "runtimes": [],
+                "git_available": true,
+                "worktree_supported": true,
+                "terminal_read_supported": true,
+                "output_read_supported": true,
+                "session_wait_supported": true,
+                "session_new_request_id_supported": true
             }),
             // The create is still running; the reply never comes.
             protocol::method::SESSION_NEW => continue,
