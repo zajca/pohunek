@@ -107,7 +107,7 @@ fn a_lost_runtime_is_one_crashed_state_whether_or_not_the_loss_is_proven() {
             "s-unproven",
             "running",
             Some(lost(
-                json!({"loss_reason": "runtime_lost_cleanup_unconfirmed"}),
+                &json!({"loss_reason": "runtime_lost_cleanup_unconfirmed"}),
             )),
         ),
         session("s-stopped-lost", "stopped", Some(lost(&json!({})))),
