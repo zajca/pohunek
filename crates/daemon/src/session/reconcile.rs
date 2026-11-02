@@ -14645,6 +14645,52 @@ handler = "codex-hook-v1"
             assert_eq!(runtime.exit, Some(oom_exit()));
         }
 
+        /// A restart after a reboot (or after the user manager was replaced)
+        /// finds journal evidence that would explain a loss, but the loss was
+        /// classified earlier: the stored verdict stays and no cause is added.
+        #[tokio::test]
+        async fn a_stored_verdict_is_not_replaced_by_a_later_restart_explanation() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-4229");
+            persist_record(&fixture.root, "s-4229", Some("runtime-s-4229"));
+            write_live_journal(
+                &fixture.root,
+                "s-4229",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-4229"),
+            );
+            let id = service_id("s-4229", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("first start");
+
+            // The host booted again before the next start.
+            write_journal_record(
+                &fixture.root,
+                "s-4229",
+                "worker-s-4229",
+                TEST_GENERATION,
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-4229"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("second start");
+
+            let runtime = runtime_of(&fixture.registry, "s-4229").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.exit, Some(oom_exit()));
+            assert_eq!(runtime.loss_cause, None);
+        }
+
         #[tokio::test]
         async fn a_verdict_survives_a_failed_write_of_the_classification() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
