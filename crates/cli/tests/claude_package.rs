@@ -2739,6 +2739,14 @@ impl Fixture {
     /// Starts a session that runs a background shell until `gate` exists, and
     /// returns once the main turn's `Stop` listed the shell.
     async fn launch_background_shell(&self, name: &str, gate: &Path) -> String {
+        assert!(
+            gate.to_str()
+                .is_some_and(|path| path.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+                })),
+            "the stub reads a plain gate path: {}",
+            gate.display()
+        );
         let id = self.new_session_id(name).await;
         self.wait_activity(&id, "idle").await;
         self.input(
@@ -4891,7 +4899,7 @@ async fn a_real_claude_background_shell_leaves_the_snapshot_at_the_next_main_sto
 const RECORD_WINDOW: Duration = Duration::from_secs(30);
 
 /// Record only (design row P2.3): whether a background shell that is killed
-/// from outside, as a task stopped in Claude's task list would be, is dropped
+/// from outside is dropped
 /// from the snapshot by a following main `Stop`. The result is printed as
 /// `P2.3 RESULT`; the scenario asserts nothing about it, because a missing
 /// `Stop` is the documented limit of the hold (it lasts until the next main
@@ -4905,6 +4913,7 @@ async fn a_killed_real_claude_background_shell_is_recorded_for_the_hold_limit() 
     fixture.allow_bash();
     let gate = fixture.harness.env.root().join("killed.gate");
     let id = fixture.launch_background_shell("bg-kill", &gate).await;
+    let pid = fixture.inspect(&id).await["pid"].clone();
 
     let needle = gate.display().to_string();
     let mut killed = 0;
@@ -4931,6 +4940,7 @@ async fn a_killed_real_claude_background_shell_is_recorded_for_the_hold_limit() 
     }
     assert!(killed > 0, "the background shell's process was found");
 
+    // timing-allowed: #495 record-only window for a main Stop that may never come
     let followed = tokio::time::timeout(
         RECORD_WINDOW,
         wait_until("the snapshot to drop the killed shell", || async {
@@ -4939,6 +4949,12 @@ async fn a_killed_real_claude_background_shell_is_recorded_for_the_hold_limit() 
     )
     .await
     .is_ok();
+    let after = fixture.inspect(&id).await;
+    assert_eq!(
+        after["runtime"]["state"], "live",
+        "an empty snapshot is a main Stop's only if the runtime lives: {after}"
+    );
+    assert_eq!(after["pid"], pid, "{after}");
     eprintln!(
         "P2.3 RESULT: a main Stop followed the killed shell within {RECORD_WINDOW:?}: {followed}"
     );
@@ -4964,16 +4980,21 @@ async fn the_locked_real_claude_monitor_tool_is_recorded() {
     })
     .await;
     let bodies = fixture.stub.bodies_containing(PROMPT);
-    let declares = |tool: &str| {
+    let lists_tool = |tool: &str| {
         bodies
             .iter()
             .any(|body| body.contains(&format!("\"name\":\"{tool}\"")))
     };
     // `Bash` is declared by every Claude Code release, so a request that does
     // not show it means the probe cannot read the tool list.
-    assert!(declares("Bash"), "the probe reads the declared tools");
-    let declared = declares("Monitor");
-    eprintln!("P2.2 RESULT: the Monitor tool is declared to the model: {declared}");
+    assert!(lists_tool("Bash"), "the probe reads the declared tools");
+    let declared = lists_tool("Monitor");
+    let named = bodies.iter().any(|body| body.contains("Monitor"));
+    eprintln!(
+        "P2.2 RESULT: the Monitor tool is declared to the model: {declared}; the name appears \
+         anywhere in the request: {named}. This fixture's configuration decides both: it points \
+         Claude at a loopback endpoint and switches non-essential traffic off."
+    );
 
     fixture.stop(&id).await;
     fixture.finish().await;
