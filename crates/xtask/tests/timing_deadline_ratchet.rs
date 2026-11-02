@@ -20,7 +20,10 @@
 //!   case); a `let` binding or a bare variable is not a field and is not
 //!   counted;
 //! - (c) the value of a `const` or `static` whose name contains one of those
-//!   words.
+//!   words. Such a name that ends in `_ms`/`_MS` also counts when the value is a
+//!   string literal of decimal digits below `HANG_GUARD`, such as the
+//!   `--request-timeout-ms` argument a test passes to the CLI as
+//!   `"200"`.
 //!
 //! A literal is an integer, with `_` separators and an optional type suffix,
 //! or a product of such integers (`5 * 60`); zero is not a budget. A named
@@ -232,6 +235,20 @@ fn literal_in_value(
         .then(|| start + (value.len() - value.trim_start().len()))
 }
 
+/// The start of the value `[start, end)` of the item `name` when `name` counts
+/// milliseconds and the value is a string literal of decimal digits below the
+/// hang guard. `code` is the view that keeps string contents.
+fn string_milliseconds_in_value(code: &str, name: &str, start: usize, end: usize) -> Option<usize> {
+    if !is_millisecond_name(name) {
+        return None;
+    }
+    let value = code[start..end].trim();
+    let digits = value.strip_prefix('"')?.strip_suffix('"')?;
+    let below_guard = digits.bytes().all(|byte| byte.is_ascii_digit())
+        && int_literal(digits).is_some_and(|ms| 0 < ms && ms < HANG_GUARD.as_millis());
+    below_guard.then(|| start + (code[start..end].len() - code[start..end].trim_start().len()))
+}
+
 /// End of the value expression that starts at `start`: the first top-level
 /// `,`, `;` or closing bracket.
 fn value_end(bytes: &[u8], start: usize) -> usize {
@@ -363,7 +380,11 @@ fn assignment_candidates(skeleton: &str, literals: &[DurationLiteral]) -> Vec<(u
 }
 
 /// Literals bound to a `const` or `static` named like a budget.
-fn const_candidates(skeleton: &str, literals: &[DurationLiteral]) -> Vec<(usize, Kind)> {
+fn const_candidates(
+    skeleton: &str,
+    code: &str,
+    literals: &[DurationLiteral],
+) -> Vec<(usize, Kind)> {
     let bytes = skeleton.as_bytes();
     let mut found = Vec::new();
     for keyword in ["const", "static"] {
@@ -391,7 +412,9 @@ fn const_candidates(skeleton: &str, literals: &[DurationLiteral]) -> Vec<(usize,
             };
             let start = equals + 1;
             let end = value_end(bytes, start);
-            if let Some(literal) = literal_in_value(skeleton, literals, name, start, end) {
+            if let Some(literal) = literal_in_value(skeleton, literals, name, start, end)
+                .or_else(|| string_milliseconds_in_value(code, name, start, end))
+            {
                 found.push((literal, Kind::BudgetConst));
             }
         }
@@ -410,7 +433,7 @@ fn scan_files(files: &BTreeMap<String, String>) -> Scan {
         let mut candidates = timeout_candidates(skeleton, &literals);
         candidates.extend(field_candidates(skeleton, &literals));
         candidates.extend(assignment_candidates(skeleton, &literals));
-        candidates.extend(const_candidates(skeleton, &literals));
+        candidates.extend(const_candidates(skeleton, &file.views().code, &literals));
         candidates.sort_by_key(|&(offset, _)| offset);
         let mut seen = BTreeSet::new();
         for (offset, kind) in candidates {
@@ -779,6 +802,8 @@ fn a_const_named_like_a_budget_is_counted() {
         "static REQUEST_TIMEOUT: Duration = Duration::from_secs(1);",
         "const SILENT_CHILD_STALL_MS: u64 = 300;",
         "const WIRE_BOUND_MS: u64 = 5 * 1_000;",
+        "const REQUEST_TIMEOUT_MS: &str = \"200\";",
+        "pub static WAIT_SLICE_MS: &str = \"8000\";",
         "const Shared_Budget: Duration = Duration::from_secs(60 * 1);",
     ];
     for statement in counted {
@@ -796,6 +821,12 @@ fn a_const_named_like_a_budget_is_counted() {
         "const DEADLINE_MS: u64 = 120_000;",
         "const POLL_INTERVAL: Duration = Duration::from_millis(20);",
         "const SETTLE_MS: u64 = 300;",
+        "const SETTLE_MS: &str = \"300\";",
+        "const DEADLINE_MS: &str = \"120000\";",
+        "const DEADLINE_MS: &str = \"0\";",
+        "const DEADLINE_ENV: &str = \"200\";",
+        "const DEADLINE_MS: &str = \"POHUNEK_DEADLINE_MS\";",
+        "const DEADLINE_MS: &str = \"200 ms\";",
         "const MAX_RETRIES: u32 = 5;",
         "const LIMIT: usize = 10;",
         "const WAIT_FN: fn() -> u32 = compute;",

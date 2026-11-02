@@ -2872,6 +2872,7 @@ fn a_remote_session_new_from_stdin_without_yes_is_refused_before_any_daemon_requ
 
 /// Creation deadline of the unanswered-creation scenario: the fixture never
 /// replies, so any deadline expires, and a short one keeps the scenario fast.
+// timing-allowed: #1898 the fixture never answers, so any deadline expires
 const UNANSWERED_CREATION_DEADLINE_MS: &str = "50";
 
 /// The caller protocol of "Creation outcome" in `docs/public-api.md`: after an

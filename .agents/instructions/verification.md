@@ -524,8 +524,11 @@ each per file against its own baseline that may only go down:
   `_ms`/`_MS`, in test code when it is the first argument of
   `tokio::time::timeout`, or the value of a struct field (in a struct literal or
   as `x.field = value`) or of a `const`/`static` whose name contains `timeout`,
-  `deadline`, `grace`, `budget`, `wait`, `bound`, `stall` or `limit`. Zero is
-  not counted. A `start_paused = true` test is exempt.
+  `deadline`, `grace`, `budget`, `wait`, `bound`, `stall` or `limit`. A
+  budget-named `const`/`static` ending `_ms`/`_MS` also counts when its value is a string
+  literal of decimal digits below `HANG_GUARD` (`const REQUEST_TIMEOUT_MS: &str =
+  "200"`, a CLI argument). Zero is not counted. A `start_paused = true` test is
+  exempt.
 - `crates/xtask/tests/sdk_timing_ratchet.rs` (TypeScript,
   `sdk_timing_baseline.txt`) counts, in `sdk/ts/**/test/**/*.ts`, an integer
   literal below `HANG_GUARD` in milliseconds (directly or through a

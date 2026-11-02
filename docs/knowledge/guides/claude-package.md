@@ -406,9 +406,13 @@ manifest opts in) and the daemon holds the latest root record.
 - A profile `[env]` entry `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` is the owner's
   switch for Claude's terminal title and, per the binary, for the records; the
   session is then screen-only. The switch is not recorded on 2.1.309.
-- Recorded on 2.1.309: an attached terminal's reply to the probe is dropped and
-  no part of it reaches the model
-  (`an_attached_clients_probe_reply_never_reaches_a_real_claude`), and a Claude
+- Recorded on 2.1.309: no part of an attached terminal's reply to the probe
+  reaches the model
+  (`an_attached_clients_probe_reply_never_reaches_a_real_claude`). That scenario
+  cannot detect an unstripped reply, because a real Claude consumes the stray
+  reply (it passes with the worker's stripping disabled on 2.1.309 and 2.1.310);
+  the guard that the worker drops the reply is the session-worker test
+  `an_attached_terminal_reply_to_an_answered_probe_is_dropped`. A Claude
   killed while its `working` record is held leaves a session that is not live
   and not working (`a_held_working_record_does_not_outlive_a_killed_claude`).
 - Not recorded on 2.1.309: the Esc interrupt (the `Interrupted` marker and its

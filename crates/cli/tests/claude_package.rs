@@ -3672,9 +3672,16 @@ async fn attached_input(
         .expect("send the client's input");
 }
 
-/// An attached terminal answers the probe it saw in the replay: exactly one
-/// reply reaches Claude (the worker's), the client's is dropped. A leaked reply
-/// would be typed into Claude's input and sent to the model with the prompt.
+/// An attached terminal's reply to the probe it saw in the replay leaves no
+/// trace in the request the model receives.
+///
+/// This scenario cannot detect an unstripped reply: a real Claude consumes the
+/// stray reply without sending it to the model, and the scenario passes with the
+/// worker's stripping disabled (Claude 2.1.309, the locked release, and 2.1.310).
+/// The guard that the worker drops the client's reply and passes everything else
+/// to the program in order is the session-worker test
+/// `an_attached_terminal_reply_to_an_answered_probe_is_dropped`, which reads the
+/// bytes the program receives.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn an_attached_clients_probe_reply_never_reaches_a_real_claude() {
