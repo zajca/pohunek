@@ -144,7 +144,11 @@ enumerated captured frames may read differently.
   does not match. Rules read the
   screen: a status line above the prompt box (`✶ Billowing… (3s · ↓ 2 tokens)`)
   or the footer `esc to interrupt` below it means `working` and outranks the
-  visible prompt box; a visible prompt box or a completed-turn line
+  visible prompt box (a status line whose timer the terminal width cut,
+  `✻ Billowing… (1…`, counts too; a parenthesis that opens with anything but a
+  digit, a unit or the cut mark does not, so a Claude without records that
+  shows such a line reads idle from the screen until the title or the footer
+  speaks); a visible prompt box or a completed-turn line
   (`✻ Brewed for 7s · done 3:34 PM`) means `idle`; the tool approval dialog
   (`Do you want to proceed?` with its options), the selection forms
   (`Enter to select · ↑/↓ to navigate · Esc to cancel`, also wrapped), the
@@ -415,11 +419,32 @@ manifest opts in) and the daemon holds the latest root record.
   `an_attached_terminal_reply_to_an_answered_probe_is_dropped`. A Claude
   killed while its `working` record is held leaves a session that is not live
   and not working (`a_held_working_record_does_not_outlive_a_killed_claude`).
-- Not recorded on 2.1.309: the Esc interrupt (the `Interrupted` marker and its
-  record), background agents, `CLAUDE_CODE_SESSION_KIND=bg`
-  and running under tmux. The Esc interrupt is a gap in the scenarios, not in
-  the tooling: `attached_input` writes raw bytes, so a bare Esc can be sent
-  (#1554).
+- Recorded on 2.1.309, the Esc interrupt (a bare Esc written by an attached
+  client, `a_real_claude_esc_interrupt_reads_idle_from_its_idle_record`): an
+  interrupt ends the turn with a root `idle` record, not `done`, whether the
+  request is still waiting for a reply or the reply has begun (Claude then draws
+  `Interrupted · What should Claude do instead?`; before any reply it puts the
+  prompt back into its input box and draws no marker). The session reads idle
+  from the record (`osc_progress`), stays idle, and the screen alone reads idle
+  too, so no `working` record outlives the interrupt.
+- Recorded on 2.1.309, background agents
+  (`a_real_claude_background_agent_records_never_drive_the_session_activity`):
+  an agent reports with child records, `state=working:app=claude-code:id=<agent>:title=<base64>`
+  when it starts and `state=clear:id=<agent>` when it ends. They never appear in
+  the root sequence (`idle`, `working`, `done`). The launching turn's root record
+  stays `working` while Claude shows `Waiting for 1 background agent to finish`
+  over an idle-looking screen, and the session keeps reading working from it
+  until the root `done` (measured: the agent's `clear` came first). The real-agent
+  scenario cannot tell a dropped root record from one Claude re-sends. The
+  session-boundary scenario
+  `a_background_agents_child_records_never_change_the_session_activity`
+  (`crates/daemon/tests/program_status_session.rs`, a stand-in agent emitting
+  the same record shapes through a real worker and PTY) fails when a child
+  record is read as a root record. A child record that drops the held root
+  record is not observed by any scenario: the idle reading the screen would give
+  is debounced, and the held record is not on the wire.
+- Not recorded on 2.1.309: `CLAUDE_CODE_SESSION_KIND=bg` and running under
+  tmux.
 
 The native installer runs `<root>/claude/versions/<release>`. The kernel name
 of a process started from the resolved image is the release (`2.1.309`), one
@@ -497,8 +522,7 @@ Limits that remain:
 ## Not verified
 
 Releases other than 2.1.309 and 2.1.289 (the range above the lock is a policy, not a
-verification), the Esc interrupt marker, the
-Homebrew and apt installs (the npm install and the distribution package ship the
+verification), the Homebrew and apt installs (the npm install and the distribution package ship the
 same binary), macOS and Windows, a real login or a real model, plan mode,
 compaction, MCP and other dialogs, the `PermissionRequest` hook, terminals
 narrower than 20 columns, and a hosted CI run of the `claude-package` job. The

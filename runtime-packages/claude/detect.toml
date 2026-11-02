@@ -46,8 +46,10 @@ regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 # Live status spinner rendered above the prompt box while a turn runs, e.g.
 # "✻ Noodling… (12s · ↓ 1.2k tokens)", "✻ Herding… (3s · thinking with high
 # effort)" or a bare "* Jiving…" at the start of a turn. The line is one verb
-# with an optional timer, or a longer message with an elapsed-time timer, so a
-# transcript bullet such as "* Then it waits… (see below)" is not a spinner.
+# with an optional timer, or a longer message with an elapsed-time timer (or the
+# start of one that the terminal width cut, "(1…"), so a transcript bullet such
+# as "* Then it waits… (see below)" is not a spinner. A parenthesis that opens
+# with anything but a digit, a unit or the cut mark is not read as a timer.
 # The prompt box (`❯`) stays visible during work in current Claude Code TUIs, so without this rule every screen render matches `live_prompt_box`
 # and the published activity flaps to idle between OSC title updates. Must
 # outrank `live_prompt_box` (950) and stay below `live_blocked_form` (980).
@@ -58,7 +60,7 @@ id = "live_status_spinner"
 state = "working"
 priority = 960
 region = "whole_recent"
-line_regex = ['^[·✢✳✶✻✽*] (?:[\p{L}\x27’-]+…|\S[^…]*… \([0-9]+[smh]\b.*)$']
+line_regex = ['^[·✢✳✶✻✽*] (?:[\p{L}\x27’-]+…|\S[^…]*… \((?:[0-9]+[smh]\b.*|[0-9]*[smh]?…))$']
 not = { any = [
   { contains = ["do you want to proceed?"] },
   { contains = ["esc to cancel"] },
