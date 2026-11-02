@@ -4963,11 +4963,16 @@ async fn the_locked_real_claude_monitor_tool_is_recorded() {
         (fixture.stub.requests_with_prompt(PROMPT) >= 1).then_some(())
     })
     .await;
-    let declared = fixture
-        .stub
-        .bodies_containing(PROMPT)
-        .iter()
-        .any(|body| body.contains("\"name\":\"Monitor\""));
+    let bodies = fixture.stub.bodies_containing(PROMPT);
+    let declares = |tool: &str| {
+        bodies
+            .iter()
+            .any(|body| body.contains(&format!("\"name\":\"{tool}\"")))
+    };
+    // `Bash` is declared by every Claude Code release, so a request that does
+    // not show it means the probe cannot read the tool list.
+    assert!(declares("Bash"), "the probe reads the declared tools");
+    let declared = declares("Monitor");
     eprintln!("P2.2 RESULT: the Monitor tool is declared to the model: {declared}");
 
     fixture.stop(&id).await;
