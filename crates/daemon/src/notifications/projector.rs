@@ -109,7 +109,7 @@ fn spawn_projector_task(
                     None => turn_edges = None,
                 },
                 received = events.recv() => match received {
-                    Ok(ProducedEvent { event, produced }) => state.handle_produced_event_blocking(&notifications, &attention, &event, produced).await,
+                    Ok(ProducedEvent { event, produced, replayed }) => state.handle_produced_event_blocking(&notifications, &attention, &event, produced, replayed).await,
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
                         warn!(
                             dropped,
@@ -155,9 +155,19 @@ async fn drain_buffered_events(
     }
     loop {
         match events.try_recv() {
-            Ok(ProducedEvent { event, produced }) => {
+            Ok(ProducedEvent {
+                event,
+                produced,
+                replayed,
+            }) => {
                 state
-                    .handle_produced_event_blocking(notifications, attention, &event, produced)
+                    .handle_produced_event_blocking(
+                        notifications,
+                        attention,
+                        &event,
+                        produced,
+                        replayed,
+                    )
                     .await;
             }
             Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
@@ -360,7 +370,9 @@ pub(super) fn terminal_tombstone_matches(
         TransitionKey::Generation(generation) => {
             session_runtime_generation(session) == Some(generation)
         }
-        TransitionKey::Unproven(_) => false,
+        TransitionKey::Unproven(generation) => session.runtime.as_ref().is_some_and(|runtime| {
+            runtime.state == RuntimeState::Lost && runtime.runtime_generation == generation
+        }),
         TransitionKey::Epoch(_) => parse_timestamp(&record.created_at)
             .is_ok_and(|created_at| epoch_keyed_record_reports_runtime(created_at, session)),
     }
@@ -450,7 +462,7 @@ struct Deferred {
 
 #[derive(Debug)]
 enum DeferredInput {
-    Event(Event),
+    Event(Event, bool),
     Snapshot(Box<SessionInfo>),
     Edge(TurnEdge),
 }
@@ -463,8 +475,14 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
     ) {
-        self.handle_produced_event_blocking(notifications, attention, event, StdInstant::now())
-            .await;
+        self.handle_produced_event_blocking(
+            notifications,
+            attention,
+            event,
+            StdInstant::now(),
+            false,
+        )
+        .await;
     }
 
     /// Projects `event`, which was produced at `produced`; the input keeps
@@ -475,6 +493,7 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
         produced: StdInstant,
+        replayed: bool,
     ) {
         let seeded_subject = event_subject(event);
         let ordered_subject = seeded_subject
@@ -485,7 +504,7 @@ impl ProjectorState {
             if self.deferred.contains_key(&session_id) {
                 self.defer(
                     &session_id,
-                    DeferredInput::Event(event.clone()),
+                    DeferredInput::Event(event.clone(), replayed),
                     ResolveAsOf::at(produced),
                 );
                 return;
@@ -495,7 +514,7 @@ impl ProjectorState {
             if !self.seed_transition_epochs(notifications, session_id).await {
                 self.defer(
                     session_id,
-                    DeferredInput::Event(event.clone()),
+                    DeferredInput::Event(event.clone(), replayed),
                     ResolveAsOf::at(produced),
                 );
                 return;
@@ -505,6 +524,7 @@ impl ProjectorState {
             notifications,
             &attention.as_of(ResolveAsOf::at(produced)),
             event,
+            replayed,
         )
         .await;
     }
@@ -514,13 +534,46 @@ impl ProjectorState {
         notifications: &NotificationService,
         attention: &AttentionCoordinator,
         event: &Event,
+        replayed: bool,
     ) {
+        if replayed {
+            if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
+                self.learn_replayed(&payload.session);
+            }
+            return;
+        }
         if let Some((session_id, activity)) = event_subject(event) {
             self.confirm_blocked_replay(notifications, &session_id, activity)
                 .await;
         }
         for pending in self.pending_event(notifications, attention, event) {
             create_pending_notification_blocking(notifications.clone(), attention, pending).await;
+        }
+    }
+
+    /// Takes in a session state the registry announced again without a
+    /// change: later transitions are measured against it, and a loss it holds
+    /// counts as reported, so a snapshot or an update of the same session
+    /// notifies nothing.
+    fn learn_replayed(&mut self, session: &SessionInfo) {
+        self.lifecycle_by_session
+            .insert(session.id.clone(), session.state);
+        let Some(runtime) = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state == RuntimeState::Lost)
+        else {
+            return;
+        };
+        if session.state == SessionState::Failed {
+            self.projected_generations.insert((
+                session.id.clone(),
+                NotificationKind::Error,
+                runtime.runtime_generation,
+            ));
+        } else {
+            self.unproven_generations
+                .insert((session.id.clone(), runtime.runtime_generation));
         }
     }
 
@@ -698,8 +751,9 @@ impl ProjectorState {
             for Deferred { input, arrived } in backlog {
                 let attention = &attention.as_of(arrived);
                 match input {
-                    DeferredInput::Event(event) => {
-                        self.project_event(notifications, attention, &event).await;
+                    DeferredInput::Event(event, replayed) => {
+                        self.project_event(notifications, attention, &event, replayed)
+                            .await;
                     }
                     DeferredInput::Snapshot(session) => {
                         self.project_session_snapshot(notifications, attention, &session)
@@ -850,7 +904,7 @@ impl ProjectorState {
         if let Some(runtime) = session
             .runtime
             .as_ref()
-            .filter(|runtime| runtime.state != RuntimeState::Lost)
+            .filter(|runtime| runtime.state == RuntimeState::Live)
         {
             self.unproven_generations
                 .remove(&(session.id.clone(), runtime.runtime_generation));
@@ -2699,6 +2753,90 @@ mod tests {
             .store
             .compact_if_needed(1)
             .expect("repeat compaction"));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_unproven_loss_stays_deleted_after_compaction_and_a_restart() {
+        let dir = temp_data_dir("unproven-compaction-replay");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let store = terminal_source_store(&dir);
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+        persist_terminal_source(&store, &running);
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &running).await;
+        assert_eq!(list(&service).len(), 1);
+        delete_visible_terminals(&service);
+        compact_deleted_terminals(&service);
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen compacted service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &running).await;
+        project_session_update(&mut projector, &service, &failed).await;
+
+        assert!(
+            list(&service).is_empty(),
+            "a deleted loss is not reported again: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_is_only_reconnecting_does_not_release_an_unproven_loss() {
+        let service = service("unproven-reconnecting");
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let reconnecting = SessionInfo {
+            runtime: session_in_generation("s-1", SessionState::Running, None, 1)
+                .runtime
+                .map(|runtime| SessionRuntime {
+                    state: RuntimeState::Reconnecting,
+                    ..runtime
+                }),
+            ..session_info("s-1", SessionState::Running, None)
+        };
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+
+        for session in [&running, &reconnecting, &failed] {
+            project_session_update(&mut projector, &service, session).await;
+        }
+
+        assert_eq!(list(&service).len(), 1, "{:#?}", list(&service));
+    }
+
+    #[tokio::test]
+    async fn a_loss_announced_again_is_learned_and_a_later_snapshot_notifies_nothing() {
+        let service = service("replayed-loss");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let crashed = lost_session("s-1", SessionState::Failed, 1, None, Some("host_restarted"));
+        let unproven = lost_session("s-2", SessionState::Running, 1, None, None);
+
+        for session in [&crashed, &unproven] {
+            projector
+                .handle_produced_event_blocking(
+                    &service,
+                    &attention,
+                    &session_event(event::SESSION_RUNTIME_LOST, session),
+                    StdInstant::now(),
+                    true,
+                )
+                .await;
+        }
+        for session in [&crashed, &unproven] {
+            projector
+                .handle_session_snapshot_blocking(&service, &attention, session, StdInstant::now())
+                .await;
+            project_session_update(&mut projector, &service, session).await;
+        }
+
+        assert!(list(&service).is_empty(), "{:#?}", list(&service));
+
+        // A later change of the same session is still news.
+        let next = lost_session("s-3", SessionState::Failed, 1, None, None);
+        project_session_update(&mut projector, &service, &next).await;
+        assert_eq!(list(&service).len(), 1);
     }
 
     #[tokio::test]

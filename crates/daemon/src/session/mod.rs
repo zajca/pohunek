@@ -2694,6 +2694,7 @@ impl SessionRegistry {
         let _ = self.inner.produced_events.send(ProducedEvent {
             event: event.clone(),
             produced,
+            replayed: false,
         });
         let _ = self.inner.events.send(event);
     }
@@ -8016,9 +8017,9 @@ impl SessionRegistry {
         self.publish(event);
     }
 
-    /// Publishes a session event to the subscribers of the public stream only.
-    /// The notification projector never sees it: it announces a state the
-    /// registry already held, not a change.
+    /// Publishes a session event that announces a state the registry already
+    /// held, not a change. The notification projector learns the state from it
+    /// and notifies nothing.
     fn emit_replayed(&self, name: &str, info: &SessionInfo) {
         let event = crate::events::event(
             name,
@@ -8026,6 +8027,11 @@ impl SessionRegistry {
                 session: info.clone(),
             }),
         );
+        let _ = self.inner.produced_events.send(ProducedEvent {
+            event: event.clone(),
+            produced: std::time::Instant::now(),
+            replayed: true,
+        });
         let _ = self.inner.events.send(event);
     }
 

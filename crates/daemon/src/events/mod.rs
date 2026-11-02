@@ -60,6 +60,9 @@ pub(crate) fn event(name: &str, payload: serde_json::Value) -> Event {
 pub(crate) struct ProducedEvent {
     pub(crate) event: Event,
     pub(crate) produced: std::time::Instant,
+    /// Whether the event announces a state the registry already held, such as
+    /// a lost session found again at startup, not a change.
+    pub(crate) replayed: bool,
 }
 
 /// File name of the active journal file inside the events directory.
