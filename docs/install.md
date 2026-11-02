@@ -60,8 +60,8 @@ pohunek setup
 Run `pohunek service upgrade` after every `brew upgrade pohunek`, and
 `pohunek service uninstall` before `brew uninstall pohunek`. The formula does not
 touch launchd itself.
-The formula installs the binaries and the catalog trust anchor, not the archive
-`MANIFEST`; `pohunek setup` therefore does not verify the Homebrew layout, and the
+The formula installs the binaries, the catalog trust anchor and the release's
+`runtime/` catalog, not the archive `MANIFEST` or `packaging/`; `pohunek setup` therefore does not verify the Homebrew layout, and the
 formula checksum and `gh attestation verify` are what rule out tampering.
 
 Or install from the archive: download the daemon archive with `curl -fLO` (curl
