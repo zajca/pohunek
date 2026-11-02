@@ -1,3 +1,0 @@
-## Unreleased (2026-11-02, Homebrew tailscale on macOS, #1583)
-
-- The Tailscale guide and the remote hosts guide say that on Apple Silicon macOS with a stock Homebrew prefix the `tailscale` CLI of the formula is found and run (`/opt/homebrew/bin` is accepted by the executable lookup), and that the App Store and standalone builds are still refused. It was checked on a real Mac with the formula installed and no `tailscaled` running: the doctor `tailscale_cli` check reads "local tailscale state is unavailable", `host list` fails with `tailscale_state_unavailable`, and the daemon logs "overlay state unavailable; serving local-only". No part of a running `tailscaled` is verified on macOS, neither the client side nor the listener.
