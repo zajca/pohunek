@@ -41,7 +41,7 @@ fn newer_daemon_line(id: &str, error: ProtocolError, class: &str) -> String {
 /// Runs `pohunek` with `arguments` against a scripted daemon. `answer` returns
 /// the result of a request, or `None` for a method the scenario does not
 /// script, which gets a health result.
-fn run_against_scripted_daemon(
+pub(crate) fn run_against_scripted_daemon(
     arguments: &[&str],
     answer: impl Fn(&Request) -> Option<Result<Value, String>> + Send + Sync + 'static,
 ) -> Output {
@@ -230,7 +230,9 @@ fn newer_daemon_session() -> Value {
 }
 
 /// Answers `session.list` with one snapshot and `session.inspect` with it.
-fn session_snapshot_daemon(session: Value) -> impl Fn(&Request) -> Option<Result<Value, String>> {
+pub(crate) fn session_snapshot_daemon(
+    session: Value,
+) -> impl Fn(&Request) -> Option<Result<Value, String>> {
     move |request| match request.method() {
         protocol::method::SESSION_LIST => Some(Ok(json!([session.clone()]))),
         protocol::method::SESSION_INSPECT => Some(Ok(session.clone())),

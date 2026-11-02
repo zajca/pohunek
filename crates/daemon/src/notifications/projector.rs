@@ -7,7 +7,8 @@ use std::time::{Duration, Instant as StdInstant};
 
 use protocol::{
     event, AgentActivity, Event, NotificationCreateParams, NotificationKind, NotificationSeverity,
-    NotificationSource, RuntimeGeneration, RuntimeRef, SessionId, SessionInfo, SessionState,
+    NotificationSource, RuntimeGeneration, RuntimeRef, RuntimeState, SessionId, SessionInfo,
+    SessionRuntime, SessionState,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -17,7 +18,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::events::ProducedEvent;
+use crate::events::{EventOrigin, ProducedEvent};
 use crate::session::{SessionRegistry, TurnEdge, TurnId};
 use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 
@@ -108,7 +109,7 @@ fn spawn_projector_task(
                     None => turn_edges = None,
                 },
                 received = events.recv() => match received {
-                    Ok(ProducedEvent { event, produced }) => state.handle_produced_event_blocking(&notifications, &attention, &event, produced).await,
+                    Ok(ProducedEvent { event, produced, origin }) => state.handle_produced_event_blocking(&notifications, &attention, &event, produced, origin).await,
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
                         warn!(
                             dropped,
@@ -154,9 +155,19 @@ async fn drain_buffered_events(
     }
     loop {
         match events.try_recv() {
-            Ok(ProducedEvent { event, produced }) => {
+            Ok(ProducedEvent {
+                event,
+                produced,
+                origin,
+            }) => {
                 state
-                    .handle_produced_event_blocking(notifications, attention, &event, produced)
+                    .handle_produced_event_blocking(
+                        notifications,
+                        attention,
+                        &event,
+                        produced,
+                        origin,
+                    )
                     .await;
             }
             Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
@@ -250,15 +261,23 @@ enum TransitionKey {
     /// so a terminal state the daemon replays after a restart keeps the key
     /// of the record it already projected.
     Generation(RuntimeGeneration),
+    /// The runtime generation an unproven loss was reported for and the
+    /// ordinal of that report: a runtime that answers again and is lost
+    /// again within its generation is reported again under the next ordinal.
+    Unproven(RuntimeGeneration, u64),
 }
 
 /// Marks a [`TransitionKey::Generation`] in a source id.
 const GENERATION_KEY_PREFIX: char = 'g';
 
+/// Marks a [`TransitionKey::Unproven`] in a source id.
+const UNPROVEN_KEY_PREFIX: char = 'u';
+
 /// Return a deterministic projector source id.
 ///
-/// Scheme: `projector:<session_id>:<kind>:<epoch>` or
-/// `projector:<session_id>:<kind>:g<runtime_generation>`.
+/// Scheme: `projector:<session_id>:<kind>:<epoch>`,
+/// `projector:<session_id>:<kind>:g<runtime_generation>` or
+/// `projector:<session_id>:<kind>:u<ordinal>_<runtime_generation>`.
 #[must_use]
 fn projector_source_id(
     session_id: &SessionId,
@@ -271,11 +290,22 @@ fn projector_source_id(
         TransitionKey::Generation(generation) => {
             format!("{prefix}{GENERATION_KEY_PREFIX}{generation}")
         }
+        TransitionKey::Unproven(generation, ordinal) => {
+            format!("{prefix}{UNPROVEN_KEY_PREFIX}{ordinal}_{generation}")
+        }
     }
 }
 
 /// The transition key a stored projector source id suffix names.
 fn parse_transition_key(key: &str) -> Option<TransitionKey> {
+    if let Some(rest) = key.strip_prefix(UNPROVEN_KEY_PREFIX) {
+        // The ordinal is the digits up to the first `_`.
+        let (ordinal, generation) = rest.split_once('_')?;
+        return Some(TransitionKey::Unproven(
+            RuntimeGeneration::parse(generation).ok()?,
+            ordinal.parse().ok()?,
+        ));
+    }
     match key.strip_prefix(GENERATION_KEY_PREFIX) {
         Some(generation) => RuntimeGeneration::parse(generation)
             .ok()
@@ -346,6 +376,8 @@ pub(super) fn terminal_tombstone_matches(
         TransitionKey::Generation(generation) => {
             session_runtime_generation(session) == Some(generation)
         }
+        TransitionKey::Unproven(generation, _) => parse_timestamp(&record.created_at)
+            .is_ok_and(|created_at| unproven_report_covers_loss(created_at, generation, session)),
         TransitionKey::Epoch(_) => parse_timestamp(&record.created_at)
             .is_ok_and(|created_at| epoch_keyed_record_reports_runtime(created_at, session)),
     }
@@ -357,7 +389,9 @@ fn event_subject(event: &Event) -> Option<(SessionId, Option<AgentActivity>)> {
     match event.event() {
         event::AGENT_STATE => parse_projector_payload::<AgentStatePayload>(event)
             .map(|payload| (payload.session_id, Some(payload.activity))),
-        event::SESSION_UPDATED => parse_projector_payload::<SessionPayload>(event)
+        event::SESSION_UPDATED
+        | event::SESSION_RUNTIME_LOST
+        | event::SESSION_RUNTIME_RECONNECTED => parse_projector_payload::<SessionPayload>(event)
             .map(|payload| (payload.session.id, None)),
         _ => None,
     }
@@ -390,6 +424,33 @@ fn epoch_keyed_record_reports_runtime(created_at: OffsetDateTime, session: &Sess
         .is_some_and(|started_at| created_at >= started_at)
 }
 
+/// Whether an unproven-loss report created at `created_at` for `generation`
+/// covers the loss `session` shows. The runtime's last connect is the time of
+/// its latest cure, so a report older than it names an earlier loss. A runtime
+/// that never connected is covered by any report of its generation, and a
+/// connect time that does not parse covers nothing: a duplicate is preferred
+/// to a silenced report. The runtime state is not tested: a runtime that is
+/// reconnecting or in conflict after an unclassifiable start still carries the
+/// connect time of the cure before the loss.
+fn unproven_report_covers_loss(
+    created_at: OffsetDateTime,
+    generation: RuntimeGeneration,
+    session: &SessionInfo,
+) -> bool {
+    let Some(runtime) = session.runtime.as_ref() else {
+        return false;
+    };
+    if runtime.runtime_generation != generation {
+        return false;
+    }
+    match runtime.last_connected_at.as_deref() {
+        None => true,
+        Some(connected_at) => {
+            parse_timestamp(connected_at).is_ok_and(|connected_at| created_at >= connected_at)
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProjectorState {
     activity_by_session: HashMap<SessionId, AgentActivity>,
@@ -397,6 +458,16 @@ struct ProjectorState {
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
     /// Terminal states the store or this process holds a record key for.
     projected_generations: HashSet<(SessionId, NotificationKind, RuntimeGeneration)>,
+    /// Generations whose unproven loss stands. A runtime that answers again
+    /// leaves the set, so a later failure of that generation is reported on
+    /// its own; while the loss stands, a proof of it adds no second report.
+    unproven_generations: HashSet<(SessionId, RuntimeGeneration)>,
+    /// The highest ordinal of an unproven report per generation.
+    unproven_ordinals: HashMap<(SessionId, RuntimeGeneration), u64>,
+    /// When the store's newest unproven report per generation was created. It
+    /// is read at every observation of the session, so a loss the registry
+    /// reports after an interlude is judged against the same reports.
+    unproven_reported_at: HashMap<(SessionId, RuntimeGeneration), OffsetDateTime>,
     /// Sessions whose transition epochs continue from the store's records.
     seeded_sessions: HashSet<SessionId>,
     /// Seeded sessions with an unread attention record and no blocked,
@@ -428,7 +499,7 @@ struct Deferred {
 
 #[derive(Debug)]
 enum DeferredInput {
-    Event(Event),
+    Event(Event, EventOrigin),
     Snapshot(Box<SessionInfo>),
     Edge(TurnEdge),
 }
@@ -441,8 +512,14 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
     ) {
-        self.handle_produced_event_blocking(notifications, attention, event, StdInstant::now())
-            .await;
+        self.handle_produced_event_blocking(
+            notifications,
+            attention,
+            event,
+            StdInstant::now(),
+            EventOrigin::Live,
+        )
+        .await;
     }
 
     /// Projects `event`, which was produced at `produced`; the input keeps
@@ -453,6 +530,7 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
         produced: StdInstant,
+        origin: EventOrigin,
     ) {
         let seeded_subject = event_subject(event);
         let ordered_subject = seeded_subject
@@ -463,7 +541,7 @@ impl ProjectorState {
             if self.deferred.contains_key(&session_id) {
                 self.defer(
                     &session_id,
-                    DeferredInput::Event(event.clone()),
+                    DeferredInput::Event(event.clone(), origin),
                     ResolveAsOf::at(produced),
                 );
                 return;
@@ -473,7 +551,7 @@ impl ProjectorState {
             if !self.seed_transition_epochs(notifications, session_id).await {
                 self.defer(
                     session_id,
-                    DeferredInput::Event(event.clone()),
+                    DeferredInput::Event(event.clone(), origin),
                     ResolveAsOf::at(produced),
                 );
                 return;
@@ -483,6 +561,7 @@ impl ProjectorState {
             notifications,
             &attention.as_of(ResolveAsOf::at(produced)),
             event,
+            origin,
         )
         .await;
     }
@@ -492,13 +571,49 @@ impl ProjectorState {
         notifications: &NotificationService,
         attention: &AttentionCoordinator,
         event: &Event,
+        origin: EventOrigin,
     ) {
+        match origin {
+            EventOrigin::Live => {}
+            EventOrigin::Replayed => {
+                if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
+                    self.learn_replayed(&payload.session);
+                }
+                return;
+            }
+        }
         if let Some((session_id, activity)) = event_subject(event) {
             self.confirm_blocked_replay(notifications, &session_id, activity)
                 .await;
         }
         for pending in self.pending_event(notifications, attention, event) {
             create_pending_notification_blocking(notifications.clone(), attention, pending).await;
+        }
+    }
+
+    /// Takes in a session state the registry announced again without a
+    /// change: later transitions are measured against it, and a loss it holds
+    /// counts as reported, so a snapshot or an update of the same session
+    /// notifies nothing.
+    fn learn_replayed(&mut self, session: &SessionInfo) {
+        self.lifecycle_by_session
+            .insert(session.id.clone(), session.state);
+        let Some(runtime) = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state == RuntimeState::Lost)
+        else {
+            return;
+        };
+        if session.state == SessionState::Failed {
+            self.projected_generations.insert((
+                session.id.clone(),
+                NotificationKind::Error,
+                runtime.runtime_generation,
+            ));
+        } else {
+            self.unproven_generations
+                .insert((session.id.clone(), runtime.runtime_generation));
         }
     }
 
@@ -602,6 +717,7 @@ impl ProjectorState {
                 agent_kind: None,
                 project_id: None,
                 dedupe_key: Some(turn_dedupe_key(session_id)),
+                unproven: false,
                 runtime_generation: None,
             },
         );
@@ -675,8 +791,9 @@ impl ProjectorState {
             for Deferred { input, arrived } in backlog {
                 let attention = &attention.as_of(arrived);
                 match input {
-                    DeferredInput::Event(event) => {
-                        self.project_event(notifications, attention, &event).await;
+                    DeferredInput::Event(event, origin) => {
+                        self.project_event(notifications, attention, &event, origin)
+                            .await;
                     }
                     DeferredInput::Snapshot(session) => {
                         self.project_session_snapshot(notifications, attention, &session)
@@ -725,7 +842,11 @@ impl ProjectorState {
                         .collect();
                 }
             }
-            event::SESSION_UPDATED => {
+            // A lost runtime is announced by its own event, which is also how
+            // startup reconciliation commits a loss.
+            event::SESSION_UPDATED
+            | event::SESSION_RUNTIME_LOST
+            | event::SESSION_RUNTIME_RECONNECTED => {
                 if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
                     return self
                         .pending_session_updated(notifications, attention, &payload.session)
@@ -808,6 +929,7 @@ impl ProjectorState {
                 agent_kind: None,
                 project_id: None,
                 dedupe_key: Some(attention_dedupe_key(session_id)),
+                unproven: false,
                 runtime_generation: None,
             },
         )
@@ -819,6 +941,32 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) -> Option<PendingNotification> {
+        if let Some(runtime) = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state == RuntimeState::Live)
+        {
+            self.unproven_generations
+                .remove(&(session.id.clone(), runtime.runtime_generation));
+        }
+        // A report the store holds for this loss stands for it, whichever
+        // state the registry reaches it in.
+        if let Some(runtime) = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state == RuntimeState::Lost)
+        {
+            let key = (session.id.clone(), runtime.runtime_generation);
+            if self
+                .unproven_reported_at
+                .get(&key)
+                .is_some_and(|created_at| {
+                    unproven_report_covers_loss(*created_at, runtime.runtime_generation, session)
+                })
+            {
+                self.unproven_generations.insert(key);
+            }
+        }
         let previous = self
             .lifecycle_by_session
             .insert(session.id.clone(), session.state);
@@ -855,10 +1003,25 @@ impl ProjectorState {
                 self.handle_explicit_stop(attention, session);
                 None
             }
-            SessionState::Starting
-            | SessionState::Running
-            | SessionState::Failed
-            | SessionState::Done => None,
+            SessionState::Starting | SessionState::Running => {
+                // A lost runtime the daemon cannot prove ended leaves the
+                // session `running`; it is reported all the same, once per
+                // standing loss.
+                if session
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+                {
+                    resolve_session_notifications(attention, &session.id);
+                    self.activity_by_session.remove(&session.id);
+                    self.blocked_replay_candidates.remove(&session.id);
+                }
+                if reported_before(NotificationKind::Error) {
+                    return None;
+                }
+                self.pending_unproven_loss_notification(notifications, session)
+            }
+            SessionState::Failed | SessionState::Done => None,
         }
     }
 
@@ -870,11 +1033,81 @@ impl ProjectorState {
         self.blocked_replay_candidates.remove(&session.id);
     }
 
+    /// The notification of a session whose runtime is lost but whose end is
+    /// not proven, so the session is still `running`.
+    fn pending_unproven_loss_notification(
+        &mut self,
+        notifications: &NotificationService,
+        session: &SessionInfo,
+    ) -> Option<PendingNotification> {
+        let runtime = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state == RuntimeState::Lost)?;
+        self.prepare_derived(
+            notifications,
+            DerivedNotification {
+                session_id: session.id.clone(),
+                kind: NotificationKind::Error,
+                severity: NotificationSeverity::Error,
+                source_event: event::SESSION_UPDATED,
+                title: "Session runtime lost".to_owned(),
+                body: runtime.loss_message(),
+                metadata: loss_metadata(runtime),
+                agent_kind: Some(session_agent_kind(session)),
+                project_id: session.project_id.clone(),
+                dedupe_key: None,
+                unproven: true,
+                runtime_generation: session_runtime_generation(session),
+            },
+        )
+    }
+
+    /// The notification of a session whose runtime was lost and whose end the
+    /// daemon proved.
+    fn pending_crashed_notification(
+        &mut self,
+        notifications: &NotificationService,
+        session: &SessionInfo,
+        runtime: &SessionRuntime,
+    ) -> Option<PendingNotification> {
+        if self
+            .unproven_generations
+            .contains(&(session.id.clone(), runtime.runtime_generation))
+        {
+            return None;
+        }
+        self.prepare_derived(
+            notifications,
+            DerivedNotification {
+                session_id: session.id.clone(),
+                kind: NotificationKind::Error,
+                severity: NotificationSeverity::Error,
+                source_event: event::SESSION_UPDATED,
+                title: "Session crashed".to_owned(),
+                body: runtime.loss_message(),
+                metadata: loss_metadata(runtime),
+                agent_kind: Some(session_agent_kind(session)),
+                project_id: session.project_id.clone(),
+                dedupe_key: None,
+                unproven: false,
+                runtime_generation: session_runtime_generation(session),
+            },
+        )
+    }
+
     fn pending_failed_notification(
         &mut self,
         notifications: &NotificationService,
         session: &SessionInfo,
     ) -> Option<PendingNotification> {
+        if let Some(runtime) = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state == RuntimeState::Lost)
+        {
+            return self.pending_crashed_notification(notifications, session, runtime);
+        }
         let (body, reason) = if let Some(exit_code) = session.exit_code {
             (
                 format!(
@@ -902,6 +1135,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                unproven: false,
                 runtime_generation: session_runtime_generation(session),
             },
         )
@@ -925,6 +1159,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                unproven: false,
                 runtime_generation: session_runtime_generation(session),
             },
         )
@@ -943,14 +1178,29 @@ impl ProjectorState {
             return None;
         }
         let transition = if let Some(generation) = derived.runtime_generation {
-            if !self.projected_generations.insert((
-                derived.session_id.clone(),
-                derived.kind,
-                generation,
-            )) {
-                return None;
+            if derived.unproven {
+                if !self
+                    .unproven_generations
+                    .insert((derived.session_id.clone(), generation))
+                {
+                    return None;
+                }
+                let ordinal = self
+                    .unproven_ordinals
+                    .entry((derived.session_id.clone(), generation))
+                    .or_insert(0);
+                *ordinal += 1;
+                TransitionKey::Unproven(generation, *ordinal)
+            } else {
+                if !self.projected_generations.insert((
+                    derived.session_id.clone(),
+                    derived.kind,
+                    generation,
+                )) {
+                    return None;
+                }
+                TransitionKey::Generation(generation)
             }
-            TransitionKey::Generation(generation)
         } else {
             let Some(epoch) = self.next_transition_epoch(&derived.session_id, derived.kind) else {
                 warn!(
@@ -1063,6 +1313,20 @@ impl ProjectorState {
                 TransitionKey::Generation(generation) => {
                     self.projected_generations
                         .insert((session_id.clone(), kind, generation));
+                }
+                TransitionKey::Unproven(generation, ordinal) => {
+                    let highest = self
+                        .unproven_ordinals
+                        .entry((session_id.clone(), generation))
+                        .or_insert(0);
+                    *highest = (*highest).max(ordinal);
+                    if let Ok(created_at) = parse_timestamp(&created_at) {
+                        let newest = self
+                            .unproven_reported_at
+                            .entry((session_id.clone(), generation))
+                            .or_insert(created_at);
+                        *newest = (*newest).max(created_at);
+                    }
                 }
             }
         }
@@ -1224,6 +1488,10 @@ struct DerivedNotification {
     /// The runtime generation a terminal state ends, when the session has a
     /// runtime; it keys the record instead of the transition epoch.
     runtime_generation: Option<RuntimeGeneration>,
+    /// Whether this reports a loss the daemon could not prove. It is keyed by
+    /// generation in a namespace of its own, so a failure of the same
+    /// generation after the runtime answered again is still reported.
+    unproven: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1254,6 +1522,32 @@ where
     }
 }
 
+/// The metadata of a loss notification: the classification reason and what
+/// the daemon knows about the cause. A key the evidence does not carry is
+/// absent.
+fn loss_metadata(runtime: &SessionRuntime) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::from([(
+        "reason".to_owned(),
+        runtime
+            .loss_reason
+            .clone()
+            .unwrap_or_else(|| "runtime_lost".to_owned()),
+    )]);
+    if let Some(exit) = &runtime.exit {
+        metadata.insert("cause".to_owned(), exit.cause.clone());
+        if let Some(killer) = &exit.oom_killer {
+            metadata.insert("oom_killer".to_owned(), killer.clone());
+        }
+        if let Some(peak) = exit.memory_peak_bytes {
+            metadata.insert("memory_peak_bytes".to_owned(), peak.to_string());
+        }
+    }
+    if let Some(cause) = &runtime.loss_cause {
+        metadata.insert("loss_cause".to_owned(), cause.clone());
+    }
+    metadata
+}
+
 fn session_runtime_generation(session: &SessionInfo) -> Option<RuntimeGeneration> {
     session
         .runtime
@@ -1270,6 +1564,7 @@ fn session_agent_kind(session: &SessionInfo) -> RuntimeRef {
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventOrigin;
     use crate::notifications::{ResolveAsOf, SEED_RETRY_DELAY};
     use std::collections::BTreeMap;
     use std::time::Instant as StdInstant;
@@ -1862,6 +2157,341 @@ mod tests {
         );
     }
 
+    /// A session whose runtime of `generation` is lost.
+    fn lost_session(
+        session_id: &str,
+        state: SessionState,
+        generation: u64,
+        exit: Option<protocol::RuntimeExit>,
+        loss_cause: Option<&str>,
+    ) -> SessionInfo {
+        SessionInfo {
+            runtime: Some(SessionRuntime {
+                state: RuntimeState::Lost,
+                runtime_generation: RuntimeGeneration::new(generation),
+                worker_id: None,
+                worker_instance_id: None,
+                started_at: None,
+                last_connected_at: None,
+                loss_reason: Some("runtime_lost".to_owned()),
+                exit,
+                loss_cause: loss_cause.map(str::to_owned),
+            }),
+            ..session_info(session_id, state, None)
+        }
+    }
+
+    /// `session` after a cure: its runtime connected after every report the
+    /// store holds.
+    fn connected_later(session: SessionInfo) -> SessionInfo {
+        SessionInfo {
+            runtime: session.runtime.map(|runtime| SessionRuntime {
+                last_connected_at: Some("2999-01-01T00:00:00Z".to_owned()),
+                ..runtime
+            }),
+            ..session
+        }
+    }
+
+    /// `session` while the registry could not classify it: the runtime is
+    /// reconnecting and keeps the connect time of its last cure.
+    fn reconnecting_of(session: SessionInfo) -> SessionInfo {
+        SessionInfo {
+            runtime: session.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Reconnecting,
+                loss_reason: Some("supervision_unavailable".to_owned()),
+                ..runtime
+            }),
+            ..session
+        }
+    }
+
+    fn oom_exit() -> protocol::RuntimeExit {
+        protocol::RuntimeExit {
+            cause: "oom_kill".to_owned(),
+            signal: Some(9),
+            code: None,
+            oom_killer: Some("systemd_oomd".to_owned()),
+            memory_peak_bytes: Some(29_200_000_000),
+            ended_at: Some("2026-11-01T08:39:00Z".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proven_loss_creates_one_crashed_notification_with_its_cause() {
+        let service = service("crashed");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let crashed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+
+        for _ in 0..2 {
+            projector
+                .handle_event_blocking(
+                    &service,
+                    &attention,
+                    &session_event(event::SESSION_UPDATED, &crashed),
+                )
+                .await;
+        }
+
+        let notifications = list(&service);
+        assert_eq!(notifications.len(), 1, "{notifications:#?}");
+        let record = &notifications[0];
+        assert_eq!(record.kind, NotificationKind::Error);
+        assert_eq!(record.title, "Session crashed");
+        assert_eq!(
+            record.body,
+            "Killed by systemd-oomd (memory pressure) at 08:39 UTC (peak 29.2 GB)"
+        );
+        let metadata = |key: &str| record.metadata.get(key).map(String::as_str);
+        assert_eq!(metadata("reason"), Some("runtime_lost"));
+        assert_eq!(metadata("cause"), Some("oom_kill"));
+        assert_eq!(metadata("oom_killer"), Some("systemd_oomd"));
+        assert_eq!(metadata("memory_peak_bytes"), Some("29200000000"));
+        assert_eq!(metadata("loss_cause"), None);
+
+        let manager = lost_session(
+            "s-2",
+            SessionState::Failed,
+            1,
+            None,
+            Some("user_manager_lost"),
+        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_UPDATED, &manager),
+            )
+            .await;
+        let record = list(&service)
+            .into_iter()
+            .find(|record| record.session_id.as_ref().is_some_and(|id| id.0 == "s-2"))
+            .expect("the lost user manager is reported");
+        assert_eq!(record.title, "Session crashed");
+        assert_eq!(
+            record.metadata.get("loss_cause").map(String::as_str),
+            Some("user_manager_lost")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unproven_loss_is_reported_once_and_a_later_proof_adds_none() {
+        let service = service("unproven");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+
+        for session in [&running, &running, &failed] {
+            projector
+                .handle_event_blocking(
+                    &service,
+                    &attention,
+                    &session_event(event::SESSION_UPDATED, session),
+                )
+                .await;
+        }
+
+        let notifications = list(&service);
+        assert_eq!(notifications.len(), 1, "{notifications:#?}");
+        assert_eq!(notifications[0].title, "Session runtime lost");
+        assert_eq!(notifications[0].kind, NotificationKind::Error);
+
+        // The next generation of the same session is reported on its own.
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Running, None, 2),
+        )
+        .await;
+        let next = lost_session("s-1", SessionState::Failed, 2, None, None);
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_RUNTIME_LOST, &next),
+            )
+            .await;
+        assert_eq!(list(&service).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_answers_again_lets_a_later_failure_of_its_generation_be_reported() {
+        let service = service("unproven-reconnected");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let reconnected = session_in_generation("s-1", SessionState::Running, None, 1);
+        let reconnected = SessionInfo {
+            runtime: reconnected.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                ..runtime
+            }),
+            ..reconnected
+        };
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+
+        for (name, session) in [
+            (event::SESSION_RUNTIME_LOST, &running),
+            (event::SESSION_RUNTIME_RECONNECTED, &reconnected),
+            (event::SESSION_RUNTIME_LOST, &failed),
+        ] {
+            projector
+                .handle_event_blocking(&service, &attention, &session_event(name, session))
+                .await;
+        }
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(
+            titles.len(),
+            2,
+            "the false alarm and the real failure are both reported: {titles:?}"
+        );
+        assert!(
+            titles.contains(&"Session runtime lost".to_owned()),
+            "{titles:?}"
+        );
+        assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_is_lost_again_within_its_generation_is_reported_again() {
+        let service = service("unproven-twice");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let lost = lost_session("s-1", SessionState::Running, 1, None, None);
+        let live = session_in_generation("s-1", SessionState::Running, None, 1);
+        let live = SessionInfo {
+            runtime: live.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                ..runtime
+            }),
+            ..live
+        };
+
+        for (name, session) in [
+            (event::SESSION_RUNTIME_LOST, &lost),
+            (event::SESSION_RUNTIME_RECONNECTED, &live),
+            (event::SESSION_RUNTIME_LOST, &lost),
+        ] {
+            projector
+                .handle_event_blocking(&service, &attention, &session_event(name, session))
+                .await;
+        }
+
+        let notifications = list(&service);
+        assert_eq!(
+            notifications.len(),
+            2,
+            "each loss of the generation is reported: {notifications:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loss_after_a_cured_unproven_loss_is_reported_after_a_restart() {
+        let dir = temp_data_dir("unproven-cured-restart");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let lost = lost_session("s-1", SessionState::Running, 1, None, None);
+        let live = session_in_generation("s-1", SessionState::Running, None, 1);
+        let live = SessionInfo {
+            runtime: live.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                ..runtime
+            }),
+            ..live
+        };
+        for (name, session) in [
+            (event::SESSION_RUNTIME_LOST, &lost),
+            (event::SESSION_RUNTIME_RECONNECTED, &live),
+        ] {
+            projector
+                .handle_event_blocking(&service, &attention, &session_event(name, session))
+                .await;
+        }
+        assert_eq!(list(&service).len(), 1);
+        drop(service);
+
+        // The runtime answered again before the restart; the worker is dead
+        // at the next start, which commits the proven loss.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let failed = connected_later(lost_session(
+            "s-1",
+            SessionState::Failed,
+            1,
+            Some(oom_exit()),
+            None,
+        ));
+        project_session_update(&mut projector, &service, &failed).await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unproven_loss_proven_at_the_next_start_is_not_reported_twice() {
+        let dir = temp_data_dir("unproven-proven-restart");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let lost = lost_session("s-1", SessionState::Running, 1, None, None);
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_RUNTIME_LOST, &lost),
+            )
+            .await;
+        assert_eq!(list(&service).len(), 1);
+        drop(service);
+
+        // The next start finds the same loss and proves it; the registry
+        // delivers the change as a live event.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_RUNTIME_LOST, &failed),
+            )
+            .await;
+        project_session_update(&mut projector, &service, &failed).await;
+
+        assert_eq!(list(&service).len(), 1, "{:#?}", list(&service));
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_loaded_again_after_a_restart_is_not_reported_again() {
+        let dir = temp_data_dir("crashed-restart");
+        let crashed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        let unproven = lost_session("s-2", SessionState::Running, 1, None, None);
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &crashed).await;
+        project_session_update(&mut projector, &service, &unproven).await;
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_replayed_loss(&mut projector, &service, &crashed).await;
+        project_replayed_loss(&mut projector, &service, &unproven).await;
+        project_session_update(&mut projector, &service, &unproven).await;
+
+        assert_eq!(records_of(&service, NotificationKind::Error), 2);
+    }
+
     #[tokio::test]
     async fn done_session_update_creates_session_finished_when_policy_enabled() {
         let service = service("done-enabled");
@@ -2129,6 +2759,23 @@ mod tests {
             .await;
     }
 
+    /// Delivers `session` as the registry announces a loss it found stored.
+    async fn project_replayed_loss(
+        projector: &mut ProjectorState,
+        service: &NotificationService,
+        session: &SessionInfo,
+    ) {
+        projector
+            .handle_produced_event_blocking(
+                service,
+                &AttentionCoordinator::disconnected(),
+                &session_event(event::SESSION_RUNTIME_LOST, session),
+                StdInstant::now(),
+                EventOrigin::Replayed,
+            )
+            .await;
+    }
+
     fn records_of(service: &NotificationService, kind: NotificationKind) -> usize {
         list(service)
             .iter()
@@ -2337,6 +2984,271 @@ mod tests {
             .store
             .compact_if_needed(1)
             .expect("repeat compaction"));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_unproven_loss_stays_deleted_after_compaction_and_a_restart() {
+        let dir = temp_data_dir("unproven-compaction-replay");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let store = terminal_source_store(&dir);
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+        persist_terminal_source(&store, &running);
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &running).await;
+        assert_eq!(list(&service).len(), 1);
+        delete_visible_terminals(&service);
+        compact_deleted_terminals(&service);
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen compacted service");
+        let mut projector = ProjectorState::default();
+        project_replayed_loss(&mut projector, &service, &running).await;
+        project_session_update(&mut projector, &service, &failed).await;
+
+        assert!(
+            list(&service).is_empty(),
+            "a deleted loss is not reported again: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_unproven_loss_stays_deleted_across_an_interlude_and_compaction() {
+        let dir = temp_data_dir("unproven-interlude-compaction");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let store = terminal_source_store(&dir);
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        persist_terminal_source(&store, &running);
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &running).await;
+        assert_eq!(list(&service).len(), 1);
+        delete_visible_terminals(&service);
+        persist_terminal_source(&store, &reconnecting_of(running.clone()));
+        compact_deleted_terminals(&service);
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen compacted service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &failed).await;
+
+        assert!(
+            list(&service).is_empty(),
+            "a deleted loss is not reported again: {:#?}",
+            list(&service)
+        );
+    }
+
+    /// Reports the unproven loss of `s-1` generation 1 into a store in `dir`
+    /// and closes it, as a daemon that is stopped afterwards.
+    async fn report_unproven_loss_then_stop(dir: &std::path::Path) {
+        let service = NotificationService::open(dir).expect("open notification service");
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        project_session_update(&mut projector, &service, &running).await;
+        assert_eq!(list(&service).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_loss_reported_before_a_restart_is_not_reported_again_after_an_interlude() {
+        let dir = temp_data_dir("unproven-interlude");
+        report_unproven_loss_then_stop(&dir).await;
+
+        // The restart could not classify the record: it shows as reconnecting
+        // with the connect time it had, and the retry then commits the loss.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &reconnecting_of(lost_session("s-1", SessionState::Running, 1, None, None)),
+        )
+        .await;
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        project_session_update(&mut projector, &service, &failed).await;
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        project_session_update(&mut projector, &service, &running).await;
+
+        assert_eq!(list(&service).len(), 1, "{:#?}", list(&service));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_projector_reports_a_stored_loss_once_whatever_state_it_arrives_in() {
+        let dir = temp_data_dir("unproven-fresh");
+        report_unproven_loss_then_stop(&dir).await;
+
+        for state in [SessionState::Failed, SessionState::Running] {
+            let service = NotificationService::open(&dir).expect("reopen notification service");
+            let mut projector = ProjectorState::default();
+            let session = lost_session("s-1", state, 1, None, None);
+            project_session_update(&mut projector, &service, &session).await;
+            assert_eq!(list(&service).len(), 1, "{state:?}: {:#?}", list(&service));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cure_before_an_interlude_makes_the_next_loss_a_new_one() {
+        let dir = temp_data_dir("unproven-cure-interlude");
+        report_unproven_loss_then_stop(&dir).await;
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let lost_again = connected_later(lost_session("s-1", SessionState::Running, 1, None, None));
+        project_session_update(
+            &mut projector,
+            &service,
+            &reconnecting_of(lost_again.clone()),
+        )
+        .await;
+        project_session_update(&mut projector, &service, &lost_again).await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert!(
+            titles.iter().all(|title| title == "Session runtime lost"),
+            "{titles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_older_than_the_last_cure_does_not_cover_a_later_proof() {
+        let dir = temp_data_dir("unproven-cured-proof");
+        report_unproven_loss_then_stop(&dir).await;
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let failed = connected_later(lost_session(
+            "s-1",
+            SessionState::Failed,
+            1,
+            Some(oom_exit()),
+            None,
+        ));
+        project_session_update(&mut projector, &service, &failed).await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_a_loss_the_store_reports_notifies_nothing() {
+        let dir = temp_data_dir("unproven-snapshot");
+        report_unproven_loss_then_stop(&dir).await;
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        projector
+            .handle_session_snapshot_blocking(
+                &service,
+                &AttentionCoordinator::disconnected(),
+                &failed,
+                StdInstant::now(),
+            )
+            .await;
+
+        assert_eq!(list(&service).len(), 1, "{:#?}", list(&service));
+    }
+
+    #[tokio::test]
+    async fn a_stop_over_a_reported_loss_adds_nothing_and_resolves_nothing() {
+        let service = service("unproven-stopped");
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        project_session_update(&mut projector, &service, &running).await;
+        let stopped = lost_session("s-1", SessionState::Stopped, 1, None, None);
+        project_session_update(&mut projector, &service, &stopped).await;
+
+        let records = list(&service);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].status, protocol::NotificationStatus::Unread);
+    }
+
+    #[tokio::test]
+    async fn a_settled_loss_nobody_reported_is_reported() {
+        let service = service("settled-unreported");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_RUNTIME_LOST, &failed),
+            )
+            .await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles, vec!["Session crashed".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_is_only_reconnecting_does_not_release_an_unproven_loss() {
+        let service = service("unproven-reconnecting");
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let reconnecting = SessionInfo {
+            runtime: session_in_generation("s-1", SessionState::Running, None, 1)
+                .runtime
+                .map(|runtime| SessionRuntime {
+                    state: RuntimeState::Reconnecting,
+                    ..runtime
+                }),
+            ..session_info("s-1", SessionState::Running, None)
+        };
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+
+        for session in [&running, &reconnecting, &failed] {
+            project_session_update(&mut projector, &service, session).await;
+        }
+
+        assert_eq!(list(&service).len(), 1, "{:#?}", list(&service));
+    }
+
+    #[tokio::test]
+    async fn a_loss_announced_again_is_learned_and_a_later_snapshot_notifies_nothing() {
+        let service = service("replayed-loss");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let crashed = lost_session("s-1", SessionState::Failed, 1, None, Some("host_restarted"));
+        let unproven = lost_session("s-2", SessionState::Running, 1, None, None);
+
+        for session in [&crashed, &unproven] {
+            projector
+                .handle_produced_event_blocking(
+                    &service,
+                    &attention,
+                    &session_event(event::SESSION_RUNTIME_LOST, session),
+                    StdInstant::now(),
+                    EventOrigin::Replayed,
+                )
+                .await;
+        }
+        for session in [&crashed, &unproven] {
+            projector
+                .handle_session_snapshot_blocking(&service, &attention, session, StdInstant::now())
+                .await;
+            project_session_update(&mut projector, &service, session).await;
+        }
+
+        assert!(list(&service).is_empty(), "{:#?}", list(&service));
+
+        // A later change of the same session is still news.
+        let next = lost_session("s-3", SessionState::Failed, 1, None, None);
+        project_session_update(&mut projector, &service, &next).await;
+        assert_eq!(list(&service).len(), 1);
     }
 
     #[tokio::test]

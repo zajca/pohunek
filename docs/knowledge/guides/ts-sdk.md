@@ -47,6 +47,22 @@ Production relays, and their bind and trust policy, belong to the client that
 hosts them. `@pohunek/sdk` implements only the client side of this contract
 (`WsTransport`).
 
+## Session condition
+
+`sessionCondition(info, { listed? })` returns the one state to show for a
+`SessionInfo` and, for a crashed session, its recovery outlook:
+`{ condition, recovery }`. The rule is the CLI's `STATE` column: an `external`
+entry keeps its state; a lost runtime is `crashed` whatever `state` says
+(proven `failed` and unproven `running` alike); a terminal state is itself; a
+live state with a `reconnecting`, `conflict` or `incompatible` runtime shows
+that runtime state; a runtime state the SDK does not know is `unknown`, never
+`running` and never `crashed`. `recovery` is `null` unless the condition is
+`crashed`, then `recoverable`, `refused` (with the daemon's code),
+`no_native_resume` or `unknown`; pass `listed: true` for a payload from
+`session.list` or `session.inspect`, the only ones that carry the daemon's
+refusals. Nothing is added on the wire: the function reads fields a protocol 4
+daemon already sends.
+
 ## Turn waits
 
 `client.sessionWaitTurn(params)` calls `session.wait_turn` on a dedicated

@@ -45,7 +45,7 @@ use crate::agent::{
 };
 use crate::catalog_anchor::CatalogTrust;
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
-use crate::events::ProducedEvent;
+use crate::events::{EventOrigin, ProducedEvent};
 use crate::external::{
     external_session_id, ExternalSessionChange, ExternalSessions, TranscriptCandidate,
     TranscriptIndex, EXTERNAL_TERMINAL_COLS, EXTERNAL_TERMINAL_ROWS,
@@ -2694,6 +2694,7 @@ impl SessionRegistry {
         let _ = self.inner.produced_events.send(ProducedEvent {
             event: event.clone(),
             produced,
+            origin: EventOrigin::Live,
         });
         let _ = self.inner.events.send(event);
     }
@@ -8014,6 +8015,24 @@ impl SessionRegistry {
             }),
         );
         self.publish(event);
+    }
+
+    /// Publishes a session event that announces a state the registry loaded
+    /// unchanged. The notification projector takes it as a baseline and
+    /// notifies nothing.
+    fn emit_replayed(&self, name: &str, info: &SessionInfo) {
+        let event = crate::events::event(
+            name,
+            event_payload(SessionEvent {
+                session: info.clone(),
+            }),
+        );
+        let _ = self.inner.produced_events.send(ProducedEvent {
+            event: event.clone(),
+            produced: std::time::Instant::now(),
+            origin: EventOrigin::Replayed,
+        });
+        let _ = self.inner.events.send(event);
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {

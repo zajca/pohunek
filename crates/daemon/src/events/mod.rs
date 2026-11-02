@@ -60,6 +60,20 @@ pub(crate) fn event(name: &str, payload: serde_json::Value) -> Event {
 pub(crate) struct ProducedEvent {
     pub(crate) event: Event,
     pub(crate) produced: std::time::Instant,
+    /// Whether the event is a change or announces a state the registry
+    /// already held unchanged.
+    pub(crate) origin: EventOrigin,
+}
+
+/// What a [`ProducedEvent`] tells a consumer about the state it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventOrigin {
+    /// A change the registry just made.
+    Live,
+    /// A state the registry loaded unchanged, such as a lost session found
+    /// again at startup. A consumer takes it as a baseline: it is never news,
+    /// whatever the consumer's own store holds.
+    Replayed,
 }
 
 /// File name of the active journal file inside the events directory.

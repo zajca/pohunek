@@ -4370,6 +4370,8 @@ impl SessionRegistry {
     ) -> bool {
         let state = classification.state();
         let id = SessionId(record.session_id.clone());
+        let stored_runtime = record.info.runtime.clone();
+        let stored_state = record.info.state;
         let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         // Boxed so the entry does not widen the futures of the callers.
         let entry = Box::new(entry);
@@ -4410,7 +4412,24 @@ impl SessionRegistry {
             | RuntimeState::Terminal
             | RuntimeState::Unknown => event::SESSION_UPDATED,
         };
-        self.emit(event_name, &info);
+        // A record that was lost in the same generation and state is loaded
+        // unchanged at every start: a baseline, not a new loss. Any other
+        // change, including the proof of a stored unproven loss, is a live
+        // event whose dedupe the notification projector decides.
+        let loaded_unchanged = stored_runtime
+            .as_ref()
+            .zip(info.runtime.as_ref())
+            .is_some_and(|(stored, current)| {
+                stored.state == RuntimeState::Lost
+                    && current.state == RuntimeState::Lost
+                    && stored.runtime_generation == current.runtime_generation
+            })
+            && stored_state == info.state;
+        if loaded_unchanged {
+            self.emit_replayed(event_name, &info);
+        } else {
+            self.emit(event_name, &info);
+        }
         if had_background {
             self.emit_background_state(&info);
         }
@@ -13634,7 +13653,7 @@ handler = "codex-hook-v1"
             ServiceObservation, ServiceState, Supervisor,
         };
         use pohunek_session_worker::{Journal, JournalRecord, RuntimePhase as JournalRuntimePhase};
-        use protocol::{RuntimeInventoryStatus, RuntimeState, SessionId};
+        use protocol::{event, RuntimeInventoryStatus, RuntimeState, SessionId, SessionState};
 
         use super::super::super::supervision::{
             RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, STALE_GENERATION, UNSUPERVISED_WORKER,
@@ -15189,6 +15208,7 @@ generation "$1"
                 runtime.loss_reason.as_deref(),
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
+            assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
         }
 
         #[tokio::test]
@@ -15995,6 +16015,11 @@ generation "$1"
                     Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
                     "{tag}"
                 );
+                assert_eq!(
+                    runtime.loss_cause.as_deref(),
+                    Some("user_manager_lost"),
+                    "{tag}"
+                );
                 assert!(marked.alive(), "{tag}: a failed sweep signals nothing");
             }
         }
@@ -16056,6 +16081,396 @@ generation "$1"
             assert_eq!(runtime.state, RuntimeState::Lost);
             assert_eq!(runtime.loss_cause.as_deref(), Some("host_restarted"));
             assert_eq!(runtime.exit, None);
+        }
+
+        /// A loss that startup reconciliation commits reaches the notification
+        /// projector, which is running before the registry reconciles. It is
+        /// reported once, and a restart that loads the same lost record again
+        /// reports nothing.
+        #[tokio::test]
+        async fn a_loss_committed_at_startup_is_reported_once_across_restarts() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_record(&fixture.root, "s-4240", Some("runtime-s-4240"));
+            write_journal_record(
+                &fixture.root,
+                "s-4240",
+                "worker-s-4240",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4240"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+            let reported = || {
+                notifications
+                    .list(protocol::NotificationListParams::default())
+                    .expect("list notifications")
+                    .notifications
+            };
+
+            // The first start: the projector subscribes before the registry
+            // reconciles, as the daemon starts them.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("first start");
+            projector.stop().await;
+            let records = reported();
+            assert_eq!(records.len(), 1, "{records:#?}");
+            assert_eq!(records[0].title, "Session crashed");
+            assert_eq!(records[0].body, "Lost when the host restarted");
+            assert_eq!(
+                records[0].metadata.get("loss_cause").map(String::as_str),
+                Some("host_restarted")
+            );
+
+            // The next start loads the failed record again and a fresh
+            // projector sees its replayed state.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("second start");
+            projector.stop().await;
+            assert_eq!(reported().len(), 1, "{:#?}", reported());
+        }
+
+        /// Stores `session_id` as the 0.38 daemon left an unproven loss:
+        /// `running` with a lost runtime.
+        fn persist_unproven_loss(root: &Path, session_id: &str) -> SessionRecord {
+            let mut record =
+                persist_record(root, session_id, Some(&format!("runtime-{session_id}")));
+            record.info.state = SessionState::Running;
+            let runtime = record.info.runtime.as_mut().expect("runtime");
+            runtime.state = RuntimeState::Lost;
+            runtime.loss_reason = Some("runtime_lost_cleanup_unconfirmed".to_owned());
+            Store::new(root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist unproven loss");
+            record
+        }
+
+        /// Writes the journal of a worker that is gone after a host restart.
+        fn write_restarted_host_journal(root: &Path, session_id: &str) {
+            write_journal_record(
+                root,
+                session_id,
+                &format!("worker-{session_id}"),
+                TEST_GENERATION,
+                dead_worker(),
+                Some(&format!("runtime-{session_id}")),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+        }
+
+        /// A start that proves a loss the owner already heard about as
+        /// unproven adds no second notification.
+        #[tokio::test]
+        async fn a_start_that_proves_a_reported_unproven_loss_adds_no_notification() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            let record = persist_unproven_loss(&fixture.root, "s-4250");
+            write_restarted_host_journal(&fixture.root, "s-4250");
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+
+            // Before the restart the daemon reports the unproven loss.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            fixture
+                .registry
+                .emit(event::SESSION_RUNTIME_LOST, &record.info);
+            projector.stop().await;
+            let list = || {
+                notifications
+                    .list(protocol::NotificationListParams::default())
+                    .expect("list notifications")
+                    .notifications
+            };
+            assert_eq!(list().len(), 1, "{:#?}", list());
+            assert_eq!(list()[0].title, "Session runtime lost");
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            projector.stop().await;
+            assert_eq!(list().len(), 1, "{:#?}", list());
+        }
+
+        /// A loss reported as unproven stays reported across an interlude in
+        /// which a start could not classify the record: the retry that then
+        /// commits the loss adds no second notification.
+        async fn a_reported_loss_survives_an_interlude(session_id: &str, interlude: RuntimeState) {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            let record = persist_unproven_loss(&fixture.root, session_id);
+            write_restarted_host_journal(&fixture.root, session_id);
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+            let list = || {
+                notifications
+                    .list(protocol::NotificationListParams::default())
+                    .expect("list notifications")
+                    .notifications
+            };
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            fixture
+                .registry
+                .emit(event::SESSION_RUNTIME_LOST, &record.info);
+            projector.stop().await;
+            assert_eq!(list().len(), 1, "{:#?}", list());
+
+            // The restart: the record is persisted as unclassifiable, then
+            // the retry commits the loss.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            assert!(
+                fixture
+                    .registry
+                    .insert_unavailable_record(record, interlude, "runtime_supervision_unavailable")
+                    .await
+            );
+            let id = SessionId(session_id.to_owned());
+            assert!(fixture.registry.retry_supervised_session(&id).await);
+            assert_eq!(
+                runtime_of(&fixture.registry, session_id).await.state,
+                RuntimeState::Lost
+            );
+            projector.stop().await;
+            assert_eq!(list().len(), 1, "{:#?}", list());
+        }
+
+        #[tokio::test]
+        async fn a_reported_loss_is_not_reported_again_after_a_reconnecting_interlude() {
+            a_reported_loss_survives_an_interlude("s-4260", RuntimeState::Reconnecting).await;
+        }
+
+        #[tokio::test]
+        async fn a_reported_loss_is_not_reported_again_after_a_conflict_interlude() {
+            a_reported_loss_survives_an_interlude("s-4261", RuntimeState::Conflict).await;
+        }
+
+        /// A start that proves a loss nobody was told about, such as one an
+        /// earlier release stored as `running` and never notified, reports it.
+        #[tokio::test]
+        async fn a_start_that_proves_an_unreported_unproven_loss_notifies_the_crash() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_unproven_loss(&fixture.root, "s-4251");
+            write_restarted_host_journal(&fixture.root, "s-4251");
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            projector.stop().await;
+            let records = notifications
+                .list(protocol::NotificationListParams::default())
+                .expect("list notifications")
+                .notifications;
+            assert_eq!(records.len(), 1, "{records:#?}");
+            assert_eq!(records[0].title, "Session crashed");
+        }
+
+        /// A loss reported as unproven whose runtime then answered again is
+        /// not a standing loss: the next start that finds the worker dead
+        /// reports the crash.
+        #[tokio::test]
+        async fn a_start_that_loses_a_runtime_that_answered_again_notifies_the_crash() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            let lost = persist_unproven_loss(&fixture.root, "s-4252");
+            let mut live = persist_record(&fixture.root, "s-4252", Some("runtime-s-4252"));
+            // The runtime answered after the loss was reported.
+            live.info
+                .runtime
+                .as_mut()
+                .expect("runtime")
+                .last_connected_at = Some("2999-01-01T00:00:00Z".to_owned());
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&live)
+                .expect("persist the cure");
+            write_restarted_host_journal(&fixture.root, "s-4252");
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            fixture
+                .registry
+                .emit(event::SESSION_RUNTIME_LOST, &lost.info);
+            fixture
+                .registry
+                .emit(event::SESSION_RUNTIME_RECONNECTED, &live.info);
+            projector.stop().await;
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            projector.stop().await;
+            let titles: Vec<String> = notifications
+                .list(protocol::NotificationListParams::default())
+                .expect("list notifications")
+                .notifications
+                .into_iter()
+                .map(|record| record.title)
+                .collect();
+            assert_eq!(titles.len(), 2, "{titles:?}");
+            assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
+        }
+
+        /// A session that was already lost when the daemon started is announced
+        /// again to the event stream, but no notification exists for it and
+        /// none is created: it is not a new loss.
+        #[tokio::test]
+        async fn a_lost_record_found_at_startup_is_not_a_new_loss_to_notify() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_record(&fixture.root, "s-4241", Some("runtime-s-4241"));
+            write_journal_record(
+                &fixture.root,
+                "s-4241",
+                "worker-s-4241",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4241"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            // The record is stored as lost by a daemon that created no
+            // notification for it.
+            let store = Store::new(fixture.root.join("data/metadata.jsonl"));
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-4241")
+                .expect("record");
+            record.info.state = protocol::SessionState::Failed;
+            record.runtime.state = RuntimeState::Lost;
+            record.info.runtime = Some(protocol::SessionRuntime {
+                state: RuntimeState::Lost,
+                runtime_generation: protocol::RuntimeGeneration::new(1),
+                worker_id: record.runtime.worker_id.clone(),
+                worker_instance_id: record.runtime.worker_instance_id.clone(),
+                started_at: None,
+                last_connected_at: None,
+                loss_reason: Some("runtime_lost".to_owned()),
+                exit: None,
+                loss_cause: Some("host_restarted".to_owned()),
+            });
+            store.record_session(&record).expect("store failed+lost");
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            projector.stop().await;
+
+            let runtime = runtime_of(&fixture.registry, "s-4241").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            let records = notifications
+                .list(protocol::NotificationListParams::default())
+                .expect("list notifications")
+                .notifications;
+            assert!(records.is_empty(), "{records:#?}");
         }
 
         /// A sweep that settles for many polls logs one `info` summary, however
