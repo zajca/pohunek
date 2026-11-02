@@ -570,8 +570,10 @@ async fn a_restated_record_emits_no_agent_state() {
 
 /// The child records of a Claude background agent never change what the
 /// session reads: they do not turn a held root `done` working. A child record
-/// that dropped the held record is not observable here: the idle reading the
-/// screen would give is debounced, and the held record is not on the wire.
+/// that dropped the held root record is not observed here, because the idle
+/// reading the screen would then give is debounced and the held record is not
+/// on the wire; `a_child_record_never_changes_the_root_record` in
+/// `program_status_detector.rs` guards that direction at the detector.
 #[tokio::test]
 async fn a_background_agents_child_records_never_change_the_session_activity() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -604,26 +606,35 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
         "only the root `done` changes the activity"
     );
 
-    // The marker line is drawn after the child records in the same stream, so
-    // once it is visible the detector has seen them.
+    // The detector task answers `session.detection` from its own screen, so
+    // once the marker shows there, it has consumed the chunk with the child
+    // records. The root `blocked` record is written only then, so it cannot
+    // share a chunk with them, and a child record read as a root `working`
+    // would have published an edge before the awaited `blocked`.
     command(&fixture, b'c');
     command(&fixture, b'x');
     command(&fixture, b'm');
-    wait_until("the marker line to be drawn", || async {
-        let screen = fixture.registry.screen(&created.id).await.ok()?;
-        screen
-            .visible_lines
+    wait_until("the detector to see the marker line", || async {
+        let detection = fixture.registry.detection(&created.id).await.ok()?;
+        detection
+            .previews
             .iter()
-            .any(|line| line.contains("SYNC"))
+            .any(|preview| preview.text.contains("SYNC"))
             .then_some(())
     })
     .await;
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
     assert_eq!(
-        fixture.activity(&created.id).await,
-        Some((AgentActivity::Idle, StateSource::OscProgress)),
-        "the child records leave the held root `done` in place"
+        agent_states(&mut events).len(),
+        1,
+        "the child records over a held root `done` add no edge before the root `blocked`"
     );
-    assert_eq!(agent_states(&mut events).len(), 0);
     fixture
         .registry
         .stop(&created.id)

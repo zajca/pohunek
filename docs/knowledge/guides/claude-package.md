@@ -440,9 +440,10 @@ manifest opts in) and the daemon holds the latest root record.
   `a_background_agents_child_records_never_change_the_session_activity`
   (`crates/daemon/tests/program_status_session.rs`, a stand-in agent emitting
   the same record shapes through a real worker and PTY) fails when a child
-  record is read as a root record. A child record that drops the held root
-  record is not observed by any scenario: the idle reading the screen would give
-  is debounced, and the held record is not on the wire.
+  record is read as a root record. That scenario does not observe a child record
+  that drops the held root record: the idle reading the screen would then give
+  is debounced and the held record is not on the wire. The detector scenario
+  `a_child_record_never_changes_the_root_record` guards that direction.
 - Not recorded on 2.1.309: `CLAUDE_CODE_SESSION_KIND=bg` and running under
   tmux.
 
