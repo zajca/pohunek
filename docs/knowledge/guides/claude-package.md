@@ -430,7 +430,7 @@ manifest opts in) and the daemon holds the latest root record.
   the root sequence (`idle`, `working`, `done`). The launching turn's root record
   stays `working` while Claude shows `Waiting for 1 background agent to finish`
   over an idle-looking screen, and the session keeps reading working from it
-  until the root `done`, which follows the agent's `clear`. The real-agent
+  until the root `done` (measured: the agent's `clear` came first). The real-agent
   scenario cannot tell a dropped root record from one Claude re-sends, so the
   detector ignoring child records is pinned with the same record shapes at the
   detector boundary

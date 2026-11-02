@@ -3811,12 +3811,17 @@ async fn a_real_claude_esc_interrupt_reads_idle_from_its_idle_record() {
     client.send(ESCAPE_KEY).await;
     let idle = fixture.wait_activity(&id, "idle").await;
     assert_eq!(idle["state_source"], "osc_progress", "{idle}");
-    let rows = fixture.wait_screen_line(&id, PROMPT).await;
+    fixture.assert_stays_idle(&id).await;
+    let (_title, rows) = fixture.screen(&id).await;
     assert!(
         !rows.iter().any(|row| row.contains(INTERRUPTED_MARKER)),
         "an interrupt before any reply draws no marker: {rows:#?}"
     );
-    fixture.assert_stays_idle(&id).await;
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with('\u{276f}') && row.contains(PROMPT)),
+        "the prompt is back in the input box: {rows:#?}"
+    );
     assert_eq!(
         capture::program_status_records(&fixture.raw_output(&id).await),
         INTERRUPTED_TURN_RECORDS
@@ -3858,10 +3863,11 @@ const WAITING_FOR_AGENT: &str = "Waiting for 1 background agent";
 
 /// The background agent of a real Claude reports with `id=` records (a
 /// `working` record, then a `clear`), and only the root record decides the
-/// session's activity. After the launching turn's reply the screen is idle
-/// (prompt box, no spinner, no turn footer) while the root record stays
-/// `working` until the agent ended: a child record that dropped the held root
-/// record would turn the session idle from the screen in that window.
+/// session's activity. The scenario pins the record shapes Claude emits, the
+/// unchanged root sequence, and a root `working` record that stays held over an
+/// idle-looking screen while the agent runs. It cannot tell a dropped root
+/// record from one Claude re-sends; the detector ignoring child records is
+/// pinned in `a_real_claude_background_agent_record_never_turns_a_done_root_working`.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_background_agent_records_never_drive_the_session_activity() {
