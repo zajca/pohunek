@@ -6,8 +6,14 @@
 //! A stop keeps the worktree and goes through the ordinary stop transaction, so
 //! the `session-stop` hook fires and the session ends `stopped`.
 //!
-//! The clock is [`SessionEntry::activity_since`]: it moves only when the activity
-//! value changes and is not persisted. One task owns the deadlines: it sleeps
+//! A session with live background work (see [`live_background_work`]) is not
+//! idle: the stop would kill that work mid-run. The `activity` value keeps its
+//! turn meaning; the hold reads the published `background` snapshot.
+//!
+//! The clock starts at the later of [`SessionEntry::activity_since`], which moves
+//! only when the activity value changes, and [`SessionEntry::background_quiet_since`],
+//! which is set when live background work ends. Neither is persisted. One task
+//! owns the deadlines: it sleeps
 //! until the earliest one, wakes on every change that can move a deadline, and
 //! re-reads the session under the stop transaction's own lock before it stops
 //! anything.
@@ -21,9 +27,10 @@ use std::time::{Duration, Instant};
 
 use pohunek_platform::filesystem::AtomicReplaceError;
 use protocol::{
-    AgentActivity, ErrorClass, IdleStopOptIn, NotificationCreateParams, NotificationKind,
-    NotificationSeverity, NotificationSource, ProtocolError, SessionId, SessionIdleStopParams,
-    SessionIdleStopResult, SessionState, IDLE_STOP_METADATA_KEY,
+    AgentActivity, BackgroundKind, ErrorClass, IdleStopOptIn, NotificationCreateParams,
+    NotificationKind, NotificationSeverity, NotificationSource, ProtocolError, SessionId,
+    SessionIdleStopParams, SessionIdleStopResult, SessionInfo, SessionState, SubagentLifecycle,
+    IDLE_STOP_METADATA_KEY,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -179,6 +186,82 @@ enum Standing {
     },
 }
 
+/// Background kinds whose live items keep a session from being idle-stopped.
+///
+/// A teammate is listed `running` while it idles, so it would hold forever. The
+/// provider-internal kinds and `other` carry no evidence that their end starts a
+/// main turn, whose `Stop` is what drops the item from the snapshot.
+const HOLDING_KINDS: [BackgroundKind; 5] = [
+    BackgroundKind::Subagent,
+    BackgroundKind::Workflow,
+    BackgroundKind::Shell,
+    BackgroundKind::Monitor,
+    BackgroundKind::McpTask,
+];
+
+/// Whether `info` shows background work that is still running.
+///
+/// The provider lists only running or pending tasks, so a listed item of a
+/// holding kind is live as of the snapshot. The listing can lag behind a
+/// subagent's own stop hook, so a subagent item whose `subagents` row is
+/// terminal does not count. Running `subagents` rows alone never count: a
+/// teammate or a Codex child can stay `running` after it stopped working.
+pub(super) fn live_background_work(info: &SessionInfo) -> bool {
+    let Some(background) = info.background.as_ref() else {
+        return false;
+    };
+    background.items.iter().any(|item| {
+        HOLDING_KINDS.contains(&item.kind)
+            && !(item.kind == BackgroundKind::Subagent
+                && info.subagents.iter().any(|row| {
+                    row.id == item.id
+                        && matches!(
+                            row.lifecycle,
+                            SubagentLifecycle::Completed
+                                | SubagentLifecycle::Failed
+                                | SubagentLifecycle::Cancelled
+                                | SubagentLifecycle::Lost
+                        )
+                }))
+    })
+}
+
+impl SessionEntry {
+    /// When the idle clock of the session started: the later of the last
+    /// activity change and the end of the last live background work.
+    fn idle_since(&self) -> Instant {
+        self.background_quiet_since
+            .map_or(self.activity_since, |quiet| quiet.max(self.activity_since))
+    }
+
+    /// Replaces the published subagents and, when the worker sent one, the
+    /// background snapshot, and starts the background quiet clock when the
+    /// replacement ends live background work.
+    ///
+    /// Returns whether the subagents and whether the background snapshot
+    /// changed.
+    pub(super) fn replace_background_view(
+        &mut self,
+        subagents: Vec<protocol::SubagentInfo>,
+        background: Option<&Option<protocol::SessionBackground>>,
+    ) -> (bool, bool) {
+        let was_live = live_background_work(&self.info);
+        let subagents_changed = self.info.subagents != subagents;
+        self.info.subagents = subagents;
+        let background_changed = match background {
+            Some(update) if self.info.background != *update => {
+                self.info.background.clone_from(update);
+                true
+            }
+            _ => false,
+        };
+        if was_live && !live_background_work(&self.info) {
+            self.background_quiet_since = Some(crate::time::now());
+        }
+        (subagents_changed, background_changed)
+    }
+}
+
 /// Reads how `entry` stands against its idle limit.
 ///
 /// A stored value an older daemon accepted without validation makes the session
@@ -202,13 +285,14 @@ fn standing(
     let stoppable = entry.info.state == SessionState::Running
         && !entry.stopping
         && entry.info.activity == Some(AgentActivity::Idle)
+        && !live_background_work(&entry.info)
         && matches!(entry.runtime, RuntimeHandle::Worker(_));
     if !stoppable {
         return Ok(Standing::Inert);
     }
     let limit = Duration::from_secs(u64::from(secs));
     Ok(Standing::Armed {
-        deadline: entry.activity_since + limit,
+        deadline: entry.idle_since() + limit,
         limit,
         source,
     })
@@ -524,7 +608,7 @@ impl SessionRegistry {
                 held.store(true, std::sync::atomic::Ordering::SeqCst);
                 return false;
             }
-            let idle = now.saturating_duration_since(entry.activity_since);
+            let idle = now.saturating_duration_since(entry.idle_since());
             idle_millis.store(
                 u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
                 std::sync::atomic::Ordering::SeqCst,

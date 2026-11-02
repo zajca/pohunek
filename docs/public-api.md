@@ -2731,6 +2731,25 @@ The idle clock and the reported activity are memory only: after a daemon restart
 a session is armed again when it reports `idle` again, and its limit counts from
 that report.
 
+Live background work holds the stop. A session whose `SessionInfo.background`
+lists an item of kind `subagent`, `workflow`, `shell`, `monitor` or `mcp_task`
+is not stopped, and `activity` is not changed by it: it keeps its turn meaning
+(`idle` once the turn ends, so `session.input` waits, `session.wait` and
+`session.wait_turn` behave as without background work). A `subagent` item whose
+`SessionInfo.subagents` row with the same id is terminal does not count. Items of
+kind `teammate`, `dream`, `auto_mode_scan`, `memory_import`, `cloud_session` and
+`other` never hold, and a `running` subagent row without a background item never
+holds (Codex lists no background snapshot, so Codex sessions are not held). The
+hold has no age limit and a held session has no deadline. When the last live item
+disappears the idle clock restarts from that moment, so the stop comes a full
+limit later. The rule reads only the published `background` and `subagents`
+fields; there is no protocol change.
+
+Rendering background work: a client shows `background` beside `activity`
+instead of treating a background session as `working`. Only the five kinds above
+hold the idle stop; the CLI's `session list` `BACKGROUND` column lists every
+reported item, teammates and internal kinds included.
+
 The stop is recorded where an operator can find it, without a protocol field:
 an INFO log line `session.idle_stop.stopped` (session id, idle seconds, whether
 the limit came from the session or the host default) and the `session_stopped`

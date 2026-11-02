@@ -20,7 +20,10 @@ use protocol::{
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use super::turn_wait_tests::{err, every_provider, ok, pause_clock, settle, Fixture, AGENT};
+use super::turn_wait_tests::{
+    advance_until_finished, debounce, err, every_provider, fresh_cursor, joined, ok, parked,
+    pause_clock, settle, Fixture, AGENT, FLUSH_SLACK, LONG_WAIT_MS,
+};
 use crate::agent::host::fixture::official_host;
 use crate::notifications::default_policy;
 use crate::session::{spawn_idle_stop, SessionRegistryConfig};
@@ -101,8 +104,18 @@ impl World {
 
     /// Pauses the clock and starts the idle-stop task over `sessions`.
     async fn adopt(fixture: Fixture, sessions: Vec<String>) -> Self {
-        let events = fixture.sessions.subscribe();
         let inhibitor = pause_clock().await;
+        Self::adopt_paused(fixture, sessions, inhibitor).await
+    }
+
+    /// Starts the idle-stop task over `sessions` on a clock that `inhibitor`
+    /// already paused.
+    async fn adopt_paused(
+        fixture: Fixture,
+        sessions: Vec<String>,
+        inhibitor: AutoAdvanceInhibitor,
+    ) -> Self {
+        let events = fixture.sessions.subscribe();
         let tasks = DaemonShutdown::default();
         let task = spawn_idle_stop(
             &tasks,
@@ -844,6 +857,387 @@ async fn activity_that_arrives_while_the_stop_waits_for_its_turn_keeps_the_sessi
         .await;
     assert!(world.system_records(0).await.is_empty());
     world.finish(&[0]).await;
+}
+
+/// A background task of provider type `kind` that the main `Stop` lists as
+/// running.
+fn task(id: &str, kind: &str) -> Value {
+    json!({"id": id, "type": kind, "status": "running", "description": "Background work"})
+}
+
+/// The agent's `SessionStart` hook input.
+fn session_start() -> Value {
+    json!({"hook_event_name": "SessionStart", "session_id": "native-idle", "source": "startup"})
+}
+
+/// A main-agent `Stop` hook input listing `tasks`.
+fn stop_listing(tasks: &[Value]) -> Value {
+    json!({"hook_event_name": "Stop", "background_tasks": tasks})
+}
+
+/// A `SubagentStart` or `SubagentStop` hook input for the agent `id`.
+fn subagent_hook(event: &str, id: &str) -> Value {
+    json!({"hook_event_name": event, "agent_id": id, "agent_type": "general-purpose"})
+}
+
+impl World {
+    /// Starts the fake Claude agent of session `index` as an idle turn end that
+    /// lists `tasks`, through the real state hook, and waits until the daemon
+    /// has imported the listing from the worker.
+    async fn stop_listing(&self, index: usize, tasks: &[Value]) {
+        let id = self.id(index);
+        self.fixture.run_hook(id, "session", &session_start()).await;
+        self.fixture
+            .run_hook(id, "stop", &stop_listing(tasks))
+            .await;
+        self.fixture.wait_listed(id, tasks.len()).await;
+        self.fixture.hook_activity(id, "idle").await;
+        settle().await;
+    }
+
+    /// A later turn end of the agent of session `index` that lists `tasks`.
+    async fn next_stop(&self, index: usize, tasks: &[Value]) {
+        let id = self.id(index);
+        self.fixture
+            .run_hook(id, "stop", &stop_listing(tasks))
+            .await;
+        self.fixture.wait_listed(id, tasks.len()).await;
+        self.quiesce().await;
+    }
+
+    /// The `activity` and `background` items of session `index`.
+    async fn published(&self, index: usize) -> (Value, Value) {
+        let info = ok(self
+            .fixture
+            .call(method::SESSION_INSPECT, json!(self.id(index)))
+            .await);
+        (
+            info["activity"].clone(),
+            info["background"]["items"].clone(),
+        )
+    }
+}
+
+/// A world of `count` sessions that run the fake Claude agent.
+async fn hooked_world(count: usize) -> World {
+    let fixture = Fixture::with_policy(config(None), Some(system_enabled()));
+    let mut sessions = Vec::new();
+    for index in 0..count {
+        sessions.push(fixture.hook_session(&format!("hook-{index}")).await);
+    }
+    World::adopt(fixture, sessions).await
+}
+
+#[tokio::test]
+async fn live_background_work_holds_the_stop_while_an_idle_control_session_is_stopped() {
+    let mut world = hooked_world(3).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    ok(world.opt_in(1, &LIMIT_SECS.to_string()).await);
+    world.stop_listing(0, &[task("shell-1", "shell")]).await;
+    world.stop_listing(1, &[]).await;
+    world.stop_listing(2, &[task("shell-2", "shell")]).await;
+
+    // The control session proves the limit passed, so the others were kept on
+    // purpose.
+    world.elapse(LIMIT_SECS - 1).await;
+    world.elapse_past(1).await;
+    world.stopped(1).await;
+    world.elapse(10 * LIMIT_SECS).await;
+    world
+        .assert_running(0, "a background shell runs past the limit")
+        .await;
+    world
+        .assert_running(2, "a session without the opt-in is never stopped")
+        .await;
+    let (activity, items) = world.published(0).await;
+    assert_eq!(activity, "idle", "the turn state is unchanged");
+    assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+
+    world.finish(&[0, 2]).await;
+}
+
+#[tokio::test]
+async fn every_counted_kind_holds_the_stop() {
+    let kinds = ["subagent", "workflow", "shell", "monitor", "MCP task"];
+    let mut world = hooked_world(kinds.len() + 1).await;
+    for (index, kind) in kinds.iter().enumerate() {
+        ok(world.opt_in(index, &LIMIT_SECS.to_string()).await);
+        world.stop_listing(index, &[task("task-1", kind)]).await;
+    }
+    // The control session proves the limit passed.
+    let control = kinds.len();
+    ok(world.opt_in(control, &LIMIT_SECS.to_string()).await);
+    world.stop_listing(control, &[]).await;
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.elapse_past(1).await;
+    world.stopped(control).await;
+    world.elapse(10 * LIMIT_SECS).await;
+    for (index, kind) in kinds.iter().enumerate() {
+        world.assert_running(index, &format!("{kind} holds")).await;
+    }
+    world.finish(&(0..kinds.len()).collect::<Vec<_>>()).await;
+}
+
+#[tokio::test]
+async fn teammates_internal_kinds_and_unlisted_subagent_rows_do_not_hold() {
+    let kinds = [
+        "teammate",
+        "dream",
+        "auto-mode scan",
+        "memory import",
+        "cloud session",
+        "custom provider type",
+    ];
+    let mut world = hooked_world(kinds.len() + 1).await;
+    for (index, kind) in kinds.iter().enumerate() {
+        ok(world.opt_in(index, &LIMIT_SECS.to_string()).await);
+        world.stop_listing(index, &[task("task-1", kind)]).await;
+    }
+    // A subagent that started but is not listed stays `running` through its
+    // first turn end; a running row alone is no evidence of live work.
+    let bare = kinds.len();
+    ok(world.opt_in(bare, &LIMIT_SECS.to_string()).await);
+    world
+        .fixture
+        .run_hook(world.id(bare), "session", &session_start())
+        .await;
+    world
+        .fixture
+        .run_hook(
+            world.id(bare),
+            "subagent-start",
+            &subagent_hook("SubagentStart", "agent-1"),
+        )
+        .await;
+    world.fixture.wait_subagent_rows(world.id(bare), 1).await;
+    world
+        .fixture
+        .run_hook(world.id(bare), "stop", &stop_listing(&[]))
+        .await;
+    world.fixture.wait_listed(world.id(bare), 0).await;
+    world.fixture.hook_activity(world.id(bare), "idle").await;
+    let info = ok(world
+        .fixture
+        .call(method::SESSION_INSPECT, json!(world.id(bare)))
+        .await);
+    assert_eq!(info["subagents"][0]["lifecycle"], "running", "{info}");
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.elapse_past(1).await;
+    world.stopped_all(&(0..=bare).collect::<Vec<_>>()).await;
+    world.finish(&[]).await;
+}
+
+#[tokio::test]
+async fn a_listing_that_lags_behind_the_subagents_own_stop_does_not_hold() {
+    let mut world = hooked_world(1).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    let id = world.id(0).to_owned();
+    world
+        .fixture
+        .run_hook(&id, "session", &session_start())
+        .await;
+    world
+        .fixture
+        .run_hook(
+            &id,
+            "subagent-start",
+            &subagent_hook("SubagentStart", "agent-1"),
+        )
+        .await;
+    world
+        .fixture
+        .run_hook(
+            &id,
+            "subagent-stop",
+            &subagent_hook("SubagentStop", "agent-1"),
+        )
+        .await;
+    // The turn end still lists the agent whose own stop hook already ran.
+    world
+        .fixture
+        .run_hook(&id, "stop", &stop_listing(&[task("agent-1", "subagent")]))
+        .await;
+    world.fixture.wait_listed(&id, 1).await;
+    world.fixture.hook_activity(&id, "idle").await;
+    let info = ok(world
+        .fixture
+        .call(method::SESSION_INSPECT, json!(&id))
+        .await);
+    assert_eq!(info["subagents"][0]["lifecycle"], "completed", "{info}");
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.elapse_past(1).await;
+    world.stopped(0).await;
+    world.finish(&[]).await;
+}
+
+/// The hold ends through the next turn end that lists nothing. The agent's
+/// `owner_exited` clear is not reachable here: the fake agent is the PTY root,
+/// so its exit ends the session instead of clearing the snapshot of a session
+/// that goes on. The scenario does not cover that clear.
+#[tokio::test]
+async fn the_clock_restarts_when_live_background_work_ends() {
+    let mut world = hooked_world(1).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    world.stop_listing(0, &[task("shell-1", "shell")]).await;
+    world.elapse(10 * LIMIT_SECS).await;
+    world.assert_running(0, "held").await;
+
+    // The next turn end lists nothing. Nothing advances the clock before the
+    // checks, so a stop begun by the end of the hold would already be done.
+    world.next_stop(0, &[]).await;
+    world
+        .assert_running(0, "the session is not due the moment the work ends")
+        .await;
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.assert_running(0, "one second before the limit").await;
+    world.elapse_past(1).await;
+    world.stopped(0).await;
+    world.finish(&[]).await;
+}
+
+#[tokio::test]
+async fn a_restarted_daemon_keeps_the_hold_and_counts_a_full_limit_from_the_end_of_the_work() {
+    let dir = pohunek_test_support::tempdir().expect("data dir");
+    let first = Fixture::with_policy(
+        SessionRegistryConfig {
+            store_path: Some(dir.path().join("metadata.jsonl")),
+            ..config(None)
+        },
+        Some(system_enabled()),
+    );
+    let id = first.hook_session("restart").await;
+    ok(first
+        .call(
+            method::SESSION_SET_METADATA,
+            json!({"session_id": id, "metadata": {IDLE_STOP_METADATA_KEY: LIMIT_SECS.to_string()}}),
+        )
+        .await);
+    let inhibitor = pause_clock().await;
+    first.run_hook(&id, "session", &session_start()).await;
+    first
+        .run_hook(&id, "stop", &stop_listing(&[task("shell-1", "shell")]))
+        .await;
+    first.wait_listed(&id, 1).await;
+    first.hook_activity(&id, "idle").await;
+
+    let registry = first.sessions.restarted_for_test(official_host()).await;
+    let restarted = first.restarted(registry, Some(system_enabled()));
+    let mut world = World::adopt_paused(restarted, vec![id], inhibitor).await;
+    // The adopted entry imports the live worker's snapshot and the activity
+    // its claim reported.
+    world.fixture.wait_listed(world.id(0), 1).await;
+    world.fixture.hook_activity(world.id(0), "idle").await;
+    world.elapse(10 * LIMIT_SECS).await;
+    world
+        .assert_running(0, "the adopted session still holds its work")
+        .await;
+
+    world.next_stop(0, &[]).await;
+    world
+        .assert_running(0, "no instant stop after adoption")
+        .await;
+    world.elapse(LIMIT_SECS - 1).await;
+    world.assert_running(0, "one second before the limit").await;
+    world.elapse_past(1).await;
+    world.stopped(0).await;
+    world.finish(&[]).await;
+}
+
+#[tokio::test]
+async fn live_work_that_arrives_while_the_stop_waits_for_its_turn_keeps_the_session() {
+    let world = hooked_world(1).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    world.stop_listing(0, &[]).await;
+    let id = SessionId(world.id(0).to_owned());
+    let lifecycle = world.fixture.sessions.hold_lifecycle_for_test(&id).await;
+
+    // The task finds the session due and parks behind the lifecycle lock.
+    world
+        .advance(Duration::from_secs(LIMIT_SECS) + TIMER_TICK)
+        .await;
+    world
+        .fixture
+        .run_hook(
+            world.id(0),
+            "stop",
+            &stop_listing(&[task("shell-1", "shell")]),
+        )
+        .await;
+    world.fixture.wait_listed(world.id(0), 1).await;
+    drop(lifecycle);
+    world.elapse(RECHECK_SECS).await;
+
+    world
+        .assert_running(0, "background work arrived before the stop transaction")
+        .await;
+    assert!(world.system_records(0).await.is_empty());
+    world.finish(&[0]).await;
+}
+
+#[tokio::test]
+async fn waits_and_turns_complete_for_a_session_with_background_work() {
+    let fixture = Fixture::with_policy(
+        config(None),
+        Some(every_provider({
+            let mut policy = default_policy().enabled;
+            policy.set(protocol::NotificationKind::TurnCompleted, true);
+            policy
+        })),
+    );
+    let session = fixture.hook_session("waits").await;
+    let cursor = fresh_cursor(&fixture, &session).await;
+    let _inhibitor = pause_clock().await;
+    fixture
+        .run_hook(&session, "session", &session_start())
+        .await;
+    fixture
+        .run_hook(&session, "stop", &stop_listing(&[task("shell-1", "shell")]))
+        .await;
+    fixture.wait_listed(&session, 1).await;
+    fixture.hook_activity(&session, "idle").await;
+
+    // The turn state reads `idle`, so an activity wait returns at once.
+    let activity_wait = fixture.spawn_call(
+        method::SESSION_WAIT,
+        json!({"session_id": session, "activities": ["idle"], "timeout_ms": 5_000}),
+    );
+    advance_until_finished(&activity_wait, FLUSH_SLACK).await;
+    let waited = ok(joined(activity_wait).await);
+    assert_eq!(waited["session"]["activity"], "idle", "{waited}");
+
+    // A waited input returns on the turn's idle evidence, although background
+    // work runs.
+    let input = fixture.spawn_call(
+        method::SESSION_INPUT,
+        json!({
+            "session_id": session, "text": "next task",
+            "wait": {"until": ["idle"], "timeout_ms": 5_000}
+        }),
+    );
+    settle().await;
+    fixture.hook_activity(&session, "working").await;
+    fixture.hook_activity(&session, "idle").await;
+    advance_until_finished(&input, FLUSH_SLACK).await;
+    let delivered = ok(joined(input).await);
+    assert_eq!(delivered["activity"], "idle", "{delivered}");
+
+    // A turn that ends completes a turn wait although background work runs.
+    let wait = fixture.spawn_wait(json!({
+        "session_ids": [session], "until": ["turn_completed"],
+        "after": cursor, "timeout_ms": LONG_WAIT_MS
+    }));
+    parked(&fixture, 1).await;
+    fixture.activity(&session, "working").await;
+    ok(fixture.turn_completed(&session, 1).await);
+    fixture.activity(&session, "idle").await;
+    advance_until_finished(&wait, debounce() + FLUSH_SLACK).await;
+    let result = ok(joined(wait).await);
+    assert_eq!(result["reason"], "event", "{result}");
+    fixture.stop_all(&[&session]).await;
 }
 
 #[tokio::test]
