@@ -2,7 +2,7 @@
 type: Guide
 id: guide/tailscale
 title: Tailscale overlay
-description: Run Pohunek hosts over a tailnet instead of NetBird, on Linux (macOS is not supported yet), the selectors that name a peer, and the error codes that explain a failure.
+description: Run Pohunek hosts over a tailnet instead of NetBird, on Linux and, for the CLI lookup, on macOS with Homebrew, the selectors that name a peer, and the error codes that explain a failure.
 source_kind: manual
 intents: [setup, debug, help]
 ---
@@ -46,17 +46,24 @@ Pohunek never starts, stops or logs in Tailscale. It only runs
   of its service manager: when the client lives in `/usr/local/bin`, make sure
   that directory is on it, and check the `tailscale_cli` entry of `pohunek
   doctor`, which reports what the daemon itself finds.
-- **macOS is not supported in 0.37.** Pohunek runs only a `tailscale` binary
-  from a directory that no untrusted account can write. On macOS the user's own
-  directories that the admin group can write, such as the stock Apple-Silicon
-  Homebrew `/opt/homebrew/bin`, are accepted (see
-  [environment resolution](environment-resolution.md)); support is claimed once
-  it is verified on a real Mac. The App Store and standalone builds are refused,
-  because their command-line tool lives below `/Applications`, a root-owned
-  directory the admin group can write: `host list` fails with `tailscale_cli_missing`, the doctor reports
-  `tailscale_cli` as `fail`, and the daemon binds no listener. A Mac keeps working over NetBird and
-  reaches Tailscale hosts only through a Linux host. Support is tracked in
-  [#1583](https://github.com/zajca/pohunek/issues/1583).
+- **macOS (Apple Silicon, Homebrew).** `brew install tailscale` installs the
+  command-line client. Pohunek finds it in `/opt/homebrew/bin` and runs it,
+  because that directory is owned by you, belongs to the `admin` group and is
+  not writable by others (see [environment resolution](environment-resolution.md)).
+  The lookup, `pohunek doctor` and `host list` were checked against a Homebrew
+  `tailscale` on a real Mac with no `tailscaled` running: `tailscale_cli` is
+  `warn` with "local tailscale state is unavailable", `host list` fails with
+  `tailscale_state_unavailable` instead of `tailscale_cli_missing`, and the
+  daemon logs "overlay state unavailable; serving local-only". Pohunek does not
+  start `tailscaled`: run it yourself (the formula needs a root service) and
+  join the tailnet. A macOS daemon that listens on the tailnet address and a
+  Linux peer that lists the Mac are not verified yet; that check needs a root
+  `tailscaled`. The App Store and standalone builds are refused, because their
+  command-line tool lives below `/Applications`, a root-owned directory the
+  admin group can write: `host list` fails with `tailscale_cli_missing`, the
+  doctor reports `tailscale_cli` as `fail`, and the daemon binds no listener. A
+  Mac keeps working over NetBird and reaches Tailscale hosts through a Linux
+  host. Tracked in [#1583](https://github.com/zajca/pohunek/issues/1583).
 - **Headscale and other control servers.** Pohunek reads only the local client's
   status, so a self-hosted control server needs no Pohunek setting. Point the
   client at it (`tailscale up --login-server=<url>`) and keep the rest of this
@@ -149,7 +156,7 @@ and `overlay_config`, and names the reason a node has no usable address.
 
 | Code or check | Cause | Fix |
 |---|---|---|
-| `tailscale_cli_missing` | no trusted `tailscale` on the search path; the message reads "not found on PATH" when none exists, or names the first candidate that was found and refused (`found <path> but not trusted: <reason>`), and the doctor `tailscale_cli` detail says the same | install the client, or fix the ownership and permissions the reason names; on Linux put it on the daemon's `PATH`; macOS is not supported in 0.37 |
+| `tailscale_cli_missing` | no trusted `tailscale` on the search path; the message reads "not found on PATH" when none exists, or names the first candidate that was found and refused (`found <path> but not trusted: <reason>`), and the doctor `tailscale_cli` detail says the same | install the client, or fix the ownership and permissions the reason names; on Linux put it on the daemon's `PATH`; on macOS use the Homebrew formula, not the App Store or standalone build |
 | `tailscale_state_unavailable` | `tailscale status` failed, did not answer within `status_timeout_secs`, printed something unreadable, or the node is not running on a kernel interface | read the message: start `tailscaled`, log in, or stop using userspace networking |
 | `tailscale_listener_address_missing` | the node has no IPv4 address Pohunek may bind | the same causes; the message names the reason |
 | `host_unknown` | the peer is expired, not in the network map or a `ShareeNode` | check `tailscale status` on this host |

@@ -225,8 +225,8 @@ macOS-specific routing, bridging, or relay mode.
   Pohunek then runs the verified canonical target.
 - **Tailscale.** With `providers = ["tailscale"]` the host works over a
   tailnet. Pohunek runs `tailscale status --json` (found like the `netbird` CLI
-  above, except that macOS support is not claimed in 0.37, see the
-  [Tailscale guide](tailscale.md)); it
+  above; on macOS the Homebrew formula's CLI is found and the App Store and
+  standalone builds are refused, see the [Tailscale guide](tailscale.md)); it
   never enables Tailscale because its CLI is installed. The daemon listens on the
   node's IPv4 address and only while Tailscale is `Running` on a kernel
   interface: userspace networking (`tailscaled --tun=userspace-networking`) has
