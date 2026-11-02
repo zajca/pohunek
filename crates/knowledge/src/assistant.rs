@@ -85,6 +85,18 @@ pub fn assistant_launch_id(version_hash: &str) -> String {
     )
 }
 
+/// Return the runtime launch id of the assistant launch that carries
+/// `request_id`.
+///
+/// The same request id gives the same id, so a launch repeated under it renders
+/// the same snapshot path into its opening prompt and the daemon sees the same
+/// request.
+#[must_use]
+pub fn assistant_keyed_launch_id(version_hash: &str, request_id: &str) -> String {
+    let digest = Sha256::digest(request_id.as_bytes());
+    format!("launch-{version_hash}-request-{digest:x}")
+}
+
 /// Return the embedded assistant knowledge bundle.
 #[must_use]
 pub fn embedded_bundle() -> EmbeddedBundle {

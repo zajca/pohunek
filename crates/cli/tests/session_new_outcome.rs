@@ -62,6 +62,7 @@ fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
     let error = &document["err"];
     assert_eq!(error["code"], "request_timeout", "{document}");
     let recover = error["recover"].as_str().expect("a recovery hint");
+    assert!(recover.contains("--request-id"), "{recover}");
     assert!(recover.contains("--meta-eq"), "{recover}");
     assert!(
         recover.contains("an empty list does not prove that nothing was created"),

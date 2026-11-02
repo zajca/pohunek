@@ -116,6 +116,8 @@ mod session_new_cwd;
 mod session_new_input_ack;
 #[path = "session_new_outcome.rs"]
 mod session_new_outcome;
+#[path = "session_new_request_id.rs"]
+mod session_new_request_id;
 #[path = "session_process_api.rs"]
 mod session_process_api;
 #[path = "session_spawned_by.rs"]
