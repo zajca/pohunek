@@ -51,8 +51,10 @@ Pohunek never starts, stops or logs in Tailscale. It only runs
   owned by you, belong to the `admin` group and are not writable by others,
   Pohunek finds the client in `/opt/homebrew/bin` and runs it: the link, its
   keg directory and the binary all have to pass the trust rule (see
-  [environment resolution](environment-resolution.md)). A root-owned or managed
-  prefix, or a daemon that runs as root, still gets `tailscale_cli_missing`.
+  [environment resolution](environment-resolution.md)). A prefix whose `bin` or
+  `Cellar` is owned by root or another account and writable by the `admin`
+  group (such as an MDM-managed Homebrew), or a daemon that runs as root, still
+  gets `tailscale_cli_missing`.
   The lookup, `pohunek doctor` and `host list` were checked against a Homebrew
   `tailscale` on a real Mac with no `tailscaled` running: `tailscale_cli` is
   `warn` with "local tailscale state is unavailable", `host list` fails with
