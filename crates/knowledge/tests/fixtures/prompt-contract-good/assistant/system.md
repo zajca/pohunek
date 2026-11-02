@@ -13,6 +13,7 @@ intents: [help]
 
 - Never print secrets.
   Continue on an indented line.
+	And on a tab-indented line.
 
 ## Navigation
 

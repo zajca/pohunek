@@ -195,9 +195,9 @@ upper bound that fails the job with an error. The mold install is always the
 `.github/actions/setup-mold` composite (never an inline `apt-get`): curl has
 transfer limits, `sha256sum`, `tar` and `mold --version` run under `timeout`,
 and each caller sets `timeout-minutes` on the `uses:` step, because composite
-steps accept no `timeout-minutes` of their own. The remaining `apt-get` step
-(`musl-tools` in `release-build.yml`) has a step `timeout-minutes` and apt
-network timeouts. `scripts/tests/test_ci_step_bounds.py` pins both.
+steps accept no `timeout-minutes` of their own. Every other `apt-get` step
+in a workflow has a step `timeout-minutes` and apt network timeouts.
+`scripts/tests/test_ci_step_bounds.py` pins both.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

@@ -80,7 +80,8 @@ impl PromptContract {
 }
 
 /// Items of the `## <heading>` section of `text`: each top-level `- ` bullet or
-/// `N. ` step, with its indented continuation lines joined by single spaces.
+/// `N. ` step, with its continuation lines (indented by any white space) joined
+/// by single spaces.
 ///
 /// Any other content in the section (prose, sub-headings, nested or `*`
 /// bullets) is refused, so an edit of the contract cannot be merged into a
@@ -98,7 +99,7 @@ fn section_items(text: &str, heading: &str) -> Result<Vec<String>, PromptContrac
             continue;
         }
         let trimmed = line.trim();
-        if !line.starts_with(' ') {
+        if !line.starts_with(char::is_whitespace) {
             let item = list_item(trimmed).ok_or_else(|| {
                 PromptContractError::at(
                     number,
