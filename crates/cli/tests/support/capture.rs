@@ -179,26 +179,39 @@ pub(crate) fn output_bytes(result: &Value) -> Vec<u8> {
         .expect("standard base64 output")
 }
 
-/// The ordered root program-status records of raw terminal output, one per
-/// line, consecutive repeats removed.
-///
-/// A root record reads `app=<app>:state=<state>[:kind=<kind>]`, a root clear
-/// reads `clear`. Probes, child (`id=`) records and discarded reports are
-/// left out, and so are `msg`, `title` and `progress`, which the parser never
-/// returns. Both terminators (BEL and `ESC \`) are accepted. Timing-dependent
-/// frames are not part of the result.
-pub(crate) fn program_status_records(raw: &[u8]) -> Vec<String> {
+/// Every program-status report of raw terminal output with its payload text,
+/// in stream order. Both terminators (BEL and `ESC \`) are accepted.
+fn program_status_reports(raw: &[u8]) -> Vec<(Option<ProgramStatusReport>, String)> {
     let mut prefix = b"\x1b]".to_vec();
     prefix.extend_from_slice(PROGRAM_STATUS_COMMAND);
     prefix.push(b';');
-    let mut records: Vec<String> = Vec::new();
+    let mut reports = Vec::new();
     let mut rest = raw;
     while let Some(start) = find(rest, &prefix) {
         let body = &rest[start + prefix.len()..];
         let Some((end, terminator)) = terminator(body) else {
             break;
         };
-        let line = match parse_program_status(&body[..end]) {
+        reports.push((
+            parse_program_status(&body[..end]),
+            String::from_utf8_lossy(&body[..end]).into_owned(),
+        ));
+        rest = &body[end + terminator..];
+    }
+    reports
+}
+
+/// The ordered root program-status records of raw terminal output, one per
+/// line, consecutive repeats removed.
+///
+/// A root record reads `app=<app>:state=<state>[:kind=<kind>]`, a root clear
+/// reads `clear`. Probes, child (`id=`) records and discarded reports are
+/// left out, and so are `msg`, `title` and `progress`, which the parser never
+/// returns. Timing-dependent frames are not part of the result.
+pub(crate) fn program_status_records(raw: &[u8]) -> Vec<String> {
+    let mut records: Vec<String> = Vec::new();
+    for (report, _payload) in program_status_reports(raw) {
+        let line = match report {
             Some(ProgramStatusReport::Record(record)) => Some(record.canonical()),
             Some(ProgramStatusReport::Clear) => Some("clear".to_owned()),
             Some(ProgramStatusReport::Probe | ProgramStatusReport::Child) | None => None,
@@ -208,9 +221,19 @@ pub(crate) fn program_status_records(raw: &[u8]) -> Vec<String> {
                 records.push(line);
             }
         }
-        rest = &body[end + terminator..];
     }
     records
+}
+
+/// The payloads of the child (`id=`) program-status records of raw terminal
+/// output, in stream order.
+pub(crate) fn child_records(raw: &[u8]) -> Vec<String> {
+    program_status_reports(raw)
+        .into_iter()
+        .filter_map(|(report, payload)| {
+            matches!(report, Some(ProgramStatusReport::Child)).then_some(payload)
+        })
+        .collect()
 }
 
 /// Writes `<name>.program-status` below `directory`: the records of

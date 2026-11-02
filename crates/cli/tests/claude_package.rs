@@ -1213,13 +1213,20 @@ fn a_program_status_record_arbitrates_with_the_real_claude_screens() {
 fn a_transcript_bullet_is_not_a_spinner_line() {
     let definition = installed_definition();
     for set in ScreenSet::ALL {
-        let mut rows = load_frame(set, "idle_after_turn", "idle_after_turn", DEFAULT_COLUMNS).rows;
-        rows.insert(2, "* Then it waits\u{2026} (see below)".to_owned());
-        assert_eq!(
-            screen_activity(&definition, &rows, DEFAULT_COLUMNS),
-            Some(AgentActivity::Idle),
-            "{set:?}"
-        );
+        let rows = load_frame(set, "idle_after_turn", "idle_after_turn", DEFAULT_COLUMNS).rows;
+        for bullet in [
+            "* Then it waits\u{2026} (see below)",
+            "* Then it waits\u{2026} (3 items)",
+            "* Then it waits\u{2026} (see\u{2026}",
+        ] {
+            let mut rows = rows.clone();
+            rows.insert(2, bullet.to_owned());
+            assert_eq!(
+                screen_activity(&definition, &rows, DEFAULT_COLUMNS),
+                Some(AgentActivity::Idle),
+                "{set:?} {bullet}"
+            );
+        }
     }
     for line in [
         "\u{2722} Architecting\u{2026} (16s)",
@@ -1228,6 +1235,10 @@ fn a_transcript_bullet_is_not_a_spinner_line() {
         "\u{2736} Dilly-dallying\u{2026} (4s \u{b7} \u{2193} 12 tokens)",
         "\u{2733} Compacting conversation\u{2026} (12s)",
         "\u{2722} Beboppin\u{2019}\u{2026}",
+        "\u{273b} Billowing\u{2026} (1\u{2026}",
+        "\u{273b} Contemplating deeply\u{2026} (12\u{2026}",
+        "\u{273b} Contemplating deeply\u{2026} (1m\u{2026}",
+        "\u{273b} Contemplating deeply\u{2026} (\u{2026}",
     ] {
         let mut rows = current_frame("idle").rows;
         rows.insert(2, line.to_owned());
@@ -3618,10 +3629,19 @@ const CLIENT_PROBE_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
 /// user and session ids), so the search needs the `;?` that hex cannot contain.
 const CLIENT_PROBE_REPLY_TEXT: &str = "]7501;?";
 
+/// An attached terminal client: its data connection carries raw bytes to the
+/// session's PTY, the way a client forwards the keys a user presses.
+struct AttachedClient {
+    stream: String,
+    data: pohunek_daemon::runtime::DataStream,
+    /// Number of inputs written so far; numbers the next write id.
+    written: u32,
+}
+
 impl Fixture {
-    /// Opens an attach stream on the session and returns its data connection,
-    /// the way an attached terminal client does.
-    async fn attach_stream(&self, id: &str) -> (String, pohunek_daemon::runtime::DataStream) {
+    /// Opens an attach stream on the session and returns the client holding
+    /// its data connection.
+    async fn attach_client(&self, id: &str) -> AttachedClient {
         let attach = self
             .harness
             .sessions
@@ -3641,35 +3661,38 @@ impl Fixture {
             .await
             .expect("redeem the attach stream");
         let pohunek_daemon::session::RedeemedRuntime::Worker(data) = redeemed.runtime;
-        (attach.stream_id.clone(), data)
+        AttachedClient {
+            stream: attach.stream_id.clone(),
+            data,
+            written: 0,
+        }
     }
 }
 
-/// Writes `bytes` as the attached client's input number `number`.
-async fn attached_input(
-    data: &mut pohunek_daemon::runtime::DataStream,
-    stream: &str,
-    number: u32,
-    bytes: &[u8],
-) {
-    let frame = pohunek_worker_protocol::DataFrame::new(
-        pohunek_worker_protocol::FrameHeader {
-            version: data.version,
-            stream_id: data.stream_id.clone(),
-            worker_instance_id: data.worker_instance_id.clone(),
-            kind: pohunek_worker_protocol::FrameKind::Input {
-                write_id: pohunek_worker_protocol::WriteId::new(format!(
-                    "attach-{stream}-{number}"
-                ))
-                .expect("write id"),
+impl AttachedClient {
+    /// Writes `bytes` as the client's next input, with no submit key.
+    async fn send(&mut self, bytes: &[u8]) {
+        self.written += 1;
+        let frame = pohunek_worker_protocol::DataFrame::new(
+            pohunek_worker_protocol::FrameHeader {
+                version: self.data.version,
+                stream_id: self.data.stream_id.clone(),
+                worker_instance_id: self.data.worker_instance_id.clone(),
+                kind: pohunek_worker_protocol::FrameKind::Input {
+                    write_id: pohunek_worker_protocol::WriteId::new(format!(
+                        "attach-{}-{}",
+                        self.stream, self.written
+                    ))
+                    .expect("write id"),
+                },
             },
-        },
-        bytes.to_vec(),
-    )
-    .expect("attach input frame");
-    pohunek_worker_protocol::write_frame(&mut data.stream, &frame)
-        .await
-        .expect("send the client's input");
+            bytes.to_vec(),
+        )
+        .expect("attach input frame");
+        pohunek_worker_protocol::write_frame(&mut self.data.stream, &frame)
+            .await
+            .expect("send the client's input");
+    }
 }
 
 /// An attached terminal answers the probe it saw in the replay: exactly one
@@ -3683,13 +3706,13 @@ async fn an_attached_clients_probe_reply_never_reaches_a_real_claude() {
     let id = fixture.new_session_id("attached").await;
     fixture.wait_activity(&id, "idle").await;
 
-    let (stream, mut data) = fixture.attach_stream(&id).await;
+    let mut client = fixture.attach_client(&id).await;
     let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
     let mut typed = CLIENT_PROBE_REPLY.to_vec();
     typed.extend_from_slice(prompt.as_bytes());
-    attached_input(&mut data, &stream, 1, &typed).await;
+    client.send(&typed).await;
     fixture.wait_screen_line(&id, PROMPT).await;
-    attached_input(&mut data, &stream, 2, b"\r").await;
+    client.send(b"\r").await;
 
     let working = fixture.wait_activity(&id, "working").await;
     assert_eq!(working["state_source"], "osc_progress", "{working}");
@@ -3711,6 +3734,224 @@ async fn an_attached_clients_probe_reply_never_reaches_a_real_claude() {
             .is_empty(),
         "no part of the client's reply reached the model"
     );
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// The Esc key as a terminal client forwards it to the PTY.
+const ESCAPE_KEY: &[u8] = b"\x1b";
+
+/// What Claude 2.1.309 draws under a reply the user interrupted after the
+/// reply began.
+const INTERRUPTED_MARKER: &str = "Interrupted";
+
+/// Root records of a session that started, ran one turn and was interrupted.
+const INTERRUPTED_TURN_RECORDS: [&str; 3] = [
+    "app=claude-code:state=idle",
+    "app=claude-code:state=working",
+    "app=claude-code:state=idle",
+];
+
+/// Root records after a second turn was interrupted as well.
+const TWICE_INTERRUPTED_RECORDS: [&str; 5] = [
+    "app=claude-code:state=idle",
+    "app=claude-code:state=working",
+    "app=claude-code:state=idle",
+    "app=claude-code:state=working",
+    "app=claude-code:state=idle",
+];
+
+impl Fixture {
+    /// Fails unless the session keeps reading idle, from the held record, for
+    /// the whole watch window: a stale `working` would flip it back.
+    async fn assert_stays_idle(&self, id: &str) {
+        let (code, waited) = self
+            .harness
+            .json(&[
+                "session",
+                "wait",
+                id,
+                "--activity",
+                "working",
+                "--timeout-ms",
+                HELD_STREAM_WATCH_MS,
+            ])
+            .await;
+        assert_eq!(code, 0, "{waited}");
+        assert_eq!(
+            waited["ok"]["reason"], "timeout",
+            "the interrupted session never reads working again: {waited}"
+        );
+        let idle = self.inspect(id).await;
+        assert_eq!(idle["activity"], "idle", "{idle}");
+        assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+    }
+}
+
+/// A user interrupt of a real Claude (a bare Esc written by an attached
+/// client) ends the turn with a root `idle` record, not a `done` one, and the
+/// session reads idle from it. The interrupt is sent twice: while the request is still held (Claude puts
+/// the prompt back into its input box) and once the reply has begun (Claude
+/// draws `Interrupted`). Neither leaves a stale `working` record behind.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_esc_interrupt_reads_idle_from_its_idle_record() {
+    require_real_claude();
+    let package = installed_definition();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("interrupt").await;
+    fixture.wait_activity(&id, "idle").await;
+    let mut client = fixture.attach_client(&id).await;
+
+    fixture
+        .input(&id, &format!("{} {PROMPT}", messages_stub::HOLD_MARKER))
+        .await;
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+    client.send(ESCAPE_KEY).await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+    let rows = fixture.wait_screen_line(&id, PROMPT).await;
+    assert!(
+        !rows.iter().any(|row| row.contains(INTERRUPTED_MARKER)),
+        "an interrupt before any reply draws no marker: {rows:#?}"
+    );
+    fixture.assert_stays_idle(&id).await;
+    assert_eq!(
+        capture::program_status_records(&fixture.raw_output(&id).await),
+        INTERRUPTED_TURN_RECORDS
+    );
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Idle).await;
+
+    // The gate stays open from here on, so this turn is held only mid-stream.
+    fixture.stub.open_gate();
+    fixture
+        .input(
+            &id,
+            &format!("{} {PROMPT}", messages_stub::STREAM_HOLD_MARKER),
+        )
+        .await;
+    fixture.wait_activity(&id, "working").await;
+    fixture
+        .wait_screen_line(&id, messages_stub::FIRST_CHUNK)
+        .await;
+    client.send(ESCAPE_KEY).await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+    fixture.wait_screen_line(&id, INTERRUPTED_MARKER).await;
+    fixture.assert_stays_idle(&id).await;
+    assert_eq!(
+        capture::program_status_records(&fixture.raw_output(&id).await),
+        TWICE_INTERRUPTED_RECORDS,
+        "each interrupt is a root `idle` record after the turn's `working` one"
+    );
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Idle).await;
+
+    fixture.stub.open_stream_gate();
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Text of the status line Claude shows while its finished turn waits for a
+/// background agent.
+const WAITING_FOR_AGENT: &str = "Waiting for 1 background agent";
+
+/// The background agent of a real Claude reports with `id=` records (a
+/// `working` record, then a `clear`), and only the root record decides the
+/// session's activity. After the launching turn's reply the screen is idle
+/// (prompt box, no spinner, no turn footer) while the root record stays
+/// `working` until the agent ended: a child record that dropped the held root
+/// record would turn the session idle from the screen in that window.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_background_agent_records_never_drive_the_session_activity() {
+    require_real_claude();
+    let package = installed_definition();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("children").await;
+    fixture.wait_activity(&id, "idle").await;
+
+    fixture
+        .input(
+            &id,
+            &format!("{} start it", messages_stub::BACKGROUND_MARKER),
+        )
+        .await;
+    wait_until("the background agent's first request", || async {
+        (fixture.stub.background_requests() >= 1).then_some(())
+    })
+    .await;
+    let working_child = wait_until("the agent's child `working` record", || async {
+        let raw = fixture.raw_output(&id).await;
+        capture::child_records(&raw)
+            .into_iter()
+            .find(|record| record.starts_with("state=working:") && record.contains(":id="))
+    })
+    .await;
+    assert!(
+        working_child.contains("app=claude-code"),
+        "the child record carries the program's app: {working_child}"
+    );
+
+    fixture.stub.open_launch_result_gate();
+    fixture.wait_screen_line(&id, WAITING_FOR_AGENT).await;
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Idle).await;
+    let (code, waited) = fixture
+        .harness
+        .json(&[
+            "session",
+            "wait",
+            &id,
+            "--activity",
+            "idle",
+            "--timeout-ms",
+            HELD_STREAM_WATCH_MS,
+        ])
+        .await;
+    assert_eq!(code, 0, "{waited}");
+    assert_eq!(
+        waited["ok"]["reason"], "timeout",
+        "the child record never ends the root `working` record: {waited}"
+    );
+    let held = fixture.inspect(&id).await;
+    assert_eq!(held["activity"], "working", "{held}");
+    assert_eq!(held["state_source"], "osc_progress", "{held}");
+    assert_eq!(
+        capture::program_status_records(&fixture.raw_output(&id).await),
+        [
+            "app=claude-code:state=idle",
+            "app=claude-code:state=working"
+        ],
+        "the child record adds nothing to the root sequence"
+    );
+
+    fixture.stub.open_run_gate();
+    let cleared_child = wait_until("the agent's child `clear` record", || async {
+        let raw = fixture.raw_output(&id).await;
+        capture::child_records(&raw)
+            .into_iter()
+            .find(|record| record.starts_with("state=clear:id="))
+    })
+    .await;
+    assert!(
+        working_child.contains(cleared_child.trim_start_matches("state=clear:")),
+        "the clear names the agent that reported working: {working_child} / {cleared_child}"
+    );
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+    let records = capture::program_status_records(&fixture.raw_output(&id).await);
+    assert_eq!(
+        records.get(..3),
+        Some(
+            &[
+                "app=claude-code:state=idle".to_owned(),
+                "app=claude-code:state=working".to_owned(),
+                "app=claude-code:state=done".to_owned(),
+            ][..]
+        ),
+        "the root `done` ends the turn: {records:?}"
+    );
+
     fixture.stop(&id).await;
     fixture.finish().await;
 }
