@@ -183,11 +183,15 @@ loopback Messages stub, dummy key; scenario
   as `working`. With the probe answered the program-status records outrank the
   title and the session reads `idle`
   (`a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`,
-  also for the name `esc to interrupt`); a Claude without records on that
-  release (the probe unanswered, as inside a shell session, or records switched
-  off) is screen-only and such a name makes an idle session read `working`
-  until the name changes. 2.1.289 puts its own glyph first (`✳ ◐ deploy`), so
-  the same name stays `idle` there.
+  also for the name `esc to interrupt`). A Claude without records on that
+  release (the probe unanswered, or records switched off) is screen-only: such
+  a name makes an idle session read `working`, and the title rule
+  (priority 1100) outranks the visible-blocker rules (980), so an approval
+  dialog reads `working` instead of `blocked`. A `session rename` does not
+  relaunch Claude, so the reading lasts until a resume under another name.
+  2.1.289 puts its own glyph first (`✳ ◐ deploy`, recorded in
+  `compat/claude/screens/n-1/named/marker_idle`), so the same name stays `idle`
+  there.
 - Resume: the name of the `--name` argument is the one shown. After a
   `session rename` to `beta`, a resume runs `--name=beta --resume <id>` and
   Claude shows `beta`, although the conversation started as `alpha`.

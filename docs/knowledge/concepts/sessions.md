@@ -237,6 +237,12 @@ daemon trims the name and rejects an over-long one (more than 128 bytes) and one
 name is stored in the logical session record, so it survives daemon and worker
 loss.
 
+A runtime package can also hand the name to its agent: the Claude Code package
+passes `--name=<name>` at launch, resume and fork, so the agent shows it in its
+prompt box and title, and a rename reaches the agent only at the next resume
+(see [the Claude package](../guides/claude-package.md#session-name) and
+[session name arguments](../guides/runtime-packages.md#session-name-arguments)).
+
 The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.

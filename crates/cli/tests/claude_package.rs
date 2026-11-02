@@ -437,18 +437,28 @@ const NAMED_SCREENS_DIR: &str = "named";
 /// The session name the named screens were recorded under.
 const NAMED_SCREEN_NAME: &str = "alpha";
 
-/// What each named screen means; a colliding name leaves an idle prompt box.
-fn named_screen_meaning(name: &str) -> Meaning {
-    match name {
-        "idle" | "collision" => Meaning::Idle,
-        "working_stream" => Meaning::Working,
-        other => panic!("unknown named screen {other}"),
+/// The session name of the `marker_idle` screen: it spells the title marker of
+/// a running turn.
+const MARKER_SCREEN_NAME: &str = "\u{25D0} deploy";
+
+/// What each named screen means, and the session name it shows; a colliding
+/// name leaves an idle prompt box. The marker-spelling name reads as `working`
+/// from the locked release's title alone (the documented detection limit),
+/// while the previous release puts its own glyph first and stays idle.
+fn named_screen_meaning(set: ScreenSet, name: &str) -> (Meaning, &'static str) {
+    match (set, name) {
+        (_, "idle" | "collision") => (Meaning::Idle, NAMED_SCREEN_NAME),
+        (_, "working_stream") => (Meaning::Working, NAMED_SCREEN_NAME),
+        (ScreenSet::Current, "marker_idle") => (Meaning::Working, MARKER_SCREEN_NAME),
+        (ScreenSet::Previous, "marker_idle") => (Meaning::Idle, MARKER_SCREEN_NAME),
+        (_, other) => panic!("unknown named screen {other}"),
     }
 }
 
 /// A session name changes the terminal title and adds a banner or a rule label,
 /// never the state: every named screen of both releases reads as its unnamed
-/// counterpart, from the screen alone and with the title Claude set.
+/// counterpart, from the screen alone and with the title Claude set. The one
+/// exception is the marker-spelling name on the locked release.
 #[test]
 fn named_screens_are_classified_like_unnamed_ones() {
     let definition = installed_definition();
@@ -456,16 +466,24 @@ fn named_screens_are_classified_like_unnamed_ones() {
     for set in ScreenSet::ALL {
         let directory = set.directory().join(NAMED_SCREENS_DIR);
         for name in fixture_names(&directory) {
-            let meant = named_screen_meaning(&name).activity();
+            let (meaning, shown) = named_screen_meaning(set, &name);
+            let meant = meaning.activity();
             let frame = load_frame_from(set, &directory, &name, &name, DEFAULT_COLUMNS);
             assert!(
-                frame.rows.iter().any(|row| row.contains(NAMED_SCREEN_NAME)),
+                frame.rows.iter().any(|row| row.contains(shown)),
                 "{name} shows the session name: {:#?}",
                 frame.rows
             );
+            // A marker-spelling name is read by the title rule only; the
+            // screen itself shows an idle prompt box.
+            let from_screen = if name == "marker_idle" {
+                Meaning::Idle.activity()
+            } else {
+                meant
+            };
             assert_eq!(
                 screen_activity(&definition, &frame.rows, frame.columns),
-                Some(meant),
+                Some(from_screen),
                 "{name} of {set:?} from the screen"
             );
             let glyph = frame
@@ -487,7 +505,7 @@ fn named_screens_are_classified_like_unnamed_ones() {
         }
     }
     assert!(
-        checked >= 6,
+        checked >= 8,
         "every named screen of both releases: {checked}"
     );
 }
@@ -5987,7 +6005,7 @@ async fn capture_the_real_claude_screens() {
 /// Records the screens of a real Claude Code that carries a pohunek session
 /// name into `named/` below the directory named by `POHUNEK_CLAUDE_CAPTURE_DIR`:
 /// the idle prompt box, a second session whose name collides with a live one,
-/// and a streaming reply. Without the variable the test does nothing.
+/// a streaming reply and an idle session whose name spells a title marker. Without the variable the test does nothing.
 #[tokio::test]
 #[ignore = "refreshes compat/claude/screens/named from a real `claude`; run with POHUNEK_CLAUDE_CAPTURE_DIR and --ignored"]
 async fn capture_the_real_claude_named_screens() {
@@ -6034,5 +6052,11 @@ async fn capture_the_real_claude_named_screens() {
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;
     fixture.stop(&id).await;
+
+    let marker = fixture.new_session_id(MARKER_SCREEN_NAME).await;
+    fixture.wait_activity(&marker, "idle").await;
+    fixture.wait_screen_line(&marker, "for shortcuts").await;
+    fixture.capture(&directory, &marker, "marker_idle").await;
+    fixture.stop(&marker).await;
     fixture.finish().await;
 }
