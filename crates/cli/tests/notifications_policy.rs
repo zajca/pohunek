@@ -16,8 +16,9 @@ use std::fs;
 use package::{build_archive, read_archive, ArchiveEntry, Limits};
 use pohunek_client::Client;
 use protocol::{
-    NotificationCreateParams, NotificationCreateResult, NotificationKind, NotificationPolicyParams,
-    NotificationSeverity, NotificationSource, ProtocolError, SessionId,
+    event, method, NotificationCreateParams, NotificationCreateResult, NotificationKind,
+    NotificationPolicyParams, NotificationSeverity, NotificationSource, ProtocolError, Request,
+    SessionId,
 };
 use serde_json::{json, Value};
 
@@ -109,6 +110,40 @@ async fn session_records(harness: &Harness, session: &str) -> Vec<Value> {
         .as_array()
         .expect("notification records")
         .clone()
+}
+
+/// Subscribes to the daemon's event stream; the subscription is acknowledged
+/// when this returns.
+async fn subscribe(harness: &Harness) -> pohunek_client::Subscription {
+    Client::connect_local(harness.socket())
+        .await
+        .expect("connect to the daemon")
+        .subscribe(
+            &Request::new("policy-scenario-subscribe", method::SUBSCRIBE, Value::Null)
+                .expect("a valid subscribe request"),
+        )
+        .await
+        .expect("subscribe to events")
+}
+
+/// The next `notification_updated` event of `events`, skipping every other
+/// event, including the create of a record committed just before the
+/// subscription was acknowledged.
+async fn next_notification_update(events: &mut pohunek_client::Subscription) -> protocol::Event {
+    tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, async {
+        loop {
+            let event = events
+                .next_event()
+                .await
+                .expect("read an event")
+                .expect("the event stream stays open");
+            if event.event() == event::NOTIFICATION_UPDATED {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("a notification update arrives")
 }
 
 /// A fresh daemon has no per-provider overrides: every provider, built-in or
@@ -598,6 +633,9 @@ async fn a_runtimes_own_report_upgrades_the_projector_record() {
     assert_eq!(committed.len(), 1, "{committed:?}");
     assert_eq!(committed[0]["id"], projector.record.id.0, "{committed:?}");
 
+    // The subscription is acknowledged before the runtime's report is sent, so
+    // the upgrade cannot precede it.
+    let mut events = subscribe(&harness).await;
     create(
         &harness,
         &session,
@@ -608,6 +646,22 @@ async fn a_runtimes_own_report_upgrades_the_projector_record() {
     .await
     .expect("the runtime's own report is admitted");
     let records = records_settled_on(&harness, &session, RUNTIME).await;
+    let upgraded = next_notification_update(&mut events).await;
+    assert_eq!(
+        upgraded.event(),
+        event::NOTIFICATION_UPDATED,
+        "{upgraded:?}"
+    );
+    assert_eq!(
+        upgraded.payload()["record"]["id"],
+        projector.record.id.0,
+        "{upgraded:?}"
+    );
+    assert_eq!(
+        upgraded.payload()["record"]["source"]["provider"],
+        RUNTIME,
+        "{upgraded:?}"
+    );
     assert_eq!(records.len(), 1, "one record for the moment: {records:?}");
     assert_eq!(records[0]["id"], projector.record.id.0, "{records:?}");
     assert_eq!(records[0]["source"]["provider"], RUNTIME, "{records:?}");
@@ -616,8 +670,8 @@ async fn a_runtimes_own_report_upgrades_the_projector_record() {
     harness.stop().await;
 }
 
-/// While both are pending in one debounce window, a runtime's own report
-/// outranks a user report whichever arrives first.
+/// While both are pending in one debounce window, a runtime's own report that
+/// arrives first outranks a user report that follows it.
 #[tokio::test]
 async fn a_runtimes_own_pending_report_outranks_a_pending_user_report() {
     let harness = Harness::start_with_debounced_notifications().await;
@@ -826,13 +880,63 @@ async fn a_restart_keeps_the_rank_of_a_runtimes_own_record() {
     harness.stop().await;
 }
 
-/// A runtime's own `turn_completed` report is a turn signal for its held
-/// session, as a listed provider's is: `session.wait` returns it as a
-/// `turn_completed` event.
+/// Reports `activity` of `session`'s agent through the public
+/// `session.report_agent` method, as the runtime's hook does.
+async fn report_activity(harness: &Harness, session: &str, activity: &str) {
+    let mut client = Client::connect_local(harness.socket())
+        .await
+        .expect("connect to the daemon");
+    let request = Request::new(
+        format!("policy-scenario-{activity}"),
+        method::SESSION_REPORT_AGENT,
+        json!({
+            "session_id": session,
+            "source": format!("pohunek:{RUNTIME}"),
+            "agent": RUNTIME,
+            "activity": activity,
+        }),
+    )
+    .expect("a valid report request");
+    let reported = client
+        .request(&request)
+        .await
+        .unwrap_or_else(|error| panic!("report the {activity} activity: {error}"));
+    assert_eq!(reported["recorded"], json!(true), "{reported}");
+}
+
+/// A runtime's own `turn_completed` report ends the turn its session is
+/// running: the record carries the turn's start, length and the session's
+/// metadata, and `session.wait` returns a `turn_completed` event naming that
+/// record.
 #[tokio::test]
 async fn a_runtimes_own_turn_report_wakes_a_turn_wait() {
     let harness = Harness::start_with_debounced_notifications().await;
     let session = start_fixture_session(&harness, RUNTIME, IDENTITY_V1_INTEGRATION).await;
+    let (code, enabled) = harness
+        .json(&[
+            "notifications",
+            "policy",
+            "set",
+            "--provider",
+            "default",
+            "--kind",
+            "turn_completed",
+            "--enabled",
+        ])
+        .await;
+    assert_eq!(code, 0, "{enabled}");
+    let tag = Request::new(
+        "policy-scenario-metadata",
+        method::SESSION_SET_METADATA,
+        json!({"session_id": session, "metadata": {"work.issue": "1878"}}),
+    )
+    .expect("a valid metadata request");
+    Client::connect_local(harness.socket())
+        .await
+        .expect("connect to the daemon")
+        .request(&tag)
+        .await
+        .expect("tag the session");
 
     let (code, start) = harness
         .json(&["session", "wait", &session, "--timeout", "1ms"])
@@ -843,9 +947,8 @@ async fn a_runtimes_own_turn_report_wakes_a_turn_wait() {
         .expect("wait cursor")
         .to_owned();
 
-    // The default policy keeps no `turn_completed` record, so the create is
-    // answered with the policy refusal; the turn event is recorded anyway.
-    let refused = create(
+    report_activity(&harness, &session, "working").await;
+    let created = create(
         &harness,
         &session,
         RUNTIME,
@@ -853,8 +956,9 @@ async fn a_runtimes_own_turn_report_wakes_a_turn_wait() {
         Some(format!("turn:{session}")),
     )
     .await
-    .expect_err("the policy drops the record");
-    assert_eq!(refused.code, "notification_kind_disabled", "{refused:?}");
+    .expect("the runtime's own turn report is admitted");
+    report_activity(&harness, &session, "idle").await;
+
     let (code, woken) = harness
         .json(&[
             "session",
@@ -872,6 +976,39 @@ async fn a_runtimes_own_turn_report_wakes_a_turn_wait() {
     assert_eq!(woken["ok"]["reason"], "event", "{woken}");
     assert_eq!(woken["ok"]["event"]["kind"], "turn_completed", "{woken}");
     assert_eq!(woken["ok"]["event"]["session_id"], session.as_str());
+
+    let records = pohunek_test_support::wait::wait_until("the turn record commits", || {
+        let harness = &harness;
+        let session = &session;
+        async move {
+            let records = session_records(harness, session).await;
+            records
+                .iter()
+                .any(|record| record["kind"] == "turn_completed")
+                .then_some(records)
+        }
+    })
+    .await;
+    let turns: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["kind"] == "turn_completed")
+        .collect();
+    assert_eq!(turns.len(), 1, "{records:?}");
+    let record = turns[0];
+    assert_eq!(record["id"], created.record.id.0, "{records:?}");
+    assert_eq!(record["source"]["provider"], RUNTIME, "{records:?}");
+    assert_eq!(record["hook_admitted"], json!(true), "{records:?}");
+    assert!(record["turn_started_at"].is_string(), "{records:?}");
+    assert!(record["turn_duration_ms"].is_u64(), "{records:?}");
+    assert_eq!(
+        record["session_metadata"],
+        json!({"work.issue": "1878"}),
+        "{records:?}"
+    );
+    assert_eq!(
+        woken["ok"]["event"]["notification_id"], record["id"],
+        "{woken}"
+    );
 
     harness.stop().await;
 }

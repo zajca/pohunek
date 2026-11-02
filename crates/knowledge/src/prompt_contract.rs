@@ -61,9 +61,9 @@ impl PromptContract {
     ///
     /// # Errors
     ///
-    /// Returns a [`PromptContractError`] naming the first line that is prose, a
-    /// sub-heading, a nested or `*` list item or an orphan continuation line,
-    /// or the section that has no item.
+    /// Returns a [`PromptContractError`] naming the first line that holds a
+    /// lone carriage return, is prose, a sub-heading, a nested or `*` list item
+    /// or an orphan continuation line, or the section that has no item.
     pub fn parse(text: &str) -> Result<Self, PromptContractError> {
         let safety = section_items(text, SAFETY_HEADING)?;
         let navigation = section_items(text, NAVIGATION_HEADING)?;
@@ -91,6 +91,16 @@ fn section_items(text: &str, heading: &str) -> Result<Vec<String>, PromptContrac
     let mut in_section = false;
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
+        // `lines()` ends a line only at `\n` (dropping a CR before it), but
+        // CommonMark also ends one at a lone CR, so a CR left in a line would
+        // render as a second item while parsing as one.
+        if line.contains('\r') {
+            return Err(PromptContractError::at(
+                number,
+                "the contract holds a carriage return that is not part of a CRLF line ending"
+                    .to_owned(),
+            ));
+        }
         if let Some(title) = line.strip_prefix("## ") {
             in_section = title.trim() == heading;
             continue;

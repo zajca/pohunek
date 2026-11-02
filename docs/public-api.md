@@ -1487,7 +1487,15 @@ a session's launch is judged by the schema its worker enforces, like one for a
 held session); the refusal is final even with `retryable_admission`. A create from any
 other producer for an unknown session id is stored, and the three identity
 reports keep ignoring an unknown session. A session's own runtime is always an
-admitted provider for identity reports.
+admitted provider for identity reports. A `notification.create` whose
+`provider` is the held session's own runtime, spelled verbatim, is judged by
+that runtime's hook schema like a listed provider's: when admitted it is a hook
+claim stored with `hook_admitted: true`, and when it is not admitted it is
+stored unmarked and ranked as a user/external source instead of being refused
+(the ranking paragraph that defines `hook_admitted` lists the cases). For a
+session without a served launch pin the create waits up to
+`worker_connect_deadline` for a reconnecting worker, as the next paragraph
+describes.
 
 **Retryable admission.** A session without a served launch pin is admitted by
 the schema its live worker journaled, and the public socket waits for that
