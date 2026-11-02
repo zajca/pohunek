@@ -2825,7 +2825,10 @@ fn refused_naming_tables(valid: &str) -> Vec<(&'static str, String)> {
             "after-joined-flag",
             naming_table(&["--zq9=y", "{session_name}"]),
         ),
-        ("after-literal", naming_table(&["zq9name", "{session_name}"])),
+        (
+            "after-literal",
+            naming_table(&["zq9name", "{session_name}"]),
+        ),
         (
             "after-triple-dash",
             naming_table(&["---zq9", "{session_name}"]),
