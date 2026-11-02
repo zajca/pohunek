@@ -136,9 +136,9 @@ retries = 0
 # message naming what it awaited before nextest kills the test. Measured on the
 # locked releases: the slowest real-upstream test takes 21 s on a warm local
 # host (claude_package), and the whole CI test step, compile included, took
-# 96-98 s in the claude-package job (ci.yml runs of 2026-10-12). If all 14
-# real-Claude tests hung, they would take 42 minutes plus nextest's kill grace
-# period, leaving the rest of the claude-package job's 50-minute timeout (which
+# 96-98 s in the claude-package job (ci.yml runs of 2026-10-12). If all 16
+# real-Claude tests hung, they would take 48 minutes plus nextest's kill grace
+# period, leaving the rest of the claude-package job's 65-minute timeout (which
 # cancels a job before nextest writes its report) to setup, about 2 minutes
 # with a warm build cache; the other package jobs keep 30 minutes for fewer
 # real-upstream tests.

@@ -252,6 +252,11 @@ const NATIVE_BEFORE: &str = "native-before-upgrade";
 /// Native id the stopped session reports before it is stopped.
 const NATIVE_STOPPED: &str = "native-stopped-session";
 
+/// Session names the previous release creates; the package's `[naming]` hands
+/// each to the relaunched agent as `--name=<name>`.
+const STOPPED_NAME: &str = "upgrade-stopped";
+const LIVE_NAME: &str = "upgrade-fake";
+
 /// Id reported after the upgrade. The new daemon persists this later report
 /// as the current native conversation for a verified launch process.
 const NATIVE_AFTER: &str = "native-after-upgrade";
@@ -1641,7 +1646,7 @@ fn start_sessions(run: &Run, previous: &Cli, start: &Start) -> Sessions {
 
     // The stopped session runs first, so its native id is the only one it
     // reports while it is live.
-    let stopped_id = new_session(previous, STOPPED_PROFILE, "upgrade-stopped", &cwd);
+    let stopped_id = new_session(previous, STOPPED_PROFILE, STOPPED_NAME, &cwd);
     wait_screen(previous, &stopped_id, "fake-agent ready");
     wait_native_id(previous, &stopped_id, NATIVE_STOPPED);
     assert_store_pin(
@@ -1662,7 +1667,7 @@ fn start_sessions(run: &Run, previous: &Cli, start: &Start) -> Sessions {
         "before the upgrade: stopped session after its stop",
     );
 
-    let id = new_session(previous, PROFILE, "upgrade-fake", &cwd);
+    let id = new_session(previous, PROFILE, LIVE_NAME, &cwd);
     let live = wait_live(previous, &id);
     wait_screen(previous, &id, "fake-agent ready");
     wait_native_id(previous, &id, NATIVE_BEFORE);
@@ -2353,20 +2358,21 @@ impl Upgrade {
     /// change. The relaunch runs in a new generation of this build's worker,
     /// with the native reference the session stopped with, and is pinned to the
     /// package its profile names.
-    fn resume(&self, id: &str, native: &str, stopped: &Runtime) -> Runtime {
+    fn resume(&self, id: &str, name: &str, native: &str, stopped: &Runtime) -> Runtime {
         let launched = self.run.launches().len();
         let notified = notification_count(&self.head, id, EVENT_AFTER_RESUME);
         self.head.json(&["session", "resume", id, "--json"]);
-        self.assert_relaunched(id, native, stopped, launched, notified)
+        self.assert_relaunched(id, name, native, stopped, launched, notified)
     }
 
     /// Checks a relaunch of session `id` after `launched` launches and
     /// `notified` resume notifications: a new generation of this build's
-    /// worker, launched with `--resume <native>`, whose hooks deliver a new
+    /// worker, launched with `--name=<name> --resume <native>`, whose hooks deliver a new
     /// resume notification and whose store pin is the package its profile names.
     fn assert_relaunched(
         &self,
         id: &str,
+        name: &str,
         native: &str,
         stopped: &Runtime,
         launched: usize,
@@ -2379,7 +2385,7 @@ impl Upgrade {
                 && resumed.worker_instance_id != stopped.worker_instance_id,
             "resume must start a new runtime generation: {stopped:?} -> {resumed:?}"
         );
-        wait_screen(head, id, &format!("args=[--resume {native}]"));
+        wait_screen(head, id, &format!("args=[--name={name} --resume {native}]"));
         let logged = self.run.wait_launches(launched + 1);
         assert_eq!(
             logged.len(),
@@ -2531,18 +2537,23 @@ fn previous_release_session_survives_the_upgrade_to_head() {
 
     // The stopped session resumes with a plain resume onto the package its
     // profile names; a second stop and plain resume succeed.
-    let relaunched = upgrade.resume(&upgrade.stopped_id, NATIVE_STOPPED, &before.stopped);
+    let relaunched = upgrade.resume(
+        &upgrade.stopped_id,
+        STOPPED_NAME,
+        NATIVE_STOPPED,
+        &before.stopped,
+    );
     upgrade.assert_package_served(CLAUDE_PACKAGE_ID, upgrade.profile_digest(CLAUDE_PACKAGE_ID));
     let stopped = stop_session(&upgrade.head, &upgrade.stopped_id);
     assert_eq!(
         stopped, relaunched,
         "the relaunched session stops as it runs"
     );
-    upgrade.resume(&upgrade.stopped_id, NATIVE_STOPPED, &stopped);
+    upgrade.resume(&upgrade.stopped_id, STOPPED_NAME, NATIVE_STOPPED, &stopped);
 
     // The adopted live session stops and resumes through the package too.
     let stopped = stop_session(&upgrade.head, &upgrade.id);
-    upgrade.resume(&upgrade.id, NATIVE_AFTER, &stopped);
+    upgrade.resume(&upgrade.id, LIVE_NAME, NATIVE_AFTER, &stopped);
 
     upgrade.assert_new_sessions_launch_through_packages();
     upgrade.assert_previous_client_creates_with_input();

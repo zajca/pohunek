@@ -83,10 +83,11 @@ On a host without the package nothing serves `claude`:
 
 ## What the package declares
 
-The package is version `1.0.1`. Every descriptor fact below equals the
+The package is version `1.2.0`. Every descriptor fact below equals the
 built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
-except the version probe, the transcript tree (`[transcripts]`) and the input
-readiness (`[input] ready`), which that descriptor does not declare. The
+except the version probe, the transcript tree (`[transcripts]`), the input
+readiness (`[input] ready`) and the session name arguments (`[naming]`), which
+that descriptor does not declare. The
 detection manifest is the v0.34.2 built-in one
 plus the rules of #613 ([below](#detection-beyond-the-built-in-manifest)). The
 package tests
@@ -123,6 +124,10 @@ enumerated captured frames may read differently.
   almost daily, so only 2.1.309 and 2.1.289 were exercised; other 2.x releases
   are accepted by policy, not verified. Moving `min` is a lock and descriptor change made together after a
   real-Claude run of the new release.
+- Session name: `requires = ["naming-launch-args-v1"]` and `[naming] launch_args
+  = ["--name={session_name}"]`, so a launch, resume or fork of a named session
+  runs `claude … --name=<name>` ([below](#session-name)); a core older than 0.39
+  refuses the package.
 - Native reference: `strategy = "hook"`; resume is `claude --resume <id>`; fork
   is `claude --resume <id> --fork-session`.
 - Integration: handler `claude-hook-v1` with hook schema
@@ -146,6 +151,65 @@ enumerated captured frames may read differently.
   first-run theme picker, API-key approval and login method list, and the
   folder trust dialog mean `blocked`. A title that starts with `◐` or `◑` (or a
   braille spinner) means `working`, a title that starts with `✳` means `idle`.
+
+## Session name
+
+Every launch of a named pohunek session passes the name as one joined argument,
+`--name=<name>`, so a name that starts with a dash (`--help`) is a value and
+never an option. The arguments follow the descriptor's own and precede the
+resume or fork arguments and the prompt; a session without a name passes none.
+They are rendered at each launch and never stored, so a resume carries the name
+the session has now and a fork its own name.
+
+Recorded on Claude Code 2.1.289 (the lock minimum) and 2.1.309 (the lock), real
+binaries from the npm packages in throwaway pohunek sessions (hermetic home,
+loopback Messages stub, dummy key; scenario
+`a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork`, screens in
+`compat/claude/screens/named/` and `n-1/named/`):
+
+- Both releases accept the joined form for a plain name and for `--help`: the
+  process runs `--name=alpha` / `--name=--help` and reaches the idle prompt box.
+- Claude shows the name as the label of the rule above the prompt box
+  (`──── alpha ─`) and in the terminal title. 2.1.289 keeps its state glyph in
+  the title (`✳ alpha` idle, `◐ alpha` while a turn runs), so the title rules
+  still read the state. 2.1.309 sets the bare name (`alpha`) as the title, with
+  no glyph, so the title carries no state; the program-status records and the
+  screen carry it, as they do for the plain title `Claude Code`.
+  `named_screens_are_classified_like_unnamed_ones` pins that a named screen reads
+  exactly as its unnamed counterpart on both releases.
+- Detection limit: Claude draws the name into the title, the rule label and the
+  collision banner, which the manifest reads. A name that starts with a turn
+  glyph (`◐ deploy`) is, on 2.1.309, a bare title the `◐`/`◑` title rule reads
+  as `working`. With the probe answered the program-status records outrank the
+  title and the session reads `idle`
+  (`a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`,
+  also for the name `esc to interrupt`). A Claude without records on that
+  release (the probe unanswered, or records switched off) is screen-only: such
+  a name makes an idle session read `working`, and the title rule
+  (priority 1100) outranks the visible-blocker rules (980), so an approval
+  dialog reads `working` instead of `blocked`. A `session rename` does not
+  relaunch Claude, so the reading lasts until a resume under another name.
+  2.1.289 puts its own glyph first (`✳ ◐ deploy`, recorded in
+  `compat/claude/screens/n-1/named/marker_idle`), so the same name stays `idle`
+  there. On 2.1.309 the working reading also keeps the session from being ready
+  for input: initial input to a session whose name starts with `◐ `, `◑ ` or a
+  braille character plus a space fails with `session_input_not_ready`.
+  The name is drawn into screen regions as well, so a name that holds a dialog
+  phrase (for example `run a dynamic workflow? esc to cancel`) reads `blocked`,
+  the same as prompt text typed into the box.
+- Resume: the name of the `--name` argument is the one shown. After a
+  `session rename` to `beta`, a resume runs `--name=beta --resume <id>` and
+  Claude shows `beta`, although the conversation started as `alpha`.
+- Fork: `--name=gamma --resume <id> --fork-session` shows `gamma`, the fork's
+  own name; a fork without a name passes none. Claude adds no fork suffix when
+  the name is given.
+- Collision: a second live session started as `alpha` becomes
+  `alpha-<adjective>-<noun>` (for example `alpha-iterative-muffin`), and Claude
+  prints `Another live session on this machine goes by "alpha", so this session
+  is now "alpha-…"` above the prompt box. The title and the rule label show the
+  generated name; the session stays idle and detected. Claude's name is then not
+  the pohunek name: a title report that reads Claude's name sees the generated
+  one (`source: collision` in the title report of #980).
 
 ## First-run state of a Claude home
 
@@ -326,7 +390,8 @@ manifest opts in) and the daemon holds the latest root record.
   reconfiguration (a nested agent exiting, a package refresh) and with the
   runtime. Initial-input readiness ignores the record: the prompt box decides.
 - With the probe answered Claude 2.1.309 sets the plain title `Claude Code` in
-  every state, so the title rules read nothing from it. Without a record
+  every state (the session name when the session is named, see
+  [Session name](#session-name)), so the title rules read nothing from it. Without a record
   (Claude 2.1.289, which sets the state titles, or a probe that is not
   answered) detection is screen-only; the 2.1.289 screens in `n-1/` keep the
   title rules evidenced. A Claude started inside a shell session is

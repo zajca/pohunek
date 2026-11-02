@@ -6,8 +6,9 @@
 
 schema = 1
 id = "pohunek.runtime.claude"
-version = "1.1.0"
+version = "1.2.0"
 runtime_api = 1
+requires = ["naming-launch-args-v1"]
 
 [runtime]
 id = "claude"
@@ -18,6 +19,11 @@ detect_manifest = "detect.toml"
 prompt_arg = true
 # `claude --version` prints `<release> (Claude Code)` on stdout.
 version_probe = { parser = "semver-line-v1", args = ["--version"], min = "2.1.289", below = "3.0.0", line = "{version} (Claude Code)" }
+
+# Claude shows the session name in its prompt box and terminal title. The joined
+# form keeps a dash-leading name from being parsed as an option.
+[naming]
+launch_args = ["--name={session_name}"]
 
 # Claude's Ink TUI takes the pasted text and the submit key as separate
 # writes; a submit delay the daemon is configured with for this runtime
