@@ -58,6 +58,14 @@ pub struct DetectorConfig {
     pub manifest: Option<Arc<Manifest>>,
     /// Which evidence makes the detector report editable input as ready.
     pub input_readiness: InputReadiness,
+    /// The session name the launch of this runtime generation handed to the
+    /// agent through `[naming] launch_args`; `None` for a runtime without
+    /// `[naming]` or a launch without a name.
+    ///
+    /// An agent that echoes this name as its whole OSC title reports no state
+    /// through it: the title is owner text, so the title region is withheld
+    /// from manifest evaluation (see [`launch_name_echo`]).
+    pub launch_name: Option<Arc<str>>,
 }
 
 impl DetectorConfig {
@@ -78,6 +86,7 @@ impl DetectorConfig {
             detection: DetectionConfig::default(),
             manifest: Some(Arc::clone(shared_generic_shell_manifest())),
             input_readiness: InputReadiness::default(),
+            launch_name: None,
         }
     }
 
@@ -110,6 +119,7 @@ impl DetectorConfig {
                 input_readiness: readiness_of(host.definition_for_pin(base, pin))
                     .for_manifest(&manifest),
                 manifest: Some(Arc::new(manifest)),
+                launch_name: None,
             },
             None => host.definition_for_pin(base, pin).map_or_else(
                 |_unresolved| Self::generic_shell(),
@@ -133,6 +143,7 @@ impl DetectorConfig {
                 manifest: Some(Arc::new(manifest)),
                 input_readiness: definition
                     .map_or_else(InputReadiness::default, RuntimeDefinition::input_readiness),
+                launch_name: None,
             },
             (None, Some(definition)) => Self::for_definition(definition),
             (None, None) => Self::generic_shell(),
@@ -147,6 +158,7 @@ impl DetectorConfig {
             detection: DetectionConfig::default(),
             manifest: Some(Arc::clone(definition.manifest())),
             input_readiness: definition.input_readiness(),
+            launch_name: None,
         }
     }
 
@@ -166,6 +178,7 @@ impl DetectorConfig {
                 detection: DetectionConfig::default(),
                 input_readiness: readiness_of(host.resolve_ref(base)).for_manifest(&manifest),
                 manifest: Some(Arc::new(manifest)),
+                launch_name: None,
             },
             None => Self::for_agent(host, base),
         }
@@ -240,6 +253,7 @@ pub struct Detector {
     state: StateMachine,
     manifest: Option<Arc<Manifest>>,
     input_readiness: InputReadiness,
+    launch_name: Option<Arc<str>>,
     initial_input_pending: bool,
     latest_title: Option<String>,
     latest_progress: Option<String>,
@@ -287,6 +301,7 @@ impl Detector {
             state: StateMachine::new(started_at, config.detection),
             manifest: config.manifest,
             input_readiness: config.input_readiness,
+            launch_name: config.launch_name,
             initial_input_pending: true,
             latest_title: None,
             latest_progress: None,
@@ -442,7 +457,7 @@ impl Detector {
             latch.evaluate(
                 manifest,
                 &self.screen,
-                self.latest_title.as_deref(),
+                evaluated_title(self.latest_title.as_deref(), self.launch_name.as_deref()),
                 self.latest_progress.as_deref(),
                 false,
             );
@@ -458,18 +473,20 @@ impl Detector {
             manifest,
             latest_title,
             latest_progress,
+            launch_name,
             ..
         } = self;
         let Some(manifest) = manifest.as_deref() else {
             return screen.feed(bytes);
         };
+        let latest_title = evaluated_title(latest_title.as_deref(), launch_name.as_deref());
         let mut drew = false;
         screen.feed_observed(bytes, &mut |screen: &ScreenTracker, observed| {
             drew |= observed.drew_chars;
             latch.evaluate(
                 manifest,
                 screen,
-                latest_title.as_deref(),
+                latest_title,
                 latest_progress.as_deref(),
                 observed.drew_chars,
             );
@@ -531,11 +548,13 @@ impl Detector {
             manifest,
             latest_title,
             latest_progress,
+            launch_name,
             ..
         } = self;
+        let latest_title = evaluated_title(latest_title.as_deref(), launch_name.as_deref());
         let mut observer = ReadinessObserver {
             manifest: manifest.as_deref(),
-            latest_title: latest_title.as_deref(),
+            latest_title,
             latest_progress: latest_progress.as_deref(),
             title_arrival: self.title_seq,
             strict_seq: &mut *strict_seq,
@@ -549,7 +568,7 @@ impl Detector {
                 latch.evaluate(
                     manifest,
                     screen,
-                    latest_title.as_deref(),
+                    latest_title,
                     latest_progress.as_deref(),
                     observed.drew_chars,
                 );
@@ -682,6 +701,7 @@ impl Detector {
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
         self.input_readiness = config.input_readiness;
+        self.launch_name = config.launch_name;
         if self.latch_eligible() {
             self.screen.resume_observation();
         } else if !self.initial_input_pending {
@@ -816,7 +836,7 @@ impl Detector {
             manifest_hit(
                 manifest,
                 &self.screen,
-                self.latest_title.as_deref(),
+                evaluated_title(self.latest_title.as_deref(), self.launch_name.as_deref()),
                 self.latest_progress.as_deref(),
                 Arrivals {
                     title: self.title_seq,
@@ -832,7 +852,7 @@ impl Detector {
         match_context_for(
             manifest,
             &self.screen,
-            self.latest_title.as_deref(),
+            evaluated_title(self.latest_title.as_deref(), self.launch_name.as_deref()),
             self.latest_progress.as_deref(),
             freshness,
         )
@@ -920,6 +940,25 @@ impl ChunkLatch {
             self.open = false;
         }
     }
+}
+
+/// Whether `title` echoes the launch name: the whole title is the name, or the
+/// name followed by `-` (an agent's rename of a colliding name, such as
+/// `alpha-iterative-muffin`).
+///
+/// Only the whole title is compared. Screen regions are never filtered: a name
+/// equal to a real dialog footer would otherwise hide the real dialog.
+fn launch_name_echo(title: &str, launch_name: &str) -> bool {
+    title == launch_name
+        || title
+            .strip_prefix(launch_name)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// The OSC title the manifest evaluates: none when the agent only echoes the
+/// name the launch gave it. The raw title stays available to previews.
+fn evaluated_title<'a>(title: Option<&'a str>, launch_name: Option<&str>) -> Option<&'a str> {
+    title.filter(|title| launch_name.is_none_or(|name| !launch_name_echo(title, name)))
 }
 
 /// Builds the manifest match context over explicit context pieces.
@@ -1333,6 +1372,7 @@ mod tests {
     /// through the manifest layer just like in the live daemon.
     fn config() -> DetectorConfig {
         DetectorConfig {
+            launch_name: None,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
@@ -1347,6 +1387,7 @@ mod tests {
 
     fn debounce_config() -> DetectorConfig {
         DetectorConfig {
+            launch_name: None,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),

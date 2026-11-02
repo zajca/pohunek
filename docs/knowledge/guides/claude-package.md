@@ -177,26 +177,28 @@ loopback Messages stub, dummy key; scenario
   screen carry it, as they do for the plain title `Claude Code`.
   `named_screens_are_classified_like_unnamed_ones` pins that a named screen reads
   exactly as its unnamed counterpart on both releases.
-- Detection limit: Claude draws the name into the title, the rule label and the
-  collision banner, which the manifest reads. A name that starts with a turn
-  glyph (`◐ deploy`) is, on 2.1.309, a bare title the `◐`/`◑` title rule reads
-  as `working`. With the probe answered the program-status records outrank the
-  title and the session reads `idle`
-  (`a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`,
-  also for the name `esc to interrupt`). A Claude without records on that
-  release (the probe unanswered, or records switched off) is screen-only: such
-  a name makes an idle session read `working`, and the title rule
-  (priority 1100) outranks the visible-blocker rules (980), so an approval
-  dialog reads `working` instead of `blocked`. A `session rename` does not
-  relaunch Claude, so the reading lasts until a resume under another name.
-  2.1.289 puts its own glyph first (`✳ ◐ deploy`, recorded in
-  `compat/claude/screens/n-1/named/marker_idle`), so the same name stays `idle`
-  there. On 2.1.309 the working reading also keeps the session from being ready
-  for input: initial input to a session whose name starts with `◐ `, `◑ ` or a
-  braille character plus a space fails with `session_input_not_ready`.
-  The name is drawn into screen regions as well, so a name that holds a dialog
-  phrase (for example `run a dynamic workflow? esc to cancel`) reads `blocked`,
-  the same as prompt text typed into the box.
+- Detection: Claude draws the name into the title, the rule label and the
+  collision banner. On 2.1.309 the title is the bare name, so a name that starts
+  with a turn glyph (`◐ deploy`) would match the `◐`/`◑` title rule. The daemon
+  keeps the name its launch gave Claude (`[naming]`) and withholds an OSC title
+  that equals it, or equals it followed by `-` (Claude's rename of a colliding
+  name, `alpha-iterative-muffin`), from manifest evaluation; the raw title
+  stays in `session.detection` previews. The comparison is against the whole
+  title, so 2.1.289, which puts its own glyph first (`◐ alpha`, `✳ ◐ deploy`),
+  keeps its title rules. A `session rename` does not relaunch Claude, so the
+  daemon keeps the launch name until the next resume, which launches under the
+  current name; a daemon restart takes the session's current name.
+  `a_title_echoing_the_launch_name_reports_no_state` and
+  `a_glyph_led_title_still_reads_working_for_a_named_session` pin both
+  releases, and `a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`
+  runs real Claude, also with an initial input.
+- Detection limit: the screen regions are not filtered, because a name equal
+  to a real dialog footer would hide the real dialog. A name that holds both
+  `run a dynamic workflow?` and `esc to cancel` is drawn into the rule label
+  and matches `dynamic_workflow_prompt`, so the session reads `blocked`, the
+  same as prompt text typed into the box
+  (`a_name_spelling_a_dialog_phrase_reads_blocked`). A Claude that truncates a
+  long name in its title also falls back to reading the title.
 - Resume: the name of the `--name` argument is the one shown. After a
   `session rename` to `beta`, a resume runs `--name=beta --resume <id>` and
   Claude shows `beta`, although the conversation started as `alpha`.

@@ -4191,9 +4191,16 @@ impl SessionRegistry {
             .profiles
             .runtimes()
             .pinned_definition(&record.info.agent_base, &pin);
-        let restored_detector_config = self
+        // The launch name is not stored: a reconciled session takes its
+        // current name, which is the launch name unless it was renamed since.
+        let launch_name =
+            super::launch_input::launch_name(pinned.as_deref(), record.info.name.as_deref());
+        let mut restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())
             .unwrap_or_else(|| default_detector_config.clone());
+        restored_detector_config
+            .launch_name
+            .clone_from(&launch_name);
         let detector_cancel = self.background_token();
         let procwatch_cancel = self.background_token();
         let runtime_watch_cancel = self.background_token();
@@ -4235,6 +4242,7 @@ impl SessionRegistry {
             input_ready,
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
+            launch_name,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -4554,6 +4562,7 @@ impl SessionRegistry {
             input_ready,
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
+            launch_name: None,
             pinned: self
                 .inner
                 .profiles

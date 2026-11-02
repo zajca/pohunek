@@ -972,12 +972,14 @@ impl SessionRegistry {
             .profiles
             .runtimes()
             .pinned_definition(&agent_base, &snapshot.launch_binding);
-        let default_detector_config = DetectorConfig::for_pinned(
+        let launch_name = super::launch_input::launch_name(pinned.as_deref(), name.as_deref());
+        let mut default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &agent_base,
             &snapshot.launch_binding,
             manifest_override,
         );
+        default_detector_config.launch_name.clone_from(&launch_name);
         let hook_schema = self.session_hook_schema(&agent_base, &snapshot.launch_binding);
         let answers_program_status_probe = default_detector_config.answers_program_status_probe();
         // Held until this function returns: the entry is installed by then,
@@ -1103,6 +1105,7 @@ impl SessionRegistry {
             input_ready,
             initial_input_done: initial_input_done.clone(),
             default_detector_config,
+            launch_name,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),

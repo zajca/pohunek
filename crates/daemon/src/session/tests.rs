@@ -18910,6 +18910,97 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     registry.stop(&forked.id).await.expect("stop the session");
 }
 
+/// The detector's launch name is the name each launch hands the agent: a
+/// rename does not relaunch, so it keeps the launch name until the next resume
+/// re-renders it from the current name, and a launch without a name has none.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_detector_launch_name_follows_the_name_each_launch_uses() {
+    let dir = temp_dir("launch-name-claude");
+    let claude_home = dir.join("claude-home");
+    let transcripts = claude_home.join("projects/fixture");
+    std::fs::create_dir_all(&transcripts).expect("create Claude transcript store");
+    std::fs::write(transcripts.join("native-live.jsonl"), "{}\n")
+        .expect("write Claude source transcript");
+    let script = dir.join("naming-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "launch-name-claude",
+        "named",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script.display(),
+            claude_home.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let launch_name = |config: DetectorConfig| config.launch_name.as_deref().map(str::to_owned);
+
+    let unnamed = registry
+        .create(SessionNewParams {
+            agent: "named".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create an unnamed session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &unnamed.id).await),
+        None
+    );
+    registry.stop(&unnamed.id).await.expect("stop the session");
+
+    let created = registry
+        .create(SessionNewParams {
+            agent: "named".to_owned(),
+            name: Some("alpha".to_owned()),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create a named session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &created.id).await).as_deref(),
+        Some("alpha")
+    );
+    let recorded = registry
+        .report_as_root(native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-live".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded);
+
+    registry
+        .rename(&created.id, Some("\u{25D0} x".to_owned()))
+        .await
+        .expect("rename the running session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &created.id).await).as_deref(),
+        Some("alpha"),
+        "a rename does not relaunch the agent"
+    );
+
+    registry.stop(&created.id).await.expect("stop the session");
+    registry
+        .resume(&created.id)
+        .await
+        .expect("resume the renamed session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &created.id).await).as_deref(),
+        Some("\u{25D0} x"),
+        "a resume launches under the current name"
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects() {

@@ -486,6 +486,7 @@ mod tests {
     #[tokio::test]
     async fn preview_applies_an_accepted_pending_configuration_first() {
         let initial = DetectorConfig {
+            launch_name: None,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
             manifest: Some(Arc::new(
@@ -503,6 +504,7 @@ mod tests {
             )),
         };
         let updated = DetectorConfig {
+            launch_name: None,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
             manifest: Some(Arc::new(
@@ -628,6 +630,7 @@ mod tests {
             let events = registry.subscribe();
 
             let config = DetectorConfig {
+                launch_name: None,
                 input_readiness: crate::agent::host::InputReadiness::default(),
                 detection: DetectionConfig {
                     recheck_after: TEST_RECHECK_AFTER,

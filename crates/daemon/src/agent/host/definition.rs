@@ -885,6 +885,12 @@ impl RuntimeDefinition {
         self.launch_env.as_slice()
     }
 
+    /// Whether the descriptor declares `[naming] launch_args`.
+    #[must_use]
+    pub fn declares_naming(&self) -> bool {
+        !self.naming.is_empty()
+    }
+
     /// The arguments that hand a session named `name` to the agent, from
     /// `[naming] launch_args`; empty for a runtime that declares none.
     #[must_use]
