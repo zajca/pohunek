@@ -1802,7 +1802,38 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
-        let harness = Harness::start().await;
+        Self::over(Harness::start().await)
+    }
+
+    /// [`Self::start`] over a durable daemon, so a restart on the same root
+    /// keeps the session records and adopts the workers still running.
+    async fn start_durable() -> Self {
+        Self::over(Harness::start_durable().await)
+    }
+
+    /// Restarts the daemon on the same root. The installed package, the Pi
+    /// configuration and the model stub stay; the new daemon reconciles the
+    /// workers the previous one left running.
+    async fn restart_daemon(self) -> Self {
+        let Self {
+            harness,
+            stub,
+            digest,
+            archive,
+            sessions_dir,
+        } = self;
+        Self {
+            harness: harness.restart().await,
+            stub,
+            digest,
+            archive,
+            sessions_dir,
+        }
+    }
+
+    /// A fixture over `harness`: a loopback model stub, the Pi configuration
+    /// that points at it, and the package archive written to the root.
+    fn over(harness: Harness) -> Self {
         let stub = ModelStub::start();
         let agent_dir = harness.env.home().join(".pi/agent");
         fs::create_dir_all(&agent_dir).expect("create the Pi agent directory");
@@ -2268,6 +2299,130 @@ async fn a_real_pi_session_launches_is_detected_resumes_and_forks() {
         "{refused}"
     );
 
+    fixture.harness.stop().await;
+}
+
+/// Pi has no credential for any provider but the loopback stub: the throwaway
+/// HOME holds no `auth.json`, its `models.json` names only the stub on
+/// loopback, and no variable of the environment the daemon hands its children
+/// has a credential-like name.
+fn check_only_the_stub_is_configured(fixture: &Fixture) {
+    assert!(
+        !fixture
+            .harness
+            .env
+            .home()
+            .join(".pi/agent/auth.json")
+            .exists(),
+        "no stored provider credential"
+    );
+    let models = fs::read_to_string(fixture.harness.env.home().join(".pi/agent/models.json"))
+        .expect("read models.json");
+    let models: Value = serde_json::from_str(&models).expect("models.json is JSON");
+    let providers = models["providers"].as_object().expect("providers");
+    assert_eq!(
+        providers.keys().collect::<Vec<_>>(),
+        [STUB_PROVIDER],
+        "the stub is the only configured provider"
+    );
+    let base_url = providers[STUB_PROVIDER]["baseUrl"]
+        .as_str()
+        .expect("stub base url");
+    assert!(
+        base_url.starts_with("http://127.0.0.1:"),
+        "the stub endpoint is loopback: {base_url}"
+    );
+    let credential_variables: Vec<String> = fixture
+        .harness
+        .env
+        .command("env")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .expect("list the child environment")
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+        .filter(|name| {
+            let upper = name.to_ascii_uppercase();
+            ["API_KEY", "TOKEN", "SECRET", "CREDENTIAL"]
+                .iter()
+                .any(|word| upper.contains(word))
+        })
+        .collect();
+    assert!(
+        credential_variables.is_empty(),
+        "a child of the test environment sees credential variables: {credential_variables:?}"
+    );
+}
+
+/// A host with the locked Pi launches a session and resumes it after the
+/// daemon restarted: once with the worker still running (the new daemon adopts
+/// it) and once after the session stopped (the new daemon resumes it from Pi's
+/// session file). Only the first turn reaches a model, and that model is the
+/// loopback stub; adoption and resume send none.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn a_real_pi_session_resumes_after_a_daemon_restart() {
+    require_real_pi();
+    let fixture = Fixture::start_durable().await;
+    fixture.install().await;
+    fixture.write_profile();
+    check_only_the_stub_is_configured(&fixture);
+
+    check_inventory(&fixture).await;
+    let (id, reference, file) = launch_and_converse(&fixture).await;
+    assert_eq!(
+        fixture.stub.started(),
+        1,
+        "the first turn is the only request"
+    );
+
+    // The daemon restarts while Pi runs: the new daemon adopts the session.
+    let fixture = fixture.restart_daemon().await;
+    let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_eq!(inspected["ok"]["runtime"]["state"], "live", "{inspected}");
+    assert_eq!(inspected["ok"]["native_session_id"], reference.as_str());
+    fixture.wait_activity(&id, "idle").await;
+    let adopted = fixture.wait_screen_line(&id, PROMPT).await;
+    assert!(
+        adopted
+            .iter()
+            .any(|line| line.contains(model_stub::FIRST_CHUNK)),
+        "the earlier turn is on screen after adoption: {adopted:#?}"
+    );
+    assert_eq!(fixture.stub.started(), 1, "adoption makes no model request");
+
+    // The session stops, the daemon restarts again, and the new daemon
+    // resumes the conversation from Pi's session file.
+    fixture.stop(&id).await;
+    let fixture = fixture.restart_daemon().await;
+    assert!(file.is_file(), "Pi's session file outlives the restarts");
+    let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 0, "{resumed}");
+    fixture.wait_activity(&id, "idle").await;
+    let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_eq!(
+        inspected["ok"]["native_session_id"],
+        reference.as_str(),
+        "the resume keeps the conversation's reference"
+    );
+    let restored = fixture.wait_screen_line(&id, PROMPT).await;
+    assert!(
+        restored
+            .iter()
+            .any(|line| line.contains(model_stub::FIRST_CHUNK)),
+        "the earlier turn is on screen after the resume: {restored:#?}"
+    );
+    assert_eq!(
+        fixture.stub.started(),
+        1,
+        "resume after a restart makes no model request"
+    );
+
+    fixture.stop(&id).await;
     fixture.harness.stop().await;
 }
 
