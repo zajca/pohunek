@@ -8017,12 +8017,10 @@ impl SessionRegistry {
         self.publish(event);
     }
 
-    /// Publishes a session event that announces a loss the registry already
-    /// held, not a new one. With [`EventOrigin::Replayed`] the notification
-    /// projector learns the state and notifies nothing; with
-    /// [`EventOrigin::SettledLoss`] it projects the settled state of a loss it
-    /// may have reported as unproven.
-    fn emit_announced(&self, name: &str, info: &SessionInfo, origin: EventOrigin) {
+    /// Publishes a session event that announces a state the registry loaded
+    /// unchanged. The notification projector takes it as a baseline and
+    /// notifies nothing.
+    fn emit_replayed(&self, name: &str, info: &SessionInfo) {
         let event = crate::events::event(
             name,
             event_payload(SessionEvent {
@@ -8032,7 +8030,7 @@ impl SessionRegistry {
         let _ = self.inner.produced_events.send(ProducedEvent {
             event: event.clone(),
             produced: std::time::Instant::now(),
-            origin,
+            origin: EventOrigin::Replayed,
         });
         let _ = self.inner.events.send(event);
     }

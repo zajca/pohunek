@@ -45,7 +45,6 @@ use super::{
 };
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
-use crate::events::EventOrigin;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
     journal_schema_supported, observation_live, require_supported_journal_schema, Lifecycle,
@@ -4413,29 +4412,23 @@ impl SessionRegistry {
             | RuntimeState::Terminal
             | RuntimeState::Unknown => event::SESSION_UPDATED,
         };
-        // A record that was already lost in the same generation is announced
-        // again at every start. The projector notifies nothing for it when
-        // the state is the same; a start that settles an unproven loss
-        // (`running` becomes `failed`) lets the projector report the proof
-        // only when no report of that loss exists.
-        let announced = stored_runtime
+        // A record that was lost in the same generation and state is loaded
+        // unchanged at every start: a baseline, not a new loss. Any other
+        // change, including the proof of a stored unproven loss, is a live
+        // event whose dedupe the notification projector decides.
+        let loaded_unchanged = stored_runtime
             .as_ref()
             .zip(info.runtime.as_ref())
-            .filter(|(stored, current)| {
+            .is_some_and(|(stored, current)| {
                 stored.state == RuntimeState::Lost
                     && current.state == RuntimeState::Lost
                     && stored.runtime_generation == current.runtime_generation
             })
-            .map(|_| {
-                if stored_state == info.state {
-                    EventOrigin::Replayed
-                } else {
-                    EventOrigin::SettledLoss
-                }
-            });
-        match announced {
-            Some(origin) => self.emit_announced(event_name, &info, origin),
-            None => self.emit(event_name, &info),
+            && stored_state == info.state;
+        if loaded_unchanged {
+            self.emit_replayed(event_name, &info);
+        } else {
+            self.emit(event_name, &info);
         }
         if had_background {
             self.emit_background_state(&info);
@@ -16243,6 +16236,75 @@ generation "$1"
             assert_eq!(list().len(), 1, "{:#?}", list());
         }
 
+        /// A loss reported as unproven stays reported across an interlude in
+        /// which a start could not classify the record: the retry that then
+        /// commits the loss adds no second notification.
+        async fn a_reported_loss_survives_an_interlude(session_id: &str, interlude: RuntimeState) {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            let record = persist_unproven_loss(&fixture.root, session_id);
+            write_restarted_host_journal(&fixture.root, session_id);
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+            let list = || {
+                notifications
+                    .list(protocol::NotificationListParams::default())
+                    .expect("list notifications")
+                    .notifications
+            };
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            fixture
+                .registry
+                .emit(event::SESSION_RUNTIME_LOST, &record.info);
+            projector.stop().await;
+            assert_eq!(list().len(), 1, "{:#?}", list());
+
+            // The restart: the record is persisted as unclassifiable, then
+            // the retry commits the loss.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            assert!(
+                fixture
+                    .registry
+                    .insert_unavailable_record(record, interlude, "runtime_supervision_unavailable")
+                    .await
+            );
+            let id = SessionId(session_id.to_owned());
+            assert!(fixture.registry.retry_supervised_session(&id).await);
+            assert_eq!(
+                runtime_of(&fixture.registry, session_id).await.state,
+                RuntimeState::Lost
+            );
+            projector.stop().await;
+            assert_eq!(list().len(), 1, "{:#?}", list());
+        }
+
+        #[tokio::test]
+        async fn a_reported_loss_is_not_reported_again_after_a_reconnecting_interlude() {
+            a_reported_loss_survives_an_interlude("s-4260", RuntimeState::Reconnecting).await;
+        }
+
+        #[tokio::test]
+        async fn a_reported_loss_is_not_reported_again_after_a_conflict_interlude() {
+            a_reported_loss_survives_an_interlude("s-4261", RuntimeState::Conflict).await;
+        }
+
         /// A start that proves a loss nobody was told about, such as one an
         /// earlier release stored as `running` and never notified, reports it.
         #[tokio::test]
@@ -16289,7 +16351,16 @@ generation "$1"
 
             let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
             let lost = persist_unproven_loss(&fixture.root, "s-4252");
-            let live = persist_record(&fixture.root, "s-4252", Some("runtime-s-4252"));
+            let mut live = persist_record(&fixture.root, "s-4252", Some("runtime-s-4252"));
+            // The runtime answered after the loss was reported.
+            live.info
+                .runtime
+                .as_mut()
+                .expect("runtime")
+                .last_connected_at = Some("2999-01-01T00:00:00Z".to_owned());
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&live)
+                .expect("persist the cure");
             write_restarted_host_journal(&fixture.root, "s-4252");
             let notifications = NotificationService::open(&fixture.root.join("notifications"))
                 .expect("open notification service");

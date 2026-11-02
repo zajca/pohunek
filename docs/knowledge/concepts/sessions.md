@@ -377,8 +377,10 @@ A session whose runtime is lost also resolves its attention records, because no
 terminal is left to answer them. The projector reports the loss itself as an
 `error` record: "Session crashed" when the daemon proved it (`failed` with a
 lost runtime) and "Session runtime lost" when it did not (`running` with a lost
-runtime); a proof that follows an unproven report adds no second record, and a
-runtime that answers again and is lost again is reported again. The cause rides
+runtime); a proof that follows an unproven report adds no second record, also across
+daemon restarts and a start that could not classify the record; a report
+counts until the runtime answers again, and a runtime that answers again and is
+lost again is reported again. The cause rides
 in the body and in the `cause`, `oom_killer`, `memory_peak_bytes` and
 `loss_cause` metadata keys.
 
