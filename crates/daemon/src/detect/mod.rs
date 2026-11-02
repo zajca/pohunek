@@ -943,8 +943,9 @@ impl ChunkLatch {
 /// starts with the name followed by `-` (an agent's rename of a colliding name, such as
 /// `alpha-iterative-muffin`).
 ///
-/// Only the whole title is compared. Screen regions are never filtered: a name
-/// equal to a real dialog footer would otherwise hide the real dialog.
+/// The match is anchored at the start of the whole title. Screen regions are
+/// never filtered: a name equal to a real dialog footer would otherwise hide
+/// the real dialog.
 fn launch_name_echo(title: &str, launch_name: &str) -> bool {
     title == launch_name
         || title

@@ -4183,7 +4183,7 @@ impl SessionRegistry {
         }
         .ok()
         .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
-        let default_detector_config = DetectorConfig::for_pinned(
+        let mut default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &record.info.agent_base,
             &pin,
@@ -4198,6 +4198,7 @@ impl SessionRegistry {
         // current name, which is the launch name unless it was renamed since.
         let launch_name =
             super::launch_input::launch_name(pinned.as_deref(), record.info.name.as_deref());
+        default_detector_config.launch_name.clone_from(&launch_name);
         let mut restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())
             .unwrap_or_else(|| default_detector_config.clone());
