@@ -673,7 +673,7 @@ pub(super) struct SweepOutcome {
 }
 
 impl SweepOutcome {
-    fn complete() -> Self {
+    pub(super) fn complete() -> Self {
         Self {
             cleanup: Cleanup::Complete,
             unreadable: Vec::new(),
@@ -880,6 +880,7 @@ impl SessionRegistry {
     /// and provably the runtime's when its fork lineage reaches the worker;
     /// without them, every unreadable-marker process keeps the cleanup
     /// unconfirmed.
+    #[cfg(test)]
     pub(super) async fn sweep_lost_runtime(
         &self,
         session_id: &str,

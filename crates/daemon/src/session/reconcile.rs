@@ -27,7 +27,7 @@ use super::settle::RescanSignal;
 use super::supervision::{
     classify_unreachable, count_unaccepted, describe_unreadable_candidates, job_identity_mismatch,
     observe, record_accepted_process, with_settle_window, Cleanup, JobEvidence, JournalWorker,
-    ManagerRecord, Unreachable, WorkerBounds, CREATE_COMPENSATION_PENDING,
+    ManagerRecord, SweepOutcome, Unreachable, WorkerBounds, CREATE_COMPENSATION_PENDING,
     MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED,
     UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
@@ -116,18 +116,26 @@ const CONFLICT: Unavailability = Unavailability::Other(RuntimeState::Conflict);
 /// The proof and loss reason of a worker whose job ended and was retired.
 ///
 /// A sweep that could not confirm every marked process gone leaves processes
-/// that may survive, so that loss is not proven to end the session. A user
-/// manager proven gone within the recorded boot ends the whole cgroup tree it
-/// held, so that cause stands in for the sweep.
+/// that may survive, so that loss is not proven to end the session. The one
+/// exception is a sweep blocked solely by processes whose markers are
+/// unreadable while the user manager that held the worker is proven gone
+/// within the recorded boot: those processes can only be members of the
+/// manager's new instance, so the cause stands in for the sweep. Any other
+/// blocker (a sweep that did not run, an inspection or signal error, a
+/// signalled process that still runs) keeps the loss unproven, so
+/// `session.resume` still makes its own confirmed sweep.
 fn ended_loss(
     journaled: bool,
-    cleanup: Cleanup,
+    swept: &SweepOutcome,
     loss_cause: Option<LossCause>,
 ) -> (LossProof, &'static str) {
-    match (journaled, cleanup) {
+    match (journaled, swept.cleanup) {
         (false, _) => (LossProof::Ended, "worker_unavailable"),
         (true, Cleanup::Complete) => (LossProof::Ended, RUNTIME_LOST),
-        (true, Cleanup::Unconfirmed) if loss_cause == Some(LossCause::UserManagerLost) => {
+        (true, Cleanup::Unconfirmed)
+            if loss_cause == Some(LossCause::UserManagerLost)
+                && swept.only_unreadable_candidates_blocked() =>
+        {
             (LossProof::Ended, RUNTIME_LOST)
         }
         (true, Cleanup::Unconfirmed) => (LossProof::Unproven, RUNTIME_LOST_CLEANUP_UNCONFIRMED),
@@ -1845,12 +1853,12 @@ impl SessionRegistry {
                 // `worker_instance_id` is set only for a journaled worker proven gone;
                 // a generation that never journaled has nothing proven to
                 // sweep, so only its job is retired.
-                let cleanup = match worker_instance_id.as_deref() {
+                let swept = match worker_instance_id.as_deref() {
                     Some(worker_instance_id) => {
-                        self.sweep_lost_runtime(&id.0, worker_instance_id, bounds)
+                        self.sweep_lost_runtime_detailed(&id.0, worker_instance_id, bounds)
                             .await
                     }
-                    None => Cleanup::Complete,
+                    None => SweepOutcome::complete(),
                 };
                 let exit = match lifecycle {
                     Some(lifecycle) => {
@@ -1911,7 +1919,7 @@ impl SessionRegistry {
                     return Box::pin(self.settle_ended_stop(record, Some(&generation), retry))
                         .await;
                 }
-                let (proof, reason) = ended_loss(journaled, cleanup, loss_cause);
+                let (proof, reason) = ended_loss(journaled, &swept, loss_cause);
                 let committed = self
                     .insert_ended_record(record, reason, proof, exit, loss_cause)
                     .await;
@@ -2338,13 +2346,13 @@ impl SessionRegistry {
                 // Only a journaled worker whose process is proven gone proves
                 // which runtime died. Without a journal nothing proves what
                 // ran, so no process is swept; the ended job is still retired.
-                let cleanup = if journaled {
+                let swept = if journaled {
                     let worker_instance_id =
                         worker_instance_id.unwrap_or_else(|| expected.worker_instance_id.clone());
-                    self.sweep_lost_runtime(&id.0, &worker_instance_id, bounds)
+                    self.sweep_lost_runtime_detailed(&id.0, &worker_instance_id, bounds)
                         .await
                 } else {
-                    Cleanup::Complete
+                    SweepOutcome::complete()
                 };
                 let (exit, retired) = self
                     .read_exit_and_retire(&id.0, lifecycle.as_ref(), job.as_ref())
@@ -2355,7 +2363,7 @@ impl SessionRegistry {
                 if retired.is_err() {
                     (RECONNECTING, SUPERVISION_UNAVAILABLE)
                 } else {
-                    let (proof, reason) = ended_loss(journaled, cleanup, loss_cause);
+                    let (proof, reason) = ended_loss(journaled, &swept, loss_cause);
                     (
                         Unavailability::lost(proof, exit).with_loss_cause(loss_cause),
                         reason,
@@ -15085,6 +15093,96 @@ generation "$1"
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
+        /// Generations of [`FORKING_HOLDER`] after the first when one more
+        /// outlives the sweep's last allowed pass.
+        #[cfg(target_os = "linux")]
+        const SURVIVING_GENERATIONS: u8 = LAST_PASS_GENERATIONS + 1;
+
+        /// A holder with one generation more than the sweep has passes still
+        /// runs after the last pass: the gone user manager does not end the
+        /// session, so resume makes its own confirmed sweep.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_gone_user_manager_does_not_end_the_session_while_a_marked_process_survives_the_sweep(
+        ) {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let barrier = fixture.root.join("holder-barrier");
+            std::fs::create_dir(&barrier).expect("holder barrier");
+            let release = ReleaseHolder(barrier.clone());
+            let generations = fixture.root.join("holder-generations");
+            std::fs::create_dir(&generations).expect("holder generations directory");
+            let fifo = fixture.root.join("holder-idle");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("holder idle fifo");
+            let chain = fixture.root.join("forking-holder.sh");
+            std::fs::write(&chain, FORKING_HOLDER).expect("write the forking holder");
+            // The holder is reparented away from the test process, so the exit
+            // of every generation is observable without reaping.
+            let launched = marker_command(
+                "/bin/sh",
+                &[("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-4239")],
+            )
+            .args([
+                "-c",
+                &format!(
+                    "trap '' HUP; /bin/bash '{chain}' {SURVIVING_GENERATIONS} '{barrier}' \
+                         '{generations}' '{fifo}' </dev/null >/dev/null 2>&1 &",
+                    chain = chain.display(),
+                    barrier = barrier.display(),
+                    generations = generations.display(),
+                    fifo = fifo.display(),
+                ),
+            ])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("launch the forking holder");
+            assert!(launched.success(), "the forking holder launches");
+            let first = super::wait_for_pid_file(
+                &generations.join(format!("ready-{SURVIVING_GENERATIONS}")),
+            )
+            .await;
+            assert_in_fixture_view(first, &fixture.root);
+            persist_record(&fixture.root, "s-4239", Some("runtime-s-4239"));
+            let (manager_pid, manager_start) = dead_worker();
+            write_journal_record(
+                &fixture.root,
+                "s-4239",
+                "worker-s-4239",
+                TEST_GENERATION,
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-4239"),
+                |journal| {
+                    journal.boot_identity = current_boot_identity();
+                    journal.boot_session_id = HostInspector::new().boot_session_id().ok();
+                    journal.worker_manager = Some(pohunek_session_worker::WorkerManager {
+                        pid: manager_pid,
+                        start_identity: manager_start.to_string(),
+                    });
+                },
+            );
+            let id = service_id("s-4239", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-4239".to_owned()))
+                .await
+                .expect("inspect");
+            drop(release);
+            assert_eq!(info.state, protocol::SessionState::Running);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+        }
+
         #[tokio::test]
         async fn a_sweep_never_reaches_a_stand_in_of_another_fixture_with_the_same_marker() {
             // Scenarios run concurrently, and two of them can mark stand-ins for
@@ -15838,6 +15936,59 @@ generation "$1"
             assert_eq!(runtime.state, RuntimeState::Lost);
             assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
             assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
+        }
+
+        /// A sweep that did not finish its look at the processes (an
+        /// enumeration or inspection error) proves nothing about them, so the
+        /// gone manager does not end the session: resume still makes its own
+        /// confirmed sweep.
+        #[tokio::test]
+        async fn a_gone_user_manager_does_not_end_the_session_when_the_sweep_failed() {
+            for tag in ["s-4237"] {
+                let inspector = Arc::new(RetryInspector::default());
+                inspector.fail_enumeration(true);
+                let fixture =
+                    fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+                let runtime_id = format!("runtime-{tag}");
+                let marked = Marked::spawn(&fixture.root, &runtime_id);
+                persist_record(&fixture.root, tag, Some(&runtime_id));
+                let (manager_pid, manager_start) = dead_worker();
+                write_journal_record(
+                    &fixture.root,
+                    tag,
+                    &format!("worker-{tag}"),
+                    TEST_GENERATION,
+                    dead_worker(),
+                    Some(&runtime_id),
+                    |journal| {
+                        journal.boot_identity = current_boot_identity();
+                        journal.boot_session_id = HostInspector::new().boot_session_id().ok();
+                        journal.worker_manager = Some(pohunek_session_worker::WorkerManager {
+                            pid: manager_pid,
+                            start_identity: manager_start.to_string(),
+                        });
+                    },
+                );
+
+                Box::pin(fixture.registry.reconcile_workers())
+                    .await
+                    .expect("reconcile");
+
+                let info = fixture
+                    .registry
+                    .inspect(&SessionId(tag.to_owned()))
+                    .await
+                    .expect("inspect");
+                assert_eq!(info.state, protocol::SessionState::Running, "{tag}");
+                let runtime = info.runtime.expect("runtime");
+                assert_eq!(runtime.state, RuntimeState::Lost, "{tag}");
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+                    "{tag}"
+                );
+                assert!(marked.alive(), "{tag}: a failed sweep signals nothing");
+            }
         }
 
         /// A manager that still runs explains nothing, so the loss stays

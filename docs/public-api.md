@@ -1963,7 +1963,8 @@ Important fields:
   manager verdict: `user_manager_lost` (the journal named the user service
   manager that held the worker, and that process is gone within the same
   boot; the manager took its cgroup tree with it, so this loss ends the session
-  `failed` even when the marker sweep could not confirm every process) or
+  `failed` even when the marker sweep was blocked only by processes with unreadable
+  markers) or
   `host_restarted` (the host booted again after the worker started).
   It is set only while `exit` is absent, kept while the runtime stays `lost`,
   cleared with `exit`, and absent when the journal proves neither (a worker

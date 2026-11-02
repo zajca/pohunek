@@ -783,10 +783,12 @@ async fn privileged_a_killed_user_manager_is_the_cause_of_a_lost_runtime() {
     )
     .await;
     let runtime = lost.runtime.expect("lost runtime");
+    let sweep = fixture.sweep_log();
+    eprintln!("daemon sweep lines:\n{sweep}");
     assert_eq!(
         lost.state,
         protocol::SessionState::Failed,
-        "a user manager proven gone ends the session: {runtime:?}"
+        "a user manager proven gone ends the session: {runtime:?}\nsweep: {sweep}"
     );
     assert_eq!(
         runtime.loss_cause.as_deref(),
@@ -1432,6 +1434,29 @@ impl Fixture {
             .args(arguments)
             .output()
             .expect("run systemctl")
+    }
+
+    /// The daemon's `swept processes of a lost runtime` lines from the user
+    /// journal: `sweep.settled` and `sweep.unreadable` show what kept a
+    /// sweep from confirming the cleanup.
+    fn sweep_log(&self) -> String {
+        let output = Command::new("journalctl")
+            .args([
+                "--user",
+                "--unit",
+                self.daemon_unit.as_str(),
+                "--no-pager",
+                "--output=cat",
+            ])
+            .output();
+        let Ok(output) = output else {
+            return "the daemon journal is not readable".to_owned();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("swept processes of a lost runtime"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn print_status(&self) {

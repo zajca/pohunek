@@ -1933,7 +1933,14 @@ Durability tiers (honest about limits):
    record names no generation, a recovery whose previous worker still answers,
    an unreachable socket, a sweep that could not confirm the cleanup of marked
    processes: `runtime_lost_cleanup_unconfirmed`) keeps the session state and clears only the activity,
-   because no detector is attached to a lost runtime. Startup reconciliation
+   because no detector is attached to a lost runtime. The one exception to the
+   unconfirmed sweep: a sweep blocked solely by processes whose markers are
+   unreadable ends the session when the journaled user manager is proven gone
+   within the recorded boot (`loss_cause=user_manager_lost`), because those
+   processes can only belong to the manager's new instance. A sweep that did
+   not run, an inspection or signal error and a signalled process that still
+   runs keep the loss unproven, so `session.resume` still makes its own
+   confirmed sweep. Startup reconciliation
    re-examines every stored record, so a record committed by an earlier release
    as `running` with a lost runtime is re-classified by its call site's proof;
    a worker that answers again re-adopts the session as `running`. A `failed`
@@ -1973,7 +1980,7 @@ Durability tiers (honest about limits):
    worker's parent) in its journal as `worker_manager`, and the daemon names
    `user_manager_lost` when that process is gone within the recorded boot (the
    manager took its cgroup tree with it, so the loss ends the session `failed`
-   even when the marker sweep could not confirm every process), or
+   even when the marker sweep was blocked only by processes with unreadable markers), or
    `host_restarted` when the host booted again. The wire fields are additive
    (no protocol bump; protocol 3 peers receive neither) and a persisted-shape
    change in the store (store schema 15, a no-op migration from 14). A lost runtime that is

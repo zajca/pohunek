@@ -1558,7 +1558,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           POHUNEK_PRIVILEGED_E2E: "1"
-        run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1 privileged_
+        run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1 privileged_ --nocapture
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run

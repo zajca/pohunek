@@ -342,7 +342,9 @@ Interpret runtime states as follows:
   intentionally retained; explicit native recovery is possible only with a valid launch
   recovery reference. Reason `runtime_lost` means the worker job ended while its
   journal still said live, and the ownership-marker sweep removed that
-  generation's leftover processes. `runtime_lost_cleanup_unconfirmed` means the
+  generation's leftover processes (or was blocked only by processes with
+  unreadable markers while `loss_cause` is `user_manager_lost`: the user
+  manager that held the worker is gone, and so are the processes of its tree). `runtime_lost_cleanup_unconfirmed` means the
   same, but the sweep could not confirm that every marked process ended,
   for example because a worker child carries the session's `POHUNEK_SESSION_ID`
   and `POHUNEK_WORKER_ID` but no `POHUNEK_WORKER_INSTANCE_ID` (a child of a
