@@ -285,6 +285,11 @@ struct AssistantArgs {
     /// A deadline that expires leaves the creation outcome unknown.
     #[arg(long, value_parser = commands::session::parse_request_timeout_ms)]
     request_timeout_ms: Option<u32>,
+    /// Idempotency key of the launch, to resume a launch whose outcome was
+    /// unknown: a repeat returns the session the first one created. Without
+    /// it a generated key is used when the daemon supports keys.
+    #[arg(long, value_name = "id", value_parser = commands::session::parse_request_id)]
+    request_id: Option<String>,
     /// Session metadata in key=value form (repeatable), written atomically
     /// with the assistant session. A caller-chosen key finds the session with
     /// `session list --meta-eq` when a creation outcome is unknown.
@@ -1265,6 +1270,12 @@ enum SessionAction {
         /// Override the daemon response timeout for this creation request.
         #[arg(long, value_parser = commands::session::parse_request_timeout_ms)]
         request_timeout_ms: Option<u32>,
+        /// Idempotency key of this creation: a repeat of the same request with
+        /// the same key returns the session the first one created
+        /// (`replayed: true`) instead of creating another. Use it to retry a
+        /// creation whose outcome is unknown.
+        #[arg(long, value_name = "id", value_parser = commands::session::parse_request_id)]
+        request_id: Option<String>,
         /// Session metadata in key=value form (repeatable). Split on the first
         /// `=` only, so a value may itself contain `=`. Each key may be set at
         /// most once; the daemon enforces size limits on the values.
@@ -2079,6 +2090,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     input_stdin,
                     input_ack_timeout_ms,
                     request_timeout_ms,
+                    request_id,
                     meta,
                     yes,
                     json,
@@ -2108,6 +2120,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             input,
                             input_ack_timeout_ms,
                             request_timeout_ms,
+                            request_id,
                             meta,
                         },
                         json,
@@ -2985,6 +2998,7 @@ fn resolve_assistant_options(
         request,
         request_from_stdin: args.request_stdin,
         request_timeout_ms: args.request_timeout_ms,
+        request_id: args.request_id,
         metadata: commands::session::parse_meta_pairs(&args.meta)?,
         agent: args.agent,
         host: effective_host(global_host, None),

@@ -157,3 +157,29 @@ fn assistant_branch_source_flags_that_contradict_each_other_are_usage_errors() {
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
     }
 }
+
+#[test]
+fn assistant_accepts_a_request_id_and_refuses_a_malformed_one_before_dialing() {
+    assert_reaches_daemon(&[
+        "assistant",
+        "--request-id",
+        "launch-1",
+        "--json",
+        "--no-start-daemon",
+    ]);
+
+    let too_long = "k".repeat(129);
+    for key in ["", "with space", "a/b", too_long.as_str()] {
+        let output = run_assistant(&[
+            "assistant",
+            "--request-id",
+            key,
+            "--json",
+            "--no-start-daemon",
+        ]);
+        assert_eq!(output.status.code(), Some(2), "{key:?}: {output:?}");
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one JSON usage error");
+        assert_eq!(document["err"]["code"], "cli_usage", "{key:?}: {document}");
+    }
+}

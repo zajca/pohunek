@@ -152,6 +152,7 @@ async fn prepare(degraded: bool) -> PreparedLaunch {
             no_snapshot: false,
             degraded,
             auto_started_daemon: false,
+            request_id: None,
         },
         ConnectionOptions {
             origin_source: OriginSource::Omitted,

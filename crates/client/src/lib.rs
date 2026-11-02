@@ -31,9 +31,10 @@ pub use transport::{
     connect_raw_local_with_options, connect_raw_tcp_addr, connect_raw_tcp_addr_with_options,
     connect_raw_with_options, is_local_host, names_this_machine, names_this_machine_in,
     next_request_id, pinned_host_id, remote_host_with_port, resolve_host_peer_in,
-    resolve_host_target, resolve_host_target_in, Client, ClientOptions, OriginSource, RawStream,
-    ResolvedHost, ResolvedPeer, Subscription, LIFECYCLE_STEP_BOUND_MS, LOCAL_HOST,
-    RESUME_SWEEP_PASSES, SESSION_FORK_REQUEST_BUDGET_MS, SESSION_NEW_REQUEST_BUDGET_MS,
+    resolve_host_target, resolve_host_target_in, session_new_request_deadline, Client,
+    ClientOptions, OriginSource, RawStream, ResolvedHost, ResolvedPeer, Subscription,
+    DEFAULT_REQUEST_TIMEOUT, LIFECYCLE_STEP_BOUND_MS, LOCAL_HOST, RESUME_SWEEP_PASSES,
+    SESSION_FORK_REQUEST_BUDGET_MS, SESSION_NEW_REQUEST_BUDGET_MS,
     SESSION_REMOVE_REQUEST_BUDGET_MS, SESSION_RESUME_REQUEST_BUDGET_MS,
     SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
 };

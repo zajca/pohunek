@@ -355,11 +355,14 @@ impl CliError {
             CliError::SessionNewOutcomeUnknown(err) => {
                 let mut error = err.to_protocol_error();
                 error.recover = Some(
-                    "the daemon may still create the session: give each create a unique \
-                     `--meta <key>=<value>` and look for it with `pohunek session list \
-                     --meta-eq <key>=<value>` before retrying; an empty list does not prove that \
-                     nothing was created, and a retry can create a second session, which the \
-                     same key shows"
+                    "the daemon may still create the session: retry with the same \
+                     `--request-id <id>` (a repeat returns the session the first request \
+                     created, or `session_request_in_progress` while it is still being created); \
+                     without a request id, give each create a unique `--meta <key>=<value>` and \
+                     look for it with `pohunek session list --meta-eq <key>=<value>` before \
+                     retrying; an empty list does not prove that nothing was created, and a \
+                     retry without a request id can create a second session, which the same key \
+                     shows"
                         .to_owned(),
                 );
                 error

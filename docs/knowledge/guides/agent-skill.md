@@ -187,7 +187,10 @@ After sending, verify the effect with `session inspect` or `session screen`
 before concluding that anything happened. Distinguish no change, timeout,
 terminal state, and success exactly as the command reports them. Do not retry
 input blindly after an ambiguous outcome: a timeout is not a delivery report,
-and a duplicate prompt can double-run work.
+and a duplicate prompt can double-run work. A `session new` whose outcome is
+unknown is the exception when it carried `--request-id <id>`: repeating the
+command with the same id returns the session the first one created
+(`replayed: true`) instead of creating a second one.
 
 To follow a coding agent until its turn ends, use the turn wait described in
 "Following sessions across turns" below: it is driven by a cursor instead of

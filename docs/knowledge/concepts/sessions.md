@@ -1226,6 +1226,11 @@ key lives and dies with the session.
   daemon without it drops the key silently, so the Rust client and the
   TypeScript SDK refuse with `session_new_request_id_unsupported` and send
   nothing.
+- `pohunek session new --request-id <id>` sends the key. `pohunek assistant`
+  sends one on every launch against a daemon that supports it (`--request-id`
+  or a generated `asst-<32 hex digits>`) and, when its first attempt gets no
+  answer, repeats it once within the same deadline. An outcome that stays
+  unknown names the id; repeating the command with it returns the session.
 
 ## Temporary directory
 

@@ -1,0 +1,4 @@
+---
+kind: added
+---
+`pohunek session new --request-id <id>` makes a creation idempotent: repeating the command with the same id returns the session the first one created (`--json` then carries `replayed: true`) instead of creating a second one, and a host whose daemon does not advertise `session_new_request_id_supported` is refused with `session_new_request_id_unsupported` before anything is sent. `pohunek assistant` takes the same `--request-id`, sends a generated one on every launch against a daemon that supports it, and repeats an unanswered creation once within the same `--request-timeout-ms` deadline; an outcome that stays unknown names the id so rerunning the same command with `--request-id <id>` can get the session back on a local host (a remote host picks a new snapshot path for every launch, so look the session up by `--meta` there). Against a daemon without the flag nothing changes: one request, never resent.

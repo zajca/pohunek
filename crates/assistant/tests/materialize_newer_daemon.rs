@@ -165,6 +165,7 @@ async fn prepare_against(materialize: Value) -> Result<PreparedLaunch, Assistant
             no_snapshot: true,
             degraded: false,
             auto_started_daemon: false,
+            request_id: None,
         },
         ConnectionOptions {
             origin_source: OriginSource::Omitted,
