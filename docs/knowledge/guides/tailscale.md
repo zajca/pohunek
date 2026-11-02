@@ -47,12 +47,14 @@ Pohunek never starts, stops or logs in Tailscale. It only runs
   that directory is on it, and check the `tailscale_cli` entry of `pohunek
   doctor`, which reports what the daemon itself finds.
 - **macOS is not supported in 0.37.** Pohunek runs only a `tailscale` binary
-  from a directory that no other account can write. The stock Apple-Silicon
-  Homebrew directory `/opt/homebrew/bin` is writable by the admin group, so the
-  binary there is refused: `host list` fails with `tailscale_cli_missing`, the
-  doctor reports `tailscale_cli` as `fail`, and the daemon binds no listener. The
-  App Store and standalone builds are refused too, because their command-line
-  tool lives inside an application bundle. A Mac keeps working over NetBird and
+  from a directory that no untrusted account can write. On macOS the user's own
+  directories that the admin group can write, such as the stock Apple-Silicon
+  Homebrew `/opt/homebrew/bin`, are accepted (see
+  [environment resolution](environment-resolution.md)); support is claimed once
+  it is verified on a real Mac. The App Store and standalone builds are refused,
+  because their command-line tool lives below `/Applications`, a root-owned
+  directory the admin group can write: `host list` fails with `tailscale_cli_missing`, the doctor reports
+  `tailscale_cli` as `fail`, and the daemon binds no listener. A Mac keeps working over NetBird and
   reaches Tailscale hosts only through a Linux host. Support is tracked in
   [#1583](https://github.com/zajca/pohunek/issues/1583).
 - **Headscale and other control servers.** Pohunek reads only the local client's

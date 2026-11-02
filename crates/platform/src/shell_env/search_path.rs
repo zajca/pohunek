@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use super::executable::is_admin_group_directory;
 use crate::filesystem::TrustedDir;
 
 /// Longest accepted joined `PATH` value in bytes.
@@ -129,12 +130,17 @@ pub enum TrustError {
 /// Another local account able to write into a searched directory could plant
 /// an agent executable that later runs as the owner, so the rules are strict:
 /// symlinks are resolved first; every component of the canonical path must
-/// pass the platform's trusted-ancestor policy (effective-user-owned
-/// components are not group- or world-writable, root-owned ones are
+/// pass the executable-lookup ancestor policy (effective-user-owned components
+/// are not world-writable and not group-writable, root-owned ones are
 /// non-writable or sticky, no foreign owners); and the final directory itself
 /// must not be writable by group or others, which also refuses sticky
-/// world-writable directories such as `/tmp` and group-writable setups such as
-/// an admin-group `/usr/local/bin` (out of scope).
+/// world-writable directories such as `/tmp`.
+///
+/// On macOS, for a process that is not root, a directory owned by the effective user may be writable by the
+/// `admin` group (gid 80), the shape of a stock Homebrew `bin`. Its members are
+/// inside the owner's executable trust boundary (see `environment-resolution`),
+/// so the group write is accepted there; a root-owned directory, another group,
+/// and world write stay refused.
 ///
 /// Returns the canonical path the checks ran against. Callers record exactly
 /// this path, so validation and recording cover the same directory and nothing
@@ -156,10 +162,16 @@ pub fn trusted_directory(entry: &Path) -> Result<PathBuf, TrustError> {
     if !metadata.is_dir() {
         return Err(TrustError::Missing);
     }
-    if metadata.mode() & GROUP_OTHER_WRITE != 0 {
+    let admin_group_directory = is_admin_group_directory(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        rustix::process::geteuid().as_raw(),
+    );
+    if metadata.mode() & GROUP_OTHER_WRITE != 0 && !admin_group_directory {
         return Err(TrustError::Refused("writable by group or others"));
     }
-    TrustedDir::open_absolute_ancestor(&canonical).map_err(|_unsafe| {
+    TrustedDir::open_absolute_lookup_ancestor(&canonical).map_err(|_unsafe| {
         TrustError::Refused("a path component is foreign-owned or writable by others")
     })?;
     Ok(canonical)

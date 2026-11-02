@@ -28,7 +28,8 @@ and `run-macos` runs them. The `macos` profile in `.config/nextest.toml` runs
 five threads, retries twice for diagnosis (a flaky result still fails the run),
 and serializes the tests that drive the shared `gui/<uid>` launchd domain. The
 job runs the lane packages' doctests natively (nextest runs none), runs the
-APFS foreign-owner test as root from the extracted archive, and fails hard when
+APFS foreign-owner test and the root admin-group lookup test as root from
+the extracted archive, and fails hard when
 the runner's `gui/<uid>` launchd domain is absent. It also runs the macOS
 contributor path first: the `scripts/tests/test_dev_bootstrap.py` scenarios under the runner's
 `python3` (>= 3.11, checked) and `scripts/dev-bootstrap --json --path native`,

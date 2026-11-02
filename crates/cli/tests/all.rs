@@ -30,6 +30,8 @@ mod daemon_packaging;
 mod daemon_start_service;
 #[path = "doctor_worker_compat.rs"]
 mod doctor_worker_compat;
+#[path = "executable_trust_darwin.rs"]
+mod executable_trust_darwin;
 #[path = "hermes_integration.rs"]
 mod hermes_integration;
 #[path = "hermes_package.rs"]

@@ -208,7 +208,9 @@ macOS-specific routing, bridging, or relay mode.
 - **Finding the `netbird` CLI.** The daemon (a launchd job) and the CLI (a shell) each locate `netbird` in their own
   process: first the process `PATH`, then the trusted install directories
   (`/opt/homebrew/bin`, `/usr/local/bin` among them). An executable another
-  account could replace is never used. `pohunek doctor` reports `netbird_cli`
+  account could replace is never used; a user-owned directory the `admin` group
+  can write, such as the stock Homebrew `bin`, is accepted (see
+  [environment resolution](environment-resolution.md)). `pohunek doctor` reports `netbird_cli`
   through the same lookup. Its warning has several causes: read the detail. A
   "not installed or not trusted" detail means no trusted `netbird` was located;
   install NetBird or fix the ownership and permissions of the directory holding
@@ -222,8 +224,8 @@ macOS-specific routing, bridging, or relay mode.
   Pohunek then runs the verified canonical target.
 - **Tailscale.** With `providers = ["tailscale"]` the host works over a
   tailnet. Pohunek runs `tailscale status --json` (found like the `netbird` CLI
-  above, except that macOS is not supported in 0.37: the admin-writable
-  `/opt/homebrew/bin` is refused, see the [Tailscale guide](tailscale.md)); it
+  above, except that macOS support is not claimed in 0.37, see the
+  [Tailscale guide](tailscale.md)); it
   never enables Tailscale because its CLI is installed. The daemon listens on the
   node's IPv4 address and only while Tailscale is `Running` on a kernel
   interface: userspace networking (`tailscaled --tun=userspace-networking`) has
