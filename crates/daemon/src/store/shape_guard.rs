@@ -76,6 +76,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (12, include_str!("fixtures/shape/schema-12.txt")),
     (13, include_str!("fixtures/shape/schema-13.txt")),
     (14, include_str!("fixtures/shape/schema-14.txt")),
+    (15, include_str!("fixtures/shape/schema-15.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -206,6 +207,10 @@ fn session_builtin_json() -> Value {
     session_json_with(&resume_builtin_json())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fully populated sample of every persisted record field"
+)]
 fn session_json_with(recovery: &Value) -> Value {
     let mut record = json!({
         "schema_version": STORE_SCHEMA_VERSION,

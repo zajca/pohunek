@@ -3,7 +3,7 @@
 //!
 //! The schema-13 fixture is a record of a lost Pi session in the shape the
 //! schema-13 daemon writes, with neutral paths and identifiers. A session that
-//! records no create request reads as having none. The schema-14 fixture carries
+//! records no create request reads as having none. The schema-15 fixture carries
 //! a request whose fingerprint was computed outside the daemon.
 
 // Rust guideline compliant 2026-11-01
@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 const SCHEMA_13: &str = include_str!("../src/store/fixtures/schema-13/metadata.jsonl");
-const SCHEMA_14: &str = include_str!("../src/store/fixtures/schema-14/metadata.jsonl");
+const SCHEMA_15: &str = include_str!("../src/store/fixtures/schema-15/metadata.jsonl");
 
 fn fixture_store(root: &std::path::Path, contents: &str) -> Store {
     let path = root.join("metadata.jsonl");
@@ -56,7 +56,7 @@ fn schema_13_sessions_migrate_without_inventing_a_create_request() {
 #[test]
 fn a_recorded_create_request_loads_and_survives_a_rewrite() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let store = fixture_store(root.path(), SCHEMA_14);
+    let store = fixture_store(root.path(), SCHEMA_15);
 
     let mut record = store.load_sessions().expect("load the session").remove(0);
     let request = CreateRequest {
