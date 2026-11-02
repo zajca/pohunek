@@ -1427,14 +1427,14 @@ where
     let transport = Arc::clone(configured.transport());
     let address = match transport.listener_addr().await {
         Ok(address) => address,
-        Err(overlay::OverlayError::CliMissing(_)) => {
+        Err(overlay::OverlayError::CliMissing { refused, .. }) => {
             return match missing_cli {
                 MissingCli::Disable => {
-                    info!(overlay = %overlay_id, port, "overlay CLI missing; listener disabled");
+                    info!(overlay = %overlay_id, port, refused = refused.as_deref(), "overlay CLI missing; listener disabled");
                     RemoteBind::Disabled
                 }
                 MissingCli::Retry => {
-                    warn!(overlay = %overlay_id, port, "overlay CLI missing; serving local-only and retrying");
+                    warn!(overlay = %overlay_id, port, refused = refused.as_deref(), "overlay CLI missing; serving local-only and retrying");
                     RemoteBind::Retry
                 }
             };

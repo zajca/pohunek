@@ -126,7 +126,10 @@ impl OverlayTransport for NetbirdTransport {
 
 fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
     match error {
-        NetbirdError::CliMissing => OverlayError::CliMissing(id.clone()),
+        NetbirdError::CliMissing { refused } => OverlayError::CliMissing {
+            overlay: id.clone(),
+            refused,
+        },
         NetbirdError::StateUnavailable(detail) | NetbirdError::Parse(detail) => {
             OverlayError::StateUnavailable {
                 overlay: id.clone(),

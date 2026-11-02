@@ -472,6 +472,21 @@ fn resolve_program(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     shell_env::resolve_executable_in_path_value(OsStr::new(program), path).ok()
 }
 
+/// The refusal that kept `program` from resolving on the daemon's `PATH`, when
+/// a candidate exists and failed a trust check; `None` when none is installed.
+pub(crate) fn executable_refusal(program: &str) -> Option<String> {
+    match shell_env::resolve_executable_in_path_value(
+        OsStr::new(program),
+        executable_search_path().as_deref(),
+    ) {
+        Err(error @ shell_env::ExecutableError::Refused { .. }) => Some(error.to_string()),
+        Err(shell_env::ExecutableError::NotExecutable(refusal)) if !refusal.is_absent() => {
+            Some(format!("found {program} but not trusted: {refusal}"))
+        }
+        _ => None,
+    }
+}
+
 /// The `PATH` agent executables are resolved on: the daemon's own.
 fn executable_search_path() -> Option<std::ffi::OsString> {
     let path = std::env::var_os("PATH");

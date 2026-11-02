@@ -8,9 +8,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 
 use pohunek_test_support::fs::write_executable;
+use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::worker_binary;
 use serde_json::Value;
 
+#[path = "../../daemon/tests/support/official_runtimes.rs"]
+mod official_runtimes;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 
@@ -106,6 +109,36 @@ async fn doctor_reports_missing_and_incompatible_selected_worker_through_cli() {
     assert_worker_failure(&harness, &selected_worker, "malformed or incompatible").await;
     fs::remove_file(&selected_worker).expect("remove incompatible worker probe");
     fs::rename(&backup, &selected_worker).expect("restore selected real worker");
+    harness.stop().await;
+}
+
+/// An agent executable in a directory others can write is named, with the
+/// reason, instead of being reported as missing.
+#[tokio::test]
+async fn doctor_names_an_agent_executable_the_trust_policy_refused() {
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let harness = Harness::start_with_trust(catalog.trust()).await;
+    let scratch = harness.env.root().join("official-packages");
+    fs::create_dir_all(&scratch).expect("create the package scratch directory");
+    catalog.install(&harness.sessions, &scratch).await;
+    let loose = harness.env.root().join("loose-bin");
+    fs::create_dir(&loose).expect("create the loose directory");
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o775))
+        .expect("make the directory group-writable");
+    let candidate = loose.join("claude");
+    write_executable(&candidate, "#!/bin/sh\nexit 0\n").expect("write the candidate");
+
+    let mut process_env = ProcessEnv::lock();
+    process_env.set("PATH", &loose);
+    let output = harness.run(&["doctor", "--json"]).await;
+    drop(process_env);
+    let document: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    let runtime = check(&document, "agent_runtime_claude");
+    let detail = runtime["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(&candidate.display().to_string()) && detail.contains("not trusted"),
+        "the refused candidate is named: {runtime}"
+    );
     harness.stop().await;
 }
 

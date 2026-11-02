@@ -111,6 +111,15 @@ pub fn reported_overlays(checks: &[DoctorCheck]) -> Vec<ReportedOverlay> {
         .collect()
 }
 
+/// How a doctor detail describes an unusable CLI: the refused candidate and its
+/// reason, or that none is installed.
+fn cli_state(refused: Option<&str>) -> String {
+    refused.map_or_else(
+        || "not installed".to_owned(),
+        |refused| format!("unusable: {refused}"),
+    )
+}
+
 fn cli_check(diagnostic: &OverlayDiagnostic, from_file: bool) -> DoctorCheck {
     let id = diagnostic.overlay.as_str();
     let name = format!("{id}{CLI_CHECK_SUFFIX}");
@@ -122,21 +131,22 @@ fn cli_check(diagnostic: &OverlayDiagnostic, from_file: bool) -> DoctorCheck {
         );
     }
     match &diagnostic.error {
-        Some(OverlayError::CliMissing(_)) if from_file => DoctorCheck::new(
+        Some(OverlayError::CliMissing { refused, .. }) if from_file => DoctorCheck::new(
             name,
             DoctorStatus::Fail,
             format!(
-                "the {id} CLI is not installed or not trusted, but overlays.toml configures \
-                 this overlay; install it, or remove {id} from providers in overlays.toml and \
-                 restart the daemon"
+                "the {id} CLI is {}, but overlays.toml configures this overlay; install or \
+                 repair it, or remove {id} from providers in overlays.toml and restart the daemon",
+                cli_state(refused.as_deref()),
             ),
         ),
-        Some(OverlayError::CliMissing(_)) => DoctorCheck::new(
+        Some(OverlayError::CliMissing { refused, .. }) => DoctorCheck::new(
             name,
             DoctorStatus::Warn,
             format!(
-                "the {id} CLI is not installed or not trusted; {id} is the default overlay and \
-                 optional (remote hosts need it)"
+                "the {id} CLI is {}; {id} is the default overlay and optional (remote hosts \
+                 need it)",
+                cli_state(refused.as_deref()),
             ),
         ),
         Some(OverlayError::ListenerAddressMissing {
