@@ -555,9 +555,15 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
                 || format!("the {overlay} CLI was not found on PATH"),
                 |refused| format!("the {overlay} CLI is unusable: {refused}"),
             ),
-            Some(format!(
-                "install the {overlay} CLI and ensure it is on PATH; run `pohunek doctor` to verify"
-            )),
+            Some(if refused.is_some() {
+                format!(
+                    "make the {overlay} CLI and its directories writable only by you, or install a trusted copy; run `pohunek doctor` to verify"
+                )
+            } else {
+                format!(
+                    "install the {overlay} CLI and ensure it is on PATH; run `pohunek doctor` to verify"
+                )
+            }),
         ),
         overlay::OverlayError::StateUnavailable { detail, .. } => ProtocolError::new(
             ErrorClass::Discovery,

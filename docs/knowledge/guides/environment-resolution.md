@@ -96,7 +96,9 @@ rename or swap entries that the user or root owns in the user's Homebrew
 directories, or hard-link a file the user or root owns (from the same volume)
 into them, and Pohunek then runs them as the user; no password is needed.
 Entries that account creates are owned by it and stay refused. On a Mac where
-the user is the only admin this adds no principal. A host with several admins
+the user is the only admin this adds no principal; `dscl . -read /Groups/admin
+GroupMembership` also lists `root` and the macOS Setup Assistant account
+`_mbsetupuser`, and neither is another admin account in this sense. A host with several admins
 removes the exposure with `chmod g-w` on the Homebrew directories (`bin`,
 `sbin`, `Cellar` and the others the prefix lists as group-writable): the strict
 rule then accepts them and Homebrew works as a single-user install.
@@ -106,7 +108,10 @@ finds no trusted executable but finds a candidate that failed a check reports
 the first such candidate and the check (`found <path> but not trusted:
 <reason>`); a name found nowhere reports that none exists. On macOS a directory
 dropped from the recorded `PATH` says which write right made it unsafe: "writable
-by others", or "writable by a group other than admin (gid 80)". A refused configured
+by others", "writable by a group other than admin (gid 80)", or "writable by the
+admin group (gid 80), accepted only in a directory the effective user owns and
+never for root" (a directory of another owner, or any directory when the process
+runs as root). A refused configured
 executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
 untrusted chain directory, or the errno of the open or execute check) so a
 rejection is diagnosable. On macOS an ACL counts only when an allow entry

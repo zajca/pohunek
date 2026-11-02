@@ -165,7 +165,7 @@ fn assert_resolved(fixture: &Fixture, path: &str) {
     );
     let detail = fixture.doctor_cli_detail(path);
     assert!(
-        !detail.contains("not installed or not trusted"),
+        !detail.contains("not installed") && !detail.contains("unusable"),
         "the doctor accepts the CLI: {detail}"
     );
 }

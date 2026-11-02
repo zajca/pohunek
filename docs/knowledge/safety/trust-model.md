@@ -171,7 +171,9 @@ owns, the shape of a stock Homebrew prefix. A process running as another admin
 account can therefore swap entries that the user or root owns there, or
 hard-link a file the user or root owns into them, and Pohunek runs them as the
 user; entries that account creates stay refused
-because of their owner. A root process never applies the exception. A host with several admins removes the exposure with
+because of their owner. `dscl . -read /Groups/admin GroupMembership` also lists
+`root` and the macOS Setup Assistant account `_mbsetupuser`; neither is another
+admin account in this sense. A root process never applies the exception. A host with several admins removes the exposure with
 `chmod g-w` on the Homebrew directories. Root-owned directories, other groups,
 and world write stay refused; see
 [environment resolution](../guides/environment-resolution.md).

@@ -210,7 +210,7 @@ fn write_refusal_reason(mode: u32, gid: u32) -> &'static str {
     if mode & WRITABLE_BY_OTHERS != 0 {
         "writable by others"
     } else if gid == DARWIN_ADMIN_GROUP {
-        "writable by the admin group (gid 80), trusted only in a directory a non-root user owns"
+        "writable by the admin group (gid 80), accepted only in a directory the effective user owns and never for root"
     } else {
         "writable by a group other than admin (gid 80)"
     }
