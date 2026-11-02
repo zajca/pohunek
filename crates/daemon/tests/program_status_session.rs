@@ -88,7 +88,12 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// terminal (`stdin` source) runs on Enter, as a submitted prompt does; one
 /// read from the `cmd` FIFO (`fifo` source) runs at once. The commands: `g`
 /// reports working, `d` done, `b` blocked and `q` exits; `t` is a turn that
-/// reports working until the FIFO yields a byte, then done.
+/// reports working until the FIFO yields a byte, then done. `c` and `x` report
+/// the child records a Claude background agent emits (a `working` record with
+/// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
+/// program answers no probe and draws one screen per FIFO byte: `s` and `w`
+/// draw a status line whose timer the terminal width cut, `b` and `n` a
+/// transcript bullet that only looks like one, above the prompt box.
 fn agent_script() -> String {
     format!(
         r#"#!/bin/sh
@@ -100,11 +105,28 @@ if [ "$mode" = reply ]; then
   head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/reply.hex"
 fi
 emit() {{ printf '\033]7501;state=%s:app={APP}\033\\' "$1"; }}
+box() {{
+  printf '────────────────────────────────────────\r\n'
+  printf '❯ \r\n'
+  printf '────────────────────────────────────────\r\n'
+  printf '  ? for shortcuts'
+}}
 printf '\033[2J\033[H'
-printf '────────────────────────────────────────\r\n'
-printf '❯ \r\n'
-printf '────────────────────────────────────────\r\n'
-printf '  ? for shortcuts'
+box
+if [ "$mode" = screen ]; then
+  exec 3<> "$dir/cmd"
+  while :; do
+    c=$(head -c 1 <&3)
+    printf '\033[2J\033[H'
+    case "$c" in
+      s) printf '✻ Billowing… (1…\r\n' ;;
+      w) printf '✻ Contemplating deeply… (1m…\r\n' ;;
+      b) printf '* Then it waits… (see below)\r\n' ;;
+      n) printf '* Then it waits… (3 items)\r\n' ;;
+    esac
+    box
+  done
+fi
 if [ "$mode" = reply ]; then emit idle; fi
 if [ "$mode" = silent ]; then
   head -c 2 | od -An -v -tx1 | tr -d ' \n' > "$dir/typed.hex"
@@ -119,6 +141,9 @@ run() {{
     d) emit done ;;
     b) emit 'blocked:kind=permission' ;;
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
+    c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
+    x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
+    m) printf 'SYNC\r\n' ;;
     q) exit 0 ;;
   esac
 }}
@@ -186,6 +211,7 @@ impl Fixture {
             ("fake-reply-stdin", "reply", "stdin"),
             ("fake-reply-fifo", "reply", "fifo"),
             ("fake-silent", "silent", "stdin"),
+            ("fake-screen", "screen", "fifo"),
         ] {
             std::fs::write(
                 agents.join(format!("{name}.toml")),
@@ -539,4 +565,112 @@ async fn a_restated_record_emits_no_agent_state() {
         .stop(&created.id)
         .await
         .expect("stop the session");
+}
+
+/// The child records of a Claude background agent never change what the
+/// session reads: they do not turn a held root `done` working. A child record
+/// that dropped a held record is not published before the next screen change,
+/// so the scenario cannot observe that fault.
+#[tokio::test]
+async fn a_background_agents_child_records_never_change_the_session_activity() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'g');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
+        .await;
+
+    // The screen is the idle prompt box, so a dropped root record would read
+    // idle from the screen before the awaited edge.
+    let mut events = fixture.registry.subscribe();
+    command(&fixture, b'c');
+    command(&fixture, b'x');
+    command(&fixture, b'd');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    assert_eq!(
+        agent_states(&mut events).len(),
+        1,
+        "only the root `done` changes the activity"
+    );
+
+    // The marker line is drawn after the child records in the same stream, so
+    // once it is visible the detector has seen them.
+    command(&fixture, b'c');
+    command(&fixture, b'x');
+    command(&fixture, b'm');
+    wait_until("the marker line to be drawn", || async {
+        let screen = fixture.registry.screen(&created.id).await.ok()?;
+        screen
+            .visible_lines
+            .iter()
+            .any(|line| line.contains("SYNC"))
+            .then_some(())
+    })
+    .await;
+    assert_eq!(
+        fixture.activity(&created.id).await,
+        Some((AgentActivity::Idle, StateSource::OscProgress)),
+        "the child records leave the held root `done` in place"
+    );
+    assert_eq!(agent_states(&mut events).len(), 0);
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A status line whose timer the terminal width cut reads working from the
+/// screen alone; a transcript bullet that only looks like one reads idle.
+#[tokio::test]
+async fn a_width_cut_status_line_reads_working_and_a_lookalike_bullet_reads_idle() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(false).await;
+    let created = fixture.start("fake-screen").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+
+    for (shown, reads) in [
+        (b's', AgentActivity::Working),
+        (b'b', AgentActivity::Idle),
+        (b'w', AgentActivity::Working),
+        (b'n', AgentActivity::Idle),
+    ] {
+        command(&fixture, shown);
+        fixture
+            .wait_activity(&created.id, (reads, StateSource::Screen))
+            .await;
+    }
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// The `agent.state` events received so far.
+fn agent_states(
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+) -> Vec<protocol::Event> {
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if event.event() == protocol::event::AGENT_STATE {
+            states.push(event);
+        }
+    }
+    states
 }

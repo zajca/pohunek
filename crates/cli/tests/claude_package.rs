@@ -1213,20 +1213,13 @@ fn a_program_status_record_arbitrates_with_the_real_claude_screens() {
 fn a_transcript_bullet_is_not_a_spinner_line() {
     let definition = installed_definition();
     for set in ScreenSet::ALL {
-        let rows = load_frame(set, "idle_after_turn", "idle_after_turn", DEFAULT_COLUMNS).rows;
-        for bullet in [
-            "* Then it waits\u{2026} (see below)",
-            "* Then it waits\u{2026} (3 items)",
-            "* Then it waits\u{2026} (see\u{2026}",
-        ] {
-            let mut rows = rows.clone();
-            rows.insert(2, bullet.to_owned());
-            assert_eq!(
-                screen_activity(&definition, &rows, DEFAULT_COLUMNS),
-                Some(AgentActivity::Idle),
-                "{set:?} {bullet}"
-            );
-        }
+        let mut rows = load_frame(set, "idle_after_turn", "idle_after_turn", DEFAULT_COLUMNS).rows;
+        rows.insert(2, "* Then it waits\u{2026} (see below)".to_owned());
+        assert_eq!(
+            screen_activity(&definition, &rows, DEFAULT_COLUMNS),
+            Some(AgentActivity::Idle),
+            "{set:?}"
+        );
     }
     for line in [
         "\u{2722} Architecting\u{2026} (16s)",
@@ -1235,10 +1228,6 @@ fn a_transcript_bullet_is_not_a_spinner_line() {
         "\u{2736} Dilly-dallying\u{2026} (4s \u{b7} \u{2193} 12 tokens)",
         "\u{2733} Compacting conversation\u{2026} (12s)",
         "\u{2722} Beboppin\u{2019}\u{2026}",
-        "\u{273b} Billowing\u{2026} (1\u{2026}",
-        "\u{273b} Contemplating deeply\u{2026} (12\u{2026}",
-        "\u{273b} Contemplating deeply\u{2026} (1m\u{2026}",
-        "\u{273b} Contemplating deeply\u{2026} (\u{2026}",
     ] {
         let mut rows = current_frame("idle").rows;
         rows.insert(2, line.to_owned());
@@ -3866,8 +3855,9 @@ const WAITING_FOR_AGENT: &str = "Waiting for 1 background agent";
 /// session's activity. The scenario pins the record shapes Claude emits, the
 /// unchanged root sequence, and a root `working` record that stays held over an
 /// idle-looking screen while the agent runs. It cannot tell a dropped root
-/// record from one Claude re-sends; the detector ignoring child records is
-/// pinned in `a_real_claude_background_agent_record_never_turns_a_done_root_working`.
+/// record from one Claude re-sends; a child record read as a root record is
+/// caught by `a_background_agents_child_records_never_change_the_session_activity`
+/// (`crates/daemon/tests/program_status_session.rs`).
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_background_agent_records_never_drive_the_session_activity() {

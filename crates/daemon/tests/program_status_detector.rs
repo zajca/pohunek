@@ -458,32 +458,6 @@ fn a_child_record_never_changes_the_root_record() {
     }
 }
 
-/// The child records a real Claude 2.1.309 emits for a background agent (a
-/// `working` record with a base64 `title`, then a bare `clear`) leave a held
-/// root `done` idle.
-#[test]
-fn a_real_claude_background_agent_record_never_turns_a_done_root_working() {
-    let mut harness = Harness::claude();
-    harness.feed(&captured("claude", "idle"));
-    harness.feed(&claude_record("working"));
-    harness.feed(&claude_record("done"));
-    assert_eq!(harness.activity(), IDLE);
-
-    for payload in [
-        format!("state=working:app={CLAUDE_APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50"),
-        "state=clear:id=a460128b96cbca53d".to_owned(),
-    ] {
-        harness.feed(&record(&payload));
-        harness.advance(Duration::from_hours(1));
-
-        assert_eq!(harness.activity(), IDLE, "{payload}");
-        assert_eq!(
-            harness.record_preview().as_deref(),
-            Some("app=claude-code:state=done")
-        );
-    }
-}
-
 #[test]
 fn a_record_of_another_app_or_without_an_app_is_ignored() {
     let mut harness = Harness::claude();

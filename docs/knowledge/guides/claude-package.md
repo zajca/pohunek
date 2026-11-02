@@ -431,10 +431,14 @@ manifest opts in) and the daemon holds the latest root record.
   stays `working` while Claude shows `Waiting for 1 background agent to finish`
   over an idle-looking screen, and the session keeps reading working from it
   until the root `done` (measured: the agent's `clear` came first). The real-agent
-  scenario cannot tell a dropped root record from one Claude re-sends, so the
-  detector ignoring child records is pinned with the same record shapes at the
-  detector boundary
-  (`a_real_claude_background_agent_record_never_turns_a_done_root_working`).
+  scenario cannot tell a dropped root record from one Claude re-sends. The
+  session-boundary scenario
+  `a_background_agents_child_records_never_change_the_session_activity`
+  (`crates/daemon/tests/program_status_session.rs`, a stand-in agent emitting
+  the same record shapes through a real worker and PTY) fails when a child
+  record is read as a root record. A child record that drops the held root
+  record is not published until the next screen change, so no scenario here
+  observes that fault.
 - Not recorded on 2.1.309: `CLAUDE_CODE_SESSION_KIND=bg` and running under
   tmux.
 
