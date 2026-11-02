@@ -1124,6 +1124,7 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch,
             activity_since: crate::time::now(),
+            background_quiet_since: None,
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
             create_request,

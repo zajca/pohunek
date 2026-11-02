@@ -965,19 +965,9 @@ impl SessionRegistry {
                     super::send_detector_config(entry, config);
                 }
             }
-            let mut changed = projected.any;
-            if entry.info.subagents != subagents {
-                entry.info.subagents = subagents;
-                changed = true;
-            }
-            let background_changed = match &background_update {
-                Some(update) if entry.info.background != *update => {
-                    entry.info.background.clone_from(update);
-                    changed = true;
-                    true
-                }
-                _ => false,
-            };
+            let (subagents_changed, background_changed) =
+                entry.replace_background_view(subagents, background_update.as_ref());
+            let changed = projected.any || subagents_changed || background_changed;
             entry
                 .last_native_report
                 .clone_from(&candidate.native_identity_ordering);
@@ -996,6 +986,9 @@ impl SessionRegistry {
         if updated.0 {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
+            // The held-or-idle verdict of the session reads the published
+            // subagents and background snapshot.
+            self.wake_idle_stop();
             let runtime = event_runtime(&updated.1);
             for subagent in updated.2 {
                 let event = crate::events::event(
@@ -4265,6 +4258,7 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
             activity_since: crate::time::now(),
+            background_quiet_since: None,
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
         };
@@ -4589,6 +4583,7 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
             activity_since: crate::time::now(),
+            background_quiet_since: None,
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
         };

@@ -1087,6 +1087,12 @@ struct SessionEntry {
     /// Memory only: an entry built by adoption starts the clock when it is
     /// built, so a restart delays an idle stop and never advances it.
     activity_since: Instant,
+    /// When live background work last ended, on the daemon clock.
+    ///
+    /// Memory only. The idle clock of [`idle_stop`] starts at the later of this
+    /// and [`Self::activity_since`], so a hold that ends without a new turn
+    /// still grants a full idle limit.
+    background_quiet_since: Option<Instant>,
     /// Daemon instance holding the create's undelivered initial input; the
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.

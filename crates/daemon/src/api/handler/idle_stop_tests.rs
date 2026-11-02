@@ -12,6 +12,9 @@ use std::time::Duration;
 
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use pohunek_test_support::wait::guard;
+use pohunek_worker_protocol::{
+    BackgroundItem, BackgroundKind, BackgroundStatus, SubagentPhase, SubagentSnapshot,
+};
 use protocol::{
     event, method, NotificationCreateParams, NotificationKind, NotificationSeverity,
     NotificationSource, NotificationStatus, NotificationUpdateParams, ProtocolError, SessionId,
@@ -843,6 +846,254 @@ async fn activity_that_arrives_while_the_stop_waits_for_its_turn_keeps_the_sessi
         .assert_running(0, "work arrived before the stop transaction")
         .await;
     assert!(world.system_records(0).await.is_empty());
+    world.finish(&[0]).await;
+}
+
+/// A background task of `kind` that the provider lists as running.
+fn task(id: &str, kind: BackgroundKind) -> BackgroundItem {
+    BackgroundItem {
+        id: id.to_owned(),
+        kind,
+        provider_kind: (kind == BackgroundKind::Other).then(|| "custom".to_owned()),
+        status: BackgroundStatus::Running,
+        agent_type: (kind == BackgroundKind::Subagent).then(|| "reviewer".to_owned()),
+        label: None,
+        program: (kind == BackgroundKind::Shell).then(|| "cargo".to_owned()),
+        first_seen_ms: 1,
+        last_seen_ms: 1,
+    }
+}
+
+/// The lifecycle row of the Claude subagent `id` in `phase`.
+fn row(id: &str, phase: SubagentPhase) -> SubagentSnapshot {
+    SubagentSnapshot {
+        id: id.to_owned(),
+        parent_id: None,
+        provider: "claude".to_owned(),
+        agent_type: Some("reviewer".to_owned()),
+        phase,
+        revision: 1,
+        started_at_ms: 1,
+        updated_at_ms: 1,
+        finished_at_ms: (phase != SubagentPhase::Running).then_some(2),
+    }
+}
+
+impl World {
+    /// Imports a worker snapshot listing `items` and the subagent `rows` into
+    /// session `index`, as the inspect poll of a Claude worker does.
+    async fn background(
+        &self,
+        index: usize,
+        items: Option<Vec<BackgroundItem>>,
+        rows: Vec<SubagentSnapshot>,
+    ) {
+        self.fixture
+            .sessions
+            .import_background_for_test(&SessionId(self.id(index).to_owned()), items, rows)
+            .await;
+        settle().await;
+    }
+
+    /// Asserts that the task has not begun a stop, which a failed or kept
+    /// attempt would still count; a session's state alone cannot tell a stop in
+    /// flight from no stop.
+    fn assert_no_stop_attempt(&self, when: &str) {
+        assert_eq!(
+            self.fixture.sessions.idle_stop_attempts_for_test(),
+            0,
+            "{when}"
+        );
+    }
+
+    /// The `activity` and `background` items of session `index`.
+    async fn published(&self, index: usize) -> (Value, Value) {
+        let info = ok(self
+            .fixture
+            .call(method::SESSION_INSPECT, json!(self.id(index)))
+            .await);
+        (
+            info["activity"].clone(),
+            info["background"]["items"].clone(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn live_background_work_holds_the_stop_and_activity_keeps_reading_idle() {
+    let world = World::new(2).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    world.activity(0, "idle").await;
+    world.activity(1, "idle").await;
+    world
+        .background(
+            0,
+            Some(vec![task("agent-1", BackgroundKind::Subagent)]),
+            vec![row("agent-1", SubagentPhase::Running)],
+        )
+        .await;
+    world
+        .background(
+            1,
+            Some(vec![task("shell-1", BackgroundKind::Shell)]),
+            vec![],
+        )
+        .await;
+
+    world.elapse(10 * LIMIT_SECS).await;
+    world
+        .assert_running(0, "a background subagent runs past the limit")
+        .await;
+    world
+        .assert_running(1, "a session without the opt-in is never stopped")
+        .await;
+    world.assert_no_stop_attempt("held sessions are not found due");
+    let (activity, items) = world.published(0).await;
+    assert_eq!(activity, "idle", "the turn state is unchanged");
+    assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+
+    world.finish(&[0, 1]).await;
+}
+
+#[tokio::test]
+async fn every_counted_kind_holds_the_stop() {
+    let kinds = [
+        BackgroundKind::Subagent,
+        BackgroundKind::Workflow,
+        BackgroundKind::Shell,
+        BackgroundKind::Monitor,
+        BackgroundKind::McpTask,
+    ];
+    let world = World::new(kinds.len()).await;
+    for (index, kind) in kinds.into_iter().enumerate() {
+        ok(world.opt_in(index, &LIMIT_SECS.to_string()).await);
+        world.activity(index, "idle").await;
+        world
+            .background(index, Some(vec![task("task-1", kind)]), vec![])
+            .await;
+    }
+
+    world.elapse(10 * LIMIT_SECS).await;
+    for (index, kind) in kinds.iter().enumerate() {
+        world
+            .assert_running(index, &format!("{kind:?} holds"))
+            .await;
+    }
+    world.assert_no_stop_attempt("held sessions are not found due");
+    world.finish(&(0..kinds.len()).collect::<Vec<_>>()).await;
+}
+
+#[tokio::test]
+async fn teammates_provider_internal_kinds_and_bare_subagent_rows_do_not_hold() {
+    let mut world = World::new(7).await;
+    let held = [
+        Some(vec![task("import-1", BackgroundKind::MemoryImport)]),
+        Some(vec![task("cloud-1", BackgroundKind::CloudSession)]),
+        Some(vec![task("mate-1", BackgroundKind::Teammate)]),
+        Some(vec![task("dream-1", BackgroundKind::Dream)]),
+        Some(vec![task("scan-1", BackgroundKind::AutoModeScan)]),
+        Some(vec![task("other-1", BackgroundKind::Other)]),
+        // A running subagent row alone is not evidence of live work.
+        Some(vec![]),
+    ];
+    for (index, items) in held.into_iter().enumerate() {
+        ok(world.opt_in(index, &LIMIT_SECS.to_string()).await);
+        world.activity(index, "idle").await;
+        let rows = if index == 6 {
+            vec![row("agent-1", SubagentPhase::Running)]
+        } else {
+            vec![]
+        };
+        world.background(index, items, rows).await;
+    }
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.elapse_past(1).await;
+    world.stopped_all(&[0, 1, 2, 3, 4, 5, 6]).await;
+    world.finish(&[]).await;
+}
+
+#[tokio::test]
+async fn a_listing_that_lags_behind_the_subagents_own_stop_does_not_hold() {
+    let mut world = World::new(1).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    world.activity(0, "idle").await;
+    world
+        .background(
+            0,
+            Some(vec![task("agent-1", BackgroundKind::Subagent)]),
+            vec![row("agent-1", SubagentPhase::Completed)],
+        )
+        .await;
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.assert_no_stop_attempt("before the limit");
+    world.elapse_past(1).await;
+    world.stopped(0).await;
+    world.finish(&[]).await;
+}
+
+#[tokio::test]
+async fn the_clock_restarts_when_live_background_work_ends() {
+    let mut world = World::new(2).await;
+    for index in 0..2 {
+        ok(world.opt_in(index, &LIMIT_SECS.to_string()).await);
+        world.activity(index, "idle").await;
+        world
+            .background(
+                index,
+                Some(vec![task("shell-1", BackgroundKind::Shell)]),
+                vec![],
+            )
+            .await;
+    }
+    world.elapse(10 * LIMIT_SECS).await;
+
+    // Session 0 lists nothing at the next turn end; session 1's worker drops
+    // the snapshot altogether, as a release or an owner exit does.
+    world.background(0, Some(vec![]), vec![]).await;
+    world.background(1, None, vec![]).await;
+    world.quiesce().await;
+    world.assert_no_stop_attempt("the sessions are not due the moment the work ends");
+
+    world.elapse(LIMIT_SECS - 1).await;
+    world.assert_no_stop_attempt("one second before the limit");
+    world.elapse_past(1).await;
+    world.stopped_all(&[0, 1]).await;
+    world.finish(&[]).await;
+}
+
+#[tokio::test]
+async fn live_work_that_arrives_while_the_stop_waits_for_its_turn_keeps_the_session() {
+    let world = World::new(1).await;
+    ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
+    world.activity(0, "idle").await;
+    let id = SessionId(world.id(0).to_owned());
+    let lifecycle = world.fixture.sessions.hold_lifecycle_for_test(&id).await;
+
+    // The task finds the session due and parks behind the lifecycle lock.
+    world
+        .advance(Duration::from_secs(LIMIT_SECS) + TIMER_TICK)
+        .await;
+    world
+        .background(
+            0,
+            Some(vec![task("shell-1", BackgroundKind::Shell)]),
+            vec![],
+        )
+        .await;
+    drop(lifecycle);
+    world.elapse(RECHECK_SECS).await;
+
+    world
+        .assert_running(0, "background work arrived before the stop transaction")
+        .await;
+    assert!(world.system_records(0).await.is_empty());
+    assert_eq!(
+        world.fixture.sessions.idle_stop_attempts_for_test(),
+        1,
+        "the task began the stop and the re-check under the lock kept the session"
+    );
     world.finish(&[0]).await;
 }
 

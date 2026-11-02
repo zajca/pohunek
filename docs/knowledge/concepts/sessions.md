@@ -661,7 +661,9 @@ the reason codes are in the
 [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook.
 
 This collection does not change the parent session's
-`activity`, launch identity, or recovery binding. The hook validates its action
+`activity`, launch identity, or recovery binding. The background snapshot it
+feeds holds an opted-in session's [idle stop](#idle-stop) while it lists live
+work. The hook validates its action
 and Pohunek handshake before reading a bounded payload directly from stdin (at
 most 64 KiB, or 1 MiB for the main `Stop`, whose input also carries the final
 assistant message and each task's description and command); it does not create a payload
@@ -1282,6 +1284,27 @@ until the daemon runs over a usable store). The stop is an ordinary `session sto
 worktree is kept, the `session-stop` hook fires, and the session can be resumed.
 The idle clock and the reported activity are memory only, so after a daemon
 restart a session is armed again when it reports `idle` again.
+
+A session whose `background` snapshot lists live background work is not idle
+for this purpose, although its `activity` stays `idle` (the turn ended and the
+session accepts input): stopping it would kill that work mid-run. The kinds
+that hold are `subagent`, `workflow`, `shell`, `monitor` and `mcp_task`, in any
+status the provider lists (it lists only running or pending tasks). A
+`subagent` item does not hold when the `subagents` row with its id is already
+terminal, which covers a listing that lags behind the subagent's own stop hook.
+A `teammate` is listed `running` while it idles, and `dream`, `auto_mode_scan`,
+`memory_import`, `cloud_session` and `other` carry no evidence that their end
+starts a main turn, so none of them holds; a `running` subagent row without a
+background item never holds, which keeps Codex sessions, whose children stay
+`running` after an interrupt, unchanged. A held session has no deadline.
+When the work ends (the next main-turn end lists none, or the snapshot is
+cleared by a release, an owner exit or the end of the runtime) the idle clock
+restarts from that moment, so the session gets a full limit after the work, not
+an instant stop. The hold has no age limit: a long build is never stopped, and a
+task killed from Claude's own task UI without a following turn stays listed
+until the next main-turn end, an owner exit or the runtime end. `session
+inspect` shows each item with its observation time, and `session stop` stops
+the session by hand.
 
 To see why a session stopped, read the daemon log line `session.idle_stop.stopped`
 (INFO) or the `session_stopped` event in the event log. A `system` notification
