@@ -20,6 +20,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use pohunek_platform::filesystem::{FsError, TrustedDir};
 use pohunek_platform::shell_env::{
     fallback_search_path, is_trusted_executable_file, resolve_executable, trusted_directory,
     ExecutableError, Refusal, SearchPath, TrustError,
@@ -123,6 +124,34 @@ fn root_never_trusts_an_admin_group_writable_directory() {
             }))
         ),
         "a symlink owned by another account is refused"
+    );
+}
+
+/// The directory chain of the catalog trust anchor beside the daemon follows
+/// the same rule: root refuses a group-writable `admin` directory, so no admin
+/// can rewrite an anchor that root reads.
+#[test]
+#[ignore = "native macOS CI runs this test as root to create root-owned fixtures"]
+fn root_never_reads_the_anchor_through_an_admin_group_writable_directory() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0, "test requires root");
+    let temporary = pohunek_test_support::tempdir().expect("create the fixture root");
+    let root = fs::canonicalize(temporary.path()).expect("canonicalize the fixture root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("set the root mode");
+
+    let admin = directory(&root, "admin", 0o775);
+    chown(&admin, None, Some(ADMIN_GID)).expect("set the admin group");
+    assert!(
+        matches!(
+            TrustedDir::open_absolute_executable_dir_ancestor(&admin),
+            Err(FsError::UnsafeMode { .. })
+        ),
+        "a root-owned admin-writable directory is refused for root"
+    );
+
+    let plain = directory(&root, "plain", 0o755);
+    assert!(
+        TrustedDir::open_absolute_executable_dir_ancestor(&plain).is_ok(),
+        "the control directory is accepted"
     );
 }
 
