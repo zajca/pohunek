@@ -209,13 +209,14 @@ impl SweepRequest {
     /// The daemon takes it from the dead worker's journal. With it, a same-user
     /// process whose markers cannot be read and whose ancestry the fork lineage
     /// leaves open is left out of the sweep when the host reports control groups
-    /// (see [`ProcessInspector::control_group`]) and the process lives outside
-    /// the user manager that holds the worker (see
-    /// [`ControlGroupPath::outside_user_manager_of`]): an unprivileged
-    /// descendant of the worker cannot leave that manager's cgroup subtree. A
-    /// process inside the subtree, an unreadable record, and a worker path
-    /// without a user manager are never dismissed this way, and the control
-    /// group never selects a process.
+    /// (see [`ProcessInspector::control_group`]) and the process lives where no
+    /// descendant of the worker places a process by accident (see
+    /// [`ControlGroupPath::outside_worker_scope_of`]): outside the user manager
+    /// that holds the worker, outside the installation's sessions slice, or in
+    /// another session's worker unit. A process in the worker's own unit, beside
+    /// it under the sessions slice, an unreadable record, and a worker path that
+    /// is not a unit of a sessions slice below a user manager are never
+    /// dismissed this way, and the control group never selects a process.
     ///
     /// Control-group paths are valid only within one boot, so the caller must
     /// pass the path only when it was recorded in the current boot.
@@ -821,10 +822,11 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// the kernel, so it is skipped unreadable instead.
 ///
 /// The worker's control group bounds the process the same way on a host whose
-/// processes live in cgroups: one outside the user manager that holds the worker
-/// is foreign (see [`outside_worker_delegation`]), because an unprivileged
-/// descendant cannot leave that manager's subtree. Only an exclusion; a process
-/// inside the subtree stays unproven.
+/// processes live in cgroups: one outside the user manager that holds the worker,
+/// outside the installation's sessions slice, or in another session's worker
+/// unit is foreign (see [`outside_worker_delegation`]). Only an exclusion; a
+/// process in the worker's unit or beside it under the sessions slice stays
+/// unproven.
 ///
 /// Without a bound, when the process exited between the two reads, or when its
 /// start identity cannot be read, the process is not provably foreign: it stays
@@ -943,13 +945,13 @@ fn outside_worker_coalitions(
     matches!(verify(inspector, identity), Ok(None)) && worker.excludes(&candidate)
 }
 
-/// Whether the cgroup hierarchy attests that `identity` is outside the user
-/// manager that holds the worker.
+/// Whether the cgroup hierarchy attests that `identity` did not descend from
+/// the worker.
 ///
 /// True only when the request names the worker's control group, the host
 /// reports the process's, both reads are bracketed by the enumerated identity,
-/// and the process lives outside the worker's `user@<uid>.service` subtree (see
-/// [`ControlGroupPath::outside_user_manager_of`]). Every other outcome is
+/// and the process lives where the worker's descendants do not place a process
+/// by accident (see [`ControlGroupPath::outside_worker_scope_of`]). Every other outcome is
 /// `false`, which leaves the caller's decision as it was: no control group
 /// named, a host that reports none, a process that exited or changed meanwhile,
 /// a record the kernel denies or withholds, an identity recheck that fails, and
@@ -989,7 +991,7 @@ fn outside_worker_delegation(
         }
     };
     matches!(verify(inspector, identity), Ok(None))
-        && candidate.outside_user_manager_of(worker, request.owner_uid())
+        && candidate.outside_worker_scope_of(worker, request.owner_uid())
 }
 
 /// Stable label of a control-group read failure for the log.

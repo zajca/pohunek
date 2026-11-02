@@ -22,6 +22,8 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::supervisor::Namespace;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -279,8 +281,10 @@ pub const MAX_CONTROL_GROUP_BYTES: usize = 4096;
 /// delegates to that user. Above it every cgroup is root-owned, so an
 /// unprivileged process can move a process only within the subtree, never out
 /// of it. A process outside the subtree of a worker therefore cannot have been
-/// moved there by one of the worker's descendants, while a process inside it
-/// proves nothing; see [`Self::outside_user_manager_of`].
+/// moved there by one of the worker's descendants. Inside it a descendant can
+/// move itself anywhere, so only a process that sits where no descendant
+/// places a process by accident is attested foreign; see
+/// [`Self::outside_worker_scope_of`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ControlGroupPath(String);
 
@@ -317,25 +321,63 @@ impl ControlGroupPath {
         &self.0
     }
 
-    /// Whether this path is provably outside the user manager that holds `worker`.
+    /// Whether this path attests that its process did not descend from the
+    /// worker whose unit cgroup is `worker`.
     ///
     /// The user manager of `worker` is the first `user@<owner_uid>.service`
-    /// segment of `worker` and everything below it. `owner_uid` is the user who
-    /// owns the swept processes, so the segment names the manager that can move
-    /// them. This is the only comparison a caller may act on: it attests that
-    /// the process at `self` did not descend from the worker. A path inside the
-    /// subtree and a `worker` without that segment attest nothing.
+    /// segment of `worker` and everything below it. A path outside it is
+    /// foreign: nothing unprivileged can move a process out of that subtree.
+    /// Inside it, the worker must run as a unit of the installation's sessions
+    /// slice (`.../<sessions slice>/<worker unit>`, both names parsed by the
+    /// installation namespace); a worker path of any other shape attests
+    /// nothing beyond the manager boundary. Then a path is foreign when it is
+    ///
+    /// - not the sessions slice or below it (`app.slice/*`, a login scope, a
+    ///   unit of another service), or
+    /// - the unit of another session's worker, or below it.
+    ///
+    /// Every other path under the sessions slice attests nothing: the worker's
+    /// own unit, another generation of the same session, and scopes such as
+    /// `tmux-spawn-*.scope` that a tool of the worker's descendants creates
+    /// beside the unit while inheriting its environment.
+    ///
+    /// A descendant that deliberately moves a process outside the sessions slice
+    /// or into another session's worker unit is treated as having left the
+    /// worker's supervision.
     #[must_use]
-    pub fn outside_user_manager_of(&self, worker: &Self, owner_uid: u32) -> bool {
+    pub fn outside_worker_scope_of(&self, worker: &Self, owner_uid: u32) -> bool {
         let Some(manager) = worker.user_manager(owner_uid) else {
             return false;
         };
-        let inside = self.0 == manager
-            || self
-                .0
-                .strip_prefix(manager)
-                .is_some_and(|rest| rest.starts_with('/'));
-        !inside
+        if !path_within(&self.0, manager) {
+            return true;
+        }
+        let Some((sessions_slice, unit)) = worker.0.rsplit_once('/') else {
+            return false;
+        };
+        let Ok((namespace, worker_key)) = Namespace::parse_any_worker_unit(unit) else {
+            return false;
+        };
+        let slice_named_by_namespace = sessions_slice
+            .rsplit_once('/')
+            .is_some_and(|(_, name)| name == namespace.sessions_slice());
+        if !slice_named_by_namespace || !path_within(sessions_slice, manager) {
+            return false;
+        }
+        if !path_within(&self.0, sessions_slice) {
+            return true;
+        }
+        let Some(first) = self
+            .0
+            .strip_prefix(sessions_slice)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split('/').next())
+        else {
+            return false;
+        };
+        namespace
+            .parse_worker_unit(first)
+            .is_ok_and(|key| key.session_id() != worker_key.session_id())
     }
 
     /// Returns the path of the `user@<owner_uid>.service` subtree this path is in.
@@ -350,6 +392,14 @@ impl ControlGroupPath {
         }
         None
     }
+}
+
+/// Whether `path` is `ancestor` or below it, compared by path component.
+fn path_within(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 impl std::fmt::Display for ControlGroupPath {

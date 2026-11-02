@@ -97,8 +97,13 @@ used only in the boot it was recorded in). A skipped process whose own `0::` pat
 lies outside the `user@<uid>.service` subtree of that path, such as a Docker
 scope or a logind session scope, is ignored and not reported: cgroup v2 lets an
 unprivileged process migrate only within the user manager's subtree, because
-everything above it is root-owned. A process inside the subtree (a user unit,
-`app-*.scope`, `systemd-run --user --scope`) proves nothing and keeps the
+everything above it is root-owned. Inside the subtree a descendant can move
+itself anywhere, so the worker's unit must sit in the installation's sessions
+slice, and a skipped process is ignored when it is outside that slice (a user
+unit, `app-*.scope`, `systemd-run --user --scope`) or in the worker unit of
+another session. A process in the worker's own unit, in another generation of
+its session, or beside the unit under the sessions slice (tmux's
+`tmux-spawn-*.scope` keeps the worker's markers) proves nothing and keeps the
 cleanup unconfirmed. The evidence only excludes: it never selects or signals a
 process, and a readable marker or an older start time decides first. A journal
 without the field, a malformed path, another boot or an unreadable record give no

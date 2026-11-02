@@ -546,8 +546,13 @@ and the daemon log has the panic.
   release) has no lineage or coalition proof, so every hidden process is a candidate.
   On Linux a hidden process outside the `user@<uid>.service` cgroup subtree of the
   worker's journaled `worker_control_group` (a Docker scope, a logind session scope)
-  is ignored; one inside it (another user unit, `systemd-run --user --scope`) is still
-  listed, and so is every hidden process when the journal lacks the field.
+  is ignored, and so is one inside it that is neither under the sessions slice
+  holding the worker (`app-*.scope`, `systemd-run --user --scope`, another user
+  service) nor in the worker unit of another session. What still blocks is a hidden
+  process in the worker's unit, in another generation of its session, or beside the
+  unit under the sessions slice: look for `tmux-spawn-*.scope` in its
+  `/proc/<pid>/cgroup`. Every hidden process is listed when the journal lacks the
+  field.
   A worker that journaled `boot_session_id` (a canonical UUID) and a host that has
   rebooted since need none of this: no process of the runtime remains, the sweep
   is complete without scanning, and the session leaves `running` with the lost
