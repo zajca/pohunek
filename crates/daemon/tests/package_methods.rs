@@ -2690,6 +2690,120 @@ async fn a_profile_backed_launch_gets_the_naming_args() {
     servers.stop().await;
 }
 
+/// The pair form `["--name", "{session_name}"]` hands the name over as a
+/// separate element, after the contributor arguments and before the native
+/// reference; a name with interior spaces stays one element, a dash-leading
+/// name is withheld with its flag at create, resume and fork, and a resume
+/// carries the name the record holds now.
+#[tokio::test]
+async fn pair_naming_args_follow_the_name_each_launch_uses() {
+    let servers = spawn_servers_over("pkg-naming-pair", Some("")).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = argv_program(&servers.plugins);
+    let document = naming_descriptor(
+        &program,
+        "1.0.0",
+        &naming_table(&["--name", "{session_name}"]),
+    );
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-naming-pair",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the pair form installs");
+    let create_flags = ["--session-id"];
+
+    for (name, expected) in [
+        (
+            "Two Words",
+            strings(&["--model", "fast", "--name", "Two Words", "--session-id"]),
+        ),
+        ("--offline", strings(&["--model", "fast", "--session-id"])),
+        ("-n", strings(&["--model", "fast", "--session-id"])),
+    ] {
+        let id = start_named_session(&mut local, RUNTIME, &cwd, Some(name)).await;
+        let argv = printed_argv(&mut local, &id).await;
+        assert_eq!(without_reference(&argv, &create_flags), expected, "{name}");
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+
+    // A rename to a plain name reaches the next resume; a rename to a
+    // dash-leading name withholds the group from it.
+    let named = start_named_session(&mut local, RUNTIME, &cwd, Some("Alpha")).await;
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(named)).await;
+    for (rename, expected) in [
+        (
+            "Beta",
+            strings(&["--model", "fast", "--name", "Beta", "--session"]),
+        ),
+        ("--Gamma", strings(&["--model", "fast", "--session"])),
+    ] {
+        let _: protocol::SessionRenameResult = call(
+            &mut local,
+            method::SESSION_RENAME,
+            json!({ "session_id": named, "name": rename }),
+        )
+        .await;
+        let resumed: protocol::SessionResumeResult =
+            call(&mut local, method::SESSION_RESUME, json!(named)).await;
+        let argv = printed_argv(&mut local, &resumed.session.id).await;
+        assert_eq!(
+            without_reference(&argv, &["--session"]),
+            expected,
+            "{rename}"
+        );
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(named)).await;
+    }
+
+    // A fork carries its own name, and none without one or with a dash.
+    let _: protocol::SessionRenameResult = call(
+        &mut local,
+        method::SESSION_RENAME,
+        json!({ "session_id": named, "name": "Source" }),
+    )
+    .await;
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(named)).await;
+    for (fork_name, expected) in [
+        (
+            Some("Delta"),
+            strings(&["--model", "fast", "--name", "Delta", "--fork"]),
+        ),
+        (None, strings(&["--model", "fast", "--fork"])),
+        (Some("-d"), strings(&["--model", "fast", "--fork"])),
+    ] {
+        let forked: protocol::SessionForkResult = call(
+            &mut local,
+            method::SESSION_FORK,
+            json!({ "session_id": resumed.session.id, "name": fork_name, "cols": 80, "rows": 24 }),
+        )
+        .await;
+        let argv = printed_argv(&mut local, &forked.session.id).await;
+        assert_eq!(
+            without_reference(&argv, &["--fork"]),
+            expected,
+            "{fork_name:?}"
+        );
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(forked.session.id)).await;
+    }
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
 /// `[naming]` tables the grammar refuses, next to the valid `valid` table.
 fn refused_naming_tables(valid: &str) -> Vec<(&'static str, String)> {
     let nine = [
@@ -2705,9 +2819,20 @@ fn refused_naming_tables(valid: &str) -> Vec<(&'static str, String)> {
     ];
     vec![
         ("bare", naming_table(&["{session_name}"])),
+        ("after-double-dash", naming_table(&["--", "{session_name}"])),
+        ("after-single-dash", naming_table(&["-", "{session_name}"])),
         (
-            "space-separated",
-            naming_table(&["--name", "{session_name}"]),
+            "after-joined-flag",
+            naming_table(&["--x=y", "{session_name}"]),
+        ),
+        ("after-literal", naming_table(&["name", "{session_name}"])),
+        (
+            "after-triple-dash",
+            naming_table(&["---x", "{session_name}"]),
+        ),
+        (
+            "two-pairs",
+            naming_table(&["--name", "{session_name}", "--also", "{session_name}"]),
         ),
         (
             "two",
@@ -2740,7 +2865,7 @@ fn refused_naming_tables(valid: &str) -> Vec<(&'static str, String)> {
 }
 
 #[tokio::test]
-async fn naming_args_install_only_with_their_feature_and_in_the_joined_form() {
+async fn naming_args_install_only_with_their_feature_and_in_a_valid_shape() {
     let servers = spawn_servers("pkg-naming-install").await;
     let mut local = connect_unix(&servers.socket).await;
     let valid = naming_table(&["--name={session_name}"]);

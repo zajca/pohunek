@@ -89,6 +89,9 @@ reserved, so either way of installing serves it.
   refresh, the held record is lost until Pi's next record. Anything that can write
   to the terminal can forge a record: it can set working or idle when no visible
   blocker is on screen, as it can forge screen text today.
+- Session name: `[naming] launch_args = ["--name", "{session_name}"]` (package
+  1.1.0, `requires = ["naming-launch-args-v1"]`), so a named pohunek session
+  runs `pi --name <name>` at launch, resume and fork. See [Session name](#session-name).
 - Native reference: `strategy = "assigned"` with `assign_fork = true`. The
   daemon generates a UUID, starts `pi --session-id <id>` (Pi creates the
   conversation with that id), resumes with `pi --session <id>`, and forks with
@@ -189,6 +192,52 @@ reserved, so either way of installing serves it.
   retitles its process shortly after start) and `node` running
   `…/coding-agent/dist/bundle/cli.js` for the first moments.
 
+## Session name
+
+Pi reads the name only as two elements, `--name <name>` (or `-n`). The package
+uses the long flag in the pair form of `[naming]`
+([runtime packages](runtime-packages.md#session-name-arguments)); the joined form
+`--name=<name>` is not a name for Pi: it falls into the generic `--` branch of the
+parser and is handed to extensions as an unknown flag, so it would be ignored
+without an error. The package needs a 0.39 core and declares Pi 1.1.0; a session
+pinned to 1.0.5 or earlier resumes and forks without the name until it is
+adopted.
+
+What was checked, from the source of the npm tarballs of Pi 1.0.0 (the lock
+minimum) and 1.4.0 (the lock; its tarball integrity equals
+`compat/pi/compatibility-lock.json`), with no model request and no credentials:
+
+- The flag takes the next element whatever it holds. `dist/cli/args.js` reads
+  `arg === "--name" || arg === "-n"` and then `result.name = args[++i]` (1.0.0
+  line 78, 1.4.0 line 79), including a value that starts with `@` or holds
+  spaces; the bundled entry point (`dist/bundle/chunks/*.js`, the file `bin.pi`
+  runs) has the identical branch. The flag exists at 1.0.0, the minimum the
+  version probe enforces on create, resume and fork, so the value cannot fall
+  through to the prompt.
+- A name is never one of Pi's own scans: `main.js` reads `args.includes("--offline")`
+  before the parser (1.0.0 line 452, 1.4.0 line 455), and the other pre-parse
+  checks are anchored at `args[0]` (`auth`, `config`, package commands), which the
+  naming elements never reach. Because core withholds a name that starts with `-`
+  in the pair form, a name such as `--offline` is not passed at all (the session
+  launches unnamed, with a WARN in the daemon log), so no scan can match it.
+- Pi trims the value, exits 1 on an empty one and appends a `session_info` entry
+  to the conversation on every launch (`main.js`, `appendSessionInfo`). Nothing is
+  written before the conversation has its first assistant message, so the
+  existence check's premise holds; after that each named launch (create, resume
+  or fork) adds one `session_info` line to the session file. A fork copies the
+  source's entries, so a fork without a pohunek name shows the source's Pi
+  name; a fork with one appends its own, and Pi reads the latest.
+- Where Pi shows the name: the footer line `<cwd> [(branch)] • <name>`, the
+  terminal title `π - <name> - <cwd>` and the message of the OSC 7501
+  program-status report (Pi 1.1.0 and later, base64-encoded; pohunek keeps only
+  the app and the state, so a name cannot set a state). The manifest has no
+  title rule. The footer sits inside the region the screen rules read, so
+  `a_footer_holding_a_marker_like_name_leaves_an_idle_screen_idle` rewrites the
+  footer of every recorded idle screen, at every recorded width, with names
+  that look like marks of the manifest (a braille spinner and its text, the
+  working footer, a rule, dialog hint words), whole and cut to the width, and
+  requires `idle`.
+
 ## Operating notes
 
 - A session that never received a model reply has no session file; `resume` is
@@ -204,6 +253,9 @@ reserved, so either way of installing serves it.
   (installed beside 1.0.0 and selected). A session launched from 1.0.0, or from
   a profile still pinned to its digest, keeps the spec it was launched with, so
   its forks hold no reference and are not resumable.
+- Package version 1.1.0 adds the session name (`pi --name <name>`); a session
+  launched from 1.0.5 or earlier keeps its pinned definition and carries no name
+  argument until it is relaunched on the new version.
 - Package version 1.0.2 adds the `blocked` and overlay-aware idle rules and the
   session-dir handling. A session keeps the existence check it was launched
   with: one launched from 1.0.1 or earlier searches only the agent directory's

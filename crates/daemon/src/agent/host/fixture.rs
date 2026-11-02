@@ -856,6 +856,40 @@ fn host_serving_document(document: &str) -> RuntimeHost {
     RuntimeHost::new(registry)
 }
 
+/// Like [`pi_shaped_host`], with the fixture runtime handing a session name to
+/// the agent in the pair form (`--name <name>`).
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn pi_shaped_naming_host(program: &Path, existence: &str) -> RuntimeHost {
+    let document = pi_shaped_document(program, existence)
+        .replace(
+            "runtime_api = 1\n",
+            "runtime_api = 1\nrequires = [\"naming-launch-args-v1\"]\n",
+        )
+        .replace(
+            "[resume]\n",
+            "[naming]\nlaunch_args = [\"--name\", \"{session_name}\"]\n\n[resume]\n",
+        );
+    let definition = RuntimeDefinition::from_toml(
+        &document,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+    )
+    .expect("the naming fixture document is valid");
+    assert!(definition.declares_naming());
+    let builtin = BuiltinSource::new("/bin/sh");
+    let fixture = FixtureSource(vec![definition]);
+    let registry =
+        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
 /// A host serving the built-in runtimes plus the Pi-shaped fixture.
 ///
 /// # Panics

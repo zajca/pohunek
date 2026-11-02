@@ -6,9 +6,9 @@
 
 schema = 1
 id = "pohunek.runtime.pi"
-version = "1.0.5"
+version = "1.1.0"
 runtime_api = 1
-requires = ["input-refuse-while-blocked-v1"]
+requires = ["input-refuse-while-blocked-v1", "naming-launch-args-v1"]
 
 [runtime]
 id = "pi"
@@ -35,6 +35,12 @@ refuse_while_blocked = true
 # so the enable signal is not readiness: only the idle editor frame (detect rule
 # `idle_editor_rule`) shows that its editor reads input.
 ready = "screen_idle"
+
+# Pi reads the session name only as the next element of `--name`, whatever it
+# starts with; `--name=<name>` is ignored as an unknown flag. A name that
+# starts with a dash is withheld by core, so the value never reads as an option.
+[naming]
+launch_args = ["--name", "{session_name}"]
 
 [resume]
 supported = true

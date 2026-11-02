@@ -1214,10 +1214,15 @@ launch_args = ["--name={session_name}"]
 ```
 
 The table holds 1 to 8 tokens, each at most 1024 bytes without control
-characters. Exactly one token holds `{session_name}` once, as the end of a
-`-<flag>=` token, so the name is one joined argv element and a dash-leading name
-is never an option. Every other brace, a bare or space-separated placeholder, text
-after it, and the placeholder in `runtime.args` are refused at install
+characters. Exactly one token holds `{session_name}` once, in one of two shapes.
+The joined shape ends a `-<flag>=` token (`--name={session_name}`), so the name
+is one argv element with its flag and a dash-leading name is never an option.
+The pair shape is the whole token directly after a flag token
+(`["--name", "{session_name}"]`), for an agent that reads the value from the next
+element; a name that starts with `-` then omits the whole group (a WARN names the
+session, never the name), so it can never be read as an option. Every other brace,
+a placeholder in any other place (first, after `--`, `-`, `--x=y` or a non-flag
+token), text after it, and the placeholder in `runtime.args` are refused at install
 (`descriptor_invalid`, naming the field and never a token). The arguments are
 rendered per launch from the name that launch uses (`session.new` `name`; the
 current name on resume; `session.fork` `name`, not the source's), after the
