@@ -261,8 +261,10 @@ enum TransitionKey {
     /// so a terminal state the daemon replays after a restart keeps the key
     /// of the record it already projected.
     Generation(RuntimeGeneration),
-    /// The runtime generation an unproven loss was reported for.
-    Unproven(RuntimeGeneration),
+    /// The runtime generation an unproven loss was reported for and the
+    /// ordinal of that report: a runtime that answers again and is lost
+    /// again within its generation is reported again under the next ordinal.
+    Unproven(RuntimeGeneration, u64),
 }
 
 /// Marks a [`TransitionKey::Generation`] in a source id.
@@ -273,8 +275,9 @@ const UNPROVEN_KEY_PREFIX: char = 'u';
 
 /// Return a deterministic projector source id.
 ///
-/// Scheme: `projector:<session_id>:<kind>:<epoch>` or
-/// `projector:<session_id>:<kind>:g<runtime_generation>`.
+/// Scheme: `projector:<session_id>:<kind>:<epoch>`,
+/// `projector:<session_id>:<kind>:g<runtime_generation>` or
+/// `projector:<session_id>:<kind>:u<ordinal>_<runtime_generation>`.
 #[must_use]
 fn projector_source_id(
     session_id: &SessionId,
@@ -287,18 +290,21 @@ fn projector_source_id(
         TransitionKey::Generation(generation) => {
             format!("{prefix}{GENERATION_KEY_PREFIX}{generation}")
         }
-        TransitionKey::Unproven(generation) => {
-            format!("{prefix}{UNPROVEN_KEY_PREFIX}{generation}")
+        TransitionKey::Unproven(generation, ordinal) => {
+            format!("{prefix}{UNPROVEN_KEY_PREFIX}{ordinal}_{generation}")
         }
     }
 }
 
 /// The transition key a stored projector source id suffix names.
 fn parse_transition_key(key: &str) -> Option<TransitionKey> {
-    if let Some(generation) = key.strip_prefix(UNPROVEN_KEY_PREFIX) {
-        return RuntimeGeneration::parse(generation)
-            .ok()
-            .map(TransitionKey::Unproven);
+    if let Some(rest) = key.strip_prefix(UNPROVEN_KEY_PREFIX) {
+        // The ordinal is the digits up to the first `_`.
+        let (ordinal, generation) = rest.split_once('_')?;
+        return Some(TransitionKey::Unproven(
+            RuntimeGeneration::parse(generation).ok()?,
+            ordinal.parse().ok()?,
+        ));
     }
     match key.strip_prefix(GENERATION_KEY_PREFIX) {
         Some(generation) => RuntimeGeneration::parse(generation)
@@ -370,7 +376,7 @@ pub(super) fn terminal_tombstone_matches(
         TransitionKey::Generation(generation) => {
             session_runtime_generation(session) == Some(generation)
         }
-        TransitionKey::Unproven(generation) => session.runtime.as_ref().is_some_and(|runtime| {
+        TransitionKey::Unproven(generation, _) => session.runtime.as_ref().is_some_and(|runtime| {
             runtime.state == RuntimeState::Lost && runtime.runtime_generation == generation
         }),
         TransitionKey::Epoch(_) => parse_timestamp(&record.created_at)
@@ -426,11 +432,12 @@ struct ProjectorState {
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
     /// Terminal states the store or this process holds a record key for.
     projected_generations: HashSet<(SessionId, NotificationKind, RuntimeGeneration)>,
-    /// Generations an unproven loss was reported for. The report is keyed by
-    /// transition epoch, not by generation, so a runtime that answers again
-    /// leaves the set and a later failure of that generation is reported on
+    /// Generations whose unproven loss stands. A runtime that answers again
+    /// leaves the set, so a later failure of that generation is reported on
     /// its own; while the loss stands, a proof of it adds no second report.
     unproven_generations: HashSet<(SessionId, RuntimeGeneration)>,
+    /// The highest ordinal of an unproven report per generation.
+    unproven_ordinals: HashMap<(SessionId, RuntimeGeneration), u64>,
     /// Sessions whose transition epochs continue from the store's records.
     seeded_sessions: HashSet<SessionId>,
     /// Seeded sessions with an unread attention record and no blocked,
@@ -1127,7 +1134,12 @@ impl ProjectorState {
                 {
                     return None;
                 }
-                TransitionKey::Unproven(generation)
+                let ordinal = self
+                    .unproven_ordinals
+                    .entry((derived.session_id.clone(), generation))
+                    .or_insert(0);
+                *ordinal += 1;
+                TransitionKey::Unproven(generation, *ordinal)
             } else {
                 if !self.projected_generations.insert((
                     derived.session_id.clone(),
@@ -1251,7 +1263,12 @@ impl ProjectorState {
                     self.projected_generations
                         .insert((session_id.clone(), kind, generation));
                 }
-                TransitionKey::Unproven(generation) => {
+                TransitionKey::Unproven(generation, ordinal) => {
+                    let highest = self
+                        .unproven_ordinals
+                        .entry((session_id.clone(), generation))
+                        .or_insert(0);
+                    *highest = (*highest).max(ordinal);
                     self.unproven_generations
                         .insert((session_id.clone(), generation));
                 }
@@ -2257,6 +2274,39 @@ mod tests {
             "{titles:?}"
         );
         assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_is_lost_again_within_its_generation_is_reported_again() {
+        let service = service("unproven-twice");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let lost = lost_session("s-1", SessionState::Running, 1, None, None);
+        let live = session_in_generation("s-1", SessionState::Running, None, 1);
+        let live = SessionInfo {
+            runtime: live.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                ..runtime
+            }),
+            ..live
+        };
+
+        for (name, session) in [
+            (event::SESSION_RUNTIME_LOST, &lost),
+            (event::SESSION_RUNTIME_RECONNECTED, &live),
+            (event::SESSION_RUNTIME_LOST, &lost),
+        ] {
+            projector
+                .handle_event_blocking(&service, &attention, &session_event(name, session))
+                .await;
+        }
+
+        let notifications = list(&service);
+        assert_eq!(
+            notifications.len(),
+            2,
+            "each loss of the generation is reported: {notifications:#?}"
+        );
     }
 
     #[tokio::test]
