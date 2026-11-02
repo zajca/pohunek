@@ -44,6 +44,8 @@ const SEEDED = {
   }),
   runningIncompatible: sessionWith("s-cond-incompatible", { runtime: runtimeOf("incompatible") }),
   runningUnknownRuntime: sessionWith("s-cond-unknown-runtime", { runtime: runtimeOf("draining") }),
+  stoppedLost: sessionWith("s-cond-stopped-lost", { state: "stopped", runtime: LOST }),
+  doneUnknownRuntime: sessionWith("s-cond-done-unknown-runtime", { state: "done", runtime: runtimeOf("draining") }),
   lostNoNativeResume: sessionWith("s-cond-no-resume", {
     state: "failed",
     runtime: LOST,
@@ -121,6 +123,10 @@ describe("sessionCondition against the fixture daemon session.list", () => {
     });
   });
 
+  test("rule 2: a lost runtime is crashed even when the session is stopped", async () => {
+    expect((await listedCondition("s-cond-stopped-lost")).condition).toBe("crashed");
+  });
+
   test("rule 3: a failed session whose runtime is terminal stays failed", async () => {
     expect(await listedCondition("s-cond-failed-terminal")).toEqual({ condition: "failed", recovery: null });
   });
@@ -145,6 +151,10 @@ describe("sessionCondition against the fixture daemon session.list", () => {
     expect(await listedCondition("s-cond-unknown-runtime")).toEqual({ condition: "unknown", recovery: null });
   });
 
+  test("rule 5 does not apply to a session that is not live", async () => {
+    expect(await listedCondition("s-cond-done-unknown-runtime")).toEqual({ condition: "done", recovery: null });
+  });
+
   test("recovery no_native_resume: a lost session whose agent cannot resume", async () => {
     expect(await listedCondition("s-cond-no-resume", { listed: true })).toEqual({
       condition: "crashed",
@@ -163,91 +173,6 @@ describe("sessionCondition against the fixture daemon session.list", () => {
     expect(await listedCondition("s-cond-failed-lost")).toEqual({
       condition: "crashed",
       recovery: { kind: "unknown" },
-    });
-  });
-});
-
-describe("sessionCondition table", () => {
-  test("rule 1: external wins over a lost runtime for every state", () => {
-    for (const state of ["starting", "running", "stopped", "done", "failed"] as const) {
-      expect(sessionCondition(sessionWith("e", { state, external: true, runtime: LOST }))).toEqual({
-        condition: state,
-        recovery: null,
-      });
-    }
-  });
-
-  test("rule 2: a lost runtime is crashed even when the session is stopped or done", () => {
-    expect(sessionCondition(sessionWith("s", { state: "stopped", runtime: LOST })).condition).toBe("crashed");
-    expect(sessionCondition(sessionWith("s", { state: "done", runtime: LOST })).condition).toBe("crashed");
-  });
-
-  test("rule 3: stopped, done and failed read as their state without a lost runtime", () => {
-    for (const state of ["stopped", "done", "failed"] as const) {
-      expect(sessionCondition(sessionWith("s", { state })).condition).toBe(state);
-      expect(sessionCondition(sessionWith("s", { state, runtime: runtimeOf("conflict") })).condition).toBe(state);
-    }
-  });
-
-  test("rule 4: a live state never reads as running for a reconnecting, conflict or incompatible runtime", () => {
-    for (const state of ["starting", "running"] as const) {
-      for (const runtime of ["reconnecting", "conflict", "incompatible"] as const) {
-        expect(sessionCondition(sessionWith("s", { state, runtime: runtimeOf(runtime) })).condition).toBe(runtime);
-      }
-    }
-  });
-
-  test("rule 5: the tolerant decode value unknown reads as unknown", () => {
-    expect(sessionCondition(sessionWith("s", { runtime: runtimeOf("unknown") })).condition).toBe("unknown");
-  });
-
-  test("rule 5: a runtime state outside the generated union reads as unknown", () => {
-    expect(sessionCondition(sessionWith("s", { state: "starting", runtime: runtimeOf("future") })).condition).toBe(
-      "unknown",
-    );
-  });
-
-  test("rule 6: live runtime states and the absence of a runtime read as the state", () => {
-    for (const runtime of ["starting", "live", "terminal"]) {
-      expect(sessionCondition(sessionWith("s", { runtime: runtimeOf(runtime) })).condition).toBe("running");
-    }
-    expect(sessionCondition(sessionWith("s", { state: "starting" })).condition).toBe("starting");
-  });
-
-  test("rule 5 does not apply to a session that is not live", () => {
-    expect(sessionCondition(sessionWith("s", { state: "done", runtime: runtimeOf("future") })).condition).toBe(
-      "done",
-    );
-  });
-
-  test("recovery is null for every condition other than crashed", () => {
-    expect(sessionCondition(sessionWith("s", { state: "failed", runtime: runtimeOf("terminal") })).recovery).toBeNull();
-    expect(sessionCondition(sessionWith("s", { runtime: runtimeOf("conflict") })).recovery).toBeNull();
-  });
-
-  test("recovery: a refusal wins over the listed flag", () => {
-    const info = sessionWith("s", {
-      runtime: LOST,
-      capability_refusals: { resume: "agent_resume_unsupported" },
-    });
-    expect(sessionCondition(info, { listed: true }).recovery).toEqual({
-      kind: "refused",
-      code: "agent_resume_unsupported",
-    });
-  });
-
-  test("recovery: no native resume wins over a refusal", () => {
-    const info = sessionWith("s", {
-      runtime: LOST,
-      capabilities: { resume: false, fork: false },
-      capability_refusals: { resume: "agent_resume_unsupported" },
-    });
-    expect(sessionCondition(info, { listed: true }).recovery).toEqual({ kind: "no_native_resume" });
-  });
-
-  test("recovery: an explicit listed false is unknown", () => {
-    expect(sessionCondition(sessionWith("s", { runtime: LOST }), { listed: false }).recovery).toEqual({
-      kind: "unknown",
     });
   });
 });

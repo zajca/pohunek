@@ -1943,8 +1943,9 @@ Durability tiers (honest about limits):
    confirmed sweep. Clients show one derived state for a lost runtime,
    `crashed` (proven or not), with the readable cause of the loss; the
    notification projector reports a proven loss as one `Error` "Session
-   crashed" and an unproven one as "Session runtime lost", once per runtime
-   generation, with the cause in the body and in the metadata. Startup reconciliation
+   crashed" and an unproven one as "Session runtime lost", once per loss
+   (a runtime that answers again and is lost again within its generation is
+   reported again), with the cause in the body and in the metadata. Startup reconciliation
    re-examines every stored record, so a record committed by an earlier release
    as `running` with a lost runtime is re-classified by its call site's proof;
    a worker that answers again re-adopts the session as `running`. A `failed`

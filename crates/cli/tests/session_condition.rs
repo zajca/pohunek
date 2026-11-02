@@ -1,5 +1,5 @@
 //! The one state `pohunek session list` and `inspect` show for a crashed
-//! session, against a scripted daemon that answers with recorded payloads.
+//! session, against a scripted daemon that answers with scripted payloads.
 //!
 //! The payloads carry only what a daemon sends; the state column, the
 //! recovery outlook and the readable cause are derived by the CLI.
@@ -262,12 +262,13 @@ fn a_cause_with_terminal_control_characters_is_printed_inert() {
     assert!(!text.contains('\u{1b}'), "{text:?}");
 }
 
-/// A `session.list` payload recorded from a 0.38 daemon: a runtime with an
-/// `exit` of three keys, and none of the keys 0.39 added.
+/// A `session.list` payload shaped like a 0.38 daemon's, written by hand
+/// from the 0.38 wire type: a runtime with an `exit` of three keys, and none
+/// of the keys 0.39 added.
 #[test]
-fn a_payload_recorded_from_a_038_daemon_still_shows_crashed() {
-    let recorded = session(
-        "s-recorded",
+fn a_payload_shaped_like_a_038_daemon_still_shows_crashed() {
+    let payload = session(
+        "s-payload",
         "failed",
         Some(lost(&json!({
             "loss_reason": "runtime_lost",
@@ -276,14 +277,14 @@ fn a_payload_recorded_from_a_038_daemon_still_shows_crashed() {
         }))),
     );
 
-    let table = list(vec![recorded.clone()]);
+    let table = list(vec![payload.clone()]);
 
-    assert_eq!(state_of(&table, "s-recorded"), "crashed", "{table}");
+    assert_eq!(state_of(&table, "s-payload"), "crashed", "{table}");
     assert!(
-        table.contains("lost s-recorded: Killed for memory;"),
+        table.contains("lost s-payload: Killed for memory;"),
         "{table}"
     );
-    let text = inspect(vec![recorded], "s-recorded");
+    let text = inspect(vec![payload], "s-payload");
     assert!(text.contains("lost: Killed for memory;"), "{text}");
 }
 

@@ -1264,13 +1264,13 @@ impl ProjectorState {
                         .insert((session_id.clone(), kind, generation));
                 }
                 TransitionKey::Unproven(generation, ordinal) => {
+                    // Whether the loss still stands is the registry's to say,
+                    // through a replayed or a live event.
                     let highest = self
                         .unproven_ordinals
                         .entry((session_id.clone(), generation))
                         .or_insert(0);
                     *highest = (*highest).max(ordinal);
-                    self.unproven_generations
-                        .insert((session_id.clone(), generation));
                 }
             }
         }
@@ -2310,6 +2310,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_loss_after_a_cured_unproven_loss_is_reported_after_a_restart() {
+        let dir = temp_data_dir("unproven-cured-restart");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let lost = lost_session("s-1", SessionState::Running, 1, None, None);
+        let live = session_in_generation("s-1", SessionState::Running, None, 1);
+        let live = SessionInfo {
+            runtime: live.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                ..runtime
+            }),
+            ..live
+        };
+        for (name, session) in [
+            (event::SESSION_RUNTIME_LOST, &lost),
+            (event::SESSION_RUNTIME_RECONNECTED, &live),
+        ] {
+            projector
+                .handle_event_blocking(&service, &attention, &session_event(name, session))
+                .await;
+        }
+        assert_eq!(list(&service).len(), 1);
+        drop(service);
+
+        // The runtime answered again before the restart; the worker is dead
+        // at the next start, which commits the proven loss.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        project_session_update(&mut projector, &service, &failed).await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unproven_loss_proven_at_the_next_start_is_not_reported_twice() {
+        let dir = temp_data_dir("unproven-proven-restart");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let lost = lost_session("s-1", SessionState::Running, 1, None, None);
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_RUNTIME_LOST, &lost),
+            )
+            .await;
+        assert_eq!(list(&service).len(), 1);
+        drop(service);
+
+        // The next start finds the same loss and announces it settled; the
+        // registry delivers it as a replayed event.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        let failed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
+        projector
+            .handle_produced_event_blocking(
+                &service,
+                &attention,
+                &session_event(event::SESSION_RUNTIME_LOST, &failed),
+                StdInstant::now(),
+                true,
+            )
+            .await;
+        project_session_update(&mut projector, &service, &failed).await;
+
+        assert_eq!(list(&service).len(), 1, "{:#?}", list(&service));
+    }
+
+    #[tokio::test]
     async fn a_lost_session_loaded_again_after_a_restart_is_not_reported_again() {
         let dir = temp_data_dir("crashed-restart");
         let crashed = lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None);
@@ -2322,7 +2399,8 @@ mod tests {
 
         let service = NotificationService::open(&dir).expect("reopen notification service");
         let mut projector = ProjectorState::default();
-        project_session_update(&mut projector, &service, &crashed).await;
+        project_replayed_loss(&mut projector, &service, &crashed).await;
+        project_replayed_loss(&mut projector, &service, &unproven).await;
         project_session_update(&mut projector, &service, &unproven).await;
 
         assert_eq!(records_of(&service, NotificationKind::Error), 2);
@@ -2595,6 +2673,23 @@ mod tests {
             .await;
     }
 
+    /// Delivers `session` as the registry announces a loss it found stored.
+    async fn project_replayed_loss(
+        projector: &mut ProjectorState,
+        service: &NotificationService,
+        session: &SessionInfo,
+    ) {
+        projector
+            .handle_produced_event_blocking(
+                service,
+                &AttentionCoordinator::disconnected(),
+                &session_event(event::SESSION_RUNTIME_LOST, session),
+                StdInstant::now(),
+                true,
+            )
+            .await;
+    }
+
     fn records_of(service: &NotificationService, kind: NotificationKind) -> usize {
         list(service)
             .iter()
@@ -2822,7 +2917,7 @@ mod tests {
 
         let service = NotificationService::open(&dir).expect("reopen compacted service");
         let mut projector = ProjectorState::default();
-        project_session_update(&mut projector, &service, &running).await;
+        project_replayed_loss(&mut projector, &service, &running).await;
         project_session_update(&mut projector, &service, &failed).await;
 
         assert!(

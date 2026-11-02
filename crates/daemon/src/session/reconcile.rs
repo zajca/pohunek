@@ -4371,7 +4371,6 @@ impl SessionRegistry {
         let state = classification.state();
         let id = SessionId(record.session_id.clone());
         let stored_runtime = record.info.runtime.clone();
-        let stored_state = record.info.state;
         let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         // Boxed so the entry does not widen the futures of the callers.
         let entry = Box::new(entry);
@@ -4412,8 +4411,10 @@ impl SessionRegistry {
             | RuntimeState::Terminal
             | RuntimeState::Unknown => event::SESSION_UPDATED,
         };
-        // A record that was already lost in the same generation and state is
-        // announced again at every start; that is no new loss to notify.
+        // A record that was already lost in the same generation is announced
+        // again at every start, and a start that proves an unproven loss
+        // announces the same loss with a settled state; neither is a new loss
+        // to notify.
         let replayed = stored_runtime
             .as_ref()
             .zip(info.runtime.as_ref())
@@ -4421,8 +4422,7 @@ impl SessionRegistry {
                 stored.state == RuntimeState::Lost
                     && current.state == RuntimeState::Lost
                     && stored.runtime_generation == current.runtime_generation
-            })
-            && stored_state == info.state;
+            });
         if replayed {
             self.emit_replayed(event_name, &info);
         } else {

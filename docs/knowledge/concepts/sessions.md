@@ -373,6 +373,14 @@ signals from lingering as unread after the agent has resumed; other kinds such
 as `error` and `session_finished` are never auto-resolved and wait for explicit
 owner action. An `idle` observation alone does not resolve attention because an
 approval prompt can be technically idle while still requiring owner input.
+A session whose runtime is lost also resolves its attention records, because no
+terminal is left to answer them. The projector reports the loss itself as an
+`error` record: "Session crashed" when the daemon proved it (`failed` with a
+lost runtime) and "Session runtime lost" when it did not (`running` with a lost
+runtime); a proof that follows an unproven report adds no second record, and a
+runtime that answers again and is lost again is reported again. The cause rides
+in the body and in the `cause`, `oom_killer`, `memory_peak_bytes` and
+`loss_cause` metadata keys.
 
 Session notifications are also debounced before they ever become visible. An
 `agent_blocked`, `approval_required`, or session-scoped `turn_completed` create
@@ -844,7 +852,14 @@ Protocol 3 connections never receive `background_state`, and their session
 objects carry no `background` key. The field and the event are current-version
 additions; see the protocol window in `docs/public-api.md`.
 
-Human-readable `pohunek session list` shows the running/recent child count in
+Human-readable `pohunek session list` shows the `STATE` column as the one
+state the client derives from `state` and `runtime.state` (`crashed` for any
+lost runtime, proven or not; the runtime state itself while a live session's
+runtime is `reconnecting`, `conflict` or `incompatible`; `unknown` for a runtime
+state the client does not know). A footer line `lost <id>: <cause>; <recovery>`
+follows the table for each crashed session, and `session inspect` prints the
+`condition` row and a `lost:` line. `--filter state=` still tests the logical
+`state`. The same listing shows the running/recent child count in
 `SUBAGENTS` and the background snapshot's per-kind counts in `BACKGROUND` (for
 example `2a 2s 1m`: agents, shells, monitors; `w` workflows, `t` teammates, `o`
 every other kind). `pohunek session inspect` includes the corresponding
