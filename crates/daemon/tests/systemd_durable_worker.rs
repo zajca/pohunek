@@ -784,6 +784,11 @@ async fn privileged_a_killed_user_manager_is_the_cause_of_a_lost_runtime() {
     .await;
     let runtime = lost.runtime.expect("lost runtime");
     assert_eq!(
+        lost.state,
+        protocol::SessionState::Failed,
+        "a user manager proven gone ends the session: {runtime:?}"
+    );
+    assert_eq!(
         runtime.loss_cause.as_deref(),
         Some("user_manager_lost"),
         "{runtime:?}"
