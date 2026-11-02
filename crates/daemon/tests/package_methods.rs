@@ -2697,6 +2697,7 @@ async fn a_profile_backed_launch_gets_the_naming_args() {
 /// carries the name the record holds now.
 #[tokio::test]
 async fn pair_naming_args_follow_the_name_each_launch_uses() {
+    capture_daemon_log();
     let servers = spawn_servers_over("pkg-naming-pair", Some("")).await;
     let mut local = connect_unix(&servers.socket).await;
     let cwd = servers
@@ -2732,6 +2733,14 @@ async fn pair_naming_args_follow_the_name_each_launch_uses() {
         let id = start_named_session(&mut local, RUNTIME, &cwd, Some(name)).await;
         let argv = printed_argv(&mut local, &id).await;
         assert_eq!(without_reference(&argv, &create_flags), expected, "{name}");
+        // The withheld group is logged with the session id, never the name.
+        let warned = captured_log_lines(&["starts with a dash", &id.0]);
+        assert_eq!(
+            warned.len(),
+            usize::from(name.starts_with('-')),
+            "{name}: {warned:?}"
+        );
+        assert!(warned.iter().all(|line| !line.contains(name)), "{warned:?}");
         let _: protocol::SessionStopResult =
             call(&mut local, method::SESSION_STOP, json!(id)).await;
     }
@@ -2802,6 +2811,49 @@ async fn pair_naming_args_follow_the_name_each_launch_uses() {
         call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
     drop(local);
     servers.stop().await;
+}
+
+/// Daemon log lines captured in memory, for the scenarios that read a warning.
+static CAPTURED_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Appends what the daemon logs to [`CAPTURED_LOG`].
+struct CapturedLogWriter;
+
+impl std::io::Write for CapturedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOG
+            .lock()
+            .expect("the log capture lock is never poisoned")
+            .push_str(&String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Routes the daemon's warnings into [`CAPTURED_LOG`] for this process.
+fn capture_daemon_log() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(|| CapturedLogWriter)
+            .init();
+    });
+}
+
+/// The captured log lines that mention every one of `needles`.
+fn captured_log_lines(needles: &[&str]) -> Vec<String> {
+    CAPTURED_LOG
+        .lock()
+        .expect("the log capture lock is never poisoned")
+        .lines()
+        .filter(|line| needles.iter().all(|needle| line.contains(needle)))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `[naming]` tables the grammar refuses, next to the valid `valid` table.
