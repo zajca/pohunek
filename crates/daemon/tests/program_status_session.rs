@@ -90,7 +90,7 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// reports working, `d` done, `b` blocked and `q` exits; `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
-/// an `id` and a `title`, then a bare `clear`). In the `screen` mode the
+/// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
 /// transcript bullet that only looks like one, above the prompt box.
@@ -144,6 +144,7 @@ run() {{
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
+    m) printf 'SYNC\r\n' ;;
     q) exit 0 ;;
   esac
 }}
@@ -605,11 +606,23 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
         "only the root `done` changes the activity"
     );
 
-    // A root `blocked` record is the only way to read blocked, so waiting for
-    // it orders the detector after the child records before it; a child record
-    // read as a root `working` would have published an edge first.
+    // The detector task answers `session.detection` from its own screen, so
+    // once the marker shows there, it has consumed the chunk with the child
+    // records. The root `blocked` record is written only then, so it cannot
+    // share a chunk with them, and a child record read as a root `working`
+    // would have published an edge before the awaited `blocked`.
     command(&fixture, b'c');
     command(&fixture, b'x');
+    command(&fixture, b'm');
+    wait_until("the detector to see the marker line", || async {
+        let detection = fixture.registry.detection(&created.id).await.ok()?;
+        detection
+            .previews
+            .iter()
+            .any(|preview| preview.text.contains("SYNC"))
+            .then_some(())
+    })
+    .await;
     command(&fixture, b'b');
     fixture
         .wait_activity(
