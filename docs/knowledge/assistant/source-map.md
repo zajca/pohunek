@@ -530,7 +530,7 @@ Daemon, sessions, integrations, and project state:
   worker's journaled `worker_coalitions`; only a difference between both
   coalitions is evidence, and only of non-membership), the Linux cgroup
   exclusion (the worker's journaled `worker_control_group`; a process outside the
-  worker's `user@<uid>.service` subtree is foreign, one inside proves nothing), the reboot proof (the worker's journaled `boot_session_id`, a canonical UUID; a host that names another boot holds no process of the runtime, so the sweep is complete without scanning), and the never-signalled
+  worker's `user@<uid>.service` subtree, outside the sessions slice holding the worker, or in another session's worker unit is foreign; one in the worker's unit or beside it under the sessions slice proves nothing), the reboot proof (the worker's journaled `boot_session_id`, a canonical UUID; a host that names another boot holds no process of the runtime, so the sweep is complete without scanning), and the never-signalled
   skip of a worker child (`POHUNEK_WORKER_ID`) of the session without a
   worker-instance marker.
 - `crates/service-config/src/lib.rs` — `service.toml` schema, trust, and

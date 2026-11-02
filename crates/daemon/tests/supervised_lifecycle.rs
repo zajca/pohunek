@@ -1899,14 +1899,22 @@ const UNREADABLE_SLEEP: &str = "unreadable-sleep";
 
 /// Where a bystander runs relative to the user manager holding the workers.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Placement {
     /// A scope of the system manager (`sudo systemd-run --scope`), outside
     /// every user manager. The CI lane has passwordless `sudo`.
     SystemScope,
     /// A scope of the user manager (`systemd-run --user --scope`), inside the
-    /// subtree of `user@<uid>.service`.
+    /// subtree of `user@<uid>.service` and outside the sessions slice: the
+    /// default slice of such a scope is `app.slice`.
     UserScope,
+    /// A scope of the user manager placed in the sessions slice that holds the
+    /// worker (`--slice=<sessions slice>`), which is where tmux 3.x puts the
+    /// panes of a worker's descendants (`tmux-spawn-*.scope`).
+    SessionsSlice,
+    /// A process moved into the unit cgroup of the worker of another live
+    /// session, whose unit is `cgroup`.
+    NeighbourWorker { cgroup: String },
 }
 
 /// A same-user process that started after a crashed worker and whose
@@ -1926,7 +1934,7 @@ struct Bystander {
 impl Bystander {
     /// Starts a bystander at `placement` and checks that it is the process the
     /// scenario claims: unreadable markers, in the cgroup class `placement` names.
-    async fn start(fixture: &Installation, placement: Placement) -> Self {
+    async fn start(fixture: &Installation, placement: &Placement, worker_cgroup: &str) -> Self {
         let binary = fixture.probe.join(UNREADABLE_SLEEP);
         if !binary.exists() {
             pohunek_test_support::hold::install_at(&binary).expect("install the holding image");
@@ -1951,9 +1959,21 @@ impl Bystander {
                 command.arg(format!("--uid={}", supervised::uid()));
                 command
             }
-            Placement::UserScope => {
+            Placement::UserScope | Placement::NeighbourWorker { .. } => {
                 let mut command = std::process::Command::new("systemd-run");
                 command.args(["--user", "--scope", "--quiet"]);
+                command
+            }
+            Placement::SessionsSlice => {
+                let (sessions_slice, _unit) = worker_cgroup
+                    .rsplit_once('/')
+                    .expect("the worker runs in a unit below its sessions slice");
+                let slice = sessions_slice
+                    .rsplit_once('/')
+                    .map_or(sessions_slice, |(_, name)| name);
+                let mut command = std::process::Command::new("systemd-run");
+                command.args(["--user", "--scope", "--quiet"]);
+                command.arg(format!("--slice={slice}"));
                 command
             }
         };
@@ -1983,11 +2003,20 @@ impl Bystander {
             .then_some(())
         })
         .await;
-        Self::assert_placement(placement, pid);
+        if let Placement::NeighbourWorker { cgroup } = placement {
+            // The delegated subtree of the user manager is writable by its user,
+            // which is also how a descendant of a worker could leave its unit.
+            std::fs::write(
+                format!("/sys/fs/cgroup{cgroup}/cgroup.procs"),
+                pid.to_string(),
+            )
+            .expect("move the bystander into the neighbour's worker unit");
+        }
+        Self::assert_placement(placement, pid, worker_cgroup);
         bystander
     }
 
-    fn assert_placement(placement: Placement, pid: u32) {
+    fn assert_placement(placement: &Placement, pid: u32, worker_cgroup: &str) {
         let cgroups = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
             .expect("read the bystander's cgroup");
         let unified = cgroups
@@ -2001,8 +2030,22 @@ impl Bystander {
                 "the bystander is in a system scope: {unified}"
             ),
             Placement::UserScope => assert!(
-                unified.contains(&format!("{manager}/")),
-                "the bystander is in the user manager: {unified}"
+                unified.contains(&format!("{manager}/app.slice/")),
+                "the bystander is in the user manager's app slice: {unified}"
+            ),
+            Placement::SessionsSlice => {
+                let (sessions_slice, _unit) = worker_cgroup
+                    .rsplit_once('/')
+                    .expect("the worker runs in a unit below its sessions slice");
+                assert!(
+                    unified.starts_with(&format!("{sessions_slice}/"))
+                        && !unified.starts_with(worker_cgroup),
+                    "the bystander is beside the worker unit in its sessions slice: {unified}"
+                );
+            }
+            Placement::NeighbourWorker { cgroup } => assert_eq!(
+                unified, cgroup,
+                "the bystander is in the neighbour's worker unit"
             ),
         }
     }
@@ -2050,6 +2093,8 @@ fn process_running_image(image: &std::path::Path) -> Option<u32> {
 struct Crashed {
     session: String,
     bystander: Bystander,
+    /// Worker of the second live session of a neighbour scenario.
+    neighbour: Option<ProcessIdentity>,
 }
 
 /// Crashes a session's worker while the daemon is away, starts a bystander
@@ -2064,13 +2109,38 @@ async fn crash_beside_bystander(
     fixture.start_daemon().await;
     let session = fixture.new_session("contained").await.id.0;
     let before = fixture.snapshot(&session).await;
+    let worker_cgroup = unified_cgroup_of(before.worker.pid);
+    // The neighbour session keeps a live worker the bystander is moved into.
+    let (neighbour, placement) = if matches!(placement, Placement::NeighbourWorker { .. }) {
+        let other = fixture.new_session("neighbour").await.id.0;
+        let worker = fixture.snapshot(&other).await.worker;
+        let cgroup = unified_cgroup_of(worker.pid);
+        (Some(worker), Placement::NeighbourWorker { cgroup })
+    } else {
+        (None, placement)
+    };
     fixture.stop_daemon().await;
-    let bystander = Bystander::start(fixture, placement).await;
+    let bystander = Bystander::start(fixture, &placement, &worker_cgroup).await;
     signal(before.worker.pid, Signal::SIGKILL);
     fixture.wait_gone(before.worker, "crashed worker").await;
     fixture.patch_journal(&session, &before.worker_id, patch);
     fixture.start_daemon().await;
-    Crashed { session, bystander }
+    Crashed {
+        session,
+        bystander,
+        neighbour,
+    }
+}
+
+/// The unified cgroup path of `pid`, from the initial cgroup namespace.
+#[cfg(target_os = "linux")]
+fn unified_cgroup_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .expect("read the cgroup")
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("the host uses the unified cgroup hierarchy")
+        .to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -2092,6 +2162,12 @@ impl Crashed {
             fixture.is_running(self.bystander.process),
             "the removal signalled the bystander"
         );
+        if let Some(neighbour) = self.neighbour {
+            assert!(
+                fixture.is_running(neighbour),
+                "the removal signalled the neighbour's worker"
+            );
+        }
     }
 
     /// The runtime is lost with an unconfirmed sweep, and the removal is refused
@@ -2180,20 +2256,59 @@ async fn privileged_a_journal_without_the_control_group_keeps_the_removal_unconf
     crashed.assert_unconfirmed(&fixture).await;
 }
 
-/// A bystander inside the user manager may have been started by the worker's
-/// descendants (`systemd-run --user --scope` keeps their environment), so it
-/// stays unproven.
+/// A bystander in a scope of the user manager's app slice sits where a launcher
+/// puts a desktop process, not where a worker's descendants land by accident, so
+/// it does not keep the removal of a lost runtime unconfirmed.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
-async fn a_bystander_in_a_user_scope_keeps_the_removal_unconfirmed() {
+async fn a_bystander_in_a_user_scope_does_not_block_the_removal() {
     let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
         pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
-        "a_bystander_in_a_user_scope_keeps_the_removal_unconfirmed",
+        "a_bystander_in_a_user_scope_does_not_block_the_removal",
     );
     let fixture = Installation::new(Settings::default()).await;
     let crashed = crash_beside_bystander(&fixture, Placement::UserScope, |_| {}).await;
+    crashed.assert_removable(&fixture).await;
+}
+
+/// A scope beside the worker unit in its sessions slice is where tmux puts the
+/// panes of a worker's descendants, with the worker's markers in their
+/// environment, so a process there stays unproven.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_bystander_beside_the_worker_in_its_sessions_slice_keeps_the_removal_unconfirmed() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_bystander_beside_the_worker_in_its_sessions_slice_keeps_the_removal_unconfirmed",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(&fixture, Placement::SessionsSlice, |_| {}).await;
     crashed.assert_unconfirmed(&fixture).await;
+}
+
+/// A process inside the worker unit of another live session belongs to that
+/// session's supervision, so it does not block this removal, and the other
+/// session is left alone.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_bystander_in_another_sessions_worker_unit_does_not_block_the_removal() {
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_bystander_in_another_sessions_worker_unit_does_not_block_the_removal",
+    );
+    let fixture = Installation::new(Settings::default()).await;
+    let crashed = crash_beside_bystander(
+        &fixture,
+        Placement::NeighbourWorker {
+            cgroup: String::new(),
+        },
+        |_| {},
+    )
+    .await;
+    crashed.assert_removable(&fixture).await;
 }
 
 /// The worker journals the control group it runs in: the unit of the user

@@ -258,6 +258,23 @@ impl Namespace {
             .map_err(|_invalid_key| Error::InvalidServiceId(unit.to_owned()))
     }
 
+    /// Parses a systemd worker unit of any installation, returning the
+    /// namespace it names together with the worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidServiceId`] under the conditions of
+    /// [`Self::parse_worker_unit`], or when the unit names no valid namespace.
+    pub fn parse_any_worker_unit(unit: &str) -> Result<(Self, WorkerKey), Error> {
+        let namespace = unit
+            .strip_prefix(UNIT_PREFIX)
+            .and_then(|rest| rest.get(..NAMESPACE_LEN))
+            .ok_or_else(|| Error::InvalidServiceId(unit.to_owned()))
+            .and_then(Self::parse)?;
+        let key = namespace.parse_worker_unit(unit)?;
+        Ok((namespace, key))
+    }
+
     /// Returns the systemd slice grouping this namespace's workers.
     #[must_use]
     pub fn sessions_slice(&self) -> String {

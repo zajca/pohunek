@@ -1261,12 +1261,20 @@ that path is foreign: cgroup v2 lets a process migrate only when the writer can
 write the `cgroup.procs` of the common ancestor of source and destination, and
 everything above `user@<uid>.service` is root-owned, so an unprivileged
 descendant of the worker cannot leave the user manager's subtree. Docker scopes
-and logind session scopes are outside it. A candidate inside the subtree
-(`app-*.scope`, `systemd-run --user --scope`, other user units) stays unproven
-and keeps the cleanup unconfirmed, as does a candidate inside the worker unit
-itself, which systemd's `KillMode=control-group` ends. A journal without the
+and logind session scopes are outside it. Inside the subtree a descendant can
+move itself anywhere, so the worker must run as `<sessions slice>/<worker unit>`
+(both names parsed by the installation namespace) and a candidate is foreign
+when it is not the sessions slice or below it (`app.slice/*`, `app-*.scope`,
+`systemd-run --user --scope` without `--slice-inherit`, other user units) or when
+it is the worker unit of another session or below it. Every other candidate
+under the sessions slice stays unproven and keeps the cleanup unconfirmed: the
+worker's own unit, which systemd's `KillMode=control-group` ends; another
+generation of the same session; and scopes such as tmux 3.x's `tmux-spawn-*.scope`,
+which a tool of the worker's descendants creates beside the unit while inheriting
+its markers. A journal without the
 field, a path that is not absolute or has an empty, `.` or `..` segment, a worker
-path without a `user@<uid>.service` segment, a journal from another boot, a
+path without a `user@<uid>.service` segment or whose leaf is not a worker unit
+below its namespace's sessions slice, a journal from another boot, a
 host without a unified hierarchy, an unreadable record and an identity change
 between the reads each give no proof, and so does a reader outside the initial
 cgroup namespace, whose paths are relative to another root than the journaled
@@ -1276,7 +1284,11 @@ migrate anywhere, and a root-owned service that starts same-user jobs with a
 recorded copy of the submitter's environment (for example `at(1)`), or a
 same-user server living in a logind session scope, runs them outside the
 subtree, so they count as foreign. The marker scheme already does
-not defend against a descendant that drops its markers on purpose.
+not defend against a descendant that drops its markers on purpose; likewise a
+non-dumpable process a descendant explicitly places outside the sessions slice
+or into another session's worker unit (a launcher scope, a `cgroup.procs` write)
+is treated as having left the worker's supervision. The dismissal never signals,
+so the failure mode is a leak, never harm to a foreign process.
 
 The same rows classify a worker that becomes unreachable while the daemon
 runs. When the control connection drops, the session turns `reconnecting` and
