@@ -92,7 +92,7 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// the child records a Claude background agent emits (a `working` record with
 /// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
-/// draw a status line whose timer the terminal width cut, `b` and `n` a
+/// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
 /// transcript bullet that only looks like one, above the prompt box.
 fn agent_script() -> String {
     format!(
@@ -123,6 +123,7 @@ if [ "$mode" = screen ]; then
       w) printf '✻ Contemplating deeply… (1m…\r\n' ;;
       b) printf '* Then it waits… (see below)\r\n' ;;
       n) printf '* Then it waits… (3 items)\r\n' ;;
+      k) printf '* Then it waits… (see…\r\n' ;;
     esac
     box
   done
@@ -569,8 +570,8 @@ async fn a_restated_record_emits_no_agent_state() {
 
 /// The child records of a Claude background agent never change what the
 /// session reads: they do not turn a held root `done` working. A child record
-/// that dropped a held record is not published before the next screen change,
-/// so the scenario cannot observe that fault.
+/// that dropped the held record is not observable here: the idle reading the
+/// screen would give is debounced, and the held record is not on the wire.
 #[tokio::test]
 async fn a_background_agents_child_records_never_change_the_session_activity() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -589,8 +590,7 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
         )
         .await;
 
-    // The screen is the idle prompt box, so a dropped root record would read
-    // idle from the screen before the awaited edge.
+    // The child records add no edge between the root `working` and `done`.
     let mut events = fixture.registry.subscribe();
     command(&fixture, b'c');
     command(&fixture, b'x');
@@ -649,6 +649,8 @@ async fn a_width_cut_status_line_reads_working_and_a_lookalike_bullet_reads_idle
         (b'b', AgentActivity::Idle),
         (b'w', AgentActivity::Working),
         (b'n', AgentActivity::Idle),
+        (b's', AgentActivity::Working),
+        (b'k', AgentActivity::Idle),
     ] {
         command(&fixture, shown);
         fixture
