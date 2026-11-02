@@ -191,7 +191,12 @@ loopback Messages stub, dummy key; scenario
   relaunch Claude, so the reading lasts until a resume under another name.
   2.1.289 puts its own glyph first (`✳ ◐ deploy`, recorded in
   `compat/claude/screens/n-1/named/marker_idle`), so the same name stays `idle`
-  there.
+  there. On 2.1.309 the working reading also keeps the session from being ready
+  for input: initial input to a session whose name starts with `◐ `, `◑ ` or a
+  braille character plus a space fails with `session_input_not_ready`.
+  The name is drawn into screen regions as well, so a name that holds a dialog
+  phrase (for example `run a dynamic workflow? esc to cancel`) reads `blocked`,
+  the same as prompt text typed into the box.
 - Resume: the name of the `--name` argument is the one shown. After a
   `session rename` to `beta`, a resume runs `--name=beta --resume <id>` and
   Claude shows `beta`, although the conversation started as `alpha`.
