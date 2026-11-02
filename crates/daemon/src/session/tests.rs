@@ -7296,19 +7296,25 @@ async fn delete_session_logs_removes_the_worker_log_family() {
 
 #[tokio::test]
 async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
+    const ATTACH_TTL: Duration = Duration::from_secs(10);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(500),
-        attach_token_ttl: Duration::from_millis(1),
+        attach_token_ttl: ATTACH_TTL,
         ..SessionRegistryConfig::default()
     });
 
     let created = registry.create(params()).await.expect("create session");
+    // Token lifetimes are measured on the paused clock, and the inhibitor keeps
+    // it from jumping while the worker's real I/O is pending, so a fresh token
+    // cannot expire between mint and redeem however slow the host is.
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
     let expired = registry
         .attach(&attach_params(&created.id))
         .await
         .expect("attach token");
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::advance(ATTACH_TTL + TIMER_TICK).await;
     let fresh = registry
         .attach(&attach_params(&created.id))
         .await
@@ -7337,6 +7343,8 @@ async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
     assert_eq!(second_redeem.code, "attach_not_found");
 
     registry.finish_attach(&redeemed.stream_id, None).await;
+    inhibitor.release().await;
+    tokio::time::resume();
     let stopped = registry.stop(&created.id).await.expect("stop session");
     assert!(stopped.stopped);
 }

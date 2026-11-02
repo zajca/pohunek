@@ -4442,6 +4442,68 @@ mod tests {
         inhibitor.release().await;
     }
 
+    /// Capability snapshot of a daemon that honors `--request-id`.
+    fn request_id_capabilities() -> serde_json::Value {
+        json!({
+            "daemon_version": "fixture",
+            "protocol_version": protocol::PROTOCOL_VERSION.get(),
+            "supported_agents": ["shell"],
+            "runtimes": [],
+            "git_available": true,
+            "worktree_supported": true,
+            "terminal_read_supported": true,
+            "output_read_supported": true,
+            "session_wait_supported": true,
+            "session_new_request_id_supported": true
+        })
+    }
+
+    /// The capability check answers on the paused clock, so only the
+    /// `session.new` request is left to run out of time.
+    #[tokio::test(start_paused = true)]
+    async fn a_keyed_session_new_without_a_reply_names_its_request_id() {
+        use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
+
+        // Response deadline of the creation; the paused clock only needs it nonzero.
+        const KEYED_NEW_TIMEOUT_MS: u32 = 1_000;
+
+        let mut daemon = crate::test_daemon::HeldDaemon::start_answering_inspect(
+            json!({}),
+            request_id_capabilities(),
+        );
+        let paths = daemon.paths.clone();
+        let args = NewArgs {
+            request_timeout_ms: Some(KEYED_NEW_TIMEOUT_MS),
+            request_id: Some("launch-1014".to_owned()),
+            ..new_args("shell", None)
+        };
+        let inhibitor = AutoAdvanceInhibitor::new();
+        let run = tokio::spawn(async move { run_new("local", &paths, args, true, false).await });
+
+        let received = daemon.request().await;
+        assert_eq!(received.request.method(), method::SESSION_NEW);
+        tokio::time::advance(Duration::from_millis(u64::from(KEYED_NEW_TIMEOUT_MS)) + TIMER_TICK)
+            .await;
+        let error = run
+            .await
+            .expect("session new task")
+            .expect_err("the creation is not confirmed");
+
+        let structured = error.to_protocol_error();
+        assert_eq!(structured.code, "request_timeout");
+        let recover = structured.recover.expect("a recovery hint");
+        assert!(
+            recover.contains("retry with the same `--request-id launch-1014`"),
+            "{recover}"
+        );
+        assert!(
+            !recover.contains("can create a second session"),
+            "a keyed retry cannot duplicate: {recover}"
+        );
+        daemon.release();
+        inhibitor.release().await;
+    }
+
     #[test]
     fn a_daemon_without_the_consent_method_gets_an_upgrade_hint() {
         let missing = CliError::Protocol(protocol::ProtocolError::method_not_found(

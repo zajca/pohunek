@@ -8,13 +8,15 @@
 //! dropped connection, a typed error, a session), and the daemon records the
 //! `session.new` parameters it saw, so the scenarios observe the keys on the
 //! wire and the number of requests. The scenarios that wait for a deadline run on
-//! tokio's paused clock.
+//! tokio's paused clock. A remote host is a scripted trusted-TCP daemon that
+//! also serves `assistant.materialize`, the way a remote launch prepares.
 
 #![cfg(unix)]
 
 // Rust guideline compliant 2026-11-01
 
 use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,8 +33,8 @@ use pohunek_client::protocol::{
 use pohunek_client::{ClientError, OriginSource};
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixListener};
 
 /// The budget a scenario gives the creation: the explicit request timeout.
 // timing-allowed: #1340 the budget split is the policy under test; every scenario runs on virtual time.
@@ -46,6 +48,9 @@ const FIRST_ATTEMPT: Duration = Duration::from_secs(15);
 /// half of it.
 // timing-allowed: #1877 the reserve split is the policy under test; the scenario runs on virtual time.
 const SHORT_BUDGET: Duration = Duration::from_secs(8);
+
+/// The project a remote launch names, since a remote host needs a target.
+const REMOTE_PROJECT: &str = "demo";
 
 /// The session a replay or an in-progress error names.
 const SESSION_ID: &str = "s-01M6CBAKG927FAMDNECX60RGAC";
@@ -66,7 +71,9 @@ enum Step {
 /// A scripted daemon: it answers `daemon.health` and `host.inspect` itself and
 /// takes one [`Step`] from its script for each `session.new`.
 struct Daemon {
-    socket_path: std::path::PathBuf,
+    host: HostConfig,
+    /// Whether the daemon is reached as a remote host.
+    remote: bool,
     script: Arc<Mutex<VecDeque<Step>>>,
     creates: Arc<Mutex<Vec<Value>>>,
     /// One signal for every `session.new` the script leaves unanswered and for
@@ -78,11 +85,49 @@ struct Daemon {
     _fixture: Box<dyn std::any::Any>,
 }
 
+/// The socket a scripted daemon accepts connections on.
+enum Listener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
 impl Daemon {
     fn start(steps: Vec<Step>, request_id_supported: bool) -> Self {
         let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
         let socket_path = fixture.path().join("assistant.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind the fixture host socket");
+        Self::serve_on(
+            HostConfig::local("test-host", &socket_path),
+            Listener::Unix(listener),
+            Box::new(fixture),
+            steps,
+            request_id_supported,
+        )
+    }
+
+    /// A daemon reached over trusted TCP, which a launch treats as remote.
+    async fn start_remote(steps: Vec<Step>) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the fixture remote host");
+        let address: SocketAddr = listener.local_addr().expect("fixture address");
+        Self::serve_on(
+            HostConfig::tcp("remote-host", address),
+            Listener::Tcp(listener),
+            Box::new(()),
+            steps,
+            true,
+        )
+    }
+
+    fn serve_on(
+        host: HostConfig,
+        listener: Listener,
+        fixture: Box<dyn std::any::Any>,
+        steps: Vec<Step>,
+        request_id_supported: bool,
+    ) -> Self {
+        let remote = matches!(listener, Listener::Tcp(_));
         let script = Arc::new(Mutex::new(VecDeque::from(steps)));
         let creates = Arc::new(Mutex::new(Vec::new()));
         let capabilities = serde_json::to_value(capabilities(request_id_supported))
@@ -93,29 +138,45 @@ impl Daemon {
         let accept_delay = Arc::clone(&inspect_delay);
         tokio::spawn(async move {
             loop {
-                let (stream, _) = listener.accept().await.expect("accept a connection");
-                tokio::spawn(serve(
-                    stream,
-                    capabilities.clone(),
-                    Arc::clone(&accept_script),
-                    Arc::clone(&accept_creates),
-                    hang_signal.clone(),
-                    Arc::clone(&accept_delay),
-                ));
+                match &listener {
+                    Listener::Unix(listener) => {
+                        let (stream, _) = listener.accept().await.expect("accept a connection");
+                        tokio::spawn(serve(
+                            stream,
+                            capabilities.clone(),
+                            Arc::clone(&accept_script),
+                            Arc::clone(&accept_creates),
+                            hang_signal.clone(),
+                            Arc::clone(&accept_delay),
+                        ));
+                    }
+                    Listener::Tcp(listener) => {
+                        let (stream, _) = listener.accept().await.expect("accept a connection");
+                        tokio::spawn(serve(
+                            stream,
+                            capabilities.clone(),
+                            Arc::clone(&accept_script),
+                            Arc::clone(&accept_creates),
+                            hang_signal.clone(),
+                            Arc::clone(&accept_delay),
+                        ));
+                    }
+                }
             }
         });
         Self {
-            socket_path,
+            host,
+            remote,
             script,
             creates,
             hangs,
             inspect_delay,
-            _fixture: Box::new(fixture),
+            _fixture: fixture,
         }
     }
 
     fn host(&self) -> HostConfig {
-        HostConfig::local("test-host", &self.socket_path)
+        self.host.clone()
     }
 
     /// The `client_request_id` of every `session.new` the daemon received.
@@ -145,14 +206,16 @@ impl Daemon {
     }
 }
 
-async fn serve(
-    stream: UnixStream,
+async fn serve<S>(
+    stream: S,
     capabilities: Value,
     script: Arc<Mutex<VecDeque<Step>>>,
     creates: Arc<Mutex<Vec<Value>>>,
     hang_signal: tokio::sync::mpsc::UnboundedSender<()>,
     inspect_delay: Arc<Mutex<Option<Duration>>>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -180,6 +243,7 @@ async fn serve(
                 }
                 ok(&request, capabilities.clone())
             }
+            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result()),
             method::SESSION_NEW => {
                 creates
                     .lock()
@@ -250,6 +314,18 @@ fn capabilities(request_id_supported: bool) -> HostCapabilities {
     }
 }
 
+/// The `assistant.materialize` result of a remote daemon holding this build's
+/// knowledge bundle.
+fn materialize_result() -> Value {
+    json!({
+        "bundle_path": "/remote/bundle",
+        "snapshot_path": "/remote/snapshot.json",
+        "version": knowledge::BUNDLE_VERSION,
+        "content_hash": knowledge::bundle_content_hash(),
+        "concepts": [],
+    })
+}
+
 fn session_result(replayed: bool) -> Value {
     let mut result = json!({
         "agent": "pohunek-assistant",
@@ -302,6 +378,21 @@ fn launch_params(request_id: Option<&str>) -> LaunchParams {
     }
 }
 
+/// The launch of a daemon: a remote host needs a target and a materialized
+/// bundle, a local one launches degraded.
+fn launch_params_for(daemon: &Daemon, request_id: Option<&str>) -> LaunchParams {
+    let params = launch_params(request_id);
+    if daemon.remote {
+        LaunchParams {
+            project: Some(REMOTE_PROJECT.to_owned()),
+            degraded: false,
+            ..params
+        }
+    } else {
+        params
+    }
+}
+
 fn assistant_paths(fixture_root: &Path) -> AssistantPaths {
     AssistantPaths {
         runtime_dir: fixture_root.join("runtime"),
@@ -341,7 +432,7 @@ async fn prepare_in(
     prepare_with_options(
         &daemon.host(),
         &assistant_paths(root),
-        launch_params(request_id),
+        launch_params_for(daemon, request_id),
         options(),
     )
     .await
@@ -702,6 +793,100 @@ async fn an_error_returned_after_the_session_was_recorded_offers_the_request_id(
         recover.contains(&format!("--request-id {key}")),
         "{recover}"
     );
+}
+
+/// What a daemon says when a request id already names a session created with
+/// other parameters.
+fn conflict() -> ProtocolError {
+    ProtocolError::session_request_conflict(&protocol::SessionId(SESSION_ID.to_owned()))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_remote_launch_that_loses_its_reply_is_not_told_to_rerun_under_its_key() {
+    let daemon = Daemon::start_remote(vec![Step::Drop, Step::Drop]).await;
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
+
+    let error = protocol_error(
+        finished(start(&daemon, prepared))
+            .await
+            .expect_err("neither attempt is answered"),
+    );
+
+    let keys = daemon.keys();
+    assert_eq!(keys.len(), 2, "one attempt and one retry: {keys:?}");
+    let key = keys[0].clone().expect("the launch sent a generated key");
+    assert_eq!(keys[1].as_deref(), Some(key.as_str()));
+    assert!(error.msg.contains(&key), "{}", error.msg);
+    let recover = error.recover.expect("a recovery hint");
+    assert!(
+        recover.contains(&format!(
+            "cannot replay request id `{key}` on a remote host"
+        )),
+        "{recover}"
+    );
+    assert!(recover.contains("session_request_conflict"), "{recover}");
+    assert!(
+        !recover.contains("rerun the same command"),
+        "a remote rerun renders another opening prompt, so it is not a replay: {recover}"
+    );
+    inhibitor.release().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_remote_conflict_points_at_the_session_the_first_request_created() {
+    let daemon = Daemon::start_remote(vec![Step::Error(conflict())]).await;
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, Some("remote-key"))
+        .await
+        .expect("the launch prepares");
+
+    let error = protocol_error(
+        finished(start(&daemon, prepared))
+            .await
+            .expect_err("the daemon refuses the repeat"),
+    );
+
+    assert_eq!(error.code, protocol::SESSION_REQUEST_CONFLICT_CODE);
+    assert_eq!(daemon.keys().len(), 1, "a typed error is not retried");
+    let recover = error.recover.expect("a recovery hint");
+    assert!(
+        recover.starts_with("use a new client_request_id"),
+        "the daemon's own recovery stays first: {recover}"
+    );
+    assert!(
+        recover.contains("on a remote host a repeated launch of the same request lands here"),
+        "{recover}"
+    );
+    assert_eq!(
+        error.details.and_then(|details| details.session_id),
+        Some(protocol::SessionId(SESSION_ID.to_owned())),
+        "the conflict names the session the first request created"
+    );
+    inhibitor.release().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_local_conflict_keeps_the_daemons_own_recovery() {
+    let daemon = Daemon::start(vec![Step::Error(conflict())], true);
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, Some("local-key"))
+        .await
+        .expect("the launch prepares");
+
+    let error = protocol_error(
+        finished(start(&daemon, prepared))
+            .await
+            .expect_err("the daemon refuses the repeat"),
+    );
+
+    assert_eq!(error.code, protocol::SESSION_REQUEST_CONFLICT_CODE);
+    assert_eq!(
+        error.recover.as_deref(),
+        conflict().recover.as_deref(),
+        "a local rerun replays, so a conflict there gets no remote explanation"
+    );
+    inhibitor.release().await;
 }
 
 #[tokio::test]

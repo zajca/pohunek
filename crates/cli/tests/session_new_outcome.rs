@@ -3,7 +3,8 @@
 //! The built CLI creates a session on a fixture daemon that never answers the
 //! `session.new` request, as a daemon still running a slow create hook does.
 //! The CLI must report the timeout with the caller's way to find the session
-//! the daemon may still create.
+//! the daemon may still create. The keyed create, whose capability check adds a
+//! request under the same deadline, runs on a paused clock in the CLI crate.
 
 #![cfg(unix)]
 
@@ -27,7 +28,7 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Runs `session new` against a daemon that never answers it and returns the
 /// recovery hint of the timeout error.
-fn recover_after_no_reply(extra_args: &[&str]) -> String {
+fn recover_after_no_reply() -> String {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let root = env.root().to_path_buf();
     for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -55,7 +56,6 @@ fn recover_after_no_reply(extra_args: &[&str]) -> String {
             REQUEST_TIMEOUT_MS,
             "--json",
         ])
-        .args(extra_args)
         .output()
         .expect("run pohunek session new");
 
@@ -71,7 +71,7 @@ fn recover_after_no_reply(extra_args: &[&str]) -> String {
 
 #[test]
 fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
-    let recover = recover_after_no_reply(&[]);
+    let recover = recover_after_no_reply();
 
     assert!(
         recover.contains("pass `--request-id <id>` on the first create"),
@@ -89,20 +89,6 @@ fn a_session_new_without_a_reply_reports_how_to_find_the_session() {
     assert!(
         recover.contains("can create a second session"),
         "an unkeyed create warns that a retry may duplicate: {recover}"
-    );
-}
-
-#[test]
-fn a_keyed_session_new_without_a_reply_names_its_request_id() {
-    let recover = recover_after_no_reply(&["--request-id", "launch-1014"]);
-
-    assert!(
-        recover.contains("retry with the same `--request-id launch-1014`"),
-        "{recover}"
-    );
-    assert!(
-        !recover.contains("can create a second session"),
-        "a keyed retry cannot duplicate: {recover}"
     );
 }
 
@@ -131,18 +117,6 @@ fn serve_connection(stream: UnixStream) {
                 "status": "ok",
                 "daemon_version": "fixture",
                 "protocol_version": PROTOCOL_VERSION.get()
-            }),
-            protocol::method::HOST_INSPECT => json!({
-                "daemon_version": "fixture",
-                "protocol_version": PROTOCOL_VERSION.get(),
-                "supported_agents": ["shell"],
-                "runtimes": [],
-                "git_available": true,
-                "worktree_supported": true,
-                "terminal_read_supported": true,
-                "output_read_supported": true,
-                "session_wait_supported": true,
-                "session_new_request_id_supported": true
             }),
             // The create is still running; the reply never comes.
             protocol::method::SESSION_NEW => continue,
