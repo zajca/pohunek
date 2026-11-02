@@ -4956,7 +4956,9 @@ async fn a_killed_real_claude_background_shell_is_recorded_for_the_hold_limit() 
     );
     assert_eq!(after["pid"], pid, "{after}");
     eprintln!(
-        "P2.3 RESULT: a main Stop followed the killed shell within {RECORD_WINDOW:?}: {followed}"
+        "P2.3 RESULT ({}): a main Stop followed the killed shell within {RECORD_WINDOW:?}: \
+         {followed}",
+        real_claude_banner().trim()
     );
 
     fixture.stop(&id).await;
@@ -4991,9 +4993,10 @@ async fn the_locked_real_claude_monitor_tool_is_recorded() {
     let declared = lists_tool("Monitor");
     let named = bodies.iter().any(|body| body.contains("Monitor"));
     eprintln!(
-        "P2.2 RESULT: the Monitor tool is declared to the model: {declared}; the name appears \
-         anywhere in the request: {named}. This fixture's configuration decides both: it points \
-         Claude at a loopback endpoint and switches non-essential traffic off."
+        "P2.2 RESULT ({}): the Monitor tool is declared to the model: {declared}; the name \
+         appears anywhere in the request: {named}. This fixture's configuration decides both: it \
+         points Claude at a loopback endpoint and switches non-essential traffic off.",
+        real_claude_banner().trim()
     );
 
     fixture.stop(&id).await;

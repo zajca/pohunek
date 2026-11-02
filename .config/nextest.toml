@@ -136,8 +136,8 @@ retries = 0
 # message naming what it awaited before nextest kills the test. Measured on the
 # locked releases: the slowest real-upstream test takes 21 s on a warm local
 # host (claude_package), and the whole CI test step, compile included, took
-# 96-98 s in the claude-package job (ci.yml runs of 2026-10-12). If all 16
-# real-Claude tests hung, they would take 48 minutes plus nextest's kill grace
+# 96-98 s in the claude-package job (ci.yml runs of 2026-10-12). If all 19
+# real-Claude tests hung, they would take 57 minutes plus nextest's kill grace
 # period, leaving the rest of the claude-package job's 65-minute timeout (which
 # cancels a job before nextest writes its report) to setup, about 2 minutes
 # with a warm build cache; the other package jobs keep 30 minutes for fewer
@@ -146,6 +146,15 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.package.junit]
 path = "junit.xml"
+
+# The two record-only real-Claude tests print their result as a `RESULT` line
+# and assert nothing about it. The line is shown in the job log without
+# --nocapture and kept in the JUnit report, which stores no success output
+# unless asked to.
+[[profile.package.overrides]]
+filter = 'package(=pohunek-cli) and binary(=all) and test(/^claude_package::(a_killed_real_claude_background_shell_is_recorded_for_the_hold_limit|the_locked_real_claude_monitor_tool_is_recorded)$/)'
+success-output = "immediate"
+junit.store-success-output = true
 
 # The macOS lane: one `cargo nextest archive --profile macos` and one run from
 # that archive per job (scripts/test-partitions run-macos and check-macos).

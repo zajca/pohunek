@@ -27,6 +27,11 @@
 //! the main turn that launched or resumed the agent ends, and runs its `Stop`
 //! hooks, only once the test opens that gate.
 //!
+//! A user turn that carries [`BACKGROUND_SHELL_MARKER`] is answered with a
+//! `Bash` tool call that runs `while [ ! -e '<gate>' ]; do sleep 0.2; done` in
+//! the background, where `<gate>` is the path after the marker. The shell ends
+//! once the test creates that file.
+//!
 //! The stub never sees a credential: a request may carry only the dummy
 //! [`API_KEY`] in `x-api-key`, and the stub records whether any request carried
 //! an `Authorization` header or another key; a test asserts that none did.
@@ -607,7 +612,8 @@ impl Conversation {
     }
 
     /// The tool call a marked user turn asks for: a last message that carries
-    /// [`BACKGROUND_MARKER`] or [`RESUME_MARKER`] and no tool result. `serial`
+    /// [`BACKGROUND_MARKER`], [`BACKGROUND_SHELL_MARKER`] or [`RESUME_MARKER`]
+    /// and no tool result. `serial`
     /// numbers the call's `tool_use` id.
     fn turn_reply(&self, serial: usize) -> Option<Reply> {
         if self.last.contains(TOOL_RESULT_MARKER) {
