@@ -43,6 +43,7 @@ const DAEMON_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Poll slice of `session wait`, in milliseconds. One slice is a bounded
 /// request; the caller repeats it until its own condition holds.
+// timing-allowed: #1908 8000 is protocol::MAX_SESSION_WAIT_MS, the longest wait the daemon accepts, so it cannot be lengthened
 const WAIT_SLICE_MS: &str = "8000";
 
 /// Number of trailing log bytes printed when a run fails.

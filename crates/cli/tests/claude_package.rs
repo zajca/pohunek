@@ -2434,6 +2434,7 @@ const WORKER_LOG_DIR: &str = "worker/state/pohunek/logs";
 
 /// How long one `session wait` polls before the caller retries, in
 /// milliseconds.
+// timing-allowed: #1908 8000 is protocol::MAX_SESSION_WAIT_MS, the longest wait the daemon accepts, so it cannot be lengthened
 const WAIT_SLICE_MS: &str = "8000";
 
 /// Text that ends the verb of Claude's status line and opens its counters, e.g.
