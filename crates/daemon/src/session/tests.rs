@@ -18935,7 +18935,6 @@ async fn the_detector_launch_name_follows_the_name_each_launch_uses() {
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
     });
