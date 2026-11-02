@@ -6895,3 +6895,45 @@ async fn a_runtime_planned_only_by_detection_with_an_altered_holder_is_refused_w
         .expect("the detecting plan plans the runtime");
     assert_eq!(package.digest, release.1.as_str());
 }
+
+/// The detail of the one refusal of `report`, which carries
+/// [`CODE_RELEASE_CATALOG_UNAVAILABLE`].
+fn catalog_unavailable_detail(report: &EnsureReport) -> &str {
+    assert_eq!(
+        refusal_codes(report),
+        [CODE_RELEASE_CATALOG_UNAVAILABLE],
+        "{:?}",
+        report.refusals
+    );
+    &report.refusals[0].detail
+}
+
+#[test]
+fn a_detection_without_a_trust_anchor_names_the_missing_anchor() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.remove_release();
+
+    let detail = catalog_unavailable_detail(&host.detect_step()).to_owned();
+
+    assert!(detail.contains("no trust anchor"), "{detail}");
+}
+
+#[test]
+fn a_detection_with_an_unsafe_anchor_directory_names_the_anchor_fault() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    fs::set_permissions(host.binary_dir(), fs::Permissions::from_mode(0o775))
+        .expect("make the executable directory group-writable");
+
+    let detail = catalog_unavailable_detail(&host.detect_step()).to_owned();
+
+    assert!(
+        detail.contains("the directory holding the trust anchor is not safe"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("install the release again"),
+        "an anchor fault is not cured by reinstalling: {detail}"
+    );
+}

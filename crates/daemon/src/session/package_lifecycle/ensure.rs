@@ -664,7 +664,7 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
     if detect {
-        detect_targets(release.as_ref(), &mut uses, &mut report)?;
+        detect_targets(inputs, release.as_ref(), &mut uses, &mut report)?;
     }
     let planned = plan_packages(&uses, release.as_ref(), &plan, &mut report)?;
     report.forget_undetected_gaps();
@@ -1750,18 +1750,34 @@ fn report_claim_refusal(report: &mut Report, subject: &str, kind: PackageErrorKi
 
 /// Adds every runtime of the release catalog for this platform and core to
 /// `uses`, so `--detect` judges each one. Without a usable catalog nothing can
-/// be detected, which is a refusal.
+/// be detected, which is a refusal whose detail names why: no trust anchor, an
+/// anchor that cannot be trusted, or a catalog that is missing or refused.
 fn detect_targets(
+    inputs: &EnsureInputs,
     release: Option<&Release<'_>>,
     uses: &mut Uses,
     report: &mut Report,
 ) -> Result<(), EnsureError> {
     let Some(release) = release else {
+        let detail = match &inputs.catalog_trust {
+            CatalogTrust::Absent => "this release has no trust anchor beside the daemon, so its \
+                 runtime catalog cannot be verified and the runtimes cannot be detected; \
+                 install the release again from a build that carries its trust anchor and \
+                 runtime catalog"
+                .to_owned(),
+            CatalogTrust::Invalid(fault) => format!(
+                "the trust anchor beside the daemon cannot be trusted ({fault}), so the \
+                 runtime catalog cannot be verified and the runtimes cannot be detected"
+            ),
+            CatalogTrust::Loaded(_) => "this release has no usable runtime catalog, so the \
+                 runtimes cannot be detected; install the release again from a build that \
+                 carries its runtime catalog"
+                .to_owned(),
+        };
         report.refuse(
             RELEASE_CATALOG_SUBJECT,
             CODE_RELEASE_CATALOG_UNAVAILABLE,
-            "this release has no usable runtime catalog, so the runtimes cannot be detected; \
-             install the release again from a build that carries its runtime catalog",
+            &detail,
         );
         return Ok(());
     };

@@ -622,7 +622,8 @@ impl TrustedDir {
     /// except that an effective-user-owned component may be group-writable when
     /// its group is the one the lookup policy accepts.
     ///
-    /// Only the executable-lookup policy of `shell_env` calls this. The group
+    /// Only the executable-lookup policy of `shell_env` and
+    /// [`Self::open_absolute_executable_dir_ancestor`] call this. The group
     /// comes from [`crate::shell_env::lookup_admin_group`]: macOS `admin` (gid
     /// 80) for a process that is not root, otherwise none. The group write is
     /// never accepted for another group, for others, or for a system-owned
@@ -634,6 +635,23 @@ impl TrustedDir {
     /// Returns [`FsError`] when the path is invalid, missing, or unsafe.
     pub(crate) fn open_absolute_lookup_ancestor(path: impl AsRef<Path>) -> FsResult<Self> {
         Self::open_absolute_ancestor_inner(path.as_ref(), crate::shell_env::lookup_admin_group())
+    }
+
+    /// Validates the directory that holds the running executable with the
+    /// executable-lookup ancestor policy: an effective-user-owned component may be
+    /// group-writable when its group is macOS `admin`.
+    ///
+    /// Callers pass only that directory, to read a file whose integrity cannot
+    /// exceed the executable's own: whoever can rewrite such a file through a
+    /// group-writable ancestor can replace the executable through the same
+    /// ancestor. This is the second and last caller of the lookup policy; every
+    /// other check keeps the strict [`Self::open_absolute_ancestor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] when the path is invalid, missing, or unsafe.
+    pub fn open_absolute_executable_dir_ancestor(path: impl AsRef<Path>) -> FsResult<Self> {
+        Self::open_absolute_lookup_ancestor(path)
     }
 
     fn open_absolute_ancestor_inner(path: &Path, admin_group: Option<u32>) -> FsResult<Self> {

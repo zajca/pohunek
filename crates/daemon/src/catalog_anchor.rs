@@ -12,9 +12,12 @@
 //! The file holds public keys only, so it is not owner-private. The policy is
 //! integrity: the executable's directory chain and the file must not be
 //! writable by anyone but the daemon's user or root, because whoever can
-//! rewrite the anchor can already replace the daemon. On macOS an extended ACL
-//! entry that lets another principal change the file counts as writable. No
-//! environment variable or command-line option selects another file.
+//! rewrite the anchor can already replace the daemon. For that reason the
+//! directory chain may also be group-writable by macOS `admin` when it is
+//! user-owned (the stock Homebrew shape), as the executable lookup allows; the
+//! file policy is unchanged. On macOS an extended ACL entry that lets another
+//! principal change the file counts as writable. No environment variable or
+//! command-line option selects another file.
 
 // Rust guideline compliant 2026-10-05
 
@@ -136,7 +139,7 @@ pub fn load_from_directory(directory: &Path) -> CatalogTrust {
 
 /// The anchor bytes, or `None` when the directory has no anchor file.
 fn read_anchor(directory: &Path, effective_uid: u32) -> Result<Option<Vec<u8>>, AnchorFault> {
-    TrustedDir::open_absolute_ancestor(directory).map_err(|error| match error {
+    TrustedDir::open_absolute_executable_dir_ancestor(directory).map_err(|error| match error {
         FsError::Io { .. } => AnchorFault::Unreadable,
         _ => AnchorFault::UnsafeDirectory,
     })?;

@@ -84,8 +84,11 @@ Homebrew `bin` and `Cellar` (`user:admin 775`). A process running as root never 
 then plant a binary that root runs. Root-owned directories that
 the admin group can write (`/Applications`, an MDM-managed Homebrew) stay
 refused, as does any other group, so the app-bundle command-line tools stay
-unsupported. The rule lives only in the executable lookup; every other trusted
-directory check (stores, locks, package roots) keeps the strict policy. The
+unsupported. The rule applies to the executable lookup and to the directory chain
+of the catalog trust anchor beside the running daemon executable (whoever can
+rewrite that chain can already replace the daemon); every other trusted
+directory check (stores, locks, package roots, the archive verifiers) keeps the
+strict policy. The
 canonical target of a Homebrew link is not pinned, because the keg path crosses
 `Cellar`, which the group can write as well. Intel Homebrew (`/usr/local/bin`
 owned by the user, group `admin`) follows the same rule but is not verified:
@@ -95,7 +98,9 @@ Intel Macs are outside the release scope.
 rename or swap entries that the user or root owns in the user's Homebrew
 directories, or hard-link a file the user or root owns (from the same volume)
 into them, and Pohunek then runs them as the user; no password is needed.
-Entries that account creates are owned by it and stay refused. On a Mac where
+Entries that account creates are owned by it and stay refused. Such an account
+can also replace the catalog trust anchor of a daemon that runs from the
+Homebrew prefix, which adds nothing beyond replacing the daemon. On a Mac where
 the user is the only admin this adds no principal; `dscl . -read /Groups/admin
 GroupMembership` also lists `root` and the macOS Setup Assistant account
 `_mbsetupuser`, and neither is another admin account in this sense. A host with several admins

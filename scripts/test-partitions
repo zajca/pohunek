@@ -86,13 +86,14 @@ MACOS_RUN_SETS = {"run-macos": LANE_SET, "run-macos-tier": TIER_SET}
 Bucket = collections.namedtuple("Bucket", "packages expression")
 MACOS_BUCKETS = {
     # Run as root in the sudo step of the lane (APFS foreign-owner refusal and
-    # the root-owned admin-group lookup directory refusal).
+    # the root-owned admin-group lookup directory refusal and the catalog
+    # anchor directory refusal under root).
     "root": Bucket(
         ("pohunek-platform",),
         "package(=pohunek-platform) and "
         "(test(=filesystem::tests::apfs_foreign_owned_private_directory_is_rejected) or "
         "(binary(=executable_trust_root) and "
-        "(test(=root_never_trusts_an_admin_group_writable_directory) or test(=root_built_fixtures_are_judged_by_an_unprivileged_process))))",
+        "(test(=root_never_trusts_an_admin_group_writable_directory) or test(=root_never_reads_the_anchor_through_an_admin_group_writable_directory) or test(=root_built_fixtures_are_judged_by_an_unprivileged_process))))",
     ),
     # Child images that only a parent test starts with `--ignored --exact`.
     "fixture": Bucket(
