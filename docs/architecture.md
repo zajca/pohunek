@@ -1971,7 +1971,9 @@ Durability tiers (honest about limits):
    no verdict carries `runtime.loss_cause` instead (never both): a worker
    records the user manager that started it (`MANAGERPID`, only when it is the
    worker's parent) in its journal as `worker_manager`, and the daemon names
-   `user_manager_lost` when that process is gone within the recorded boot, or
+   `user_manager_lost` when that process is gone within the recorded boot (the
+   manager took its cgroup tree with it, so the loss ends the session `failed`
+   even when the marker sweep could not confirm every process), or
    `host_restarted` when the host booted again. The wire fields are additive
    (no protocol bump; protocol 3 peers receive neither) and a persisted-shape
    change in the store (store schema 15, a no-op migration from 14). A lost runtime that is

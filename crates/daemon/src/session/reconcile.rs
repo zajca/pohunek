@@ -116,11 +116,20 @@ const CONFLICT: Unavailability = Unavailability::Other(RuntimeState::Conflict);
 /// The proof and loss reason of a worker whose job ended and was retired.
 ///
 /// A sweep that could not confirm every marked process gone leaves processes
-/// that may survive, so that loss is not proven to end the session.
-fn ended_loss(journaled: bool, cleanup: Cleanup) -> (LossProof, &'static str) {
+/// that may survive, so that loss is not proven to end the session. A user
+/// manager proven gone within the recorded boot ends the whole cgroup tree it
+/// held, so that cause stands in for the sweep.
+fn ended_loss(
+    journaled: bool,
+    cleanup: Cleanup,
+    loss_cause: Option<LossCause>,
+) -> (LossProof, &'static str) {
     match (journaled, cleanup) {
         (false, _) => (LossProof::Ended, "worker_unavailable"),
         (true, Cleanup::Complete) => (LossProof::Ended, RUNTIME_LOST),
+        (true, Cleanup::Unconfirmed) if loss_cause == Some(LossCause::UserManagerLost) => {
+            (LossProof::Ended, RUNTIME_LOST)
+        }
         (true, Cleanup::Unconfirmed) => (LossProof::Unproven, RUNTIME_LOST_CLEANUP_UNCONFIRMED),
     }
 }
@@ -1902,7 +1911,7 @@ impl SessionRegistry {
                     return Box::pin(self.settle_ended_stop(record, Some(&generation), retry))
                         .await;
                 }
-                let (proof, reason) = ended_loss(journaled, cleanup);
+                let (proof, reason) = ended_loss(journaled, cleanup, loss_cause);
                 let committed = self
                     .insert_ended_record(record, reason, proof, exit, loss_cause)
                     .await;
@@ -2346,7 +2355,7 @@ impl SessionRegistry {
                 if retired.is_err() {
                     (RECONNECTING, SUPERVISION_UNAVAILABLE)
                 } else {
-                    let (proof, reason) = ended_loss(journaled, cleanup);
+                    let (proof, reason) = ended_loss(journaled, cleanup, loss_cause);
                     (
                         Unavailability::lost(proof, exit).with_loss_cause(loss_cause),
                         reason,
@@ -15786,6 +15795,51 @@ generation "$1"
             assert_eq!(runtime.exit, None, "a loss cause never rides with an exit");
         }
 
+        /// The user manager that held the worker is gone, so its cgroup tree
+        /// is too: a sweep that cannot read every marker does not keep the
+        /// loss unproven.
+        #[tokio::test]
+        async fn a_gone_user_manager_ends_the_session_although_the_sweep_is_unconfirmed() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let _marked = Marked::spawn(&fixture.root, "runtime-s-4236");
+            persist_record(&fixture.root, "s-4236", Some("runtime-s-4236"));
+            let (manager_pid, manager_start) = dead_worker();
+            write_journal_record(
+                &fixture.root,
+                "s-4236",
+                "worker-s-4236",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4236"),
+                |journal| {
+                    journal.boot_identity = current_boot_identity();
+                    journal.boot_session_id = HostInspector::new().boot_session_id().ok();
+                    journal.worker_manager = Some(pohunek_session_worker::WorkerManager {
+                        pid: manager_pid,
+                        start_identity: manager_start.to_string(),
+                    });
+                },
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-4236".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
+        }
+
         /// A manager that still runs explains nothing, so the loss stays
         /// unexplained rather than blamed on it.
         #[tokio::test]
@@ -25046,7 +25100,7 @@ generation "$1"
                     memory_peak_bytes: None,
                     ended_at: None,
                 }),
-                loss_cause: None,
+                loss_cause: Some("user_manager_lost".to_owned()),
             });
             store.record_session(&record).expect("store failed+lost");
             let registry = upgraded_registry(
@@ -25071,6 +25125,10 @@ generation "$1"
             );
             assert_eq!(runtime.loss_reason, None);
             assert_eq!(runtime.exit, None, "a live runtime carries no exit");
+            assert_eq!(
+                runtime.loss_cause, None,
+                "a live runtime carries no loss cause"
+            );
             assert_eq!(session.state, protocol::SessionState::Running);
             worker.server_task.abort();
             drop(worker.reporter);
