@@ -245,6 +245,31 @@ impl Harness {
         .await
     }
 
+    /// Restarts the daemon like [`Self::restart`], with the notification inbox
+    /// and the attention debounce coordinator the daemon binary attaches.
+    pub(crate) async fn restart_with_debounced_notifications(self) -> Self {
+        let surviving = self.shut_down().await;
+        Self::start_over_with(surviving, Inbox::Debounced).await
+    }
+
+    /// Starts a durable daemon with the attention debounce coordinator, so a
+    /// restart on the same root keeps the sessions and the notification inbox.
+    pub(crate) async fn start_durable_with_debounced_notifications() -> Self {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        Self::serve(
+            env,
+            Arc::new(SubprocessWorkerLauncher::new()),
+            DaemonSpec {
+                catalog_trust: CatalogTrust::Absent,
+                worker_executable: worker_binary(),
+                inbox: Inbox::Debounced,
+                durable: true,
+                reconcile: false,
+            },
+        )
+        .await
+    }
+
     /// Stops this daemon's server and returns what survives it. The daemon's
     /// workers keep running, as they do when the daemon process exits.
     pub(crate) async fn shut_down(self) -> Surviving {
@@ -263,13 +288,18 @@ impl Harness {
     /// Starts a durable daemon over the surviving environment that adopts the
     /// workers already running on its root.
     pub(crate) async fn start_over(surviving: Surviving) -> Self {
+        Self::start_over_with(surviving, Inbox::Absent).await
+    }
+
+    /// [`Self::start_over`] with the notification inbox `inbox`.
+    async fn start_over_with(surviving: Surviving, inbox: Inbox) -> Self {
         Self::serve(
             surviving.env,
             surviving.launcher,
             DaemonSpec {
                 catalog_trust: CatalogTrust::Absent,
                 worker_executable: worker_binary(),
-                inbox: Inbox::Absent,
+                inbox,
                 durable: true,
                 reconcile: true,
             },

@@ -227,6 +227,7 @@ fn record(id: &str, created_at: &str) -> serde_json::Value {
         turn_started_at: None,
         turn_duration_ms: None,
         session_metadata: BTreeMap::new(),
+        hook_admitted: false,
     })
     .expect("record JSON")
 }

@@ -33,9 +33,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant as StdInstant};
 
 use futures::StreamExt;
-use protocol::{
-    NotificationId, NotificationKind, NotificationRecord, NotificationSource, SessionTurnEventKind,
-};
+use protocol::{NotificationId, NotificationKind, NotificationRecord, SessionTurnEventKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::time::DelayQueue;
@@ -340,7 +338,7 @@ fn defer(
         && inbox
         && record.kind == protocol::NotificationKind::TurnCompleted
         && is_turn_dedupe_key(&dedupe_key)
-        && source_priority(&record.source) != SourcePriority::Projector
+        && source_priority(&record) != SourcePriority::Projector
         && (repeats_reported_turn
             || recently_resolved_turns
                 .remove(&dedupe_key)
@@ -362,8 +360,7 @@ fn defer(
     // inbox record re-arms the timer only while no inbox candidate is pending.
     // Reports of one turn merge; reports of other turns are other entries.
     let key = (dedupe_key, turn);
-    let foreign_at =
-        (source_priority(&record.source) != SourcePriority::Projector).then_some(minted);
+    let foreign_at = (source_priority(&record) != SourcePriority::Projector).then_some(minted);
     let (existing_inbox, existing_signal, existing_generation, existing_foreign) =
         match pending.remove(&key) {
             Some(entry) => (
@@ -542,7 +539,7 @@ async fn flush(
         let repeat_window = entry.repeat_window;
         let repeats_reported_turn = entry.inbox.as_ref().is_some_and(|record| {
             record.kind == protocol::NotificationKind::TurnCompleted
-                && source_priority(&record.source) != SourcePriority::Projector
+                && source_priority(record) != SourcePriority::Projector
                 && record
                     .session_id
                     .as_ref()
@@ -680,12 +677,12 @@ fn turn_kind(kind: NotificationKind) -> Option<SessionTurnEventKind> {
 /// equal priority takes the incoming record so a fresh report refreshes the
 /// pending payload.
 fn outranks(existing: &NotificationRecord, incoming: &NotificationRecord) -> bool {
-    priority_rank(&existing.source) > priority_rank(&incoming.source)
+    priority_rank(existing) > priority_rank(incoming)
 }
 
-/// Rank a source's priority for pending-buffer conflict resolution.
-fn priority_rank(source: &NotificationSource) -> u8 {
-    match source_priority(source) {
+/// Rank a record's priority for pending-buffer conflict resolution.
+fn priority_rank(record: &NotificationRecord) -> u8 {
+    match source_priority(record) {
         SourcePriority::Projector => 0,
         SourcePriority::User => 1,
         SourcePriority::Provider => 2,

@@ -343,8 +343,13 @@ without sharing a producer-specific source id. Within the policy's attention
 dedupe window, provider hook records outrank daemon projector records for the
 same session attention key, and while reports are held pending in the debounce
 window a provider hook record outranks a user or external record. A provider
-ranks as a hook provider exactly when a registered hook schema lists it as an
-identity provider (today `shell`, `codex`, `claude`, `hermes`, and `muse`).
+ranks as a hook provider when a registered hook schema lists it as an identity
+provider (today `shell`, `codex`, `claude`, `hermes`, and `muse`) or when the
+daemon marked the record as an admitted hook claim (below).
+A create from a package runtime's own id for a session of that runtime is a hook
+claim too when the runtime's hook schema admits it: the daemon stores it with
+`hook_admitted: true` and it ranks as a hook provider; otherwise it is stored as
+a plain report, not refused.
 A create from a hook provider for a session id the daemon neither holds nor is
 launching is refused with `hook_not_admitted`, so no provider-ranked record exists for an id
 that cannot be checked against a hook schema; creates from other producers are

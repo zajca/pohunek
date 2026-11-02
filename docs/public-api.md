@@ -2594,13 +2594,16 @@ Event sources:
 - `turn_completed`, `agent_blocked`, and `approval_required` come from two
   trusted producers only: provider hook reports through `notification.create`
   with the `turn:<session_id>` or `attention:<session_id>` dedupe key, from a
-  provider with a hook schema (Claude, Codex, Hermes) whose report the
-  session's runtime admits, for a session this daemon holds (the worker relays
-  its hook socket reports the same way); and the daemon projector's
-  `agent_blocked` for a detected blocked activity and its `turn_completed` for
-  a session whose activity goes from `working` to `idle`. A create from any other
-  producer, or naming a session the daemon does not hold, is handled by the
-  inbox only and records no turn event. Trusted signals are recorded whether or
+  provider with a hook schema (Claude, Codex, Hermes, Muse) or a held
+  session's own runtime whose report the session's runtime admits, for a session
+  this daemon holds (the worker relays its hook socket reports the same way);
+  and the daemon projector's `agent_blocked` for a detected blocked activity and
+  its `turn_completed` for a session whose activity goes from `working` to
+  `idle`. A create from any other producer, or from a hook provider for a
+  session whose launch is still in flight, is handled by the inbox only and
+  records no turn event; a hook-provider create for any other session the
+  daemon does not hold is refused with `hook_not_admitted` (see hook
+  admission above). Trusted signals are recorded whether or
   not the notification policy keeps an inbox record. With the default policy,
   `turn_completed` is disabled for the inbox, so `notification.create` still
   answers `notification_kind_disabled` and no record is listed, yet the turn
@@ -3616,6 +3619,11 @@ Important fields:
   notifications use `turn:<session_id>`.
 - `read_at`, `acked_at`, `archived_at`, `deleted_at`: lifecycle timestamps set
   by status transitions.
+- `hook_admitted`: optional boolean, omitted when false. `true` when the daemon
+  admitted the create as a hook claim of its session's runtime (see the source
+  ranking below). Older clients ignore it. The notification store records this
+  with format 2; a daemon reads format 1 stores unchanged, ranks their
+  records without the key by provider name, and rewrites the marker to 2.
 - `turn_started_at`, `turn_duration_ms`, `session_metadata`: optional, on a
   `turn_completed` that the daemon stamps: the projector's, and a provider hook
   report that attaches to a turn the session's current agent runs.
@@ -3758,14 +3766,28 @@ Policy is enforced daemon-side for all notification producers. If a producer
 creates a disabled kind, `notification.create` returns
 `runtime/notification_kind_disabled`.
 
-A source ranks as a provider hook exactly when its `provider` is an identity
-provider of a registered hook schema (today `shell`, `codex`, `claude`, and
-`hermes`, matched case-sensitively). These are the providers whose
-session-scoped `notification.create` reports are checked against the session's
-hook schema; that admission additionally admits a session's own runtime, which
-does not change its rank. `pohunek` and `daemon` rank as daemon projectors.
-Every other producer, including a runtime that no hook schema lists, ranks as a
-user/external source.
+A record ranks as a provider hook when the daemon admitted its create as a hook
+claim (the record's `hook_admitted`, below), or when its `provider` is an
+identity provider of a registered hook schema (today `shell`, `codex`, `claude`,
+`hermes`, and `muse`, matched case-sensitively), which is the rank of a
+session-less create from those providers and of a record stored before the
+marker existed. `pohunek` and `daemon` rank as daemon projectors. Every other
+producer ranks as a user/external source.
+
+`hook_admitted` is set by the daemon alone, never by a producer: a key a create
+carries for it is ignored. A session-scoped create from a listed hook provider
+is checked against the session's hook schema and refused when it is not
+admitted. A session-scoped create whose `provider` is the id of the held
+session's own runtime, spelled verbatim, and which that runtime's hook schema
+admits, is a hook claim too: it is stored with `hook_admitted: true`, ranks as a
+provider hook, upgrades the projector's attention record in place, and is a turn
+signal like a listed provider's. Such a create that is not admitted (the runtime
+names no schema or the schema does not admit the action, the name only
+normalizes to the runtime id, the session is unknown, or the runtime is another
+session's) is no hook claim and is not refused: it is stored unmarked and ranks
+as a user/external source. With `retryable_admission: true`, a runtime whose
+worker could not report its schema in time answers `hook_schema_unavailable`
+like a listed provider does.
 
 Provider hooks have higher source priority than daemon projectors for the same
 `attention:<session_id>` key inside `attention_dedupe_window_secs`. Every

@@ -35,11 +35,12 @@ const NOTIFICATIONS_COMPACTION_NAME: &str = "notifications.jsonl.tmp";
 /// ignore the file, and a build that meets a newer value stops using the store.
 const FORMAT_FILE_NAME: &str = "format.json";
 
-/// Format of the notification action log and policy this build reads and writes.
+/// Format of the notification action log and policy this build writes; it
+/// reads this format and every earlier one.
 ///
 /// Raise it, together with a snapshot in `format_guard`, when a key or enum
 /// value of `StoreAction`, `NotificationRecord` or `NotificationPolicy` changes.
-pub(crate) const NOTIFICATIONS_FORMAT_VERSION: u32 = 1;
+pub(crate) const NOTIFICATIONS_FORMAT_VERSION: u32 = 2;
 
 /// File name of the durable notification policy.
 ///
@@ -450,7 +451,7 @@ impl NotificationStore {
 
         if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
             let incoming_created_at = parse_timestamp(&candidate.created_at)?;
-            let incoming_priority = source_priority(&candidate.source);
+            let incoming_priority = source_priority(&candidate);
             for existing in state.records.values().cloned() {
                 if !matches!(
                     existing.status,
@@ -465,7 +466,7 @@ impl NotificationStore {
                 {
                     continue;
                 }
-                let existing_priority = source_priority(&existing.source);
+                let existing_priority = source_priority(&existing);
                 match (incoming_priority, existing_priority) {
                     (SourcePriority::Provider, SourcePriority::Projector) => {
                         let updated = upgrade_projector(existing, &candidate);
@@ -936,7 +937,7 @@ fn note_contribution(
     id: &str,
     minted: Instant,
 ) {
-    if source_priority(&candidate.source) != SourcePriority::Projector {
+    if source_priority(candidate) != SourcePriority::Projector {
         let newest = state.contributions.entry(id.to_owned()).or_insert(minted);
         *newest = (*newest).max(minted);
     }
@@ -1041,6 +1042,7 @@ fn upgrade_projector(
     existing.source_id.clone_from(&replacement.source_id);
     existing.dedupe_key.clone_from(&replacement.dedupe_key);
     existing.project_id.clone_from(&replacement.project_id);
+    existing.hook_admitted = replacement.hook_admitted;
     existing.superseded_by = None;
     existing
 }
@@ -1106,11 +1108,21 @@ fn unreadable_policy(dir: &Path) -> Result<Option<String>, NotificationError> {
         .map(|error| error.to_string()))
 }
 
-/// Writes the format marker atomically when it is missing.
+/// Writes the format marker atomically when it is missing or names an older
+/// format than this build writes.
+///
+/// A marker that is present was checked by [`unsupported_format`] to be
+/// readable and not newer than this build.
 fn write_format_marker(dir: &Path) -> Result<(), NotificationError> {
     let path = dir.join(FORMAT_FILE_NAME);
     if path.exists() {
-        return Ok(());
+        let content =
+            fs::read_to_string(&path).map_err(|source| NotificationError::io(&path, source))?;
+        let current = serde_json::from_str::<FormatMarker>(&content)
+            .is_ok_and(|marker| marker.format_version >= NOTIFICATIONS_FORMAT_VERSION);
+        if current {
+            return Ok(());
+        }
     }
     let temp_path = dir.join("format.json.tmp");
     let mut file = owner_private_write_options()
@@ -1364,7 +1376,57 @@ mod tests {
             turn_started_at: None,
             turn_duration_ms: None,
             session_metadata: BTreeMap::new(),
+            hook_admitted: false,
         }
+    }
+
+    /// The daemon's `hook_admitted` marker is what ranks a runtime's own
+    /// report: it survives a reopen of the store, a projector report inside
+    /// the window then leaves the record alone, and a projector record is
+    /// upgraded in place by an admitted report.
+    #[test]
+    fn an_admitted_hook_claim_keeps_its_rank_across_a_reopen() {
+        let data_dir = temp_data_dir("hook-admitted-rank");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+
+        let mut projector = record("n-1", "2026-07-03T10:00:00Z");
+        projector.kind = NotificationKind::AgentBlocked;
+        projector.source.provider = "pohunek".to_owned();
+        projector.dedupe_key = Some("moment".to_owned());
+        store
+            .create_or_dedupe(projector, 120, std::time::Instant::now())
+            .expect("store the projector record");
+
+        let mut own = record("n-2", "2026-07-03T10:00:05Z");
+        own.kind = NotificationKind::AgentBlocked;
+        own.source.provider = "pi".to_owned();
+        own.dedupe_key = Some("moment".to_owned());
+        own.hook_admitted = true;
+        let outcome = store
+            .create_or_dedupe(own, 120, std::time::Instant::now())
+            .expect("store the admitted report");
+        let super::CreateOutcome::Updated(upgraded) = outcome else {
+            panic!("the projector record is upgraded in place: {outcome:?}");
+        };
+        assert_eq!(upgraded.id.0, "n-1");
+        assert!(upgraded.hook_admitted);
+        drop(store);
+
+        let reopened = NotificationStore::open(&data_dir).expect("reopen store");
+        let mut later = record("n-3", "2026-07-03T10:00:10Z");
+        later.kind = NotificationKind::AgentBlocked;
+        later.source.provider = "pohunek".to_owned();
+        later.dedupe_key = Some("moment".to_owned());
+        let outcome = reopened
+            .create_or_dedupe(later, 120, std::time::Instant::now())
+            .expect("store the later projector report");
+        let super::CreateOutcome::Existing(kept) = outcome else {
+            panic!("the later projector report is dropped: {outcome:?}");
+        };
+        assert_eq!(kept.id.0, "n-1");
+        assert_eq!(kept.source.provider, "pi");
+        assert!(kept.hook_admitted);
+        assert_eq!(reopened.all().len(), 1);
     }
 
     #[test]

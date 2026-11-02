@@ -180,6 +180,7 @@ fn notification_record() -> NotificationRecord {
         turn_started_at: None,
         turn_duration_ms: None,
         session_metadata: BTreeMap::new(),
+        hook_admitted: false,
     }
 }
 

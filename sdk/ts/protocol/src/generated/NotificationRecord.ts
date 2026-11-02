@@ -142,4 +142,14 @@ export type NotificationRecord = {
    * Set only by the daemon on `turn_completed` records.
    */
   session_metadata?: { [key in string]: string };
+  /**
+   * Whether the daemon admitted the create as a hook report of the linked
+   * session's runtime.
+   *
+   * Additive: an older daemon omits it, and an older client ignores it. Set
+   * only by the daemon after hook admission; a producer cannot supply it.
+   * An admitted record ranks above user and projector records of the same
+   * session moment.
+   */
+  hook_admitted?: boolean;
 };

@@ -385,6 +385,76 @@ async fn a_healthy_store_writes_the_format_marker_and_stays_available() {
         .expect("the format marker is written");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&marker).expect("marker json"),
-        serde_json::json!({"format_version": 1})
+        serde_json::json!({"format_version": 2})
+    );
+}
+
+/// A store a format-1 build wrote opens as it is: its marker is rewritten to
+/// the current format, and a record without the `hook_admitted` key still
+/// ranks by its provider name, so a projector report inside the dedupe window
+/// does not displace it.
+#[tokio::test]
+async fn a_format_1_store_opens_keeps_its_ranking_and_moves_to_format_2() {
+    let env = TestEnv::new().expect("create short test environment");
+    let created_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format the timestamp");
+    let legacy = serde_json::json!({
+        "action": "created",
+        "record": {
+            "id": "n-legacy",
+            "source": {
+                "provider": "hermes",
+                "provider_event": "PermissionRequest",
+                "host_local_source_id": "hermes-hook-1"
+            },
+            "kind": "agent_blocked",
+            "severity": "action_required",
+            "status": "unread",
+            "title": "Approval required",
+            "body": "",
+            "metadata": {},
+            "created_at": created_at,
+            "dedupe_key": "legacy-moment"
+        }
+    });
+    let log = format!("{legacy}\n");
+    let layout = Layout::new(
+        &env,
+        &[
+            ("format.json", b"{\"format_version\":1}\n"),
+            ("notifications.jsonl", log.as_bytes()),
+        ],
+    );
+
+    let mut daemon = daemon_command(&env, &layout).spawn().expect("spawn daemon");
+    wait_until_ready(&mut daemon, &layout.socket()).await;
+    let mut client = pohunek_client::Client::connect_local(&layout.socket())
+        .await
+        .expect("connect to the daemon");
+    let mut projector = create_params();
+    projector.source.provider = "pohunek".to_owned();
+    projector.kind = NotificationKind::AgentBlocked;
+    projector.dedupe_key = Some("legacy-moment".to_owned());
+    let reported = client
+        .call::<method::NotificationCreate>(projector)
+        .await
+        .expect("the format-1 store is available");
+    assert_eq!(reported.record.id.0, "n-legacy", "{reported:?}");
+    let listed = client
+        .call::<method::NotificationList>(NotificationListParams::default())
+        .await
+        .expect("the store lists");
+    assert_eq!(listed.notifications.len(), 1, "{listed:?}");
+    assert_eq!(listed.notifications[0].source.provider, "hermes");
+    drop(client);
+    daemon.kill().await.expect("stop daemon");
+    let _ = daemon.wait().await;
+
+    let marker = std::fs::read_to_string(layout.notifications.join("format.json"))
+        .expect("the format marker is kept");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&marker).expect("marker json"),
+        serde_json::json!({"format_version": 2})
     );
 }
