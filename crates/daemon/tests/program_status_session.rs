@@ -90,7 +90,7 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// reports working, `d` done, `b` blocked and `q` exits; `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
-/// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
+/// an `id` and a `title`, then a bare `clear`). In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
 /// transcript bullet that only looks like one, above the prompt box.
@@ -144,7 +144,6 @@ run() {{
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
-    m) printf 'SYNC\r\n' ;;
     q) exit 0 ;;
   esac
 }}
@@ -570,8 +569,10 @@ async fn a_restated_record_emits_no_agent_state() {
 
 /// The child records of a Claude background agent never change what the
 /// session reads: they do not turn a held root `done` working. A child record
-/// that dropped the held record is not observable here: the idle reading the
-/// screen would give is debounced, and the held record is not on the wire.
+/// that dropped the held root record is not observed here, because the idle
+/// reading the screen would then give is debounced and the held record is not
+/// on the wire; `a_child_record_never_changes_the_root_record` in
+/// `program_status_detector.rs` guards that direction at the detector.
 #[tokio::test]
 async fn a_background_agents_child_records_never_change_the_session_activity() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -604,26 +605,23 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
         "only the root `done` changes the activity"
     );
 
-    // The marker line is drawn after the child records in the same stream, so
-    // once it is visible the detector has seen them.
+    // A root `blocked` record is the only way to read blocked, so waiting for
+    // it orders the detector after the child records before it; a child record
+    // read as a root `working` would have published an edge first.
     command(&fixture, b'c');
     command(&fixture, b'x');
-    command(&fixture, b'm');
-    wait_until("the marker line to be drawn", || async {
-        let screen = fixture.registry.screen(&created.id).await.ok()?;
-        screen
-            .visible_lines
-            .iter()
-            .any(|line| line.contains("SYNC"))
-            .then_some(())
-    })
-    .await;
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
     assert_eq!(
-        fixture.activity(&created.id).await,
-        Some((AgentActivity::Idle, StateSource::OscProgress)),
-        "the child records leave the held root `done` in place"
+        agent_states(&mut events).len(),
+        1,
+        "the child records over a held root `done` add no edge before the root `blocked`"
     );
-    assert_eq!(agent_states(&mut events).len(), 0);
     fixture
         .registry
         .stop(&created.id)
