@@ -27,6 +27,11 @@
 //! the main turn that launched or resumed the agent ends, and runs its `Stop`
 //! hooks, only once the test opens that gate.
 //!
+//! A user turn that carries [`BACKGROUND_SHELL_MARKER`] is answered with a
+//! `Bash` tool call that runs `while [ ! -e '<gate>' ]; do sleep 0.2; done` in
+//! the background, where `<gate>` is the path after the marker. The shell ends
+//! once the test creates that file.
+//!
 //! The stub never sees a credential: a request may carry only the dummy
 //! [`API_KEY`] in `x-api-key`, and the stub records whether any request carried
 //! an `Authorization` header or another key; a test asserts that none did.
@@ -108,6 +113,11 @@ pub(crate) const BACKGROUND_PROMPT: &str = "background job: reply with one word"
 /// Name of the tool the background reply calls: the name Claude Code 2.1.289
 /// and 2.1.296 declare.
 pub(crate) const BACKGROUND_TOOL: &str = "Agent";
+
+/// Prompt text that makes the stub answer with a `Bash` call that runs in the
+/// background until the file named after the marker (one space, then the
+/// absolute path) exists.
+pub(crate) const BACKGROUND_SHELL_MARKER: &str = "[bg-shell]";
 
 /// Prompt text that makes the stub answer with a message to a background
 /// agent; the agent id follows the marker after one space.
@@ -602,7 +612,8 @@ impl Conversation {
     }
 
     /// The tool call a marked user turn asks for: a last message that carries
-    /// [`BACKGROUND_MARKER`] or [`RESUME_MARKER`] and no tool result. `serial`
+    /// [`BACKGROUND_MARKER`], [`BACKGROUND_SHELL_MARKER`] or [`RESUME_MARKER`]
+    /// and no tool result. `serial`
     /// numbers the call's `tool_use` id.
     fn turn_reply(&self, serial: usize) -> Option<Reply> {
         if self.last.contains(TOOL_RESULT_MARKER) {
@@ -619,6 +630,17 @@ impl Conversation {
                 }),
             });
         }
+        if let Some(gate) = background_shell_gate(&self.last) {
+            return Some(Reply::Tool {
+                id: format!("{TOOL_USE_PREFIX}{serial}"),
+                name: "Bash",
+                input: serde_json::json!({
+                    "command": format!("while [ ! -e '{gate}' ]; do sleep 0.2; done"),
+                    "description": "Wait for the gate file",
+                    "run_in_background": true,
+                }),
+            });
+        }
         let target = resume_target(&self.last)?;
         Some(Reply::Tool {
             id: format!("{RESUME_TOOL_USE_PREFIX}{serial}"),
@@ -630,6 +652,19 @@ impl Conversation {
             }),
         })
     }
+}
+
+/// The gate path after [`BACKGROUND_SHELL_MARKER`] and one space in `text`; it
+/// ends at the first character that cannot be part of a plain absolute path.
+fn background_shell_gate(text: &str) -> Option<&str> {
+    let (_before, after) = text.split_once(BACKGROUND_SHELL_MARKER)?;
+    let path = after.strip_prefix(' ')?;
+    let end = path
+        .find(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-'))
+        })
+        .unwrap_or(path.len());
+    (end > 0 && path.starts_with('/')).then(|| &path[..end])
 }
 
 /// The agent id after [`RESUME_MARKER`] and one space in `text`.

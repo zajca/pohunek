@@ -2707,6 +2707,64 @@ impl Fixture {
         .expect("write settings.json");
     }
 
+    /// Lets Claude run `Bash` without an approval prompt, by adding the tool to
+    /// the allow list of the fixture's Claude settings.
+    fn allow_bash(&self) {
+        let path = self.claude_home.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings.json"))
+                .expect("settings.json is JSON");
+        settings["permissions"] = serde_json::json!({ "allow": ["Bash"] });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&settings).expect("settings JSON"),
+        )
+        .expect("write settings.json");
+    }
+
+    /// The kinds of the session's background items, in the snapshot's order;
+    /// none when the session holds no snapshot.
+    async fn background_kinds(&self, id: &str) -> Vec<String> {
+        self.inspect(id).await["background"]["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| json_scalar(&item["kind"]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Starts a session that runs a background shell until `gate` exists, and
+    /// returns once the main turn's `Stop` listed the shell.
+    async fn launch_background_shell(&self, name: &str, gate: &Path) -> String {
+        assert!(
+            gate.to_str()
+                .is_some_and(|path| path.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+                })),
+            "the stub reads a plain gate path: {}",
+            gate.display()
+        );
+        let id = self.new_session_id(name).await;
+        self.wait_activity(&id, "idle").await;
+        self.input(
+            &id,
+            &format!(
+                "{} {}",
+                messages_stub::BACKGROUND_SHELL_MARKER,
+                gate.display()
+            ),
+        )
+        .await;
+        wait_until("the background shell in the snapshot", || async {
+            (self.background_kinds(&id).await == ["shell"]).then_some(())
+        })
+        .await;
+        id
+    }
+
     /// The inventory entry `host inspect local` reports for `profile`.
     async fn inventory_entry(&self, profile: &str) -> Value {
         let (code, host) = self.harness.json(&["host", "inspect", "local"]).await;
@@ -4803,6 +4861,143 @@ async fn a_real_claude_background_agent_without_its_stop_is_settled_by_the_main_
             .then_some(())
     })
     .await;
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// A background shell that ends is dropped from the session's snapshot by the
+/// main `Stop` of the turn its task notification starts, so the idle-stop hold
+/// of #495 ends without a user turn (design row P2.1). The stub answers the
+/// prompt with a `Bash` call that runs in the background until a gate file
+/// exists; the test creates the file.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_background_shell_leaves_the_snapshot_at_the_next_main_stop() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    fixture.allow_bash();
+    let gate = fixture.harness.env.root().join("shell.gate");
+    let id = fixture.launch_background_shell("bg-shell", &gate).await;
+    let pid = fixture.inspect(&id).await["pid"].clone();
+
+    fs::write(&gate, "").expect("open the gate");
+    wait_until("the snapshot to drop the ended shell", || async {
+        fixture.background_kinds(&id).await.is_empty().then_some(())
+    })
+    .await;
+    let after = fixture.inspect(&id).await;
+    assert_eq!(after["runtime"]["state"], "live", "{after}");
+    assert_eq!(after["pid"], pid, "{after}");
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// How long the record-only scenarios watch for a main `Stop` that never comes.
+const RECORD_WINDOW: Duration = Duration::from_secs(30);
+
+/// Record only (design row P2.3): whether a background shell that is killed
+/// from outside is dropped
+/// from the snapshot by a following main `Stop`. The result is printed as
+/// `P2.3 RESULT`; the scenario asserts nothing about it, because a missing
+/// `Stop` is the documented limit of the hold (it lasts until the next main
+/// `Stop`, an owner exit or the runtime end), not a failure.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_killed_real_claude_background_shell_is_recorded_for_the_hold_limit() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    fixture.allow_bash();
+    let gate = fixture.harness.env.root().join("killed.gate");
+    let id = fixture.launch_background_shell("bg-kill", &gate).await;
+    let pid = fixture.inspect(&id).await["pid"].clone();
+
+    let needle = gate.display().to_string();
+    let mut killed = 0;
+    for entry in fs::read_dir("/proc").expect("read /proc").flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(command) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let command = String::from_utf8_lossy(&command);
+        if command.contains(&needle) && command.contains("while") {
+            let status = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .expect("run kill");
+            assert!(status.success(), "kill {pid}");
+            killed += 1;
+        }
+    }
+    assert!(killed > 0, "the background shell's process was found");
+
+    // timing-allowed: #495 record-only window for a main Stop that may never come
+    let followed = tokio::time::timeout(
+        RECORD_WINDOW,
+        wait_until("the snapshot to drop the killed shell", || async {
+            fixture.background_kinds(&id).await.is_empty().then_some(())
+        }),
+    )
+    .await
+    .is_ok();
+    let after = fixture.inspect(&id).await;
+    assert_eq!(
+        after["runtime"]["state"], "live",
+        "an empty snapshot is a main Stop's only if the runtime lives: {after}"
+    );
+    assert_eq!(after["pid"], pid, "{after}");
+    eprintln!(
+        "P2.3 RESULT ({}): a main Stop followed the killed shell within {RECORD_WINDOW:?}: \
+         {followed}",
+        real_claude_banner().trim()
+    );
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Record only (design row P2.2): whether the locked Claude declares a
+/// `Monitor` tool to the model. A monitor scenario needs the tool's input
+/// schema, which the request carries; the result is printed as `P2.2 RESULT`.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn the_locked_real_claude_monitor_tool_is_recorded() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    let id = fixture.new_session_id("monitor-probe").await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture.input(&id, PROMPT).await;
+    wait_until("the prompt's request", || async {
+        (fixture.stub.requests_with_prompt(PROMPT) >= 1).then_some(())
+    })
+    .await;
+    let bodies = fixture.stub.bodies_containing(PROMPT);
+    let lists_tool = |tool: &str| {
+        bodies
+            .iter()
+            .any(|body| body.contains(&format!("\"name\":\"{tool}\"")))
+    };
+    // `Bash` is declared by every Claude Code release, so a request that does
+    // not show it means the probe cannot read the tool list.
+    assert!(lists_tool("Bash"), "the probe reads the declared tools");
+    let declared = lists_tool("Monitor");
+    let named = bodies.iter().any(|body| body.contains("Monitor"));
+    eprintln!(
+        "P2.2 RESULT ({}): the Monitor tool is declared to the model: {declared}; the name \
+         appears anywhere in the request: {named}. This fixture's configuration decides both: it \
+         points Claude at a loopback endpoint and switches non-essential traffic off.",
+        real_claude_banner().trim()
+    );
 
     fixture.stop(&id).await;
     fixture.finish().await;
