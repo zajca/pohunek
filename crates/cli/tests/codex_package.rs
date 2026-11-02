@@ -2207,6 +2207,7 @@ const PROMPT: &str = "say hi";
 
 /// How long one `session wait` polls before the caller retries, in
 /// milliseconds.
+// timing-allowed: #1908 8000 is protocol::MAX_SESSION_WAIT_MS, the longest wait the daemon accepts, so it cannot be lengthened
 const WAIT_SLICE_MS: &str = "8000";
 
 /// Looks `name` up on `PATH` the way the daemon resolves a program.
