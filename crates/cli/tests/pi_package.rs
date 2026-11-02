@@ -2105,6 +2105,9 @@ async fn launch_and_converse(fixture: &Fixture) -> (String, String, PathBuf) {
     // the idle editor rule of the real screen.
     let idle = fixture.wait_activity(&id, "idle").await;
     assert_eq!(idle["state_source"], recorded_source(), "{idle}");
+    // The pohunek name reached Pi as `--name e2e`: its footer shows it.
+    fixture.wait_screen_line(&id, "\u{2022} e2e").await;
+    assert_eq!(fixture.stub.started(), 0, "no model request yet");
 
     // Input: bracketed paste then a separate submit; the stub holds the reply
     // so the working rule is on screen.
