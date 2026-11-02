@@ -892,9 +892,10 @@ impl RuntimeDefinition {
     }
 
     /// The arguments that hand a session named `name` to the agent, from
-    /// `[naming] launch_args`; empty for a runtime that declares none.
+    /// `[naming] launch_args`: empty for a runtime that declares none, `None`
+    /// when the pair form withholds a dash-leading name.
     #[must_use]
-    pub fn naming_args(&self, name: &str) -> Vec<String> {
+    pub fn naming_args(&self, name: &str) -> Option<Vec<String>> {
         self.naming.render(name)
     }
 

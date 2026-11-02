@@ -169,17 +169,16 @@ impl SessionRegistry {
 }
 
 /// The session name a launch under `name` hands to the agent: the validated
-/// name when the runtime declares `[naming]` and the name passes the
-/// session-name rule, else `None`. This is the name [`naming_args`] renders.
+/// name when the runtime declares `[naming]`, the name passes the session-name
+/// rule and the arguments do not withhold it, else `None`. This is the name
+/// [`naming_args`] renders.
 pub(super) fn launch_name(
     definition: Option<&RuntimeDefinition>,
     name: Option<&str>,
 ) -> Option<Arc<str>> {
-    if !definition?.declares_naming() {
-        return None;
-    }
+    let definition = definition.filter(|definition| definition.declares_naming())?;
     match validate_session_name(name) {
-        Ok(Some(name)) => Some(Arc::from(name)),
+        Ok(Some(name)) => definition.naming_args(&name).map(|_| Arc::from(name)),
         Ok(None) | Err(_) => None,
     }
 }
@@ -187,13 +186,20 @@ pub(super) fn launch_name(
 /// The `[naming]` arguments of a launch of `id` under `name`.
 ///
 /// A stored name that no longer passes the session-name rule omits the group:
-/// a record written before the rule existed must still launch.
+/// a record written before the rule existed must still launch. So does a name
+/// the arguments withhold (a dash-leading name in the pair form).
 fn naming_args(definition: &RuntimeDefinition, name: Option<&str>, id: &SessionId) -> Vec<String> {
     let Some(name) = name else {
         return Vec::new();
     };
     match validate_session_name(Some(name)) {
-        Ok(Some(name)) => definition.naming_args(&name),
+        Ok(Some(name)) => definition.naming_args(&name).unwrap_or_else(|| {
+            warn!(
+                session_id = %id.0,
+                "the session name starts with a dash, which the agent's naming arguments would read as an option; launching without them"
+            );
+            Vec::new()
+        }),
         Ok(None) => Vec::new(),
         Err(error) => {
             warn!(

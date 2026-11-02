@@ -19034,6 +19034,60 @@ async fn the_detector_launch_name_follows_the_name_each_launch_uses() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
+/// The pair form withholds a dash-leading name, so the detector's launch name
+/// only ever holds a name the agent received.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_withheld_dash_leading_name_leaves_the_detector_launch_name_unset() {
+    let dir = temp_dir("launch-name-pi");
+    let script = dir.join("pi-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "launch-name-pi",
+        "named-pi",
+        &format!(
+            "base = \"{}\"\n{}program = \"{}\"\n",
+            crate::agent::host::fixture::PI_SHAPED_ID,
+            crate::agent::host::fixture::pi_shaped_profile_pin(),
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_naming_host(
+            &script,
+            crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        ),
+    );
+    for (name, expected) in [
+        ("Refactor auth", Some("Refactor auth")),
+        ("--offline", None),
+    ] {
+        let created = registry
+            .create(SessionNewParams {
+                agent: "named-pi".to_owned(),
+                name: Some(name.to_owned()),
+                cwd: Some(dir.clone()),
+                ..params()
+            })
+            .await
+            .expect("create a named Pi session");
+        assert_eq!(
+            running_detector_config(&registry, &created.id)
+                .await
+                .launch_name
+                .as_deref(),
+            expected,
+            "{name}"
+        );
+        registry.stop(&created.id).await.expect("stop the session");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects() {

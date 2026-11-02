@@ -202,12 +202,32 @@ launch_args = ["--name={session_name}"]
 ```
 
 The table holds 1 to 8 tokens. Exactly one token holds the `{session_name}`
-placeholder, and it ends a `-<flag>=` token (`--name={session_name}`): the name
-is joined into that one element, so a name that starts with a dash is never
-parsed as an option. A bare `{session_name}`, the space-separated form, text
-after the placeholder, a second placeholder, `{reference}` and any other brace
-are `descriptor_invalid`, as is the placeholder in `runtime.args` or the resume
-and fork templates. The diagnostic never reflects a token.
+placeholder, in one of two shapes:
+
+- Joined: it ends a `-<flag>=` token (`--name={session_name}`). The name is
+  joined into that one element, so a name that starts with a dash is never
+  parsed as an option.
+- Pair: it is the whole token directly after a flag token
+  (`["--name", "{session_name}"]`, the flag matching `^--?[A-Za-z0-9][A-Za-z0-9-]*$`),
+  for an agent that reads the flag's value from the next element only. The name
+  is a separate element there, so core omits the whole group for a name that
+  starts with `-` and logs a WARN with the session id (never the name); the
+  agent never sees a name it could read as an option, and the detector's launch
+  name is unset for that launch.
+
+A bare placeholder as the first token or after `--`, `-`, a joined flag or a
+non-flag token, text after the placeholder, a second placeholder, `{reference}`
+and any other brace are `descriptor_invalid`, as is the placeholder in
+`runtime.args` or the resume and fork templates. The diagnostic never reflects a
+token.
+
+A package that declares the pair form must show, for the lock minimum and the
+locked release, that the flag consumes the next element whatever it holds, that
+no argument scan outside the parser matches a value that does not start with a
+dash, that the flag exists at the lock minimum (the version probe enforces the
+minimum on create, resume and fork), where the agent persists or shows the name,
+and that its detection manifest holds with a marker-like name wherever the name
+is drawn. [Pi package](pi-package.md#session-name) records this for Pi.
 
 The arguments are rendered at every launch from the name that launch uses and
 are never frozen into the resume snapshot: a new session uses its `name`, a

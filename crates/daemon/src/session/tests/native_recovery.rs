@@ -44,6 +44,7 @@ pub(super) fn codex_host_with_handler(
 id = "pohunek.runtime.codex"
 version = "1.0.0"
 runtime_api = 1
+requires = ["naming-launch-args-v1"]
 
 [runtime]
 id = "codex"
@@ -57,6 +58,9 @@ prompt_arg = true
 bracketed_paste = true
 submit_delay_ms = 0
 text_policy = "unrestricted"
+
+[naming]
+launch_args = ["--name", "{{session_name}}"]
 
 [resume]
 supported = true
@@ -111,6 +115,11 @@ pub(super) struct Rig {
 
 impl Rig {
     pub(super) async fn new(tag: &str, verified_launch: bool) -> Self {
+        Self::named(tag, verified_launch, None).await
+    }
+
+    /// [`Rig::new`] for a session created with the display `name`.
+    pub(super) async fn named(tag: &str, verified_launch: bool, name: Option<&str>) -> Self {
         let dir = temp_dir(tag);
         let commands_path = dir.join("commands.fifo");
         let commands = hook_gate(&commands_path);
@@ -163,6 +172,7 @@ impl Rig {
         let session = registry
             .create(SessionNewParams {
                 agent: "codex".to_owned(),
+                name: name.map(str::to_owned),
                 cwd: Some(dir),
                 ..params()
             })

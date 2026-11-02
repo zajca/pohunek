@@ -119,7 +119,7 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
     match &definition.binding().provenance {
         BindingProvenance::Package { package, .. } => {
             assert_eq!(package.id.as_str(), PACKAGE_ID);
-            assert_eq!(package.version.as_str(), "1.0.5");
+            assert_eq!(package.version.as_str(), "1.1.0");
         }
         other @ BindingProvenance::Builtin { .. } => {
             panic!("a package-served runtime, got {other:?}")
@@ -134,6 +134,15 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
         InputReadiness::ScreenIdle,
         "the idle editor frame, not the bracketed-paste enable, shows readiness"
     );
+
+    // Pi reads its name as the next element of `--name`: the pair form hands
+    // it over as two elements and withholds a name that starts with a dash.
+    assert!(definition.declares_naming());
+    assert_eq!(
+        definition.naming_args("Refactor auth"),
+        Some(vec!["--name".to_owned(), "Refactor auth".to_owned()])
+    );
+    assert_eq!(definition.naming_args("--offline"), None);
 
     assert_eq!(
         definition.native_reference_strategy(),
@@ -998,6 +1007,53 @@ fn every_screen_rendered_at_every_terminal_width_is_classified_without_error() {
             fixture.name
         );
     }
+}
+
+/// Names that look like the marks the manifest reads: a braille spinner and
+/// its message, the working footer, a rule and dialog hint words.
+const MARKER_NAMES: [&str; 4] = [
+    "\u{280B} Working...",
+    "esc to interrupt",
+    "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+    "\u{2191}\u{2193} navigate \u{00B7} enter select \u{00B7} esc cancel",
+];
+
+/// Pi draws the session name in the footer after the working directory
+/// (`<pwd> \u{2022} <name>`) and cuts the line to the terminal width. A name that
+/// looks like a mark of the manifest never changes what an idle editor frame
+/// reads as, at any recorded width, whole or cut.
+#[test]
+fn a_footer_holding_a_marker_like_name_leaves_an_idle_screen_idle() {
+    let definition = installed_definition();
+    let mut checked = 0;
+    for fixture in width_fixtures()
+        .into_iter()
+        .filter(|fixture| fixture.expected == AgentActivity::Idle)
+    {
+        let footer = fixture.rows.len() - 2;
+        let pwd = fixture.rows[footer].clone();
+        assert!(
+            !pwd.starts_with('\u{2500}'),
+            "{}: the footer row",
+            fixture.name
+        );
+        for name in MARKER_NAMES {
+            let mut rows = fixture.rows.clone();
+            rows[footer] = format!("{pwd} \u{2022} {name}")
+                .chars()
+                .take(usize::from(fixture.columns))
+                .collect();
+            assert_eq!(
+                activity_at(&definition, &rows, fixture.columns),
+                Some(AgentActivity::Idle),
+                "{} with the name {name:?}: {:?}",
+                fixture.name,
+                rows[footer]
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 100, "idle screens checked: {checked}");
 }
 
 #[test]
@@ -2049,6 +2105,9 @@ async fn launch_and_converse(fixture: &Fixture) -> (String, String, PathBuf) {
     // the idle editor rule of the real screen.
     let idle = fixture.wait_activity(&id, "idle").await;
     assert_eq!(idle["state_source"], recorded_source(), "{idle}");
+    // The pohunek name reached Pi as `--name e2e`: its footer shows it.
+    fixture.wait_screen_line(&id, "\u{2022} e2e").await;
+    assert_eq!(fixture.stub.started(), 0, "no model request yet");
 
     // Input: bracketed paste then a separate submit; the stub holds the reply
     // so the working rule is on screen.
