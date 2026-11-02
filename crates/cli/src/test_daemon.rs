@@ -2,7 +2,9 @@
 //!
 //! It answers `daemon.health` on every connection and holds the reply to the
 //! first other request until the test releases it, so a scenario on a paused
-//! clock decides when the daemon answers.
+//! clock decides when the daemon answers. A fixture started with a capability
+//! snapshot also answers `host.inspect` itself, so the held request is the one
+//! after the capability check.
 
 use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, PROTOCOL_VERSION};
@@ -35,6 +37,16 @@ impl HeldDaemon {
     /// Binds the fixture on a private socket; `result` answers the lifecycle
     /// request once released.
     pub(crate) fn start(result: Value) -> Self {
+        Self::bind(result, None)
+    }
+
+    /// Like [`Self::start`], and `host.inspect` is answered with `inspect`
+    /// instead of being held.
+    pub(crate) fn start_answering_inspect(result: Value, inspect: Value) -> Self {
+        Self::bind(result, Some(inspect))
+    }
+
+    fn bind(result: Value, inspect: Option<Value>) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let socket = env
             .socket_path("daemon.sock")
@@ -63,6 +75,7 @@ impl HeldDaemon {
                     stream,
                     connection == 0,
                     result.clone(),
+                    inspect.clone(),
                     received_tx.clone(),
                     std::sync::Arc::clone(&release_rx),
                 ));
@@ -107,6 +120,7 @@ async fn serve_connection(
     stream: UnixStream,
     shared: bool,
     result: Value,
+    inspect: Option<Value>,
     received: mpsc::UnboundedSender<Received>,
     release: std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>,
 ) {
@@ -124,6 +138,9 @@ async fn serve_connection(
                 "daemon_version": "fixture",
                 "protocol_version": PROTOCOL_VERSION.get()
             })
+        } else if let (protocol::method::HOST_INSPECT, Some(inspect)) = (request.method(), &inspect)
+        {
+            inspect.clone()
         } else {
             let held = release.lock().await.take();
             let id = request.id().to_owned();

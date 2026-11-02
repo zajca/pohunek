@@ -3326,6 +3326,11 @@ async fn a_real_claude_turn_is_reported_through_program_status_records() {
 /// The reply an attached terminal sends for the probe it saw in the replay.
 const CLIENT_PROBE_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
 
+/// The printable part of [`CLIENT_PROBE_REPLY`] as it would appear in a request
+/// body. The bare digits `7501` also occur in the random hex of a request (the
+/// user and session ids), so the search needs the `;?` that hex cannot contain.
+const CLIENT_PROBE_REPLY_TEXT: &str = "]7501;?";
+
 impl Fixture {
     /// Opens an attach stream on the session and returns its data connection,
     /// the way an attached terminal client does.
@@ -3413,7 +3418,10 @@ async fn an_attached_clients_probe_reply_never_reaches_a_real_claude() {
         "the turn reached the model"
     );
     assert!(
-        fixture.stub.bodies_containing("7501").is_empty(),
+        fixture
+            .stub
+            .bodies_containing(CLIENT_PROBE_REPLY_TEXT)
+            .is_empty(),
         "no part of the client's reply reached the model"
     );
     fixture.stop(&id).await;
