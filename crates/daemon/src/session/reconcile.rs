@@ -15189,6 +15189,7 @@ generation "$1"
                 runtime.loss_reason.as_deref(),
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
+            assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
         }
 
         #[tokio::test]
@@ -15995,6 +15996,11 @@ generation "$1"
                     Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
                     "{tag}"
                 );
+                assert_eq!(
+                    runtime.loss_cause.as_deref(),
+                    Some("user_manager_lost"),
+                    "{tag}"
+                );
                 assert!(marked.alive(), "{tag}: a failed sweep signals nothing");
             }
         }
@@ -16056,6 +16062,78 @@ generation "$1"
             assert_eq!(runtime.state, RuntimeState::Lost);
             assert_eq!(runtime.loss_cause.as_deref(), Some("host_restarted"));
             assert_eq!(runtime.exit, None);
+        }
+
+        /// A loss that startup reconciliation commits reaches the notification
+        /// projector, which is running before the registry reconciles. It is
+        /// reported once, and a restart that loads the same lost record again
+        /// reports nothing.
+        #[tokio::test]
+        async fn a_loss_committed_at_startup_is_reported_once_across_restarts() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_record(&fixture.root, "s-4240", Some("runtime-s-4240"));
+            write_journal_record(
+                &fixture.root,
+                "s-4240",
+                "worker-s-4240",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4240"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+            let reported = || {
+                notifications
+                    .list(protocol::NotificationListParams::default())
+                    .expect("list notifications")
+                    .notifications
+            };
+
+            // The first start: the projector subscribes before the registry
+            // reconciles, as the daemon starts them.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("first start");
+            projector.stop().await;
+            let records = reported();
+            assert_eq!(records.len(), 1, "{records:#?}");
+            assert_eq!(records[0].title, "Session crashed");
+            assert_eq!(records[0].body, "Lost when the host restarted");
+            assert_eq!(
+                records[0].metadata.get("loss_cause").map(String::as_str),
+                Some("host_restarted")
+            );
+
+            // The next start loads the failed record again and a fresh
+            // projector sees its replayed state.
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("second start");
+            projector.stop().await;
+            assert_eq!(reported().len(), 1, "{:#?}", reported());
         }
 
         /// A sweep that settles for many polls logs one `info` summary, however

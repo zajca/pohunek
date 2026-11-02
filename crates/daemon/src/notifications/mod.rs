@@ -196,6 +196,10 @@ const ALLOWED_METADATA_KEYS: &[&str] = &[
     "hook_event_id",
     "matcher",
     "tool_name",
+    "cause",
+    "oom_killer",
+    "memory_peak_bytes",
+    "loss_cause",
 ];
 
 /// Error returned by the daemon notification subsystem.

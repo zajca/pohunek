@@ -1,0 +1,6 @@
+## Unreleased (2026-11-02, one state for a crashed session, #422)
+
+- `SessionInfo::condition()`, `recovery()` and `loss_message()` in `crates/protocol` derive the one client-side state, the recovery outlook and the readable cause from fields every protocol 4 daemon already sends; nothing is added on the wire or in the store. The TypeScript SDK mirrors the rule as `sessionCondition()`.
+- The CLI `STATE` column, a `lost <id>: <cause>; <recovery>` footer line and the `inspect` rows `condition` and `lost` show it. The projector turns a proven loss into the `Error` notification "Session crashed" and an unproven one into "Session runtime lost", once per runtime generation; the notification format is unchanged (the cause rides in the free metadata map).
+- A `runtime_lost` loss discharged by `loss_cause=user_manager_lost` resumes without the fresh sweep that `runtime_lost_cleanup_unconfirmed` requires (documented at the resume row and in the sessions concept page).
+- The projector also reads `session_runtime_lost` events: a loss that startup reconciliation or a running-session classification commits is announced by that event alone, so before this change the projector never saw it. The notification metadata allowlist gains `cause`, `oom_killer`, `memory_peak_bytes` and `loss_cause`.

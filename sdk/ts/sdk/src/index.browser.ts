@@ -14,6 +14,13 @@ export type {
   ObservedProtocolError,
 } from "./error";
 export { CompatError, downgradeRequestParams, upgradeEventPayload, upgradeResult } from "./compat";
+export { sessionCondition } from "./condition";
+export type {
+  SessionCondition,
+  SessionConditionOptions,
+  SessionConditionResult,
+  SessionRecovery,
+} from "./condition";
 export type { CompatFailure } from "./compat";
 export {
   decodeResponse,

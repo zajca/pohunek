@@ -2545,18 +2545,18 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  CWD",
+        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  CWD",
         "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN", "SUBAGENTS", "BACKGROUND",
     );
     for session in sessions {
         let _ = writeln!(
             output,
-            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  {}",
+            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  {}",
             session.id.0,
             name_label(session),
             session_agent_label(session),
             origin_label(session),
-            state_label(session.state),
+            session.condition().as_str(),
             activity_label_option(session.activity),
             state_source_label(session.state_source),
             session.pid,
@@ -2604,6 +2604,15 @@ fn render_list_footer(output: &mut String, sessions: &[SessionInfo]) {
                 capability_refusals_label(refusals)
             );
         }
+        if let Some(message) = session.loss_message() {
+            let _ = writeln!(
+                output,
+                "lost {}: {}; {}",
+                session.id.0,
+                terminal_text(&message),
+                recovery_label(session.recovery(true))
+            );
+        }
         for warning in session
             .warnings
             .iter()
@@ -2617,6 +2626,20 @@ fn render_list_footer(output: &mut String, sessions: &[SessionInfo]) {
                 warning.message
             );
         }
+    }
+}
+
+/// What a crashed session's recovery looks like to an operator.
+fn recovery_label(recovery: Option<protocol::SessionRecovery>) -> String {
+    match recovery {
+        Some(protocol::SessionRecovery::Recoverable) => {
+            "recoverable with session resume".to_owned()
+        }
+        Some(protocol::SessionRecovery::Refused(code)) => {
+            format!("cannot be recovered ({code})")
+        }
+        Some(protocol::SessionRecovery::NoNativeResume) => "no native resume".to_owned(),
+        _ => "recoverable: unknown".to_owned(),
     }
 }
 
@@ -2802,6 +2825,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ("cols", info.cols.to_string()),
         ("rows", info.rows.to_string()),
         ("state", state_label(info.state).to_owned()),
+        ("condition", info.condition().as_str().to_owned()),
         ("activity", activity_label_option(info.activity).to_owned()),
         (
             "state_source",
@@ -2901,6 +2925,14 @@ fn insert_active_agent_rows(rows: &mut Vec<(&'static str, String)>, info: &Sessi
 }
 
 fn append_inspect_details(output: &mut String, info: &SessionInfo, now_ms: u64) {
+    if let Some(message) = info.loss_message() {
+        let _ = writeln!(
+            *output,
+            "lost: {}; {}",
+            terminal_text(&message),
+            recovery_label(info.recovery(true))
+        );
+    }
     // Each non-fatal warning is detailed below the table so a worktree session
     // surfaces exactly what happened and what was done instead.
     for warning in &info.warnings {

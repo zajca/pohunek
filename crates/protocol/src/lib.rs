@@ -25,6 +25,7 @@ mod assistant;
 mod capabilities;
 mod command;
 pub mod compat;
+mod condition;
 mod decimal;
 mod discovery;
 mod doctor;
@@ -55,6 +56,8 @@ pub use assistant::{
 pub use capabilities::{AgentRuntime, HostCapabilities, HostInspectParams};
 #[doc(inline)]
 pub use command::{CommandErrorKind, CommandRunParams, CommandRunResult};
+#[doc(inline)]
+pub use condition::{SessionCondition, SessionRecovery};
 #[doc(inline)]
 pub use decimal::{
     ActivityRevision, BackgroundRevision, DecimalWireError, OutputOffset, ProcessStartIdentity,
