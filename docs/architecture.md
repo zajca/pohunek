@@ -2402,8 +2402,8 @@ Each protocol type has one field policy, kept in the table of
   earlier release, which requires every flag, reads what this one wrote. The six current kinds serialize in declaration order, exactly
   the bytes of the struct it replaces, so neither the notification format nor
   the protocol changes. A new `NotificationKind` value changes the persisted
-  policy shape, so the format guard fails until notification format 2 exists,
-  and it needs the same release rule as any new enum value: a client of an
+  policy shape, so the format guard fails until a new notification format exists
+  (format 3), and it needs the same release rule as any new enum value: a client of an
   earlier release is strict for it.
 - **lenient**: the type carries no `deny_unknown_fields` and no hand-written
   refusal, so both decodes ignore an unknown key. Most param, result and event

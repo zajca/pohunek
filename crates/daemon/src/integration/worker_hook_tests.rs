@@ -25,6 +25,10 @@ use crate::runtime::Worker;
 const SESSION_ID: &str = "s-9101";
 const WORKER_ID: &str = "worker-notify";
 
+/// Body of a held shell session: it stays alive without a `PATH` lookup and
+/// reads no rc file of the host's `$SHELL`.
+const HELD_SESSION_SCRIPT: &str = "exec /bin/sleep 30";
+
 /// Daemon socket served by the real dispatcher; records every request line.
 struct DaemonStub {
     lines: Arc<Mutex<Vec<String>>>,
@@ -55,7 +59,13 @@ impl DaemonStub {
         policy.providers.clear();
         notifications.set_policy(policy).expect("enable all kinds");
         let sessions =
-            crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default());
+            crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig {
+                shell_command: crate::session::ShellCommand::new(
+                    "/bin/sh",
+                    ["-c", HELD_SESSION_SCRIPT],
+                ),
+                ..crate::session::SessionRegistryConfig::default()
+            });
         let held_sessions = sessions.clone();
         let (attention, _task) = crate::notifications::AttentionCoordinator::spawn(
             &crate::shutdown::DaemonShutdown::default(),
@@ -138,6 +148,14 @@ impl DaemonStub {
             .await
             .expect("create the held session");
         created.id.0
+    }
+
+    /// Stops the session [`Self::hold_session`] started.
+    async fn release_session(&self, session: &str) {
+        self.sessions
+            .stop(&protocol::SessionId(session.to_owned()))
+            .await
+            .expect("stop the held session");
     }
 
     fn records(&self) -> Vec<protocol::NotificationRecord> {
@@ -359,6 +377,7 @@ async fn deliver(
     };
     drop(worker);
     task.abort();
+    daemon.release_session(&delivery.session).await;
     delivery
 }
 
@@ -542,6 +561,7 @@ async fn run_hook_with_worker_reply(
         .await
         .expect("run notify hook");
     assert!(output.status.success(), "hook must exit 0");
+    daemon.release_session(&session).await;
     (daemon.request_lines(), daemon.reply_lines())
 }
 

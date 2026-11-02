@@ -23147,43 +23147,75 @@ async fn failed_entry_commit_with_a_confirmed_retire_removes_the_worktree() {
         .await;
 }
 
-/// A hook notification for a session whose create is in flight is admitted
-/// while the launch holds its reservation, and refused again once the create
-/// failed: the id is then neither held nor launching.
+/// Sends one hook `notification.create` for `session` through the public
+/// dispatcher of `state`.
+async fn create_hook_notification(
+    state: &DaemonState,
+    session: &SessionId,
+    source: &str,
+) -> Response {
+    let mut params = hook_notification("codex", session);
+    params["source"]["host_local_source_id"] = serde_json::json!(source);
+    params["source_id"] = serde_json::json!(source);
+    let request =
+        Request::new("hook-window", method::NOTIFICATION_CREATE, params).expect("valid request");
+    let line = serde_json::to_string(&request).expect("request serializes");
+    let crate::api::Dispatch::Reply(reply) = dispatch_line(&line, state, None).await else {
+        panic!("notification.create returns a one-shot reply");
+    };
+    serde_json::from_str(&reply).expect("response deserializes")
+}
+
+/// A hook notification for a session whose create is in flight is accepted
+/// while the launch holds its reservation, and answered `hook_not_admitted`
+/// again once the create failed: the id is then neither held nor launching.
 #[tokio::test]
 async fn a_failed_create_releases_its_hook_admission_reservation() {
     let mut held = HeldWorktreeCreate::start("wt-reservation-failed", "feat/reservation").await;
-    let admit = |registry: &SessionRegistry, id: SessionId| {
-        let registry = registry.clone();
-        async move {
-            registry
-                .admit_held_session_hook(
-                    &id,
-                    pohunek_worker_protocol::HookAction::Notification,
-                    "codex",
-                    "hook notification",
-                    false,
-                )
-                .await
-        }
+    let notifications = crate::notifications::NotificationService::open(
+        &temp_dir("wt-reservation-notifications").join("notifications"),
+    )
+    .expect("notification service opens");
+    let state = DaemonState::new(
+        HealthInfo::new("test"),
+        held.registry.clone(),
+        Arc::new(crate::governance::HostGovernanceService::open_test()),
+        crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
+    )
+    .with_notifications(notifications.clone());
+    let records = || {
+        notifications
+            .list(protocol::NotificationListParams::default())
+            .expect("list notifications")
+            .notifications
     };
-    assert!(
-        admit(&held.registry, held.id.clone()).await.is_ok(),
-        "a launching session admits the hook notification"
-    );
-    assert_eq!(held.registry.launching_for_test(), [held.id.clone()]);
+
+    let admitted = create_hook_notification(&state, &held.id, "window-report")
+        .await
+        .into_result()
+        .expect("a launching session admits the hook notification");
+    assert_eq!(admitted["created"], true, "{admitted}");
+    let stored = records();
+    let [record] = stored.as_slice() else {
+        panic!("the admitted create is stored: {stored:?}");
+    };
+    assert_eq!(record.session_id.as_ref(), Some(&held.id));
 
     held.fail_entry_commit();
     held.release.notify_one();
     held.outcome().await.expect_err("the entry cannot commit");
 
-    assert!(held.registry.launching_for_test().is_empty());
-    assert!(
-        matches!(
-            admit(&held.registry, held.id.clone()).await,
-            Err(super::HookAdmissionError::UnknownSession)
-        ),
-        "the failed create's id is refused again"
+    let refused = create_hook_notification(&state, &held.id, "after-failure")
+        .await
+        .into_result()
+        .expect_err("the failed create's id is refused again");
+    assert_eq!(refused.code, "hook_not_admitted", "{refused:?}");
+    assert_eq!(
+        records().len(),
+        1,
+        "the refused create stores nothing: {:?}",
+        records()
     );
 }
 

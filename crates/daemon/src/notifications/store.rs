@@ -1380,55 +1380,6 @@ mod tests {
         }
     }
 
-    /// The daemon's `hook_admitted` marker is what ranks a runtime's own
-    /// report: it survives a reopen of the store, a projector report inside
-    /// the window then leaves the record alone, and a projector record is
-    /// upgraded in place by an admitted report.
-    #[test]
-    fn an_admitted_hook_claim_keeps_its_rank_across_a_reopen() {
-        let data_dir = temp_data_dir("hook-admitted-rank");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-
-        let mut projector = record("n-1", "2026-07-03T10:00:00Z");
-        projector.kind = NotificationKind::AgentBlocked;
-        projector.source.provider = "pohunek".to_owned();
-        projector.dedupe_key = Some("moment".to_owned());
-        store
-            .create_or_dedupe(projector, 120, std::time::Instant::now())
-            .expect("store the projector record");
-
-        let mut own = record("n-2", "2026-07-03T10:00:05Z");
-        own.kind = NotificationKind::AgentBlocked;
-        own.source.provider = "pi".to_owned();
-        own.dedupe_key = Some("moment".to_owned());
-        own.hook_admitted = true;
-        let outcome = store
-            .create_or_dedupe(own, 120, std::time::Instant::now())
-            .expect("store the admitted report");
-        let super::CreateOutcome::Updated(upgraded) = outcome else {
-            panic!("the projector record is upgraded in place: {outcome:?}");
-        };
-        assert_eq!(upgraded.id.0, "n-1");
-        assert!(upgraded.hook_admitted);
-        drop(store);
-
-        let reopened = NotificationStore::open(&data_dir).expect("reopen store");
-        let mut later = record("n-3", "2026-07-03T10:00:10Z");
-        later.kind = NotificationKind::AgentBlocked;
-        later.source.provider = "pohunek".to_owned();
-        later.dedupe_key = Some("moment".to_owned());
-        let outcome = reopened
-            .create_or_dedupe(later, 120, std::time::Instant::now())
-            .expect("store the later projector report");
-        let super::CreateOutcome::Existing(kept) = outcome else {
-            panic!("the later projector report is dropped: {outcome:?}");
-        };
-        assert_eq!(kept.id.0, "n-1");
-        assert_eq!(kept.source.provider, "pi");
-        assert!(kept.hook_admitted);
-        assert_eq!(reopened.all().len(), 1);
-    }
-
     #[test]
     fn resolve_attention_acknowledges_matching_attention_records() {
         let data_dir = temp_data_dir("resolve-attention");

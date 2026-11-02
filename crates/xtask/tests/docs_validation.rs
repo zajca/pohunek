@@ -241,6 +241,18 @@ fn docs_check_rejects_unicode_space_nested_list_in_prompt_contract() {
     );
 }
 
+#[test]
+fn docs_check_rejects_lone_cr_in_prompt_contract() {
+    let error = validate_docs(source_fixture("prompt-contract-lone-cr"))
+        .expect_err("a lone CR in the contract must be rejected");
+    assert_bundle_issue(
+        "prompt-contract-lone-cr",
+        &error,
+        "prompt_contract",
+        "line 14: the contract holds a carriage return that is not part of a CRLF line ending",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn docs_build_rejects_symlinked_source_file() {

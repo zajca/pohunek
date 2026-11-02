@@ -1094,8 +1094,8 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
         loop {
             let frame = read_frame(&mut attach.stream)
                 .await
-                .expect("read attach frame")
-                .expect("attach stream stays open");
+                .unwrap_or_else(|error| panic!("read attach frame: {error}; {progress}"))
+                .unwrap_or_else(|| panic!("attach stream stays open; {progress}"));
             progress.record(&frame);
             match frame.header().kind {
                 FrameKind::Gap { .. } => progress.gaps += 1,
