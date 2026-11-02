@@ -2354,11 +2354,31 @@ fn check_only_the_stub_is_configured(fixture: &Fixture) {
     );
 }
 
+/// The worker instance and runtime generation `session inspect` reports for
+/// the live runtime of `id`.
+async fn runtime_identity(fixture: &Fixture, id: &str) -> (String, String) {
+    let (code, inspected) = fixture.harness.json(&["session", "inspect", id]).await;
+    assert_eq!(code, 0, "{inspected}");
+    let runtime = &inspected["ok"]["runtime"];
+    (
+        scalar(&runtime["worker_instance_id"]),
+        scalar(&runtime["runtime_generation"]),
+    )
+}
+
 /// A host with the locked Pi launches a session and resumes it after the
 /// daemon restarted: once with the worker still running (the new daemon adopts
-/// it) and once after the session stopped (the new daemon resumes it from Pi's
-/// session file). Only the first turn reaches a model, and that model is the
-/// loopback stub; adoption and resume send none.
+/// the same worker instance and generation) and once after the session stopped
+/// (the new daemon resumes it from Pi's session file in a new worker). Only the
+/// first turn reaches a model, and that model is the loopback stub; adoption
+/// and resume send none.
+///
+/// A restart is `Harness::restart`, not the exit of a `pohunekd` process: the
+/// server, the session registry and the event log are rebuilt, and the new
+/// registry reconciles the durable store against the worker sockets, the worker
+/// journals and the supervisor jobs. The launcher of the first daemon is
+/// carried over as the stand-in for the service manager that outlives a daemon,
+/// so native job inspection is not exercised.
 ///
 /// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`.
 #[tokio::test]
@@ -2379,10 +2399,16 @@ async fn a_real_pi_session_resumes_after_a_daemon_restart() {
     );
 
     // The daemon restarts while Pi runs: the new daemon adopts the session.
+    let before = runtime_identity(&fixture, &id).await;
     let fixture = fixture.restart_daemon().await;
     let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
     assert_eq!(code, 0, "{inspected}");
     assert_eq!(inspected["ok"]["runtime"]["state"], "live", "{inspected}");
+    assert_eq!(
+        runtime_identity(&fixture, &id).await,
+        before,
+        "the new daemon adopted the surviving worker instead of launching another"
+    );
     assert_eq!(inspected["ok"]["native_session_id"], reference.as_str());
     fixture.wait_activity(&id, "idle").await;
     let adopted = fixture.wait_screen_line(&id, PROMPT).await;
@@ -2402,6 +2428,11 @@ async fn a_real_pi_session_resumes_after_a_daemon_restart() {
     let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
     assert_eq!(code, 0, "{resumed}");
     fixture.wait_activity(&id, "idle").await;
+    assert_ne!(
+        runtime_identity(&fixture, &id).await,
+        before,
+        "the resume launched a new worker, so the identity check tells it from adoption"
+    );
     let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
     assert_eq!(code, 0, "{inspected}");
     assert_eq!(

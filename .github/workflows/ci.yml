@@ -2815,7 +2815,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       POHUNEK_PI_E2E: "1"
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
