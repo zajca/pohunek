@@ -100,9 +100,6 @@ pub(super) struct IdleStopState {
     /// Passes of the task that began and that ran to their end.
     #[cfg(test)]
     passes: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
-    /// Stops the task began, whatever their outcome.
-    #[cfg(test)]
-    attempts: std::sync::atomic::AtomicU64,
 }
 
 impl IdleStopState {
@@ -119,8 +116,6 @@ impl IdleStopState {
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
             ),
-            #[cfg(test)]
-            attempts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -456,17 +451,6 @@ impl SessionRegistry {
         passes.0.load(SeqCst) > passes.1.load(SeqCst)
     }
 
-    /// How many stops the idle-stop task has begun. A stop that fails or is
-    /// kept still counts, so a session the task never found due leaves it at
-    /// zero.
-    #[cfg(test)]
-    pub(crate) fn idle_stop_attempts_for_test(&self) -> u64 {
-        self.inner
-            .idle_stop
-            .attempts
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
     /// Makes the next `count` idle stops fail before they begin; `0` stops the
     /// failures.
     #[cfg(test)]
@@ -507,39 +491,6 @@ impl SessionRegistry {
             .insert(IDLE_STOP_METADATA_KEY.to_owned(), value.to_owned());
         drop(sessions);
         self.wake_idle_stop();
-    }
-
-    /// Imports a worker snapshot that lists `items` and the subagent `rows`
-    /// through the same path as the live inspect poll of a Claude worker.
-    ///
-    /// `None` for `items` is a snapshot that holds no background view, which
-    /// clears the held one.
-    #[cfg(test)]
-    pub(crate) async fn import_background_for_test(
-        &self,
-        id: &SessionId,
-        items: Option<Vec<pohunek_worker_protocol::BackgroundItem>>,
-        rows: Vec<pohunek_worker_protocol::SubagentSnapshot>,
-    ) {
-        static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let worker = {
-            let sessions = self.inner.sessions.lock().await;
-            let RuntimeHandle::Worker(worker) = &sessions.get(id).expect("session entry").runtime
-            else {
-                panic!("a worker runtime");
-            };
-            worker.clone()
-        };
-        let mut snapshot = worker.inspect().await.expect("inspect the worker");
-        snapshot.hook_schema = Some("identity-subagent-v1".to_owned());
-        snapshot.subagents = rows;
-        snapshot.background = items.map(|items| pohunek_worker_protocol::BackgroundSnapshot {
-            revision: REVISION.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            observed_at_ms: 1,
-            items,
-        });
-        let outcome = self.apply_worker_metadata_snapshot(id, &snapshot).await;
-        assert_eq!(outcome, super::WorkerMetadataApplyOutcome::Applied);
     }
 
     /// Tells the idle-stop task that a deadline may have moved.
@@ -616,11 +567,6 @@ impl SessionRegistry {
         if self.inner.daemon_shutdown.is_cancelled() {
             return Ok(StopOutcome::Kept);
         }
-        #[cfg(test)]
-        self.inner
-            .idle_stop
-            .attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(test)]
         if self
             .inner

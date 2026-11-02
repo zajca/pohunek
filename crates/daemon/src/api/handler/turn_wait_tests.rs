@@ -40,6 +40,37 @@ const AGENT_LAUNCH: &str = r#"program = "/bin/sh"
 args = ["-c", "printf ready; i=0; while [ $i -lt 2400 ] && sleep 0.05; do i=$((i+1)); if [ -e go ]; then rm -f go; printf tick; fi; done"]
 "#;
 
+/// Name of the host profile whose sessions run [`HOOK_AGENT_SCRIPT`].
+pub(super) const HOOK_AGENT: &str = "hook-agent";
+
+/// A fake Claude agent: it is the PTY root and runs the installed state hook as
+/// its own child for each `hook:<action> <file>` line it reads, with the file as
+/// the hook's input, so the hook reports the agent's own pid. Its script name
+/// contains `claude`, which the worker requires of a reporting process.
+const HOOK_AGENT_SCRIPT: &str = r#"#!/bin/sh
+set -u
+: "${FAKE_AGENT_HOOK:?}" "${FAKE_AGENT_INPUTS:?}"
+printf 'fake-agent ready\n'
+while IFS= read -r line; do
+    case "$line" in
+        hook:*)
+            request="${line#hook:}"
+            action="${request%% *}"
+            input="${request#* }"
+            /bin/sh "$FAKE_AGENT_HOOK" "$action" <"$FAKE_AGENT_INPUTS/$input"
+            printf 'fake-agent ran %s %s\n' "$action" "$input"
+            ;;
+        quit)
+            exit 0
+            ;;
+    esac
+done
+"#;
+
+/// Scheduler rounds a scenario waits for a real hook process or the worker
+/// import that follows it before it reports a stuck run.
+const HOOK_WAIT_ROUNDS: usize = 200_000;
+
 /// Debounce window of the default notification policy.
 pub(super) fn debounce() -> Duration {
     Duration::from_secs(u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS))
@@ -150,6 +181,7 @@ impl Fixture {
             ),
         )
         .expect("write the agent profile");
+        write_hook_agent(root.path(), &agents);
         let sessions = SessionRegistry::new_with_runtimes(
             SessionRegistryConfig {
                 agents_dir: Some(agents),
@@ -228,6 +260,106 @@ impl Fixture {
             )
             .await);
         created["id"].as_str().expect("session id").to_owned()
+    }
+
+    /// Creates a live session that runs the fake Claude agent and returns its
+    /// id once the agent is ready for hooks.
+    pub(super) async fn hook_session(&self, tag: &str) -> String {
+        let cwd = self.cwd(tag);
+        std::fs::create_dir_all(&cwd).expect("create the session working directory");
+        let created = ok(self
+            .call(
+                method::SESSION_NEW,
+                json!({"agent": HOOK_AGENT, "cwd": cwd, "cols": 80, "rows": 24}),
+            )
+            .await);
+        let id = created["id"].as_str().expect("session id").to_owned();
+        self.wait_screen_line(&id, "fake-agent ready").await;
+        id
+    }
+
+    /// Waits until a screen line of `session` contains `needle`, while real PTY
+    /// output arrives on the paused clock.
+    pub(super) async fn wait_screen_line(&self, session: &str, needle: &str) {
+        for _ in 0..HOOK_WAIT_ROUNDS {
+            let screen = ok(self
+                .call(method::SESSION_SCREEN, json!({"session_id": session}))
+                .await);
+            let seen = screen["visible_lines"].as_array().is_some_and(|lines| {
+                lines
+                    .iter()
+                    .any(|line| line.as_str().is_some_and(|line| line.contains(needle)))
+            });
+            if seen {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("no screen line of {session} contains {needle:?}");
+    }
+
+    /// Runs the real Claude state hook `action` in the agent of `session` with
+    /// `payload` on its stdin, and returns once the hook process has exited.
+    pub(super) async fn run_hook(&self, session: &str, action: &str, payload: &Value) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let input = format!("{}.json", NEXT.fetch_add(1, Ordering::Relaxed));
+        std::fs::write(
+            self.root.path().join(HOOK_INPUTS).join(&input),
+            payload.to_string(),
+        )
+        .expect("write the hook input");
+        ok(self
+            .call(
+                method::SESSION_INPUT,
+                json!({"session_id": session, "text": format!("hook:{action} {input}")}),
+            )
+            .await);
+        self.wait_screen_line(session, &format!("fake-agent ran {action} {input}"))
+            .await;
+    }
+
+    /// Reports the activity of the fake Claude agent of `session`, as its
+    /// managed hook does through the daemon socket the fixture does not serve.
+    pub(super) async fn hook_activity(&self, session: &str, activity: &str) {
+        let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
+        let reported = ok(self
+            .call(
+                method::SESSION_REPORT_AGENT,
+                json!({
+                    "session_id": session,
+                    "source": "pohunek:claude",
+                    "agent": HOOK_AGENT,
+                    "activity": activity,
+                    "pid": info["active_agent_pid"],
+                    "agent_session_id": info["active_agent_session_id"],
+                }),
+            )
+            .await);
+        assert_eq!(reported["recorded"], true, "{activity} report: {reported}");
+    }
+
+    /// Waits until `session` publishes a background snapshot of `count` items
+    /// that the daemon read from the worker's hook-fed snapshot. A first empty
+    /// listing publishes no snapshot; `count == 0` then waits for the agent's
+    /// identity.
+    pub(super) async fn wait_listed(&self, session: &str, count: usize) {
+        for _ in 0..HOOK_WAIT_ROUNDS {
+            let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
+            let items = info["background"]["items"].as_array().map(Vec::len);
+            // A first empty listing publishes no snapshot, so the agent's
+            // identity is the only sign that the hooks were imported.
+            let seen = items == Some(count)
+                || (count == 0 && info["background"].is_null() && info["active_agent"] == "claude");
+            if seen {
+                return;
+            }
+            // The daemon reads the worker's snapshot on a timer, which only
+            // the virtual clock moves.
+            settle().await;
+            tokio::time::advance(CLOCK_STEP).await;
+        }
+        let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
+        panic!("{session} never published {count} background items: {info}");
     }
 
     pub(super) fn cwd(&self, tag: &str) -> PathBuf {
@@ -326,6 +458,38 @@ impl Fixture {
             assert_eq!(stopped["stopped"], true, "{session} stops");
         }
     }
+}
+
+/// Directory below the fixture root that holds the fake agent's hook inputs.
+const HOOK_INPUTS: &str = "hook-inputs";
+
+/// Writes the fake Claude agent, the installed state hook it runs and the
+/// profile that launches it over the official Claude package.
+fn write_hook_agent(root: &std::path::Path, agents: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create the agent directory");
+    let inputs = root.join(HOOK_INPUTS);
+    std::fs::create_dir_all(&inputs).expect("create the hook input directory");
+    let agent = bin.join("fake-claude.sh");
+    std::fs::write(&agent, HOOK_AGENT_SCRIPT).expect("write the fake agent");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake agent executable");
+    let hook = crate::integration::runnable_script("claude", "pohunek-agent-state.sh");
+    let path = std::env::var("PATH").expect("the test process has a PATH");
+    std::fs::write(
+        agents.join(format!("{HOOK_AGENT}.toml")),
+        format!(
+            "base = \"claude\"\n{}program = \"{}\"\nargs = []\n\n[env]\n\
+             FAKE_AGENT_HOOK = \"{}\"\nFAKE_AGENT_INPUTS = \"{}\"\nPATH = \"{path}\"\n\n\
+             [input_rules]\nbracketed_paste = false\n",
+            official_profile_pin("claude"),
+            agent.display(),
+            hook.display(),
+            inputs.display(),
+        ),
+    )
+    .expect("write the hook agent profile");
 }
 
 /// The default policy with `enabled` as the per-kind switches of every provider.
