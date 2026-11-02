@@ -1650,9 +1650,10 @@ impl Unavailability {
     /// state it had before.
     ///
     /// A `Lost` classification carries either an exit or a loss cause, never
-    /// both. One without new evidence keeps what a runtime that was already
-    /// lost holds, because the job that held it is gone; every other
-    /// classification drops both.
+    /// both. A runtime that was already lost keeps what it holds unless a new
+    /// exit arrives, because the cause belongs to the loss that was first
+    /// classified and the journal would explain a later restart as another
+    /// loss; every other classification drops both.
     pub(super) fn apply_exit(&self, runtime: &mut SessionRuntime) {
         match self {
             Self::Lost {
@@ -1661,6 +1662,7 @@ impl Unavailability {
                 runtime.exit = Some(exit.clone());
                 runtime.loss_cause = None;
             }
+            Self::Lost { exit: None, .. } if runtime.state == RuntimeState::Lost => {}
             Self::Lost {
                 exit: None,
                 loss_cause: Some(cause),
@@ -1669,11 +1671,6 @@ impl Unavailability {
                 runtime.exit = None;
                 runtime.loss_cause = Some(cause.as_str().to_owned());
             }
-            Self::Lost {
-                exit: None,
-                loss_cause: None,
-                ..
-            } if runtime.state == RuntimeState::Lost => {}
             Self::Lost { .. } | Self::Other(_) => {
                 runtime.exit = None;
                 runtime.loss_cause = None;

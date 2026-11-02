@@ -623,25 +623,44 @@ async fn privileged_a_killed_user_manager_is_the_cause_of_a_lost_runtime() {
 
     let uid = nix::unistd::Uid::effective().as_raw();
     let manager_unit = format!("user@{uid}.service");
-    for arguments in [
-        vec!["systemctl", "kill", "--signal=KILL", manager_unit.as_str()],
-        vec!["systemctl", "start", manager_unit.as_str()],
-    ] {
+    let sudo_systemctl = |arguments: &[&str]| {
         let output = Command::new("sudo")
-            .arg("--non-interactive")
-            .args(&arguments)
+            .args(["--non-interactive", "systemctl"])
+            .args(arguments)
             .output()
             .expect("run sudo systemctl");
         assert_success(&output);
-    }
+    };
+    sudo_systemctl(&["kill", "--signal=KILL", manager_unit.as_str()]);
+    // The kill is asynchronous: start only once the manager unit has ended.
     let deadline = tokio::time::Instant::now() + SYSTEMD_CALL_TIMEOUT;
-    while !Fixture::systemctl_output(["is-system-running"])
-        .status
-        .success()
-    {
+    loop {
+        let active = Command::new("systemctl")
+            .args(["is-active", manager_unit.as_str()])
+            .output()
+            .expect("run systemctl is-active");
+        if String::from_utf8_lossy(&active.stdout).trim() != "active" {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the user manager did not come back"
+            "the killed user manager unit never ended"
+        );
+        // timing-allowed: #326 polls the real system manager for the unit's end, bounded by the explicit deadline above
+        tokio::time::sleep(CONNECT_DELAY).await;
+    }
+    sudo_systemctl(&["start", manager_unit.as_str()]);
+    // A runner whose manager starts `degraded` is as usable as a `running` one.
+    let deadline = tokio::time::Instant::now() + SYSTEMD_CALL_TIMEOUT;
+    loop {
+        let state = Fixture::systemctl_output(["is-system-running"]);
+        let state = String::from_utf8_lossy(&state.stdout).trim().to_owned();
+        if matches!(state.as_str(), "running" | "degraded") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the user manager did not come back (state {state:?})"
         );
         // timing-allowed: #326 polls the restarted real manager, bounded by the explicit deadline above
         tokio::time::sleep(CONNECT_DELAY).await;

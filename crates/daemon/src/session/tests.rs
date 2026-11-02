@@ -31864,6 +31864,26 @@ fn a_loss_records_an_exit_or_a_cause_and_other_states_drop_both() {
     let mut runtime = runtime_with(RuntimeState::Lost, None, Some("user_manager_lost"));
     Unavailability::lost(LossProof::Ended, None).apply_exit(&mut runtime);
     assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
+
+    // A later restart explains nothing about a loss that was already
+    // classified: the stored verdict, the stored cause and a plain loss all
+    // stay as they are.
+    let mut runtime = runtime_with(RuntimeState::Lost, Some(manager_exit()), None);
+    Unavailability::lost(LossProof::Ended, None)
+        .with_loss_cause(Some(LossCause::HostRestarted))
+        .apply_exit(&mut runtime);
+    assert_eq!(runtime.exit, Some(manager_exit()));
+    assert_eq!(runtime.loss_cause, None);
+    let mut runtime = runtime_with(RuntimeState::Lost, None, Some("user_manager_lost"));
+    Unavailability::lost(LossProof::Ended, None)
+        .with_loss_cause(Some(LossCause::HostRestarted))
+        .apply_exit(&mut runtime);
+    assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
+    let mut runtime = runtime_with(RuntimeState::Lost, None, None);
+    Unavailability::lost(LossProof::Ended, None)
+        .with_loss_cause(Some(LossCause::HostRestarted))
+        .apply_exit(&mut runtime);
+    assert_eq!((runtime.exit, runtime.loss_cause), (None, None));
     let mut runtime = runtime_with(RuntimeState::Lost, Some(manager_exit()), None);
     Unavailability::lost(LossProof::Ended, None).apply_exit(&mut runtime);
     assert_eq!(runtime.exit, Some(manager_exit()));

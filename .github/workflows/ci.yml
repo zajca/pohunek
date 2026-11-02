@@ -1501,7 +1501,7 @@ jobs:
 
       - name: Daemon durability on transient units
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1 --skip privileged_
 
       - name: pohunek service transactions
         if: ${{ !cancelled() }}
@@ -1550,6 +1550,15 @@ jobs:
       - name: Workflow event reactions
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'workflow_reactions::'
+
+      # Issue #422: the `privileged_` scenario kills and restarts the runner's
+      # own user manager through `sudo`, so it runs alone and last; every step
+      # above has finished with the original manager.
+      - name: Daemon after the user manager is killed
+        if: ${{ !cancelled() }}
+        env:
+          POHUNEK_PRIVILEGED_E2E: "1"
+        run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1 privileged_
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
