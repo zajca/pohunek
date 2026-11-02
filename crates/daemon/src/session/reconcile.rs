@@ -953,9 +953,12 @@ impl SessionRegistry {
                 // A projected claim is bound or released by a scan that reads
                 // its process, so ask for one.
                 entry.procwatch_rescan.request();
-                let config = reported_detector_config
+                let mut config = reported_detector_config
                     .clone()
                     .unwrap_or_else(|| entry.default_detector_config.clone());
+                // The running configuration carries the generation's launch
+                // name, which a candidate does not.
+                config.launch_name.clone_from(&entry.launch_name);
                 // Reconfiguring restarts detection, so an agent whose
                 // configuration already runs keeps its detector state.
                 if entry.detector_config.borrow().config != config {

@@ -181,8 +181,8 @@ loopback Messages stub, dummy key; scenario
   collision banner. On 2.1.309 the title is the bare name, so a name that starts
   with a turn glyph (`◐ deploy`) would match the `◐`/`◑` title rule. The daemon
   keeps the name its launch gave Claude (`[naming]`) and withholds an OSC title
-  that equals it, or equals it followed by `-` (Claude's rename of a colliding
-  name, `alpha-iterative-muffin`), from manifest evaluation; the raw title
+  that equals it, or starts with it followed by `-` (Claude's rename of a
+  colliding name, `alpha-iterative-muffin`), from manifest evaluation; the raw title
   stays in `session.detection` previews. The comparison is against the whole
   title, so 2.1.289, which puts its own glyph first (`◐ alpha`, `✳ ◐ deploy`),
   keeps its title rules. A `session rename` does not relaunch Claude, so the

@@ -939,8 +939,8 @@ impl ChunkLatch {
     }
 }
 
-/// Whether `title` echoes the launch name: the whole title is the name, or the
-/// name followed by `-` (an agent's rename of a colliding name, such as
+/// Whether `title` echoes the launch name: the whole title is the name, or it
+/// starts with the name followed by `-` (an agent's rename of a colliding name, such as
 /// `alpha-iterative-muffin`).
 ///
 /// Only the whole title is compared. Screen regions are never filtered: a name

@@ -242,6 +242,10 @@ impl SessionRegistry {
             let previous = std::mem::replace(&mut entry.pinned, resolution.pinned);
             rebind_observed_agents(entry, previous.as_ref());
             entry.default_detector_config = resolution.default.clone();
+            entry
+                .default_detector_config
+                .launch_name
+                .clone_from(&entry.launch_name);
             let current = active_snapshot(entry);
             if current == candidate.active {
                 match candidate.active {
