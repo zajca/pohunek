@@ -218,6 +218,13 @@ reference arguments and the prompt argument. A session without a name, or with a
 stored name that fails the session-name rule, launches without the group. A
 host-profile launch gets the group too, so a profile must not pass the same flag.
 
+The daemon keeps the name each launch handed the agent. An agent that echoes it
+as its whole terminal title (or a title that starts with that name followed by `-`, as an
+agent does for a colliding name) reports no state through that title, so the title region is
+withheld from manifest evaluation; screen regions are never filtered, and
+`session.detection` previews keep the raw title. A rename does not relaunch the
+agent, so the kept name changes at the next resume.
+
 The table joins the digest of a built-in descriptor, so the package that adopts
 it changes its digest. A session pinned to the earlier digest resumes and forks
 without the name until it is adopted. A core older than 0.39 refuses the

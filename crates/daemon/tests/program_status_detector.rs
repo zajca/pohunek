@@ -75,6 +75,7 @@ fn fast_detection() -> DetectionConfig {
 
 fn config(manifest: &str, readiness: InputReadiness) -> DetectorConfig {
     DetectorConfig {
+        launch_name: None,
         detection: fast_detection(),
         manifest: Some(Arc::new(
             Manifest::parse_str(manifest).expect("the manifest parses"),

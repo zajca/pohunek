@@ -18918,6 +18918,122 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     registry.stop(&forked.id).await.expect("stop the session");
 }
 
+/// Waits until the detector's `osc_title` preview shows `title`.
+async fn wait_for_title_preview(registry: &SessionRegistry, id: &SessionId, title: &str) {
+    wait_until(&format!("the title preview {title:?}"), || async {
+        let detection = registry.detection(id).await.ok()?;
+        detection
+            .previews
+            .iter()
+            .any(|preview| preview.region == "osc_title" && preview.text == title)
+            .then_some(())
+    })
+    .await;
+}
+
+/// The detector's launch name is the name each launch hands the agent: a
+/// rename does not relaunch, so it keeps the launch name until the next resume
+/// re-renders it from the current name, and a launch without a name has none.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_detector_launch_name_follows_the_name_each_launch_uses() {
+    let dir = temp_dir("launch-name-claude");
+    let claude_home = dir.join("claude-home");
+    let transcripts = claude_home.join("projects/fixture");
+    std::fs::create_dir_all(&transcripts).expect("create Claude transcript store");
+    std::fs::write(transcripts.join("native-live.jsonl"), "{}\n")
+        .expect("write Claude source transcript");
+    let script = dir.join("naming-agent");
+    // The agent echoes the name it was launched with as its terminal title.
+    write_executable(
+        &script,
+        "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    --name=*) printf '\\033]0;%s\\007' \"${argument#--name=}\" ;;\n  esac\ndone\nsleep 30\n",
+    );
+    let agents_dir = temp_agents_dir_with(
+        "launch-name-claude",
+        "named",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script.display(),
+            claude_home.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let launch_name = |config: DetectorConfig| config.launch_name.as_deref().map(str::to_owned);
+
+    let unnamed = registry
+        .create(SessionNewParams {
+            agent: "named".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create an unnamed session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &unnamed.id).await),
+        None
+    );
+    registry.stop(&unnamed.id).await.expect("stop the session");
+
+    let created = registry
+        .create(SessionNewParams {
+            agent: "named".to_owned(),
+            name: Some("alpha".to_owned()),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create a named session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &created.id).await).as_deref(),
+        Some("alpha")
+    );
+    let recorded = registry
+        .report_as_root(native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-live".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded);
+
+    wait_for_title_preview(&registry, &created.id, "alpha").await;
+    registry
+        .rename(&created.id, Some("\u{25D0} x".to_owned()))
+        .await
+        .expect("rename the running session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &created.id).await).as_deref(),
+        Some("alpha"),
+        "a rename does not relaunch the agent"
+    );
+
+    registry.stop(&created.id).await.expect("stop the session");
+    registry
+        .resume(&created.id)
+        .await
+        .expect("resume the renamed session");
+    assert_eq!(
+        launch_name(running_detector_config(&registry, &created.id).await).as_deref(),
+        Some("\u{25D0} x"),
+        "a resume launches under the current name"
+    );
+    // The resumed agent echoes the glyph-led name: the preview shows it, and
+    // the title is not what the activity rests on.
+    wait_for_title_preview(&registry, &created.id, "\u{25D0} x").await;
+    let resumed = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_ne!(resumed.state_source, StateSource::OscTitle);
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects() {
@@ -28552,6 +28668,54 @@ async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarde
         title_activity(&running, "profile-only-title"),
         Some(AgentActivity::Blocked),
         "the detector follows the newer report"
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// A worker-reported identity change that selects the configuration already
+/// running leaves the detector alone, also for a session whose configuration
+/// carries the launch name: the comparison ignores the name a candidate lacks.
+#[tokio::test]
+async fn an_identity_change_selecting_the_running_config_of_a_named_session_keeps_the_detector() {
+    let (registry, inspector, created) = mock_direct_registry("launch-name-guard", "claude").await;
+    let start = root_start_identity(&inspector, &created);
+    let generation = |registry: &SessionRegistry, id: &SessionId| {
+        let registry = registry.clone();
+        let id = id.clone();
+        async move {
+            let sessions = registry.inner.sessions.lock().await;
+            let generation = sessions
+                .get(&id)
+                .expect("the live session")
+                .detector_config
+                .borrow()
+                .generation;
+            generation
+        }
+    };
+    assert_eq!(
+        running_detector_config(&registry, &created.id)
+            .await
+            .launch_name
+            .as_deref(),
+        Some("launch-name-guard")
+    );
+    let before = generation(&registry, &created.id).await;
+    for (seq, native) in [(1, "native-one"), (2, "native-two")] {
+        let report = SessionReportAgentParams {
+            agent: "claude".to_owned(),
+            ..bound_report(&created, start, seq, native)
+        };
+        assert!(registry.report_agent(report).await.recorded);
+        assert_eq!(
+            annotation(&registry, &created.id).await.as_deref(),
+            Some(native)
+        );
+    }
+    assert_eq!(
+        generation(&registry, &created.id).await,
+        before,
+        "the running configuration is not replaced by an equal one"
     );
     registry.stop(&created.id).await.expect("stop the session");
 }

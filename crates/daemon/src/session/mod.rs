@@ -1032,6 +1032,10 @@ struct SessionEntry {
     /// Cancelled as soon as the initial-input readiness wait ends.
     initial_input_done: CancellationToken,
     default_detector_config: DetectorConfig,
+    /// The name the runtime generation was launched with through `[naming]`,
+    /// carried by every detector configuration the session runs. A rename does
+    /// not relaunch, so the agent keeps the name it was launched with.
+    launch_name: Option<Arc<str>>,
     /// Definition of the session's launch pin, fixed when this daemon
     /// launched or adopted the session: the verified installed package, or the
     /// built-in runtime of the same package identity. A session launched by
@@ -9300,7 +9304,8 @@ fn active_agent_origin(entry: &SessionEntry) -> Option<ActiveAgentOrigin> {
     )
 }
 
-fn send_detector_config(entry: &SessionEntry, config: DetectorConfig) {
+fn send_detector_config(entry: &SessionEntry, mut config: DetectorConfig) {
+    config.launch_name.clone_from(&entry.launch_name);
     let generation = entry
         .detector_config
         .borrow()

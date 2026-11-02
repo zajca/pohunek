@@ -7,6 +7,8 @@
 
 // Rust guideline compliant 2026-10-27
 
+use std::sync::Arc;
+
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
 use tracing::warn;
 
@@ -163,6 +165,22 @@ impl SessionRegistry {
                 private_dir: &state_root.join(&id.0),
             })
             .map(Some)
+    }
+}
+
+/// The session name a launch under `name` hands to the agent: the validated
+/// name when the runtime declares `[naming]` and the name passes the
+/// session-name rule, else `None`. This is the name [`naming_args`] renders.
+pub(super) fn launch_name(
+    definition: Option<&RuntimeDefinition>,
+    name: Option<&str>,
+) -> Option<Arc<str>> {
+    if !definition?.declares_naming() {
+        return None;
+    }
+    match validate_session_name(name) {
+        Ok(Some(name)) => Some(Arc::from(name)),
+        Ok(None) | Err(_) => None,
     }
 }
 

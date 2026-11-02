@@ -953,9 +953,12 @@ impl SessionRegistry {
                 // A projected claim is bound or released by a scan that reads
                 // its process, so ask for one.
                 entry.procwatch_rescan.request();
-                let config = reported_detector_config
+                let mut config = reported_detector_config
                     .clone()
                     .unwrap_or_else(|| entry.default_detector_config.clone());
+                // The running configuration carries the generation's launch
+                // name, which a candidate does not.
+                config.launch_name.clone_from(&entry.launch_name);
                 // Reconfiguring restarts detection, so an agent whose
                 // configuration already runs keeps its detector state.
                 if entry.detector_config.borrow().config != config {
@@ -4180,7 +4183,7 @@ impl SessionRegistry {
         }
         .ok()
         .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
-        let default_detector_config = DetectorConfig::for_pinned(
+        let mut default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &record.info.agent_base,
             &pin,
@@ -4191,9 +4194,17 @@ impl SessionRegistry {
             .profiles
             .runtimes()
             .pinned_definition(&record.info.agent_base, &pin);
-        let restored_detector_config = self
+        // The launch name is not stored: a reconciled session takes its
+        // current name, which is the launch name unless it was renamed since.
+        let launch_name =
+            super::launch_input::launch_name(pinned.as_deref(), record.info.name.as_deref());
+        default_detector_config.launch_name.clone_from(&launch_name);
+        let mut restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())
             .unwrap_or_else(|| default_detector_config.clone());
+        restored_detector_config
+            .launch_name
+            .clone_from(&launch_name);
         let detector_cancel = self.background_token();
         let procwatch_cancel = self.background_token();
         let runtime_watch_cancel = self.background_token();
@@ -4235,6 +4246,7 @@ impl SessionRegistry {
             input_ready,
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
+            launch_name,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -4554,6 +4566,7 @@ impl SessionRegistry {
             input_ready,
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
+            launch_name: None,
             pinned: self
                 .inner
                 .profiles

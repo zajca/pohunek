@@ -200,11 +200,22 @@ fn frame_bytes(title: Option<&str>, rows: &[String]) -> Vec<u8> {
 }
 
 fn detector_for(definition: &RuntimeDefinition, now: Instant, columns: u16) -> Detector {
+    detector_launched_as(definition, None, now, columns)
+}
+
+/// A detector for the generation of a session launched with `launch_name`.
+fn detector_launched_as(
+    definition: &RuntimeDefinition,
+    launch_name: Option<&str>,
+    now: Instant,
+    columns: u16,
+) -> Detector {
     Detector::new(
         24,
         columns,
         now,
         DetectorConfig {
+            launch_name: launch_name.map(Arc::from),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
                 confirmations: 1,
@@ -508,6 +519,203 @@ fn named_screens_are_classified_like_unnamed_ones() {
         checked >= 8,
         "every named screen of both releases: {checked}"
     );
+}
+
+/// The evidence of a detector launched as `launch_name` over one frame: the
+/// last winner that is not the byte-activity fallback, and whether the
+/// detector reports the input as ready.
+fn launched_evidence(
+    definition: &RuntimeDefinition,
+    launch_name: Option<&str>,
+    title: Option<&str>,
+    rows: &[String],
+    columns: u16,
+) -> (Option<(AgentActivity, StateSource)>, bool) {
+    let started = Instant::now();
+    let mut detector = detector_launched_as(definition, launch_name, started, columns);
+    let evidence = detector
+        .feed(started, &frame_bytes(title, rows))
+        .iter()
+        .rfind(|transition| transition.source != StateSource::Process)
+        .map(|transition| (transition.activity, transition.source));
+    (evidence, detector.input_ready())
+}
+
+/// The launch-name discount: a title that only echoes the name the launch gave
+/// the agent reports no state, so a name spelling the title marker of a running
+/// turn neither makes an idle prompt read `working` nor masks a dialog. Only
+/// the title is withheld; the screen is read as it is, and a runtime that
+/// declares no `[naming]` has no launch name.
+#[test]
+fn a_title_echoing_the_launch_name_reports_no_state() {
+    let definition = installed_definition();
+    let marker = "\u{25D0} deploy";
+    let idle = load_frame_from(
+        ScreenSet::Current,
+        &ScreenSet::Current.directory().join(NAMED_SCREENS_DIR),
+        "marker_idle",
+        "marker_idle",
+        DEFAULT_COLUMNS,
+    );
+    assert_eq!(idle.title.as_deref(), Some(marker));
+
+    let (read, ready) = launched_evidence(
+        &definition,
+        Some(marker),
+        idle.title.as_deref(),
+        &idle.rows,
+        idle.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Idle, StateSource::Screen)));
+    assert!(ready, "the idle prompt box takes input");
+    let (read, ready) = launched_evidence(
+        &definition,
+        None,
+        idle.title.as_deref(),
+        &idle.rows,
+        idle.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Working, StateSource::OscTitle)));
+    assert!(
+        !ready,
+        "without a launch name the title keeps the prompt closed"
+    );
+
+    // The preview keeps the raw title the discount withholds from evaluation.
+    let started = Instant::now();
+    let mut detector = detector_launched_as(&definition, Some(marker), started, idle.columns);
+    detector.feed(started, &frame_bytes(idle.title.as_deref(), &idle.rows));
+    let title_preview = detector
+        .region_previews()
+        .into_iter()
+        .find(|preview| preview.region == "osc_title")
+        .expect("the manifest requires the osc_title region");
+    assert_eq!(title_preview.text, marker);
+
+    let approval = load_frame(ScreenSet::Current, "approval", "approval", DEFAULT_COLUMNS);
+    let (read, _) = launched_evidence(
+        &definition,
+        Some(marker),
+        Some(marker),
+        &approval.rows,
+        approval.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Blocked, StateSource::Screen)));
+    let (read, _) = launched_evidence(
+        &definition,
+        None,
+        Some(marker),
+        &approval.rows,
+        approval.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Working, StateSource::OscTitle)));
+
+    // A collision rename `<name>-<adjective>-<noun>` is the same echo; a longer
+    // word that merely starts with the name is not.
+    for (title, echoed) in [
+        ("\u{25D0} deploy-iterative-muffin", true),
+        ("\u{25D0} deployment", false),
+    ] {
+        assert_eq!(
+            title_only_activity(&definition, Some(marker), title).is_none(),
+            echoed,
+            "{title}"
+        );
+    }
+}
+
+/// What a detector launched as `launch_name` reads from a terminal title alone.
+fn title_only_activity(
+    definition: &RuntimeDefinition,
+    launch_name: Option<&str>,
+    title: &str,
+) -> Option<AgentActivity> {
+    let started = Instant::now();
+    let mut detector = detector_launched_as(definition, launch_name, started, 80);
+    detector
+        .feed(started, format!("\x1b]2;{title}\x07").as_bytes())
+        .iter()
+        .rfind(|transition| transition.source == StateSource::OscTitle)
+        .map(|transition| transition.activity)
+}
+
+/// The previous release leads its title with its own glyph (`\u{25D0} alpha`),
+/// which is never the bare launch name: the title keeps reading `working`, also
+/// where a narrow terminal cuts the footer the screen would show it with.
+#[test]
+fn a_glyph_led_title_still_reads_working_for_a_named_session() {
+    let definition = installed_definition();
+    let streaming = load_frame_from(
+        ScreenSet::Previous,
+        &ScreenSet::Previous.directory().join(NAMED_SCREENS_DIR),
+        "working_stream",
+        "working_stream",
+        DEFAULT_COLUMNS,
+    );
+    assert_eq!(streaming.title.as_deref(), Some("\u{25D0} alpha"));
+    let (read, _) = launched_evidence(
+        &definition,
+        Some(NAMED_SCREEN_NAME),
+        streaming.title.as_deref(),
+        &streaming.rows,
+        streaming.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Working, StateSource::OscTitle)));
+
+    let narrow = load_frame_from(
+        ScreenSet::Previous,
+        &ScreenSet::Previous.directory().join("widths"),
+        "working_stream_w30",
+        "working_stream",
+        30,
+    );
+    let (read, _) = launched_evidence(
+        &definition,
+        Some(NAMED_SCREEN_NAME),
+        streaming.title.as_deref(),
+        &narrow.rows,
+        narrow.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Working, StateSource::OscTitle)));
+}
+
+/// The screen regions are not filtered: a name holding the words of a dialog
+/// is drawn into the rule label, and the dialog rule matches it. This is the
+/// residual the guide documents (`dynamic_workflow_prompt`).
+#[test]
+fn a_name_spelling_a_dialog_phrase_reads_blocked() {
+    let definition = installed_definition();
+    let phrase = "run a dynamic workflow? esc to cancel";
+    let idle = load_frame_from(
+        ScreenSet::Current,
+        &ScreenSet::Current.directory().join(NAMED_SCREENS_DIR),
+        "idle",
+        "idle",
+        DEFAULT_COLUMNS,
+    );
+    // The longer name takes the place of the rule that precedes the label, so
+    // the row keeps its width.
+    let extra = phrase.chars().count() - NAMED_SCREEN_NAME.chars().count();
+    let renamed: Vec<String> = idle
+        .rows
+        .iter()
+        .map(|row| match row.find(NAMED_SCREEN_NAME) {
+            Some(at) => format!(
+                "{}{phrase}{}",
+                row[..at].chars().skip(extra).collect::<String>(),
+                &row[at + NAMED_SCREEN_NAME.len()..]
+            ),
+            None => row.clone(),
+        })
+        .collect();
+    let (read, _) = launched_evidence(
+        &definition,
+        Some(phrase),
+        Some(phrase),
+        &renamed,
+        idle.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Blocked, StateSource::Screen)));
 }
 
 #[test]
@@ -1051,6 +1259,7 @@ fn without_a_record_every_captured_screen_reads_as_without_the_opt_in() {
                 frame.columns,
                 started,
                 DetectorConfig {
+                    launch_name: None,
                     detection: DetectionConfig {
                         recheck_after: Duration::from_millis(100),
                         confirmations: 1,
@@ -2554,6 +2763,26 @@ impl Fixture {
         self.harness.json(&arguments).await
     }
 
+    /// `session new` of the package profile under `name` with `input` as the
+    /// initial input, which the daemon sends once the prompt box takes input.
+    async fn launch_with_input(&self, name: &str, input: &str) -> (i32, Value) {
+        let cwd = self.cwd.clone();
+        let name = format!("--name={name}");
+        self.harness
+            .json(&[
+                "session",
+                "new",
+                "--agent",
+                PROFILE,
+                "--cwd",
+                path_str(&cwd),
+                &name,
+                "--input",
+                input,
+            ])
+            .await
+    }
+
     async fn launch(&self, profile: &str, name: &str) -> (i32, Value) {
         self.launch_at(profile, Some(name), DEFAULT_COLUMNS).await
     }
@@ -3751,8 +3980,8 @@ async fn a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle(
         let id = fixture.new_session_id(name).await;
         fixture.wait_activity(&id, "idle").await;
         fixture.wait_screen_line(&id, "for shortcuts").await;
-        // The daemon's own detection reads the program-status records of the
-        // locked release, which outrank the name drawn into the title.
+        // The title that repeats the launch name is not evaluated, so the
+        // program-status records and the screen decide.
         let inspected = fixture.inspect(&id).await;
         assert_eq!(inspected["activity"], "idle", "{name:?}: {inspected}");
         assert!(
@@ -3763,6 +3992,18 @@ async fn a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle(
         show_named_screen(&fixture, &id, name).await;
         fixture.stop(&id).await;
     }
+
+    // The initial input of a session named like a running turn reaches Claude.
+    let (code, launched) = fixture.launch_with_input(MARKER_NAMES[0], PROMPT).await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    fixture.stop(&id).await;
     fixture.finish().await;
 }
 

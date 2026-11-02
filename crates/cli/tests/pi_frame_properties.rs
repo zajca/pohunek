@@ -358,6 +358,7 @@ fn detector(manifest: &Arc<Manifest>, columns: u16) -> Detector {
         columns,
         now,
         DetectorConfig {
+            launch_name: None,
             input_readiness: pohunek_daemon::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
