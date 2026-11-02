@@ -1263,7 +1263,7 @@ everything above `user@<uid>.service` is root-owned, so an unprivileged
 descendant of the worker cannot leave the user manager's subtree. Docker scopes
 and logind session scopes are outside it. Inside the subtree a descendant can
 move itself anywhere, so the worker must run as `<sessions slice>/<worker unit>`
-(both names parsed by the installation namespace) and a candidate is foreign
+(both names parsed in the namespace the worker unit names) and a candidate is foreign
 when it is not the sessions slice or below it (`app.slice/*`, `app-*.scope`,
 `systemd-run --user --scope` without `--slice-inherit`, other user units) or when
 it is the worker unit of another session or below it. Every other candidate
