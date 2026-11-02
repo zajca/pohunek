@@ -601,9 +601,14 @@ mod tests {
             .untrusted
             .iter()
             .all(|dropped| !dropped.reason.is_empty()));
+        let sticky_reason = if cfg!(target_os = "macos") {
+            "writable by others"
+        } else {
+            "writable by group or others"
+        };
         assert_eq!(
             trusted_directory(&sticky),
-            Err(TrustError::Refused("writable by group or others"))
+            Err(TrustError::Refused(sticky_reason))
         );
         let only_untrusted = SearchPath::sanitize(&group_writable.display().to_string(), true);
         assert!(

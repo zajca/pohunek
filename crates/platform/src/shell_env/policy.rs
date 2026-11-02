@@ -396,10 +396,12 @@ mod tests {
         assert_eq!(resolution.path.entries(), expected);
         assert_eq!(resolution.untrusted.len(), 1);
         assert_eq!(resolution.untrusted[0].entry, loose.display().to_string());
-        assert_eq!(
-            resolution.untrusted[0].reason,
+        let reason = if cfg!(target_os = "macos") {
+            "writable by a group other than admin (gid 80)"
+        } else {
             "writable by group or others"
-        );
+        };
+        assert_eq!(resolution.untrusted[0].reason, reason);
     }
 
     #[test]
