@@ -7,8 +7,7 @@ import { minimalSessionInfo } from "./mock-daemon";
 
 /**
  * `sessionCondition` against the sessions the fixture daemon serves through
- * `session.list`, then the rows the fixture cannot produce on its own: values
- * outside the generated unions and combinations no daemon state reaches.
+ * `session.list`: one row per rule and per recovery kind.
  */
 
 function runtimeOf(state: string, overrides: Partial<SessionRuntime> = {}): SessionRuntime {

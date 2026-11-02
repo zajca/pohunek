@@ -45,7 +45,7 @@ use crate::agent::{
 };
 use crate::catalog_anchor::CatalogTrust;
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
-use crate::events::ProducedEvent;
+use crate::events::{EventOrigin, ProducedEvent};
 use crate::external::{
     external_session_id, ExternalSessionChange, ExternalSessions, TranscriptCandidate,
     TranscriptIndex, EXTERNAL_TERMINAL_COLS, EXTERNAL_TERMINAL_ROWS,
@@ -2694,7 +2694,7 @@ impl SessionRegistry {
         let _ = self.inner.produced_events.send(ProducedEvent {
             event: event.clone(),
             produced,
-            replayed: false,
+            origin: EventOrigin::Live,
         });
         let _ = self.inner.events.send(event);
     }
@@ -8017,10 +8017,12 @@ impl SessionRegistry {
         self.publish(event);
     }
 
-    /// Publishes a session event that announces a state the registry already
-    /// held, not a change. The notification projector learns the state from it
-    /// and notifies nothing.
-    fn emit_replayed(&self, name: &str, info: &SessionInfo) {
+    /// Publishes a session event that announces a loss the registry already
+    /// held, not a new one. With [`EventOrigin::Replayed`] the notification
+    /// projector learns the state and notifies nothing; with
+    /// [`EventOrigin::SettledLoss`] it projects the settled state of a loss it
+    /// may have reported as unproven.
+    fn emit_announced(&self, name: &str, info: &SessionInfo, origin: EventOrigin) {
         let event = crate::events::event(
             name,
             event_payload(SessionEvent {
@@ -8030,7 +8032,7 @@ impl SessionRegistry {
         let _ = self.inner.produced_events.send(ProducedEvent {
             event: event.clone(),
             produced: std::time::Instant::now(),
-            replayed: true,
+            origin,
         });
         let _ = self.inner.events.send(event);
     }
