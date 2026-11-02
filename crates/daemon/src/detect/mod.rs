@@ -854,16 +854,6 @@ impl Detector {
             )
         })
     }
-
-    fn match_context(&self, manifest: &Manifest, freshness: ContextFreshness) -> MatchContext {
-        match_context_for(
-            manifest,
-            &self.screen,
-            evaluated_title(self.latest_title.as_deref(), self.launch_name.as_deref()),
-            self.latest_progress.as_deref(),
-            freshness,
-        )
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -970,10 +960,10 @@ fn evaluated_title<'a>(title: Option<&'a str>, launch_name: Option<&str>) -> Opt
 
 /// Builds the manifest match context over explicit context pieces.
 ///
-/// A pure, shared counterpart of [`Detector::match_context`]: the observed
-/// feed's observer borrows the detector field by field (the screen is being
-/// fed through the same borrow set), so both the whole-detector path and the
-/// observer must build one context the same way.
+/// A pure function over explicit pieces: the observed feed's observer borrows
+/// the detector field by field (the screen is being fed through the same
+/// borrow set), so the whole-detector path and the observer build one context
+/// the same way.
 fn match_context_for(
     manifest: &Manifest,
     screen: &ScreenTracker,
