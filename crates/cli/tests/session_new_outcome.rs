@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 /// Response deadline the caller gives the creation: far shorter than the
 /// fixture, which never answers it.
+// timing-allowed: #1898 the fixture never answers, so any deadline expires
 const REQUEST_TIMEOUT_MS: &str = "200";
 
 /// Mode of the runtime directory the client expects to be owner-private.

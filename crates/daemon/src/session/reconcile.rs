@@ -16237,17 +16237,41 @@ generation "$1"
         }
 
         /// A loss reported as unproven stays reported across an interlude in
-        /// which a start could not classify the record: the retry that then
-        /// commits the loss adds no second notification.
-        async fn a_reported_loss_survives_an_interlude(session_id: &str, interlude: RuntimeState) {
+        /// which a real start could not classify the record: the retry that
+        /// then settles the loss adds no second notification.
+        ///
+        /// `interlude` is what the supervisor shows at the start and
+        /// `persisted` the runtime state and reason that start records. The
+        /// retry sees the job ended and the worker gone; `cleanup_confirmed`
+        /// tells whether the loss is proven (`failed`, as after a host
+        /// restart) or stays unproven (`running`, the sweep cannot finish).
+        async fn a_reported_loss_survives_an_interlude(
+            session_id: &str,
+            interlude: JobScript,
+            persisted: (RuntimeState, &str),
+            cleanup_confirmed: bool,
+        ) {
             use crate::notifications::{
                 spawn_projector, AttentionCoordinator, NotificationService,
             };
             use crate::shutdown::DaemonShutdown;
 
-            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            let inspector = Arc::new(RetryInspector::default());
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
             let record = persist_unproven_loss(&fixture.root, session_id);
-            write_restarted_host_journal(&fixture.root, session_id);
+            if cleanup_confirmed {
+                write_restarted_host_journal(&fixture.root, session_id);
+            } else {
+                // Without a host restart the sweep decides, and it cannot
+                // enumerate the process table.
+                write_live_journal(
+                    &fixture.root,
+                    session_id,
+                    dead_worker(),
+                    Some(&format!("runtime-{session_id}")),
+                );
+            }
             let notifications = NotificationService::open(&fixture.root.join("notifications"))
                 .expect("open notification service");
             let list = || {
@@ -16270,8 +16294,11 @@ generation "$1"
             projector.stop().await;
             assert_eq!(list().len(), 1, "{:#?}", list());
 
-            // The restart: the record is persisted as unclassifiable, then
-            // the retry commits the loss.
+            // The restart: the supervisor cannot settle the record, so the
+            // start persists the interlude.
+            let id = SessionId(session_id.to_owned());
+            let job = service_id(session_id, TEST_GENERATION);
+            fixture.supervisor.script_job(job.clone(), interlude);
             let tasks = DaemonShutdown::default();
             let projector = spawn_projector(
                 &tasks,
@@ -16279,30 +16306,69 @@ generation "$1"
                 notifications.clone(),
                 AttentionCoordinator::disconnected(),
             );
-            assert!(
-                fixture
-                    .registry
-                    .insert_unavailable_record(record, interlude, "runtime_supervision_unavailable")
-                    .await
-            );
-            let id = SessionId(session_id.to_owned());
-            assert!(fixture.registry.retry_supervised_session(&id).await);
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            let interlude = runtime_of(&fixture.registry, session_id).await;
+            assert_eq!(interlude.state, persisted.0, "{interlude:?}");
             assert_eq!(
-                runtime_of(&fixture.registry, session_id).await.state,
-                RuntimeState::Lost
+                interlude.loss_reason.as_deref(),
+                Some(persisted.1),
+                "{interlude:?}"
             );
+
+            // The retry finds the job ended and the worker gone.
+            inspector.fail_enumeration(!cleanup_confirmed);
+            fixture
+                .supervisor
+                .script_job(job, present(ServiceState::Failed, None));
+            assert!(fixture.registry.retry_supervised_session(&id).await);
+            let settled = fixture.registry.inspect(&id).await.expect("inspect");
+            assert_eq!(
+                settled.state,
+                if cleanup_confirmed {
+                    protocol::SessionState::Failed
+                } else {
+                    protocol::SessionState::Running
+                },
+                "{settled:?}"
+            );
+            assert_eq!(settled.runtime.expect("runtime").state, RuntimeState::Lost);
             projector.stop().await;
             assert_eq!(list().len(), 1, "{:#?}", list());
         }
 
         #[tokio::test]
-        async fn a_reported_loss_is_not_reported_again_after_a_reconnecting_interlude() {
-            a_reported_loss_survives_an_interlude("s-4260", RuntimeState::Reconnecting).await;
+        async fn a_reported_loss_is_not_reported_again_after_an_unavailable_supervisor() {
+            a_reported_loss_survives_an_interlude(
+                "s-4260",
+                JobScript::Unavailable,
+                (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE),
+                true,
+            )
+            .await;
         }
 
         #[tokio::test]
-        async fn a_reported_loss_is_not_reported_again_after_a_conflict_interlude() {
-            a_reported_loss_survives_an_interlude("s-4261", RuntimeState::Conflict).await;
+        async fn a_reported_loss_is_not_reported_again_after_an_ambiguous_start() {
+            a_reported_loss_survives_an_interlude(
+                "s-4261",
+                present(ServiceState::Running, None),
+                (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS),
+                true,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_reported_loss_the_retry_keeps_unproven_is_not_reported_again() {
+            a_reported_loss_survives_an_interlude(
+                "s-4262",
+                present(ServiceState::Running, None),
+                (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS),
+                false,
+            )
+            .await;
         }
 
         /// A start that proves a loss nobody was told about, such as one an

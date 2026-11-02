@@ -432,6 +432,14 @@ fn epoch_keyed_record_reports_runtime(created_at: OffsetDateTime, session: &Sess
 /// to a silenced report. The runtime state is not tested: a runtime that is
 /// reconnecting or in conflict after an unclassifiable start still carries the
 /// connect time of the cure before the loss.
+///
+/// `created_at` is when the report was written, the only time a stored report
+/// has: an event carries a process-local instant, which no later process can
+/// compare with a stored connect time. A projector that writes a report only
+/// after the runtime reconnected therefore leaves a report that covers the
+/// next loss, but only for a start that commits that loss before the
+/// projector reports it; within a process the `Live` observation releases the
+/// generation first.
 fn unproven_report_covers_loss(
     created_at: OffsetDateTime,
     generation: RuntimeGeneration,
@@ -2184,12 +2192,35 @@ mod tests {
     /// `session` after a cure: its runtime connected after every report the
     /// store holds.
     fn connected_later(session: SessionInfo) -> SessionInfo {
+        connected_at(session, "2999-01-01T00:00:00Z")
+    }
+
+    /// `session` whose runtime last connected at `connected_at`.
+    fn connected_at(session: SessionInfo, connected_at: &str) -> SessionInfo {
         SessionInfo {
             runtime: session.runtime.map(|runtime| SessionRuntime {
-                last_connected_at: Some("2999-01-01T00:00:00Z".to_owned()),
+                last_connected_at: Some(connected_at.to_owned()),
                 ..runtime
             }),
             ..session
+        }
+    }
+
+    /// A connect time before every report the tests write.
+    const CONNECTED_LONG_AGO: &str = "2026-01-01T00:00:00Z";
+
+    /// A running session whose runtime of generation 1 answers, as it does
+    /// after a cure that connected at `connected_at`.
+    fn cured_at(session_id: &str, connected_at: &str) -> SessionInfo {
+        let lost = lost_session(session_id, SessionState::Running, 1, None, None);
+        SessionInfo {
+            runtime: lost.runtime.clone().map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                loss_reason: None,
+                last_connected_at: Some(connected_at.to_owned()),
+                ..runtime
+            }),
+            ..lost
         }
     }
 
@@ -3040,6 +3071,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_deleted_unproven_loss_stays_deleted_when_the_runtime_connected_before_the_report() {
+        let dir = temp_data_dir("unproven-interlude-compaction-connected");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let store = terminal_source_store(&dir);
+        let running = connected_at(
+            lost_session("s-1", SessionState::Running, 1, None, None),
+            CONNECTED_LONG_AGO,
+        );
+        let failed = connected_at(
+            lost_session("s-1", SessionState::Failed, 1, Some(oom_exit()), None),
+            CONNECTED_LONG_AGO,
+        );
+        persist_terminal_source(&store, &running);
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &running).await;
+        assert_eq!(list(&service).len(), 1);
+        delete_visible_terminals(&service);
+        persist_terminal_source(&store, &reconnecting_of(running.clone()));
+        compact_deleted_terminals(&service);
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen compacted service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &failed).await;
+
+        assert!(
+            list(&service).is_empty(),
+            "a deleted loss is not reported again: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_unproven_loss_does_not_hide_a_loss_after_a_cure() {
+        let dir = temp_data_dir("unproven-interlude-compaction-cured");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let store = terminal_source_store(&dir);
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        persist_terminal_source(&store, &running);
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &running).await;
+        assert_eq!(list(&service).len(), 1);
+        delete_visible_terminals(&service);
+        // The runtime answered after the report and was then lost again: the
+        // stored record carries the later connect time, so the deleted report
+        // names an earlier loss and compaction drops its tombstone.
+        let cured_and_lost = connected_later(running.clone());
+        persist_terminal_source(&store, &reconnecting_of(cured_and_lost.clone()));
+        compact_deleted_terminals(&service);
+        assert_eq!(
+            std::fs::read_to_string(service.store_path())
+                .expect("compacted log")
+                .lines()
+                .count(),
+            0,
+            "the tombstone of the earlier loss is dropped"
+        );
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen compacted service");
+        let mut projector = ProjectorState::default();
+        let failed = connected_later(lost_session(
+            "s-1",
+            SessionState::Failed,
+            1,
+            Some(oom_exit()),
+            None,
+        ));
+        project_session_update(&mut projector, &service, &failed).await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles, vec!["Session crashed".to_owned()], "{titles:?}");
+    }
+
     /// Reports the unproven loss of `s-1` generation 1 into a store in `dir`
     /// and closes it, as a daemon that is stopped afterwards.
     async fn report_unproven_loss_then_stop(dir: &std::path::Path) {
@@ -3115,6 +3224,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_projector_that_reports_after_the_cure_still_reports_the_next_loss() {
+        let service = service("unproven-lagging-projector");
+        let mut projector = ProjectorState::default();
+
+        // The report is written after the runtime reconnected, as by a
+        // projector whose queue lags: its time is later than the connect
+        // time. The `Live` event that follows releases the generation, so the
+        // next loss is reported without a comparison of the two times.
+        let lost = connected_at(
+            lost_session("s-1", SessionState::Running, 1, None, None),
+            CONNECTED_LONG_AGO,
+        );
+        project_session_update(&mut projector, &service, &lost).await;
+        project_session_update(
+            &mut projector,
+            &service,
+            &cured_at("s-1", CONNECTED_LONG_AGO),
+        )
+        .await;
+        project_session_update(&mut projector, &service, &lost).await;
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert!(
+            titles.iter().all(|title| title == "Session runtime lost"),
+            "{titles:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_report_older_than_the_last_cure_does_not_cover_a_later_proof() {
         let dir = temp_data_dir("unproven-cured-proof");
         report_unproven_loss_then_stop(&dir).await;
@@ -3170,6 +3312,19 @@ mod tests {
         let records = list(&service);
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(records[0].status, protocol::NotificationStatus::Unread);
+
+        // The stop settles the loss, not the session's future: a resumed
+        // runtime of the next generation that is lost is reported on its own.
+        let resumed_and_lost = lost_session("s-1", SessionState::Running, 2, None, None);
+        project_session_update(&mut projector, &service, &resumed_and_lost).await;
+        let records = list(&service);
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert!(
+            records
+                .iter()
+                .all(|record| record.status == protocol::NotificationStatus::Unread),
+            "{records:#?}"
+        );
     }
 
     #[tokio::test]
