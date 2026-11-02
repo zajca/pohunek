@@ -951,8 +951,8 @@ fn outside_worker_coalitions(
 /// True only when the request names the worker's control group, the host
 /// reports the process's, both reads are bracketed by the enumerated identity,
 /// and the process lives where the worker's descendants do not place a process
-/// by accident (see [`ControlGroupPath::outside_worker_scope_of`]). Every other outcome is
-/// `false`, which leaves the caller's decision as it was: no control group
+/// by accident (see [`ControlGroupPath::outside_worker_scope_of`]). Every other
+/// outcome is `false`, which leaves the caller's decision as it was: no control group
 /// named, a host that reports none, a process that exited or changed meanwhile,
 /// a record the kernel denies or withholds, an identity recheck that fails, and
 /// any other read failure (a malformed path, an operating-system error). The
