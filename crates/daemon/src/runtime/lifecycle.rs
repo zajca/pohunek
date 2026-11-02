@@ -1666,15 +1666,13 @@ pub(crate) fn runtime_exit(evidence: &ExitEvidence) -> RuntimeExit {
     }
 }
 
-/// The memory killer the kill counters evidence, when exactly one.
+/// The memory killer the kill counters evidence: the one whose counter is
+/// positive while the other reads zero. A counter the manager does not report
+/// leaves the killer unnamed.
 fn oom_killer(evidence: &ExitEvidence) -> Option<&'static str> {
-    let kills = |count: Option<u64>| count.is_some_and(|count| count > 0);
-    match (
-        kills(evidence.oom_kills()),
-        kills(evidence.managed_oom_kills()),
-    ) {
-        (true, false) => Some("kernel"),
-        (false, true) => Some("systemd_oomd"),
+    match (evidence.oom_kills(), evidence.managed_oom_kills()) {
+        (Some(kernel), Some(0)) if kernel > 0 => Some("kernel"),
+        (Some(0), Some(managed)) if managed > 0 => Some("systemd_oomd"),
         _ => None,
     }
 }

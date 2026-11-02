@@ -26,8 +26,8 @@ const RETRY_INITIAL: Duration = Duration::from_millis(25);
 /// waited out.
 const ACK_WINDOW_MS: u32 = 8_000;
 
-/// Frozen schema-15 record of a Pi session created with [`FROZEN_KEY`].
-const FROZEN_STORE: &str = include_str!("../../src/store/fixtures/schema-15/metadata.jsonl");
+/// Record of a Pi session created with [`FROZEN_KEY`].
+const FROZEN_STORE: &str = include_str!("../fixtures/session-request/metadata.jsonl");
 
 /// Key the frozen record carries.
 const FROZEN_KEY: &str = "req-frozen-1";

@@ -14484,12 +14484,30 @@ handler = "codex-hook-v1"
             use std::time::{Duration, SystemTime};
 
             let ended = SystemTime::UNIX_EPOCH + Duration::from_hours(24);
+            // (session, manager result, kernel kills, oomd kills, killer, detail)
             let kills = [
-                ("s-4226", Some(1), Some(0), Some("kernel")),
-                ("s-4227", Some(0), Some(1), Some("systemd_oomd")),
-                ("s-4228", Some(1), Some(1), None),
+                ("s-4226", "oom-kill", Some(1), Some(0), Some("kernel"), true),
+                (
+                    "s-4227",
+                    "oom-kill",
+                    Some(0),
+                    Some(1),
+                    Some("systemd_oomd"),
+                    true,
+                ),
+                ("s-4228", "oom-kill", Some(1), Some(1), None, true),
+                ("s-4229", "oom-kill", Some(0), Some(0), None, true),
+                ("s-4230", "oom-kill", None, None, None, true),
+                ("s-4231", "oom-kill", Some(1), None, None, true),
+                ("s-4232", "oom-kill", None, None, None, false),
+                ("s-4233", "signal", Some(1), Some(0), None, true),
             ];
-            for (session, oom_kills, managed, killer) in kills {
+            for (session, result, oom_kills, managed, killer, detail) in kills {
+                let (peak, exited_at) = if detail {
+                    (Some(26_300_000_000), Some(ended))
+                } else {
+                    (None, None)
+                };
                 let fixture = fixture(Arc::new(RetryInspector::default()));
                 let runtime_id = format!("runtime-{session}");
                 Marked::spawn(&fixture.root, &runtime_id);
@@ -14507,10 +14525,10 @@ handler = "codex-hook-v1"
                 fixture.supervisor.script_exit_evidence(
                     id,
                     crate::runtime::lifecycle::tests::EvidenceScript::Failed(
-                        ExitEvidence::new("oom-kill".to_owned(), Some(JobExit::Signal(9)))
+                        ExitEvidence::new(result.to_owned(), Some(JobExit::Signal(9)))
                             .with_oom_kills(oom_kills, managed)
-                            .with_memory_peak(Some(26_300_000_000))
-                            .with_exited_at(Some(ended)),
+                            .with_memory_peak(peak)
+                            .with_exited_at(exited_at),
                     ),
                 );
 
@@ -14519,12 +14537,17 @@ handler = "codex-hook-v1"
                     .expect("reconcile");
 
                 let expected = protocol::RuntimeExit {
-                    cause: "oom_kill".to_owned(),
+                    cause: if result == "oom-kill" {
+                        "oom_kill"
+                    } else {
+                        "signal"
+                    }
+                    .to_owned(),
                     signal: Some(9),
                     code: None,
                     oom_killer: killer.map(str::to_owned),
-                    memory_peak_bytes: Some(26_300_000_000),
-                    ended_at: Some("1970-01-02T00:00:00Z".to_owned()),
+                    memory_peak_bytes: peak,
+                    ended_at: detail.then(|| "1970-01-02T00:00:00Z".to_owned()),
                 };
                 let runtime = runtime_of(&fixture.registry, session).await;
                 assert_eq!(runtime.state, RuntimeState::Lost, "{session}");
@@ -14643,6 +14666,40 @@ handler = "codex-hook-v1"
             let runtime = info.runtime.expect("runtime");
             assert_eq!(runtime.state, RuntimeState::Lost);
             assert_eq!(runtime.exit, Some(oom_exit()));
+        }
+
+        /// A cause recorded for a lost runtime survives the next start, which
+        /// finds the same evidence again.
+        #[tokio::test]
+        async fn a_lost_runtime_keeps_its_loss_cause_across_a_second_start() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            persist_record(&fixture.root, "s-4234", Some("runtime-s-4234"));
+            write_journal_record(
+                &fixture.root,
+                "s-4234",
+                "worker-s-4234",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4234"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("first start");
+            let first = runtime_of(&fixture.registry, "s-4234").await;
+            assert_eq!(first.loss_cause.as_deref(), Some("host_restarted"));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("second start");
+
+            let runtime = runtime_of(&fixture.registry, "s-4234").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_cause.as_deref(), Some("host_restarted"));
+            assert_eq!(runtime.exit, None);
         }
 
         /// A restart after a reboot (or after the user manager was replaced)
@@ -14848,6 +14905,42 @@ handler = "codex-hook-v1"
             let runtime = runtime_of(&fixture.registry, "s-1345").await;
             assert_eq!(runtime.state, RuntimeState::Conflict);
             assert_eq!(runtime.exit, None);
+        }
+
+        #[tokio::test]
+        async fn a_lost_record_reclassified_as_a_conflict_drops_its_loss_cause() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-4235");
+            persist_record(&fixture.root, "s-4235", Some("runtime-s-4235"));
+            store_as_running_lost(&fixture.root, "s-4235");
+            let store = Store::new(fixture.root.join("data/metadata.jsonl"));
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-4235")
+                .expect("record");
+            record.info.runtime.as_mut().expect("runtime").loss_cause =
+                Some("user_manager_lost".to_owned());
+            store.record_session(&record).expect("store lost+cause");
+            write_live_journal(
+                &fixture.root,
+                "s-4235",
+                dead_worker(),
+                Some("runtime-s-4235"),
+            );
+            let id = service_id("s-4235", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id, present(ServiceState::Running, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-4235").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_cause, None);
         }
 
         /// Generations of [`FORKING_HOLDER`] after the first: the sweep's
