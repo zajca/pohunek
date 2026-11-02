@@ -222,6 +222,31 @@ async fn a_resume_applies_the_contribution_once_and_never_persists_it() {
 }
 
 #[tokio::test]
+async fn naming_args_follow_the_contributed_args_and_precede_the_native_reference() {
+    install_fixture();
+    let rig = Rig::named("launch-input-naming-order", true, Some("Two Words")).await;
+    let path = overlay_path(&rig);
+    let created = format!("--overlay {} --name Two Words", path.display());
+    wait_until("the create to log its argv", || async {
+        launch_log(&rig).contains(&created).then_some(())
+    })
+    .await;
+    stop_with_reference(&rig).await;
+
+    rig.registry
+        .resume(&rig.session.id)
+        .await
+        .expect("resume the conversation");
+    let resumed = format!("{created} resume {NATIVE_ID}");
+    wait_until("the resume to log its argv", || async {
+        launch_log(&rig).contains(&resumed).then_some(())
+    })
+    .await;
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
 async fn a_refused_resume_launches_nothing_and_keeps_the_session_resumable() {
     let fixture = install_fixture();
     let rig = Rig::new("launch-input-refused", true).await;

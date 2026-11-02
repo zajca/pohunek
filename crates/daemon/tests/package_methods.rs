@@ -2898,11 +2898,17 @@ async fn naming_args_install_only_with_their_feature_and_in_a_valid_shape() {
         .await;
         let error = result.expect_err(name);
         assert_eq!(error.code, "package_descriptor_invalid", "{name}");
-        assert!(
-            !error.msg.contains("marker-flag") && !error.msg.contains("zq9"),
-            "{name}: {}",
-            error.msg
-        );
+        // A refusal never reflects a token of the table it refuses; tokens of
+        // one or two characters would match the reason's own words.
+        for token in tables
+            .lines()
+            .filter_map(|line| line.strip_prefix("launch_args = ["))
+            .flat_map(|list| list.trim_end_matches(']').split(", "))
+            .map(|token| token.trim_matches('"'))
+            .filter(|token| token.len() > 2 && *token != "{session_name}")
+        {
+            assert!(!error.msg.contains(token), "{name}: {token}: {}", error.msg);
+        }
     }
 
     // The placeholder is not a launch argument of the runtime itself.
