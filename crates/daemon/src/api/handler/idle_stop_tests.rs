@@ -959,12 +959,19 @@ async fn live_background_work_holds_the_stop_while_an_idle_control_session_is_st
 #[tokio::test]
 async fn every_counted_kind_holds_the_stop() {
     let kinds = ["subagent", "workflow", "shell", "monitor", "MCP task"];
-    let world = hooked_world(kinds.len()).await;
+    let mut world = hooked_world(kinds.len() + 1).await;
     for (index, kind) in kinds.iter().enumerate() {
         ok(world.opt_in(index, &LIMIT_SECS.to_string()).await);
         world.stop_listing(index, &[task("task-1", kind)]).await;
     }
+    // The control session proves the limit passed.
+    let control = kinds.len();
+    ok(world.opt_in(control, &LIMIT_SECS.to_string()).await);
+    world.stop_listing(control, &[]).await;
 
+    world.elapse(LIMIT_SECS - 1).await;
+    world.elapse_past(1).await;
+    world.stopped(control).await;
     world.elapse(10 * LIMIT_SECS).await;
     for (index, kind) in kinds.iter().enumerate() {
         world.assert_running(index, &format!("{kind} holds")).await;
@@ -1003,6 +1010,7 @@ async fn teammates_internal_kinds_and_unlisted_subagent_rows_do_not_hold() {
             &subagent_hook("SubagentStart", "agent-1"),
         )
         .await;
+    world.fixture.wait_subagent_rows(world.id(bare), 1).await;
     world
         .fixture
         .run_hook(world.id(bare), "stop", &stop_listing(&[]))
@@ -1068,7 +1076,7 @@ async fn a_listing_that_lags_behind_the_subagents_own_stop_does_not_hold() {
 /// The hold ends through the next turn end that lists nothing. The agent's
 /// `owner_exited` clear is not reachable here: the fake agent is the PTY root,
 /// so its exit ends the session instead of clearing the snapshot of a session
-/// that goes on, and no seam is added for it.
+/// that goes on. The scenario does not cover that clear.
 #[tokio::test]
 async fn the_clock_restarts_when_live_background_work_ends() {
     let mut world = hooked_world(1).await;
@@ -1171,7 +1179,7 @@ async fn live_work_that_arrives_while_the_stop_waits_for_its_turn_keeps_the_sess
 }
 
 #[tokio::test]
-async fn waits_return_for_a_held_session_as_they_do_without_background_work() {
+async fn waits_and_turns_complete_for_a_session_with_background_work() {
     let fixture = Fixture::with_policy(
         config(None),
         Some(every_provider({

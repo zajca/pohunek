@@ -67,9 +67,9 @@ while IFS= read -r line; do
 done
 "#;
 
-/// Scheduler rounds a scenario waits for a real hook process or the worker
-/// import that follows it before it reports a stuck run.
-const HOOK_WAIT_ROUNDS: usize = 200_000;
+/// Real time a scenario waits for a hook process or the worker import that
+/// follows it before it reports a stuck run.
+const HOOK_WAIT: Duration = pohunek_test_support::wait::HANG_GUARD;
 
 /// Debounce window of the default notification policy.
 pub(super) fn debounce() -> Duration {
@@ -281,7 +281,8 @@ impl Fixture {
     /// Waits until a screen line of `session` contains `needle`, while real PTY
     /// output arrives on the paused clock.
     pub(super) async fn wait_screen_line(&self, session: &str, needle: &str) {
-        for _ in 0..HOOK_WAIT_ROUNDS {
+        let started = std::time::Instant::now();
+        while started.elapsed() < HOOK_WAIT {
             let screen = ok(self
                 .call(method::SESSION_SCREEN, json!({"session_id": session}))
                 .await);
@@ -339,15 +340,14 @@ impl Fixture {
     }
 
     /// Waits until `session` publishes a background snapshot of `count` items
-    /// that the daemon read from the worker's hook-fed snapshot. A first empty
-    /// listing publishes no snapshot; `count == 0` then waits for the agent's
-    /// identity.
+    /// that the daemon read from the worker's hook-fed snapshot. `count == 0`
+    /// also accepts the agent's identity with no snapshot, which is all a first
+    /// empty listing publishes.
     pub(super) async fn wait_listed(&self, session: &str, count: usize) {
-        for _ in 0..HOOK_WAIT_ROUNDS {
+        let started = std::time::Instant::now();
+        while started.elapsed() < HOOK_WAIT {
             let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
             let items = info["background"]["items"].as_array().map(Vec::len);
-            // A first empty listing publishes no snapshot, so the agent's
-            // identity is the only sign that the hooks were imported.
             let seen = items == Some(count)
                 || (count == 0 && info["background"].is_null() && info["active_agent"] == "claude");
             if seen {
@@ -360,6 +360,20 @@ impl Fixture {
         }
         let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
         panic!("{session} never published {count} background items: {info}");
+    }
+
+    /// Waits until `session` publishes `count` subagent rows.
+    pub(super) async fn wait_subagent_rows(&self, session: &str, count: usize) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < HOOK_WAIT {
+            let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
+            if info["subagents"].as_array().map(Vec::len) == Some(count) {
+                return;
+            }
+            settle().await;
+            tokio::time::advance(CLOCK_STEP).await;
+        }
+        panic!("{session} never published {count} subagent rows");
     }
 
     pub(super) fn cwd(&self, tag: &str) -> PathBuf {
