@@ -36,6 +36,15 @@ pub struct ConnectionOptions {
     pub origin_source: OriginSource,
 }
 
+impl ConnectionOptions {
+    /// These options with an explicit request deadline.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = Some(request_timeout);
+        self
+    }
+}
+
 impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {

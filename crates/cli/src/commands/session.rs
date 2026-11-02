@@ -204,6 +204,18 @@ pub(crate) fn parse_request_timeout_ms(value: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
+/// Parse the `--request-id` idempotency key of a creation.
+pub(crate) fn parse_request_id(value: &str) -> Result<String, String> {
+    if protocol::is_valid_client_request_id(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "--request-id must be 1 to {} bytes of A-Z, a-z, 0-9, '.', '_', ':' or '-'",
+            protocol::MAX_CLIENT_REQUEST_ID_BYTES
+        ))
+    }
+}
+
 /// Maximum text accepted from stdin for `session new` and `session input`.
 ///
 /// The daemon remains authoritative for provider-specific safe-text policy.
@@ -428,6 +440,9 @@ pub(crate) struct NewArgs {
     pub input_ack_timeout_ms: Option<u32>,
     /// Optional daemon response timeout for this creation request.
     pub request_timeout_ms: Option<u32>,
+    /// Idempotency key (`--request-id`): a repeat of the same request returns
+    /// the session the first one created.
+    pub request_id: Option<String>,
     /// Parsed `--meta KEY=VALUE` pairs, one per repeated flag. Shape-validated
     /// per pair by [`parse_meta_pair`] (the clap value parser); duplicate-key
     /// rejection happens once the full set is known, in [`parse_meta_pairs`].
@@ -782,8 +797,10 @@ pub(crate) async fn run_new(
 
     // The session exists either way, so a daemon that advertises the capability
     // but omits the outcome leaves the delivery unknown: it is not printed.
+    let replayed = result.replayed == Some(true);
+    // A replay does not carry the first response's `prompt_delivered`.
     let prompt_delivered = if args.input_ack_timeout_ms.is_some() {
-        if result.prompt_delivered.is_none() {
+        if result.prompt_delivered.is_none() && !replayed {
             eprintln!(
                 "pohunek: warning: host '{host}' did not report whether the prompt was delivered \
                  although it advertises `session_new_input_ack_supported`; session {} is running.",
@@ -805,6 +822,9 @@ pub(crate) async fn run_new(
                 serde_json::Value::Bool(delivered),
             );
         }
+        if let (true, Some(object)) = (replayed, value.as_object_mut()) {
+            object.insert("replayed".to_owned(), serde_json::Value::Bool(true));
+        }
         print!(
             "{}",
             crate::commands::render_json_with_v3_identity(method::SESSION_NEW, &value)?
@@ -812,7 +832,12 @@ pub(crate) async fn run_new(
     } else {
         print!(
             "{}",
-            render_new_human(info, result.worktree_source.as_ref(), prompt_delivered)
+            render_new_human(
+                info,
+                result.worktree_source.as_ref(),
+                prompt_delivered,
+                replayed,
+            )
         );
     }
     Ok(())
@@ -2144,7 +2169,7 @@ fn render_sweep_human(host: &str, result: &SessionRetentionResult) -> String {
 
 fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
     Ok(SessionNewParams {
-        client_request_id: None,
+        client_request_id: args.request_id.clone(),
         agent: args.agent.clone(),
         name: args.name.clone(),
         cwd: args.cwd.clone(),
@@ -2424,9 +2449,15 @@ fn render_new_human(
     info: &SessionInfo,
     source: Option<&protocol::WorktreeSource>,
     prompt_delivered: Option<bool>,
+    replayed: bool,
 ) -> String {
+    let headline = if replayed {
+        "already created by an earlier request with this --request-id"
+    } else {
+        "created"
+    };
     let mut output = format!(
-        "session {} created (state: {})\n",
+        "session {} {headline} (state: {})\n",
         info.id.0,
         state_label(info.state)
     );
@@ -3289,6 +3320,7 @@ mod tests {
             input: None,
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
+            request_id: None,
             meta: Vec::new(),
         }
     }
@@ -3385,6 +3417,7 @@ mod tests {
             input: Some("Fix #1234".to_owned()),
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
+            request_id: None,
             meta: vec![
                 ("link.provider".to_owned(), "github".to_owned()),
                 ("link.kind".to_owned(), "pull_request".to_owned()),
@@ -4031,7 +4064,7 @@ mod tests {
             },
         ];
 
-        let output = render_new_human(&session, None, None);
+        let output = render_new_human(&session, None, None, false);
 
         assert!(
             output.starts_with("session s-42 created (state: running)\n"),

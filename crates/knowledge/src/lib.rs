@@ -14,8 +14,8 @@ mod validation;
 
 #[doc(inline)]
 pub use assistant::{
-    assistant_launch_id, bundle_content_hash, embedded_bundle, materialized_version_hash,
-    sha256_for_bytes, EmbeddedBundle, BUNDLE_VERSION,
+    assistant_keyed_launch_id, assistant_launch_id, bundle_content_hash, embedded_bundle,
+    materialized_version_hash, sha256_for_bytes, EmbeddedBundle, BUNDLE_VERSION,
 };
 #[doc(inline)]
 pub use index::{bundle_index, BundleIndexError, ConceptMeta};

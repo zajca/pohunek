@@ -4615,19 +4615,30 @@ use the Rust SDK's dedicated connections and preserve inherited request-origin
 markers. `session new --request-timeout-ms <u32>` overrides the response deadline
 for that creation request; zero is rejected. Without that flag, every creation
 uses the Rust SDK's dedicated creation budget described below, which covers
-the daemon's bounded worker startup and create hooks. `session new` sends one
-`session.new` request and never resends it. Only its own refusals before that
-request (`cli_usage`, `confirmation_required`, `confirmation_declined`) prove
-that nothing was created. Any other failure leaves the outcome unknown:
+the daemon's bounded worker startup and create hooks. `session new --request-id
+<id>` (1 to 128 bytes of `A-Za-z0-9._:-`, refused with `cli_usage` otherwise)
+sends the id as `client_request_id`, so repeating the same command returns the
+session the first one created: `--json` then carries a top-level `replayed:
+true` and no `prompt_delivered`, and the human output says the session was
+already created. A host whose daemon does not advertise
+`session_new_request_id_supported` is refused with
+`session_new_request_id_unsupported` before the request is sent. `session new`
+sends one `session.new` request and never resends it by itself. Only its own
+refusals before that request (`cli_usage`, `confirmation_required`,
+`confirmation_declined`, `session_new_request_id_unsupported`) prove that
+nothing was created. Any other failure
+leaves the outcome unknown:
 `request_timeout`, whose recovery hint says so; a transport error such as
 `framing` locally or `remote_daemon_unavailable` for a remote host, which may
 be a reply lost after the request was sent; or a typed daemon error returned
 after the session was recorded, such as `session_runtime_reconnecting`. A
 create in progress is listed only once its target, the `pre-create` and
 `post-create` hooks included, and its launch are done. To find the session,
-pass a caller key such as `--meta launch=<id>` and look it up as described in
+repeat the command with the same `--request-id`, or, without one, pass a
+caller key such as `--meta launch=<id>` and look it up as described in
 [Creation outcome](#creation-outcome): the lookup, how to read its result, and
-why a retry can create a second session apply to `session new` as well.
+why a retry without a request id can create a second session apply to
+`session new` as well.
 
 Initial input waits for an editable prompt or bracketed-paste enable signal,
 up to the bounded startup grace for a silent agent; the body and submit key
@@ -4674,20 +4685,62 @@ confirmation prompt, so a remote launch with `--request-stdin` needs `--yes`
 
 `--request-timeout-ms <u32>` overrides the response deadline of the creation
 request only, with the same parser and meaning as on `session new`. Without it,
-the creation uses the Rust SDK's dedicated initial-input budget. `--meta
-key=value` (repeatable) writes caller metadata atomically with the session, as
-on `session new`.
+the creation uses the Rust SDK's dedicated initial-input budget. `--request-id
+<id>` and `--meta key=value` (repeatable) work as on `session new`: the id makes
+the launch idempotent, the metadata is written atomically with the session.
 
 #### Creation outcome
 
-A launch sends exactly one `session.new` request, and the CLI never resends it.
-Only the CLI's own refusals before that request prove that no session was
-created: `cli_usage` (including an invalid stdin request),
-`confirmation_required`, `no_capable_agent`, `materialization_failed` and
-`agent_cannot_read_bundle`.
+A launch against a daemon that advertises `session_new_request_id_supported`
+sends its `session.new` with a request id and, when no answer arrives, repeats
+the request once; against any other daemon it sends exactly one `session.new`
+and never resends it.
 
-Any other failure leaves the outcome unknown, because the caller cannot tell
-whether it came before or after the request:
+The request id is `--request-id <id>` (1 to 128 bytes of `A-Za-z0-9._:-`,
+`cli_usage` otherwise), or, without it, a generated `asst-` followed by 32
+random hex digits. A daemon that does not advertise the flag is sent no
+generated id; `--request-id` against it fails with
+`session_new_request_id_unsupported` before the request is sent. The retry
+happens only when an attempt got no answer: `request_timeout`, or a connection
+that failed or dropped (`remote_daemon_unavailable`, `host_unreachable`,
+`daemon_unreachable`, a framing or I/O error) or a reply that cannot be read. A
+typed daemon error is never retried. One budget
+`D` is measured from the first send: the explicit `--request-timeout-ms`, or
+the Rust SDK's dedicated creation budget. The first attempt gets `D` minus a
+reserve of five seconds (at most half of `D`), the retry what remains, so the
+two never exceed `D`.
+
+The daemon answers the retry at once when the first request reached it:
+
+- **The session exists:** the launch succeeds with that session, and `--json`
+  carries a top-level `replayed: true`. No second session, hook or prompt is
+  made.
+- **The create is still running:** `session_request_in_progress`, naming the
+  session. The outcome is then known: a create is running as that session.
+
+If the first request never arrived, the retry creates the session itself within
+what remains of the budget. An outcome that stays unknown after the retry fails
+with its error code, and every error of a keyed launch names the request id in
+its message. On a local host the recovery is to rerun the same command, with the
+same request, target and `--meta` flags and the same agent, plus `--request-id
+<id>`: the launch then renders
+the same opening prompt and the daemon answers with the same session, or with
+`session_request_in_progress` while it is still being created. On a remote host
+the opening prompt names a snapshot path the remote daemon picks for every
+launch, so a new process cannot replay the request: look the session up with
+the `--meta` key you passed (below). A caller who passes `--request-id` and sees
+an unknown outcome follows the same recovery. A request id names one launch: its
+snapshot file is written by the first launch and kept by a repeat, so use an id
+again only to repeat the same request.
+
+Only the CLI's own refusals before that request prove that no session was
+created: `cli_usage` (including an invalid stdin request or request id),
+`confirmation_required`, `no_capable_agent`, `materialization_failed`,
+`agent_cannot_read_bundle` and `session_new_request_id_unsupported`.
+
+Without a request id (a daemon that does not support one), any other failure
+leaves the outcome unknown, because the caller cannot tell whether it came
+before or after the request:
 
 - `request_timeout`.
 - A transport error, such as `remote_daemon_unavailable`, `host_unreachable`
@@ -4697,12 +4750,12 @@ whether it came before or after the request:
   and was rolled back, as described for `session.new` above. Some are returned
   after the session was recorded, for example `session_runtime_reconnecting`.
 
-`session.new` has no idempotency key, so pohunek cannot make a retry safe. A
-retry while the first create is still running creates a second session. A
-caller-chosen correlation key makes every attempt visible. Pass one, for
-example `--meta launch=<unique id>`, and keep it for every attempt of the same
-launch. The key name is the caller's convention: pohunek reserves and
-interprets none. After an unknown outcome, look the key up before deciding:
+Such a request cannot be retried safely: a retry while the first create is
+still running creates a second session. A caller-chosen correlation key makes
+every attempt visible. Pass one, for example `--meta launch=<unique id>`, and
+keep it for every attempt of the same launch. The key name is the caller's
+convention: pohunek reserves and interprets none. After an unknown outcome,
+look the key up before deciding:
 
 ```bash
 printf '%s' 'Why does attach fail on my laptop?' \

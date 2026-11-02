@@ -31,7 +31,8 @@ use crate::ClientError;
 
 /// Reserved host name that routes to this machine's Unix socket.
 pub const LOCAL_HOST: &str = "local";
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Response deadline of an ordinary request when the caller sets none.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A creation waits for bounded worker startup, the project's create hooks
 /// and, with initial input, the host's configured reader grace. In a native
@@ -843,12 +844,7 @@ impl Client {
         if params.input.is_some() {
             params.extended_input_ready_wait = Some(true);
         }
-        let budget_ms = SESSION_NEW_REQUEST_BUDGET_MS.saturating_add(
-            params.input_ack_timeout_ms.map_or(0, |ack_ms| {
-                ack_ms.saturating_add(protocol::MAX_SESSION_WAIT_MS)
-            }),
-        );
-        let timeout = lifecycle_request_timeout(self.options, budget_ms);
+        let timeout = lifecycle_request_timeout(self.options, session_new_budget_ms(&params));
         let mut client = self
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;
@@ -1805,6 +1801,28 @@ fn command_unsupported(error: ClientError) -> ClientError {
         }
         other => other,
     }
+}
+
+/// Milliseconds of daemon work `session.new` with `params` may take.
+fn session_new_budget_ms(params: &SessionNewParams) -> u32 {
+    SESSION_NEW_REQUEST_BUDGET_MS.saturating_add(params.input_ack_timeout_ms.map_or(0, |ack_ms| {
+        ack_ms.saturating_add(protocol::MAX_SESSION_WAIT_MS)
+    }))
+}
+
+/// The response deadline [`Client::session_new`] applies to `params`.
+///
+/// `explicit` is the caller's own request timeout, which wins; without one the
+/// deadline is the dedicated creation budget plus transport headroom. A caller
+/// that splits one budget across attempts starts from this value.
+#[must_use]
+pub fn session_new_request_deadline(
+    params: &SessionNewParams,
+    explicit: Option<Duration>,
+) -> Duration {
+    explicit.unwrap_or_else(|| {
+        dedicated_request_timeout(DEFAULT_REQUEST_TIMEOUT, session_new_budget_ms(params))
+    })
 }
 
 /// Response timeout of a lifecycle request whose daemon work is bounded by

@@ -8,15 +8,16 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use knowledge::{
-    assistant_launch_id, bundle_content_hash, bundle_index, materialize as materialize_bundle,
-    materialized_version_hash, BUNDLE_VERSION,
+    assistant_keyed_launch_id, assistant_launch_id, bundle_content_hash, bundle_index,
+    materialize as materialize_bundle, materialized_version_hash, BUNDLE_VERSION,
 };
-use pohunek_client::Client;
+use pohunek_client::{session_new_request_deadline, Client, ClientError, DEFAULT_REQUEST_TIMEOUT};
 use protocol::{
     method, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent, ConceptMeta,
-    HostCapabilities, ProtocolError, RuntimeRef, SessionInfo, SessionNewParams,
+    HostCapabilities, ProtocolError, RuntimeRef, SessionInfo, SessionNewParams, SessionNewResult,
 };
 use serde::Serialize;
 
@@ -127,6 +128,10 @@ pub struct LaunchParams {
     pub no_snapshot: bool,
     pub degraded: bool,
     pub auto_started_daemon: bool,
+    /// Caller-chosen idempotency key of the launch, to resume an earlier launch
+    /// whose outcome was unknown. `None` lets a daemon that supports keys get a
+    /// generated one.
+    pub request_id: Option<String>,
 }
 
 /// Materialized assistant knowledge description.
@@ -167,6 +172,9 @@ pub struct LaunchResult {
     pub session: SessionInfo,
     pub applied_input: Option<bool>,
     pub worktree_source: Option<protocol::WorktreeSource>,
+    /// The daemon answered with a session an earlier attempt of the same
+    /// request had created, so no new session exists.
+    pub replayed: bool,
     pub assistant: LaunchMeta,
 }
 
@@ -263,6 +271,7 @@ pub async fn prepare_with_options(
         )
         .into());
     }
+    let client_request_id = launch_request_id(config, &capabilities, params.request_id.as_deref())?;
     let selection = select_agent(&capabilities, params.agent.as_deref())?;
     let (snapshot, orientation) = if params.no_snapshot {
         skipped_snapshot(config, &params, &selection.name)
@@ -271,13 +280,13 @@ pub async fn prepare_with_options(
     };
 
     let knowledge = if params.degraded {
-        let degraded = materialize_degraded(paths, &snapshot)?;
+        let degraded = materialize_degraded(paths, &snapshot, client_request_id.as_deref())?;
         preflight_snapshot_readable(&degraded.snapshot_path)?;
         PreparedKnowledge::Degraded(degraded)
     } else if is_remote(config) {
         PreparedKnowledge::Materialized(materialize_remote(&mut client, &snapshot).await?)
     } else {
-        let materialized = materialize_local(paths, &snapshot)?;
+        let materialized = materialize_local(paths, &snapshot, client_request_id.as_deref())?;
         preflight_read_access(
             &materialized.bundle_path,
             &materialized.snapshot_path,
@@ -310,7 +319,7 @@ pub async fn prepare_with_options(
     };
 
     let session_params = SessionNewParams {
-        client_request_id: None,
+        client_request_id,
         agent: selection.name.clone(),
         name: None,
         cwd: None,
@@ -350,15 +359,13 @@ pub async fn start_prepared_with_options(
     prepared: PreparedLaunch,
     options: ConnectionOptions,
 ) -> Result<LaunchResult, AssistantError> {
-    let mut client = connect_client(config, options).await?;
-    let result = client
-        .call::<method::SessionNew>(prepared.session_params)
-        .await?;
+    let result = create_session(config, &prepared.session_params, options).await?;
 
     Ok(LaunchResult {
         session: result.session,
         applied_input: result.applied_input,
         worktree_source: result.worktree_source,
+        replayed: result.replayed == Some(true),
         assistant: LaunchMeta {
             intent: prepared.intent,
             agent: prepared.selection.name,
@@ -368,6 +375,203 @@ pub async fn start_prepared_with_options(
             knowledge: prepared.knowledge.label,
         },
     })
+}
+
+/// Sends `session.new`, once without a key and at most twice with one.
+///
+/// A keyed request is safe to repeat: the daemon answers a repeat with the
+/// session the first one created, with `session_request_in_progress` while it
+/// is still being created, or creates it when the first never arrived. One
+/// budget `D` (the explicit request timeout, or the dedicated creation budget)
+/// is measured from the first send. The first attempt gets `D` minus a reserve
+/// of [`DEFAULT_REQUEST_TIMEOUT`] (at most half of `D`), the retry what remains,
+/// and each attempt as a whole (connections, capability check and request) is
+/// bounded by its share, so the two never exceed `D`. Only an unanswered attempt
+/// is retried; a typed daemon error is final.
+async fn create_session(
+    config: &HostConfig,
+    params: &SessionNewParams,
+    options: ConnectionOptions,
+) -> Result<SessionNewResult, AssistantError> {
+    let Some(request_id) = params.client_request_id.as_deref() else {
+        return attempt(config, params, options).await;
+    };
+    let resume = ResumeHint {
+        request_id,
+        resumable: !is_remote(config),
+    };
+    let started = tokio::time::Instant::now();
+    let deadline = session_new_request_deadline(params, options.request_timeout);
+    let reserve = DEFAULT_REQUEST_TIMEOUT.min(deadline / 2);
+    let first = bounded_attempt(config, params, options, deadline.saturating_sub(reserve)).await;
+    let unanswered = match first {
+        Ok(result) => return Ok(result),
+        Err(error) if outcome_unknown(&error) => error,
+        Err(error) => return Err(resume.name(error)),
+    };
+    let remaining = deadline.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(resume.name(unanswered));
+    }
+    bounded_attempt(config, params, options, remaining)
+        .await
+        .map_err(|error| resume.name(error))
+}
+
+/// One attempt that ends within `limit`, connections included.
+async fn bounded_attempt(
+    config: &HostConfig,
+    params: &SessionNewParams,
+    options: ConnectionOptions,
+    limit: Duration,
+) -> Result<SessionNewResult, AssistantError> {
+    let attempted = tokio::time::timeout(
+        limit,
+        attempt(config, params, options.with_request_timeout(limit)),
+    )
+    .await;
+    attempted.unwrap_or_else(|_elapsed| {
+        Err(AssistantError::Client(ClientError::RequestTimeout {
+            host: is_remote(config).then(|| host_label(config)),
+            timeout: limit,
+        }))
+    })
+}
+
+/// One `session.new` on a fresh connection.
+async fn attempt(
+    config: &HostConfig,
+    params: &SessionNewParams,
+    options: ConnectionOptions,
+) -> Result<SessionNewResult, AssistantError> {
+    let mut client = connect_client(config, options).await?;
+    Ok(client.call::<method::SessionNew>(params.clone()).await?)
+}
+
+/// Whether `error` leaves it unknown that the daemon handled the request: a
+/// deadline, a connection that failed or dropped, or a reply that cannot be
+/// read. A keyed request is safe to repeat in each of these cases.
+const fn outcome_unknown(error: &AssistantError) -> bool {
+    matches!(
+        error,
+        AssistantError::Client(
+            ClientError::RequestTimeout { .. }
+                | ClientError::Framing(_)
+                | ClientError::Io(_)
+                | ClientError::Json(_)
+                | ClientError::DaemonUnreachable { .. }
+                | ClientError::HostUnreachable { .. }
+                | ClientError::RemoteDaemonUnavailable { .. }
+        )
+    )
+}
+
+/// Typed `session.new` errors that can be returned after the session was
+/// recorded, so the caller may need the request id to get it back.
+const RECORDED_CODES: [&str; 2] = [
+    "session_request_in_progress",
+    "session_runtime_reconnecting",
+];
+
+/// How a launch that carried a request id tells its caller to get the session
+/// back.
+struct ResumeHint<'a> {
+    request_id: &'a str,
+    /// A new process renders the same opening prompt under the id, so the daemon
+    /// replays. A remote daemon picks a different snapshot path for every launch,
+    /// so only the retry inside the launch can replay there.
+    resumable: bool,
+}
+
+impl ResumeHint<'_> {
+    /// `error` with the request id in its message and a way to get the session
+    /// back in its recovery. A typed daemon error keeps its own recovery first.
+    fn name(&self, error: AssistantError) -> AssistantError {
+        let unknown = outcome_unknown(&error);
+        let mut error = match error {
+            AssistantError::Client(source) => source.to_protocol_error(),
+            AssistantError::Protocol(source) => source,
+            other => return other,
+        };
+        error.msg = format!("{} (request id `{}`)", error.msg, self.request_id);
+        let resume = self.recover_text();
+        let recorded = RECORDED_CODES.contains(&error.code.as_str());
+        error.recover = match (unknown, recorded, error.recover.take()) {
+            (true, _, _) | (false, true, None) => Some(resume),
+            (false, true, Some(own)) => {
+                Some(format!("{own}; if a session was created anyway, {resume}"))
+            }
+            (false, false, own) => own,
+        };
+        AssistantError::Protocol(error)
+    }
+
+    fn recover_text(&self) -> String {
+        let id = self.request_id;
+        if self.resumable {
+            format!(
+                "the daemon may have created the session: rerun the same command with \
+                 `--request-id {id}` to get it back (the daemon answers with the same session, \
+                 or with `session_request_in_progress` while it is still being created); the \
+                 request, target and `--meta` flags and the agent must be unchanged"
+            )
+        } else {
+            format!(
+                "the daemon may have created the session: look for it with `pohunek session \
+                 list`, filtered by the `--meta` key you passed; a new launch cannot replay \
+                 request id `{id}` on a remote host, because the opening prompt names a snapshot \
+                 path that host picks for every launch"
+            )
+        }
+    }
+}
+
+/// The idempotency key the launch sends, or `None` for a daemon that cannot
+/// honor one.
+///
+/// A caller key is checked against the daemon's capability, since an old daemon
+/// would drop it silently. Without one, a daemon that supports keys gets a
+/// generated key so a lost reply can be retried safely.
+fn launch_request_id(
+    config: &HostConfig,
+    capabilities: &HostCapabilities,
+    requested: Option<&str>,
+) -> Result<Option<String>, AssistantError> {
+    if let Some(id) = requested {
+        if !protocol::is_valid_client_request_id(id) {
+            return Err(ProtocolError::bad_request(
+                "request id must be 1 to 128 bytes of A-Z, a-z, 0-9, '.', '_', ':' or '-'",
+            )
+            .into());
+        }
+        if !capabilities.session_new_request_id_supported {
+            let host = is_remote(config).then(|| host_label(config));
+            return Err(ProtocolError::session_new_request_id_unsupported(host.as_deref()).into());
+        }
+        return Ok(Some(id.to_owned()));
+    }
+    if !capabilities.session_new_request_id_supported {
+        return Ok(None);
+    }
+    generated_request_id().map(Some)
+}
+
+/// `asst-` and 128 random bits as 32 lowercase hex digits.
+fn generated_request_id() -> Result<String, AssistantError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| {
+        AssistantError::Protocol(ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "assistant_launch_failed",
+            format!("cannot generate a request id: {error}"),
+            None,
+        ))
+    })?;
+    let mut id = String::from("asst-");
+    for byte in bytes {
+        write!(id, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(id)
 }
 
 /// Prepare and start an assistant session.
@@ -470,13 +674,14 @@ impl PreparedKnowledge {
 fn materialize_degraded(
     paths: &AssistantPaths,
     snapshot: &str,
+    request_id: Option<&str>,
 ) -> Result<DegradedMaterializeResult, AssistantError> {
-    let runtime_dir = assistant_runtime_dir(paths)?;
+    let runtime_dir = assistant_runtime_dir(paths, request_id)?;
     create_private_dir_all(&runtime_dir).map_err(|err| {
         ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
     })?;
     let snapshot_path = runtime_dir.join(SNAPSHOT_FILE);
-    std::fs::write(&snapshot_path, snapshot).map_err(|err| {
+    write_snapshot(&snapshot_path, snapshot, request_id.is_some()).map_err(|err| {
         ProtocolError::materialization_failed(
             &snapshot_path.display().to_string(),
             &err.to_string(),
@@ -492,6 +697,7 @@ fn materialize_degraded(
 fn materialize_local(
     paths: &AssistantPaths,
     snapshot: &str,
+    request_id: Option<&str>,
 ) -> Result<AssistantMaterializeResult, AssistantError> {
     let version_hash = materialized_version_hash();
     let concepts: Vec<protocol::ConceptMeta> = bundle_index()
@@ -508,12 +714,12 @@ fn materialize_local(
                 &err.to_string(),
             )
         })?;
-    let runtime_dir = assistant_runtime_dir(paths)?;
+    let runtime_dir = assistant_runtime_dir(paths, request_id)?;
     create_private_dir_all(&runtime_dir).map_err(|err| {
         ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
     })?;
     let snapshot_path = runtime_dir.join(SNAPSHOT_FILE);
-    std::fs::write(&snapshot_path, snapshot).map_err(|err| {
+    write_snapshot(&snapshot_path, snapshot, request_id.is_some()).map_err(|err| {
         ProtocolError::materialization_failed(
             &snapshot_path.display().to_string(),
             &err.to_string(),
@@ -544,6 +750,26 @@ async fn materialize_remote(
     Ok(result)
 }
 
+/// Writes the launch snapshot to `path`.
+///
+/// A launch under a request id owns its directory: the first launch writes the
+/// snapshot and a repeat keeps it, so a repeat that the daemon refuses (another
+/// request under the same id) cannot change the file a running session reads.
+fn write_snapshot(path: &Path, snapshot: &str, keep_existing: bool) -> std::io::Result<()> {
+    if !keep_existing {
+        return std::fs::write(path, snapshot);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => std::io::Write::write_all(&mut file, snapshot.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Creates `dir` and every missing ancestor owner-private. The runtime root
 /// is `XDG_RUNTIME_DIR/pohunek`, which the daemon refuses unless it is 0700.
 fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
@@ -565,9 +791,18 @@ fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
-fn assistant_runtime_dir(paths: &AssistantPaths) -> Result<PathBuf, AssistantError> {
+/// The runtime directory of one local launch: unique per launch, or, under a
+/// request id, a function of it, so a launch repeated under the id renders the
+/// same snapshot path into its prompt.
+fn assistant_runtime_dir(
+    paths: &AssistantPaths,
+    request_id: Option<&str>,
+) -> Result<PathBuf, AssistantError> {
     let version_hash = materialized_version_hash();
-    let launch_id = assistant_launch_id(&version_hash);
+    let launch_id = match request_id {
+        Some(id) => assistant_keyed_launch_id(&version_hash, id),
+        None => assistant_launch_id(&version_hash),
+    };
     paths.assistant_runtime_dir(&launch_id).ok_or_else(|| {
         ProtocolError::materialization_failed("assistant runtime", "invalid launch id").into()
     })

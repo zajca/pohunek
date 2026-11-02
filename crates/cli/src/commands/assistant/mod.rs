@@ -73,6 +73,9 @@ pub(crate) struct AssistantOptions {
     /// Explicit response deadline of the `session.new` request; `None` keeps
     /// the SDK's dedicated initial-input creation budget.
     pub(crate) request_timeout_ms: Option<u32>,
+    /// Caller-chosen idempotency key of the launch; `None` lets a daemon that
+    /// supports keys get a generated one.
+    pub(crate) request_id: Option<String>,
     /// Caller metadata written atomically with the session.
     pub(crate) metadata: BTreeMap<String, String>,
     pub(crate) agent: Option<String>,
@@ -233,7 +236,7 @@ async fn run_prepared(
     let launched = core_assistant::start_prepared_with_options(&host, prepared, options)
         .await
         .map_err(core_error)?;
-    if launched.applied_input != Some(true) {
+    if launched.applied_input != Some(true) && !launched.replayed {
         eprintln!(
             "pohunek: warning: host '{}' did not confirm the assistant opening prompt was \
              delivered; the session is running without it.",
@@ -328,6 +331,8 @@ fn emit_launch_output(
             session: &'a protocol::SessionInfo,
             #[serde(skip_serializing_if = "Option::is_none")]
             worktree_source: Option<&'a protocol::WorktreeSource>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            replayed: bool,
             assistant: AssistantMeta<'a>,
         }
         print!(
@@ -335,6 +340,7 @@ fn emit_launch_output(
             crate::commands::render_json(&Output {
                 session: info,
                 worktree_source: result.worktree_source.as_ref(),
+                replayed: result.replayed,
                 assistant: AssistantMeta {
                     intent: opts.intent.as_str(),
                     agent: &result.assistant.agent,
@@ -356,7 +362,14 @@ fn emit_launch_output(
         } else {
             ""
         };
-        println!("started assistant session{degraded_note}: {target}");
+        if result.replayed {
+            println!(
+                "assistant session already started by an earlier request with this request \
+                 id{degraded_note}: {target}"
+            );
+        } else {
+            println!("started assistant session{degraded_note}: {target}");
+        }
         if let Some(source) = &result.worktree_source {
             println!(
                 "worktree source: {} at {}",
@@ -441,6 +454,7 @@ fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assista
         no_snapshot: opts.no_snapshot,
         degraded: opts.degraded,
         auto_started_daemon: auto_started,
+        request_id: opts.request_id.clone(),
     }
 }
 
@@ -482,6 +496,7 @@ mod tests {
             request: None,
             request_from_stdin: false,
             request_timeout_ms: None,
+            request_id: None,
             metadata: BTreeMap::new(),
             agent: None,
             host: host.to_owned(),
