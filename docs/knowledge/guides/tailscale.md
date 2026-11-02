@@ -47,23 +47,27 @@ Pohunek never starts, stops or logs in Tailscale. It only runs
   that directory is on it, and check the `tailscale_cli` entry of `pohunek
   doctor`, which reports what the daemon itself finds.
 - **macOS (Apple Silicon, Homebrew).** `brew install tailscale` installs the
-  command-line client. Pohunek finds it in `/opt/homebrew/bin` and runs it,
-  because that directory is owned by you, belongs to the `admin` group and is
-  not writable by others (see [environment resolution](environment-resolution.md)).
+  command-line client. In a stock Homebrew prefix, where `bin` and `Cellar` are
+  owned by you, belong to the `admin` group and are not writable by others,
+  Pohunek finds the client in `/opt/homebrew/bin` and runs it: the link, its
+  keg directory and the binary all have to pass the trust rule (see
+  [environment resolution](environment-resolution.md)). A root-owned or managed
+  prefix, or a daemon that runs as root, still gets `tailscale_cli_missing`.
   The lookup, `pohunek doctor` and `host list` were checked against a Homebrew
   `tailscale` on a real Mac with no `tailscaled` running: `tailscale_cli` is
   `warn` with "local tailscale state is unavailable", `host list` fails with
   `tailscale_state_unavailable` instead of `tailscale_cli_missing`, and the
   daemon logs "overlay state unavailable; serving local-only". Pohunek does not
   start `tailscaled`: run it yourself (the formula needs a root service) and
-  join the tailnet. A macOS daemon that listens on the tailnet address and a
-  Linux peer that lists the Mac are not verified yet; that check needs a root
-  `tailscaled`. The App Store and standalone builds are refused, because their
-  command-line tool lives below `/Applications`, a root-owned directory the
-  admin group can write: `host list` fails with `tailscale_cli_missing`, the
-  doctor reports `tailscale_cli` as `fail`, and the daemon binds no listener. A
-  Mac keeps working over NetBird and reaches Tailscale hosts through a Linux
-  host. Tracked in [#1583](https://github.com/zajca/pohunek/issues/1583).
+  join the tailnet. No part of a running `tailscaled` is verified on macOS,
+  neither the client side (status, peers, `host list`, `--host`) nor the
+  listener on the tailnet address; that check needs a root `tailscaled`. The App
+  Store and standalone builds are refused, because their command-line tool
+  lives below `/Applications`, a root-owned directory the admin group can
+  write: `host list` fails with `tailscale_cli_missing`, the doctor reports
+  `tailscale_cli` as `fail`, and the daemon binds no listener. A Mac keeps
+  working over NetBird and reaches Tailscale hosts only through a Linux host.
+  Tracked in [#1583](https://github.com/zajca/pohunek/issues/1583).
 - **Headscale and other control servers.** Pohunek reads only the local client's
   status, so a self-hosted control server needs no Pohunek setting. Point the
   client at it (`tailscale up --login-server=<url>`) and keep the rest of this
