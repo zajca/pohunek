@@ -2690,6 +2690,34 @@ async fn a_profile_backed_launch_gets_the_naming_args() {
     servers.stop().await;
 }
 
+/// Creates sessions named with plain and dash-leading names and checks the pair
+/// group each launch carries and the warning a withheld group logs.
+async fn assert_pair_creates(local: &mut Framed<UnixStream, LinesCodec>, cwd: &Path) {
+    let create_flags = ["--session-id"];
+
+    for (name, expected) in [
+        (
+            "Two Words",
+            strings(&["--model", "fast", "--name", "Two Words", "--session-id"]),
+        ),
+        ("--offline", strings(&["--model", "fast", "--session-id"])),
+        ("-n", strings(&["--model", "fast", "--session-id"])),
+    ] {
+        let id = start_named_session(local, RUNTIME, cwd, Some(name)).await;
+        let argv = printed_argv(local, &id).await;
+        assert_eq!(without_reference(&argv, &create_flags), expected, "{name}");
+        // The withheld group is logged with the session id, never the name.
+        let warned = captured_log_lines(&["starts with a dash", &id.0]);
+        assert_eq!(
+            warned.len(),
+            usize::from(name.starts_with('-')),
+            "{name}: {warned:?}"
+        );
+        assert!(warned.iter().all(|line| !line.contains(name)), "{warned:?}");
+        let _: protocol::SessionStopResult = call(local, method::SESSION_STOP, json!(id)).await;
+    }
+}
+
 /// The pair form `["--name", "{session_name}"]` hands the name over as a
 /// separate element, after the contributor arguments and before the native
 /// reference; a name with interior spaces stays one element, a dash-leading
@@ -2720,30 +2748,7 @@ async fn pair_naming_args_follow_the_name_each_launch_uses() {
     )
     .await;
     installed.expect("the pair form installs");
-    let create_flags = ["--session-id"];
-
-    for (name, expected) in [
-        (
-            "Two Words",
-            strings(&["--model", "fast", "--name", "Two Words", "--session-id"]),
-        ),
-        ("--offline", strings(&["--model", "fast", "--session-id"])),
-        ("-n", strings(&["--model", "fast", "--session-id"])),
-    ] {
-        let id = start_named_session(&mut local, RUNTIME, &cwd, Some(name)).await;
-        let argv = printed_argv(&mut local, &id).await;
-        assert_eq!(without_reference(&argv, &create_flags), expected, "{name}");
-        // The withheld group is logged with the session id, never the name.
-        let warned = captured_log_lines(&["starts with a dash", &id.0]);
-        assert_eq!(
-            warned.len(),
-            usize::from(name.starts_with('-')),
-            "{name}: {warned:?}"
-        );
-        assert!(warned.iter().all(|line| !line.contains(name)), "{warned:?}");
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(id)).await;
-    }
+    assert_pair_creates(&mut local, &cwd).await;
 
     // A rename to a plain name reaches the next resume; a rename to a
     // dash-leading name withholds the group from it.
