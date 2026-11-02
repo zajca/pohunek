@@ -1559,16 +1559,40 @@ pub(super) enum LossProof {
     Unproven,
 }
 
+/// Why a runtime was lost when no service-manager verdict exists.
+///
+/// The wire carries the string as the open `loss_cause`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LossCause {
+    /// The user service manager that held the worker is gone within the boot
+    /// the worker recorded.
+    UserManagerLost,
+    /// The host booted again after the worker was started.
+    HostRestarted,
+}
+
+impl LossCause {
+    /// The stable wire string.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserManagerLost => "user_manager_lost",
+            Self::HostRestarted => "host_restarted",
+        }
+    }
+}
+
 /// A runtime classification committed by the unavailable-runtime funnels.
 ///
 /// A `Lost` classification cannot be built without its [`LossProof`]. The
 /// exit the service manager recorded for the worker rides with it: it is a
-/// fact about the worker's job, independent of the proof.
+/// fact about the worker's job, independent of the proof. The loss cause is
+/// the journal's explanation for a loss that has no such exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Unavailability {
     Lost {
         proof: LossProof,
         exit: Option<protocol::RuntimeExit>,
+        loss_cause: Option<LossCause>,
     },
     Other(RuntimeState),
 }
@@ -1576,7 +1600,26 @@ pub(super) enum Unavailability {
 impl Unavailability {
     /// A `Lost` classification with what the caller proved and observed.
     pub(super) const fn lost(proof: LossProof, exit: Option<protocol::RuntimeExit>) -> Self {
-        Self::Lost { proof, exit }
+        Self::Lost {
+            proof,
+            exit,
+            loss_cause: None,
+        }
+    }
+
+    /// Adds the journal's explanation of a loss. It applies only while the
+    /// classification carries no exit, because a manager verdict already
+    /// explains the loss.
+    pub(super) fn with_loss_cause(mut self, cause: Option<LossCause>) -> Self {
+        if let Self::Lost {
+            exit: None,
+            loss_cause,
+            ..
+        } = &mut self
+        {
+            *loss_cause = cause;
+        }
+        self
     }
 
     /// A classification other than `Lost`.
@@ -1606,16 +1649,32 @@ impl Unavailability {
     /// Records this classification in `runtime`, which still names the
     /// state it had before.
     ///
-    /// A `Lost` classification without new evidence keeps the exit of a
-    /// runtime that was already lost, because the job that held it is gone;
-    /// every other classification drops it.
+    /// A `Lost` classification carries either an exit or a loss cause, never
+    /// both. A runtime that was already lost keeps what it holds unless a new
+    /// exit arrives, because the cause belongs to the loss that was first
+    /// classified and the journal would explain a later restart as another
+    /// loss; every other classification drops both.
     pub(super) fn apply_exit(&self, runtime: &mut SessionRuntime) {
         match self {
             Self::Lost {
                 exit: Some(exit), ..
-            } => runtime.exit = Some(exit.clone()),
+            } => {
+                runtime.exit = Some(exit.clone());
+                runtime.loss_cause = None;
+            }
             Self::Lost { exit: None, .. } if runtime.state == RuntimeState::Lost => {}
-            Self::Lost { exit: None, .. } | Self::Other(_) => runtime.exit = None,
+            Self::Lost {
+                exit: None,
+                loss_cause: Some(cause),
+                ..
+            } => {
+                runtime.exit = None;
+                runtime.loss_cause = Some(cause.as_str().to_owned());
+            }
+            Self::Lost { .. } | Self::Other(_) => {
+                runtime.exit = None;
+                runtime.loss_cause = None;
+            }
         }
     }
 }
@@ -1723,6 +1782,7 @@ fn exit_transition(
         runtime.state = RuntimeState::Terminal;
         runtime.loss_reason = None;
         runtime.exit = None;
+        runtime.loss_cause = None;
     }
     // A runtime that was unavailable ends as the terminal runtime it is.
     if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
@@ -7046,6 +7106,7 @@ impl SessionRegistry {
             runtime.state = RuntimeState::Reconnecting;
             runtime.loss_reason = Some(WORKER_CONNECTION_LOST.to_owned());
             runtime.exit = None;
+            runtime.loss_cause = None;
         }
         entry.info.updated_at = timestamp_now();
         drop(sessions);
@@ -7185,6 +7246,7 @@ impl SessionRegistry {
                 runtime.last_connected_at = Some(timestamp_now());
                 runtime.loss_reason = None;
                 runtime.exit = None;
+                runtime.loss_cause = None;
             }
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
@@ -8419,6 +8481,7 @@ fn create_intent_record(
             last_connected_at: None,
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         }),
         cols: params.cols,
         rows: params.rows,

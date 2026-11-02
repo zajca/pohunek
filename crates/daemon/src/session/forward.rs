@@ -907,9 +907,7 @@ impl SessionRegistry {
         if already_committed {
             return;
         }
-        let outcome = self
-            .apply_worker_metadata_snapshot_locked(id, &snapshot)
-            .await;
+        let outcome = Box::pin(self.apply_worker_metadata_snapshot_locked(id, &snapshot)).await;
         if outcome != WorkerMetadataApplyOutcome::Applied {
             warn!(
                 name: "session.active_identity.commit_deferred",

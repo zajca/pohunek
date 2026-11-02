@@ -619,7 +619,7 @@ fn protocol_3_session_results_and_events_omit_the_spawner() {
 }
 
 #[test]
-fn protocol_3_session_results_and_events_omit_the_runtime_exit() {
+fn protocol_3_session_results_and_events_omit_the_runtime_exit_and_loss_cause() {
     let previous = fixtures(RESULTS, "results.json")
         .entries
         .into_iter()
@@ -628,7 +628,14 @@ fn protocol_3_session_results_and_events_omit_the_runtime_exit() {
         .clone();
     let mut current =
         upgrade_result(v3(), method::SESSION_INSPECT, previous).expect("upgrade recorded result");
-    current["runtime"]["exit"] = json!({"cause": "oom_kill", "signal": 9});
+    current["runtime"]["exit"] = json!({
+        "cause": "oom_kill",
+        "signal": 9,
+        "oom_killer": "kernel",
+        "memory_peak_bytes": 1_024,
+        "ended_at": "2026-11-01T08:39:00Z"
+    });
+    current["runtime"]["loss_cause"] = json!("user_manager_lost");
     let decoded: protocol::SessionInfo =
         serde_json::from_value(current.clone()).expect("current type decodes the exit");
     assert_eq!(
@@ -637,6 +644,9 @@ fn protocol_3_session_results_and_events_omit_the_runtime_exit() {
             cause: "oom_kill".to_owned(),
             signal: Some(9),
             code: None,
+            oom_killer: Some("kernel".to_owned()),
+            memory_peak_bytes: Some(1_024),
+            ended_at: Some("2026-11-01T08:39:00Z".to_owned()),
         })
     );
 
@@ -656,6 +666,10 @@ fn protocol_3_session_results_and_events_omit_the_runtime_exit() {
                 session["runtime"].get("exit").is_none(),
                 "{method_name}: {session}"
             );
+            assert!(
+                session["runtime"].get("loss_cause").is_none(),
+                "{method_name}: {session}"
+            );
             assert!(session["runtime"].get("runtime_id").is_some());
         }
     }
@@ -668,6 +682,10 @@ fn protocol_3_session_results_and_events_omit_the_runtime_exit() {
     .expect("downgrade event")
     .expect("protocol 3 knows the event");
     assert!(lost["session"]["runtime"].get("exit").is_none(), "{lost}");
+    assert!(
+        lost["session"]["runtime"].get("loss_cause").is_none(),
+        "{lost}"
+    );
 
     let upgraded = upgrade_result(
         v3(),

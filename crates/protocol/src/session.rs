@@ -2661,6 +2661,14 @@ pub struct SessionRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub exit: Option<RuntimeExit>,
+    /// Why the runtime was lost when no service-manager verdict exists: the
+    /// manager that held the worker, or the host, is gone. Open string;
+    /// clients must tolerate a value they do not know. The documented values
+    /// are `user_manager_lost` and `host_restarted`. Set only while `exit` is
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub loss_cause: Option<String>,
 }
 
 /// The end of a worker as recorded by the service manager.
@@ -2682,6 +2690,22 @@ pub struct RuntimeExit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub code: Option<i32>,
+    /// Which memory killer ended the worker when `cause` is `oom_kill`. Open
+    /// string; clients must tolerate a value they do not know. The
+    /// documented values are `kernel`, `systemd_oomd` and `jetsam`. Absent
+    /// when the evidence does not name exactly one killer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub oom_killer: Option<String>,
+    /// Highest memory use of the worker's unit in bytes, children included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub memory_peak_bytes: Option<u64>,
+    /// When the worker's main process ended (RFC 3339), per the manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub ended_at: Option<String>,
 }
 
 impl RuntimeState {

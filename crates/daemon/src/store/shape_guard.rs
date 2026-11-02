@@ -76,6 +76,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (12, include_str!("fixtures/shape/schema-12.txt")),
     (13, include_str!("fixtures/shape/schema-13.txt")),
     (14, include_str!("fixtures/shape/schema-14.txt")),
+    (15, include_str!("fixtures/shape/schema-15.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -206,6 +207,10 @@ fn session_builtin_json() -> Value {
     session_json_with(&resume_builtin_json())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fully populated sample of every persisted record field"
+)]
 fn session_json_with(recovery: &Value) -> Value {
     let mut record = json!({
         "schema_version": STORE_SCHEMA_VERSION,
@@ -237,7 +242,15 @@ fn session_json_with(recovery: &Value) -> Value {
                 "started_at": "2026-01-01T00:00:00Z",
                 "last_connected_at": "2026-01-01T00:00:01Z",
                 "loss_reason": "none",
-                "exit": {"cause": "oom_kill", "signal": 15, "code": 1}
+                "loss_cause": "user_manager_lost",
+                "exit": {
+                    "cause": "oom_kill",
+                    "signal": 15,
+                    "code": 1,
+                    "oom_killer": "kernel",
+                    "memory_peak_bytes": 1024,
+                    "ended_at": "2026-01-01T00:00:02Z"
+                }
             },
             "cols": 120,
             "rows": 40,
@@ -484,17 +497,24 @@ fn assert_every_field_is_reviewed(
         last_connected_at: _,
         loss_reason,
         exit,
+        loss_cause,
     }) = session_runtime
     {
         let _: &RuntimeState = runtime_state;
         let _: &Option<String> = loss_reason;
+        let _: &Option<String> = loss_cause;
         if let Some(protocol::RuntimeExit {
             cause,
             signal: _,
             code: _,
+            oom_killer,
+            memory_peak_bytes: _,
+            ended_at,
         }) = exit
         {
             let _: &String = cause;
+            let _: &Option<String> = oom_killer;
+            let _: &Option<String> = ended_at;
         }
     }
     for protocol::SubagentInfo {
@@ -820,6 +840,9 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.info.runtime.last_connected_at",
     "session.info.runtime.loss_reason",
     "session.info.runtime.exit.cause",
+    "session.info.runtime.exit.oom_killer",
+    "session.info.runtime.exit.ended_at",
+    "session.info.runtime.loss_cause",
     "session.info.subagents[].id",
     "session.info.subagents[].parent_id",
     "session.info.subagents[].provider",
@@ -865,7 +888,8 @@ const ABSOLUTE_FREE: &[&str] = &[
 /// digests, provider strings, argument literals, user metadata (`metadata.*`),
 /// and the open-string fields an older reader cannot reject
 /// (`transaction.phase`, `runtime.reason`, `info.runtime.loss_reason`,
-/// `info.runtime.exit.cause`). Each entry lists the leaf paths it covers; an
+/// `info.runtime.loss_cause`, `info.runtime.exit.cause`, `exit.oom_killer`,
+/// `exit.ended_at`). Each entry lists the leaf paths it covers; an
 /// entry that matches no sample leaf fails the guard.
 fn free_text() -> Vec<Vec<String>> {
     let mut entries: Vec<Vec<String>> = RESUME_FREE

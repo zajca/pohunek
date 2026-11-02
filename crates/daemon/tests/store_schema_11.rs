@@ -76,6 +76,9 @@ fn a_recorded_exit_round_trips_through_the_store() {
         cause: "oom_kill".to_owned(),
         signal: Some(15),
         code: None,
+        oom_killer: None,
+        memory_peak_bytes: None,
+        ended_at: None,
     };
     record.info.runtime.as_mut().expect("runtime").exit = Some(exit.clone());
     store.record_session(&record).expect("record the exit");
