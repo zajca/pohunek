@@ -251,10 +251,15 @@ enum TransitionKey {
     /// so a terminal state the daemon replays after a restart keeps the key
     /// of the record it already projected.
     Generation(RuntimeGeneration),
+    /// The runtime generation an unproven loss was reported for.
+    Unproven(RuntimeGeneration),
 }
 
 /// Marks a [`TransitionKey::Generation`] in a source id.
 const GENERATION_KEY_PREFIX: char = 'g';
+
+/// Marks a [`TransitionKey::Unproven`] in a source id.
+const UNPROVEN_KEY_PREFIX: char = 'u';
 
 /// Return a deterministic projector source id.
 ///
@@ -272,11 +277,19 @@ fn projector_source_id(
         TransitionKey::Generation(generation) => {
             format!("{prefix}{GENERATION_KEY_PREFIX}{generation}")
         }
+        TransitionKey::Unproven(generation) => {
+            format!("{prefix}{UNPROVEN_KEY_PREFIX}{generation}")
+        }
     }
 }
 
 /// The transition key a stored projector source id suffix names.
 fn parse_transition_key(key: &str) -> Option<TransitionKey> {
+    if let Some(generation) = key.strip_prefix(UNPROVEN_KEY_PREFIX) {
+        return RuntimeGeneration::parse(generation)
+            .ok()
+            .map(TransitionKey::Unproven);
+    }
     match key.strip_prefix(GENERATION_KEY_PREFIX) {
         Some(generation) => RuntimeGeneration::parse(generation)
             .ok()
@@ -347,6 +360,7 @@ pub(super) fn terminal_tombstone_matches(
         TransitionKey::Generation(generation) => {
             session_runtime_generation(session) == Some(generation)
         }
+        TransitionKey::Unproven(_) => false,
         TransitionKey::Epoch(_) => parse_timestamp(&record.created_at)
             .is_ok_and(|created_at| epoch_keyed_record_reports_runtime(created_at, session)),
     }
@@ -358,10 +372,10 @@ fn event_subject(event: &Event) -> Option<(SessionId, Option<AgentActivity>)> {
     match event.event() {
         event::AGENT_STATE => parse_projector_payload::<AgentStatePayload>(event)
             .map(|payload| (payload.session_id, Some(payload.activity))),
-        event::SESSION_UPDATED | event::SESSION_RUNTIME_LOST => {
-            parse_projector_payload::<SessionPayload>(event)
-                .map(|payload| (payload.session.id, None))
-        }
+        event::SESSION_UPDATED
+        | event::SESSION_RUNTIME_LOST
+        | event::SESSION_RUNTIME_RECONNECTED => parse_projector_payload::<SessionPayload>(event)
+            .map(|payload| (payload.session.id, None)),
         _ => None,
     }
 }
@@ -400,6 +414,11 @@ struct ProjectorState {
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
     /// Terminal states the store or this process holds a record key for.
     projected_generations: HashSet<(SessionId, NotificationKind, RuntimeGeneration)>,
+    /// Generations an unproven loss was reported for. The report is keyed by
+    /// transition epoch, not by generation, so a runtime that answers again
+    /// leaves the set and a later failure of that generation is reported on
+    /// its own; while the loss stands, a proof of it adds no second report.
+    unproven_generations: HashSet<(SessionId, RuntimeGeneration)>,
     /// Sessions whose transition epochs continue from the store's records.
     seeded_sessions: HashSet<SessionId>,
     /// Seeded sessions with an unread attention record and no blocked,
@@ -605,6 +624,7 @@ impl ProjectorState {
                 agent_kind: None,
                 project_id: None,
                 dedupe_key: Some(turn_dedupe_key(session_id)),
+                unproven: false,
                 runtime_generation: None,
             },
         );
@@ -730,7 +750,9 @@ impl ProjectorState {
             }
             // A lost runtime is announced by its own event, which is also how
             // startup reconciliation commits a loss.
-            event::SESSION_UPDATED | event::SESSION_RUNTIME_LOST => {
+            event::SESSION_UPDATED
+            | event::SESSION_RUNTIME_LOST
+            | event::SESSION_RUNTIME_RECONNECTED => {
                 if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
                     return self
                         .pending_session_updated(notifications, attention, &payload.session)
@@ -813,6 +835,7 @@ impl ProjectorState {
                 agent_kind: None,
                 project_id: None,
                 dedupe_key: Some(attention_dedupe_key(session_id)),
+                unproven: false,
                 runtime_generation: None,
             },
         )
@@ -824,6 +847,14 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) -> Option<PendingNotification> {
+        if let Some(runtime) = session
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.state != RuntimeState::Lost)
+        {
+            self.unproven_generations
+                .remove(&(session.id.clone(), runtime.runtime_generation));
+        }
         let previous = self
             .lifecycle_by_session
             .insert(session.id.clone(), session.state);
@@ -864,6 +895,15 @@ impl ProjectorState {
                 // A lost runtime the daemon cannot prove ended leaves the
                 // session `running`; it is reported all the same, once per
                 // generation.
+                if session
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+                {
+                    resolve_session_notifications(attention, &session.id);
+                    self.activity_by_session.remove(&session.id);
+                    self.blocked_replay_candidates.remove(&session.id);
+                }
                 if reported_before(NotificationKind::Error) {
                     return None;
                 }
@@ -905,6 +945,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                unproven: true,
                 runtime_generation: session_runtime_generation(session),
             },
         )
@@ -918,6 +959,12 @@ impl ProjectorState {
         session: &SessionInfo,
         runtime: &SessionRuntime,
     ) -> Option<PendingNotification> {
+        if self
+            .unproven_generations
+            .contains(&(session.id.clone(), runtime.runtime_generation))
+        {
+            return None;
+        }
         self.prepare_derived(
             notifications,
             DerivedNotification {
@@ -931,6 +978,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                unproven: false,
                 runtime_generation: session_runtime_generation(session),
             },
         )
@@ -975,6 +1023,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                unproven: false,
                 runtime_generation: session_runtime_generation(session),
             },
         )
@@ -998,6 +1047,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                unproven: false,
                 runtime_generation: session_runtime_generation(session),
             },
         )
@@ -1016,14 +1066,24 @@ impl ProjectorState {
             return None;
         }
         let transition = if let Some(generation) = derived.runtime_generation {
-            if !self.projected_generations.insert((
-                derived.session_id.clone(),
-                derived.kind,
-                generation,
-            )) {
-                return None;
+            if derived.unproven {
+                if !self
+                    .unproven_generations
+                    .insert((derived.session_id.clone(), generation))
+                {
+                    return None;
+                }
+                TransitionKey::Unproven(generation)
+            } else {
+                if !self.projected_generations.insert((
+                    derived.session_id.clone(),
+                    derived.kind,
+                    generation,
+                )) {
+                    return None;
+                }
+                TransitionKey::Generation(generation)
             }
-            TransitionKey::Generation(generation)
         } else {
             let Some(epoch) = self.next_transition_epoch(&derived.session_id, derived.kind) else {
                 warn!(
@@ -1136,6 +1196,10 @@ impl ProjectorState {
                 TransitionKey::Generation(generation) => {
                     self.projected_generations
                         .insert((session_id.clone(), kind, generation));
+                }
+                TransitionKey::Unproven(generation) => {
+                    self.unproven_generations
+                        .insert((session_id.clone(), generation));
                 }
             }
         }
@@ -1297,6 +1361,10 @@ struct DerivedNotification {
     /// The runtime generation a terminal state ends, when the session has a
     /// runtime; it keys the record instead of the transition epoch.
     runtime_generation: Option<RuntimeGeneration>,
+    /// Whether this reports a loss the daemon could not prove. It is keyed by
+    /// generation in a namespace of its own, so a failure of the same
+    /// generation after the runtime answered again is still reported.
+    unproven: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2093,6 +2161,48 @@ mod tests {
             )
             .await;
         assert_eq!(list(&service).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_answers_again_lets_a_later_failure_of_its_generation_be_reported() {
+        let service = service("unproven-reconnected");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+        let running = lost_session("s-1", SessionState::Running, 1, None, None);
+        let reconnected = session_in_generation("s-1", SessionState::Running, None, 1);
+        let reconnected = SessionInfo {
+            runtime: reconnected.runtime.map(|runtime| SessionRuntime {
+                state: RuntimeState::Live,
+                ..runtime
+            }),
+            ..reconnected
+        };
+        let failed = lost_session("s-1", SessionState::Failed, 1, None, None);
+
+        for (name, session) in [
+            (event::SESSION_RUNTIME_LOST, &running),
+            (event::SESSION_RUNTIME_RECONNECTED, &reconnected),
+            (event::SESSION_RUNTIME_LOST, &failed),
+        ] {
+            projector
+                .handle_event_blocking(&service, &attention, &session_event(name, session))
+                .await;
+        }
+
+        let titles: Vec<String> = list(&service)
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert_eq!(
+            titles.len(),
+            2,
+            "the false alarm and the real failure are both reported: {titles:?}"
+        );
+        assert!(
+            titles.contains(&"Session runtime lost".to_owned()),
+            "{titles:?}"
+        );
+        assert!(titles.contains(&"Session crashed".to_owned()), "{titles:?}");
     }
 
     #[tokio::test]

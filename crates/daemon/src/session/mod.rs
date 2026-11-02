@@ -8016,6 +8016,19 @@ impl SessionRegistry {
         self.publish(event);
     }
 
+    /// Publishes a session event to the subscribers of the public stream only.
+    /// The notification projector never sees it: it announces a state the
+    /// registry already held, not a change.
+    fn emit_replayed(&self, name: &str, info: &SessionInfo) {
+        let event = crate::events::event(
+            name,
+            event_payload(SessionEvent {
+                session: info.clone(),
+            }),
+        );
+        let _ = self.inner.events.send(event);
+    }
+
     fn emit(&self, name: &str, info: &SessionInfo) {
         if name == event::SESSION_REMOVED {
             self.inner.turns.forget(&info.id);

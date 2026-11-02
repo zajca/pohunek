@@ -39,7 +39,7 @@ fn runtime(state: &str) -> Value {
     json!({"state": state, "runtime_generation": "1"})
 }
 
-fn lost(extra: Value) -> Value {
+fn lost(extra: &Value) -> Value {
     let mut runtime = runtime("lost");
     for (key, value) in extra.as_object().expect("runtime keys") {
         runtime[key] = value.clone();
@@ -95,13 +95,13 @@ fn inspect(sessions: Vec<Value>, id: &str) -> String {
 
 #[test]
 fn a_lost_runtime_is_one_crashed_state_whether_or_not_the_loss_is_proven() {
-    let mut external = session("s-external", "running", Some(lost(json!({}))));
+    let mut external = session("s-external", "running", Some(lost(&json!({}))));
     external["external"] = json!(true);
     let table = list(vec![
         session(
             "s-proven",
             "failed",
-            Some(lost(json!({"loss_reason": "runtime_lost"}))),
+            Some(lost(&json!({"loss_reason": "runtime_lost"}))),
         ),
         session(
             "s-unproven",
@@ -110,7 +110,7 @@ fn a_lost_runtime_is_one_crashed_state_whether_or_not_the_loss_is_proven() {
                 json!({"loss_reason": "runtime_lost_cleanup_unconfirmed"}),
             )),
         ),
-        session("s-stopped-lost", "stopped", Some(lost(json!({})))),
+        session("s-stopped-lost", "stopped", Some(lost(&json!({})))),
         external,
         session("s-failed", "failed", None),
         session("s-stopped", "stopped", Some(runtime("terminal"))),
@@ -156,12 +156,12 @@ fn a_lost_runtime_is_one_crashed_state_whether_or_not_the_loss_is_proven() {
 
 #[test]
 fn a_crashed_session_says_whether_it_can_be_recovered() {
-    let mut recoverable = session("s-recoverable", "failed", Some(lost(json!({}))));
+    let mut recoverable = session("s-recoverable", "failed", Some(lost(&json!({}))));
     recoverable["capabilities"] = json!({"resume": true, "fork": true});
-    let mut refused = session("s-refused", "failed", Some(lost(json!({}))));
+    let mut refused = session("s-refused", "failed", Some(lost(&json!({}))));
     refused["capabilities"] = json!({"resume": true, "fork": true});
     refused["capability_refusals"] = json!({"resume": "agent_native_store_relocated"});
-    let mut none = session("s-none", "failed", Some(lost(json!({}))));
+    let mut none = session("s-none", "failed", Some(lost(&json!({}))));
     none["capabilities"] = json!({"resume": false, "fork": false});
 
     let table = list(vec![recoverable, refused, none]);
@@ -184,7 +184,7 @@ fn a_crashed_session_says_whether_it_can_be_recovered() {
 #[test]
 fn inspect_prints_the_readable_cause_of_every_kind_of_loss() {
     let oom = |killer: &str| {
-        lost(json!({"exit": {
+        lost(&json!({"exit": {
             "cause": "oom_kill",
             "signal": 9,
             "oom_killer": killer,
@@ -202,42 +202,42 @@ fn inspect_prints_the_readable_cause_of_every_kind_of_loss() {
             "Killed by systemd-oomd (memory pressure) at 08:39 UTC (peak 26.3 GB)",
         ),
         (
-            lost(json!({"exit": {"cause": "signal", "signal": 9}})),
+            lost(&json!({"exit": {"cause": "signal", "signal": 9}})),
             "Killed by signal 9;",
         ),
         (
-            lost(json!({"exit": {"cause": "exit_code", "code": 3}})),
+            lost(&json!({"exit": {"cause": "exit_code", "code": 3}})),
             "Worker exited with code 3;",
         ),
         (
-            lost(json!({"loss_cause": "user_manager_lost"})),
+            lost(&json!({"loss_cause": "user_manager_lost"})),
             "Lost with the user service manager; see journalctl -u user@<uid>.service;",
         ),
         (
-            lost(json!({"loss_cause": "host_restarted"})),
+            lost(&json!({"loss_cause": "host_restarted"})),
             "Lost when the host restarted;",
         ),
         (
-            lost(json!({"exit": {"cause": "a_cause_from_a_newer_daemon"}})),
+            lost(&json!({"exit": {"cause": "a_cause_from_a_newer_daemon"}})),
             "a_cause_from_a_newer_daemon;",
         ),
         (
-            lost(json!({"loss_cause": "a_loss_cause_from_a_newer_daemon"})),
+            lost(&json!({"loss_cause": "a_loss_cause_from_a_newer_daemon"})),
             "a_loss_cause_from_a_newer_daemon;",
         ),
         (
-            lost(json!({"loss_reason": "runtime_lost"})),
+            lost(&json!({"loss_reason": "runtime_lost"})),
             "The worker ended and left no record of why;",
         ),
         (
-            lost(json!({"loss_reason": "runtime_lost_cleanup_unconfirmed"})),
-            "processes of the session may still run, check ps;",
+            lost(&json!({"loss_reason": "runtime_lost_cleanup_unconfirmed"})),
+            "The worker ended; processes of the session may still run, check ps;",
         ),
     ];
     for (runtime, expected) in cases {
         let text = inspect(vec![session("s-1", "failed", Some(runtime.clone()))], "s-1");
         assert!(
-            text.contains(&format!("lost: {expected}")) || text.contains(expected),
+            text.contains(&format!("lost: {expected}")),
             "{runtime}\n{text}"
         );
         assert!(
@@ -254,7 +254,7 @@ fn a_cause_with_terminal_control_characters_is_printed_inert() {
         vec![session(
             "s-1",
             "failed",
-            Some(lost(json!({"loss_cause": "evil\u{1b}[31mred"}))),
+            Some(lost(&json!({"loss_cause": "evil\u{1b}[31mred"}))),
         )],
         "s-1",
     );
@@ -269,7 +269,7 @@ fn a_payload_recorded_from_a_038_daemon_still_shows_crashed() {
     let recorded = session(
         "s-recorded",
         "failed",
-        Some(lost(json!({
+        Some(lost(&json!({
             "loss_reason": "runtime_lost",
             "worker_id": "worker-1",
             "exit": {"cause": "oom_kill", "signal": 15},
@@ -285,4 +285,17 @@ fn a_payload_recorded_from_a_038_daemon_still_shows_crashed() {
     );
     let text = inspect(vec![recorded], "s-recorded");
     assert!(text.contains("lost: Killed for memory;"), "{text}");
+}
+
+#[test]
+fn a_refusal_code_with_terminal_control_characters_is_printed_inert() {
+    let mut refused = session("s-1", "failed", Some(lost(&json!({}))));
+    refused["capabilities"] = json!({"resume": true, "fork": true});
+    refused["capability_refusals"] = json!({"resume": "code\u{1b}[31mred"});
+
+    let table = list(vec![refused.clone()]);
+    let text = inspect(vec![refused], "s-1");
+
+    assert!(!table.contains('\u{1b}'), "{table:?}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
 }

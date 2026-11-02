@@ -1,5 +1,6 @@
-//! The one state a reader shows for a session, derived from fields every
-//! protocol 4 daemon already sends.
+//! The one state a reader shows for a session, derived from fields a
+//! protocol 4 daemon already sends (the recovery outlook needs the refusals of
+//! a 0.35 or later daemon).
 //!
 //! Nothing here is on the wire: the condition, the recovery outlook and the
 //! readable cause are pure projections of [`SessionInfo`], so a client shows
@@ -158,6 +159,16 @@ impl SessionRuntime {
     /// the loss was classified with. An unknown cause prints as received.
     #[must_use]
     pub fn loss_message(&self) -> String {
+        let base = self.cause_message();
+        if self.loss_reason.as_deref() == Some("runtime_lost_cleanup_unconfirmed")
+            && (self.exit.is_some() || self.loss_cause.is_some())
+        {
+            return format!("{base}; processes of the session may still run, check ps");
+        }
+        base
+    }
+
+    fn cause_message(&self) -> String {
         if let Some(exit) = &self.exit {
             return exit.message();
         }

@@ -4370,6 +4370,8 @@ impl SessionRegistry {
     ) -> bool {
         let state = classification.state();
         let id = SessionId(record.session_id.clone());
+        let stored_runtime = record.info.runtime.clone();
+        let stored_state = record.info.state;
         let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         // Boxed so the entry does not widen the futures of the callers.
         let entry = Box::new(entry);
@@ -4410,7 +4412,22 @@ impl SessionRegistry {
             | RuntimeState::Terminal
             | RuntimeState::Unknown => event::SESSION_UPDATED,
         };
-        self.emit(event_name, &info);
+        // A record that was already lost in the same generation and state is
+        // announced again at every start; that is no new loss to notify.
+        let replayed = stored_runtime
+            .as_ref()
+            .zip(info.runtime.as_ref())
+            .is_some_and(|(stored, current)| {
+                stored.state == RuntimeState::Lost
+                    && current.state == RuntimeState::Lost
+                    && stored.runtime_generation == current.runtime_generation
+            })
+            && stored_state == info.state;
+        if replayed {
+            self.emit_replayed(event_name, &info);
+        } else {
+            self.emit(event_name, &info);
+        }
         if had_background {
             self.emit_background_state(&info);
         }
@@ -16134,6 +16151,77 @@ generation "$1"
                 .expect("second start");
             projector.stop().await;
             assert_eq!(reported().len(), 1, "{:#?}", reported());
+        }
+
+        /// A session that was already lost when the daemon started is announced
+        /// again to the event stream, but no notification exists for it and
+        /// none is created: it is not a new loss.
+        #[tokio::test]
+        async fn a_lost_record_found_at_startup_is_not_a_new_loss_to_notify() {
+            use crate::notifications::{
+                spawn_projector, AttentionCoordinator, NotificationService,
+            };
+            use crate::shutdown::DaemonShutdown;
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_record(&fixture.root, "s-4241", Some("runtime-s-4241"));
+            write_journal_record(
+                &fixture.root,
+                "s-4241",
+                "worker-s-4241",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4241"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            // The record is stored as lost by a daemon that created no
+            // notification for it.
+            let store = Store::new(fixture.root.join("data/metadata.jsonl"));
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-4241")
+                .expect("record");
+            record.info.state = protocol::SessionState::Failed;
+            record.runtime.state = RuntimeState::Lost;
+            record.info.runtime = Some(protocol::SessionRuntime {
+                state: RuntimeState::Lost,
+                runtime_generation: protocol::RuntimeGeneration::new(1),
+                worker_id: record.runtime.worker_id.clone(),
+                worker_instance_id: record.runtime.worker_instance_id.clone(),
+                started_at: None,
+                last_connected_at: None,
+                loss_reason: Some("runtime_lost".to_owned()),
+                exit: None,
+                loss_cause: Some("host_restarted".to_owned()),
+            });
+            store.record_session(&record).expect("store failed+lost");
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+
+            let tasks = DaemonShutdown::default();
+            let projector = spawn_projector(
+                &tasks,
+                &fixture.registry,
+                notifications.clone(),
+                AttentionCoordinator::disconnected(),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            projector.stop().await;
+
+            let runtime = runtime_of(&fixture.registry, "s-4241").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            let records = notifications
+                .list(protocol::NotificationListParams::default())
+                .expect("list notifications")
+                .notifications;
+            assert!(records.is_empty(), "{records:#?}");
         }
 
         /// A sweep that settles for many polls logs one `info` summary, however

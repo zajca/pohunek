@@ -2636,7 +2636,7 @@ fn recovery_label(recovery: Option<protocol::SessionRecovery>) -> String {
             "recoverable with session resume".to_owned()
         }
         Some(protocol::SessionRecovery::Refused(code)) => {
-            format!("cannot be recovered ({code})")
+            format!("cannot be recovered ({})", terminal_text(&code))
         }
         Some(protocol::SessionRecovery::NoNativeResume) => "no native resume".to_owned(),
         _ => "recoverable: unknown".to_owned(),
@@ -3270,7 +3270,10 @@ fn state_source_label(source: StateSource) -> &'static str {
 fn capability_refusals_label(refusals: &protocol::SessionCapabilityRefusals) -> String {
     [("resume", &refusals.resume), ("fork", &refusals.fork)]
         .into_iter()
-        .filter_map(|(operation, code)| code.as_ref().map(|code| format!("{operation}={code}")))
+        .filter_map(|(operation, code)| {
+            code.as_ref()
+                .map(|code| format!("{operation}={}", terminal_text(code)))
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
