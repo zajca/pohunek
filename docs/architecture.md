@@ -1933,7 +1933,14 @@ Durability tiers (honest about limits):
    record names no generation, a recovery whose previous worker still answers,
    an unreachable socket, a sweep that could not confirm the cleanup of marked
    processes: `runtime_lost_cleanup_unconfirmed`) keeps the session state and clears only the activity,
-   because no detector is attached to a lost runtime. Startup reconciliation
+   because no detector is attached to a lost runtime. The one exception to the
+   unconfirmed sweep: a sweep blocked solely by processes whose markers are
+   unreadable ends the session when the journaled user manager is proven gone
+   within the recorded boot (`loss_cause=user_manager_lost`), because those
+   processes can only belong to the manager's new instance. A sweep that did
+   not run, an inspection or signal error and a signalled process that still
+   runs keep the loss unproven, so `session.resume` still makes its own
+   confirmed sweep. Startup reconciliation
    re-examines every stored record, so a record committed by an earlier release
    as `running` with a lost runtime is re-classified by its call site's proof;
    a worker that answers again re-adopts the session as `running`. A `failed`
@@ -1954,7 +1961,11 @@ Durability tiers (honest about limits):
    manager, an undelegated memory controller, the manager's `UINT64_MAX`) is
    absent, never zero, and never loses the verdict. Since systemd 251 a
    `systemd-oomd` kill also ends the unit with `Result=oom-kill`, so the
-   counters, not the result, tell the killers apart. The launchd backend keeps no verdict, so the
+   counters, not the result, tell the killers apart:
+   `runtime.exit.oom_killer` is `kernel` or `systemd_oomd` when that counter
+   is positive and the other reads zero, and absent otherwise (also when the
+   manager does not report the other counter), and `memory_peak_bytes` and
+   `ended_at` ride along. The launchd backend keeps no verdict, so the
    daemon arms a kernel exit watch on the worker process when the runtime
    becomes live (`Supervisor::watch_exit`, a kqueue `EVFILT_PROC` filter with
    `NOTE_EXIT | NOTE_EXITSTATUS | NOTE_EXIT_DETAIL`; `launchctl print` is never
@@ -1963,7 +1974,16 @@ Durability tiers (honest about limits):
    memory-pressure kill by the kernel (jetsam) `oom_kill` with the kill signal.
    A clean exit is no evidence. The evidence exists only for a process that
    ended while the daemon watched it; a worker that died while the daemon was
-   down leaves none. A failed read never blocks the classification. A lost runtime that is
+   down leaves none. A failed read never blocks the classification. A loss with
+   no verdict carries `runtime.loss_cause` instead (never both): a worker
+   records the user manager that started it (`MANAGERPID`, only when it is the
+   worker's parent) in its journal as `worker_manager`, and the daemon names
+   `user_manager_lost` when that process is gone within the recorded boot (the
+   manager took its cgroup tree with it, so the loss ends the session `failed`
+   even when the marker sweep was blocked only by processes with unreadable markers), or
+   `host_restarted` when the host booted again. The wire fields are additive
+   (no protocol bump; protocol 3 peers receive neither) and a persisted-shape
+   change in the store (store schema 15, a no-op migration from 14). A lost runtime that is
    classified again without a verdict keeps the one it has; any other
    classification of the runtime drops it. A user-requested stop ends the
    runtime `terminal` and carries no exit. The field is additive on the wire

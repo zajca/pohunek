@@ -19391,7 +19391,11 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
             cause: "oom_kill".to_owned(),
             signal: None,
             code: None,
+            oom_killer: None,
+            memory_peak_bytes: None,
+            ended_at: None,
         }),
+        loss_cause: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -19468,6 +19472,15 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         .as_mut()
         .expect("lost runtime")
         .worker_instance_id = Some(previous_worker_instance_id.clone());
+    // The recovery must drop a recorded cause as well as the exit.
+    sessions
+        .get_mut(&created.id)
+        .expect("lost session")
+        .info
+        .runtime
+        .as_mut()
+        .expect("lost runtime")
+        .loss_cause = Some("user_manager_lost".to_owned());
     drop(sessions);
 
     let resumed = registry
@@ -19490,6 +19503,15 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         resumed.runtime.as_ref().expect("resumed runtime").exit,
         None,
         "the recovered runtime carries no exit of the lost one"
+    );
+    assert_eq!(
+        resumed
+            .runtime
+            .as_ref()
+            .expect("resumed runtime")
+            .loss_cause,
+        None,
+        "the recovered runtime carries no cause of the lost one"
     );
 
     let argv = wait_for_file_contains(&marker, "native-manual").await;
@@ -20053,6 +20075,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
             last_connected_at: None,
             loss_reason: None,
             exit: None,
+            loss_cause: None,
         });
         drop(sessions);
         let error = registry
@@ -27973,6 +27996,7 @@ async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
         last_connected_at: None,
         loss_reason: Some("test_runtime_lost".to_owned()),
         exit: None,
+        loss_cause: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -28137,6 +28161,7 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         last_connected_at: None,
         loss_reason: Some("test_runtime_lost".to_owned()),
         exit: None,
+        loss_cause: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");

@@ -86,7 +86,11 @@ way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `privileged_` scenarios of
 `supervised_lifecycle.rs` start a bystander through
 `sudo systemd-run --scope` and need `POHUNEK_PRIVILEGED_E2E=1` plus passwordless
-`sudo`, which only the CI job provides; a local run adds `--skip privileged_`. The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
+`sudo`, which only the CI job provides; a local run adds `--skip privileged_`.
+The `privileged_` scenario of `systemd_durable_worker.rs` kills and restarts the
+runner's own user manager, so the CI job runs it alone in its last step and every
+other run of that suite skips it (`--skip privileged_`); never run it on a
+developer host. The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
 called by `ci.yml` when the daemon, worker, protocol, or CLI crates change, and
 by `release.yml` before any publishable binary is built) installs the previous
 release's published Linux binaries (checksum verified, never rebuilt), runs

@@ -213,7 +213,7 @@ impl SessionRegistry {
                 }),
             )
         };
-        let (terminal_base, previous) = match self.commit_stop_intent(id, intent).await {
+        let (terminal_base, previous) = match Box::pin(self.commit_stop_intent(id, intent)).await {
             Ok(committed) => committed,
             Err(error) => {
                 self.rollback_stop_intent(

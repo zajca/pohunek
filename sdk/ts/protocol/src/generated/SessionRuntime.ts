@@ -41,4 +41,12 @@ export type SessionRuntime = {
    * failed result at the moment of loss.
    */
   exit?: RuntimeExit;
+  /**
+   * Why the runtime was lost when no service-manager verdict exists: the
+   * manager that held the worker, or the host, is gone. Open string;
+   * clients must tolerate a value they do not know. The documented values
+   * are `user_manager_lost` and `host_restarted`. Set only while `exit` is
+   * absent.
+   */
+  loss_cause?: string;
 };
