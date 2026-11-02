@@ -109,6 +109,11 @@ pub(crate) const BACKGROUND_PROMPT: &str = "background job: reply with one word"
 /// and 2.1.296 declare.
 pub(crate) const BACKGROUND_TOOL: &str = "Agent";
 
+/// Prompt text that makes the stub answer with a `Bash` call that runs in the
+/// background until the file named after the marker (one space, then the
+/// absolute path) exists.
+pub(crate) const BACKGROUND_SHELL_MARKER: &str = "[bg-shell]";
+
 /// Prompt text that makes the stub answer with a message to a background
 /// agent; the agent id follows the marker after one space.
 pub(crate) const RESUME_MARKER: &str = "[resume]";
@@ -619,6 +624,17 @@ impl Conversation {
                 }),
             });
         }
+        if let Some(gate) = background_shell_gate(&self.last) {
+            return Some(Reply::Tool {
+                id: format!("{TOOL_USE_PREFIX}{serial}"),
+                name: "Bash",
+                input: serde_json::json!({
+                    "command": format!("while [ ! -e '{gate}' ]; do sleep 0.2; done"),
+                    "description": "Wait for the gate file",
+                    "run_in_background": true,
+                }),
+            });
+        }
         let target = resume_target(&self.last)?;
         Some(Reply::Tool {
             id: format!("{RESUME_TOOL_USE_PREFIX}{serial}"),
@@ -630,6 +646,19 @@ impl Conversation {
             }),
         })
     }
+}
+
+/// The gate path after [`BACKGROUND_SHELL_MARKER`] and one space in `text`; it
+/// ends at the first character that cannot be part of a plain absolute path.
+fn background_shell_gate(text: &str) -> Option<&str> {
+    let (_before, after) = text.split_once(BACKGROUND_SHELL_MARKER)?;
+    let path = after.strip_prefix(' ')?;
+    let end = path
+        .find(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-'))
+        })
+        .unwrap_or(path.len());
+    (end > 0 && path.starts_with('/')).then(|| &path[..end])
 }
 
 /// The agent id after [`RESUME_MARKER`] and one space in `text`.
