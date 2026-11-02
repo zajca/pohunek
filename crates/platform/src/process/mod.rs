@@ -327,9 +327,9 @@ impl ControlGroupPath {
     /// The user manager of `worker` is the first `user@<owner_uid>.service`
     /// segment of `worker` and everything below it. A path outside it is
     /// foreign: nothing unprivileged can move a process out of that subtree.
-    /// Inside it, the worker must run as a unit of the installation's sessions
-    /// slice (`.../<sessions slice>/<worker unit>`, both names parsed by the
-    /// installation namespace); a worker path of any other shape attests
+    /// Inside it, the worker must run as a unit of a sessions
+    /// slice (`.../<sessions slice>/<worker unit>`, both names parsed in the
+    /// namespace the worker unit names); a worker path of any other shape attests
     /// nothing beyond the manager boundary. Then a path is foreign when it is
     ///
     /// - not the sessions slice or below it (`app.slice/*`, a login scope, a
