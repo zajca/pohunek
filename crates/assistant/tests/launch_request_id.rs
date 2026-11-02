@@ -42,6 +42,11 @@ const BUDGET: Duration = Duration::from_secs(20);
 /// client keeps back for its retry.
 const FIRST_ATTEMPT: Duration = Duration::from_secs(15);
 
+/// A budget under twice the client's five-second reserve, so the reserve is
+/// half of it.
+// timing-allowed: #1877 the reserve split is the policy under test; the scenario runs on virtual time.
+const SHORT_BUDGET: Duration = Duration::from_secs(8);
+
 /// The session a replay or an in-progress error names.
 const SESSION_ID: &str = "s-01M6CBAKG927FAMDNECX60RGAC";
 
@@ -309,8 +314,12 @@ fn assistant_paths(fixture_root: &Path) -> AssistantPaths {
 
 /// Connection options with the scenario's budget and no ambient origin.
 fn options() -> ConnectionOptions {
+    options_for(BUDGET)
+}
+
+fn options_for(budget: Duration) -> ConnectionOptions {
     ConnectionOptions {
-        request_timeout: Some(BUDGET),
+        request_timeout: Some(budget),
         origin_source: OriginSource::Omitted,
         ..ConnectionOptions::default()
     }
@@ -375,9 +384,9 @@ async fn finished(
 #[tokio::test(start_paused = true)]
 async fn a_retry_that_meets_the_running_create_ends_the_launch_naming_session_and_key() {
     let mut daemon = Daemon::start(vec![Step::Hang, Step::Error(in_progress())], true);
-    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     // Real I/O runs on this paused clock; time moves only through `advance`.
     let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     let started = tokio::time::Instant::now();
     let task = start(&daemon, prepared);
 
@@ -412,8 +421,8 @@ async fn a_retry_that_meets_the_running_create_ends_the_launch_naming_session_an
 #[tokio::test(start_paused = true)]
 async fn a_reply_lost_on_the_transport_is_retried_and_the_launch_succeeds_once() {
     let daemon = Daemon::start(vec![Step::Drop, Step::Session { replayed: true }], true);
-    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
 
     let launched = finished(start(&daemon, prepared))
         .await
@@ -432,13 +441,13 @@ async fn a_reply_lost_on_the_transport_is_retried_and_the_launch_succeeds_once()
 #[tokio::test(start_paused = true)]
 async fn the_first_attempt_gets_the_budget_less_the_reserve_and_the_retry_what_remains() {
     let mut daemon = Daemon::start(vec![Step::Hang, Step::Hang], true);
+    let inhibitor = AutoAdvanceInhibitor::new();
     let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     let key = prepared
         .session_params
         .client_request_id
         .clone()
         .expect("a generated key");
-    let inhibitor = AutoAdvanceInhibitor::new();
     let task = start(&daemon, prepared);
 
     daemon.next_hang().await;
@@ -462,6 +471,10 @@ async fn the_first_attempt_gets_the_budget_less_the_reserve_and_the_retry_what_r
     assert!(error.msg.contains(&key), "{}", error.msg);
     let recover = error.recover.expect("a recovery hint");
     assert!(
+        recover.starts_with("the request may have completed"),
+        "the timeout keeps its own recovery first: {recover}"
+    );
+    assert!(
         recover.contains(&format!("--request-id {key}")),
         "{recover}"
     );
@@ -470,10 +483,40 @@ async fn the_first_attempt_gets_the_budget_less_the_reserve_and_the_retry_what_r
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_budget_under_ten_seconds_keeps_half_of_it_for_the_retry() {
+    let mut daemon = Daemon::start(vec![Step::Hang, Step::Hang], true);
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
+    let host = daemon.host();
+    let task = tokio::spawn(async move {
+        start_prepared_with_options(&host, prepared, options_for(SHORT_BUDGET)).await
+    });
+    let half = SHORT_BUDGET / 2;
+
+    daemon.next_hang().await;
+    // One tick short of half the budget: the retry must not exist yet.
+    tokio::time::advance(half.saturating_sub(TIMER_TICK)).await;
+    assert_eq!(daemon.keys().len(), 1, "the first attempt is still waiting");
+    tokio::time::advance(2 * TIMER_TICK).await;
+    daemon.next_hang().await;
+    // The retry has the other half, to the tick: one tick past it the launch ends.
+    tokio::time::advance(half).await;
+    let error = protocol_error(
+        finished(task)
+            .await
+            .expect_err("neither attempt is answered"),
+    );
+
+    assert_eq!(error.code, "request_timeout");
+    assert_eq!(daemon.keys().len(), 2);
+    inhibitor.release().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_slow_capability_check_does_not_stretch_the_first_attempt_past_its_share() {
     let mut daemon = Daemon::start(vec![Step::Hang, Step::Error(in_progress())], true);
-    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     let inhibitor = AutoAdvanceInhibitor::new();
+    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     // The dedicated connection's capability check answers one second before
     // the first attempt's deadline; its request then hangs.
     let slow = FIRST_ATTEMPT.saturating_sub(Duration::from_secs(1));
@@ -523,9 +566,9 @@ async fn a_typed_daemon_error_is_not_retried() {
 #[tokio::test(start_paused = true)]
 async fn a_daemon_without_the_flag_gets_no_key_and_no_retry() {
     let mut daemon = Daemon::start(vec![Step::Hang], false);
+    let inhibitor = AutoAdvanceInhibitor::new();
     let prepared = prepare(&daemon, None).await.expect("the launch prepares");
     assert_eq!(prepared.session_params.client_request_id, None);
-    let inhibitor = AutoAdvanceInhibitor::new();
     let task = start(&daemon, prepared);
 
     daemon.next_hang().await;

@@ -4727,8 +4727,10 @@ same request, target and `--meta` flags and the same agent, plus `--request-id
 the same opening prompt and the daemon answers with the same session, or with
 `session_request_in_progress` while it is still being created. On a remote host
 the opening prompt names a snapshot path the remote daemon picks for every
-launch, so a new process cannot replay the request: look the session up with
-the `--meta` key you passed (below). A caller who passes `--request-id` and sees
+launch, so a new process cannot replay the request: when the first request
+created the session the repeat answers `session_request_conflict`, whose
+`details.session_id` names that session (otherwise the repeat creates it), or
+look the session up with the `--meta` key you passed (below). A caller who passes `--request-id` and sees
 an unknown outcome follows the same recovery. A request id names one launch: its
 snapshot file is written by the first launch and kept by a repeat, so use an id
 again only to repeat the same request.

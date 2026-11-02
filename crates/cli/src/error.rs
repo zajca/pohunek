@@ -61,9 +61,12 @@ pub(crate) enum CliError {
     Client(#[from] SdkClientError),
 
     /// `session new` got no reply before its deadline, so the daemon may still
-    /// finish the create.
-    #[error(transparent)]
-    SessionNewOutcomeUnknown(SdkClientError),
+    /// finish the create. `request_id` is the key the request carried, if any.
+    #[error("{source}")]
+    SessionNewOutcomeUnknown {
+        source: Box<SdkClientError>,
+        request_id: Option<String>,
+    },
 
     /// Prompt rendering failed before any daemon request was made.
     #[error(transparent)]
@@ -352,19 +355,26 @@ impl CliError {
             }
             CliError::Protocol(err) => err.clone(),
             CliError::Client(err) => err.to_protocol_error(),
-            CliError::SessionNewOutcomeUnknown(err) => {
-                let mut error = err.to_protocol_error();
-                error.recover = Some(
-                    "the daemon may still create the session: retry with the same \
-                     `--request-id <id>` (a repeat returns the session the first request \
-                     created, or `session_request_in_progress` while it is still being created); \
-                     without a request id, give each create a unique `--meta <key>=<value>` and \
-                     look for it with `pohunek session list --meta-eq <key>=<value>` before \
-                     retrying; an empty list does not prove that nothing was created, and a \
-                     retry without a request id can create a second session, which the same key \
-                     shows"
+            CliError::SessionNewOutcomeUnknown { source, request_id } => {
+                let mut error = source.to_protocol_error();
+                error.recover = Some(match request_id {
+                    Some(id) => format!(
+                        "the daemon may still create the session: retry with the same \
+                         `--request-id {id}` (a repeat returns the session the first request \
+                         created, or `session_request_in_progress` while it is still being \
+                         created), or look for it with `pohunek session list --meta-eq \
+                         <key>=<value>` if the request carried a `--meta` key; an empty list \
+                         does not prove that nothing was created"
+                    ),
+                    None => "the daemon may still create the session: give each create a unique \
+                             `--meta <key>=<value>` and look for it with `pohunek session list \
+                             --meta-eq <key>=<value>` before retrying; an empty list does not \
+                             prove that nothing was created, and a retry can create a second \
+                             session, which the same key shows. The request carried no \
+                             `--request-id`, so a retry under a new id cannot be matched to it; \
+                             pass `--request-id <id>` on the first create to make a repeat safe"
                         .to_owned(),
-                );
+                });
                 error
             }
             CliError::Prompt(err) => ProtocolError::new(

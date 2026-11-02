@@ -1230,7 +1230,11 @@ key lives and dies with the session.
   sends one on every launch against a daemon that supports it (`--request-id`
   or a generated `asst-<32 hex digits>`) and, when its first attempt gets no
   answer, repeats it once within the same deadline. An outcome that stays
-  unknown names the id; repeating the command with it returns the session.
+  unknown names the id. On a local host, repeating the command with it returns
+  the session. A remote host picks a new snapshot path for every launch, so
+  when the first request created the session the repeat answers
+  `session_request_conflict` instead, and `details.session_id` names it;
+  otherwise the repeat creates the session.
 
 ## Temporary directory
 

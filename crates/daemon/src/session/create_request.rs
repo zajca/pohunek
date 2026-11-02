@@ -243,7 +243,8 @@ impl SessionRegistry {
         let Some(store) = self.inner.store.clone() else {
             return Ok(None);
         };
-        let records = tokio::task::spawn_blocking(move || store.load_sessions())
+        let key = request.id.clone();
+        let mut holders = tokio::task::spawn_blocking(move || store.sessions_holding_request(&key))
             .await
             .map_err(|_join_error| {
                 runtime_error(
@@ -257,16 +258,9 @@ impl SessionRegistry {
                     format!("failed to read the session records for a client_request_id: {error}"),
                 )
             })?;
-        let mut holders: Vec<_> = records
-            .iter()
-            .filter(|record| {
-                record
-                    .create_request
-                    .as_deref()
-                    .is_some_and(|held| held.id == request.id)
-            })
-            .collect();
-        holders.sort_by_key(|record| created_order(&record.info.created_at));
+        holders.sort_by(|left, right| {
+            created_order(&left.info.created_at).cmp(&created_order(&right.info.created_at))
+        });
         let Some(oldest) = holders.first() else {
             return Ok(None);
         };

@@ -625,7 +625,9 @@ the session the first request created, or `session_request_in_progress` while it
 is still being created. A launch that still ends without an answer names its
 key in the error. On a local host, rerunning the same command with `--request-id
 <id>` returns the session; a remote host picks a different snapshot path for
-every launch, so look the session up by `--meta` there. Against a daemon without
+every launch, so there the repeat answers `session_request_conflict` with the
+created session in `details.session_id` (or creates it when the first request
+never arrived), and a `--meta` lookup finds it too. Against a daemon without
 that support the launch sends one
 `session.new` and never resends it; after an unknown outcome look up your
 `--meta` key before launching again. Only the CLI's own refusals before the
