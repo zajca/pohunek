@@ -22,11 +22,24 @@ use std::process::Command;
 
 use pohunek_platform::shell_env::{
     fallback_search_path, is_trusted_executable_file, resolve_executable, trusted_directory,
-    ExecutableError, Refusal, SearchPath,
+    ExecutableError, Refusal, SearchPath, TrustError,
 };
 
 /// The macOS `admin` group.
 const ADMIN_GID: u32 = 80;
+
+/// The macOS `staff` group, a group other than `admin`.
+const STAFF_GID: u32 = 20;
+
+/// Why `trusted_directory` refuses an `admin`-group directory the effective
+/// user does not own.
+const ADMIN_GROUP_NOT_OWNED: &str = "writable by the admin group (gid 80), accepted only in a directory the effective user owns and never for root";
+
+/// Why `trusted_directory` refuses a group-writable directory of another group.
+const OTHER_GROUP: &str = "writable by a group other than admin (gid 80)";
+
+/// Why `trusted_directory` refuses a directory whose ancestor is unsafe.
+const UNSAFE_ANCESTOR: &str = "a path component is foreign-owned or writable by others";
 
 /// An account other than root and the effective user.
 const FOREIGN_UID: u32 = 1;
@@ -164,6 +177,21 @@ fn root_built_fixtures_are_judged_by_an_unprivileged_process() {
     let foreign_program = executable(&foreign, "agent");
     chown(&foreign_program, Some(user), Some(group)).expect("hand the program to the user");
 
+    // A user-owned directory of the `staff` group the group can write: the
+    // group is not `admin`, so no site may accept it.
+    let staff = directory(&root, "staff", 0o775);
+    chown(&staff, Some(user), Some(STAFF_GID)).expect("hand the directory to the user");
+    let staff_program = executable(&staff, "agent");
+    chown(&staff_program, Some(user), Some(group)).expect("hand the program to the user");
+
+    // User-owned directories that only the ancestor walk can refuse: each is
+    // 0755, but the directory above it is group-writable and either not owned
+    // by the user or not of the `admin` group.
+    let below_root_admin = directory(&root_admin, "below", 0o755);
+    chown(&below_root_admin, Some(user), Some(ADMIN_GID)).expect("hand the directory to the user");
+    let below_staff = directory(&staff, "below", 0o755);
+    chown(&below_staff, Some(user), Some(STAFF_GID)).expect("hand the directory to the user");
+
     let test_binary = std::env::current_exe().expect("locate the test binary");
     let output = Command::new(test_binary)
         .args(pohunek_test_support::exact_test_filter(
@@ -211,19 +239,53 @@ fn an_unprivileged_process_applies_the_admin_group_rule_to_the_fixtures() {
         "and a trusted search directory"
     );
 
+    // The holder check decides first for a program inside a group-writable
+    // directory, so its two conditions show as `ChainSharedDirectory`; a site
+    // that wrongly accepts would let the ancestor walk answer with
+    // `ChainDirectory` instead.
     let root_admin = root.join("root-admin");
     assert!(
         matches!(
             resolve_executable(root_admin.join("agent").as_os_str(), &search),
-            Err(ExecutableError::NotExecutable(
-                Refusal::ChainDirectory { .. } | Refusal::ChainSharedDirectory { .. }
-            ))
+            Err(ExecutableError::NotExecutable(Refusal::ChainSharedDirectory {
+                dir,
+                owner: 0
+            })) if dir == root_admin
         ),
-        "a root-owned admin directory is refused for a non-root process"
+        "a root-owned admin directory is refused by the holder check"
     );
+    assert_eq!(
+        trusted_directory(&root_admin),
+        Err(TrustError::Refused(ADMIN_GROUP_NOT_OWNED)),
+        "and by the search directory check"
+    );
+    let staff = root.join("staff");
     assert!(
-        trusted_directory(&root_admin).is_err(),
-        "and is no trusted search directory"
+        matches!(
+            resolve_executable(staff.join("agent").as_os_str(), &search),
+            Err(ExecutableError::NotExecutable(Refusal::ChainSharedDirectory {
+                dir,
+                ..
+            })) if dir == staff
+        ),
+        "a user-owned group-writable directory of another group is refused by the holder check"
+    );
+    assert_eq!(
+        trusted_directory(&staff),
+        Err(TrustError::Refused(OTHER_GROUP)),
+        "and by the search directory check"
+    );
+    // The directory itself is 0755 and owned by the user, so only the
+    // ancestor walk refuses it.
+    assert_eq!(
+        trusted_directory(&root_admin.join("below")),
+        Err(TrustError::Refused(UNSAFE_ANCESTOR)),
+        "an admin-group ancestor the user does not own is refused by the ancestor walk"
+    );
+    assert_eq!(
+        trusted_directory(&staff.join("below")),
+        Err(TrustError::Refused(UNSAFE_ANCESTOR)),
+        "a group-writable ancestor of another group is refused by the ancestor walk"
     );
 
     let shared = root.join("shared");
