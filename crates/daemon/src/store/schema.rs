@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 14;
+pub const STORE_SCHEMA_VERSION: u32 = 15;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -106,6 +106,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 13,
         apply: migrate_v13_to_v14,
+    },
+    Migration {
+        from: 14,
+        apply: migrate_v14_to_v15,
     },
 ];
 
@@ -208,6 +212,15 @@ fn migrate_v12_to_v13(_record: &mut Map<String, Value>) {}
 /// A record written without the field was created without a key, which is how
 /// every schema 13 session reads, so no record needs rewriting.
 fn migrate_v13_to_v14(_record: &mut Map<String, Value>) {}
+
+/// Schema 14 to 15: a session's runtime may record why it was lost without a
+/// service-manager verdict (`info.runtime.loss_cause`), and its exit evidence
+/// may name the memory killer, the unit's peak memory and the end time
+/// (`info.runtime.exit.{oom_killer,memory_peak_bytes,ended_at}`).
+///
+/// A record written without the fields has no recorded evidence, which is how
+/// every schema 14 runtime reads, so no record needs rewriting.
+fn migrate_v14_to_v15(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
