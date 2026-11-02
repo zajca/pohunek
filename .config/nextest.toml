@@ -140,8 +140,11 @@ retries = 0
 # real-Claude tests hung, each would take its 3 minutes plus nextest's default
 # 10 s kill grace: 21 x 190 s = 66.5 minutes, leaving about 4.5 minutes of the
 # claude-package job's 71-minute timeout (which cancels a job before nextest
-# writes its report) to setup, about 2 minutes with a warm build cache; the
-# other package jobs keep 30 minutes for fewer real-upstream tests.
+# writes its report) to setup, about 2 minutes with a warm build cache. The
+# pi-package job runs 9 real-Pi tests: 9 x 190 s = 28.5 minutes, and its
+# 40-minute timeout leaves about 11 minutes for setup and the test-binary
+# compile (about 3 minutes). The codex-package job keeps 30 minutes for fewer
+# real-upstream tests, and hermes-package has its own 45-minute timeout.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.package.junit]

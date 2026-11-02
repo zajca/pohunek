@@ -302,7 +302,9 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
   existence check and the session-dir refusals on Pi's real file layouts.
 - The same file holds `#[ignore]`d tests that drive a real `pi` through an
   installed package: launch, idle and working detection, input, stop, resume,
-  fork, stop and resume of the fork, refusal without a session file, an
+  fork, stop and resume of the fork, adoption of a live session and resume of a
+  stopped one by a daemon that restarted (only the first turn reaches the
+  stub), refusal without a session file, an
   extension dialog and the project trust prompt read `blocked`, a session kept
   in `PI_CODING_AGENT_SESSION_DIR` resumes, and a `sessionDir` setting or the
   `--session-dir` flag refuses the launch. A loopback chat-completions stub

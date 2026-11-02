@@ -384,7 +384,7 @@ The throwaway catalog expires a day after `throwaway-catalog` writes it.
 The official Pi runtime package (`runtime-packages/pi`, lock in `compat/pi/`) has
 always-running tests in `crates/cli/tests/pi_package.rs` (descriptor, supported
 range against the lock, manifest on real screens, existence check on Pi's real
-file layout) and two `#[ignore]`d tests that drive a real `pi` through the
+file layout) and `#[ignore]`d tests that drive a real `pi` through the
 installed package against a loopback model stub. The `pi-package` CI job
 installs the locked release from npm and runs them; locally:
 
