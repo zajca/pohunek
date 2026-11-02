@@ -537,6 +537,7 @@ where
         "owner-path-session-new",
         method::SESSION_NEW,
         serde_json::to_value(SessionNewParams {
+            client_request_id: None,
             name: None,
             agent: "shell".to_owned(),
             cwd: Some(cwd.to_path_buf()),

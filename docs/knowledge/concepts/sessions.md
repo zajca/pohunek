@@ -1195,6 +1195,32 @@ and runtime id. A typed worker-stream failure is surfaced once and is not
 retried. A lost worker cannot be reconstructed by retrying attach; inspect
 `runtime.state` and use explicit native recovery only when supported.
 
+## Idempotent session.new
+
+`session.new` accepts an optional `client_request_id` (1 to 128 bytes of
+`[A-Za-z0-9._:-]`) so a caller that lost the reply can repeat the request
+without creating a second session. The daemon keeps the key and a fingerprint of
+the request on the session's record and never reports them on `SessionInfo`; the
+key lives and dies with the session.
+
+- The same key with the same request returns the existing session with
+  `replayed: true`. No hook runs and no input is injected; `worktree_source` and
+  `prompt_delivered` belong to the first response and are absent.
+- The same key with another request (another `agent`, `input` or `metadata`)
+  fails with `session_request_conflict` and creates nothing. Only `cols`, `rows`
+  and `secret_env` values may differ: the fingerprint covers none of them, so a
+  retry with another secret value replays the session with its original
+  credentials.
+- A key whose create has not settled (the create is running, its initial input
+  is not delivered yet, or its compensation is pending) fails with
+  `session_request_in_progress`; retry the same request. Both errors carry the
+  session id in `details.session_id`.
+- A rolled-back create, `session remove` and retention free the key.
+- A client checks `HostCapabilities.session_new_request_id_supported` first. A
+  daemon without it drops the key silently, so the Rust client and the
+  TypeScript SDK refuse with `session_new_request_id_unsupported` and send
+  nothing.
+
 ## Temporary directory
 
 Each session's agent runs with `TMPDIR` set to the session's own directory,

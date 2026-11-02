@@ -27,7 +27,7 @@ use crate::runtime::lifecycle::{
     Generation, LaunchFailure, Lifecycle, LifecycleGuard, PreviousGeneration,
     SUPERVISION_UNAVAILABLE,
 };
-use crate::store::StoredInputRules;
+use crate::store::{CreateRequest, StoredInputRules};
 use crate::worktree::HookStderrTail;
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
@@ -87,6 +87,9 @@ pub(super) struct PtySessionSpec {
     /// Origin of the request that created the session, carried unchanged by
     /// every later registration of it.
     pub(super) spawned_by: Option<protocol::SpawnedBy>,
+    /// Idempotency key of the creating request, carried unchanged by every
+    /// later registration of the session.
+    pub(super) create_request: Option<Box<CreateRequest>>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
     /// The association a session created by `project`/`repo` in a directory
@@ -756,6 +759,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             spawned_by,
+            create_request,
             warnings,
             reference_launch,
             initial_input_pending,
@@ -763,6 +767,28 @@ impl SessionRegistry {
             package_authority: _package_authority,
         } = spec;
 
+        // A relaunch keeps the key of the session's creating request, which the
+        // session's live entry and its durable record both hold.
+        let create_request = match (&registration, create_request) {
+            (PtyRegistration::Recover { .. }, None) => {
+                let live = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&id)
+                    .map(|entry| entry.create_request.clone());
+                match live {
+                    Some(request) => request,
+                    None => self
+                        .load_durable_session_record(&id)
+                        .await
+                        .map_err(LaunchFailure::Cleaned)?
+                        .and_then(|record| record.create_request),
+                }
+            }
+            (_, request) => request,
+        };
         let created_at = match &registration {
             PtyRegistration::Create => timestamp_now(),
             PtyRegistration::Recover { created_at, .. } => created_at.clone(),
@@ -900,6 +926,7 @@ impl SessionRegistry {
             }),
             info: preparing_info,
             active_agent_origin: None,
+            create_request: create_request.clone(),
             native_identity_ordering: carried_native_report.as_deref().cloned(),
             recovery: Some(ResumeBinding {
                 session_id: id.0.clone(),
@@ -1095,6 +1122,7 @@ impl SessionRegistry {
             activity_since: crate::time::now(),
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
+            create_request,
         };
         #[cfg(test)]
         self.hold_launch_commit().await;

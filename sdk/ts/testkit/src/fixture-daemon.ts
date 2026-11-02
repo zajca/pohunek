@@ -340,6 +340,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly sockets = new Set<Socket>();
   private readonly subscribers = new Set<Socket>();
   private readonly sessions = new Map<string, SessionInfo>();
+  /** Idempotency keys of `session.new` with the request each one created. */
+  private readonly createRequests = new Map<string, { fingerprint: string; sessionId: string }>();
   private readonly notifications = new Map<string, NotificationRecord>();
   private notificationPolicy: NotificationPolicy;
   private readonly projects = new Map<string, ProjectInfo>();
@@ -950,6 +952,26 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (params === undefined) {
       return errResponse(request.id, invalidParams(request.method));
     }
+    const key = params.client_request_id;
+    if (key !== undefined && !isValidClientRequestId(key)) {
+      return errResponse(request.id, badRequest("session.new: client_request_id must be 1..=128 bytes of [A-Za-z0-9._:-]"));
+    }
+    const fingerprint = key === undefined ? "" : createRequestFingerprint(params);
+    if (key !== undefined) {
+      const held = this.createRequests.get(key);
+      const existing = held === undefined ? undefined : this.sessions.get(held.sessionId);
+      if (held !== undefined && existing !== undefined) {
+        if (held.fingerprint !== fingerprint) {
+          return errResponse(request.id, sessionRequestConflict(held.sessionId));
+        }
+        const replay: SessionNewResult = cloneValue(existing);
+        replay.replayed = true;
+        if (params.input !== undefined) {
+          replay.applied_input = true;
+        }
+        return okResponse(request.id, replay);
+      }
+    }
     if (!this.hostCapabilities.supported_agents.includes(params.agent)) {
       return errResponse(request.id, agentKindUnsupported(params.agent));
     }
@@ -981,6 +1003,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const session = this.buildSession(params, runtime.agent_base ?? agentBaseFor(params.agent));
     if (request.origin !== undefined) session.spawned_by = { ...request.origin };
     this.sessions.set(session.id, session);
+    if (key !== undefined) {
+      this.createRequests.set(key, { fingerprint, sessionId: session.id });
+    }
     const activityStream = ackTimeoutMs === undefined ? undefined : this.openActivityStream(session.id);
     this.emitSessionEvent(EVENT_SESSION_CREATED, session);
 
@@ -2261,6 +2286,7 @@ function defaultHostCapabilities(daemonVersion: string): HostCapabilities {
     session_wait_turn_supported: true,
     session_new_input_ack_supported: true,
     session_new_secret_env_supported: true,
+    session_new_request_id_supported: true,
   };
 }
 
@@ -2561,6 +2587,9 @@ function readSessionNewParams(request: ControlRequest): SessionNewParams | undef
     return undefined;
   }
   if (!optionalString(params.input) || !optionalStringRecord(params.metadata)) {
+    return undefined;
+  }
+  if (!optionalString(params.client_request_id)) {
     return undefined;
   }
   // The fixture checks the shape and never stores or echoes the values.
@@ -3089,6 +3118,48 @@ function copyBytes(bytes: Uint8Array): Uint8Array {
 
 function sessionNotFound(sessionId: string): ProtocolError {
   return protocolError("runtime", "session_not_found", `session not found: ${sessionId}`);
+}
+
+/**
+ * The request fields the daemon fingerprints: every `session.new` member but
+ * the key, the terminal size and the `secret_env` values.
+ */
+function createRequestFingerprint(params: SessionNewParams): string {
+  const members: Record<string, unknown> = { ...params };
+  for (const member of ["client_request_id", "cols", "rows", "secret_env"]) {
+    delete members[member];
+  }
+  members["secret_env_names"] = Object.keys(params.secret_env ?? {}).sort();
+  // Sorted members without nulls, so the order a client sends them in and an
+  // explicit `null` for an absent member do not change the fingerprint.
+  const covered = Object.keys(members)
+    .sort()
+    .filter((name) => members[name] !== null && members[name] !== undefined)
+    .map((name) => [name, canonicalMember(members[name])]);
+  return JSON.stringify(covered);
+}
+
+function canonicalMember(value: unknown): unknown {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right));
+  }
+  return value;
+}
+
+function isValidClientRequestId(key: string): boolean {
+  return /^[A-Za-z0-9._:-]{1,128}$/u.test(key);
+}
+
+function sessionRequestConflict(sessionId: string): ProtocolError {
+  return {
+    ...protocolError(
+      "runtime",
+      "session_request_conflict",
+      `the client_request_id was already used with different parameters by session ${sessionId}; nothing was created`,
+      "use a new client_request_id for a different request, or resend the original parameters",
+    ),
+    details: { session_id: sessionId },
+  };
 }
 
 function sessionNotRunning(sessionId: string): ProtocolError {

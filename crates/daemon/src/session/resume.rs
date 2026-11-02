@@ -976,6 +976,7 @@ impl SessionRegistry {
                     worktree_path,
                     metadata: binding.metadata,
                     spawned_by,
+                    create_request: None,
                     warnings: outdated_hooks,
                     reference_launch: None,
                     initial_input_pending: false,
@@ -1367,6 +1368,7 @@ impl SessionRegistry {
                 worktree_path,
                 metadata: binding.metadata,
                 spawned_by: binding.spawned_by,
+                create_request: None,
                 warnings: outdated_hooks,
                 // The live entry's launch marker is carried when the resumed entry
                 // is installed.

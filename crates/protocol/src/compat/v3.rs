@@ -206,6 +206,7 @@ fn has_session_new_option(params: &Value) -> bool {
         "on_diverged",
         "input_ack_timeout_ms",
         "secret_env",
+        "client_request_id",
     ]
     .iter()
     .any(|key| params.get(key).is_some_and(|value| !value.is_null()))

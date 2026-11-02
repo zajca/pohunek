@@ -42,6 +42,7 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
                 applied_input: requested_input.then_some(true),
                 worktree_source: outcome.worktree_source,
                 prompt_delivered: outcome.prompt_delivered,
+                replayed: outcome.replayed.then_some(true),
             };
             ok_value(request, &result)
         }

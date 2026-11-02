@@ -388,6 +388,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
         let _process_env = without_pohunek_markers();
         registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: Some("procwatch-real-child".to_owned()),
                 agent: "shell".to_owned(),
                 cwd: Some(dir.to_path_buf()),
@@ -477,6 +478,7 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
         let _process_env = without_pohunek_markers();
         registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: Some(format!("procwatch-unserved-{agent}")),
                 agent: "shell".to_owned(),
                 cwd: Some(dir.to_path_buf()),
@@ -583,6 +585,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                         let _process_env = without_pohunek_markers();
                         first
                             .create(SessionNewParams {
+                                client_request_id: None,
                                 name: Some("procwatch-restart-agent".to_owned()),
                                 agent: "shell".to_owned(),
                                 cwd: Some(dir.to_path_buf()),
@@ -740,6 +743,7 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
         let _process_env = without_pohunek_markers();
         registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: Some("procwatch-nested-worker".to_owned()),
                 agent: "shell".to_owned(),
                 cwd: Some(dir.to_path_buf()),
@@ -825,6 +829,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
     .await;
     let created = registry
         .create(SessionNewParams {
+            client_request_id: None,
             name: Some("procwatch-cwd".to_owned()),
             agent: "shell".to_owned(),
             cwd: Some(start_dir),

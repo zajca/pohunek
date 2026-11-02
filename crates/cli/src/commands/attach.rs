@@ -870,6 +870,7 @@ fn build_menu_new_session_request(
     request_with_params(
         method::SESSION_NEW,
         &SessionNewParams {
+            client_request_id: None,
             agent: source.agent.clone(),
             name: None,
             cwd: Some(source.cwd.clone()),

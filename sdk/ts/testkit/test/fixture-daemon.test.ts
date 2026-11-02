@@ -128,6 +128,35 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("a repeated client_request_id replays the session and another request conflicts", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("request-id") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const params = { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS, client_request_id: "req-fixture" };
+      const created = await client.call("session.new", params);
+      expect(created.replayed).toBeUndefined();
+
+      // The terminal size is not part of the request.
+      const replayed = await client.call("session.new", { ...params, cols: TEST_COLS + 20 });
+      expect(replayed.replayed).toBe(true);
+      expect(replayed.id).toBe(created.id);
+
+      const conflict = await expectClientError(client.call("session.new", { ...params, name: "other" }));
+      expect(conflict.toProtocolError().code).toBe("session_request_conflict");
+      expect(conflict.toProtocolError().details?.session_id).toBe(created.id);
+      expect((await client.call("session.list", {})).length).toBe(1);
+
+      // A removed session frees its key.
+      daemon.scenario.removeSession(created.id);
+      const fresh = await client.call("session.new", params);
+      expect(fresh.replayed).toBeUndefined();
+      expect(fresh.id === created.id).toBe(false);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session wait compares its update cursor as an instant", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("wait-cursor") } });
     try {

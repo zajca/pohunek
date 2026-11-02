@@ -855,6 +855,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         "privacy-sentinel-create",
         method::SESSION_NEW,
         serde_json::to_value(SessionNewParams {
+            client_request_id: Some("privacy-request-1".to_owned()),
             name: None,
             agent: "sentinelclaude".to_owned(),
             cwd: Some(session_cwd.clone()),
@@ -1069,6 +1070,13 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     assert!(
         worker_log_text.contains("peer_outside_subject"),
         "the worker must record why it rejected the report: {worker_log_text}"
+    );
+
+    // The keyed create persists its key and fingerprint with the record, and
+    // the prompt it fingerprinted appears nowhere (checked above).
+    assert!(
+        String::from_utf8_lossy(&store_bytes).contains("\"create_request\""),
+        "the logical store records the request key"
     );
 
     // A safe identifier (the session id) legitimately appears everywhere.
@@ -1288,6 +1296,13 @@ const SECRET_SLOT: &str = "METER_TOKEN";
 /// A secret value no artifact or response may carry.
 const SECRET_VALUE: &str = "SENTINEL_SECRET_ENV_5d41402a";
 
+/// Another value for the same slot: a repeated idempotency key replays the
+/// session although this value differs, and no artifact may carry it either.
+const OTHER_SECRET_VALUE: &str = "SENTINEL_SECRET_ENV_other_7b3f";
+
+/// Idempotency key of the accepted create.
+const REQUEST_KEY: &str = "secret-env-request-1";
+
 /// Owner-only fixture for the secret-env scenarios: a worker-backed daemon over
 /// a profile whose slot a request fills, and the files the agent writes into.
 struct SecretEnvHost {
@@ -1384,6 +1399,7 @@ impl SecretEnvHost {
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            client_request_id: None,
         })
         .expect("serialize session.new params");
         params["secret_env"] = secret_env;
@@ -1528,11 +1544,10 @@ async fn session_secret_env_reaches_only_the_agent_process() {
     };
 
     // The accepted request: the agent process holds the value.
-    let create = Request::make(
-        "secret-env-create",
-        method::SESSION_NEW,
-        host.new_params("metered", serde_json::json!({SECRET_SLOT: SECRET_VALUE})),
-    );
+    let mut create_params =
+        host.new_params("metered", serde_json::json!({SECRET_SLOT: SECRET_VALUE}));
+    create_params["client_request_id"] = serde_json::json!(REQUEST_KEY);
+    let create = Request::make("secret-env-create", method::SESSION_NEW, create_params);
     let created_payload = ok_payload(exchange(&mut control, &create).await);
     let created: SessionInfo =
         serde_json::from_value(created_payload.clone()).expect("session info");
@@ -1555,6 +1570,23 @@ async fn session_secret_env_reaches_only_the_agent_process() {
         expected,
         "the agent process holds the exact value (its sha256 matches)"
     );
+
+    // The key replays the session whatever the secret value of the repeat: the
+    // fingerprint covers the slot names and no value.
+    let mut repeat_params = host.new_params(
+        "metered",
+        serde_json::json!({SECRET_SLOT: OTHER_SECRET_VALUE}),
+    );
+    repeat_params["client_request_id"] = serde_json::json!(REQUEST_KEY);
+    let repeated = ok_payload(
+        exchange(
+            &mut control,
+            &Request::make("secret-env-repeat", method::SESSION_NEW, repeat_params),
+        )
+        .await,
+    );
+    assert_eq!(repeated["replayed"], true, "{repeated}");
+    assert_eq!(repeated["id"], created_payload["id"], "{repeated}");
 
     // Observation paths.
     let list = Request::make(
@@ -1633,9 +1665,32 @@ async fn session_secret_env_reaches_only_the_agent_process() {
         &artifacts,
         &[
             (SECRET_VALUE, "the secret value"),
+            (
+                OTHER_SECRET_VALUE,
+                "the secret value of the repeated request",
+            ),
             ("SENTINEL_", "a sentinel"),
         ],
     );
+    // The agent writes the digest of its slot into the test host's files, so
+    // only the daemon's own artifacts are scanned for it.
+    assert_artifacts_free_of(
+        &artifacts[..6],
+        &[(expected.as_str(), "the SHA-256 of the secret value")],
+    );
+    // The key and the request fingerprint are persisted with the session
+    // record, and only there.
+    let store_text = String::from_utf8_lossy(&store_bytes);
+    assert!(
+        store_text.contains(REQUEST_KEY) && store_text.contains("\"fingerprint\":\"v1:"),
+        "the store records the key and the fingerprint: {store_text}"
+    );
+    for (artifact_name, bytes) in &artifacts[1..6] {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(REQUEST_KEY),
+            "{artifact_name} carries the idempotency key"
+        );
+    }
     // The slot name is configuration, not a secret, but the structured stores
     // never need it either.
     for (artifact_name, bytes) in [

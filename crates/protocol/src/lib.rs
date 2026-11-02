@@ -70,6 +70,8 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
+    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REQUEST_CONFLICT_CODE,
+    SESSION_REQUEST_IN_PROGRESS_CODE,
 };
 #[doc(inline)]
 pub use governance::{
@@ -156,28 +158,29 @@ pub use secret_env::{
 };
 #[doc(inline)]
 pub use session::{
-    AgentActivity, AgentStateEvent, AttachEvent, AttachHeader, BackgroundItem, BackgroundKind,
-    BackgroundStateEvent, BackgroundStatus, BranchSource, CwdSource, DetectionRegionKind,
-    DetectionRegionPreview, ForkCwdMode, ObservationParamsError, OnDiverged, RuntimeExit,
-    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult, RuntimeInventoryStatus,
-    RuntimeState, SessionAttachParams, SessionAttachResult, SessionBackground, SessionCapabilities,
-    SessionCapabilityRefusals, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionListParams, SessionNativeRecoveredEvent,
-    SessionNewParams, SessionNewResult, SessionOutputGap, SessionOutputParams, SessionOutputResult,
-    SessionPolicyParams, SessionPolicyResult, SessionReadFormat, SessionReadParams,
-    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
-    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionParams,
-    SessionRetentionPolicy, SessionRetentionReason, SessionRetentionResult, SessionRuntime,
-    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind, SpawnedBy,
-    SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
-    TerminalDimensionsError, UnconfirmedProcess, WorktreeSource,
+    is_valid_client_request_id, AgentActivity, AgentStateEvent, AttachEvent, AttachHeader,
+    BackgroundItem, BackgroundKind, BackgroundStateEvent, BackgroundStatus, BranchSource,
+    CwdSource, DetectionRegionKind, DetectionRegionPreview, ForkCwdMode, ObservationParamsError,
+    OnDiverged, RuntimeExit, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult,
+    RuntimeInventoryStatus, RuntimeState, SessionAttachParams, SessionAttachResult,
+    SessionBackground, SessionCapabilities, SessionCapabilityRefusals, SessionDetachParams,
+    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionDiffParams,
+    SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionNewResult, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionPolicyParams, SessionPolicyResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionCandidate,
+    SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
+    SessionRetentionResult, SessionRuntime, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, SpawnedBy, SubagentInfo, SubagentLifecycle, SubagentStateEvent,
+    TerminalCursor, TerminalDimensions, TerminalDimensionsError, UnconfirmedProcess,
+    WorktreeSource, MAX_CLIENT_REQUEST_ID_BYTES,
 };
 #[doc(inline)]
 pub use store::{

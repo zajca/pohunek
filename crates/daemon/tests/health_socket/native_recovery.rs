@@ -450,6 +450,53 @@ async fn a_resumed_by_reference_session_keeps_its_reference_outside_every_reposi
     );
 }
 
+/// `session.new` with `params`, decoded with its replay marker.
+async fn keyed_create(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    params: &Value,
+) -> protocol::SessionNewResult {
+    let request = Request::make("claude-keyed-new", method::SESSION_NEW, params.clone());
+    serde_json::from_value(ok_payload(exchange(control, &request).await))
+        .expect("session.new result")
+}
+
+/// A recovered session keeps the idempotency key of its creating request, in
+/// memory and in the record the recovery writes.
+#[tokio::test]
+async fn a_recovered_session_keeps_the_key_of_its_creating_request() {
+    let mut rig = ClaudeRig::new("claude-key-resume").await;
+    let mut params =
+        serde_json::to_value(session_params_in(rig.cwd.to_path_buf())).expect("serialize params");
+    params["agent"] = serde_json::json!("claude-fixture");
+    params["client_request_id"] = serde_json::json!("req-recovered");
+    let created = keyed_create(&mut rig.control, &params).await;
+    let id = created.session.id.clone();
+    rig.additional_sessions.push(id.clone());
+    rig.transcript(LAUNCH);
+    rig.report_for(&id, "startup", LAUNCH).await;
+    rig.stop(&id).await;
+    ok_payload(rig.resume_session(&id).await);
+
+    let replay = keyed_create(&mut rig.control, &params).await;
+    assert_eq!(
+        replay.replayed,
+        Some(true),
+        "the recovered session holds the key"
+    );
+    assert_eq!(replay.session.id, id);
+
+    rig.stop(&id).await;
+    let mut rig = rig.restarted().await;
+    let after_restart = keyed_create(&mut rig.control, &params).await;
+    assert_eq!(
+        after_restart.replayed,
+        Some(true),
+        "the recovery wrote the key to the durable record"
+    );
+    assert_eq!(after_restart.session.id, id);
+    rig.stop_daemon().await;
+}
+
 /// A session that has captured a native id keeps a metadata edit in its durable
 /// session record.
 #[tokio::test]

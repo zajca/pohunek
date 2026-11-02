@@ -33,10 +33,12 @@ export type ProtocolError = {
   /**
    * Structured facts a caller reads instead of parsing `msg`.
    *
-   * Only `command_failed` carries it, and only a client that called
-   * `command.run` can receive that error, so no other error and no older
-   * client sees the key. It is boxed so the error type stays small in
-   * every `Result` that carries it.
+   * `command_failed` carries the process exit, and only a client that called
+   * `command.run` can receive that error. `session_request_in_progress` and
+   * `session_request_conflict` carry the session id, and only a client that
+   * sent a `client_request_id` can receive them. No older client sees the
+   * key. It is boxed so the error type stays small in every `Result` that
+   * carries it.
    */
   details?: ErrorDetails;
 };

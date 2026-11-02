@@ -293,6 +293,7 @@ impl Fixture {
         process_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
         self.registry
             .create(SessionNewParams {
+                client_request_id: None,
                 name: None,
                 agent: profile.to_owned(),
                 cwd: Some(self.env.cwd().to_path_buf()),

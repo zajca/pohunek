@@ -442,6 +442,7 @@ impl Installation {
     /// Parameters of a `session.new` for the fixture's agent profile.
     pub(crate) fn new_params(&self, name: &str) -> SessionNewParams {
         SessionNewParams {
+            client_request_id: None,
             agent: AGENT.to_owned(),
             name: Some(name.to_owned()),
             cwd: Some(self.home()),
@@ -843,6 +844,7 @@ impl Installation {
         };
         self.store()
             .record_session(&SessionRecord {
+                create_request: None,
                 schema_version: 1,
                 session_id: session_id.to_owned(),
                 desired_state: DesiredState::Running,

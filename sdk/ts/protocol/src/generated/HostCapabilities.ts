@@ -95,6 +95,15 @@ export type HostCapabilities = {
    */
   session_new_secret_env_supported?: boolean;
   /**
+   * Whether `session.new` honors `client_request_id` and answers a repeated
+   * key with the same session.
+   *
+   * A daemon that predates the field omits the flag, which decodes as
+   * `false`; it would drop `client_request_id` silently and a retry would
+   * create a second session. `false` is likewise omitted on the wire.
+   */
+  session_new_request_id_supported?: boolean;
+  /**
    * Whether the daemon serves `session.idle_stop.get` and
    * `session.idle_stop.set` and stops sessions opted in to idle stop.
    *

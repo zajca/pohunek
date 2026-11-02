@@ -436,6 +436,7 @@ impl Scenario {
             process_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
             registry
                 .create(SessionNewParams {
+                    client_request_id: None,
                     name: Some("forced-close".to_owned()),
                     agent: "shell".to_owned(),
                     cwd: Some(self.env.cwd().to_path_buf()),

@@ -15,8 +15,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     runtime_id::RuntimeId,
+    session::SessionId,
     version::{ProtocolVersion, ProtocolVersionRange},
 };
+
+/// Error code of a keyed `session.new` whose create has not settled.
+pub const SESSION_REQUEST_IN_PROGRESS_CODE: &str = "session_request_in_progress";
+/// Error code of a keyed `session.new` whose key names a session created with
+/// different parameters.
+pub const SESSION_REQUEST_CONFLICT_CODE: &str = "session_request_conflict";
+/// Error code a client raises when the daemon cannot honor `client_request_id`.
+pub const SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE: &str = "session_new_request_id_unsupported";
 
 /// Broad error category for a control-protocol error.
 ///
@@ -88,10 +97,12 @@ pub struct ProtocolError {
     pub recover: Option<String>,
     /// Structured facts a caller reads instead of parsing `msg`.
     ///
-    /// Only `command_failed` carries it, and only a client that called
-    /// `command.run` can receive that error, so no other error and no older
-    /// client sees the key. It is boxed so the error type stays small in
-    /// every `Result` that carries it.
+    /// `command_failed` carries the process exit, and only a client that called
+    /// `command.run` can receive that error. `session_request_in_progress` and
+    /// `session_request_conflict` carry the session id, and only a client that
+    /// sent a `client_request_id` can receive them. No older client sees the
+    /// key. It is boxed so the error type stays small in every `Result` that
+    /// carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub details: Option<Box<ErrorDetails>>,
@@ -110,6 +121,11 @@ pub struct ErrorDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub process_exit: Option<ProcessExit>,
+    /// The session a request key already names, on `session_request_in_progress`
+    /// and `session_request_conflict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub session_id: Option<SessionId>,
 }
 
 /// How a process ended abnormally: exactly one of the fields is set.
@@ -1373,6 +1389,75 @@ impl ProtocolError {
             "task_request_conflict",
             "the request key was already used with different parameters; nothing was executed",
             Some("use a new client_request_id for a different request, or resend the original parameters"),
+        )
+    }
+
+    /// The canonical `runtime/session_request_in_progress` error.
+    ///
+    /// Raised by `session.new` when its `client_request_id` names a create
+    /// that has not settled: the create is running, or a restart or a
+    /// compensation that could not finish left its record unsettled. The
+    /// session id is in the message and in [`ErrorDetails::session_id`].
+    /// Code is stable: `session_request_in_progress`.
+    #[must_use]
+    pub fn session_request_in_progress(session_id: &SessionId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            SESSION_REQUEST_IN_PROGRESS_CODE,
+            format!(
+                "the create for this client_request_id has not settled; it is session {}",
+                session_id.0
+            ),
+            Some("retry the same request".to_owned()),
+        )
+        .with_details(ErrorDetails {
+            session_id: Some(session_id.clone()),
+            ..ErrorDetails::default()
+        })
+    }
+
+    /// The canonical `runtime/session_request_conflict` error.
+    ///
+    /// Raised by `session.new` when its `client_request_id` already names a
+    /// session created with different parameters; nothing is created. The
+    /// session id is in the message and in [`ErrorDetails::session_id`].
+    /// Code is stable: `session_request_conflict`.
+    #[must_use]
+    pub fn session_request_conflict(session_id: &SessionId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            SESSION_REQUEST_CONFLICT_CODE,
+            format!(
+                "the client_request_id was already used with different parameters by session {}; nothing was created",
+                session_id.0
+            ),
+            Some(
+                "use a new client_request_id for a different request, or resend the original parameters"
+                    .to_owned(),
+            ),
+        )
+        .with_details(ErrorDetails {
+            session_id: Some(session_id.clone()),
+            ..ErrorDetails::default()
+        })
+    }
+
+    /// The `daemon/session_new_request_id_unsupported` error a client raises
+    /// before it sends `session.new` to a daemon that cannot honor
+    /// `client_request_id`.
+    #[must_use]
+    pub fn session_new_request_id_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
+            format!(
+                "{target} predates client_request_id and would drop it silently; nothing was sent"
+            ),
+            Some("upgrade the daemon, then retry".to_owned()),
         )
     }
 

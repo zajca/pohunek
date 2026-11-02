@@ -52,9 +52,9 @@ use serde_json::{json, Value};
 
 use super::schema::{MIGRATIONS, STORE_SCHEMA_VERSION};
 use super::{
-    ActiveAgentOrigin, DesiredState, NativeIdentityOrdering, ProjectRecord, Record, ResumeBinding,
-    RuntimeRecord, SessionRecord, SessionTransaction, StoredInputRules, TransactionKind,
-    WorktreeBinding, WorktreeStatus,
+    ActiveAgentOrigin, CreateRequest, DesiredState, NativeIdentityOrdering, ProjectRecord, Record,
+    ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction, StoredInputRules,
+    TransactionKind, WorktreeBinding, WorktreeStatus,
 };
 use crate::agent::{
     ExistenceCheckKind, NameMatch, NativeArg, NativeReferenceProvenance, SessionRefKind,
@@ -75,6 +75,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (11, include_str!("fixtures/shape/schema-11.txt")),
     (12, include_str!("fixtures/shape/schema-12.txt")),
     (13, include_str!("fixtures/shape/schema-13.txt")),
+    (14, include_str!("fixtures/shape/schema-14.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -293,7 +294,8 @@ fn session_json_with(recovery: &Value) -> Value {
             "executable": "/opt/pohunek/pohunek-sessiond",
             "reason": "none"
         },
-        "active_agent_origin": "reported"
+        "active_agent_origin": "reported",
+        "create_request": {"id": "req-1", "fingerprint": "v1:0123456789abcdef"}
     });
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
@@ -380,9 +382,16 @@ fn assert_every_field_is_reviewed(
         native_identity_ordering,
         runtime,
         active_agent_origin,
+        create_request,
     } = session;
     let _: &DesiredState = desired_state;
     let _: &Option<ActiveAgentOrigin> = active_agent_origin;
+    if let Some(request) = create_request {
+        let CreateRequest {
+            id: _,
+            fingerprint: _,
+        } = &**request;
+    }
     if let Some(SessionTransaction {
         id: _,
         kind,
@@ -842,6 +851,8 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.info.background.items[].label",
     "session.info.background.items[].program",
     "session.native_identity_ordering.runtime_id",
+    "session.create_request.id",
+    "session.create_request.fingerprint",
     "session.runtime.worker_id",
     "session.runtime.runtime_id",
     "session.runtime.service_id",

@@ -148,6 +148,7 @@ impl Installation {
             .client()
             .await
             .call::<method::SessionNew>(SessionNewParams {
+                client_request_id: None,
                 agent: "shell".to_owned(),
                 name: Some(name.to_owned()),
                 cwd: Some(self.root.join("home")),

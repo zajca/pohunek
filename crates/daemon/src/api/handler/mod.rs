@@ -859,6 +859,7 @@ mod tests {
         let cwd = crate::test_support::thread_scoped_dir("pohunek-cwd-");
         let created = sessions
             .create(SessionNewParams {
+                client_request_id: None,
                 agent: "shell".to_owned(),
                 name: None,
                 cwd: Some(cwd),
@@ -951,6 +952,7 @@ mod tests {
         let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
         let created = sessions
             .create(SessionNewParams {
+                client_request_id: None,
                 agent: "shell".to_owned(),
                 name: None,
                 cwd: Some(cwd.path().to_path_buf()),
@@ -1014,6 +1016,7 @@ mod tests {
         let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
         let created = sessions
             .create(SessionNewParams {
+                client_request_id: None,
                 agent: "shell".to_owned(),
                 name: None,
                 cwd: Some(cwd.path().to_path_buf()),
@@ -1069,6 +1072,7 @@ mod tests {
         let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
         let created = sessions
             .create(SessionNewParams {
+                client_request_id: None,
                 agent: "shell".to_owned(),
                 name: None,
                 cwd: Some(cwd.path().to_path_buf()),
@@ -1309,6 +1313,7 @@ mod tests {
             async move {
                 sessions
                     .create(SessionNewParams {
+                        client_request_id: None,
                         agent: "shell".to_owned(),
                         name: None,
                         cwd: Some(cwd),

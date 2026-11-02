@@ -688,6 +688,40 @@ async fn secret_env_fails_before_the_previous_daemon_receives_it() {
     .await;
 }
 
+/// The previous daemon would drop `client_request_id` and a retry would create a
+/// second session, so the adapter refuses the request before it is written.
+#[tokio::test]
+async fn client_request_id_fails_before_the_previous_daemon_receives_it() {
+    guard("the current-only client_request_id option", async {
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let params = json!({
+            "agent": "shell",
+            "cols": 80,
+            "rows": 24,
+            "client_request_id": "req-previous-1"
+        });
+        let error = client
+            .request(&request_for(method::SESSION_NEW, params))
+            .await
+            .expect_err("the previous daemon would drop the key and a retry would duplicate");
+        assert!(matches!(
+            error,
+            ClientError::DaemonProtocolTooOld {
+                method: ref name,
+                daemon_version,
+                required_version,
+                ..
+            } if name == method::SESSION_NEW
+                && daemon_version == previous()
+                && required_version == PROTOCOL_VERSION
+        ));
+        assert_eq!(daemon.methods(), [method::DAEMON_HEALTH]);
+        assert_eq!(daemon.violations(), Vec::<String>::new());
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_version_dependent_request_learns_the_version_before_it_is_sent() {
     guard("the dependent request", async {

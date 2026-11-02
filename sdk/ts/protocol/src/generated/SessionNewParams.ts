@@ -5,6 +5,10 @@ import type { OnDiverged } from "./OnDiverged";
 
 /**
  * Parameters for `session.new`.
+ *
+ * The daemon fingerprints a keyed request (`client_request_id`) from these
+ * fields, so a new field must leave the fingerprint unchanged when unset, or
+ * the fingerprint version must change.
  */
 export type SessionNewParams = {
   /**
@@ -114,4 +118,20 @@ export type SessionNewParams = {
    * Owner-controlled metadata for the session. Must not contain secrets.
    */
   metadata?: { [key in string]: string };
+  /**
+   * Idempotency key of the request: 1..=[`MAX_CLIENT_REQUEST_ID_BYTES`]
+   * bytes of `[A-Za-z0-9._:-]`, scoped to the daemon.
+   *
+   * The daemon persists the key with the session it creates. A later
+   * `session.new` with the same key and the same parameters returns that
+   * session with [`SessionNewResult::replayed`] instead of creating another;
+   * the same key with other parameters fails with `session_request_conflict`,
+   * and a key whose create has not settled fails with
+   * `session_request_in_progress`. A removed session frees its key, and so
+   * does a create that was rolled back. A daemon that does not advertise
+   * `HostCapabilities::session_new_request_id_supported` would drop the field
+   * silently, so a client checks the flag before sending it (the protocol 3
+   * client adapter refuses it).
+   */
+  client_request_id?: string;
 };
