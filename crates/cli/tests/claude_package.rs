@@ -581,6 +581,17 @@ fn a_title_echoing_the_launch_name_reports_no_state() {
         "without a launch name the title keeps the prompt closed"
     );
 
+    // The preview keeps the raw title the discount withholds from evaluation.
+    let started = Instant::now();
+    let mut detector = detector_launched_as(&definition, Some(marker), started, idle.columns);
+    detector.feed(started, &frame_bytes(idle.title.as_deref(), &idle.rows));
+    let title_preview = detector
+        .region_previews()
+        .into_iter()
+        .find(|preview| preview.region == "osc_title")
+        .expect("the manifest requires the osc_title region");
+    assert_eq!(title_preview.text, marker);
+
     let approval = load_frame(ScreenSet::Current, "approval", "approval", DEFAULT_COLUMNS);
     let (read, _) = launched_evidence(
         &definition,
@@ -3961,8 +3972,8 @@ async fn a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle(
         let id = fixture.new_session_id(name).await;
         fixture.wait_activity(&id, "idle").await;
         fixture.wait_screen_line(&id, "for shortcuts").await;
-        // The daemon's own detection reads the program-status records of the
-        // locked release, which outrank the name drawn into the title.
+        // The title that repeats the launch name is not evaluated, so the
+        // program-status records and the screen decide.
         let inspected = fixture.inspect(&id).await;
         assert_eq!(inspected["activity"], "idle", "{name:?}: {inspected}");
         assert!(
@@ -3974,8 +3985,7 @@ async fn a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle(
         fixture.stop(&id).await;
     }
 
-    // The initial input of a session named like a running turn reaches Claude:
-    // the title that echoes the launch name does not keep the prompt closed.
+    // The initial input of a session named like a running turn reaches Claude.
     let (code, launched) = fixture.launch_with_input(MARKER_NAMES[0], PROMPT).await;
     assert_eq!(code, 0, "{launched}");
     let id = launched["ok"]["id"]

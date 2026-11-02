@@ -785,7 +785,14 @@ impl Detector {
         let Some(manifest) = &self.manifest else {
             return Vec::new();
         };
-        let context = self.match_context(manifest, ContextFreshness::all());
+        // Previews show the title as the agent set it, evaluated or not.
+        let context = match_context_for(
+            manifest,
+            &self.screen,
+            self.latest_title.as_deref(),
+            self.latest_progress.as_deref(),
+            ContextFreshness::all(),
+        );
 
         let mut previews: Vec<_> = manifest
             .required_regions()
