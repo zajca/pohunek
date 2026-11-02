@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use pohunek_platform::shell_env::{
-    is_trusted_executable_file, resolve_executable, trusted_directory, ExecutableError, Refusal,
-    SearchPath,
+    fallback_search_path, is_trusted_executable_file, resolve_executable, trusted_directory,
+    ExecutableError, Refusal, SearchPath,
 };
 
 /// The macOS `admin` group.
@@ -76,6 +76,21 @@ fn root_never_trusts_an_admin_group_writable_directory() {
     assert!(
         trusted_directory(&admin).is_err(),
         "the directory is not a trusted search directory"
+    );
+    let admin_entry = admin.to_str().expect("UTF-8");
+    let plain_entry = directory(&root, "control", 0o755);
+    let plain_entry = plain_entry.to_str().expect("UTF-8");
+    let resolved = fallback_search_path(&[plain_entry, admin_entry], None)
+        .expect("the control directory is trusted");
+    let dropped = resolved
+        .untrusted
+        .iter()
+        .find(|dropped| dropped.entry == admin_entry)
+        .expect("the admin directory is reported");
+    assert!(
+        dropped.reason.contains("never for root"),
+        "root is told why the admin group is not accepted: {}",
+        dropped.reason
     );
 
     let plain = directory(&root, "plain", 0o755);

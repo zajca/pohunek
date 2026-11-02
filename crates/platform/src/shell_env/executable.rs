@@ -191,7 +191,9 @@ pub enum Refusal {
 /// # Errors
 ///
 /// Returns [`ExecutableError`] for an invalid or relative name, a configured
-/// path that is not executable, and a bare name found nowhere.
+/// path that is not executable, a bare name found nowhere, and
+/// [`ExecutableError::Refused`] for a candidate that exists but failed a trust
+/// check.
 pub fn resolve_executable(
     program: &OsStr,
     search: &SearchPath,

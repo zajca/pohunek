@@ -106,7 +106,10 @@ finds no trusted executable but finds a candidate that failed a check reports
 the first such candidate and the check (`found <path> but not trusted:
 <reason>`); a name found nowhere reports that none exists. On macOS a directory
 dropped from the recorded `PATH` says which write right made it unsafe: "writable
-by others", or "writable by a group other than admin (gid 80)". A refused configured
+by others", "writable by a group other than admin (gid 80)", or "writable by the
+admin group (gid 80), accepted only in a directory the effective user owns and
+never for root" (a directory of another owner, or any directory when the process
+runs as root). A refused configured
 executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
 untrusted chain directory, or the errno of the open or execute check) so a
 rejection is diagnosable. On macOS an ACL counts only when an allow entry

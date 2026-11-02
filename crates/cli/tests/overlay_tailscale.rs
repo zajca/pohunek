@@ -588,6 +588,11 @@ fn a_missing_or_failing_cli_is_reported_by_cause() {
     let message = error_message(&output);
     assert!(message.contains("not found on PATH"), "{message}");
     assert!(!message.contains("not trusted"), "{message}");
+    let hint = json(&output)["err"]["recover"]
+        .as_str()
+        .expect("recovery hint")
+        .to_owned();
+    assert!(hint.contains("install the tailscale CLI"), "{hint}");
     let (output, targets) = fixture.dial("alpha");
     assert_eq!(error_code(&output), "tailscale_cli_missing");
     assert!(targets.is_empty(), "{targets:?}");
@@ -607,6 +612,14 @@ fn a_missing_or_failing_cli_is_reported_by_cause() {
     assert!(
         message.contains(&candidate.display().to_string()) && message.contains("not trusted"),
         "the untrusted candidate is named: {message}"
+    );
+    let hint = json(&output)["err"]["recover"]
+        .as_str()
+        .expect("recovery hint")
+        .to_owned();
+    assert!(
+        hint.contains("writable only by you") && !hint.contains("install the tailscale CLI"),
+        "a refused candidate gets the permissions hint: {hint}"
     );
     let output = fixture.run_on_path(&loose, &["doctor", "--json"]);
     let document = json(&output);
