@@ -104,12 +104,12 @@ const FIXTURE_ROOT_VARIABLE: &str = "TRUST_FIXTURE_ROOT";
 /// The test the unprivileged child runs.
 const CHILD_TEST: &str = "an_unprivileged_process_applies_the_admin_group_rule_to_the_fixtures";
 
-/// Reads a numeric id `sudo` hands to the commands it runs.
-fn invoking_id(variable: &str) -> u32 {
-    std::env::var(variable)
-        .unwrap_or_else(|_| panic!("{variable} is unset: run this test through sudo"))
+/// Parses a numeric id `sudo` hands to the commands it runs.
+fn sudo_id(value: Result<String, std::env::VarError>, name: &str) -> u32 {
+    value
+        .unwrap_or_else(|_| panic!("{name} is unset: run this test through sudo"))
         .parse()
-        .unwrap_or_else(|error| panic!("{variable} is not a number: {error}"))
+        .unwrap_or_else(|error| panic!("{name} is not a number: {error}"))
 }
 
 /// Builds the fixtures as root and checks them from a child process that runs
@@ -118,8 +118,8 @@ fn invoking_id(variable: &str) -> u32 {
 #[ignore = "native macOS CI runs this test as root to create root-owned fixtures"]
 fn root_built_fixtures_are_judged_by_an_unprivileged_process() {
     assert_eq!(rustix::process::geteuid().as_raw(), 0, "test requires root");
-    let user = invoking_id("SUDO_UID");
-    let group = invoking_id("SUDO_GID");
+    let user = sudo_id(std::env::var("SUDO_UID"), "SUDO_UID");
+    let group = sudo_id(std::env::var("SUDO_GID"), "SUDO_GID");
     assert_ne!(user, 0, "the invoking account must not be root");
 
     let temporary = pohunek_test_support::tempdir().expect("create the fixture root");
@@ -151,7 +151,11 @@ fn root_built_fixtures_are_judged_by_an_unprivileged_process() {
 
     let test_binary = std::env::current_exe().expect("locate the test binary");
     let output = Command::new(test_binary)
-        .args([CHILD_TEST, "--ignored", "--exact", "--nocapture"])
+        .args(pohunek_test_support::exact_test_filter(
+            module_path!(),
+            CHILD_TEST,
+        ))
+        .args(["--ignored", "--nocapture"])
         .env_clear()
         .env(FIXTURE_ROOT_VARIABLE, &root)
         .uid(user)
