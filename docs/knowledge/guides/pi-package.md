@@ -199,7 +199,7 @@ uses the long flag in the pair form of `[naming]`
 ([runtime packages](runtime-packages.md#session-name-arguments)); the joined form
 `--name=<name>` is not a name for Pi: it falls into the generic `--` branch of the
 parser and is handed to extensions as an unknown flag, so it would be ignored
-without an error. The package needs a 0.39 core and declares Pi 1.1.0; a session
+without an error. The package needs a 0.39 core and is package version 1.1.0; a session
 pinned to 1.0.5 or earlier resumes and forks without the name until it is
 adopted.
 
@@ -217,18 +217,18 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
 - A name is never one of Pi's own scans: `main.js` reads `args.includes("--offline")`
   before the parser (1.0.0 line 452, 1.4.0 line 455), and the other pre-parse
   checks are anchored at `args[0]` (`auth`, `config`, package commands), which the
-  naming elements never reach. Because core withholds a name that starts with `-`
+  naming elements never reach: the name is never `args[0]`. Because core withholds a name that starts with `-`
   in the pair form, a name such as `--offline` is not passed at all (the session
   launches unnamed, with a WARN in the daemon log), so no scan can match it.
 - Pi trims the value, exits 1 on an empty one and appends a `session_info` entry
   to the conversation on every launch (`main.js`, `appendSessionInfo`). Nothing is
-  written before the conversation has its first assistant message, so the
+  written before the conversation has a message, so the
   existence check's premise holds; after that each named launch (create, resume
   or fork) adds one `session_info` line to the session file. A fork copies the
   source's entries, so a fork without a pohunek name shows the source's Pi
   name; a fork with one appends its own, and Pi reads the latest.
 - Where Pi shows the name: the footer line `<cwd> [(branch)] • <name>`, the
-  terminal title `π - <name> - <cwd>` and the message of the OSC 7501
+  terminal title `π - <name> - <cwd basename>` and the message of the OSC 7501
   program-status report (Pi 1.1.0 and later, base64-encoded; pohunek keeps only
   the app and the state, so a name cannot set a state). The manifest has no
   title rule. The footer sits inside the region the screen rules read, so
@@ -236,7 +236,9 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
   footer of every recorded idle screen, at every recorded width, with names
   that look like marks of the manifest (a braille spinner and its text, the
   working footer, a rule, dialog hint words), whole and cut to the width, and
-  requires `idle`.
+  requires `idle`. The manifest's rules are anchored at the start of a line,
+  and the name follows the working directory, so the test guards that anchoring
+  rather than a rule that fails today.
 
 ## Operating notes
 

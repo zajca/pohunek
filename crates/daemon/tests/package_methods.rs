@@ -2823,20 +2823,20 @@ fn refused_naming_tables(valid: &str) -> Vec<(&'static str, String)> {
         ("after-single-dash", naming_table(&["-", "{session_name}"])),
         (
             "after-joined-flag",
-            naming_table(&["--x=y", "{session_name}"]),
+            naming_table(&["--zq9=y", "{session_name}"]),
         ),
-        ("after-literal", naming_table(&["name", "{session_name}"])),
+        ("after-literal", naming_table(&["zq9name", "{session_name}"])),
         (
             "after-triple-dash",
-            naming_table(&["---x", "{session_name}"]),
+            naming_table(&["---zq9", "{session_name}"]),
         ),
         (
             "two-pairs",
-            naming_table(&["--name", "{session_name}", "--also", "{session_name}"]),
+            naming_table(&["--name", "{session_name}", "--zq9also", "{session_name}"]),
         ),
         (
             "two",
-            naming_table(&["--name={session_name}", "--also={session_name}"]),
+            naming_table(&["--name={session_name}", "--zq9also={session_name}"]),
         ),
         ("none", naming_table(&["--name"])),
         (
@@ -2895,7 +2895,11 @@ async fn naming_args_install_only_with_their_feature_and_in_a_valid_shape() {
         .await;
         let error = result.expect_err(name);
         assert_eq!(error.code, "package_descriptor_invalid", "{name}");
-        assert!(!error.msg.contains("marker-flag"), "{name}: {}", error.msg);
+        assert!(
+            !error.msg.contains("marker-flag") && !error.msg.contains("zq9"),
+            "{name}: {}",
+            error.msg
+        );
     }
 
     // The placeholder is not a launch argument of the runtime itself.
