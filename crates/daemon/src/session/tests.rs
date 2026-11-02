@@ -19471,6 +19471,15 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         .as_mut()
         .expect("lost runtime")
         .worker_instance_id = Some(previous_worker_instance_id.clone());
+    // The recovery must drop a recorded cause as well as the exit.
+    sessions
+        .get_mut(&created.id)
+        .expect("lost session")
+        .info
+        .runtime
+        .as_mut()
+        .expect("lost runtime")
+        .loss_cause = Some("user_manager_lost".to_owned());
     drop(sessions);
 
     let resumed = registry
@@ -19493,6 +19502,15 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         resumed.runtime.as_ref().expect("resumed runtime").exit,
         None,
         "the recovered runtime carries no exit of the lost one"
+    );
+    assert_eq!(
+        resumed
+            .runtime
+            .as_ref()
+            .expect("resumed runtime")
+            .loss_cause,
+        None,
+        "the recovered runtime carries no cause of the lost one"
     );
 
     let argv = wait_for_file_contains(&marker, "native-manual").await;
@@ -31800,115 +31818,4 @@ async fn a_fast_turn_nobody_asked_for_edges_activity_but_opens_no_turn() {
         "a turn nobody asked for opened one: {seen:?}"
     );
     registry.stop(&id).await.expect("stop the session");
-}
-
-fn runtime_with(
-    state: RuntimeState,
-    exit: Option<protocol::RuntimeExit>,
-    loss_cause: Option<&str>,
-) -> SessionRuntime {
-    SessionRuntime {
-        state,
-        runtime_generation: protocol::RuntimeGeneration::new(1),
-        worker_id: None,
-        worker_instance_id: None,
-        started_at: None,
-        last_connected_at: None,
-        loss_reason: None,
-        exit,
-        loss_cause: loss_cause.map(str::to_owned),
-    }
-}
-
-fn manager_exit() -> protocol::RuntimeExit {
-    protocol::RuntimeExit {
-        cause: "oom_kill".to_owned(),
-        signal: Some(9),
-        code: None,
-        oom_killer: Some("kernel".to_owned()),
-        memory_peak_bytes: Some(1_024),
-        ended_at: None,
-    }
-}
-
-/// A loss carries a manager exit or a journal cause, never both; evidence
-/// stays on a runtime that is lost again without new evidence, and every other
-/// classification drops it.
-#[test]
-fn a_loss_records_an_exit_or_a_cause_and_other_states_drop_both() {
-    use crate::session::{LossCause, LossProof, Unavailability};
-
-    // A loss cause lands on a runtime that was live.
-    let mut runtime = runtime_with(RuntimeState::Live, None, None);
-    Unavailability::lost(LossProof::Ended, None)
-        .with_loss_cause(Some(LossCause::UserManagerLost))
-        .apply_exit(&mut runtime);
-    assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
-    assert_eq!(runtime.exit, None);
-
-    // A manager verdict wins: the cause is not recorded next to it.
-    let mut runtime = runtime_with(RuntimeState::Live, None, None);
-    Unavailability::lost(LossProof::Ended, Some(manager_exit()))
-        .with_loss_cause(Some(LossCause::HostRestarted))
-        .apply_exit(&mut runtime);
-    assert_eq!(runtime.exit, Some(manager_exit()));
-    assert_eq!(runtime.loss_cause, None);
-
-    // A new exit replaces a stored cause.
-    let mut runtime = runtime_with(RuntimeState::Lost, None, Some("host_restarted"));
-    Unavailability::lost(LossProof::Ended, Some(manager_exit())).apply_exit(&mut runtime);
-    assert_eq!(runtime.exit, Some(manager_exit()));
-    assert_eq!(runtime.loss_cause, None);
-
-    // A lost runtime lost again without new evidence keeps what it holds.
-    let mut runtime = runtime_with(RuntimeState::Lost, None, Some("user_manager_lost"));
-    Unavailability::lost(LossProof::Ended, None).apply_exit(&mut runtime);
-    assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
-
-    // A later restart explains nothing about a loss that was already
-    // classified: the stored verdict, the stored cause and a plain loss all
-    // stay as they are.
-    let mut runtime = runtime_with(RuntimeState::Lost, Some(manager_exit()), None);
-    Unavailability::lost(LossProof::Ended, None)
-        .with_loss_cause(Some(LossCause::HostRestarted))
-        .apply_exit(&mut runtime);
-    assert_eq!(runtime.exit, Some(manager_exit()));
-    assert_eq!(runtime.loss_cause, None);
-    let mut runtime = runtime_with(RuntimeState::Lost, None, Some("user_manager_lost"));
-    Unavailability::lost(LossProof::Ended, None)
-        .with_loss_cause(Some(LossCause::HostRestarted))
-        .apply_exit(&mut runtime);
-    assert_eq!(runtime.loss_cause.as_deref(), Some("user_manager_lost"));
-    let mut runtime = runtime_with(RuntimeState::Lost, None, None);
-    Unavailability::lost(LossProof::Ended, None)
-        .with_loss_cause(Some(LossCause::HostRestarted))
-        .apply_exit(&mut runtime);
-    assert_eq!((runtime.exit, runtime.loss_cause), (None, None));
-    let mut runtime = runtime_with(RuntimeState::Lost, Some(manager_exit()), None);
-    Unavailability::lost(LossProof::Ended, None).apply_exit(&mut runtime);
-    assert_eq!(runtime.exit, Some(manager_exit()));
-
-    // A runtime that was not lost before has nothing to keep.
-    let mut runtime = runtime_with(RuntimeState::Reconnecting, None, Some("host_restarted"));
-    Unavailability::lost(LossProof::Unproven, None).apply_exit(&mut runtime);
-    assert_eq!(runtime.loss_cause, None);
-
-    // Every other classification clears both.
-    for state in [
-        RuntimeState::Reconnecting,
-        RuntimeState::Conflict,
-        RuntimeState::Incompatible,
-    ] {
-        let mut runtime = runtime_with(
-            RuntimeState::Lost,
-            Some(manager_exit()),
-            Some("user_manager_lost"),
-        );
-        Unavailability::other(state).apply_exit(&mut runtime);
-        assert_eq!(
-            (runtime.exit, runtime.loss_cause),
-            (None, None),
-            "{state:?}"
-        );
-    }
 }

@@ -322,9 +322,10 @@ Interpret runtime states as follows:
   retained or has been imported.
 - `lost`: no live PTY generation remains. `session inspect --json` shows
   `runtime.exit` when the service manager still held the failed worker job:
-  `cause` `oom_kill` means the kernel memory limit of the worker unit was hit
-  (the signal then only says how the worker process was stopped), `signal` and
-  `exit_code` carry the signal number or exit code, and `other` is any result
+  `cause` `oom_kill` means the worker unit was killed for memory, by the kernel
+  at its memory limit or by `systemd-oomd` under memory pressure (`oom_killer`
+  below says which; the signal only says how the worker process was stopped),
+  `signal` and `exit_code` carry the signal number or exit code, and `other` is any result
   the daemon does not map. For `oom_kill`, `oom_killer` is `kernel` or
   `systemd_oomd` when the manager's counters name one killer, and
   `memory_peak_bytes` and `ended_at` show the unit's peak memory and end time.

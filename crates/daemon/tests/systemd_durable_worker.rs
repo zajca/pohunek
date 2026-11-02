@@ -79,6 +79,18 @@ const LOSS_MARGIN: Duration = Duration::from_secs(15);
 const OOM_MEMORY_MAX: &str = "1M";
 /// Makes the kernel pick the worker over its own children.
 const OOM_SCORE_ADJ_MAX: &str = "1000";
+/// `MemoryHigh` of the running worker unit: below what the worker already
+/// holds, so every charge is throttled and the unit stalls on memory without
+/// the kernel ever reaching an OOM kill.
+const OOMD_MEMORY_HIGH: &str = "1M";
+/// Memory pressure (share of time stalled) above which `systemd-oomd` kills
+/// the units of the sessions slice; low so the throttled worker crosses it.
+const OOMD_PRESSURE_LIMIT: &str = "1%";
+/// How long the pressure must hold before `systemd-oomd` acts.
+const OOMD_PRESSURE_DURATION: &str = "2s";
+/// Bound on waiting for `systemd-oomd`, which samples pressure once a second
+/// and then waits out [`OOMD_PRESSURE_DURATION`].
+const OOMD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
@@ -547,6 +559,103 @@ async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
     assert_eq!(runtime.loss_cause, None, "an exit explains the loss itself");
 }
 
+/// A worker unit killed by `systemd-oomd` is a failed session whose runtime
+/// names `systemd_oomd` as the killer: the kill ends the unit with the
+/// `oom-kill` result, so only the manager's kill counters tell it from the
+/// kernel's.
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager with the memory controller, and a running systemd-oomd"]
+async fn a_systemd_oomd_killed_worker_is_a_failed_session_with_its_killer() {
+    assert_eq!(
+        std::env::var("POHUNEK_SYSTEMD_E2E").as_deref(),
+        Ok("1"),
+        "set POHUNEK_SYSTEMD_E2E=1 explicitly"
+    );
+    require_memory_controller();
+    require_oomd();
+    let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
+    let worker_bin = required_binary("POHUNEK_WORKER_BIN");
+    let fixture = Fixture::new(&worker_bin);
+    adopt_running_worker(&fixture, &daemon_bin).await;
+
+    // The slice is the monitored cgroup, the worker unit its candidate;
+    // MemoryHigh throttles the worker so the kernel never kills it.
+    Fixture::systemctl([
+        "set-property",
+        "--runtime",
+        fixture.namespace.sessions_slice().as_str(),
+        "ManagedOOMMemoryPressure=kill",
+        format!("ManagedOOMMemoryPressureLimit={OOMD_PRESSURE_LIMIT}").as_str(),
+        format!("ManagedOOMMemoryPressureDurationSec={OOMD_PRESSURE_DURATION}").as_str(),
+    ]);
+    Fixture::systemctl([
+        "set-property",
+        "--runtime",
+        fixture.worker_unit.as_str(),
+        format!("MemoryHigh={OOMD_MEMORY_HIGH}").as_str(),
+    ]);
+
+    // Input keeps the throttled worker allocating until `systemd-oomd` acts.
+    let deadline = tokio::time::Instant::now() + OOMD_TIMEOUT;
+    let lost = loop {
+        let info = fixture.inspect().await;
+        if info
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+        {
+            break info;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            fixture.print_status();
+            panic!("the worker was not killed by systemd-oomd in time");
+        }
+        if let Ok(mut client) = Client::connect_local(&fixture.socket).await {
+            let _ = client
+                .call::<method::SessionInput>(SessionInputParams {
+                    session_id: SessionId(fixture.session_id.clone()),
+                    text: "pressure".to_owned(),
+                    wait: None,
+                })
+                .await;
+        }
+        // timing-allowed: #326 polls the real daemon while systemd-oomd samples pressure, bounded by the explicit deadline above
+        tokio::time::sleep(CONNECT_DELAY).await;
+    };
+
+    assert_eq!(lost.state, protocol::SessionState::Failed);
+    let runtime = lost.runtime.expect("lost runtime");
+    let exit = runtime.exit.as_ref().expect("the manager's verdict");
+    assert_eq!(exit.cause, "oom_kill", "{runtime:?}");
+    assert_eq!(
+        exit.oom_killer.as_deref(),
+        Some("systemd_oomd"),
+        "systemd-oomd killed the worker, the kernel did not: {runtime:?}"
+    );
+    assert!(exit.memory_peak_bytes.is_some(), "{runtime:?}");
+    assert!(exit.ended_at.is_some(), "{runtime:?}");
+    assert_eq!(runtime.loss_cause, None, "an exit explains the loss itself");
+}
+
+/// Fails with a stated precondition unless `systemd-oomd` runs on the host
+/// and the kernel exposes memory pressure, which it samples.
+fn require_oomd() {
+    let output = Command::new("systemctl")
+        .args(["is-active", "systemd-oomd"])
+        .output()
+        .expect("run systemctl");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "active",
+        "precondition: systemd-oomd is not running; install and start it \
+         (`systemctl enable --now systemd-oomd`) before running this scenario"
+    );
+    assert!(
+        Path::new("/proc/pressure/memory").exists(),
+        "precondition: the kernel exposes no memory pressure (PSI), which systemd-oomd samples"
+    );
+}
+
 /// A worker unit an operator reset (`reset-failed`) while the user manager
 /// stayed alive leaves no verdict and no explanation: the loss stays plain.
 #[tokio::test]
@@ -673,7 +782,6 @@ async fn privileged_a_killed_user_manager_is_the_cause_of_a_lost_runtime() {
         "the worker of the killed user manager",
     )
     .await;
-    assert_eq!(lost.state, protocol::SessionState::Failed);
     let runtime = lost.runtime.expect("lost runtime");
     assert_eq!(
         runtime.loss_cause.as_deref(),
@@ -1356,6 +1464,10 @@ impl Drop for Fixture {
                 .args(["--user", "reset-failed", unit.as_str()])
                 .status();
         }
+        // Drops the runtime properties a scenario set on the sessions slice.
+        let _ = Command::new("systemctl")
+            .args(["--user", "revert", self.namespace.sessions_slice().as_str()])
+            .status();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

@@ -1955,8 +1955,9 @@ Durability tiers (honest about limits):
    absent, never zero, and never loses the verdict. Since systemd 251 a
    `systemd-oomd` kill also ends the unit with `Result=oom-kill`, so the
    counters, not the result, tell the killers apart:
-   `runtime.exit.oom_killer` is `kernel` or `systemd_oomd` when exactly one
-   counter is non-zero and absent otherwise, and `memory_peak_bytes` and
+   `runtime.exit.oom_killer` is `kernel` or `systemd_oomd` when that counter
+   is positive and the other reads zero, and absent otherwise (also when the
+   manager does not report the other counter), and `memory_peak_bytes` and
    `ended_at` ride along. The launchd backend keeps no verdict, so the
    daemon arms a kernel exit watch on the worker process when the runtime
    becomes live (`Supervisor::watch_exit`, a kqueue `EVFILT_PROC` filter with
