@@ -18,6 +18,9 @@
 //! - [`verify_catalog`] authenticates the signed runtime catalog that
 //!   authorizes official packages by archive digest; [`LocalTrust`] is the
 //!   separate explicit-digest trust for third-party archives.
+//! - [`verify_index`] authenticates the signed plugin index that authorizes
+//!   plugin packages by archive digest; [`VerifiedIndex::authorize`] applies
+//!   the per-entry install-time checks.
 //!
 //! On Unix the crate also stores verified archives:
 //!
@@ -52,6 +55,7 @@ mod catalog;
 mod compression;
 mod error;
 mod limits;
+mod plugin_index;
 mod release;
 mod sign;
 pub mod version_probe;
@@ -96,6 +100,16 @@ pub use error::{ArchiveError, EntryRejection};
 pub use limits::{
     Limits, MAX_COMPRESSED_BYTES, MAX_EXPANDED_BYTES, MAX_EXPANSION_RATIO, MAX_FILES,
     MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_WINDOW_BYTES,
+};
+pub use plugin_index::{
+    index_key_record_signing_message, index_signing_message, parse_index_envelope,
+    revocation_signing_message, verify_index, IndexBody, IndexEntry, IndexEntryRefusal,
+    IndexEntryRejection, IndexEnvelope, IndexError, IndexKeyRecord, IndexLimit, IndexVerifierState,
+    RevocationBody, SignedRevocations, VerifiedIndex, INDEX_REFUSED_RUNTIME_IDS,
+    INDEX_SCHEMA_VERSION, MAX_ENTRY_URL_BYTES, MAX_INDEX_BYTES, MAX_INDEX_ENTRIES,
+    MAX_INDEX_KEY_RECORDS, MAX_INDEX_KEY_WINDOW_SECONDS, MAX_INDEX_LIFETIME_SECONDS,
+    MAX_INDEX_SEQUENCE_SKEW_SECONDS, MAX_INDEX_SIGNATURES, OFFICIAL_INDEX_FILE_NAME,
+    OFFICIAL_NAMESPACE, OFFICIAL_RUNTIME_PACKAGE_PREFIX, OFFICIAL_SCOPE,
 };
 pub use protocol::PackageDigest;
 pub use release::{
