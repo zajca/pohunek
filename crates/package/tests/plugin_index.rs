@@ -1326,3 +1326,68 @@ fn refused_runtime_is_reported_before_the_package_binding() {
     );
     assert_eq!(authorize(&verified, &muse(), "0.40.0"), Ok(()));
 }
+
+#[test]
+fn key_record_message_is_the_domain_plus_the_canonical_record() {
+    let fixture = Fixture::new();
+    let record = &fixture.records[0];
+    let expected = format!(
+        "pohunek-plugin-index-key-record-v1\n{{\"endorsed_by\":\"{}\",\"key_id\":\"{}\",\"not_after\":{},\"not_before\":{},\"public_key\":\"{}\",\"scope\":\"official\"}}",
+        record.endorsed_by, record.key_id, record.not_after, record.not_before, record.public_key
+    );
+
+    assert_eq!(
+        index_key_record_signing_message(record),
+        expected.as_bytes()
+    );
+}
+
+#[test]
+fn endorsement_covers_scope_and_window_start() {
+    let fixture = Fixture::new();
+
+    // R endorsed the key for scope `verified`; relabeling it keeps the signature.
+    let mut relabeled = record(&fixture.r, &fixture.k, "verified", KEY_START, KEY_END);
+    relabeled.scope = "official".to_owned();
+    assert_eq!(
+        error_of(&Fixture::new().with_records(vec![relabeled])),
+        IndexError::BadEndorsement
+    );
+
+    let mut earlier = fixture.records[0].clone();
+    earlier.not_before -= 1;
+    assert_eq!(
+        error_of(&Fixture::new().with_records(vec![earlier])),
+        IndexError::BadEndorsement
+    );
+}
+
+#[test]
+fn a_catalog_signature_under_the_index_domain_does_not_verify_as_a_catalog() {
+    let fixture = Fixture::new();
+    let anchor = TrustAnchor::new(vec![root(&fixture.r)], Vec::new()).unwrap();
+    let catalog = Catalog {
+        schema_version: CATALOG_SCHEMA_VERSION,
+        sequence: 1,
+        expires_at: NOW + DAY,
+        release: catalog_release(),
+        revoked_key_ids: Vec::new(),
+        revoked_digests: Vec::new(),
+        entries: Vec::new(),
+    };
+    let genuine = sign_catalog(catalog.clone(), &fixture.r).unwrap();
+    verify_catalog(&serde_json::to_vec(&genuine).unwrap(), &anchor, NOW, None)
+        .expect("the control catalog verifies");
+
+    let message = swap_domain(
+        &package::catalog_signing_message(&catalog).unwrap(),
+        CATALOG_DOMAIN,
+        INDEX_DOMAIN,
+    );
+    let mut forged = genuine;
+    forged.signatures[0].signature = hex(&fixture.r.sign(&message).to_bytes());
+    assert_eq!(
+        verify_catalog(&serde_json::to_vec(&forged).unwrap(), &anchor, NOW, None).unwrap_err(),
+        CatalogError::BadSignature
+    );
+}
