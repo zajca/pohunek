@@ -118,10 +118,10 @@ const CATALOG_DOMAIN: &[u8] = b"pohunek-runtime-catalog-v2\n";
 const KEY_RECORD_DOMAIN: &[u8] = b"pohunek-catalog-key-record-v1\n";
 
 /// Length of an Ed25519 public key in bytes.
-const PUBLIC_KEY_BYTES: usize = 32;
+pub(crate) const PUBLIC_KEY_BYTES: usize = 32;
 
 /// Length of an Ed25519 signature in bytes.
-const SIGNATURE_BYTES: usize = 64;
+pub(crate) const SIGNATURE_BYTES: usize = 64;
 
 /// Length of a SHA-256 digest in bytes, the size of a [`KeyId`].
 const KEY_ID_BYTES: usize = 32;
@@ -539,6 +539,11 @@ impl RootKey {
         &self.id
     }
 
+    /// The verifying key, for verifiers in this crate.
+    pub(crate) fn verifying_key(&self) -> &VerifyingKey {
+        &self.key
+    }
+
     /// The raw 32-byte public key.
     #[must_use]
     pub fn public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
@@ -623,7 +628,7 @@ pub fn key_record_signing_message(record: &SignedKeyRecord) -> Vec<u8> {
     domain_message(KEY_RECORD_DOMAIN, &Value::Object(body))
 }
 
-fn domain_message(domain: &[u8], value: &Value) -> Vec<u8> {
+pub(crate) fn domain_message(domain: &[u8], value: &Value) -> Vec<u8> {
     let mut message = domain.to_vec();
     message.extend_from_slice(&canonical_bytes(value));
     message
@@ -1059,7 +1064,7 @@ fn validate_entries(
     Ok(verified)
 }
 
-fn parse_core_range(text: &str) -> Option<VersionReq> {
+pub(crate) fn parse_core_range(text: &str) -> Option<VersionReq> {
     if text.is_empty() || text.len() > MAX_CORE_RANGE_BYTES {
         return None;
     }

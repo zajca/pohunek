@@ -755,6 +755,8 @@ Signed runtime catalog:
 - `crates/package/src/catalog.rs` — catalog schema, key chain, signature verification, authorization, local trust.
 - `crates/package/src/canonical_json.rs` — strict JSON parsing and the canonical signed byte form.
 - `crates/package/tests/catalog.rs`
+- `crates/package/src/plugin_index.rs` — signed plugin index schema, depth-1 key records, embedded revocations, freshness caps and per-entry install authorization.
+- `crates/package/tests/plugin_index.rs`
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
