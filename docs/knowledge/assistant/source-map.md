@@ -768,8 +768,9 @@ Signed runtime catalog:
 - `crates/xtask/src/package_evidence.rs` — `package build --evidence-dir`: the archive checksum, manifest projection, provenance input and compatibility vector, refused when the archived bytes, the lock or the matrix differ from the blobs of `HEAD`.
 - `crates/package/src/anchor.rs` — the catalog trust anchor file format and its strict parser.
 - `crates/package/src/sign.rs` — catalog signing for release tooling.
-- `crates/daemon/src/catalog_anchor.rs` — reading the anchor beside the daemon executable and its file-safety policy.
-- `crates/daemon/src/doctor.rs` — the `catalog_trust_anchor` doctor check.
+- `crates/daemon/src/catalog_anchor.rs` — reading the anchor and the plugin index channel file beside the daemon executable and their file-safety policy.
+- `crates/daemon/src/doctor.rs` — the `catalog_trust_anchor` and `plugin_index_channel` doctor checks.
+- `crates/daemon/src/packages/trust.rs` — index verification, listing and entry authorization for `package.install` with the `index` trust kind.
 - `crates/xtask/src/catalog.rs` — `cargo xtask catalog build|sign|verify|anchor|public-key`.
 - `crates/xtask/src/catalog_key.rs` — owner-private signing key file reader.
 - `packaging/runtime-catalog-anchor.json` — the production trust anchor shipped beside `pohunekd`.

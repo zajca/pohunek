@@ -361,6 +361,7 @@ mod tests {
             session_new_request_id_supported: true,
             session_idle_stop_supported: true,
             package_install_commands_supported: true,
+            package_install_index_supported: false,
             package_bind_profile_expected_supported: true,
             session_new_branch_source_supported: true,
             supported_agents: vec![
@@ -445,6 +446,7 @@ mod tests {
             session_new_request_id_supported: true,
             session_idle_stop_supported: true,
             package_install_commands_supported: true,
+            package_install_index_supported: false,
             package_bind_profile_expected_supported: true,
             session_new_branch_source_supported: true,
         };

@@ -22,7 +22,7 @@ use protocol::{
     NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
     NotificationUpdateParams, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
     OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault, PackageFindingKind,
-    PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PrincipalId,
+    PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PackageTrust, PrincipalId,
     ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
     Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
@@ -3517,6 +3517,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
+        package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
     };
 
@@ -3557,8 +3558,48 @@ fn host_capabilities_json_shape_roundtrips() {
         })
     );
 
-    let back = line_roundtrip(&caps);
-    assert_eq!(back, caps);
+    assert_eq!(line_roundtrip(&caps), caps);
+}
+
+#[test]
+fn the_index_install_flag_is_on_the_wire_only_when_true() {
+    let mut caps: HostCapabilities = serde_json::from_value(json!({
+        "daemon_version": "0.1.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_agents": [],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "terminal_read_supported": false,
+        "output_read_supported": false,
+        "session_wait_supported": false
+    }))
+    .expect("a host that predates the flag decodes");
+    assert!(!caps.package_install_index_supported);
+    let value = serde_json::to_value(&caps).expect("serialize host capabilities");
+    assert!(value.get("package_install_index_supported").is_none());
+
+    caps.package_install_index_supported = true;
+    let value = serde_json::to_value(&caps).expect("serialize host capabilities");
+    assert_eq!(value["package_install_index_supported"], json!(true));
+    assert_eq!(line_roundtrip(&caps), caps);
+}
+
+#[test]
+fn the_index_trust_kind_is_tagged_and_strict() {
+    let trust = PackageTrust::Index {
+        index_path: "/var/index.json".to_owned(),
+    };
+    let value = serde_json::to_value(&trust).expect("serialize the trust");
+    assert_eq!(
+        value,
+        json!({ "kind": "index", "index_path": "/var/index.json" })
+    );
+    assert_eq!(line_roundtrip(&trust), trust);
+    serde_json::from_value::<PackageTrust>(
+        json!({ "kind": "index", "index_path": "/i", "extra": 1 }),
+    )
+    .expect_err("an unknown field is refused");
 }
 
 #[test]
@@ -3608,6 +3649,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.package_install_commands_supported,
         "a host that omits the commands flag rejects accept_commands"
+    );
+    assert!(
+        !caps.package_install_index_supported,
+        "a host that omits the index flag rejects the index trust kind"
     );
     assert!(
         !caps.package_bind_profile_expected_supported,

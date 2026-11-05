@@ -17,4 +17,10 @@ export type PackageTrust = {
    * Absolute path of the catalog document on the daemon host.
    */
   catalog_path: string;
+} | {
+  "kind": "index";
+  /**
+   * Absolute path of the index document on the daemon host.
+   */
+  index_path: string;
 };

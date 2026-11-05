@@ -572,6 +572,15 @@ repeating the command; the CLI never retries an install on its own.
   decompresses anything, so bytes the catalog does not list, a corrupted copy
   of a listed archive included, are refused with `package_untrusted` without
   being decoded. Installs trusted by `--sha256` are unaffected.
+- Installs by plugin index use the daemon only: `package.install` with the
+  `index` trust kind verifies a signed index document against the endorser root
+  named by `plugin-index-channel.json` beside the trust anchor, persists the
+  index and revocation marks before the install, looks the archive digest up
+  before decompressing, and refuses the runtime ids `shell`, `codex`, `claude`,
+  `hermes` and `pi` (`package_runtime_not_claimable`) and any package that
+  declares commands (`package_untrusted`). A host without the channel file
+  refuses it (`official_trust_unavailable`) and `pohunek doctor` reports the
+  `plugin_index_channel` check as `warn`; catalog installs are unaffected.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 

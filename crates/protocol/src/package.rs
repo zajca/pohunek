@@ -303,6 +303,16 @@ pub enum PackageTrust {
         /// Absolute path of the catalog document on the daemon host.
         catalog_path: String,
     },
+    /// The signed plugin index at `index_path` authorizes the archive as an
+    /// official plugin package.
+    ///
+    /// A client sends it only to a host that advertises
+    /// `HostCapabilities::package_install_index_supported`; an older daemon
+    /// refuses the unknown kind at params decoding.
+    Index {
+        /// Absolute path of the index document on the daemon host.
+        index_path: String,
+    },
 }
 
 /// Parameters for `package.install`.

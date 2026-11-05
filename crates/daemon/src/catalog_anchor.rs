@@ -18,6 +18,12 @@
 //! file policy is unchanged. On macOS an extended ACL entry that lets another
 //! principal change the file counts as writable. No environment variable or
 //! command-line option selects another file.
+//!
+//! The plugin index channel file ([`package::INDEX_CHANNEL_FILE_NAME`]) sits in
+//! the same directory and is read, after a loaded anchor only, under the same
+//! file policy. It names the one anchor root that endorses plugin index keys
+//! ([`IndexTrust`]); its absence or a fault in it never changes
+//! [`CatalogTrust`], so catalog installs behave the same with or without it.
 
 // Rust guideline compliant 2026-10-05
 
@@ -26,7 +32,10 @@ use std::io::{ErrorKind, Read as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-use package::{parse_anchor, AnchorFileError, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES};
+use package::{
+    parse_anchor, parse_index_channel, AnchorFile, AnchorFileError, IndexChannelError, RootKey,
+    ANCHOR_FILE_NAME, INDEX_CHANNEL_FILE_NAME, MAX_ANCHOR_BYTES, MAX_INDEX_CHANNEL_BYTES,
+};
 use pohunek_platform::filesystem::{acl_grants_change, FsError, TrustedDir};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -84,6 +93,54 @@ pub enum AnchorFault {
     Malformed(AnchorFileError),
 }
 
+/// What this installation trusts to authorize plugin index installs.
+#[derive(Debug, Clone, Default)]
+pub enum IndexTrust {
+    /// The installation ships no channel file beside the anchor.
+    #[default]
+    Absent,
+    /// The channel was read and names this anchor root as the index endorser.
+    Loaded(Box<RootKey>),
+    /// The channel file exists and cannot be trusted.
+    Invalid(IndexChannelFault),
+}
+
+/// Why the plugin index channel of an installation cannot be trusted.
+///
+/// The messages are fixed text: they carry no path and no file content.
+#[derive(Debug, Clone, Copy, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum IndexChannelFault {
+    /// The channel file or its directory could not be read.
+    #[error("the plugin index channel file or its directory could not be read")]
+    Unreadable,
+    /// The channel file, or its directory chain, can be rewritten by another
+    /// account or is not a plain regular file.
+    #[error("the plugin index channel file is not safe: it must be a regular file owned by the daemon user or root, not writable by group or others (by mode or ACL), with one link")]
+    Unsafe,
+    /// The channel file is larger than [`MAX_INDEX_CHANNEL_BYTES`].
+    #[error("the plugin index channel file is too large")]
+    TooLarge,
+    /// The channel file is not valid, or names an endorser the anchor does
+    /// not hold.
+    #[error("the plugin index channel file is invalid: {0}")]
+    Malformed(IndexChannelError),
+}
+
+impl From<AnchorFault> for IndexChannelFault {
+    fn from(fault: AnchorFault) -> Self {
+        match fault {
+            // `Malformed` is a parse outcome, which the file read this
+            // conversion serves never produces.
+            AnchorFault::Unreadable
+            | AnchorFault::ExecutableUnknown
+            | AnchorFault::Malformed(_) => Self::Unreadable,
+            AnchorFault::TooLarge => Self::TooLarge,
+            AnchorFault::UnsafeDirectory | AnchorFault::UnsafeFile => Self::Unsafe,
+        }
+    }
+}
+
 impl CatalogTrust {
     /// Reads the anchor beside the running daemon executable.
     ///
@@ -125,9 +182,12 @@ pub fn load_from_directory(directory: &Path) -> CatalogTrust {
         Ok(None) => CatalogTrust::Absent,
         Ok(Some(bytes)) => match parse_anchor(&bytes) {
             Ok(file) => {
-                let (roots, revoked) = file.into_parts();
-                match HostTrustAnchor::new(roots, revoked) {
-                    Ok(anchor) => CatalogTrust::Loaded(anchor),
+                match HostTrustAnchor::new(file.roots().to_vec(), file.revoked_key_ids().to_vec()) {
+                    Ok(anchor) => CatalogTrust::Loaded(anchor.with_index(load_index_channel(
+                        directory,
+                        &file,
+                        effective_uid,
+                    ))),
                     Err(error) => CatalogTrust::Invalid(AnchorFault::Malformed(error.into())),
                 }
             }
@@ -137,13 +197,44 @@ pub fn load_from_directory(directory: &Path) -> CatalogTrust {
     }
 }
 
+/// Reads the channel file in `directory` and resolves its endorser against
+/// the roots of the loaded `anchor`.
+fn load_index_channel(directory: &Path, anchor: &AnchorFile, effective_uid: u32) -> IndexTrust {
+    let bytes = match read_trusted_file(
+        directory,
+        INDEX_CHANNEL_FILE_NAME,
+        MAX_INDEX_CHANNEL_BYTES,
+        effective_uid,
+    ) {
+        Ok(None) => return IndexTrust::Absent,
+        Ok(Some(bytes)) => bytes,
+        Err(fault) => return IndexTrust::Invalid(fault.into()),
+    };
+    let endorser = parse_index_channel(&bytes).and_then(|channel| channel.endorser(anchor));
+    match endorser {
+        Ok(root) => IndexTrust::Loaded(Box::new(root)),
+        Err(error) => IndexTrust::Invalid(IndexChannelFault::Malformed(error)),
+    }
+}
+
 /// The anchor bytes, or `None` when the directory has no anchor file.
 fn read_anchor(directory: &Path, effective_uid: u32) -> Result<Option<Vec<u8>>, AnchorFault> {
+    read_trusted_file(directory, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES, effective_uid)
+}
+
+/// The bytes of `name` in `directory` under the integrity policy, or `None`
+/// when the directory has no such file. `max_bytes` bounds what is read.
+fn read_trusted_file(
+    directory: &Path,
+    name: &str,
+    max_bytes: usize,
+    effective_uid: u32,
+) -> Result<Option<Vec<u8>>, AnchorFault> {
     TrustedDir::open_absolute_executable_dir_ancestor(directory).map_err(|error| match error {
         FsError::Io { .. } => AnchorFault::Unreadable,
         _ => AnchorFault::UnsafeDirectory,
     })?;
-    let path: PathBuf = directory.join(ANCHOR_FILE_NAME);
+    let path: PathBuf = directory.join(name);
     let Some(file) = open_anchor(&path)? else {
         return Ok(None);
     };
@@ -160,20 +251,20 @@ fn read_anchor(directory: &Path, effective_uid: u32) -> Result<Option<Vec<u8>>, 
         },
         effective_uid,
     )?;
-    let limit = u64::try_from(MAX_ANCHOR_BYTES)
+    let limit = u64::try_from(max_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let mut bytes = Vec::new();
     file.take(limit)
         .read_to_end(&mut bytes)
         .map_err(|_error| AnchorFault::Unreadable)?;
-    if bytes.len() > MAX_ANCHOR_BYTES {
+    if bytes.len() > max_bytes {
         return Err(AnchorFault::TooLarge);
     }
     Ok(Some(bytes))
 }
 
-/// Opens the anchor without following a final symbolic link and without
+/// Opens a trust file without following a final symbolic link and without
 /// blocking on a FIFO. A missing file is `Ok(None)`.
 fn open_anchor(path: &Path) -> Result<Option<File>, AnchorFault> {
     match OpenOptions::new()

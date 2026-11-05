@@ -26,9 +26,9 @@ pub(crate) mod ensure;
 mod error;
 mod fault;
 mod retention;
-pub(crate) mod selection;
+mod selection;
 mod source;
-pub(crate) mod trust;
+mod trust;
 
 pub use self::authority::PackageService;
 pub(crate) use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority};
@@ -44,8 +44,9 @@ use package::registry::{
     RegistryState,
 };
 use package::{
-    archive_digest, read_archive, read_archive_with_digest, Limits, LocalTrust, LocalTrustError,
-    PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES,
+    archive_digest, read_archive, read_archive_with_digest, IndexVerifierState, Limits, LocalTrust,
+    LocalTrustError, PackageDigest, RootKey, VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES,
+    MAX_INDEX_BYTES,
 };
 use protocol::{
     CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
@@ -68,12 +69,12 @@ use crate::agent::host::{
     RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
-use crate::catalog_anchor::CatalogTrust;
+use crate::catalog_anchor::{CatalogTrust, IndexTrust};
 use crate::integration::RetainedSchemas;
 use crate::session::SessionRegistry;
 
 /// What a package method needs from the authority.
-pub(crate) struct Context {
+struct Context {
     store: PackageStore,
     runtimes: RuntimeHost,
     trust: CatalogTrust,
@@ -94,6 +95,9 @@ struct Prepared {
     source: RecordSource,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
+    /// The plugin index that authorized the package, recorded before the
+    /// install.
+    index: Option<VerifiedIndex>,
 }
 
 /// An archive whose descriptor exports commands only, checked like
@@ -138,7 +142,7 @@ struct Inspected {
 }
 
 impl PackageAuthority {
-    pub(crate) fn context(&self) -> Result<Context, PackageErrorKind> {
+    fn context(&self) -> Result<Context, PackageErrorKind> {
         let runtimes = self.runtimes.clone();
         let Some(store) = runtimes.package_store().cloned() else {
             warn!("a package method was called on a host without a package store");
@@ -160,6 +164,17 @@ impl Context {
             CatalogTrust::Loaded(anchor) => Ok(anchor),
             CatalogTrust::Absent => Err(PackageErrorKind::TrustUnavailable),
             CatalogTrust::Invalid(_fault) => Err(PackageErrorKind::TrustAnchorInvalid),
+        }
+    }
+
+    /// The host trust anchor and the root that endorses plugin index keys, or
+    /// why index installs are unavailable.
+    fn index_endorser(&self) -> Result<(&HostTrustAnchor, &RootKey), PackageErrorKind> {
+        let anchor = self.catalog_anchor()?;
+        match anchor.index() {
+            IndexTrust::Loaded(endorser) => Ok((anchor, endorser.as_ref())),
+            IndexTrust::Absent => Err(PackageErrorKind::TrustUnavailable),
+            IndexTrust::Invalid(_fault) => Err(PackageErrorKind::TrustAnchorInvalid),
         }
     }
 }
@@ -913,6 +928,27 @@ fn prepare_archive(
             prepare_official(anchor, &state, path, catalog_path)
                 .map(|prepared| Candidate::Runtime(Box::new(prepared)))
         }
+        PackageTrust::Index { index_path } => {
+            let (anchor, endorser) = context.index_endorser()?;
+            let registry = context.store.registry();
+            let catalog_state = registry
+                .catalog_state()
+                .map_err(|error| registry_kind(&error))?;
+            let index_state = registry
+                .index_state()
+                .map_err(|error| registry_kind(&error))?;
+            prepare_indexed(
+                &IndexTrustInputs {
+                    anchor,
+                    endorser,
+                    catalog_state: &catalog_state,
+                    index_state: &index_state,
+                },
+                path,
+                index_path,
+            )
+            .map(|prepared| Candidate::Runtime(Box::new(prepared)))
+        }
     }
 }
 
@@ -949,6 +985,7 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, Packag
         authority: Authority::Local,
         source: RecordSource::ExplicitDigest,
         catalog: None,
+        index: None,
     })))
 }
 
@@ -1010,6 +1047,81 @@ fn prepare_official(
         authority: Authority::Official,
         source: RecordSource::Official,
         catalog: Some(verified),
+        index: None,
+    })
+}
+
+/// What an index install verifies against.
+struct IndexTrustInputs<'a> {
+    anchor: &'a HostTrustAnchor,
+    /// The anchor root the channel names as the index endorser.
+    endorser: &'a RootKey,
+    catalog_state: &'a CatalogState,
+    index_state: &'a IndexVerifierState,
+}
+
+/// Prepares an archive that the signed plugin index at `index_path`
+/// authorizes as official.
+///
+/// The verified index must list the raw archive digest before the archive is
+/// decoded; the identity the decoded descriptor declares must then match the
+/// listed entry. A package that exports commands, alone or beside a runtime,
+/// is refused: the index install paths have no consent step that shows a
+/// command.
+fn prepare_indexed(
+    inputs: &IndexTrustInputs<'_>,
+    path: &str,
+    index_path: &str,
+) -> Result<Prepared, PackageErrorKind> {
+    let limits = Limits::DEFAULT;
+    let bytes = read_archive_file(path, &limits)?;
+    let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
+    let document = read_regular_file(index_path, max)
+        .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
+    let verified = trust::verify_index_document(
+        &document,
+        inputs.endorser,
+        inputs.anchor,
+        inputs.catalog_state,
+        inputs.index_state,
+        unix_now()?,
+    )?;
+    let raw = archive_digest(&bytes).map_err(|error| {
+        warn!(%error, "a package archive digest cannot be computed");
+        PackageErrorKind::ArchiveInvalid
+    })?;
+    trust::require_indexed(&verified, &raw)?;
+    let (digest, descriptor) = read_authorized(&bytes, &raw, &limits)?;
+    let identity = descriptor.identity().clone();
+    let (definition, commands) = descriptor.into_parts();
+    let Some(definition) = definition else {
+        warn!(
+            "a package that exports commands only was refused: an index entry binds a runtime id"
+        );
+        return Err(PackageErrorKind::Untrusted);
+    };
+    if !commands.is_empty() {
+        warn!("an indexed package that declares commands was refused: no consent step shows them");
+        return Err(PackageErrorKind::Untrusted);
+    }
+    trust::authorize_indexed(
+        &verified,
+        &identity,
+        definition.runtime_id(),
+        &digest,
+        &trust::core_version()?,
+        &trust::host_platform()?,
+    )?;
+    Ok(Prepared {
+        bytes,
+        digest,
+        definition,
+        commands,
+        identity,
+        authority: Authority::Official,
+        source: RecordSource::Official,
+        catalog: None,
+        index: Some(verified),
     })
 }
 
@@ -1068,6 +1180,7 @@ fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
         authority: Authority::Local,
         source: RecordSource::Link,
         catalog: None,
+        index: None,
     })))
 }
 
@@ -1079,6 +1192,9 @@ struct Install {
     source: RecordSource,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
+    /// The plugin index that authorized the package, recorded before the
+    /// install.
+    index: Option<VerifiedIndex>,
     /// The integration the package declares; none for a package without a
     /// runtime.
     integration: Integration,
@@ -1104,6 +1220,7 @@ fn commit_candidate(
                 identity: prepared.identity,
                 source: prepared.source,
                 catalog: None,
+                index: None,
                 integration: Integration::Known(None),
                 runtime: None,
                 commands: prepared.commands,
@@ -1139,6 +1256,7 @@ fn commit_install(
             identity: prepared.identity,
             source: prepared.source,
             catalog: prepared.catalog,
+            index: prepared.index,
         },
         plan,
         retained,
@@ -1184,6 +1302,7 @@ fn install_package(
         identity,
         source,
         catalog,
+        index,
         integration,
         runtime,
         commands,
@@ -1242,6 +1361,15 @@ fn install_package(
     if let Some(catalog) = catalog.as_ref() {
         registry
             .record_catalog(catalog)
+            .map_err(|error| registry_kind(&error))?;
+    }
+    // The index marks and revocations are persisted for the same reason and
+    // before the install too: they only tighten, so a crash after this write
+    // leaves the package absent under raised marks, and the same document
+    // installs on the next attempt.
+    if let Some(index) = index.as_ref() {
+        registry
+            .record_index(index)
             .map_err(|error| registry_kind(&error))?;
     }
     let report = registry

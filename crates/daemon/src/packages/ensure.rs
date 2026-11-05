@@ -1069,6 +1069,9 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
 /// judges by: a store line that may pin a package and cannot be read is never
 /// searched for a digest, and while one exists the gate set also holds every
 /// installed digest.
+///
+/// Crate-visible because the session scenarios compare this set with the one
+/// the daemon's uninstall judges by.
 pub(crate) fn retained_pins(
     store_path: &Path,
     profiles: &ProfileRegistry,

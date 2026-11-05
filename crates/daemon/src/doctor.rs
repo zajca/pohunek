@@ -15,7 +15,7 @@ use protocol::{
 };
 
 use crate::agent::host::VersionRefusal;
-use crate::catalog_anchor::{AnchorFault, CatalogTrust};
+use crate::catalog_anchor::{AnchorFault, CatalogTrust, IndexTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::session::{ActiveSupervision, RejectedLinesState};
 use crate::Paths;
@@ -99,6 +99,7 @@ pub(crate) async fn report(
     );
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
+    checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     Ok(bounded_report(checks))
 }
@@ -754,6 +755,35 @@ fn catalog_trust_check(trust: &CatalogTrust) -> DoctorCheck {
             &invalid_anchor_detail(*fault),
         ),
     }
+}
+
+const INDEX_CHANNEL_CHECK: &str = "plugin_index_channel";
+
+/// The check for the plugin index channel beside a loaded anchor: an absent
+/// channel is a warning (installs by id are off, the daemon is otherwise
+/// unaffected) and an untrusted one a failure. A host without a loaded anchor
+/// has no channel to report on.
+fn index_channel_check(trust: &CatalogTrust) -> Option<DoctorCheck> {
+    let CatalogTrust::Loaded(anchor) = trust else {
+        return None;
+    };
+    Some(match anchor.index() {
+        IndexTrust::Loaded(_) => check(
+            INDEX_CHANNEL_CHECK,
+            DoctorStatus::Ok,
+            "The plugin index channel is loaded; plugins can be installed by id.",
+        ),
+        IndexTrust::Absent => check(
+            INDEX_CHANNEL_CHECK,
+            DoctorStatus::Warn,
+            "Installs by id are off: no plugin index channel beside the daemon; upgrade through the release archive's installer.",
+        ),
+        IndexTrust::Invalid(fault) => check(
+            INDEX_CHANNEL_CHECK,
+            DoctorStatus::Fail,
+            &format!("{fault}; installs by id are refused until the channel file is fixed and the daemon restarts."),
+        ),
+    })
 }
 
 fn invalid_anchor_detail(fault: AnchorFault) -> String {

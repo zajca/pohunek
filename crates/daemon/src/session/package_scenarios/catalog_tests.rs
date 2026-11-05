@@ -14,6 +14,7 @@ use package::{
     catalog_signing_message, Attestation, BinarySet, Catalog, CatalogEntry, CatalogEnvelope,
     CatalogSignature, KeyId, Limits, Release, RootKey, Sha256Digest, CATALOG_SCHEMA_VERSION,
 };
+use pohunek_test_support::catalog::host_platform;
 use protocol::{
     PackageErrorKind, PackageId, PackageInstallParams, PackageOrigin, PackageTrust, PackageVersion,
     RuntimeId,
@@ -23,7 +24,6 @@ use sha2::{Digest as _, Sha256};
 
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
-use crate::packages::trust::host_platform;
 use crate::packages::HostTrustAnchor;
 
 /// Start of every signing window: the first second after the epoch.
@@ -89,8 +89,8 @@ pub(super) fn entry(
         version: PackageVersion::parse(version).expect("version"),
         digest: package.digest.clone(),
         runtime_api: 1,
-        platforms: vec![host_platform().expect("a supported platform")],
-        attestations: vec![attestation(&host_platform().expect("a supported platform"))],
+        platforms: vec![host_platform()],
+        attestations: vec![attestation(&host_platform())],
         core: ANY_CORE.to_owned(),
     }
 }
@@ -113,7 +113,7 @@ fn release_for(entries: &[CatalogEntry]) -> Release {
     let mut targets: Vec<String> = entries
         .iter()
         .flat_map(|entry| entry.platforms.iter().cloned())
-        .chain(host_platform().ok())
+        .chain([host_platform()])
         .collect();
     targets.sort();
     targets.dedup();
