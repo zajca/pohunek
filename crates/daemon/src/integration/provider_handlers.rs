@@ -13,6 +13,7 @@ use protocol::{IntegrationAgentStatus, IntegrationUninstallReport, ProtocolError
 
 use super::commit::StepGate;
 use super::handler::{CliRunHandler, DaemonHandler, Handler, RetiredBuiltin, StagedUpdate};
+use super::launch_input::{LaunchContributor, LaunchInput, LaunchInputContext};
 use super::{
     reported_agent_status, stage_claude, stage_codex, AssetManifest, InstallPaths, StagedClaude,
     StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS, CODEX_REPORTED_ACTIONS,
@@ -36,6 +37,29 @@ pub(super) static REGISTRY: [Handler; 4] = [
 /// Handler of the Codex hook asset set.
 #[derive(Debug)]
 struct CodexHook;
+
+/// The Codex argument that keeps a session's app-server a child of its own
+/// TUI. Without it every Codex session on one `CODEX_HOME` attaches to the
+/// first session's managed daemon, so its hooks carry the first session's
+/// environment and stopping the first session strands the others.
+const CODEX_NO_DAEMON_ARG: &str = "--no-daemon";
+
+impl LaunchContributor for CodexHook {
+    /// Adds [`CODEX_NO_DAEMON_ARG`] to every launch unless the frozen
+    /// arguments already carry it, so a profile that sets it itself is not
+    /// given a second copy.
+    fn contribute(&self, ctx: &LaunchInputContext<'_>) -> Result<LaunchInput, ProtocolError> {
+        let present = ctx.args.iter().any(|arg| arg == CODEX_NO_DAEMON_ARG);
+        Ok(LaunchInput {
+            root_args: if present {
+                Vec::new()
+            } else {
+                vec![CODEX_NO_DAEMON_ARG.to_owned()]
+            },
+            ..LaunchInput::default()
+        })
+    }
+}
 
 /// The built-in Codex runtime release 0.34.2 compiled in, as its descriptor
 /// declared it (`compat/codex/builtin-v0.34/runtime.toml`), so the hooks it
@@ -129,6 +153,10 @@ impl DaemonHandler for CodexHook {
 
     fn retired_builtin(&self) -> Option<&'static RetiredBuiltin> {
         Some(&CODEX_RETIRED)
+    }
+
+    fn launch_contributor(&self) -> Option<&'static dyn LaunchContributor> {
+        Some(&CodexHook)
     }
 }
 

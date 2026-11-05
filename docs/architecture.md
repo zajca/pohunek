@@ -1638,6 +1638,10 @@ applies it exactly once. A contribution outside the bounds is refused with
 config home that does not resolve (a relative or unusable `config_home.env`
 value), with `launch_input_unavailable`; either refuses the launch before a worker starts.
 
+The Codex handler contributes the single root argument `--no-daemon` (and no
+environment or files), so a Codex session never attaches to a shared managed
+app-server daemon whatever its profile arguments (`crates/daemon/src/integration/provider_handlers.rs`).
+
 The Muse Code handler is the first user of this seam
 (`crates/daemon/src/integration/muse/`, removed with #1643): its contribution
 is a per-session managed hooks overlay plus the reporter script, in the state

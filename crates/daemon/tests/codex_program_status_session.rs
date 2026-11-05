@@ -46,9 +46,6 @@ const NO_TURN_WAIT_MS: u32 = 8_000;
 /// The first two bytes of a probe reply, as hex: `ESC ]`. Typed input starts
 /// with `ESC [` (bracketed paste).
 const REPLY_PREFIX_HEX: &str = "1b5d";
-/// The release before the first Codex that reports program status, which the
-/// package still supports and reads from the title.
-const PREVIOUS_BANNER: &str = "codex-cli 0.160.0";
 /// Bound of a wait that must be satisfied by the stand-in agent.
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// Poll interval of the process watcher in the nested-agent scenario.
@@ -169,8 +166,8 @@ impl Fixture {
                 "stdin",
             ),
             (
-                "fake-codex-previous",
-                PREVIOUS_BANNER.to_owned(),
+                "fake-codex-silent",
+                official_runtimes::supported_banner("codex"),
                 "silent",
                 "fifo",
             ),
@@ -547,15 +544,15 @@ async fn a_codex_session_never_gets_a_probe_reply() {
         .expect("stop the session");
 }
 
-/// N1: an agent of the previous supported release (banner 0.160.0) launches
-/// and reads from the title.
+/// N1: a supported Codex that sends no program-status records launches and
+/// reads from the title.
 #[tokio::test]
-async fn the_previous_supported_codex_release_launches_and_reads_from_the_title() {
+async fn a_supported_codex_without_program_status_records_reads_from_the_title() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
     let fixture = Fixture::with_agent_profiles().await;
-    let created = fixture.start("fake-codex-previous").await;
+    let created = fixture.start("fake-codex-silent").await;
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscTitle))
         .await;

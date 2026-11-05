@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.4.0";
+const PACKAGE_VERSION: &str = "1.5.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -597,19 +597,19 @@ fn the_version_probe_reads_the_codex_banner_and_nothing_else() {
 
     // The banner `codex --version` prints on stdout (stderr carries warnings
     // the probe does not read).
-    assert_eq!(supported("codex-cli 0.160.0\n"), Some(true));
-    assert_eq!(supported("codex-cli 0.160.9"), Some(true));
+    assert_eq!(supported("codex-cli 0.164.0\n"), Some(true));
+    assert_eq!(supported("codex-cli 0.164.9"), Some(true));
     assert_eq!(
-        supported("codex-cli 0.159.9"),
+        supported("codex-cli 0.163.9"),
         Some(false),
         "below the range"
     );
     assert_eq!(
-        supported("codex-cli 0.161.0"),
+        supported("codex-cli 0.165.0"),
         Some(true),
         "a later 0.x release is inside the range"
     );
-    assert_eq!(supported("codex-cli 0.162.1"), Some(true));
+    assert_eq!(supported("codex-cli 0.166.1"), Some(true));
     assert_eq!(
         supported("codex-cli 1.0.0"),
         Some(false),
@@ -618,13 +618,13 @@ fn the_version_probe_reads_the_codex_banner_and_nothing_else() {
 
     for unreadable in [
         "",
-        "0.160.0",
-        "codex 0.160.0",
-        "codex-cli 0.160.0-rc.1",
-        "codex-cli 0.160",
-        "codex-cli v0.160.0",
-        "Codex CLI 0.160.0",
-        "WARNING: proceeding\ncodex-cli 0.160.0",
+        "0.164.0",
+        "codex 0.164.0",
+        "codex-cli 0.164.0-rc.1",
+        "codex-cli 0.164",
+        "codex-cli v0.164.0",
+        "Codex CLI 0.164.0",
+        "WARNING: proceeding\ncodex-cli 0.164.0",
     ] {
         assert_eq!(supported(unreadable), None, "{unreadable:?}");
     }
@@ -2993,10 +2993,11 @@ async fn assert_private_hook_diagnostics(fixture: &Fixture, id: &str, pid: u64, 
     );
 }
 
-/// Codex 0.160.0 runs its hooks from a `codex app-server` process below the one
-/// pohunek launched (a child of it, or of the native binary an npm launcher
-/// starts). The daemon records the conversation id that process reports as the
-/// session's native reference, so `session resume` has something to resume with.
+/// Codex runs its hooks from the launched process or a process below it (a
+/// child of the native binary an npm launcher starts), never from a shared
+/// daemon. The daemon records the
+/// conversation id that process reports as the session's native reference, so
+/// `session resume` has something to resume with.
 ///
 /// Needs a `codex` on `PATH` and `POHUNEK_CODEX_E2E=1`; the model is a
 /// loopback stub.
@@ -3043,10 +3044,6 @@ async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_an
     let reporter_pid = reported["active_agent_pid"]
         .as_u64()
         .expect("the reporting process id");
-    assert_ne!(
-        reporter_pid, launch_pid,
-        "Codex 0.160.0 runs hooks outside the launched process"
-    );
     let (chain, reached) = ancestry(reporter_pid, launch_pid);
     let tree = describe_chain(&chain);
     eprintln!("process chain from the reporter up to the launch process:\n{tree}");
@@ -3150,6 +3147,114 @@ async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_an
         "the resumed session keeps the conversation it resumed: {inspected}"
     );
     fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Two sessions on one `CODEX_HOME` each get their own native reference, no
+/// managed app-server daemon exists, and stopping one session leaves the
+/// other's turn running to its reply.
+///
+/// Needs a `codex` on `PATH` and `POHUNEK_CODEX_E2E=1`; the model is a
+/// loopback stub.
+#[tokio::test]
+#[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
+async fn two_real_codex_sessions_on_one_codex_home_do_not_share_a_daemon() {
+    require_real_codex();
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    let first = fixture.new_session("first").await["id"]
+        .as_str()
+        .expect("first session id")
+        .to_owned();
+    let other_cwd = fixture.harness.env.root().join("other-work");
+    fs::create_dir(&other_cwd).expect("second working directory");
+    let second = fixture.new_session_in("second", &other_cwd).await["id"]
+        .as_str()
+        .expect("second session id")
+        .to_owned();
+    fixture.wait_activity(&first, "idle").await;
+    fixture.wait_activity(&second, "idle").await;
+
+    let mut references = Vec::new();
+    for id in [&first, &second] {
+        let (code, sent) = fixture
+            .harness
+            .json(&["session", "input", id, PROMPT])
+            .await;
+        assert_eq!(code, 0, "{sent}");
+        let reported = wait_until(&format!("the native reference of {id}"), || async {
+            let (code, inspected) = fixture.harness.json(&["session", "inspect", id]).await;
+            assert_eq!(code, 0, "{inspected}");
+            inspected["ok"]["native_session_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .await;
+        references.push(reported);
+        fixture.wait_activity(id, "idle").await;
+    }
+    assert_ne!(
+        references[0], references[1],
+        "each session reports its own conversation"
+    );
+
+    let daemons: Vec<String> = fixture
+        .processes
+        .members()
+        .into_iter()
+        .filter_map(|pid| fs::read(format!("/proc/{pid}/cmdline")).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+        .filter(|command| command.contains("--managed-daemon"))
+        .collect();
+    assert!(
+        daemons.is_empty(),
+        "a managed daemon is running: {daemons:?}"
+    );
+
+    let replies_before = fixture.stub.finished();
+    let (code, sent) = fixture
+        .harness
+        .json(&[
+            "session",
+            "input",
+            &second,
+            &format!("{} {PROMPT}", responses_stub::HOLD_MARKER),
+        ])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    fixture.wait_activity(&second, "working").await;
+    wait_until("the second session's model response is held", || async {
+        (!fixture
+            .stub
+            .bodies_containing(responses_stub::HOLD_MARKER)
+            .is_empty()
+            && fixture.stub.finished() == replies_before)
+            .then_some(())
+    })
+    .await;
+
+    fixture.stop(&first).await;
+    let (code, inspected) = fixture.harness.json(&["session", "inspect", &second]).await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_eq!(
+        inspected["ok"]["runtime"]["state"], "live",
+        "stopping the first session leaves the second running: {inspected}"
+    );
+    fixture.stub.open_gate();
+    fixture.wait_activity(&second, "idle").await;
+    fixture
+        .wait_screen_line(
+            &second,
+            &format!(
+                "{}{}",
+                responses_stub::FIRST_CHUNK,
+                responses_stub::SECOND_CHUNK
+            ),
+        )
+        .await;
+
+    fixture.stop(&second).await;
     fixture.finish().await;
 }
 
