@@ -217,6 +217,34 @@ loopback Messages stub, dummy key; scenario
   the pohunek name: a title report that reads Claude's name sees the generated
   one (`source: collision` in the title report of #980).
 
+## Synchronized output for torn frames
+
+A client that draws between two PTY reads (the Android companion is one) can
+show a half-drawn frame, torn rows while scrolling, unless Claude Code wraps its
+frames in synchronized output (DEC private mode 2026). Setting
+`CLAUDE_CODE_FORCE_SYNC_OUTPUT` to `1` makes Claude wrap them; a real-phone
+check with the companion app showed no torn rows with it and torn rows without
+it (pohunekd/pohunek-companion-android#193). The package does not set it:
+enable it on the profile that launches Claude, in the profile `[env]`:
+
+```toml
+base = "claude"
+# Keep the profile's existing package and digest binding.
+env = { CLAUDE_CODE_FORCE_SYNC_OUTPUT = "1" }
+```
+
+The inline table is the profile's `[env]` table; add the pair to an `[env]`
+table the profile already has instead of declaring the table twice.
+
+The variable applies to every create, resume and fork of that profile and
+reaches only that profile's Claude. It is undocumented by Anthropic, so a Claude
+Code release may rename or drop it, which turns the fix off without warning.
+Editing a profile's `[env]` makes its existing sessions ask for
+`--accept-profile-change` on the next resume (see [agent
+profiles](../concepts/agent-profiles.md#resuming-and-forking-a-profile-backed-session)).
+Whether Claude enables synchronized output by itself when the terminal answers
+a mode 2026 query is not verified here.
+
 ## First-run state of a Claude home
 
 A fresh `CLAUDE_CONFIG_DIR` shows first-run screens. The state lives in two

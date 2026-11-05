@@ -174,6 +174,10 @@ An unknown future base-kind string is presentation-only: it can be displayed
 neutrally but cannot be launched, mutated, recovered, or persisted until the
 daemon explicitly supports it.
 
+A profile over `claude` can also set `CLAUDE_CODE_FORCE_SYNC_OUTPUT = "1"` in
+its `[env]` so clients that draw between PTY reads do not show torn frames; see
+[Synchronized output for torn frames](../guides/claude-package.md#synchronized-output-for-torn-frames).
+
 ## Switching between subscriptions
 
 Several accounts of one agent (for example a work and a personal Claude
