@@ -1068,12 +1068,14 @@ fn catalog_release() -> Release {
 }
 
 #[test]
-fn an_index_signature_never_verifies_as_a_catalog() {
+fn an_index_document_is_refused_as_a_catalog_by_its_schema_version() {
     let fixture = Fixture::new();
     let anchor = TrustAnchor::new(vec![root(&fixture.r)], Vec::new()).unwrap();
     let k_signature = fixture.signatures[0].clone();
 
     // A catalog-shaped document whose `catalog` member holds the index body.
+    // The schema version guard refuses it before any signature is checked;
+    // the signature domains are covered by the tests above and below.
     let disguised = serde_json::json!({
         "schema_version": CATALOG_SCHEMA_VERSION,
         "catalog": fixture.body,
@@ -1081,10 +1083,16 @@ fn an_index_signature_never_verifies_as_a_catalog() {
         "signatures": [k_signature],
     });
     let bytes = serde_json::to_vec(&disguised).unwrap();
-    verify_catalog(&bytes, &anchor, NOW, None).unwrap_err();
+    assert_eq!(
+        verify_catalog(&bytes, &anchor, NOW, None).unwrap_err(),
+        CatalogError::UnsupportedSchemaVersion
+    );
 
     // The whole index envelope is not a catalog either.
-    verify_catalog(&fixture.bytes(), &anchor, NOW, None).unwrap_err();
+    assert_eq!(
+        verify_catalog(&fixture.bytes(), &anchor, NOW, None).unwrap_err(),
+        CatalogError::UnsupportedSchemaVersion
+    );
 }
 
 #[test]
