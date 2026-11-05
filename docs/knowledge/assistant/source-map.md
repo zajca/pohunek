@@ -757,6 +757,9 @@ Signed runtime catalog:
 - `crates/package/tests/catalog.rs`
 - `crates/package/src/plugin_index.rs` — signed plugin index schema, depth-1 key records, embedded revocations, freshness caps and per-entry install authorization.
 - `crates/package/tests/plugin_index.rs`
+- `crates/package/src/index_state.rs` — persisted plugin index marks and accumulated revoked key ids (`index-state.json`).
+- `crates/package/src/index_channel.rs` — the `plugin-index-channel.json` parser that names the index endorser root.
+- `crates/package/tests/index_state.rs`
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.

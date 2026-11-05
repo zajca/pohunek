@@ -20,7 +20,8 @@
 //!   separate explicit-digest trust for third-party archives.
 //! - [`verify_index`] authenticates the signed plugin index that authorizes
 //!   plugin packages by archive digest; [`VerifiedIndex::authorize`] applies
-//!   the per-entry install-time checks.
+//!   the per-entry install-time checks. [`parse_index_channel`] reads the
+//!   channel file that names the index endorser root of the trust anchor.
 //!
 //! On Unix the crate also stores verified archives:
 //!
@@ -30,7 +31,8 @@
 //! - [`registry`] keeps the transactional record of installed packages and, in
 //!   the same plugin root, the monotonic catalog state ([`catalog_state`]) the
 //!   catalog verifier needs from its caller: the sequence high-water mark and
-//!   the accumulated revoked key ids.
+//!   the accumulated revoked key ids, and the same for the plugin index
+//!   verifier (`Registry::index_state`, `Registry::record_index`).
 //! - [`directory`] builds the canonical archive of a developer directory, the
 //!   input of `plugin link` and `package build`.
 //!
@@ -54,6 +56,7 @@ mod canonical_json;
 mod catalog;
 mod compression;
 mod error;
+mod index_channel;
 mod limits;
 mod plugin_index;
 mod release;
@@ -68,6 +71,8 @@ pub mod catalog_state;
 pub mod directory;
 #[cfg(unix)]
 mod hash;
+#[cfg(unix)]
+mod index_state;
 #[cfg(unix)]
 pub mod install;
 #[cfg(unix)]
@@ -97,6 +102,10 @@ pub use catalog::{
     MAX_REVOKED_KEYS, MAX_SIGNATURES, MAX_TRUST_ROOTS,
 };
 pub use error::{ArchiveError, EntryRejection};
+pub use index_channel::{
+    parse_index_channel, IndexChannel, IndexChannelError, INDEX_CHANNEL_FILE_NAME,
+    INDEX_CHANNEL_SCHEMA_VERSION, MAX_INDEX_CHANNEL_BYTES,
+};
 pub use limits::{
     Limits, MAX_COMPRESSED_BYTES, MAX_EXPANDED_BYTES, MAX_EXPANSION_RATIO, MAX_FILES,
     MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_WINDOW_BYTES,

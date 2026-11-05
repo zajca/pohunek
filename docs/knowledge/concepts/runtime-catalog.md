@@ -405,3 +405,12 @@ one unusable entry never invalidates the index for the others. With the
 `semver` crate a pre-release core such as `0.41.0-rc.1` does not match
 `>=0.40.0`, so a release-candidate daemon refuses those entries with
 `CoreExcluded`.
+
+**Channel file.** The endorser root is named by `plugin-index-channel.json`
+beside the trust anchor: `{"schema_version": 1, "index_endorser_key_id": "<64
+hex>"}`, `deny_unknown_fields`, at most 4 KiB, parsed with the strict JSON
+subset (`parse_index_channel`, typed `IndexChannelError`). The file holds no key
+material: `IndexChannel::endorser(&anchor)` returns the anchor root with that id
+and fails with `EndorserNotInAnchor` when there is none. There is no compiled
+fallback, so a missing channel file leaves index installs refused (the reader of
+the file owns that refusal).

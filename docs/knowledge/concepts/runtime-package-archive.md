@@ -385,6 +385,20 @@ stored mark and the catalog sequence and revoked key ids are united (at most
 changes nothing and a merge that changes nothing writes nothing. A corrupt or
 unknown-schema file is a typed error and is never replaced.
 
+### Index state
+
+The plugin index verifier has its own state file, `index-state.json` (schema 1,
+unknown fields denied, `0600`, at most 16 KiB), with the same rules as the
+catalog state: beside the record, under the same lock, read without the lock by
+`index_state()` (a missing file is the empty state), never replaced when
+damaged. It holds `index_high_water`, `revocation_high_water` and the sorted,
+unique `revoked_key_ids` (at most `MAX_REVOKED_KEYS`). `record_index(&verified)`
+changes nothing when the document's sequence or its revocation sequence is below
+the stored mark; otherwise both marks become the maximum, the revoked ids are
+united (else `TooManyRevokedKeys`) and a merge that changes nothing writes
+nothing. The caller builds the verifier's `base_revoked` from the anchor and
+`catalog_state()`; index revocations do not feed `catalog-state.json`.
+
 ## Daemon host
 
 The daemon opens `<state>/plugins` (`pohunek_paths::PLUGINS_SUBDIR`, exact
