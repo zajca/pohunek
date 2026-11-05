@@ -174,7 +174,10 @@ impl Context {
         match anchor.index() {
             IndexTrust::Loaded(endorser) => Ok((anchor, endorser.as_ref())),
             IndexTrust::Absent => Err(PackageErrorKind::TrustUnavailable),
-            IndexTrust::Invalid(_fault) => Err(PackageErrorKind::TrustAnchorInvalid),
+            IndexTrust::Invalid(fault) => {
+                warn!(%fault, "a plugin index install was refused: the channel cannot be trusted");
+                Err(PackageErrorKind::TrustAnchorInvalid)
+            }
         }
     }
 }

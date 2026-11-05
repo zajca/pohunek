@@ -206,14 +206,34 @@ fn load_index_channel(directory: &Path, anchor: &AnchorFile, effective_uid: u32)
         MAX_INDEX_CHANNEL_BYTES,
         effective_uid,
     ) {
-        Ok(None) => return IndexTrust::Absent,
+        Ok(None) => {
+            info!("no plugin index channel beside the trust anchor");
+            return IndexTrust::Absent;
+        }
         Ok(Some(bytes)) => bytes,
-        Err(fault) => return IndexTrust::Invalid(fault.into()),
+        Err(fault) => {
+            let fault = IndexChannelFault::from(fault);
+            warn!(%fault, "the plugin index channel cannot be trusted");
+            return IndexTrust::Invalid(fault);
+        }
     };
     let endorser = parse_index_channel(&bytes).and_then(|channel| channel.endorser(anchor));
-    match endorser {
+    let trust = match endorser {
         Ok(root) => IndexTrust::Loaded(Box::new(root)),
         Err(error) => IndexTrust::Invalid(IndexChannelFault::Malformed(error)),
+    };
+    log_index_trust(&trust);
+    trust
+}
+
+/// Logs the outcome of reading a channel file that was present.
+fn log_index_trust(trust: &IndexTrust) {
+    match trust {
+        IndexTrust::Loaded(_) => info!("loaded the plugin index channel"),
+        IndexTrust::Invalid(fault) => {
+            warn!(%fault, "the plugin index channel cannot be trusted");
+        }
+        IndexTrust::Absent => {}
     }
 }
 
