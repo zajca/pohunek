@@ -19,7 +19,7 @@ use crate::session::SessionRegistry;
 /// package digest between the retained set being computed and the package
 /// being removed.
 #[derive(Debug)]
-pub struct PackageAuthority {
+pub(crate) struct PackageAuthority {
     pub(super) lifecycle: Arc<RwLock<()>>,
     pub(super) trust: CatalogTrust,
     pub(super) runtimes: RuntimeHost,
@@ -29,14 +29,14 @@ pub struct PackageAuthority {
 /// it to drop.
 #[derive(Debug)]
 #[must_use = "dropping the guard releases the lifecycle lock"]
-pub struct LaunchGuard<'a>(
+pub(crate) struct LaunchGuard<'a>(
     #[expect(dead_code, reason = "held for its drop")] RwLockReadGuard<'a, ()>,
 );
 
 /// A launch's hold on the lifecycle lock that a detached task can own.
 #[derive(Debug)]
 #[must_use = "dropping the guard releases the lifecycle lock"]
-pub struct OwnedLaunchGuard(
+pub(crate) struct OwnedLaunchGuard(
     #[expect(dead_code, reason = "held for its drop")] OwnedRwLockReadGuard<()>,
 );
 
@@ -51,7 +51,7 @@ pub struct PackageService {
 impl PackageAuthority {
     /// The authority over `runtimes`, authorizing official packages by `trust`.
     #[must_use]
-    pub fn new(trust: CatalogTrust, runtimes: RuntimeHost) -> Self {
+    pub(crate) fn new(trust: CatalogTrust, runtimes: RuntimeHost) -> Self {
         Self {
             lifecycle: Arc::new(RwLock::new(())),
             trust,
@@ -61,7 +61,7 @@ impl PackageAuthority {
 
     /// What the host trusts to authorize official packages.
     #[must_use]
-    pub fn catalog_trust(&self) -> &CatalogTrust {
+    pub(crate) fn catalog_trust(&self) -> &CatalogTrust {
         &self.trust
     }
 
@@ -81,7 +81,7 @@ impl PackageAuthority {
 
     /// Holds the shared lifecycle lock until the returned guard drops, for a
     /// path that resolves a pin itself and persists a record in a detached task.
-    pub async fn hold_launch(&self) -> OwnedLaunchGuard {
+    pub(crate) async fn hold_launch(&self) -> OwnedLaunchGuard {
         OwnedLaunchGuard(Arc::clone(&self.lifecycle).read_owned().await)
     }
 

@@ -22,7 +22,7 @@
 
 mod authority;
 mod bind;
-pub mod ensure;
+pub(crate) mod ensure;
 mod error;
 mod fault;
 mod retention;
@@ -30,7 +30,8 @@ pub(crate) mod selection;
 mod source;
 pub(crate) mod trust;
 
-pub use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority, PackageService};
+pub use self::authority::PackageService;
+pub(crate) use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority};
 pub use self::retention::PackageUninstallError;
 pub(crate) use self::retention::{installed_digests, RetainedPins};
 
@@ -478,8 +479,7 @@ impl PackageService {
         &self,
         params: PackageUninstallParams,
     ) -> Result<PackageUninstallResult, PackageErrorKind> {
-        self.remove_package(
-            &params.digest, params.remove_modified)
+        self.remove_package(&params.digest, params.remove_modified)
             .await
             .map_err(|error| match error {
                 PackageUninstallError::Registry(error) => registry_kind(&error),

@@ -2,8 +2,8 @@
 //! profiles pin, and the re-derivation of adopted sessions after the runtime
 //! registry was rebuilt.
 //!
-//! The package authority reaches this code only through
-//! [`PackageSessions`](crate::packages::PackageSessions).
+//! The package service calls into it for the retained digests, the adopted-pin
+//! refresh and the transaction spawner.
 
 // Rust guideline compliant 2026-10-05
 
@@ -28,7 +28,7 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// The errors of [`PackageAuthority::guard_launch`].
+    /// The errors of [`crate::packages::PackageAuthority::guard_launch`].
     pub(super) async fn guard_package_launch(
         &self,
         definition: &host::RuntimeDefinition,
