@@ -678,14 +678,14 @@ fn revocation_list_below_the_high_water_mark_is_stale() {
         ..IndexVerifierState::default()
     };
 
-    let stale = verify_with(
+    let outcome = verify_with(
         &fixture.bytes(),
         &fixture.endorser(),
         &BTreeSet::new(),
         &state,
     );
     assert_eq!(
-        stale.unwrap_err(),
+        outcome.unwrap_err(),
         IndexError::StaleRevocation {
             sequence: 4,
             high_water: 5
@@ -742,14 +742,14 @@ fn index_sequence_below_the_high_water_mark_is_stale() {
         index_high_water: Some(SEQUENCE + 1),
         ..IndexVerifierState::default()
     };
-    let stale = verify_with(
+    let outcome = verify_with(
         &fixture.bytes(),
         &fixture.endorser(),
         &BTreeSet::new(),
         &state,
     );
     assert_eq!(
-        stale.unwrap_err(),
+        outcome.unwrap_err(),
         IndexError::StaleSequence {
             sequence: SEQUENCE,
             high_water: SEQUENCE + 1
@@ -1081,10 +1081,10 @@ fn an_index_signature_never_verifies_as_a_catalog() {
         "signatures": [k_signature],
     });
     let bytes = serde_json::to_vec(&disguised).unwrap();
-    assert!(verify_catalog(&bytes, &anchor, NOW, None).is_err());
+    verify_catalog(&bytes, &anchor, NOW, None).unwrap_err();
 
     // The whole index envelope is not a catalog either.
-    assert!(verify_catalog(&fixture.bytes(), &anchor, NOW, None).is_err());
+    verify_catalog(&fixture.bytes(), &anchor, NOW, None).unwrap_err();
 }
 
 #[test]

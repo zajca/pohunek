@@ -339,3 +339,69 @@ entry (one per platform), 16 binary sets per release, core range 128 bytes,
 16 key records,
 8 signatures, 64 revoked key ids, 1024 revoked digests, 8 anchor roots.
 Errors are typed (`CatalogError`) and never carry catalog content.
+
+## Plugin index
+
+A plugin package is authorized by a signed **plugin index**, a document family
+separate from the catalog: file name `official-index-v1.json`, its own
+signature domains and its own verifier (`verify_index` in
+`crates/package/src/plugin_index.rs`). `verify_index` never calls the catalog
+key-set builder, so a catalog signature or key record never counts as an index
+one and the reverse. The module is pure: `now`, the persisted marks
+(`IndexVerifierState`) and the revoked key ids are inputs.
+
+**Trust is two levels deep.** The caller passes one `endorser` root. That root
+alone endorses index key records (scope `official`, window at most 366 days)
+and signs the revocation list embedded in every document. An index signature
+counts only when it comes from such a record; a root key, the endorser
+included, is an unknown signer. A record endorsed by another record or by any
+other root, the release CI root included, is `UnknownEndorser`.
+
+**Document.** `{schema_version, index, key_records, signatures, revocations}`,
+every object `deny_unknown_fields`, 1 MiB, parsed with the strict JSON subset
+of the catalog. `index` is `{schema_version, scope, sequence, expires_at,
+entries}`; an entry is `{package_id, runtime_id, version, digest, url,
+platforms, core}`. `revocations` is `{revocations: {schema_version, sequence,
+revoked_key_ids}, signature}` and is required, so a revocation cannot be
+withheld separately from the index. Signatures cover the domain prefix plus
+the canonical bytes of the member as parsed:
+
+| Signs | Prefix |
+|---|---|
+| `index` | `pohunek-plugin-index-v1\n` |
+| key record without `signature` | `pohunek-plugin-index-key-record-v1\n` |
+| `revocations.revocations` | `pohunek-plugin-index-revocations-v1\n` |
+
+**Freshness.** `sequence` is the Unix second of signing. A sequence below the
+persisted high-water mark is `StaleSequence` (an equal one is accepted); one
+more than a day ahead of `now` is `SequenceInFuture`, which bounds how far a
+stolen index key can raise a host's mark. `expires_at - sequence` must be in
+`1..=14 days` (`LifetimeTooLong`), and `now >= expires_at` is `Expired`. The
+revocation list has its own sequence and mark (`StaleRevocation`).
+
+**Revocation.** The revoked set is the caller's `base_revoked`, the state's
+accumulated ids and the document's list. The endorser or a signing key in it
+is `SignerRevoked`.
+
+**Verification order** (first failure wins): size, strict parse, schema
+version, typed decode, limits (256 entries, 4 key records, 4 signatures, 64
+revoked ids); endorser window; revocation signature and sequence; revoked set;
+key records; signatures; body scope, sequence, lifetime, expiry; entry
+structure (platforms, URL of printable ASCII up to 512 bytes, core string of
+1..=128 bytes that is not parsed, no duplicate `(package_id, version)` or
+digest, one-to-one package and runtime ids). `parse_index_envelope` runs only
+the first five checks for untrusted version selection.
+
+**Install-time authorization.** `VerifiedIndex::authorize` takes the entry
+with the given digest and checks, first failure wins: listed (`NotListed`),
+identity equal (`IdentityMismatch`), `pohunek.` namespace (`Namespace`),
+runtime id not one of `shell`, `codex`, `claude`, `hermes`, `pi`
+(`RuntimeRefused`), package id exactly `pohunek.runtime.` plus the runtime id
+(`PackageIdBinding`, which keeps an entry from claiming a release package id),
+core range that parses with at least one comparator (`CoreRange`), range that
+matches the running core (`CoreExcluded`), platform listed (`Platform`). Core
+range, platform, namespace and refused runtime ids are per-entry refusals, so
+one unusable entry never invalidates the index for the others. With the
+`semver` crate a pre-release core such as `0.41.0-rc.1` does not match
+`>=0.40.0`, so a release-candidate daemon refuses those entries with
+`CoreExcluded`.
