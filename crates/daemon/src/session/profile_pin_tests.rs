@@ -15,11 +15,11 @@ use package::{Limits, PackageDigest};
 use pohunek_test_support::wait::HANG_GUARD;
 use protocol::{PackageErrorKind, PackageUninstallParams, SessionNewParams};
 
-use super::packages::PackageUninstallError;
 use super::tests::{assigned_agent_script, hermetic_shell, params, temp_dir, temp_store_path};
 use super::{SessionRegistry, SessionRegistryConfig};
 use crate::agent::host::fixture::{installed_pi_host, PI_SHAPED_PACKAGE_ID};
 use crate::agent::host::{LaunchSource, RuntimeHost};
+use crate::packages::PackageUninstallError;
 
 /// The package fixture, its host and an agents directory holding a profile
 /// pinned to it.
@@ -192,12 +192,9 @@ async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_profil
     let registry = pinned.registry();
 
     let daemon = registry.retained_package_digests().await.expect("retained");
-    let plan = super::package_lifecycle::ensure::retained_pins(
-        &pinned.store_path,
-        &registry.inner.profiles,
-        None,
-    )
-    .expect("the plan's retained set");
+    let plan =
+        crate::packages::ensure::retained_pins(&pinned.store_path, &registry.inner.profiles, None)
+            .expect("the plan's retained set");
 
     assert!(daemon.contains(&pinned.digest));
     assert_eq!(
@@ -218,6 +215,7 @@ async fn a_profile_pin_alone_retains_the_package_and_refuses_uninstall() {
     assert!(retained.contains(&pinned.digest));
 
     let refused = registry
+        .packages()
         .uninstall_package(&pinned.digest)
         .await
         .expect_err("a profile pins the package");
@@ -226,10 +224,11 @@ async fn a_profile_pin_alone_retains_the_package_and_refuses_uninstall() {
         PackageUninstallError::Registry(RegistryError::StillReferenced)
     ));
 
-    let listed = registry.package_list().await.expect("list");
+    let listed = registry.packages().package_list().await.expect("list");
     assert!(listed.packages[0].referenced);
     assert_eq!(
         registry
+            .packages()
             .package_uninstall(PackageUninstallParams {
                 digest: pinned.digest.clone(),
                 remove_modified: false,
@@ -241,6 +240,7 @@ async fn a_profile_pin_alone_retains_the_package_and_refuses_uninstall() {
 
     fs::remove_file(pinned.agents.join("pinned.toml")).expect("remove the profile");
     registry
+        .packages()
         .uninstall_package(&pinned.digest)
         .await
         .expect("an unpinned package uninstalls");
@@ -274,6 +274,7 @@ async fn a_profile_pin_refuses_removal_of_a_modified_root() {
 
     assert_eq!(
         registry
+            .packages()
             .package_uninstall(PackageUninstallParams {
                 digest: pinned.digest.clone(),
                 remove_modified: true,
@@ -286,6 +287,7 @@ async fn a_profile_pin_refuses_removal_of_a_modified_root() {
 
     fs::remove_file(pinned.agents.join("pinned.toml")).expect("remove the profile");
     registry
+        .packages()
         .package_uninstall(PackageUninstallParams {
             digest: pinned.digest.clone(),
             remove_modified: true,
@@ -322,6 +324,7 @@ async fn every_profile_a_launch_can_load_retains_its_package() {
         .expect("the symlinked profile loads, so a launch can use it");
     // No session references the package, so only the profile can retain it.
     let refused = registry
+        .packages()
         .uninstall_package(&pinned.digest)
         .await
         .expect_err("the loadable profile pins the package");

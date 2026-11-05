@@ -56,6 +56,7 @@ async fn install_with(fixture: &Fixture, package: &Package, enable: bool, select
     let path = fixture.write_archive(package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, package, enable, select))
         .await
         .expect("install");
@@ -105,6 +106,7 @@ async fn an_unpinned_package_served_profile_is_pinned_to_the_selected_package() 
 
     let preview = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, None, true))
         .await
         .expect("preview");
@@ -116,6 +118,7 @@ async fn an_unpinned_package_served_profile_is_pinned_to_the_selected_package() 
 
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, None, false))
         .await
         .expect("bind");
@@ -172,6 +175,7 @@ async fn re_pinning_to_another_digest_changes_the_profile_revision() {
 
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, Some(&second.digest), false))
         .await
         .expect("re-pin");
@@ -197,6 +201,7 @@ async fn an_already_pinned_profile_is_reported_unchanged_without_a_write() {
     for dry_run in [true, false] {
         let result = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, None, dry_run))
             .await
             .expect("unchanged");
@@ -221,6 +226,7 @@ async fn a_dry_run_changes_nothing_and_keeps_stale_temporaries() {
 
     let preview = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, Some(&package.digest), true))
         .await
         .expect("preview");
@@ -242,6 +248,7 @@ async fn a_builtin_base_is_refused() {
         for digest in [None, Some(&package.digest)] {
             let error = fixture
                 .registry
+                .packages()
                 .package_bind_profile(bind(PROFILE, digest, false))
                 .await
                 .expect_err("a built-in base takes no pin");
@@ -268,6 +275,7 @@ async fn a_target_that_cannot_be_pinned_is_refused_and_the_profile_is_untouched(
     for digest in bad_digests {
         let error = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, Some(digest), false))
             .await
             .expect_err("not a target");
@@ -277,6 +285,7 @@ async fn a_target_that_cannot_be_pinned_is_refused_and_the_profile_is_untouched(
     for digest in [None, Some(&package.digest)] {
         let error = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, digest, false))
             .await
             .expect_err("faulted");
@@ -294,6 +303,7 @@ async fn no_selected_enabled_package_leaves_the_profile_unpinned() {
 
     let error = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, None, false))
         .await
         .expect_err("none selected");
@@ -302,6 +312,7 @@ async fn no_selected_enabled_package_leaves_the_profile_unpinned() {
 
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, Some(&package.digest), false))
         .await
         .expect("an explicit digest needs no selection");
@@ -328,7 +339,12 @@ async fn two_selected_enabled_packages_serving_the_base_are_ambiguous() {
         .expect("force the first back on");
     fixture.host.reload().expect("reload");
     fixture.write_profile(PROFILE, &unpinned());
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     let candidates = listed
         .packages
         .iter()
@@ -338,6 +354,7 @@ async fn two_selected_enabled_packages_serving_the_base_are_ambiguous() {
 
     let error = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, None, false))
         .await
         .expect_err("ambiguous");
@@ -374,6 +391,7 @@ async fn an_unusable_profile_is_refused_without_echoing_its_content() {
         let path = fixture.write_profile(name, &text);
         let error = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(name, None, false))
             .await
             .expect_err("unusable");
@@ -391,6 +409,7 @@ async fn an_unusable_profile_is_refused_without_echoing_its_content() {
     for name in ["linked", "hard", "writable", "huge"] {
         let error = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(name, None, false))
             .await
             .expect_err("unusable");
@@ -413,6 +432,7 @@ async fn a_missing_profile_or_name_is_not_found() {
     for name in ["absent", "bad name", "../escape"] {
         let error = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(name, None, false))
             .await
             .expect_err("not found");
@@ -450,6 +470,7 @@ async fn the_next_bind_removes_a_temporary_an_interrupted_rewrite_left() {
 
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, Some(&second.digest), false))
         .await
         .expect("bind");
@@ -472,11 +493,9 @@ async fn race_once(tag: &str, bind_first: bool) {
     install_with(&fixture, &second, true, false).await;
     fixture.write_profile(PROFILE, &pinned(&first.digest));
 
-    let bind_call =
-        fixture
-            .registry
-            .package_bind_profile(bind(PROFILE, Some(&second.digest), false));
-    let uninstall_call = fixture.registry.package_uninstall(PackageUninstallParams {
+    let packages = fixture.registry.packages();
+    let bind_call = packages.package_bind_profile(bind(PROFILE, Some(&second.digest), false));
+    let uninstall_call = packages.package_uninstall(PackageUninstallParams {
         digest: second.digest.clone(),
         remove_modified: false,
     });
@@ -497,7 +516,12 @@ async fn race_once(tag: &str, bind_first: bool) {
             panic!("{tag}: both refused: {bind_error:?} / {remove_error:?}")
         }
     }
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     let pinned_digest = pin_of(&fixture, PROFILE).expect("the profile keeps a pin");
     assert!(
         listed
@@ -574,6 +598,7 @@ async fn expect_refused(fixture: &Fixture, path: &Path, target: &Package) {
     for dry_run in [true, false] {
         let refused = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, Some(&target.digest), dry_run))
             .await
             .expect_err("the candidate would not launch");
@@ -600,6 +625,7 @@ async fn a_resume_override_that_conflicts_with_an_assigned_target_is_refused() {
     );
     fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, Some(&hook.digest), false))
         .await
         .expect("already pinned to the hook version");
@@ -634,6 +660,7 @@ async fn a_profile_without_overrides_migrates_across_a_strategy_change() {
 
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, Some(&assigned.digest), false))
         .await
         .expect("nothing in the profile conflicts with the target");
@@ -662,6 +689,7 @@ async fn the_rewritten_profile_must_fit_the_size_limit_the_loader_applies() {
     for dry_run in [true, false] {
         let refused = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, None, dry_run))
             .await
             .expect_err("the rewrite would exceed the loader's limit");
@@ -674,6 +702,7 @@ async fn the_rewritten_profile_must_fit_the_size_limit_the_loader_applies() {
     fixture.write_profile(PROFILE, &room);
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(PROFILE, None, false))
         .await
         .expect("a profile with room migrates");
@@ -715,6 +744,7 @@ async fn an_oversized_manifest_override_is_refused_in_preview_and_commit() {
     for dry_run in [true, false] {
         let refused = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, None, dry_run))
             .await
             .expect_err("the manifest is over the parser's limit");
@@ -743,6 +773,7 @@ async fn a_non_regular_manifest_override_is_refused_without_blocking() {
     for dry_run in [true, false] {
         let refused = fixture
             .registry
+            .packages()
             .package_bind_profile(bind(PROFILE, None, dry_run))
             .await
             .expect_err("a fifo is not a manifest");
@@ -787,6 +818,7 @@ async fn a_bind_that_expects_another_pin_is_refused_and_writes_nothing() {
         for dry_run in [true, false] {
             let error = fixture
                 .registry
+                .packages()
                 .package_bind_profile(bind_expecting(&second.digest, expected.clone(), dry_run))
                 .await
                 .expect_err("the pin is not the expected one");
@@ -799,6 +831,7 @@ async fn a_bind_that_expects_another_pin_is_refused_and_writes_nothing() {
     let before_unpinned = state_of(&unpinned_path);
     let error = fixture
         .registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             profile: "other".to_owned(),
             ..bind_expecting(
@@ -829,6 +862,7 @@ async fn a_bind_that_expects_the_current_pin_goes_through() {
 
     let repinned = fixture
         .registry
+        .packages()
         .package_bind_profile(bind_expecting(
             &second.digest,
             ExpectedPin::Pinned {
@@ -840,6 +874,7 @@ async fn a_bind_that_expects_the_current_pin_goes_through() {
         .expect("the expected pin is the current one");
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             profile: "fresh".to_owned(),
             ..bind_expecting(&first.digest, ExpectedPin::Unpinned, false)
@@ -866,11 +901,13 @@ async fn a_profile_with_only_a_digest_key_is_previewed_and_bound_as_unpinned() {
 
     let preview = fixture
         .registry
+        .packages()
         .package_bind_profile(bind_expecting(&first.digest, ExpectedPin::Unpinned, true))
         .await
         .expect("the preview of a profile that holds no pin");
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind_expecting(&first.digest, ExpectedPin::Unpinned, false))
         .await
         .expect("the profile holds no pin, as the preview reported");

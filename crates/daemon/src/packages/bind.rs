@@ -16,16 +16,16 @@ use protocol::{
 };
 use tracing::warn;
 
-use super::super::packages::RetainedPins;
 use super::selection::{conflict, differs, integration_of};
-use super::{inspect_record, prove_loadable, read_state, Context, Inspected};
+use super::{
+    inspect_record, prove_loadable, read_state, Context, Inspected, PackageService, RetainedPins,
+};
 use crate::agent::host::ServedBy;
 use std::sync::Arc;
 
 use crate::agent::{apply_pin, parse_head, BindError, Pin, ProfileRegistry};
-use crate::session::SessionRegistry;
 
-impl SessionRegistry {
+impl PackageService {
     /// Pins the host agent profile `params.profile` to an installed package.
     ///
     /// Without a digest the profile moves to the selected, enabled package
@@ -41,7 +41,7 @@ impl SessionRegistry {
         &self,
         params: PackageBindProfileParams,
     ) -> Result<PackageBindProfileResult, PackageErrorKind> {
-        let profiles = self.inner.profiles.clone();
+        let profiles = self.sessions.profiles().clone();
         // The pin being replaced is not a reference to compare the new pin with.
         let replaced = Some(params.profile.clone());
         self.package_transaction_excluding(replaced, move |context, retained| {

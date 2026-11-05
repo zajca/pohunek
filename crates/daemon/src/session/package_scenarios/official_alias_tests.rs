@@ -92,6 +92,7 @@ async fn install_official_version(
     );
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(fixture, package, &document, false))
         .await
         .expect("official install")
@@ -221,6 +222,7 @@ async fn an_official_package_claims_a_reserved_alias_and_is_served() {
         );
         let inspected = fixture
             .registry
+            .packages()
             .package_inspect(package.digest.clone())
             .await
             .expect("inspect");
@@ -262,6 +264,7 @@ async fn a_local_package_never_takes_an_alias_an_official_package_serves() {
         assert_eq!(
             fixture
                 .registry
+                .packages()
                 .package_install(explicit(&path, &rival, true, true))
                 .await
                 .expect_err(alias),
@@ -300,6 +303,7 @@ async fn a_catalog_that_does_not_authorize_the_exact_alias_package_and_digest_re
         let document = signed_by(&key, catalog(5, vec![entry]));
         let refused = fixture
             .registry
+            .packages()
             .package_install(catalog_install(&fixture, &package, &document, false))
             .await
             .expect_err(name);
@@ -324,6 +328,7 @@ async fn the_shell_is_never_claimable_even_through_a_catalog() {
 
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &package, &document, false))
         .await
         .expect_err("the shell");
@@ -352,6 +357,7 @@ async fn disabling_or_uninstalling_the_official_package_leaves_the_alias_unserve
 
         fixture
             .registry
+            .packages()
             .package_set_enabled(PackageSetEnabledParams {
                 digest: package.digest.clone(),
                 enabled: false,
@@ -367,6 +373,7 @@ async fn disabling_or_uninstalling_the_official_package_leaves_the_alias_unserve
 
         fixture
             .registry
+            .packages()
             .package_set_enabled(PackageSetEnabledParams {
                 digest: package.digest.clone(),
                 enabled: true,
@@ -381,6 +388,7 @@ async fn disabling_or_uninstalling_the_official_package_leaves_the_alias_unserve
 
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest))
             .await
             .expect("uninstall");
@@ -422,6 +430,7 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_bind_profile(bind(false))
             .await
             .expect_err("no package serves the base"),
@@ -432,6 +441,7 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
 
     let preview = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(true))
         .await
         .expect("preview");
@@ -440,6 +450,7 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
 
     let bound = fixture
         .registry
+        .packages()
         .package_bind_profile(bind(false))
         .await
         .expect("bind");
@@ -451,6 +462,7 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest))
             .await
             .expect_err("the pin retains the package"),
@@ -512,6 +524,7 @@ async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_after_t
 
     restarted
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall");
@@ -1527,6 +1540,7 @@ async fn an_adopted_built_in_session_stays_unattributed_after_another_package_se
     // session was adopted without a definition of its pin.
     restarted
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the official package");
@@ -1616,6 +1630,7 @@ async fn an_unresolved_built_in_spec_is_never_repaired_from_the_package_that_ser
     // damaged binding (unpinned, launched from the built-in) can refuse it.
     fixture
         .registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             expected_previous: None,
             profile: DAMAGED_PROFILE.to_owned(),
@@ -1663,6 +1678,7 @@ async fn an_ordinary_package_keeps_serving_next_to_an_official_alias() {
     let path = fixture.write_archive(&ordinary);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &ordinary, true, true))
         .await
         .expect("an ordinary package");
@@ -1954,6 +1970,7 @@ async fn install_real_official(
         catalog(sequence, vec![entry(package, &package_id, alias, &version)]),
     );
     registry
+        .packages()
         .package_install(catalog_install(fixture, package, &document, false))
         .await
         .expect("official install");
@@ -2519,7 +2536,8 @@ async fn an_uninstall_waits_for_an_adopted_resume_to_persist_its_package_pin() {
         restarted
             .registry
             .inner
-            .package_lifecycle
+            .packages
+            .lifecycle()
             .try_write()
             .is_err(),
         "the exclusive package lifecycle is unavailable while the adopted resume is in flight"
@@ -2527,7 +2545,12 @@ async fn an_uninstall_waits_for_an_adopted_resume_to_persist_its_package_pin() {
     let uninstall = tokio::spawn({
         let registry = restarted.registry.clone();
         let digest = package.digest.clone();
-        async move { registry.package_uninstall(uninstall(&digest)).await }
+        async move {
+            registry
+                .packages()
+                .package_uninstall(uninstall(&digest))
+                .await
+        }
     });
 
     gate.release.notify_one();
@@ -2665,6 +2688,7 @@ async fn a_live_built_in_claude_session_follows_its_package_detector_through_ins
 
     adopted
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the package");
@@ -2762,6 +2786,7 @@ async fn an_agent_report_held_across_an_uninstall_follows_the_current_pin() {
     gate.entered.notified().await;
     adopted
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the package");
@@ -2878,6 +2903,7 @@ async fn an_agent_report_held_across_a_registry_rebuild_resolves_again_and_commi
     );
     adopted
         .registry
+        .packages()
         .reload_runtimes()
         .expect("rebuild the runtime registry");
     disarm_report_hold(&adopted.registry);
@@ -2955,6 +2981,7 @@ async fn an_agent_report_whose_registry_keeps_changing_is_dropped_after_bounded_
         gate.entered.notified().await;
         adopted
             .registry
+            .packages()
             .reload_runtimes()
             .expect("rebuild the runtime registry");
         if resolution == resolutions {
@@ -3042,6 +3069,7 @@ async fn a_nested_agent_report_held_across_an_uninstall_of_its_package_is_never_
     gate.entered.notified().await;
     fixture
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the package");
@@ -3137,6 +3165,7 @@ async fn a_nested_agent_of_another_runtime_keeps_its_detector_through_a_package_
 
     adopted
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the package");
@@ -3335,6 +3364,7 @@ async fn install_version(
         catalog(sequence, vec![entry(package, &package_id, alias, version)]),
     );
     registry
+        .packages()
         .package_install(catalog_install(fixture, package, &document, false))
         .await
         .expect("official install");
@@ -3413,7 +3443,12 @@ async fn a_refresh_that_finds_the_active_agent_ended_sends_the_default_detector(
     let uninstall = tokio::spawn({
         let registry = adopted.registry.clone();
         let digest = package.digest.clone();
-        async move { registry.package_uninstall(uninstall(&digest)).await }
+        async move {
+            registry
+                .packages()
+                .package_uninstall(uninstall(&digest))
+                .await
+        }
     });
     gate.entered.notified().await;
     let mut sessions = adopted.registry.inner.sessions.lock().await;
@@ -3517,6 +3552,7 @@ async fn adopt_session_beside_a_profile_named_like_its_runtime(
     install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 5).await;
     adopted
         .registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             expected_previous: None,
             profile: RuntimeId::CLAUDE.to_owned(),
@@ -3560,6 +3596,7 @@ async fn install_unselected_next_claude(fixture: &Fixture) {
     install.select = false;
     fixture
         .registry
+        .packages()
         .package_install(install)
         .await
         .expect("install the unselected version");
@@ -3780,6 +3817,7 @@ async fn a_worker_report_projected_across_an_uninstall_runs_the_current_pins_det
     );
     let package = real_official(RuntimeId::CLAUDE);
     registry
+        .packages()
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the package");
@@ -3999,6 +4037,7 @@ async fn an_observed_nested_agent_in_a_record_without_an_origin_is_restored_as_o
     .await;
     adopted
         .registry
+        .packages()
         .package_bind_profile(unconditional_bind(RuntimeId::CODEX, None))
         .await
         .expect("pin the codex profile to the served package");
@@ -4231,6 +4270,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
 async fn bind_claude_profile(fixture: &Fixture) {
     fixture
         .registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             expected_previous: None,
             profile: PROFILE.to_owned(),

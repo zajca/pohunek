@@ -20,16 +20,21 @@
 
 // Rust guideline compliant 2026-10-13
 
+mod authority;
 mod bind;
-pub(super) mod ensure;
+pub mod ensure;
 mod error;
 mod fault;
-mod selection;
+mod retention;
+pub(crate) mod selection;
 mod source;
-mod trust;
+pub(crate) mod trust;
 
-use super::packages::RetainedPins;
-use std::sync::Mutex;
+pub use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority, PackageService};
+pub use self::retention::PackageUninstallError;
+pub(crate) use self::retention::{installed_digests, RetainedPins};
+
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use package::catalog_state::CatalogState;
@@ -56,8 +61,6 @@ use self::fault::fault_of;
 use self::selection::{block_of, conflict, declared_by, Integration, Integrations};
 use self::source::{build_directory, read_archive_file, read_regular_file};
 pub use self::trust::HostTrustAnchor;
-use super::packages::PackageUninstallError;
-use super::SessionRegistry;
 use crate::agent::host::{
     decide_claim, descriptor_from_archive, is_reserved, may_serve_reserved, Authority,
     ClaimRefusal, PackageDescriptor, PackageRejection, PackageReport, PackageStore,
@@ -65,10 +68,11 @@ use crate::agent::host::{
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
 use crate::catalog_anchor::CatalogTrust;
-use crate::integration::{ConfigHomes, RetainedSchemas};
+use crate::integration::RetainedSchemas;
+use crate::session::SessionRegistry;
 
-/// What a package method needs from the session registry.
-struct Context {
+/// What a package method needs from the authority.
+pub(crate) struct Context {
     store: PackageStore,
     runtimes: RuntimeHost,
     trust: CatalogTrust,
@@ -132,6 +136,22 @@ struct Inspected {
     commands_only: bool,
 }
 
+impl PackageAuthority {
+    pub(crate) fn context(&self) -> Result<Context, PackageErrorKind> {
+        let runtimes = self.runtimes.clone();
+        let Some(store) = runtimes.package_store().cloned() else {
+            warn!("a package method was called on a host without a package store");
+            return Err(PackageErrorKind::RegistryFailed);
+        };
+        Ok(Context {
+            store,
+            runtimes,
+            trust: self.trust.clone(),
+            integrations: Mutex::default(),
+        })
+    }
+}
+
 impl Context {
     /// The host trust anchor, or why official packages cannot be authorized.
     fn catalog_anchor(&self) -> Result<&HostTrustAnchor, PackageErrorKind> {
@@ -143,15 +163,15 @@ impl Context {
     }
 }
 
-impl SessionRegistry {
+impl PackageService {
     /// Lists every installed package with its health.
     ///
     /// # Errors
     ///
     /// Returns the [`PackageErrorKind`] of a registry that cannot be read.
     pub async fn package_list(&self) -> Result<PackageListResult, PackageErrorKind> {
-        let context = self.package_context()?;
-        let retained = self.package_retained().await?;
+        let context = self.authority.context()?;
+        let retained = self.retained().await?;
         blocking(move || {
             let state = read_state(&context)?;
             let report = context.runtimes.package_report();
@@ -177,8 +197,8 @@ impl SessionRegistry {
         &self,
         digest: PackageDigest,
     ) -> Result<PackageInspectResult, PackageErrorKind> {
-        let context = self.package_context()?;
-        let retained = self.package_retained().await?;
+        let context = self.authority.context()?;
+        let retained = self.retained().await?;
         blocking(move || {
             let state = read_state(&context)?;
             let record = state
@@ -209,8 +229,8 @@ impl SessionRegistry {
         &self,
         filter: Option<PackageId>,
     ) -> Result<PackageDoctorResult, PackageErrorKind> {
-        let context = self.package_context()?;
-        let retained = self.package_retained().await?;
+        let context = self.authority.context()?;
+        let retained = self.retained().await?;
         blocking(move || {
             let state = read_state(&context)?;
             let report = context.runtimes.package_report();
@@ -309,29 +329,31 @@ impl SessionRegistry {
         T: Send + 'static,
         F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageErrorKind> + Send + 'static,
     {
-        let context = self.package_context()?;
-        let registry = self.clone();
-        self.spawn_transaction("package_transaction", async move {
-            let _exclusive = registry.inner.package_lifecycle.write().await;
-            let retained = registry
-                .retained_digests_excluding_profile(profile)
-                .await
-                .map_err(|error| {
-                    warn!(%error, "the sessions that pin packages cannot be listed");
-                    PackageErrorKind::RegistryFailed
-                })?;
-            let uncertain = retained.is_uncertain();
-            let outcome = blocking(move || work(&context, &retained)).await;
-            if uncertain && outcome.is_err() {
-                warn_refused_under_uncertainty("a package change");
-            }
-            // Every transaction may have rebuilt the registry, so live adopted
-            // sessions follow whichever package serves their runtime now.
-            registry.refresh_adopted_pins().await;
-            outcome
-        })
-        .await
-        .map_err(|_join_error| PackageErrorKind::RegistryFailed)?
+        let context = self.authority.context()?;
+        let sessions = self.sessions.clone();
+        let authority = Arc::clone(&self.authority);
+        self.sessions
+            .spawn_transaction("package_transaction", async move {
+                let _exclusive = authority.lifecycle.write().await;
+                let retained = sessions
+                    .retained_digests_excluding_profile(profile)
+                    .await
+                    .map_err(|error| {
+                        warn!(%error, "the sessions that pin packages cannot be listed");
+                        PackageErrorKind::RegistryFailed
+                    })?;
+                let uncertain = retained.is_uncertain();
+                let outcome = blocking(move || work(&context, &retained)).await;
+                if uncertain && outcome.is_err() {
+                    warn_refused_under_uncertainty("a package change");
+                }
+                // Every transaction may have rebuilt the registry, so live adopted
+                // sessions follow whichever package serves their runtime now.
+                sessions.refresh_adopted_pins().await;
+                outcome
+            })
+            .await
+            .map_err(|_join_error| PackageErrorKind::RegistryFailed)?
     }
 
     /// Installs a package archive.
@@ -456,7 +478,8 @@ impl SessionRegistry {
         &self,
         params: PackageUninstallParams,
     ) -> Result<PackageUninstallResult, PackageErrorKind> {
-        self.remove_package(&params.digest, params.remove_modified)
+        self.remove_package(
+            &params.digest, params.remove_modified)
             .await
             .map_err(|error| match error {
                 PackageUninstallError::Registry(error) => registry_kind(&error),
@@ -476,74 +499,6 @@ impl SessionRegistry {
             digest: params.digest,
             reloaded: true,
         })
-    }
-
-    fn package_context(&self) -> Result<Context, PackageErrorKind> {
-        let runtimes = self.inner.profiles.runtimes().clone();
-        let Some(store) = runtimes.package_store().cloned() else {
-            warn!("a package method was called on a host without a package store");
-            return Err(PackageErrorKind::RegistryFailed);
-        };
-        Ok(Context {
-            store,
-            runtimes,
-            trust: self.inner.config.catalog_trust.clone(),
-            integrations: Mutex::default(),
-        })
-    }
-
-    /// What the package command service needs from this registry: the package
-    /// store, the `PATH` every agent launch sees, and the daemon shutdown
-    /// signal.
-    ///
-    /// The search path is the launch base environment's, so an interpreter a
-    /// command program names with `#!/usr/bin/env` resolves as it does for an
-    /// agent. A base environment that cannot be formed leaves `search_path`
-    /// as an error and every run unavailable.
-    pub(crate) fn package_command_host(&self) -> crate::package_command::CommandHost {
-        let search_path = self.integration_homes().map(|homes| homes.search_path());
-        crate::package_command::CommandHost {
-            store: self.inner.profiles.runtimes().package_store().cloned(),
-            search_path,
-            shutdown: self.inner.daemon_shutdown.clone(),
-        }
-    }
-
-    /// What resolves the config home a launch of a runtime gives its agent: the
-    /// host profiles and the base environment this registry hands every agent.
-    ///
-    /// A registry without a worker backend launches no agent; its base
-    /// environment is the default selection of the daemon's own.
-    ///
-    /// # Errors
-    ///
-    /// Returns `worker_initialize_invalid` when the configured allowlist or
-    /// the daemon's environment cannot form a base environment.
-    pub(crate) fn integration_homes(&self) -> Result<ConfigHomes, ProtocolError> {
-        let (allowlist, source) = match self.inner.config.supervision.as_ref() {
-            Some(supervision) => (
-                supervision.environment_allowlist.clone(),
-                supervision.environment_source.clone(),
-            ),
-            None => (
-                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect(),
-                crate::runtime::EnvironmentSource::Process,
-            ),
-        };
-        let base = crate::runtime::environment::base_environment(&allowlist, &source).map_err(
-            |error| {
-                ProtocolError::new(
-                    protocol::ErrorClass::Runtime,
-                    "worker_initialize_invalid",
-                    error.to_string(),
-                    None,
-                )
-            },
-        )?;
-        Ok(ConfigHomes::new(self.inner.profiles.clone(), base))
     }
 
     /// Runs an integration update under the shared lifecycle guard with the
@@ -566,52 +521,61 @@ impl SessionRegistry {
         T: Send + 'static,
         F: FnOnce(&RetainedSchemas) -> Result<T, ProtocolError> + Send + 'static,
     {
-        let registry = self.clone();
-        self.spawn_transaction("integration_install", async move {
-            let _shared = registry.inner.package_lifecycle.read().await;
-            let mut uncertain = false;
-            let schemas = if registry.inner.profiles.runtimes().package_store().is_none() {
-                RetainedSchemas::default()
-            } else {
-                let context = registry.package_context()?;
-                let retained = registry.package_retained().await?;
-                uncertain = retained.is_uncertain();
-                blocking(move || {
-                    let state = read_state(&context)?;
-                    Ok(selection::retained_schemas(
-                        &context,
-                        &state,
-                        retained.gate(),
-                    ))
-                })
-                .await?
-            };
-            let outcome = tokio::task::spawn_blocking(move || work(&schemas))
-                .await
-                .map_err(|error| {
-                    warn!(%error, "an integration install task failed");
-                    ProtocolError::new(
-                        protocol::ErrorClass::Daemon,
-                        "integration_install_task_panicked",
-                        "integration installation task panicked",
-                        Some("retry the request; if it repeats, inspect daemon logs".to_owned()),
-                    )
-                })?;
-            if uncertain && outcome.is_err() {
-                warn_refused_under_uncertainty("an integration install");
-            }
-            outcome
-        })
-        .await
-        .map_err(|_join_error| ProtocolError::from(PackageErrorKind::RegistryFailed))?
+        let sessions = self.sessions.clone();
+        let authority = Arc::clone(&self.authority);
+        self.sessions
+            .spawn_transaction("integration_install", async move {
+                let _shared = authority.lifecycle.read().await;
+                let mut uncertain = false;
+                let schemas = if authority.runtimes.package_store().is_none() {
+                    RetainedSchemas::default()
+                } else {
+                    let context = authority.context()?;
+                    let retained = retained(&sessions).await?;
+                    uncertain = retained.is_uncertain();
+                    blocking(move || {
+                        let state = read_state(&context)?;
+                        Ok(selection::retained_schemas(
+                            &context,
+                            &state,
+                            retained.gate(),
+                        ))
+                    })
+                    .await?
+                };
+                let outcome = tokio::task::spawn_blocking(move || work(&schemas))
+                    .await
+                    .map_err(|error| {
+                        warn!(%error, "an integration install task failed");
+                        ProtocolError::new(
+                            protocol::ErrorClass::Daemon,
+                            "integration_install_task_panicked",
+                            "integration installation task panicked",
+                            Some(
+                                "retry the request; if it repeats, inspect daemon logs".to_owned(),
+                            ),
+                        )
+                    })?;
+                if uncertain && outcome.is_err() {
+                    warn_refused_under_uncertainty("an integration install");
+                }
+                outcome
+            })
+            .await
+            .map_err(|_join_error| ProtocolError::from(PackageErrorKind::RegistryFailed))?
     }
 
-    async fn package_retained(&self) -> Result<RetainedPins, PackageErrorKind> {
-        self.retained_package_pins().await.map_err(|error| {
-            warn!(%error, "the sessions that pin packages cannot be listed");
-            PackageErrorKind::RegistryFailed
-        })
+    async fn retained(&self) -> Result<RetainedPins, PackageErrorKind> {
+        retained(&self.sessions).await
     }
+}
+
+/// The digests the sessions and profiles pin, as a package error on failure.
+async fn retained(sessions: &SessionRegistry) -> Result<RetainedPins, PackageErrorKind> {
+    sessions.retained_package_pins().await.map_err(|error| {
+        warn!(%error, "the sessions that pin packages cannot be listed");
+        PackageErrorKind::RegistryFailed
+    })
 }
 
 /// Logs that `change` was refused while an unreadable metadata-store line may
@@ -1317,20 +1281,3 @@ fn install_package(
         reloaded: true,
     })
 }
-
-#[cfg(test)]
-mod bind_tests;
-#[cfg(test)]
-mod catalog_tests;
-#[cfg(test)]
-mod commands_tests;
-#[cfg(test)]
-mod newer_version_tests;
-#[cfg(test)]
-mod official_alias_tests;
-#[cfg(test)]
-mod selection_tests;
-#[cfg(test)]
-mod test_fixture;
-#[cfg(test)]
-mod tests;

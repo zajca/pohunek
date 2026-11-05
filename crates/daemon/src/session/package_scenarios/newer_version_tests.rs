@@ -170,6 +170,7 @@ async fn install(fixture: &Fixture, kind: &Kind, package: &Package, version: &st
     );
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(fixture, package, &document, false))
         .await
         .expect("official install");
@@ -179,6 +180,7 @@ async fn install(fixture: &Fixture, kind: &Kind, package: &Package, version: &st
 /// `plugin profile migrate` does.
 async fn pin_profile(registry: &SessionRegistry, digest: &PackageDigest) {
     let bound = registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             expected_previous: None,
             profile: PROFILE.to_owned(),
@@ -244,6 +246,7 @@ async fn stopped_from(
         let path = fixture.write_archive(launched);
         fixture
             .registry
+            .packages()
             .package_install(explicit(&path, launched, true, true))
             .await
             .expect("a local package of the official package id installs");
@@ -492,6 +495,7 @@ async fn a_lower_selected_version_never_adopts_a_session_of_a_higher_one() {
     let selected = session
         .fixture
         .registry
+        .packages()
         .package_select(PackageSelectParams {
             digest: old.digest.clone(),
         })
@@ -622,6 +626,7 @@ async fn install_newer(fixture: &Fixture, case: &FailClosed) -> PackageDigest {
     params.select = select;
     let installed = fixture
         .registry
+        .packages()
         .package_install(params)
         .await
         .unwrap_or_else(|error| panic!("{}: the newer version installs: {error:?}", case.name));
@@ -629,6 +634,7 @@ async fn install_newer(fixture: &Fixture, case: &FailClosed) -> PackageDigest {
     if matches!(case.newer, Newer::Disabled) {
         fixture
             .registry
+            .packages()
             .package_set_enabled(protocol::PackageSetEnabledParams {
                 digest: package.digest.clone(),
                 enabled: false,
@@ -806,6 +812,7 @@ async fn a_local_package_of_a_newer_version_never_adopts_an_official_session() {
     let installed = session
         .fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &local, true, true))
         .await
         .expect("a local package of the official package id installs");

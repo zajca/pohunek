@@ -112,6 +112,7 @@ pub(super) async fn handle_integration_install(request: &Request, state: &Daemon
     // caller's disconnect cannot cancel.
     let agent = params.agent;
     match sessions
+        .packages()
         .integration_install(move |retained| {
             crate::integration::install_in(&homes, agent.as_ref(), &selection, retained)
         })

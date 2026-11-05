@@ -48,6 +48,10 @@ fn aliases() -> Vec<&'static str> {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario walks the whole install-to-uninstall round trip"
+)]
 async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follows() {
     let fixture = Fixture::new("package-round-trip");
     let package = Package::pi();
@@ -55,6 +59,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
 
     let installed = fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, false, false))
         .await
         .expect("install");
@@ -71,13 +76,19 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
     assert!(installed.commands.is_empty());
     assert_eq!(fixture.serving(RUNTIME), None, "recorded but not loaded");
 
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert_eq!(listed.generation, 1);
     assert_eq!(listed.packages.len(), 1);
     assert_eq!(listed.packages[0].digest, package.digest);
 
     let enabled = fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&package.digest, true))
         .await
         .expect("enable");
@@ -86,6 +97,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
 
     let selected = fixture
         .registry
+        .packages()
         .package_select(select(&package.digest))
         .await
         .expect("select");
@@ -94,6 +106,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
 
     let disabled = fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&package.digest, false))
         .await
         .expect("disable");
@@ -106,6 +119,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
 
     fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&package.digest, true))
         .await
         .expect("enable again");
@@ -113,6 +127,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
 
     let inspected = fixture
         .registry
+        .packages()
         .package_inspect(package.digest.clone())
         .await
         .expect("inspect");
@@ -123,6 +138,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
 
     let removed = fixture
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest, false))
         .await
         .expect("uninstall");
@@ -130,6 +146,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
     assert_eq!(fixture.serving(RUNTIME), None);
     assert!(fixture
         .registry
+        .packages()
         .package_list()
         .await
         .expect("list")
@@ -142,6 +159,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_inspect(package.digest.clone())
             .await
             .expect_err("gone"),
@@ -156,6 +174,7 @@ async fn an_install_that_cannot_load_leaves_no_record_and_no_root() {
     let first_path = fixture.write_archive(&first);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&first_path, &first, true, true))
         .await
         .expect("a valid package installs");
@@ -205,6 +224,7 @@ async fn an_install_that_cannot_load_leaves_no_record_and_no_root() {
         assert_eq!(
             fixture
                 .registry
+                .packages()
                 .package_install(params)
                 .await
                 .expect_err("refused"),
@@ -228,6 +248,7 @@ async fn an_unusable_archive_or_path_leaves_no_record_and_no_root() {
     let first_path = fixture.write_archive(&first);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&first_path, &first, true, true))
         .await
         .expect("a valid package installs");
@@ -249,6 +270,7 @@ async fn an_unusable_archive_or_path_leaves_no_record_and_no_root() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_install(wrong_digest)
             .await
             .expect_err("digest"),
@@ -261,6 +283,7 @@ async fn an_unusable_archive_or_path_leaves_no_record_and_no_root() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_install(garbage_params)
             .await
             .expect_err("garbage"),
@@ -273,6 +296,7 @@ async fn an_unusable_archive_or_path_leaves_no_record_and_no_root() {
         assert_eq!(
             fixture
                 .registry
+                .packages()
                 .package_install(explicit(&path, &other, true, true))
                 .await
                 .expect_err("unreadable"),
@@ -293,6 +317,7 @@ async fn a_dry_run_validates_and_changes_nothing() {
 
     let preview = fixture
         .registry
+        .packages()
         .package_install(params.clone())
         .await
         .expect("preview");
@@ -310,6 +335,7 @@ async fn a_dry_run_validates_and_changes_nothing() {
     );
     assert!(fixture
         .registry
+        .packages()
         .package_list()
         .await
         .expect("list")
@@ -325,6 +351,7 @@ async fn a_dry_run_validates_and_changes_nothing() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_install(refused)
             .await
             .expect_err("refused"),
@@ -339,12 +366,14 @@ async fn installing_again_reports_the_recorded_state_and_restores_a_missing_root
     let path = fixture.write_archive(&package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, false, false))
         .await
         .expect("install");
 
     let again = fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, true, true))
         .await
         .expect("idempotent");
@@ -352,10 +381,16 @@ async fn installing_again_reports_the_recorded_state_and_restores_a_missing_root
     assert!(!again.package.enabled, "the recorded state is kept");
 
     fs::remove_dir_all(fixture.root(&package.digest)).expect("remove the root");
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert_eq!(listed.packages[0].fault, Some(PackageFault::RootMissing));
     let restored = fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, false, false))
         .await
         .expect("restore");
@@ -370,6 +405,7 @@ async fn identity_and_runtime_id_conflicts_are_refused() {
     let first_path = fixture.write_archive(&first);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&first_path, &first, true, true))
         .await
         .expect("install");
@@ -380,6 +416,7 @@ async fn identity_and_runtime_id_conflicts_are_refused() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_install(explicit(&rebuilt_path, &rebuilt, true, true))
             .await
             .expect_err("identity"),
@@ -394,6 +431,7 @@ async fn identity_and_runtime_id_conflicts_are_refused() {
         assert_eq!(
             fixture
                 .registry
+                .packages()
                 .package_install(explicit(&rival_path, &rival, enable, select))
                 .await
                 .expect_err("runtime conflict"),
@@ -411,6 +449,7 @@ async fn enabling_or_selecting_cannot_create_a_runtime_id_conflict() {
     let first_path = fixture.write_archive(&first);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&first_path, &first, false, false))
         .await
         .expect("install while nothing serves the runtime id");
@@ -418,6 +457,7 @@ async fn enabling_or_selecting_cannot_create_a_runtime_id_conflict() {
     let rival_path = fixture.write_archive(&rival);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&rival_path, &rival, true, true))
         .await
         .expect("the rival takes the runtime id");
@@ -426,6 +466,7 @@ async fn enabling_or_selecting_cannot_create_a_runtime_id_conflict() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_set_enabled(enable(&first.digest, true))
             .await
             .expect_err("conflict"),
@@ -434,6 +475,7 @@ async fn enabling_or_selecting_cannot_create_a_runtime_id_conflict() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_select(select(&first.digest))
             .await
             .expect_err("conflict"),
@@ -452,19 +494,26 @@ async fn a_second_version_installs_side_by_side_and_serves_only_once_selected() 
         let path = fixture.write_archive(package);
         fixture
             .registry
+            .packages()
             .package_install(explicit(&path, package, true, select))
             .await
             .expect("install");
     }
 
     assert_eq!(fixture.serving(RUNTIME), Some(first.digest.clone()));
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     let selected: Vec<_> = listed.packages.iter().filter(|p| p.selected).collect();
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].digest, first.digest);
 
     fixture
         .registry
+        .packages()
         .package_select(select(&second.digest))
         .await
         .expect("select the second version");
@@ -478,6 +527,7 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
     let path = fixture.write_archive(&package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, true, true))
         .await
         .expect("install");
@@ -486,6 +536,7 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest, true))
             .await
             .expect_err("intact"),
@@ -493,15 +544,26 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
     );
 
     fixture.tamper(&package.digest);
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert_eq!(listed.packages[0].fault, Some(PackageFault::RootModified));
     assert_eq!(listed.packages[0].runtime_id, None);
-    let doctor = fixture.registry.package_doctor(None).await.expect("doctor");
+    let doctor = fixture
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
     assert_eq!(doctor.findings.len(), 1);
     assert_eq!(doctor.findings[0].kind, PackageFindingKind::Fault);
     assert_eq!(doctor.findings[0].fault, Some(PackageFault::RootModified));
     let filtered = fixture
         .registry
+        .packages()
         .package_doctor(Some(
             protocol::PackageId::parse("acme.runtime.other").expect("id"),
         ))
@@ -515,6 +577,7 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_set_enabled(enable(&package.digest, true))
             .await
             .expect_err("enable"),
@@ -523,6 +586,7 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_select(select(&package.digest))
             .await
             .expect_err("select"),
@@ -531,6 +595,7 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest, false))
             .await
             .expect_err("uninstall"),
@@ -539,12 +604,14 @@ async fn a_modified_root_is_reported_and_refuses_every_change_but_removal_as_mod
 
     let removed = fixture
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest, true))
         .await
         .expect("removed as modified");
     assert!(removed.reloaded);
     assert!(fixture
         .registry
+        .packages()
         .package_list()
         .await
         .expect("list")
@@ -561,6 +628,7 @@ async fn doctor_reports_roots_without_a_record() {
     let path = fixture.write_archive(&package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, true, true))
         .await
         .expect("install");
@@ -568,7 +636,12 @@ async fn doctor_reports_roots_without_a_record() {
         package::PackageDigest::parse(&format!("sha256:{}", "ab".repeat(32))).expect("digest");
     fs::create_dir(fixture.root(&stray)).expect("a root nobody recorded");
 
-    let doctor = fixture.registry.package_doctor(None).await.expect("doctor");
+    let doctor = fixture
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
 
     assert_eq!(doctor.findings.len(), 1);
     assert_eq!(
@@ -607,6 +680,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
 
     let preview = fixture
         .registry
+        .packages()
         .package_link(link(true))
         .await
         .expect("preview");
@@ -615,6 +689,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
 
     let linked = fixture
         .registry
+        .packages()
         .package_link(link(false))
         .await
         .expect("link");
@@ -635,11 +710,17 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
         source.replace(INERT_PROGRAM, "/bin/true"),
     )
     .expect("edit the directory");
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert_eq!(listed.packages[0].fault, None);
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_link(link(false))
             .await
             .expect_err("the directory changed without a version bump"),
@@ -650,6 +731,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
     fs::write(directory.join("runtime.toml"), &source).expect("restore");
     let again = fixture
         .registry
+        .packages()
         .package_link(link(false))
         .await
         .expect("again");
@@ -660,6 +742,7 @@ async fn a_linked_directory_is_copied_disabled_and_never_loaded() {
         assert_eq!(
             fixture
                 .registry
+                .packages()
                 .package_link(PackageLinkParams {
                     directory: relative,
                     dry_run: false,
@@ -692,6 +775,7 @@ async fn a_linked_directory_cannot_claim_a_reserved_runtime_id() {
 
     let refused = fixture
         .registry
+        .packages()
         .package_link(PackageLinkParams {
             directory: directory.to_str().expect("utf-8").to_owned(),
             dry_run: false,
@@ -707,7 +791,11 @@ async fn a_linked_directory_cannot_claim_a_reserved_runtime_id() {
 async fn a_host_without_a_package_store_refuses_package_methods() {
     let registry = crate::session::SessionRegistry::default();
     assert_eq!(
-        registry.package_list().await.expect_err("no store"),
+        registry
+            .packages()
+            .package_list()
+            .await
+            .expect_err("no store"),
         PackageErrorKind::RegistryFailed
     );
 }
@@ -737,6 +825,7 @@ async fn session_fixture(
     let path = fixture.write_archive(&package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, true, true))
         .await
         .expect("install the agent package");
@@ -760,11 +849,17 @@ async fn a_pinned_session_blocks_uninstall_even_of_a_modified_root() {
         .await
         .expect("create");
 
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert!(listed.packages[0].referenced);
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest, false))
             .await
             .expect_err("pinned"),
@@ -775,6 +870,7 @@ async fn a_pinned_session_blocks_uninstall_even_of_a_modified_root() {
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest, true))
             .await
             .expect_err("a retained tampered root is not removed"),
@@ -794,6 +890,7 @@ async fn a_pinned_session_blocks_uninstall_even_of_a_modified_root() {
         .expect("remove the session");
     fixture
         .registry
+        .packages()
         .package_uninstall(uninstall(&package.digest, true))
         .await
         .expect("unpinned, the modified root is removed");
@@ -818,6 +915,7 @@ async fn a_disabled_package_refuses_fresh_launches_and_still_resumes_its_session
 
     fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&package.digest, false))
         .await
         .expect("disable");
@@ -858,7 +956,12 @@ async fn doctor_reports_a_pinned_digest_the_registry_does_not_record() {
 
     // A registry over the same sessions but an empty plugin root.
     let bare = Fixture::with_store("package-pinned-missing-bare", store);
-    let doctor = bare.registry.package_doctor(None).await.expect("doctor");
+    let doctor = bare
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
 
     assert_eq!(doctor.findings.len(), 1);
     assert_eq!(
@@ -874,6 +977,7 @@ async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
     let (fixture, package, dir, mut gate, _store) = session_fixture("package-argv-preview").await;
     let runtime = fixture
         .registry
+        .packages()
         .package_inspect(package.digest.clone())
         .await
         .expect("inspect")

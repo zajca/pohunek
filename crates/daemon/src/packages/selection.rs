@@ -35,14 +35,14 @@ use crate::integration::RetainedSchemas;
 
 /// The integration a package declares: its handler id and hook schema id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Declared {
+pub(crate) struct Declared {
     handler: String,
     schema: &'static pohunek_worker_protocol::HookSchema,
 }
 
 /// What the integration of a package resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Integration {
+pub(crate) enum Integration {
     /// The package declares this integration, or none.
     Known(Option<Declared>),
     /// The descriptor cannot be read, so nothing is known about the package.
@@ -50,7 +50,7 @@ pub(super) enum Integration {
 }
 
 /// The integration `definition` declares.
-pub(super) fn declared_by(definition: &RuntimeDefinition) -> Integration {
+pub(crate) fn declared_by(definition: &RuntimeDefinition) -> Integration {
     Integration::Known(
         definition
             .integration_handler()
@@ -69,7 +69,7 @@ pub(super) fn declared_by(definition: &RuntimeDefinition) -> Integration {
 /// roots are content addressed, so a cached entry stays valid for the life of
 /// the request.
 #[derive(Debug, Default)]
-pub(super) struct Integrations {
+pub(crate) struct Integrations {
     resolved: BTreeMap<PackageDigest, Integration>,
 }
 
@@ -80,7 +80,7 @@ impl Integrations {
     /// `[integration] hook_schema` resolves through the handler it names, the
     /// same way a live worker launched from it does; anything else that cannot
     /// be read is [`Integration::Unresolvable`].
-    pub(super) fn of(&mut self, context: &Context, record: &PackageRecord) -> Integration {
+    pub(crate) fn of(&mut self, context: &Context, record: &PackageRecord) -> Integration {
         self.resolved
             .entry(record.digest().clone())
             .or_insert_with(|| resolve(context, record))
@@ -126,7 +126,7 @@ fn legacy(context: &Context, record: &PackageRecord) -> Integration {
 /// the candidate itself take no part: the first has no declaration to compare
 /// and resolves to the uninstalled runtime at launch, and the others do not
 /// share the candidate's runtime.
-pub(super) fn conflict(
+pub(crate) fn conflict(
     context: &Context,
     state: &RegistryState,
     retained: &RetainedDigests,

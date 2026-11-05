@@ -1608,7 +1608,11 @@ carries no code that Pohunek loads. The archive format, the owner-private
 registry and the signed catalog are in `crates/package`; the daemon turns a
 verified package into a validated runtime definition
 (`crates/daemon/src/agent/host/package.rs`) and runs install, enable, select
-and uninstall in `crates/daemon/src/session/package_lifecycle/`.
+and uninstall in `crates/daemon/src/packages/`. The package authority
+(`PackageAuthority`) owns the lifecycle lock, the catalog trust and the package
+store handle; the session registry reaches packages only through
+`PackageAuthority::guard_launch` (the shared launch guard) and keeps the
+session-side retention and adopted-pin refresh in `session/package_pins.rs`.
 
 | Class | Authorized by | Status |
 |---|---|---|

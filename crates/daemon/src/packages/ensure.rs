@@ -11,7 +11,7 @@
 
 // Rust guideline compliant 2026-10-14
 
-use super::super::packages::{installed_digests, RetainedPins};
+use super::{installed_digests, RetainedPins};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1069,7 +1069,7 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
 /// judges by: a store line that may pin a package and cannot be read is never
 /// searched for a digest, and while one exists the gate set also holds every
 /// installed digest.
-pub(in crate::session) fn retained_pins(
+pub(crate) fn retained_pins(
     store_path: &Path,
     profiles: &ProfileRegistry,
     skip: Option<&str>,

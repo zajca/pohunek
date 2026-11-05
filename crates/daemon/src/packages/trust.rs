@@ -196,7 +196,7 @@ pub(super) fn core_version() -> Result<Version, PackageErrorKind> {
 ///
 /// Returns [`PackageErrorKind::Incompatible`] on a platform the catalog does
 /// not name.
-pub(super) fn host_platform() -> Result<String, PackageErrorKind> {
+pub(crate) fn host_platform() -> Result<String, PackageErrorKind> {
     platform_name(
         std::env::consts::ARCH,
         std::env::consts::OS,

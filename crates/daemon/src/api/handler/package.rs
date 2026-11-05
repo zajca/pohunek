@@ -43,7 +43,7 @@ pub(super) async fn handle_package_list(request: &Request, state: &DaemonState) 
     if let Err(response) = require_local(request, state) {
         return response;
     }
-    respond(request, state.sessions.package_list().await)
+    respond(request, state.sessions.packages().package_list().await)
 }
 
 pub(super) async fn handle_package_inspect(request: &Request, state: &DaemonState) -> Response {
@@ -51,7 +51,14 @@ pub(super) async fn handle_package_inspect(request: &Request, state: &DaemonStat
         return response;
     }
     match parse_params::<PackageInspectParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_inspect(params.digest).await),
+        Ok(params) => respond(
+            request,
+            state
+                .sessions
+                .packages()
+                .package_inspect(params.digest)
+                .await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -61,7 +68,14 @@ pub(super) async fn handle_package_doctor(request: &Request, state: &DaemonState
         return response;
     }
     match parse_optional_params::<PackageDoctorParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_doctor(params.package).await),
+        Ok(params) => respond(
+            request,
+            state
+                .sessions
+                .packages()
+                .package_doctor(params.package)
+                .await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -71,7 +85,10 @@ pub(super) async fn handle_package_install(request: &Request, state: &DaemonStat
         return response;
     }
     match parse_params::<PackageInstallParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_install(params).await),
+        Ok(params) => respond(
+            request,
+            state.sessions.packages().package_install(params).await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -81,7 +98,10 @@ pub(super) async fn handle_package_link(request: &Request, state: &DaemonState) 
         return response;
     }
     match parse_params::<PackageLinkParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_link(params).await),
+        Ok(params) => respond(
+            request,
+            state.sessions.packages().package_link(params).await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -91,7 +111,10 @@ pub(super) async fn handle_package_set_enabled(request: &Request, state: &Daemon
         return response;
     }
     match parse_params::<PackageSetEnabledParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_set_enabled(params).await),
+        Ok(params) => respond(
+            request,
+            state.sessions.packages().package_set_enabled(params).await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -101,7 +124,10 @@ pub(super) async fn handle_package_select(request: &Request, state: &DaemonState
         return response;
     }
     match parse_params::<PackageSelectParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_select(params).await),
+        Ok(params) => respond(
+            request,
+            state.sessions.packages().package_select(params).await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -111,7 +137,10 @@ pub(super) async fn handle_package_uninstall(request: &Request, state: &DaemonSt
         return response;
     }
     match parse_params::<PackageUninstallParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_uninstall(params).await),
+        Ok(params) => respond(
+            request,
+            state.sessions.packages().package_uninstall(params).await,
+        ),
         Err(error) => error_value(request, error),
     }
 }
@@ -124,7 +153,10 @@ pub(super) async fn handle_package_bind_profile(
         return response;
     }
     match parse_params::<PackageBindProfileParams>(request) {
-        Ok(params) => respond(request, state.sessions.package_bind_profile(params).await),
+        Ok(params) => respond(
+            request,
+            state.sessions.packages().package_bind_profile(params).await,
+        ),
         Err(error) => error_value(request, error),
     }
 }

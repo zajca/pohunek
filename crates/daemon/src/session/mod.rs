@@ -91,8 +91,9 @@ use launch_input::LaunchSubject;
 mod native_attestation;
 mod native_repair;
 mod observation;
-mod package_lifecycle;
-mod packages;
+mod package_pins;
+#[cfg(test)]
+mod package_scenarios;
 mod procwatch;
 #[cfg(test)]
 mod profile_freeze_tests;
@@ -121,14 +122,14 @@ mod tmpdir;
 mod turn_events;
 mod turn_wait;
 
-pub use attach::{RedeemedAttach, RedeemedRuntime};
-pub use background::ShutdownReport;
-pub use idle_stop::{spawn_idle_stop, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
-pub use package_lifecycle::ensure::{
+pub use crate::packages::ensure::{
     detect_official_runtimes, ensure_official_runtimes, plan_official_runtimes, EnsureError,
     EnsureInputs, OfficialPlan, PlannedProfile,
 };
-pub use package_lifecycle::HostTrustAnchor;
+pub use crate::packages::HostTrustAnchor;
+pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use background::ShutdownReport;
+pub use idle_stop::{spawn_idle_stop, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
 pub use retention::{spawn_session_retention, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
@@ -793,11 +794,8 @@ struct SessionRegistryInner {
     /// for a daemon that has not read the worker's journal yet.
     #[cfg(test)]
     worker_imports_blocked: AtomicBool,
-    /// Shared by every fresh launch from verification until its durable record
-    /// exists, exclusive for a package uninstall, so a launch cannot pin a
-    /// package digest between the retained set being computed and the
-    /// package being removed.
-    package_lifecycle: Arc<tokio::sync::RwLock<()>>,
+    /// Owns the package lifecycle lock, the catalog trust and the package store.
+    packages: Arc<crate::packages::PackageAuthority>,
     /// Serializes create, native recovery, stop, and remove per session, so
     /// one session never runs two lifecycle transactions at once.
     lifecycle_locks: SessionLocks,
@@ -2554,6 +2552,10 @@ impl SessionRegistry {
         let idle_stop = idle_stop::IdleStopState::new(config.idle_stop_policy_path.clone());
         let daemon_instance_id = generate_daemon_instance_id();
         let turns = TurnEvents::new(daemon_instance_id.clone(), config.turn_event_capacity);
+        let packages = Arc::new(crate::packages::PackageAuthority::new(
+            config.catalog_trust.clone(),
+            profiles.runtimes().clone(),
+        ));
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -2588,7 +2590,7 @@ impl SessionRegistry {
                 resume_writes_blocked: AtomicBool::new(false),
                 #[cfg(test)]
                 worker_imports_blocked: AtomicBool::new(false),
-                package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+                packages,
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
                 launching: std::sync::Mutex::new(HashMap::new()),
@@ -2909,7 +2911,7 @@ impl SessionRegistry {
 
     /// Spawns a finite transaction with the worker or the store that shutdown
     /// waits for instead of aborting.
-    pub(super) fn spawn_transaction<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
+    pub(crate) fn spawn_transaction<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,

@@ -119,6 +119,7 @@ impl OfficialCatalog {
             let archive = scratch.join(format!("{runtime}.tar.zst"));
             std::fs::write(&archive, bytes).expect("write the official package archive");
             let result = registry
+                .packages()
                 .package_install(PackageInstallParams {
                     archive_path: path_string(&archive),
                     trust: PackageTrust::Catalog {
@@ -230,6 +231,7 @@ impl OfficialCatalog {
         let file = scratch.join(format!("{runtime}-{sequence}.tar.zst"));
         std::fs::write(&file, bytes).expect("write the official package archive");
         let result = registry
+            .packages()
             .package_install(PackageInstallParams {
                 archive_path: path_string(&file),
                 trust: PackageTrust::Catalog {
@@ -261,6 +263,7 @@ impl OfficialCatalog {
             self.configure(installer_config(scratch), plugins_dir.to_path_buf()),
         );
         let result = registry
+            .packages()
             .package_install(PackageInstallParams {
                 archive_path: path_string(
                     &release.join("packages").join(format!("{runtime}.tar.zst")),
@@ -345,6 +348,7 @@ pub(crate) async fn preinstall_third_party(
     };
     let registry = installer_registry(config);
     let result = registry
+        .packages()
         .package_install(PackageInstallParams {
             archive_path: path_string(&archive),
             trust: PackageTrust::ExplicitDigest {
@@ -369,6 +373,7 @@ pub(crate) async fn enable_package(plugins_dir: &Path, scratch: &Path, digest: &
         ..installer_config(scratch)
     };
     let result = installer_registry(config)
+        .packages()
         .package_set_enabled(PackageSetEnabledParams {
             digest: digest.clone(),
             enabled: true,

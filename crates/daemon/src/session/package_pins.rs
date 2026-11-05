@@ -1,147 +1,96 @@
-//! Runtime package lifecycle on the session registry: explicit reload and
-//! retention-checked uninstall.
+//! The session side of the package lifecycle: the digests live sessions and
+//! profiles pin, and the re-derivation of adopted sessions after the runtime
+//! registry was rebuilt.
 //!
-//! A package digest stays referenced while any live, lost or resumable session
-//! was launched from it, so uninstall never retires content a session can
-//! still resume from. Fresh launches hold a shared guard from the moment their
-//! package is verified until their durable record exists; uninstall takes the
-//! exclusive guard, so a launch can never pin a digest between the retained
-//! set being computed and the package being removed.
+//! The package authority reaches this code only through
+//! [`PackageSessions`](crate::packages::PackageSessions).
 
 // Rust guideline compliant 2026-10-05
 
 use std::io;
 use std::sync::Arc;
 
-use package::registry::{RegistryError, RetainedDigests};
+use package::registry::RetainedDigests;
 use package::PackageDigest;
 use protocol::{BindingProvenance, RuntimeRef};
-use thiserror::Error;
 
 use super::{host, ProtocolError, SessionEntry, SessionId, SessionRegistry};
-use crate::agent::host::{LaunchPin, PackageReport, ReloadError, RuntimeDefinition, RuntimeHost};
+use crate::agent::host::{LaunchPin, RuntimeDefinition, RuntimeHost};
 use crate::agent::{ProfileRegistry, ResolvedAgent};
-
 use crate::detect::DetectorConfig;
+use crate::integration::ConfigHomes;
+use crate::packages::{installed_digests, LaunchGuard, RetainedPins};
 use tracing::warn;
 
-/// Why a package could not be uninstalled.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum PackageUninstallError {
-    /// The registry's runtime host has no package store.
-    #[error("the runtime host has no package store")]
-    NoPackageStore,
-    /// The durable sessions that may reference the package could not be read.
-    #[error("the sessions that may reference the package cannot be listed: {0}")]
-    Retention(#[source] io::Error),
-    /// A store line that may pin the package cannot be read, so the removal
-    /// cannot be proven safe.
-    #[error("an unreadable metadata-store line may reference the package")]
-    RetentionUncertain,
-    /// The package registry refused: still referenced, not installed, a
-    /// modified root, or a registry fault.
-    #[error(transparent)]
-    Registry(#[from] RegistryError),
-    /// The package was uninstalled but the runtime registry could not be
-    /// rebuilt; the previous registry stays in place until the next reload.
-    #[error("the package was uninstalled but the runtime registry was not rebuilt: {0}")]
-    Reload(#[source] ReloadError),
-}
-
-/// The package digests the daemon retains, for display and for gates.
-///
-/// An unreadable store line that may pin a package never shrinks a gate's set:
-/// [`Self::gate`] widens to every installed digest while one exists, and only
-/// gates see it.
-#[derive(Debug, Clone, Default)]
-pub(super) struct RetainedPins {
-    /// Digests a profile, a readable durable record or a live session pins.
-    known: RetainedDigests,
-    /// [`Self::known`], plus every installed digest while a store line that may
-    /// pin a package cannot be read.
-    gate: RetainedDigests,
-    /// Whether such a line exists.
-    uncertain: bool,
-}
-
-impl RetainedPins {
-    /// The known digests of a read that found `unreadable_lines` store lines
-    /// that may pin a package and cannot be read. While one exists the gate
-    /// also holds every digest in `installed`, so an unreadable line never
-    /// shrinks what a gate judges.
-    #[must_use]
-    pub(super) fn with_unreadable(
-        known: RetainedDigests,
-        unreadable_lines: usize,
-        installed: impl IntoIterator<Item = PackageDigest>,
-    ) -> Self {
-        let uncertain = unreadable_lines > 0;
-        let mut gate = known.clone();
-        if uncertain {
-            gate.extend(installed);
-        }
-        Self {
-            known,
-            gate,
-            uncertain,
-        }
-    }
-
-    /// The digests that are provably pinned.
-    #[must_use]
-    pub(super) fn known(&self) -> &RetainedDigests {
-        &self.known
-    }
-
-    /// The set every gate judges.
-    #[must_use]
-    pub(super) fn gate(&self) -> &RetainedDigests {
-        &self.gate
-    }
-
-    /// Whether an unreadable store line widened [`Self::gate`].
-    #[must_use]
-    pub(super) fn is_uncertain(&self) -> bool {
-        self.uncertain
-    }
-}
-
-/// The digest of every installed package; empty without a package store.
-///
-/// # Errors
-///
-/// Returns an error when the package registry state cannot be read.
-pub(super) fn installed_digests(runtimes: &RuntimeHost) -> io::Result<Vec<PackageDigest>> {
-    runtimes
-        .package_store()
-        .map(|store| {
-            store.registry().state().map(|state| {
-                state
-                    .packages()
-                    .iter()
-                    .map(|record| record.digest().clone())
-                    .collect::<Vec<_>>()
-            })
-        })
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .map_err(|error| io::Error::other(error.to_string()))
-}
-
 impl SessionRegistry {
-    /// Rebuilds the runtime registry from the packages installed now.
-    ///
-    /// Reload is explicit: installing, enabling, disabling or selecting a
-    /// package changes nothing until it is called. Every enabled package root
-    /// is verified again; the previous registry stays in place when the
-    /// rebuild fails.
+    /// Verifies that `definition` may serve a fresh launch and holds the shared
+    /// package lifecycle lock for as long as the returned guard lives.
     ///
     /// # Errors
     ///
-    /// Returns the [`ReloadError`] of the runtime host.
-    pub fn reload_runtimes(&self) -> Result<Arc<PackageReport>, ReloadError> {
-        self.inner.profiles.runtimes().reload()
+    /// The errors of [`PackageAuthority::guard_launch`].
+    pub(super) async fn guard_package_launch(
+        &self,
+        definition: &host::RuntimeDefinition,
+    ) -> Result<LaunchGuard<'_>, ProtocolError> {
+        self.inner
+            .packages
+            .guard_launch(definition, &self.inner.profiles)
+            .await
+    }
+
+    /// What the package command service needs from this registry: the package
+    /// store, the `PATH` every agent launch sees, and the daemon shutdown
+    /// signal.
+    ///
+    /// The search path is the launch base environment's, so an interpreter a
+    /// command program names with `#!/usr/bin/env` resolves as it does for an
+    /// agent. A base environment that cannot be formed leaves `search_path`
+    /// as an error and every run unavailable.
+    pub(crate) fn package_command_host(&self) -> crate::package_command::CommandHost {
+        let search_path = self.integration_homes().map(|homes| homes.search_path());
+        crate::package_command::CommandHost {
+            store: self.inner.profiles.runtimes().package_store().cloned(),
+            search_path,
+            shutdown: self.inner.daemon_shutdown.clone(),
+        }
+    }
+
+    /// What resolves the config home a launch of a runtime gives its agent: the
+    /// host profiles and the base environment this registry hands every agent.
+    ///
+    /// A registry without a worker backend launches no agent; its base
+    /// environment is the default selection of the daemon's own.
+    ///
+    /// # Errors
+    ///
+    /// Returns `worker_initialize_invalid` when the configured allowlist or
+    /// the daemon's environment cannot form a base environment.
+    pub(crate) fn integration_homes(&self) -> Result<ConfigHomes, ProtocolError> {
+        let (allowlist, source) = match self.inner.config.supervision.as_ref() {
+            Some(supervision) => (
+                supervision.environment_allowlist.clone(),
+                supervision.environment_source.clone(),
+            ),
+            None => (
+                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+                crate::runtime::EnvironmentSource::Process,
+            ),
+        };
+        let base = crate::runtime::environment::base_environment(&allowlist, &source).map_err(
+            |error| {
+                ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "worker_initialize_invalid",
+                    error.to_string(),
+                    None,
+                )
+            },
+        )?;
+        Ok(ConfigHomes::new(self.inner.profiles.clone(), base))
     }
 
     /// Re-derives the pinned definition and the running detector configuration
@@ -153,7 +102,7 @@ impl SessionRegistry {
     /// session's active agent at that time: the same rule the launch, report
     /// and observation paths use. An active agent that changed while the
     /// sources resolved is collected again, a bounded number of times.
-    pub(super) async fn refresh_adopted_pins(&self) {
+    pub(crate) async fn refresh_adopted_pins(&self) {
         let mut only: Option<Vec<SessionId>> = None;
         for _attempt in 0..REFRESH_ATTEMPTS {
             let candidates = self.collect_adopted(only.as_deref()).await;
@@ -284,7 +233,7 @@ impl SessionRegistry {
     ///
     /// Returns the I/O error when the durable store cannot be read.
     pub async fn retained_package_digests(&self) -> io::Result<RetainedDigests> {
-        Ok(self.retained_package_pins().await?.known)
+        Ok(self.retained_package_pins().await?.into_known())
     }
 
     /// The retained digests for display and for gates.
@@ -292,7 +241,7 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// The errors of [`Self::retained_package_digests`].
-    pub(super) async fn retained_package_pins(&self) -> io::Result<RetainedPins> {
+    pub(crate) async fn retained_package_pins(&self) -> io::Result<RetainedPins> {
         self.retained_digests_excluding_profile(None).await
     }
 
@@ -302,7 +251,7 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// The errors of [`Self::retained_package_digests`].
-    pub(super) async fn retained_digests_excluding_profile(
+    pub(crate) async fn retained_digests_excluding_profile(
         &self,
         profile: Option<String>,
     ) -> io::Result<RetainedPins> {
@@ -347,164 +296,6 @@ impl SessionRegistry {
             unreadable_lines,
             installed,
         ))
-    }
-
-    /// Uninstalls the package `digest` unless a session still references it,
-    /// then rebuilds the runtime registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PackageUninstallError::Registry`] with
-    /// [`RegistryError::StillReferenced`] while a session references the
-    /// digest, [`PackageUninstallError::RetentionUncertain`] while an
-    /// unreadable store line may reference it, and the other variants for a missing store, an unreadable
-    /// session store, a registry refusal or a failed rebuild.
-    pub async fn uninstall_package(
-        &self,
-        digest: &PackageDigest,
-    ) -> Result<(), PackageUninstallError> {
-        self.remove_package(digest, false).await
-    }
-
-    /// Removes the package `digest` unless a session still references it, then
-    /// rebuilds the runtime registry.
-    ///
-    /// With `remove_modified` the package must fail root verification, which a
-    /// normal uninstall refuses to touch; a root that verifies is refused with
-    /// [`RegistryError::RootIntact`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::uninstall_package`].
-    pub async fn remove_package(
-        &self,
-        digest: &PackageDigest,
-        remove_modified: bool,
-    ) -> Result<(), PackageUninstallError> {
-        let runtimes = self.inner.profiles.runtimes().clone();
-        let store = runtimes
-            .package_store()
-            .ok_or(PackageUninstallError::NoPackageStore)?
-            .clone();
-        let registry = self.clone();
-        let digest = digest.clone();
-        // The whole transaction runs in a task of its own: the exclusive
-        // authority is held by the task that computes the retained set,
-        // removes the package and reloads, so a caller that stops waiting
-        // cannot release it while the removal is still in flight.
-        self.spawn_transaction("package_uninstall", async move {
-            let _exclusive = registry.inner.package_lifecycle.write().await;
-            let pins = registry
-                .retained_package_pins()
-                .await
-                .map_err(PackageUninstallError::Retention)?;
-            let removal = tokio::task::spawn_blocking(move || {
-                let registry = store.registry();
-                let result = if remove_modified {
-                    registry.remove_modified(&digest, pins.gate())
-                } else {
-                    registry.uninstall(&digest, pins.gate())
-                };
-                match result {
-                    Err(RegistryError::StillReferenced)
-                        if pins.is_uncertain() && !pins.known().contains(&digest) =>
-                    {
-                        Err(PackageUninstallError::RetentionUncertain)
-                    }
-                    Err(error) => Err(PackageUninstallError::Registry(error)),
-                    Ok(_generation) => Ok(()),
-                }
-            })
-            .await
-            .map_err(|join_error| {
-                PackageUninstallError::Retention(io::Error::other(join_error.to_string()))
-            })?;
-            // The record is already replaced when the root could not be fully
-            // deleted or the commit's durability is uncertain, so the runtime
-            // registry must follow it before the error is returned.
-            let committed = matches!(
-                removal,
-                Ok(())
-                    | Err(PackageUninstallError::Registry(
-                        RegistryError::RemovalIncomplete | RegistryError::CommitUncertain
-                    ))
-            );
-            let reload = committed.then(|| runtimes.reload());
-            registry.refresh_adopted_pins().await;
-            removal?;
-            match reload {
-                Some(Err(error)) => Err(PackageUninstallError::Reload(error)),
-                _ => Ok(()),
-            }
-        })
-        .await
-        .map_err(|join_error| {
-            PackageUninstallError::Retention(io::Error::other(join_error.to_string()))
-        })?
-    }
-
-    /// Verifies that `definition` may serve a fresh launch and holds the
-    /// shared lifecycle guard for as long as the returned value lives.
-    ///
-    /// # Errors
-    ///
-    /// Returns the stable protocol error of
-    /// [`host::RuntimeHost::verify_launchable`], or `runtime_package_changed`
-    /// when the definition is no longer the selected version of its package.
-    pub(super) async fn guard_package_launch(
-        &self,
-        definition: &host::RuntimeDefinition,
-    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, ProtocolError> {
-        let guard = self.inner.package_lifecycle.read().await;
-        self.inner
-            .profiles
-            .runtimes()
-            .verify_launchable(definition)?;
-        self.ensure_launch_is_current(definition).await?;
-        Ok(guard)
-    }
-
-    /// Verifies, under the shared lifecycle guard, that a launch resolved
-    /// before the guard was taken still launches the version that serves its
-    /// runtime now.
-    ///
-    /// A package selection commits under the exclusive guard after proving
-    /// that no referenced version is incompatible with the selected one, so a
-    /// launch that resolved the previously selected version and pinned it
-    /// after the selection would reference exactly such a version. A digest
-    /// that a host profile pins launches whatever is selected.
-    async fn ensure_launch_is_current(
-        &self,
-        definition: &host::RuntimeDefinition,
-    ) -> Result<(), ProtocolError> {
-        let BindingProvenance::Package {
-            package,
-            package_digest,
-        } = &definition.binding().provenance
-        else {
-            return Ok(());
-        };
-        let runtimes = self.inner.profiles.runtimes();
-        let Some(store) = runtimes.package_store() else {
-            return Ok(());
-        };
-        let incompatible = || ProtocolError::runtime_incompatible(definition.runtime_id());
-        let state = store.registry().state().map_err(|_error| incompatible())?;
-        if state.selected(&package.id) == Some(package_digest) {
-            return Ok(());
-        }
-        let profiles = self.inner.profiles.clone();
-        let pinned = tokio::task::spawn_blocking(move || profiles.pinned_digests())
-            .await
-            .map_err(|_error| incompatible())?
-            .map_err(|_error| incompatible())?;
-        if pinned.contains(package_digest) {
-            Ok(())
-        } else {
-            Err(ProtocolError::runtime_package_changed(
-                definition.runtime_id(),
-            ))
-        }
     }
 }
 
