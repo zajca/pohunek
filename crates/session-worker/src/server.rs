@@ -8001,8 +8001,9 @@ fn executable_is_named_for(
 /// The hook-helper role of a provider: the first argument of the process its
 /// launch process starts to run the provider's hooks.
 ///
-/// Codex 0.160.0 runs its hooks from `codex app-server ...`, a direct child of
-/// the launched `codex`, so that child speaks for the conversation. A provider
+/// Codex runs its hooks from `codex app-server ...`, a direct child of the
+/// launched `codex`, when its managed daemon is on (a session launched without
+/// `--no-daemon`), so that child speaks for the conversation. A provider
 /// without an entry has no such helper, and only its launch process may report.
 /// An independent same-provider child (a second `codex` or `claude` the launch
 /// process started) carries no helper argument, so it never qualifies.

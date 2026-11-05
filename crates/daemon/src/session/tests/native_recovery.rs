@@ -120,6 +120,21 @@ impl Rig {
 
     /// [`Rig::new`] for a session created with the display `name`.
     pub(super) async fn named(tag: &str, verified_launch: bool, name: Option<&str>) -> Self {
+        Self::build(tag, verified_launch, name, None).await
+    }
+
+    /// [`Rig::new`] for a session launched through a profile over `codex`
+    /// whose arguments are the fixture script followed by `extra_args`.
+    pub(super) async fn profiled(tag: &str, extra_args: &[&str]) -> Self {
+        Self::build(tag, true, None, Some(extra_args)).await
+    }
+
+    async fn build(
+        tag: &str,
+        verified_launch: bool,
+        name: Option<&str>,
+        profile_args: Option<&[&str]>,
+    ) -> Self {
         let dir = temp_dir(tag);
         let commands_path = dir.join("commands.fifo");
         let commands = hook_gate(&commands_path);
@@ -161,6 +176,26 @@ impl Rig {
             store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         };
+        let mut agent = "codex";
+        if let Some(extra_args) = profile_args {
+            let launch_args: Vec<String> = std::iter::once(script.display().to_string())
+                .chain(extra_args.iter().map(|arg| (*arg).to_owned()))
+                .collect();
+            let body = format!(
+                "base = \"codex\"\npackage = \"pohunek.runtime.codex\"\ndigest = \"{}\"\nprogram = {:?}\nargs = {:?}\n",
+                crate::agent::host::fixture::PACKAGE_DIGEST,
+                program.display().to_string(),
+                launch_args
+            );
+            let agents = temp_store_path(tag)
+                .parent()
+                .expect("store parent")
+                .join("agents");
+            fs::create_dir_all(&agents).expect("create agents dir");
+            fs::write(agents.join("codexprofile.toml"), body).expect("write profile");
+            config.agents_dir = Some(agents);
+            agent = "codexprofile";
+        }
         let (runtime_root, state_root) = test_worker_roots(&config);
         config.supervision = Some(crate::session::test_supervision(&runtime_root, &state_root));
         config.worker_runtime_root = Some(runtime_root.clone());
@@ -171,7 +206,7 @@ impl Rig {
         let registry = Self::registry(&config, &host, &launcher);
         let session = registry
             .create(SessionNewParams {
-                agent: "codex".to_owned(),
+                agent: agent.to_owned(),
                 name: name.map(str::to_owned),
                 cwd: Some(dir),
                 ..params()

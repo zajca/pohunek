@@ -730,7 +730,7 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
     wait_for_file_contains(&rig.marker, "--session\nconversation-cleared\n").await;
     assert_eq!(
         rig.launch_argv(1),
-        ["--model", "fast", "--session", "conversation-cleared"]
+        fast_argv("--session", "conversation-cleared")
     );
     rig.assert_held(
         &restarted,
@@ -745,7 +745,7 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
     wait_for_file_contains(&rig.marker, "--fork\nconversation-cleared\n").await;
     assert_eq!(
         rig.launch_argv(2),
-        ["--model", "fast", "--fork", "conversation-cleared"]
+        fast_argv("--fork", "conversation-cleared")
     );
     assert_eq!(
         forked.native_session_id, None,
@@ -883,7 +883,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
     wait_for_file_contains(&rig.marker, "--session\nconversation-two\n").await;
     assert_eq!(
         rig.launch_argv(1),
-        ["--model", "fast", "--session", "conversation-two"]
+        fast_argv("--session", "conversation-two")
     );
     rig.assert_held(
         &rig.registry,
@@ -897,10 +897,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         .await
         .expect("native fork");
     wait_for_file_contains(&rig.marker, "--fork\nconversation-two\n").await;
-    assert_eq!(
-        rig.launch_argv(2),
-        ["--model", "fast", "--fork", "conversation-two"]
-    );
+    assert_eq!(rig.launch_argv(2), fast_argv("--fork", "conversation-two"));
     rig.registry
         .stop(&forked.id)
         .await
@@ -1048,7 +1045,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
     wait_for_file_contains(&second.marker, "--session\nconversation-without-file\n").await;
     assert_eq!(
         second.launch_argv(1),
-        ["--session", "conversation-without-file"],
+        ["--no-daemon", "--session", "conversation-without-file"],
         "a profile recovers with its own args and the resume template"
     );
     second.finish(&second.registry).await;
@@ -1217,7 +1214,7 @@ async fn a_switch_below_a_wrapper_is_followed_through_the_verified_launch_proces
     wait_for_file_contains(&rig.marker, "--session\nconversation-below-wrapper\n").await;
     assert_eq!(
         rig.launch_argv(1),
-        ["--model", "fast", "--session", "conversation-below-wrapper"]
+        fast_argv("--session", "conversation-below-wrapper")
     );
     rig.finish(&rig.registry).await;
 }
@@ -1308,9 +1305,15 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
     rig.finish(&rig.registry).await;
 }
 
+/// The argv of a recovery launch of the fixture agent: its fixed `--model
+/// fast`, the handler's `--no-daemon`, the recovery `flag` and the reference.
+fn fast_argv<'a>(flag: &'a str, reference: &'a str) -> [&'a str; 5] {
+    ["--model", "fast", "--no-daemon", flag, reference]
+}
+
 /// Lines of a recovery launch the fixture agent records: `--model fast`, the
-/// recovery flag and the reference.
-const LAUNCH_ARGV_LINES: usize = 4;
+/// handler's `--no-daemon`, the recovery flag and the reference.
+const LAUNCH_ARGV_LINES: usize = 5;
 
 /// One step of a generated history of a session whose reference core assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1591,7 +1594,7 @@ async fn run_history(seed: u64, history: &[Step]) {
                 .await;
                 assert_eq!(
                     rig.launch_argv(before),
-                    ["--model", "fast", "--session", latest.as_str()],
+                    fast_argv("--session", latest.as_str()),
                     "resume uses the latest reference: {at}"
                 );
                 older.clear();
@@ -1609,7 +1612,7 @@ async fn run_history(seed: u64, history: &[Step]) {
                 .await;
                 assert_eq!(
                     rig.launch_argv(before),
-                    ["--model", "fast", "--session", latest.as_str()],
+                    fast_argv("--session", latest.as_str()),
                     "an ended session resumes the reference it switched to: {at}"
                 );
             }
@@ -1642,7 +1645,7 @@ async fn run_history(seed: u64, history: &[Step]) {
                     .await;
                     assert_eq!(
                         rig.launch_argv(before),
-                        ["--model", "fast", "--session", latest.as_str()],
+                        fast_argv("--session", latest.as_str()),
                         "recovery follows acceptance order: {at}"
                     );
                     older.clear();
@@ -1678,7 +1681,7 @@ async fn run_history(seed: u64, history: &[Step]) {
                 .await;
                 assert_eq!(
                     rig.launch_argv(before),
-                    ["--model", "fast", "--fork", latest.as_str()],
+                    fast_argv("--fork", latest.as_str()),
                     "fork uses the latest reference: {at}"
                 );
                 rig.registry

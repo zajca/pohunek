@@ -1724,10 +1724,10 @@ version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", bel
 four tokens) is the probe argv, and `[min, below)` is the supported release
 range, so a package update can move the range without a daemon release. The
 official packages declare `min` as their tested minimum (the verified release,
-except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release, and Codex and Claude, whose
+except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release, and Claude, whose
 `min` is the previous verified release, with its captures kept in the
-repository) and `below` as
-the next major release (codex `[0.160.0, 1.0.0)`, claude
+repository; Codex's `min` is the verified release) and `below` as
+the next major release (codex `[0.164.0, 1.0.0)`, claude
 `[2.1.289, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
 update the agent CLIs independently of pohunek. The
 declaration is rejected unless `args`, `min` and `below` are all present, `min`
@@ -1785,7 +1785,7 @@ without one). A program that does not resolve to an executable refuses the launc
 launched. Its message tells the cases apart without echoing probe output: a
 release outside the range names the parsed release and the declared
 `[min, below)` (`reports version 1.0.0, outside its runtime's supported range
-[0.160.0, 1.0.0)`); output that exits successfully but does not match the
+[0.164.0, 1.0.0)`); output that exits successfully but does not match the
 grammar says the output does not match the runtime's declared format; a
 failing or timed-out probe, or a parser id this daemon does not compile in,
 keeps the generic message. The first two carry a `recover` hint. `pohunek

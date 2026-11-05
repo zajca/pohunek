@@ -57,6 +57,7 @@ use super::{
     MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
+mod codex_no_daemon;
 mod conflict_cleanup;
 mod data_root_recovery;
 mod launch_input;
@@ -27177,7 +27178,7 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
             v0_33_0_fields: serde_json::json!({
                 "resume_mode": "subcommand", "ref_kind": "id", "resumable": true,
             }),
-            resume_argv: &["resume", "native-legacy"],
+            resume_argv: &["--no-daemon", "resume", "native-legacy"],
             fork_argv: None,
         },
         MigratedAgentCase {

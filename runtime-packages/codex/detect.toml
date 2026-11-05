@@ -104,6 +104,10 @@ all = [
   { line_regex = ['(?i)^\s*press esc to go back\s*$'] },
 ]
 
+# Codex shows this dialog when it attaches to a running managed daemon whose
+# feature settings differ from its own. A session launched with `--no-daemon`
+# attaches to none, so the dialog cannot appear there; the rule stays for a
+# Codex started without the flag, such as one launched by an older core.
 [[rules]]
 id = "startup_incompatible_settings_prompt"
 state = "blocked"

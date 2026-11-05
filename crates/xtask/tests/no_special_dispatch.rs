@@ -164,6 +164,8 @@ const ALLOW_LIST: &[Entry] = &[
     "Ok(Box::new(stage_claude(dir)?))",
     "Ok(Box::new(stage_codex(dir)?))",
     "Some(&CLAUDE_RETIRED)",
+    "Some(&CodexHook)",
+    "impl LaunchContributor for CodexHook {",
     "Some(&CODEX_RETIRED)",
     "StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS, CODEX_REPORTED_ACTIONS,",
     "actions: HERMES_REPORTED_ACTIONS,",

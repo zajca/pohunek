@@ -2,7 +2,7 @@
 type: Guide
 id: guide/codex-package
 title: Codex runtime package
-description: The official Codex runtime package source (Codex 0.x releases from 0.160.0, verified on 0.164.0), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
+description: The official Codex runtime package source (Codex 0.x releases from 0.164.0, verified on 0.164.0), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -84,16 +84,36 @@ copies of that descriptor and its detection manifest in
   terminal title or the screen. See
   [runtime packages](runtime-packages.md#declaring-input-readiness).
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
-  min = "0.160.0", below = "1.0.0", line = "codex-cli {version}" }`. `codex
+  min = "0.164.0", below = "1.0.0", line = "codex-cli {version}" }`. `codex
   --version` prints `codex-cli 0.164.0` on standard output; the probe reads only
   that first line, so the `WARNING: proceeding, even though we could not create
   PATH aliases` line Codex writes to standard error when its home is under a
   temporary directory is ignored. A pre-release (`codex-cli 0.161.0-rc.1`) or
-  any other wording is unsupported. The range is a lower bound: `min` is the
-  previous verified release, whose captures stay in `compat/codex/screens/n-1`,
-  and `below` is the next major, because hosts update the Codex CLI
+  any other wording is unsupported. The range is a lower bound: `min` is
+  the first release verified with `--no-daemon` (0.164.0; the captures of 0.160.0
+  stay in `compat/codex/screens/n-1` and `startup-dialogs` as screen regressions
+  for releases below `min`), and `below` is the next major, because hosts update the Codex CLI
   independently of pohunek and a refused launch breaks every Codex session.
   Releases above 0.164.0 are accepted by policy, not verified.
+- Launch arguments: `args = []`; the `codex-hook-v1` handler adds `--no-daemon`
+  to every launch as per-launch input (create, resume and fork), after the
+  frozen arguments and before the native resume arguments, so a relaunch runs
+  `codex <frozen args> --no-daemon resume <id>`. A frozen argument list that
+  already holds `--no-daemon` gets no second copy. Every Codex release in the
+  range auto-starts a managed app-server daemon per `CODEX_HOME` and attaches
+  later TUIs to it (measured on 0.164.0). A second Pohunek Codex session on the
+  same home would then run its hooks under the first session's daemon: they
+  carry the first session's `POHUNEK_WORKER_SOCKET_PATH`, the second session
+  gets no native reference, and stopping the first session ends the daemon and
+  strands the second at "Reconnecting to server...". With `--no-daemon` each
+  session's app-server runs inside its own TUI process and no `--managed-daemon`
+  process exists. The input is never stored in the launch snapshot, so every launch
+  of every session, profile sessions included, carries the flag. A launch whose
+  config home cannot be resolved (a relative or `~` `CODEX_HOME`, or no `HOME`)
+  is refused with `launch_input_unavailable`. A profile whose program is a
+  wrapper that treats the first argument as its own (`/bin/sh -c ...`) receives
+  the flag in that position, so the wrapper has to pass it on to `codex`. Needs a core release; the descriptor carries no
+  argument.
 - Native reference: `strategy = "hook"`; resume is `codex resume <id>`; fork is
   unsupported.
 - Integration: handler `codex-hook-v1` with hook schema `identity-subagent-v1`.
@@ -254,9 +274,11 @@ composer.
   [#1298](https://github.com/zajca/pohunek/issues/1298), awaiting owner scheduling.
   This package update changes the `pohunek.runtime.codex` digest; after release,
   host profiles pinned to the old digest are repinned during upgrade.
-- **Hooks run in a descendant process.** Codex 0.160.0 runs its hooks from a
+- **Hooks run in a descendant process.** Codex runs its hooks from a
   `codex app-server --listen unix:// --managed-daemon` process below the
-  launched `codex`: a direct child of the native binary, which is itself a child
+  launched `codex` when its managed daemon is on (a launch by a core release that
+  does not add `--no-daemon`); with the flag the hooks run from the TUI itself. The
+  rest of this item describes the daemon case: a direct child of the native binary, which is itself a child
   of the Node launcher an npm install starts. The session worker accepts a launch
   claim from the launch process itself and from the `codex app-server` helper
   (a process named for the provider, started directly by the launch process,
@@ -395,7 +417,7 @@ absence of egress).
 
 Update procedure for a new Codex release: install it from the locked npm tree,
 move the current captures to `compat/codex/screens/n-1` (the older set is
-deleted and `min` raised to the previous release), rerun the real-Codex tests,
+deleted), rerun the real-Codex tests,
 then recapture the screens and program-status sequences with
 `POHUNEK_CODEX_CAPTURE_DIR` set to the absolute path of `compat/codex/screens`
 (`POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test all -- --include-ignored

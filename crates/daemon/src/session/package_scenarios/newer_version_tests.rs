@@ -71,15 +71,15 @@ const CLAUDE: Kind = Kind {
 };
 
 /// Codex at the releases of the owner's host that motivated the range
-/// widening: the newer package accepts `codex-cli 0.162.1`.
+/// widening: the newer package accepts `codex-cli 0.166.1`.
 const CODEX: Kind = Kind {
     runtime: RuntimeId::CODEX,
     old_version: "1.1.0",
-    old_below: "0.161.0",
+    old_below: "0.165.0",
     new_version: "1.1.1",
     new_below: "1.0.0",
-    in_both: "0.160.5",
-    only_new: "0.162.1",
+    in_both: "0.164.5",
+    only_new: "0.166.1",
     version_line: "codex-cli {version}",
     home_env: "CODEX_HOME",
 };
