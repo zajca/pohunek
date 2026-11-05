@@ -2203,6 +2203,7 @@ const OFFLINE_FEATURES: &str =
     "plugins = false\nremote_plugin = false\nplugin_sharing = false\napps = false\nin_app_updates = false";
 
 /// The launch argument the Codex hook handler adds to every launch.
+#[cfg(target_os = "linux")]
 const NO_DAEMON: &str = "--no-daemon";
 
 /// The prompt the tests submit.
