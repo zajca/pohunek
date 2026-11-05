@@ -2202,6 +2202,9 @@ const PROFILE: &str = "codex-test";
 const OFFLINE_FEATURES: &str =
     "plugins = false\nremote_plugin = false\nplugin_sharing = false\napps = false\nin_app_updates = false";
 
+/// The launch argument the Codex hook handler adds to every launch.
+const NO_DAEMON: &str = "--no-daemon";
+
 /// The prompt the tests submit.
 const PROMPT: &str = "say hi";
 
@@ -3464,8 +3467,8 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
     }
 
     // The locked release and a later 0.x release, the one a host's Codex
-    // auto-update installed (`codex-cli 0.162.1`), both launch.
-    for (index, version) in [release.as_str(), "0.162.1"].into_iter().enumerate() {
+    // auto-update installed (`codex-cli 0.166.1`), both launch.
+    for (index, version) in [release.as_str(), "0.166.1"].into_iter().enumerate() {
         let profile = format!("fake-supported-{index}");
         let program = write_fake_codex(&root, &profile, &format!("codex-cli {version}"));
         fixture.write_profile(&profile, Some(&program));
@@ -3744,9 +3747,16 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
     for (directory, launch_line) in [
         (
             "dispatch-wrapper",
-            format!("exec {} {}", cwd.display(), dispatch_agent.display()),
+            format!(
+                "exec {} {} {NO_DAEMON}",
+                cwd.display(),
+                dispatch_agent.display()
+            ),
         ),
-        ("bridge-wrapper", bridge_agent.display().to_string()),
+        (
+            "bridge-wrapper",
+            format!("{} {NO_DAEMON}", bridge_agent.display()),
+        ),
     ] {
         let log = wait_until("the wrapper's launch argv entry", || async {
             let log = fs::read_to_string(wrapper_argv_log(&root, directory)).ok()?;
@@ -3796,8 +3806,13 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
         // can trail the resume command, so wait for the exact resume lines and
         // treat a missing or partially written log as pending.
         let resumed_line = match directory {
-            "dispatch-wrapper" => format!("exec {} {agent} resume {reference}", cwd.display()),
-            _ => format!("{agent} resume {reference}"),
+            "dispatch-wrapper" => {
+                format!(
+                    "exec {} {agent} {NO_DAEMON} resume {reference}",
+                    cwd.display()
+                )
+            }
+            _ => format!("{agent} {NO_DAEMON} resume {reference}"),
         };
         let log = wait_until("the wrapper's resume argv entry", || async {
             let log = fs::read_to_string(wrapper_argv_log(&root, directory)).ok()?;
@@ -3812,7 +3827,7 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
             "dispatch-wrapper" => "dispatch-agent",
             _ => "bridge-agent",
         };
-        let agent_resumed_line = format!("resume {reference}");
+        let agent_resumed_line = format!("{NO_DAEMON} resume {reference}");
         let agent_log = wait_until("the agent's resume argv entry", || async {
             let log = fs::read_to_string(root.join(format!("agent-{agent_directory}.log"))).ok()?;
             log.lines()

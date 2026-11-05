@@ -181,7 +181,7 @@ pub(crate) struct Driver {
     /// How the runtime reports its conversation id.
     pub(crate) integration: Integration,
     /// Whether the resumed process reports itself through the hook again.
-    /// Codex 0.160.0 registers no new reporter after a resume.
+    /// Codex registers no new reporter after a resume.
     pub(crate) reports_after_resume: bool,
     /// Writes the agent configuration below `env` and starts the stub.
     pub(crate) prepare: fn(&TestEnv) -> Prepared,

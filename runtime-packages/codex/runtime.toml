@@ -16,8 +16,7 @@ id = "codex"
 name = "Codex"
 program = "codex"
 # No launch arguments: the `codex-hook-v1` handler adds `--no-daemon` to every
-# launch (create, resume and fork), so profile sessions and sessions created
-# earlier get it too. Without it a second session on one CODEX_HOME would
+# launch (create, resume and fork), profile sessions included. Without it a second session on one CODEX_HOME would
 # attach to the first session's managed daemon and misattribute its hooks.
 args = []
 detect_manifest = "detect.toml"

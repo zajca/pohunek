@@ -106,10 +106,13 @@ copies of that descriptor and its detection manifest in
   carry the first session's `POHUNEK_WORKER_SOCKET_PATH`, the second session
   gets no native reference, and stopping the first session ends the daemon and
   strands the second at "Reconnecting to server...". With `--no-daemon` each
-  session's app-server is a child of its own TUI and no `--managed-daemon`
-  process exists. The input is never stored in the launch snapshot, so profile
-  sessions and sessions created before the handler contributed it get the flag
-  on their next launch too. Needs a core release; the descriptor carries no
+  session's app-server runs inside its own TUI process and no `--managed-daemon`
+  process exists. The input is never stored in the launch snapshot, so every launch
+  of every session, profile sessions included, carries the flag. A launch whose
+  config home cannot be resolved (a relative or `~` `CODEX_HOME`, or no `HOME`)
+  is refused with `launch_input_unavailable`. A profile whose program is a
+  wrapper that treats the first argument as its own (`/bin/sh -c ...`) receives
+  the flag in that position, so the wrapper has to pass it on to `codex`. Needs a core release; the descriptor carries no
   argument.
 - Native reference: `strategy = "hook"`; resume is `codex resume <id>`; fork is
   unsupported.

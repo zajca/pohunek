@@ -42,19 +42,19 @@ struct CodexHook;
 /// TUI. Without it every Codex session on one `CODEX_HOME` attaches to the
 /// first session's managed daemon, so its hooks carry the first session's
 /// environment and stopping the first session strands the others.
-const CODEX_NO_DAEMON_ARG: &str = "--no-daemon";
+const NO_DAEMON_ARG: &str = "--no-daemon";
 
 impl LaunchContributor for CodexHook {
-    /// Adds [`CODEX_NO_DAEMON_ARG`] to every launch unless the frozen
+    /// Adds [`NO_DAEMON_ARG`] to every launch unless the frozen
     /// arguments already carry it, so a profile that sets it itself is not
     /// given a second copy.
     fn contribute(&self, ctx: &LaunchInputContext<'_>) -> Result<LaunchInput, ProtocolError> {
-        let present = ctx.args.iter().any(|arg| arg == CODEX_NO_DAEMON_ARG);
+        let present = ctx.args.iter().any(|arg| arg == NO_DAEMON_ARG);
         Ok(LaunchInput {
             root_args: if present {
                 Vec::new()
             } else {
-                vec![CODEX_NO_DAEMON_ARG.to_owned()]
+                vec![NO_DAEMON_ARG.to_owned()]
             },
             ..LaunchInput::default()
         })

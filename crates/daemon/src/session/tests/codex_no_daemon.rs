@@ -68,7 +68,7 @@ async fn a_plain_codex_session_gets_the_flag_on_create_and_on_every_resume_exact
     let record = format!("{:?}", rig.durable_record());
     assert!(
         !record.contains(FLAG),
-        "the stored launch snapshot holds no flag, so a session created before the handler contributed it resumes with it: {record}"
+        "the stored launch snapshot holds no flag; the flag is added at launch: {record}"
     );
     rig.remove().await;
 }
