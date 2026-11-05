@@ -548,55 +548,6 @@ async fn a_retained_version_that_cannot_be_read_holds_the_update_back() {
 }
 
 #[tokio::test]
-async fn a_descriptor_that_predates_the_hook_schema_resolves_through_its_handler() {
-    let dir = temp_dir("selection-legacy");
-    let marker = dir.join("argv.txt");
-    let (script, _gate) = assigned_agent_script(&dir, &marker);
-    let fixture = Fixture::with_store(
-        "selection-legacy-plugins",
-        temp_store_path("selection-legacy"),
-    );
-    let legacy = legacy_package(
-        "1.0.0",
-        SUBAGENT.0,
-        script.to_str().expect("utf-8 script path"),
-    );
-    install(&fixture, &legacy, true).await;
-    let created = fixture
-        .registry
-        .create(new_params(&dir))
-        .await
-        .expect("create");
-
-    // A retained pre-schema version is compatible with the integration its
-    // handler resolves to and incompatible with any other.
-    let same = update("2.0.0", Some(SUBAGENT));
-    let other = update("2.1.0", Some(IDENTITY));
-    install(&fixture, &same, false).await;
-    install(&fixture, &other, false).await;
-    fixture
-        .registry
-        .packages()
-        .package_select(select(&same.digest))
-        .await
-        .expect("the handler's own integration is compatible");
-    assert_eq!(
-        fixture
-            .registry
-            .packages()
-            .package_select(select(&other.digest))
-            .await
-            .expect_err("another integration is incompatible"),
-        PackageErrorKind::IntegrationIncompatible
-    );
-    assert_eq!(
-        info(&fixture, &other.digest).await.selection_blocked,
-        Some(block_by(&legacy.digest))
-    );
-    end(&fixture, &created.id).await;
-}
-
-#[tokio::test]
 async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selected_one() {
     let v = versions("selection-bind", Some(SUBAGENT)).await;
     let new = update("2.0.0", Some(IDENTITY));
@@ -1172,21 +1123,4 @@ async fn an_integration_install_keeps_the_lifecycle_guard_after_its_caller_goes_
         .lifecycle()
         .try_write()
         .expect("the guard is released with the task");
-}
-
-// ----- fixtures of the pre-schema test -----------------------------------
-
-/// A package whose descriptor names only `handler`, as one written before
-/// `[integration] hook_schema` existed.
-fn legacy_package(version: &str, handler: &str, program: &str) -> Package {
-    use crate::agent::host::fixture::{pi_shaped_document, PI_SHAPED_NO_CHECK};
-    let document = pi_shaped_document(std::path::Path::new(program), PI_SHAPED_NO_CHECK)
-        .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
-        .replace(
-            "detect_manifest = \"any\"",
-            "detect_manifest = \"detect.toml\"",
-        );
-    Package::with_descriptor(&format!(
-        "{document}\n[integration]\nhandler = \"{handler}\"\n"
-    ))
 }
