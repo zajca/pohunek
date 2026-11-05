@@ -743,6 +743,25 @@ impl VersionProbe {
         self.line_of_release(&self.min)
     }
 
+    /// The line this probe's grammar prints for the lowest release both this
+    /// probe and `other` accept, so one fake agent runs under either package.
+    fn lowest_line_accepted_with(&self, other: &Self) -> String {
+        let version = if release_order(&self.min, &other.min) == std::cmp::Ordering::Less {
+            &other.min
+        } else {
+            &self.min
+        };
+        assert!(
+            self.accepts(version) && other.accepts(version),
+            "the probes accept no common release: {} .. {} and {} .. {}",
+            self.min,
+            self.below,
+            other.min,
+            other.below
+        );
+        self.line_of_release(version)
+    }
+
     /// Whether the probe accepts release `version`: `min <= version < below`.
     fn accepts(&self, version: &str) -> bool {
         release_order(&self.min, version) != std::cmp::Ordering::Greater
@@ -1610,8 +1629,14 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         // it installed, which may differ from the head's.
         write_agent_scripts(
             &run,
-            &claude.descriptor.probe.lowest_line(),
-            &codex.descriptor.probe.lowest_line(),
+            &claude
+                .descriptor
+                .probe
+                .lowest_line_accepted_with(&packages.claude.descriptor.probe),
+            &codex
+                .descriptor
+                .probe
+                .lowest_line_accepted_with(&packages.codex.descriptor.probe),
         );
     }
     eprintln!("previous release starts on {start:?}");

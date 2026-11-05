@@ -144,7 +144,7 @@ impl SessionRegistry {
                             ErrorClass::Runtime,
                             LAUNCH_INPUT_UNAVAILABLE_CODE,
                             format!("the runtime's config home cannot be resolved: {error}"),
-                            None,
+                            Some(String::from("set the runtime's config home variable (for example CODEX_HOME) to an absolute path, or set HOME")),
                         )
                     })?,
             ),
