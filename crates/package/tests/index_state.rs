@@ -382,6 +382,11 @@ fn the_state_file_must_be_an_owner_private_regular_file() {
 
     set_mode(&state_file(&fixture), 0o644);
     assert_eq!(registry.index_state().unwrap_err(), RegistryError::Unsafe);
+    assert_eq!(
+        registry.record_index(&verified(9, 9, &[])).unwrap_err(),
+        RegistryError::Unsafe
+    );
+    assert_eq!(registry.index_state().unwrap_err(), RegistryError::Unsafe);
     set_mode(&state_file(&fixture), 0o600);
     registry.index_state().unwrap();
 
@@ -542,6 +547,39 @@ fn concurrent_writers_lose_no_update() {
     // A writer that ran after a higher sequence was stored is ignored, so
     // only the highest document's revocations are guaranteed.
     assert!(state.revoked_key_ids.contains(&key_id("writer-8")));
+    assert!(state
+        .revoked_key_ids
+        .iter()
+        .all(|id| labels.iter().any(|label| &key_id(label) == id)));
+}
+
+#[test]
+fn concurrent_writers_with_one_sequence_lose_no_revoked_id() {
+    const WRITERS: u64 = 8;
+    let fixture = PluginFixture::new();
+    fixture.open();
+    let labels: Vec<String> = (1..=WRITERS).map(|n| format!("same-{n}")).collect();
+    let documents: Vec<VerifiedIndex> = labels
+        .iter()
+        .map(|label| verified(5, 1, &[label.as_str()]))
+        .collect();
+
+    std::thread::scope(|scope| {
+        for document in &documents {
+            let fixture = &fixture;
+            scope.spawn(move || {
+                let registry = fixture.open();
+                until_unlocked(|| registry.record_index(document));
+            });
+        }
+    });
+
+    let state = fixture.open().index_state().unwrap();
+    assert_eq!(state.index_high_water, Some(BASE + 5));
+    assert_eq!(
+        state.revoked_key_ids,
+        labels.iter().map(|label| key_id(label)).collect()
+    );
 }
 
 // --- W2-2.T3: the channel file ---------------------------------------------------
@@ -647,6 +685,9 @@ fn a_malformed_channel_is_refused_before_it_is_interpreted() {
         parse_index_channel(&vec![b' '; MAX_INDEX_CHANNEL_BYTES + 1]).unwrap_err(),
         IndexChannelError::TooLarge
     );
+    let mut padded = channel_text("endorser-root").into_bytes();
+    padded.resize(MAX_INDEX_CHANNEL_BYTES, b' ');
+    parse_index_channel(&padded).expect("a document of exactly the limit parses");
     assert_eq!(channel_error("{ not json"), IndexChannelError::Syntax);
     assert_eq!(channel_error(""), IndexChannelError::Syntax);
     assert_eq!(
