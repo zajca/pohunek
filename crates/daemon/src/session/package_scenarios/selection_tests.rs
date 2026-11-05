@@ -16,8 +16,8 @@ use protocol::{
     PackageUninstallParams,
 };
 
-use super::selection::{Declared, Integration, Integrations};
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
+use crate::packages::selection::{Declared, Integration, Integrations};
 use crate::session::tests::{
     assigned_agent_script, exit_settled, params, temp_dir, temp_store_path,
 };
@@ -82,6 +82,7 @@ async fn install(
     let path = fixture.write_archive(package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, package, true, select))
         .await
         .expect("install")
@@ -111,6 +112,7 @@ fn new_params(dir: &std::path::Path) -> protocol::SessionNewParams {
 async fn info(fixture: &Fixture, digest: &PackageDigest) -> PackageInfo {
     fixture
         .registry
+        .packages()
         .package_inspect(digest.clone())
         .await
         .expect("inspect")
@@ -131,7 +133,12 @@ async fn end(fixture: &Fixture, id: &protocol::SessionId) {
 /// in the list, the inspection and the doctor report, and that selecting it
 /// is refused without changing anything.
 async fn assert_held_back(fixture: &Fixture, candidate: &Package, old: &Package) {
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     let entry = listed
         .packages
         .iter()
@@ -151,7 +158,12 @@ async fn assert_held_back(fixture: &Fixture, candidate: &Package, old: &Package)
     assert!(selected.selected, "the old version stays selected");
     assert_eq!(selected.selection_blocked, None);
 
-    let doctor = fixture.registry.package_doctor(None).await.expect("doctor");
+    let doctor = fixture
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
     let finding = doctor
         .findings
         .iter()
@@ -165,6 +177,7 @@ async fn assert_held_back(fixture: &Fixture, candidate: &Package, old: &Package)
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_select(select(&candidate.digest))
             .await
             .expect_err("an incompatible package is not selected"),
@@ -192,6 +205,7 @@ async fn assert_selectable_then_select(fixture: &Fixture, candidate: &Package, o
     );
     fixture
         .registry
+        .packages()
         .package_select(select(&candidate.digest))
         .await
         .expect("selectable once the reference is gone");
@@ -292,6 +306,7 @@ async fn an_integration_install_refused_under_an_unreadable_store_record_names_t
 
     v.fixture
         .registry
+        .packages()
         .integration_install(refuse)
         .await
         .expect_err("the work refuses");
@@ -310,6 +325,7 @@ async fn an_integration_install_refused_under_an_unreadable_store_record_names_t
     drop(store);
     v.fixture
         .registry
+        .packages()
         .integration_install(refuse)
         .await
         .expect_err("the work refuses");
@@ -339,6 +355,7 @@ async fn a_dry_run_install_reports_the_withheld_selection() {
     let preview = v
         .fixture
         .registry
+        .packages()
         .package_install(request)
         .await
         .expect("preview");
@@ -414,6 +431,7 @@ async fn uninstalling_the_old_version_releases_the_update_without_selecting_it()
 
     v.fixture
         .registry
+        .packages()
         .package_uninstall(PackageUninstallParams {
             digest: v.old.digest.clone(),
             remove_modified: false,
@@ -429,6 +447,7 @@ async fn uninstalling_the_old_version_releases_the_update_without_selecting_it()
     );
     v.fixture
         .registry
+        .packages()
         .package_select(select(&new.digest))
         .await
         .expect("select");
@@ -463,6 +482,7 @@ async fn a_compatible_update_selects_normally_while_the_old_version_is_in_use() 
 
     v.fixture
         .registry
+        .packages()
         .package_select(select(&v.old.digest))
         .await
         .expect("selecting back is compatible too");
@@ -516,6 +536,7 @@ async fn a_retained_version_that_cannot_be_read_holds_the_update_back() {
     assert_eq!(
         v.fixture
             .registry
+            .packages()
             .package_select(select(&new.digest))
             .await
             .expect_err("the retained version's integration is unknown"),
@@ -549,7 +570,11 @@ async fn a_descriptor_that_predates_the_hook_schema_resolves_through_its_handler
             .expect("install the pre-schema package");
     }
     let state = registry.state().expect("state");
-    let context = fixture.registry.package_context().expect("context");
+    let context = fixture
+        .registry
+        .package_authority()
+        .context()
+        .expect("context");
     let mut integrations = Integrations::default();
 
     let resolved = integrations_of(&mut integrations, &context, &state, &legacy.digest);
@@ -568,24 +593,24 @@ async fn a_descriptor_that_predates_the_hook_schema_resolves_through_its_handler
     let retained = RetainedDigests::from_iter([legacy.digest.clone()]);
     let candidate = fixture_record(&fixture, &current);
     assert_eq!(
-        super::selection::conflict(
+        crate::packages::selection::conflict(
             &context,
             &state,
             &retained,
             (&candidate.0, &candidate.1),
-            &super::selection::declared_by(&candidate.2),
+            &crate::packages::selection::declared_by(&candidate.2),
         ),
         None
     );
     let other = update("2.1.0", Some(IDENTITY));
     let other = fixture_record(&fixture, &other);
     assert_eq!(
-        super::selection::conflict(
+        crate::packages::selection::conflict(
             &context,
             &state,
             &retained,
             (&other.0, &other.1),
-            &super::selection::declared_by(&other.2),
+            &crate::packages::selection::declared_by(&other.2),
         ),
         Some(legacy.digest)
     );
@@ -603,6 +628,7 @@ async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selec
         assert_eq!(
             v.fixture
                 .registry
+                .packages()
                 .package_bind_profile(PackageBindProfileParams {
                     expected_previous: None,
                     profile: "work".to_owned(),
@@ -618,6 +644,7 @@ async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selec
     }
     v.fixture
         .registry
+        .packages()
         .package_bind_profile(PackageBindProfileParams {
             expected_previous: None,
             profile: "work".to_owned(),
@@ -652,6 +679,7 @@ async fn profiles_cannot_pin_incompatible_versions_even_when_none_is_selected() 
 
     fixture
         .registry
+        .packages()
         .package_bind_profile(bind_to("first", &old.digest))
         .await
         .expect("the first pin has nothing to conflict with");
@@ -662,6 +690,7 @@ async fn profiles_cannot_pin_incompatible_versions_even_when_none_is_selected() 
         assert_eq!(
             fixture
                 .registry
+                .packages()
                 .package_bind_profile(request)
                 .await
                 .expect_err("the other pin is an incompatible referenced version"),
@@ -675,6 +704,7 @@ async fn profiles_cannot_pin_incompatible_versions_even_when_none_is_selected() 
     );
     fixture
         .registry
+        .packages()
         .package_bind_profile(bind_to("third", &old.digest))
         .await
         .expect("a compatible pin of the same version");
@@ -684,6 +714,7 @@ async fn profiles_cannot_pin_incompatible_versions_even_when_none_is_selected() 
     assert_eq!(
         fixture
             .registry
+            .packages()
             .package_bind_profile(bind_to("first", &new.digest))
             .await
             .expect_err("another profile still pins the old version"),
@@ -692,6 +723,7 @@ async fn profiles_cannot_pin_incompatible_versions_even_when_none_is_selected() 
     fs::remove_file(fixture.agents.join("third.toml")).expect("drop the other pin");
     fixture
         .registry
+        .packages()
         .package_bind_profile(bind_to("first", &new.digest))
         .await
         .expect("the replaced pin does not count against itself");
@@ -750,6 +782,7 @@ async fn activate_integration(
     let dir = dir.to_path_buf();
     fixture
         .registry
+        .packages()
         .integration_install(move |retained| {
             let mut env = ProcessEnv::lock();
             env.set(crate::integration::CODEX_HOME_ENV, &dir);
@@ -995,7 +1028,8 @@ async fn race_once(tag: &str) {
     let new = update("2.0.0", Some(IDENTITY));
     install(&v.fixture, &new, false).await;
     let launch = v.fixture.registry.create(new_params(&v.dir));
-    let choose = v.fixture.registry.package_select(select(&new.digest));
+    let packages = v.fixture.registry.packages();
+    let choose = packages.package_select(select(&new.digest));
     let (launch, chosen) = tokio::join!(launch, choose);
 
     let retained = v
@@ -1061,6 +1095,7 @@ async fn the_integration_update_path_sees_the_schemas_of_retained_versions() {
         let registry = registry.clone();
         async move {
             registry
+                .packages()
                 .integration_install(|retained| {
                     Ok((
                         retained
@@ -1097,6 +1132,7 @@ async fn an_integration_install_keeps_the_lifecycle_guard_after_its_caller_goes_
         let registry = registry.clone();
         async move {
             registry
+                .packages()
                 .integration_install(move |_retained| {
                     entered_tx.send(()).expect("announce the activation");
                     release_rx.recv().expect("wait for the release");
@@ -1113,20 +1149,21 @@ async fn an_integration_install_keeps_the_lifecycle_guard_after_its_caller_goes_
     caller.abort();
     assert!(caller.await.expect_err("aborted").is_cancelled());
     assert!(
-        registry.inner.package_lifecycle.try_write().is_err(),
+        registry.inner.packages.lifecycle().try_write().is_err(),
         "the install task still owns the shared guard"
     );
 
     let selecting = tokio::spawn({
         let registry = registry.clone();
         let digest = new.digest.clone();
-        async move { registry.package_select(select(&digest)).await }
+        async move { registry.packages().package_select(select(&digest)).await }
     });
     let uninstalling = tokio::spawn({
         let registry = registry.clone();
         let digest = new.digest.clone();
         async move {
             registry
+                .packages()
                 .package_uninstall(PackageUninstallParams {
                     digest,
                     remove_modified: false,
@@ -1151,7 +1188,8 @@ async fn an_integration_install_keeps_the_lifecycle_guard_after_its_caller_goes_
     );
     let _free = registry
         .inner
-        .package_lifecycle
+        .packages
+        .lifecycle()
         .try_write()
         .expect("the guard is released with the task");
 }
@@ -1197,7 +1235,7 @@ fn identity_of(package: &Package) -> protocol::PackageIdentity {
 
 fn integrations_of(
     integrations: &mut Integrations,
-    context: &super::Context,
+    context: &crate::packages::Context,
     state: &package::registry::RegistryState,
     digest: &PackageDigest,
 ) -> Integration {

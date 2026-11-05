@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
 use protocol::{PackageInstallParams, PackageTrust, RuntimeId};
 
-use super::HostTrustAnchor;
 use crate::agent::host::fixture::{pi_shaped_document, PI_SHAPED_NO_CHECK};
 use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
 use crate::catalog_anchor::CatalogTrust;
+use crate::packages::HostTrustAnchor;
 use crate::session::tests::{hermetic_shell, temp_dir};
 use crate::session::{SessionRegistry, SessionRegistryConfig};
 

@@ -68,6 +68,7 @@ async fn a_commands_only_package_is_reviewed_installed_and_serves_no_runtime() {
     review.dry_run = true;
     let preview = fixture
         .registry
+        .packages()
         .package_install(review)
         .await
         .expect("preview");
@@ -84,6 +85,7 @@ async fn a_commands_only_package_is_reviewed_installed_and_serves_no_runtime() {
 
     let installed = fixture
         .registry
+        .packages()
         .package_install(accepted(&path, &package, true, true))
         .await
         .expect("install");
@@ -123,6 +125,7 @@ async fn a_command_exposure_defaults_to_local() {
 
     let installed = fixture
         .registry
+        .packages()
         .package_install(accepted(&path, &package, false, false))
         .await
         .expect("install");
@@ -202,6 +205,7 @@ async fn an_invalid_command_export_is_refused_before_anything_is_recorded() {
         let path = fixture.write_archive(&package);
         let refusal = fixture
             .registry
+            .packages()
             .package_install(accepted(&path, &package, true, true))
             .await
             .expect_err(label);
@@ -231,6 +235,7 @@ async fn commands_need_the_package_commands_feature() {
         let path = fixture.write_archive(&package);
         let refusal = fixture
             .registry
+            .packages()
             .package_install(accepted(&path, &package, true, true))
             .await
             .expect_err(label);
@@ -280,6 +285,7 @@ async fn a_schema_fault_is_reported_before_a_missing_feature_requirement() {
         let path = fixture.write_archive(package);
         let refusal = fixture
             .registry
+            .packages()
             .package_install(accepted(&path, package, true, true))
             .await
             .expect_err(label);
@@ -313,6 +319,7 @@ async fn a_linked_directory_keeps_the_program_rules() {
 
     let installed = fixture
         .registry
+        .packages()
         .package_link(link(false))
         .await
         .expect("link");
@@ -327,6 +334,7 @@ async fn a_linked_directory_keeps_the_program_rules() {
     let before = fixture.snapshot();
     fixture
         .registry
+        .packages()
         .package_link(link(false))
         .await
         .expect_err("a symbolic link is refused");
@@ -342,6 +350,7 @@ async fn a_commands_only_package_follows_the_lifecycle_of_a_runtime_package() {
         let path = fixture.write_archive(package);
         fixture
             .registry
+            .packages()
             .package_install(accepted(&path, package, false, false))
             .await
             .expect("install");
@@ -349,12 +358,14 @@ async fn a_commands_only_package_follows_the_lifecycle_of_a_runtime_package() {
 
     let enabled = fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&first.digest, true))
         .await
         .expect("enable");
     assert!(enabled.package.enabled && !enabled.package.selected);
     let selected = fixture
         .registry
+        .packages()
         .package_select(select(&first.digest))
         .await
         .expect("select");
@@ -364,17 +375,24 @@ async fn a_commands_only_package_follows_the_lifecycle_of_a_runtime_package() {
     // conflict between two packages that declare none.
     fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&second.digest, true))
         .await
         .expect("enable the second version");
     let moved = fixture
         .registry
+        .packages()
         .package_select(select(&second.digest))
         .await
         .expect("select the second version");
     assert!(moved.package.selected);
 
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert_eq!(listed.packages.len(), 2);
     for info in &listed.packages {
         assert_eq!(info.fault, None, "{info:?}");
@@ -383,16 +401,23 @@ async fn a_commands_only_package_follows_the_lifecycle_of_a_runtime_package() {
     }
     let inspected = fixture
         .registry
+        .packages()
         .package_inspect(second.digest.clone())
         .await
         .expect("inspect");
     assert_eq!(inspected.runtime, None);
     assert_eq!(inspected.package.fault, None);
-    let doctor = fixture.registry.package_doctor(None).await.expect("doctor");
+    let doctor = fixture
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
     assert!(doctor.findings.is_empty(), "{:?}", doctor.findings);
 
     let disabled = fixture
         .registry
+        .packages()
         .package_set_enabled(enable(&second.digest, false))
         .await
         .expect("disable");
@@ -401,11 +426,17 @@ async fn a_commands_only_package_follows_the_lifecycle_of_a_runtime_package() {
     for package in [&first, &second] {
         fixture
             .registry
+            .packages()
             .package_uninstall(uninstall(&package.digest))
             .await
             .expect("uninstall");
     }
-    let listed = fixture.registry.package_list().await.expect("list");
+    let listed = fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list");
     assert!(listed.packages.is_empty());
 }
 
@@ -427,6 +458,7 @@ async fn a_package_exporting_both_launches_sessions_and_carries_its_commands() {
 
     let installed = fixture
         .registry
+        .packages()
         .package_install(accepted(&path, &package, true, true))
         .await
         .expect("install");
@@ -480,6 +512,7 @@ async fn a_request_without_the_opt_in_is_refused_for_every_package_that_declares
         for dry_run in [true, false] {
             let refusal = fixture
                 .registry
+                .packages()
                 .package_install(protocol::PackageInstallParams {
                     dry_run,
                     ..explicit(&path, package, true, true)
@@ -496,6 +529,7 @@ async fn a_request_without_the_opt_in_is_refused_for_every_package_that_declares
         let path = fixture.write_archive(package);
         let installed = fixture
             .registry
+            .packages()
             .package_install(accepted(&path, package, true, true))
             .await
             .expect("an opted-in request installs");
@@ -520,6 +554,7 @@ async fn a_request_without_the_opt_in_is_refused_for_every_package_that_declares
         for dry_run in [true, false] {
             let refusal = fixture
                 .registry
+                .packages()
                 .package_link(PackageLinkParams {
                     directory: directory.to_str().expect("utf-8 path").to_owned(),
                     dry_run,
@@ -553,6 +588,7 @@ async fn a_catalog_cannot_authorize_a_package_that_exports_commands_only() {
     for dry_run in [true, false] {
         let refusal = fixture
             .registry
+            .packages()
             .package_install(protocol::PackageInstallParams {
                 accept_commands: true,
                 ..catalog_install(&fixture, &package, &document, dry_run)
@@ -580,6 +616,7 @@ async fn a_catalog_cannot_authorize_a_package_that_exports_commands_only() {
     for dry_run in [true, false] {
         let refusal = fixture
             .registry
+            .packages()
             .package_install(protocol::PackageInstallParams {
                 accept_commands: true,
                 ..catalog_install(&fixture, &both, &document, dry_run)

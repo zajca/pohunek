@@ -104,7 +104,7 @@ pub(super) struct PtySessionSpec {
     pub(super) prompt_in_argv: bool,
     /// Shared package authority a launch holds until its registration ends,
     /// for launches that pin a package outside the create transaction.
-    pub(super) package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    pub(super) package_authority: Option<crate::packages::OwnedLaunchGuard>,
 }
 
 /// The canonical form of `path` when it is an absolute path of an existing
@@ -582,9 +582,17 @@ impl SessionRegistry {
             })
     }
 
-    /// What this registry trusts to authorize official packages.
-    pub(crate) fn catalog_trust(&self) -> &crate::catalog_anchor::CatalogTrust {
-        &self.inner.config.catalog_trust
+    /// The owner of the package lifecycle and of the trust that authorizes
+    /// official packages.
+    pub(crate) fn package_authority(&self) -> &Arc<crate::packages::PackageAuthority> {
+        &self.inner.packages
+    }
+
+    /// The `package.*` methods and the integration install, run against this
+    /// registry's sessions and profiles.
+    #[must_use]
+    pub fn packages(&self) -> crate::packages::PackageService {
+        self.inner.packages.service(self.clone())
     }
 
     /// Returns the lifecycle engine, or `worker_backend_required` when this

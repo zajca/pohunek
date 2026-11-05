@@ -668,13 +668,13 @@ Runtime package archive format:
 - `crates/daemon/src/agent/host/package.rs` — package-backed runtime loading and pin resolution.
 - `crates/daemon/src/agent/host/handle.rs` — runtime host snapshot, reload and launch verification.
 - `crates/package/src/version_probe.rs` — the `semver-v1` and `semver-line-v1` data-driven version probe policy (probe argv, `[min, below)` release range, the `line` output template and the out-of-range or unparseable refusal), shared by the daemon launch gate and the CLI Hermes integration gate.
-- `crates/daemon/src/session/packages.rs` — reload and retention-checked uninstall.
+- `crates/daemon/src/packages/retention.rs` — retention-checked uninstall; `crates/daemon/src/session/package_pins.rs` — the digests live sessions pin and the adopted-session refresh after a reload.
 - `crates/package/src/hash.rs` — SHA-256 helpers.
 - `crates/package/src/directory.rs` — directory-to-archive builder behind `plugin link` and `cargo xtask package build`.
 - `crates/package/src/catalog_state.rs` — persisted catalog high-water mark and revoked key ids.
-- `crates/daemon/src/session/package_lifecycle/` — the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload, and the compatibility-gated selection (`selection.rs`).
-- `crates/daemon/src/session/package_lifecycle/trust.rs` — catalog verification against the host anchor and persisted high-water mark, and the official entry, core version and platform checks (`package_untrusted`, `package_incompatible`).
-- `crates/daemon/src/session/package_lifecycle/fault.rs` — the mapping of root and descriptor failures to the `plugin doctor` fault kinds.
+- `crates/daemon/src/packages/` — the package authority (`authority.rs`: lifecycle lock, trust, launch guard) and the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload, and the compatibility-gated selection (`selection.rs`).
+- `crates/daemon/src/packages/trust.rs` — catalog verification against the host anchor and persisted high-water mark, and the official entry, core version and platform checks (`package_untrusted`, `package_incompatible`).
+- `crates/daemon/src/packages/fault.rs` — the mapping of root and descriptor failures to the `plugin doctor` fault kinds.
 - `crates/daemon/src/agent/host/claim.rs` — which package may serve which runtime id.
 - `crates/daemon/src/agent/host/config_home.rs` — the `[config_home]` descriptor declaration and the one resolver of a runtime's config directory.
 - `crates/daemon/src/agent/host/transcripts.rs` — the `[transcripts]` descriptor declaration: transcript tree below the config home or a root of its own (`root_env`/`root_home`), the walk depth and the compiled parser id.

@@ -22,9 +22,9 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
-use super::trust::host_platform;
-use super::HostTrustAnchor;
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
+use crate::packages::trust::host_platform;
+use crate::packages::HostTrustAnchor;
 
 /// Start of every signing window: the first second after the epoch.
 const WINDOW_START: u64 = 1;
@@ -195,6 +195,7 @@ async fn a_host_without_a_trust_anchor_fails_closed() {
 
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &package, &document, false))
         .await
         .expect_err("no anchor");
@@ -216,6 +217,7 @@ async fn an_untrusted_anchor_fails_closed_with_its_own_diagnostic() {
     for dry_run in [true, false] {
         let refused = fixture
             .registry
+            .packages()
             .package_install(catalog_install(&fixture, &package, &document, dry_run))
             .await
             .expect_err("an untrusted anchor authorizes nothing");
@@ -235,6 +237,7 @@ async fn an_untrusted_anchor_does_not_affect_explicit_digest_installs() {
     let path = fixture.write_archive(&package);
     fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, true, true))
         .await
         .expect("local trust needs no anchor");
@@ -249,6 +252,7 @@ async fn a_signed_catalog_installs_an_official_package_and_persists_its_sequence
 
     let installed = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &package, &document, false))
         .await
         .expect("official install");
@@ -268,6 +272,7 @@ async fn a_catalog_dry_run_records_nothing() {
 
     let preview = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &package, &document, true))
         .await
         .expect("preview");
@@ -276,6 +281,7 @@ async fn a_catalog_dry_run_records_nothing() {
     assert_eq!(state(&fixture).high_water(), None);
     assert!(fixture
         .registry
+        .packages()
         .package_list()
         .await
         .expect("list")
@@ -292,6 +298,7 @@ async fn an_explicit_digest_never_yields_an_official_package() {
 
     let installed = fixture
         .registry
+        .packages()
         .package_install(explicit(&path, &package, true, true))
         .await
         .expect("explicit install");
@@ -340,6 +347,7 @@ async fn catalogs_that_do_not_verify_install_nothing() {
     for (name, document) in cases {
         let refused = fixture
             .registry
+            .packages()
             .package_install(catalog_install(&fixture, &package, &document, false))
             .await
             .expect_err(name);
@@ -361,6 +369,7 @@ async fn a_signer_the_anchor_revokes_is_refused() {
 
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &package, &document, false))
         .await
         .expect_err("revoked signer");
@@ -376,6 +385,7 @@ async fn an_older_catalog_is_refused_after_a_newer_one_was_used() {
     let second = Package::build("acme.runtime.two", "1.0.0", "two", INERT_PROGRAM);
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(
             &fixture,
             &first,
@@ -391,6 +401,7 @@ async fn an_older_catalog_is_refused_after_a_newer_one_was_used() {
 
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &second, &stale, false))
         .await
         .expect_err("stale sequence");
@@ -414,6 +425,7 @@ async fn a_key_an_earlier_catalog_revoked_stays_revoked() {
     revoking.revoked_key_ids = vec![key_id(&second_key)];
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(
             &fixture,
             &one,
@@ -434,6 +446,7 @@ async fn a_key_an_earlier_catalog_revoked_stays_revoked() {
     };
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &two, &later(&second_key), false))
         .await
         .expect_err("the revoked key no longer signs");
@@ -441,6 +454,7 @@ async fn a_key_an_earlier_catalog_revoked_stays_revoked() {
 
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(&fixture, &two, &later(&first_key), false))
         .await
         .expect("the surviving key still signs");
@@ -461,6 +475,7 @@ async fn an_entry_for_another_core_or_platform_is_incompatible() {
         let document = signed_by(&key, catalog(5, vec![entry]));
         let refused = fixture
             .registry
+            .packages()
             .package_install(catalog_install(&fixture, &package, &document, false))
             .await
             .expect_err(name);
@@ -482,6 +497,7 @@ async fn unreadable_catalog_and_archive_paths_are_source_errors() {
     ] {
         let refused = fixture
             .registry
+            .packages()
             .package_install(PackageInstallParams {
                 archive_path: archive.clone(),
                 trust: PackageTrust::Catalog { catalog_path },
@@ -516,6 +532,7 @@ async fn a_failed_trust_state_write_installs_enables_and_reloads_nothing() {
     first.revoked_key_ids = revoked_ids("first", 40);
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(
             &fixture,
             &one,
@@ -533,6 +550,7 @@ async fn a_failed_trust_state_write_installs_enables_and_reloads_nothing() {
 
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(
             &fixture,
             &two,
@@ -563,6 +581,7 @@ async fn trust_state_is_persisted_before_a_package_that_then_fails_to_install() 
     let package = Package::pi();
     fixture
         .registry
+        .packages()
         .package_install(catalog_install(
             &fixture,
             &package,
@@ -576,6 +595,7 @@ async fn trust_state_is_persisted_before_a_package_that_then_fails_to_install() 
     let rival = Package::build(PACKAGE, "1.0.0", RUNTIME, "/bin/true");
     let refused = fixture
         .registry
+        .packages()
         .package_install(catalog_install(
             &fixture,
             &rival,

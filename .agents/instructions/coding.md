@@ -78,6 +78,12 @@
   `docs/cli.md`, matching `docs/knowledge/` guidance and source map entries, and
   release/install coverage when those surfaces change. Run at least
   `cargo test -p pohunek-cli` and `cargo xtask docs check` before the full gates.
+- **Soft cap on production file size.** No new production file over 3,000
+  lines; a change that grows or creates one either splits it or carries a split
+  plan in its issue or PR. Tests and generated files are exempt. Large owners
+  such as the session registry stay decomposed by owner: a service with its own
+  lock, trust or state (the package authority in `crates/daemon/src/packages/`)
+  is a module of its own, not more `impl SessionRegistry`.
 - Comments and all repository text are in **English**.
 
 The first complete team-relay release intentionally trusts collaborators at the

@@ -54,7 +54,7 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    edit while the daemon runs risks a short read and data loss at the next
    rewrite.
 2. Match each finding (implemented in
-   `crates/daemon/src/session/package_lifecycle/` and
+   `crates/daemon/src/packages/` and
    `crates/package/src/registry.rs`):
    - `root missing`: the package files are gone but the record remains.
      Reinstall the same archive with the same trust (`--sha256 <digest>` or
@@ -144,7 +144,7 @@ The install is refused before anything is recorded; the registry is unchanged.
 Official packages are installed from the daemon archive of the release the
 daemon runs, with
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json`.
-The checks are in `crates/daemon/src/session/package_lifecycle/trust.rs` and
+The checks are in `crates/daemon/src/packages/trust.rs` and
 `crates/daemon/src/catalog_anchor.rs`.
 
 1. Run `pohunek doctor --json` and read the `catalog_trust_anchor` check.

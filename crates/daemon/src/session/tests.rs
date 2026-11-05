@@ -26227,7 +26227,7 @@ impl PackagedPi {
         self.registry_handle()
             .set_enabled(&self.digest, false)
             .expect("disable");
-        registry.reload_runtimes().expect("reload");
+        registry.packages().reload_runtimes().expect("reload");
     }
 
     fn registry_handle(&self) -> package::registry::Registry {
@@ -26387,7 +26387,7 @@ async fn a_session_resumes_from_its_pin_after_the_package_is_disabled() {
         .registry_handle()
         .set_enabled(&packaged.digest, false)
         .expect("disable");
-    registry.reload_runtimes().expect("reload");
+    registry.packages().reload_runtimes().expect("reload");
 
     let fresh = registry
         .create(packaged_params(&dir))
@@ -26418,12 +26418,13 @@ async fn uninstall_is_refused_while_a_live_session_references_the_package() {
     let retained = registry.retained_package_digests().await.expect("retained");
     assert!(retained.contains(&packaged.digest));
     let refused = registry
+        .packages()
         .uninstall_package(&packaged.digest)
         .await
         .expect_err("a referenced package cannot be uninstalled");
     assert!(matches!(
         refused,
-        super::packages::PackageUninstallError::Registry(
+        crate::packages::PackageUninstallError::Registry(
             package::registry::RegistryError::StillReferenced
         )
     ));
@@ -26435,6 +26436,7 @@ async fn uninstall_is_refused_while_a_live_session_references_the_package() {
     registry.stop(&created.id).await.expect("stop the session");
     registry.remove(&created.id).await.expect("remove");
     registry
+        .packages()
         .uninstall_package(&packaged.digest)
         .await
         .expect("an unreferenced package uninstalls");
@@ -26483,7 +26485,11 @@ async fn durable_bindings_without_a_live_session_still_retain_the_package() {
     let retained = second.retained_package_digests().await.expect("retained");
 
     assert!(retained.contains(&packaged.digest));
-    assert!(second.uninstall_package(&packaged.digest).await.is_err());
+    assert!(second
+        .packages()
+        .uninstall_package(&packaged.digest)
+        .await
+        .is_err());
 }
 
 /// The offline upgrade plan decides whether an uninstall command is safe to name
@@ -26514,9 +26520,8 @@ async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_sessio
 
     let second = packaged.registry(&store_path);
     let daemon = second.retained_package_digests().await.expect("retained");
-    let plan =
-        super::package_lifecycle::ensure::retained_pins(&store_path, &second.inner.profiles, None)
-            .expect("the plan's retained set");
+    let plan = crate::packages::ensure::retained_pins(&store_path, &second.inner.profiles, None)
+        .expect("the plan's retained set");
 
     assert!(daemon.contains(&packaged.digest));
     assert_eq!(
@@ -26535,13 +26540,14 @@ async fn a_registry_without_a_package_store_cannot_uninstall() {
     .expect("digest");
 
     let error = registry
+        .packages()
         .uninstall_package(&digest)
         .await
         .expect_err("no store");
 
     assert!(matches!(
         error,
-        super::packages::PackageUninstallError::NoPackageStore
+        crate::packages::PackageUninstallError::NoPackageStore
     ));
 }
 
@@ -26592,7 +26598,7 @@ async fn a_fork_holds_the_package_authority_until_its_registration_ends() {
     packaged.disable_and_reload(&registry);
 
     // An uninstall in progress holds the exclusive authority.
-    let exclusive = registry.inner.package_lifecycle.write().await;
+    let exclusive = registry.inner.packages.lifecycle().write().await;
     let forking = registry.clone();
     let source = created.id.clone();
     let mut fork = tokio::spawn(async move {
@@ -26632,10 +26638,10 @@ async fn an_uninstall_survives_the_cancellation_of_its_caller() {
     let registry = packaged.registry(&temp_store_path("packaged-uninstall-cancel"));
 
     // A launch in progress holds the shared authority.
-    let launch = registry.inner.package_lifecycle.read().await;
+    let launch = registry.inner.packages.lifecycle().read().await;
     let caller = registry.clone();
     let digest = packaged.digest.clone();
-    let outer = tokio::spawn(async move { caller.uninstall_package(&digest).await });
+    let outer = tokio::spawn(async move { caller.packages().uninstall_package(&digest).await });
     for _ in 0..16 {
         tokio::task::yield_now().await;
     }
@@ -26648,7 +26654,7 @@ async fn an_uninstall_survives_the_cancellation_of_its_caller() {
 
     // The exclusive authority is free only once the uninstall transaction is
     // over, whoever awaited it.
-    drop(registry.inner.package_lifecycle.write().await);
+    drop(registry.inner.packages.lifecycle().write().await);
     assert!(
         packaged
             .registry_handle()
@@ -26684,15 +26690,17 @@ async fn an_unreadable_store_record_blocks_uninstall_and_leaves_listing_availabl
     drop(store);
 
     let refused = registry
+        .packages()
         .uninstall_package(&packaged.digest)
         .await
         .expect_err("a record that cannot be read may pin the package");
     assert!(matches!(
         refused,
-        super::packages::PackageUninstallError::RetentionUncertain
+        crate::packages::PackageUninstallError::RetentionUncertain
     ));
 
     let listed = registry
+        .packages()
         .package_list()
         .await
         .expect("listing does not depend on the unreadable line");
@@ -26702,6 +26710,7 @@ async fn an_unreadable_store_record_blocks_uninstall_and_leaves_listing_availabl
         "the unreadable line proves no pin, so the package is not reported as referenced"
     );
     let refused = registry
+        .packages()
         .package_uninstall(protocol::PackageUninstallParams {
             digest: packaged.digest.clone(),
             remove_modified: false,
@@ -26743,6 +26752,7 @@ async fn a_pinned_digest_is_still_referenced_while_an_unreadable_store_record_ex
     drop(store);
 
     let refused = registry
+        .packages()
         .package_uninstall(protocol::PackageUninstallParams {
             digest: packaged.digest.clone(),
             remove_modified: false,
@@ -26754,7 +26764,11 @@ async fn a_pinned_digest_is_still_referenced_while_an_unreadable_store_record_ex
         protocol::PackageErrorKind::Referenced,
         "a provable pin keeps its own refusal"
     );
-    let listed = registry.package_list().await.expect("list packages");
+    let listed = registry
+        .packages()
+        .package_list()
+        .await
+        .expect("list packages");
     assert!(listed.packages[0].referenced);
 }
 
@@ -26923,7 +26937,7 @@ async fn callbacks_of_a_pinned_session_use_its_own_version_after_another_is_sele
         .registry_handle()
         .select(&second)
         .expect("select v2");
-    registry.reload_runtimes().expect("reload");
+    registry.packages().reload_runtimes().expect("reload");
     let fresh = packaged
         .host
         .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))

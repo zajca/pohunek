@@ -519,7 +519,7 @@ impl SessionRegistry {
         // persisted the resumed record, so an adopting package cannot be
         // uninstalled in between: the built-in pin does not count as a
         // reference to it. Taken before the lifecycle guard, as `fork` does.
-        let package_authority = Arc::clone(&self.inner.package_lifecycle).read_owned().await;
+        let package_authority = self.inner.packages.hold_launch().await;
         let guard = self.lock_lifecycle(id).await;
         let (binding, definition, registration, record) = {
             let sessions = self.inner.sessions.lock().await;
@@ -869,7 +869,7 @@ impl SessionRegistry {
         // Held from resolving the pin until the detached registration has
         // persisted the fork's record, so the pinned package cannot be
         // uninstalled in between. A disabled package still forks.
-        let package_authority = Arc::clone(&self.inner.package_lifecycle).read_owned().await;
+        let package_authority = self.inner.packages.hold_launch().await;
         let (binding, repo, branch, worktree_path, record) =
             self.fork_source(&params.session_id).await?;
         let definition = self.binding_definition(&binding)?;
@@ -1262,7 +1262,7 @@ impl SessionRegistry {
         registration: super::target::PtyRegistration,
         relaunch: RelaunchPlan,
         guard: super::LifecycleGuard,
-        package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        package_authority: Option<crate::packages::OwnedLaunchGuard>,
     ) -> Result<SessionInfo, ProtocolError> {
         // The resume mechanics come from the frozen structural snapshot (C.4). A
         // binding without a snapshot program falls back to the base kind's

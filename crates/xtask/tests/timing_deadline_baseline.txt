@@ -37,8 +37,8 @@ crates/daemon/src/runtime/client.rs 16
 crates/daemon/src/runtime/launcher.rs 4
 crates/daemon/src/session/detector.rs 1
 crates/daemon/src/session/mod.rs 1
-crates/daemon/src/session/package_lifecycle/official_alias_tests.rs 1
-crates/daemon/src/session/package_lifecycle/test_fixture.rs 1
+crates/daemon/src/session/package_scenarios/official_alias_tests.rs 1
+crates/daemon/src/session/package_scenarios/test_fixture.rs 1
 crates/daemon/src/session/procwatch.rs 1
 crates/daemon/src/session/profile_freeze_tests.rs 1
 crates/daemon/src/session/profile_pin_tests.rs 1
