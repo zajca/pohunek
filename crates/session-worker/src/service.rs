@@ -216,6 +216,7 @@ mod tests {
             wait_timing: pohunek_service_config::DEFAULT_WAIT_TIMING,
             hook_stderr_tail_bytes: pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES,
             hook_required: Vec::new(),
+            trusted_repositories: Vec::new(),
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
             worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,

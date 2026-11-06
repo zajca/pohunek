@@ -183,6 +183,7 @@ fn spec() -> ConfigSpec {
         wait_timing: DEFAULT_WAIT_TIMING,
         hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
         hook_required: Vec::new(),
+        trusted_repositories: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
         inventory_probe: DEFAULT_INVENTORY_PROBE,
         worker_journal_max_age: DEFAULT_WORKER_JOURNAL_MAX_AGE,
@@ -1550,6 +1551,104 @@ fn an_invalid_required_list_names_its_key_and_entry_without_echoing_the_value() 
     assert!(
         matches!(non_string, Err(ConfigError::Parse { .. })),
         "{non_string:?}"
+    );
+}
+
+/// `GOLDEN` with a `[checkout_trust]` table listing `entries`.
+fn with_trusted_repositories(entries: &str) -> String {
+    format!("{GOLDEN}\n[checkout_trust]\ntrusted_repositories = {entries}\n")
+}
+
+#[test]
+fn trusted_repositories_round_trip_in_lower_case_and_are_not_unknown_keys() {
+    let fixture = Fixture::new();
+    let loaded = fixture
+        .load(&with_trusted_repositories(
+            "[\"Acme/Widgets\", \"o-1/r.x_y\"]",
+        ))
+        .expect("trusted repositories load");
+    assert_eq!(loaded.trusted_repositories(), ["acme/widgets", "o-1/r.x_y"]);
+    assert!(loaded.unknown_keys().is_empty(), "the table is known");
+    loaded.write(&fixture.path()).expect("write the config");
+    let written = fs::read_to_string(fixture.path()).expect("read the written config");
+    assert!(written.contains("[checkout_trust]"), "{written}");
+    let reloaded = ServiceConfig::load(&fixture.path()).expect("reload the written config");
+    assert_eq!(
+        reloaded.trusted_repositories(),
+        loaded.trusted_repositories()
+    );
+}
+
+#[test]
+fn an_absent_or_empty_trusted_list_trusts_nothing_and_is_not_written() {
+    let fixture = Fixture::new();
+    for text in [GOLDEN.to_owned(), with_trusted_repositories("[]")] {
+        let loaded = fixture.load(&text).expect("no trusted repository loads");
+        assert!(loaded.trusted_repositories().is_empty());
+        loaded.write(&fixture.path()).expect("write the config");
+        let written = fs::read_to_string(fixture.path()).expect("read the written config");
+        assert!(
+            !written.contains("checkout_trust"),
+            "a previous release must still read the file: {written}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_trusted_repository_names_its_entry_without_echoing_the_value() {
+    let fixture = Fixture::new();
+    for (entry, secret) in [
+        ("\"no-slash\"", "no-slash"),
+        ("\"a/b/c\"", "a/b/c"),
+        ("\"/zebra\"", "/zebra"),
+        ("\"acme/\"", "acme/"),
+        ("\"ac me/repo\"", "ac me"),
+        ("\"acme/re po\"", "re po"),
+        ("\"acme/..\"", "acme/.."),
+        ("\"acme/zed.git\"", "zed.git"),
+        ("\"https://github.com/a/b\"", "https://github.com/a/b"),
+        ("\"under_score/repo\"", "under_score"),
+    ] {
+        let result = fixture.load(&with_trusted_repositories(&format!("[{entry}]")));
+        let Err(ConfigError::InvalidTrustedRepository { index: 0 }) = result else {
+            panic!("{entry} is refused: {result:?}");
+        };
+        let message = result.expect_err("refused").to_string();
+        assert!(!message.contains(secret), "{message}");
+    }
+    let too_long_owner = format!("[\"{}/repo\"]", "a".repeat(40));
+    let too_long_repo = format!("[\"owner/{}\"]", "a".repeat(101));
+    for entries in [too_long_owner, too_long_repo] {
+        let result = fixture.load(&with_trusted_repositories(&entries));
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidTrustedRepository { index: 0 })
+            ),
+            "{result:?}"
+        );
+    }
+    let duplicate = fixture.load(&with_trusted_repositories("[\"a/b\", \"c/d\", \"A/B\"]"));
+    assert!(
+        matches!(
+            duplicate,
+            Err(ConfigError::DuplicateTrustedRepository { index: 2, first: 0 })
+        ),
+        "{duplicate:?}"
+    );
+    let many: Vec<String> = (0..257).map(|n| format!("\"o/r{n}\"")).collect();
+    let too_many = fixture.load(&with_trusted_repositories(&format!("[{}]", many.join(","))));
+    assert!(
+        matches!(
+            too_many,
+            Err(ConfigError::TooManyTrustedRepositories { max: 256 })
+        ),
+        "{too_many:?}"
+    );
+    let mistyped = fixture.load(&with_trusted_repositories("\"a/b\""));
+    assert!(
+        matches!(mistyped, Err(ConfigError::Parse { .. })),
+        "{mistyped:?}"
     );
 }
 

@@ -503,6 +503,10 @@ pub struct SessionRegistryConfig {
     /// Hook events whose failure aborts the operation (`hooks.required`);
     /// empty requires nothing.
     pub hook_required: Vec<pohunek_service_config::RequiredHook>,
+    /// GitHub repositories (`owner/repo`, lower-case) whose checkouts a runtime
+    /// may launch with its trusted-checkout arguments (`checkout_trust`); empty
+    /// trusts none.
+    pub trusted_repositories: Vec<String>,
     /// How long a background process may keep a captured hook's stderr open
     /// after the hook ended before the daemon hands the stderr to a drain
     /// process.
@@ -674,6 +678,7 @@ impl Default for SessionRegistryConfig {
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
             hook_required: Vec::new(),
+            trusted_repositories: Vec::new(),
             hook_stderr_release_grace: DEFAULT_HOOK_STDERR_RELEASE_GRACE,
             event_log_dir: None,
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
@@ -834,6 +839,9 @@ struct SessionRegistryInner {
     /// resume/worktree records, and is shared into `spawn_blocking` for the
     /// (blocking) git detection + store I/O.
     projects: Option<Arc<ProjectManager>>,
+    /// Replacement for the GitHub URL the trusted-checkout predicate fetches a
+    /// remote `HEAD` from; `None` fetches from GitHub over https.
+    checkout_remote_source: std::sync::Mutex<Option<crate::checkout_trust::RemoteSourceResolver>>,
     /// Cancellation signal for the event-log drain, fired by
     /// [`SessionRegistry::shutdown_event_log`] so the drain flushes its backlog
     /// and exits cleanly at shutdown.
@@ -2612,6 +2620,7 @@ impl SessionRegistry {
                 supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
+                checkout_remote_source: std::sync::Mutex::new(None),
                 event_log_shutdown: CancellationToken::new(),
                 event_log_task: std::sync::Mutex::new(None),
                 agent_state_hook_shutdown: CancellationToken::new(),
@@ -3959,6 +3968,13 @@ impl SessionRegistry {
                         )
                         .await,
                     );
+                    let trusted_args = self
+                        .trusted_checkout_args(
+                            &resolved.definition,
+                            &target.launch_cwd,
+                            target.project_id.as_deref(),
+                        )
+                        .await;
                     self.create_spec(
                         &id,
                         &params,
@@ -3969,6 +3985,7 @@ impl SessionRegistry {
                         target,
                         spawned_by,
                         create_request,
+                        &trusted_args,
                     )
                 }
             }
@@ -4399,6 +4416,7 @@ impl SessionRegistry {
         target: TargetResolution,
         spawned_by: Option<protocol::SpawnedBy>,
         create_request: Option<Box<CreateRequest>>,
+        trusted_args: &[String],
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
         let reference_launch = target.reference_launch();
         let TargetResolution {
@@ -4464,6 +4482,7 @@ impl SessionRegistry {
                 kind: LaunchKind::Create,
                 frozen_args: &snapshot.args,
                 name: name.as_deref(),
+                trusted_args,
             },
         )?;
         // A slot never replaces a variable an earlier layer (descriptor,

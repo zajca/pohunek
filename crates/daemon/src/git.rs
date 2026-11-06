@@ -144,6 +144,17 @@ fn dropped_git_vars(names: impl IntoIterator<Item = OsString>) -> impl Iterator<
     })
 }
 
+/// The trusted `git` executable, for a caller that runs it through the bounded
+/// runner with its own cleared environment.
+///
+/// # Errors
+///
+/// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
+/// like a failed spawn.
+pub(crate) fn executable() -> Result<std::path::PathBuf, String> {
+    crate::agent::trusted_program("git").map_err(|err| format!("failed to run git: {err}"))
+}
+
 /// Builds a command for the trusted `git` executable that drops every `GIT_*`
 /// variable of the daemon's environment except those [`is_inherited`] accepts.
 ///
@@ -156,9 +167,7 @@ fn dropped_git_vars(names: impl IntoIterator<Item = OsString>) -> impl Iterator<
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
 /// like a failed spawn.
 pub(crate) fn command() -> Result<Command, String> {
-    let program =
-        crate::agent::trusted_program("git").map_err(|err| format!("failed to run git: {err}"))?;
-    let mut command = Command::new(program);
+    let mut command = Command::new(executable()?);
     for name in dropped_git_vars(std::env::vars_os().map(|(name, _)| name)) {
         command.env_remove(name);
     }

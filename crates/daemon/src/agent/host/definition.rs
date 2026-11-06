@@ -22,6 +22,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::checkout_trust::CheckoutTrust;
 use super::config_home::ConfigHome;
 use super::features::{check_gates, check_required_keys, check_requires, FeatureTables};
 use super::launch_env::DescriptorLaunchEnv;
@@ -439,6 +440,9 @@ pub struct RuntimeDefinition {
     /// How the runtime keeps a session out of a shared host daemon, from
     /// `[placement]`; `None` for a runtime that declares none.
     placement: Option<Placement>,
+    /// The arguments a trusted checkout adds to a launch and the paths its
+    /// trust predicate compares, from `[runtime] trusted_checkout_args`.
+    checkout_trust: Option<CheckoutTrust>,
     config_home: Option<ConfigHome>,
     /// Where below the config home the agent writes transcripts and which
     /// compiled parser reads them; `None` for a runtime that declares none.
@@ -477,7 +481,7 @@ impl RuntimeDefinition {
         parts: DefinitionParts,
         launch_env: DescriptorLaunchEnv,
     ) -> Result<Self, DefinitionError> {
-        Self::new_declared(parts, launch_env, NamingLaunchArgs::default(), None)
+        Self::new_declared(parts, launch_env, NamingLaunchArgs::default(), None, None)
     }
 
     /// [`Self::new_with_env`] with the validated `[naming]` arguments the
@@ -491,6 +495,7 @@ impl RuntimeDefinition {
         launch_env: DescriptorLaunchEnv,
         naming: NamingLaunchArgs,
         placement: Option<Placement>,
+        checkout_trust: Option<CheckoutTrust>,
     ) -> Result<Self, DefinitionError> {
         let DefinitionParts {
             runtime_id,
@@ -514,14 +519,7 @@ impl RuntimeDefinition {
         validate_integration(integration.as_ref(), &origin)?;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
-        if let LaunchProgram::Fixed(program) = &program {
-            if program.contains('/') && !Path::new(program).is_absolute() {
-                return Err(DefinitionError::Field {
-                    field: "runtime.program",
-                    reason: "must be a bare program name or an absolute path",
-                });
-            }
-        }
+        validate_program_path(&program)?;
         let submit_delay_ms = submit_delay_millis(input_rules.submit_delay)?;
         if let Some(native) = &native {
             validate_native(native)?;
@@ -555,6 +553,7 @@ impl RuntimeDefinition {
                     launch_env: launch_env.as_slice(),
                     naming: naming.as_slice(),
                     placement: placement.as_ref().map(PlacementFacts::of),
+                    checkout_trust: checkout_trust.as_ref(),
                 });
                 BindingProvenance::Builtin {
                     package,
@@ -586,6 +585,7 @@ impl RuntimeDefinition {
             launch_env,
             naming,
             placement,
+            checkout_trust,
             config_home: None,
             transcripts: None,
             hook_existence: None,
@@ -747,6 +747,7 @@ impl RuntimeDefinition {
             .as_ref()
             .map(RawPlacement::validated)
             .transpose()?;
+        let checkout_trust = raw.validated_checkout_trust()?;
         let definition = Self::new_declared(
             DefinitionParts {
                 runtime_id,
@@ -778,6 +779,7 @@ impl RuntimeDefinition {
             launch_env,
             naming,
             placement,
+            checkout_trust,
         )?;
         validate_placement_handler(&definition)?;
         let definition = match hook_existence {
@@ -916,6 +918,13 @@ impl RuntimeDefinition {
     #[must_use]
     pub fn launch_env(&self) -> &[(String, String)] {
         self.launch_env.as_slice()
+    }
+
+    /// The trusted-checkout arguments and paths, when the descriptor declares
+    /// `[runtime] trusted_checkout_args`.
+    #[must_use]
+    pub fn checkout_trust(&self) -> Option<&CheckoutTrust> {
+        self.checkout_trust.as_ref()
     }
 
     /// Whether the descriptor declares `[naming] launch_args`.
@@ -1239,6 +1248,10 @@ struct DescriptorFacts<'a> {
     /// the value persisted sessions record.
     #[serde(skip_serializing_if = "Option::is_none")]
     placement: Option<PlacementFacts<'a>>,
+    /// Omitted while absent, so a descriptor without trusted-checkout
+    /// arguments hashes to the value persisted sessions record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkout_trust: Option<&'a CheckoutTrust>,
 }
 
 #[derive(Serialize)]
@@ -1262,6 +1275,21 @@ struct InputFacts {
     submit_delay_ms: u64,
     text_policy: &'static str,
     allow_while_blocked: bool,
+}
+
+/// A fixed program is a bare name or an absolute path.
+fn validate_program_path(program: &LaunchProgram) -> Result<(), DefinitionError> {
+    match program {
+        LaunchProgram::Fixed(program)
+            if program.contains('/') && !Path::new(program).is_absolute() =>
+        {
+            Err(DefinitionError::Field {
+                field: "runtime.program",
+                reason: "must be a bare program name or an absolute path",
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn descriptor_digest(facts: &DescriptorFacts<'_>) -> DescriptorDigest {
@@ -1359,6 +1387,12 @@ struct RawRuntime {
     /// Absent means the prompt is delivered as terminal input.
     #[serde(default)]
     prompt_arg: bool,
+    /// Arguments added only to a launch of a trusted checkout.
+    #[serde(default)]
+    trusted_checkout_args: Option<Vec<String>>,
+    /// Checkout paths the trust predicate compares with the default branch.
+    #[serde(default)]
+    trusted_checkout_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1409,6 +1443,23 @@ pub(super) fn malformed_at(source: &str, error: &toml::de::Error) -> DefinitionE
 }
 
 impl RawDefinition {
+    /// The `[runtime]` trusted-checkout declaration; both keys or neither.
+    fn validated_checkout_trust(&self) -> Result<Option<CheckoutTrust>, DefinitionError> {
+        match (
+            &self.runtime.trusted_checkout_args,
+            &self.runtime.trusted_checkout_paths,
+        ) {
+            (None, None) => Ok(None),
+            (Some(args), paths) => {
+                CheckoutTrust::new(args.clone(), paths.clone().unwrap_or_default()).map(Some)
+            }
+            (None, Some(_)) => Err(DefinitionError::Field {
+                field: "runtime.trusted_checkout_paths",
+                reason: "requires runtime.trusted_checkout_args",
+            }),
+        }
+    }
+
     /// The `[naming] launch_args`, empty when the table is absent.
     fn validated_naming(&self) -> Result<NamingLaunchArgs, DefinitionError> {
         self.naming

@@ -114,6 +114,7 @@ The features this core implements:
 | `transcripts-head-paths-v1` | 0.39.0 | `[transcripts] id_path`, `cwd_path` |
 | `naming-launch-args-v1` | 0.39.0 | `[naming]` |
 | `placement-v1` | 0.40.0 | `[placement]` |
+| `checkout-trust-args-v1` | 0.40.0 | `[runtime] trusted_checkout_args`, `trusted_checkout_paths` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -290,6 +291,77 @@ it changes its digest. A session pinned to the earlier digest resumes and forks
 without the name until it is adopted. A core older than 0.39 refuses the
 descriptor with `runtime_feature_unsupported` (0.38) or `descriptor_invalid`
 (0.37).
+
+## Trusted checkout arguments
+
+A runtime that loads project configuration (hooks, rules, plugin settings) from
+the checkout it starts in can ask for an argument that trusts that checkout only
+when the checkout is the operator's own (`requires =
+["checkout-trust-args-v1"]`):
+
+```toml
+requires = ["checkout-trust-args-v1"]
+
+[runtime]
+trusted_checkout_args = ["--trust-workspace"]
+trusted_checkout_paths = [".muse", ".agents"]
+```
+
+`trusted_checkout_args` holds 1 to 8 literal tokens (no `{session_name}`
+placeholder). `trusted_checkout_paths` is required with it and names what the
+runtime loads once it trusts a checkout: 1 to 16 paths, each relative to the
+checkout root, `/`-separated and normalized (no empty, `.`, `..` or `.git`
+component, no leading or trailing `/`, backslash, colon or control character,
+at most 256 bytes), none equal to or inside another (per component, ignoring
+ASCII letter case). Either key without the other, or a violation, is
+`descriptor_invalid`.
+
+At every create, resume and fork the daemon appends the arguments to the root
+arguments (after the frozen, contributor and `[naming]` arguments, before the
+native reference and prompt arguments) only when all of these hold; any error,
+timeout, ambiguity or missing fact means they are not appended:
+
+1. The project record's `origin_url` is exactly `https://github.com/<owner>/<repo>[.git]`
+   or `git@github.com:<owner>/<repo>[.git]` (scheme, host and owner compared without
+   regard to letter case, a `.git` suffix stripped), that lower-cased `owner/repo` is
+   listed in the host's `[checkout_trust] trusted_repositories` (`service.toml`; an
+   absent or empty list trusts no repository), and the launch directory holds a `.git`
+   entry.
+2. The daemon fetches `HEAD` of `https://github.com/<owner>/<repo>.git` (one commit,
+   trees only, every object verified) into a private bare repository it creates for the
+   evaluation below the worker state root (never in a directory a session can write). The fetch uses https only, no configuration, no credential helper and no
+   redirect, so only a public repository can be trusted, and a host that cannot reach
+   GitHub (or needs a proxy variable the daemon does not pass) trusts nothing.
+3. For each declared path, the files on disk are exactly the blobs that commit's tree
+   holds there, compared by object id of the file contents (hashed without filters in
+   the private repository), with the same executable bits. A symbolic link, a
+   submodule, a special file, a nested `.git` entry, an untracked or ignored file, a
+   non-directory ancestor, more than 2048 files, or a tree entry that differs from a path
+   component only by ASCII letter case refuses.
+
+No git command runs against the checkout: its refs, index, objects and configuration
+are never read, so a process that can write the checkout's git directory cannot forge
+the answer or make the daemon run a program. A working-tree file that differs from the
+committed bytes (for example through `core.autocrlf` or a content filter) is not
+trusted. The files can change between the evaluation and the moment the runtime reads
+them, so the guarantee holds for a launch whose agent (or another session in the same
+checkout) is not writing the declared paths at that moment; it is not a defence against
+a process that can write them concurrently.
+
+All git commands of one evaluation share one 30 second deadline, each also bounded to
+10 seconds and a fixed output size, and run with a cleared environment, no user or
+system configuration, no hooks, no pager, no lazy fetch and literal pathspecs. The
+evaluation runs again at every launch, so a resume after a declared path changed
+launches without the arguments, and again with them once the path matches again. The
+arguments are never frozen into the resume snapshot. A failure (an unreachable remote,
+an unreadable path, the deadline) logs one `checkout_trust.failed` warning naming the
+checkout and the reason, never a URL, and launches without the arguments. A run of
+frozen fixed arguments equal to the `trusted_checkout_args` is dropped from a resume or
+fork command, so a session whose frozen arguments hold them does not carry them into an
+untrusted checkout.
+
+The keys join the digest of a built-in descriptor only while declared. A core
+older than 0.40 refuses the descriptor with `runtime_feature_unsupported`.
 
 ## Transcripts
 
