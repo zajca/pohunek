@@ -423,6 +423,53 @@ one unusable entry never invalidates the index for the others. With the
 `>=0.40.0`, so a release-candidate daemon refuses those entries with
 `CoreExcluded`.
 
+**Entries tree and tooling.** The index repository holds one TOML file per
+admitted version at `official/<package_id>/<version>.toml`, and
+`cargo xtask index build` accepts no other file, directory, depth or symbolic
+link. The directory name equals `package_id` and the file stem equals
+`version`. The file is `deny_unknown_fields`:
+
+```toml
+package_id = "pohunek.runtime.muse"
+runtime_id = "muse"
+version = "0.2.0"
+digest = "sha256:<64 hex>"
+url = "https://github.com/<owner>/<repo>/releases/download/v0.2.0/<package_id>-0.2.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+core = ">=0.40.0"
+
+[source]
+repo = "<owner>/<repo>"
+repo_id = 1            # numeric GitHub repository id, greater than 0
+tag = "v0.2.0"         # `v` plus version
+commit = "<40 lowercase hex>"
+built_with = "v0.40.0" # release tag of the workflow that built it, never a sha
+```
+
+The seven fields before `[source]` are the signed entry. `[source]` is
+admission metadata: it is validated (`repo` is `owner/name` over letters,
+digits, `-`, `.` and `_`, never `.` or `..` as the name), and never copied into
+the document. `index build --entries <dir> --print-source` prints it as
+`key=value` lines for a tree that holds exactly one entry. Entries are sorted
+by `(package_id, version)`, and the result must pass the daemon's body rules
+(freshness, lifetime, entry structure) before it is written.
+
+Signing never happens in an xtask process. `index message` writes the file a
+signature covers (the index domain prefix and the canonical bytes of the
+`index` member as parsed), `index attach` inserts a signature made over that
+file elsewhere (128 lowercase hex characters, one optional newline) and writes
+the document only if `verify_index` accepts it with the signer named by
+`--key-id`, and `index verify` runs the same verifier at the current time with
+the anchor's revoked ids and optional high-water marks. `index verify --record
+--revocations [--previous-revocations]` checks key material for a change to
+the index repository with `verify_key_record_document` and
+`verify_revocation_document`, the functions `verify_index` itself calls per
+record and for the embedded list; a verification failure exits 1 with the
+error text. `index throwaway --entries <dir> --output <dir>` writes an anchor
+that trusts one random root, the channel naming it and an index signed by a
+random key endorsed by that root (valid for a day, seeds never written), into
+an empty directory outside the checkout; no release anchor trusts it.
+
 **Channel file.** The endorser root is named by `plugin-index-channel.json`
 beside the trust anchor: `{"schema_version": 1, "index_endorser_key_id": "<64
 hex>"}`, `deny_unknown_fields`, at most 4 KiB, parsed with the strict JSON

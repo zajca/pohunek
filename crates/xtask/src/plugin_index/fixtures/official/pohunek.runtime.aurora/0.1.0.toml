@@ -1,0 +1,14 @@
+package_id = "pohunek.runtime.aurora"
+runtime_id = "aurora"
+version = "0.1.0"
+digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+url = "https://github.com/pohunekd/plugin-aurora/releases/download/v0.1.0/pohunek.runtime.aurora-0.1.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu"]
+core = ">=0.40.0"
+
+[source]
+repo = "pohunekd/plugin-aurora"
+repo_id = 1002
+tag = "v0.1.0"
+commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+built_with = "v0.40.0"

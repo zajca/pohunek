@@ -128,3 +128,28 @@ cargo xtask index channel --anchor packaging/runtime-catalog-anchor.json \
 ```
 
 The command refuses an id that is not a root of the anchor.
+
+## 5. Build, sign and verify an index
+
+These commands read no key file; the online key is used only by a tool outside
+the workspace, so code built from the workspace never holds it.
+
+| Command | Writes | Checks |
+|---|---|---|
+| `index build --entries <dir> --revocations <file> --key-record <file>... --sequence <s> --expires-at <s> --output <unsigned.json>` | the unsigned index | entry layout and `[source]`, then the daemon's body rules |
+| `index message --unsigned <unsigned.json> --output <message.bin>` | the bytes a signature covers | the key-free parse of the daemon |
+| `index attach --unsigned <unsigned.json> --key-id <K> --signature <sig.hex> --anchor <anchor.json> --channel <channel.json> --output <signed.json>` | the signed index | `verify_index` with the signer `K` |
+| `index verify --index <signed.json> --anchor <anchor.json> --channel <channel.json> [--index-high-water <n>] [--revocation-high-water <n>]` | nothing | `verify_index` at the current time |
+| `index verify --record <record.json> --revocations <revocations.json> [--previous-revocations <file>] --anchor <anchor.json> --channel <channel.json>` | nothing | the record, the list signature and, with `--previous-revocations`, a higher sequence and a superset |
+| `index throwaway --entries <dir> --output <dir>` | an anchor, a channel and an index of a random root | the index under its own anchor |
+
+The signer signs `message.bin` as a plain Ed25519 message and writes the
+signature as 128 lowercase hex characters (one optional newline). A signature
+over other bytes, a key id without a record, a signer the anchor or the
+revocation list revokes, and a document that already carries signatures are
+refused and leave no output. The `[source]` table of an entry file never
+reaches the index; `index build --print-source` is how admission reads it.
+
+`index throwaway` is for proofs only: its root and key exist for the run, its
+output lies outside the checkout, and the committed anchor and channel do not
+name its root, so `index verify` against them fails.

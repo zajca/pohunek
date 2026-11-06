@@ -773,6 +773,12 @@ Signed runtime catalog:
 - `crates/daemon/src/packages/trust.rs` — index verification, listing and entry authorization for `package.install` with the `index` trust kind.
 - `crates/xtask/src/catalog.rs` — `cargo xtask catalog build|sign|verify|anchor|public-key`.
 - `crates/xtask/src/catalog_key.rs` — owner-private signing key file reader.
+- `crates/xtask/src/plugin_index.rs` — the plugin index owner ceremony commands (`catalog keygen`, `index endorse|revoke|channel`) and the shared document writer.
+- `crates/xtask/src/plugin_index/build.rs` — `index build`: the entries tree reader, the typed `[source]` checks and `--print-source`.
+- `crates/xtask/src/plugin_index/sign.rs` — `index message|attach|verify`: the signing message, the external-signature attach and the index and key-material verification.
+- `crates/xtask/src/plugin_index/throwaway.rs` — `index throwaway`: a random root and index key for proofs.
+- `crates/xtask/tests/plugin_index_ceremony.rs`
+- `crates/xtask/tests/plugin_index_tooling.rs`
 - `packaging/runtime-catalog-anchor.json` — the production trust anchor shipped beside `pohunekd`.
 - `packaging/catalog-trust/roots.txt` — the production roots and windows (with the `primary.pub` and `ci.pub` public keys) the anchor is generated from.
 - `crates/cli/tests/plugin_catalog_install.rs` — clean-environment official install through a real daemon with a test key.

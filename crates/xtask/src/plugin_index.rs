@@ -1,14 +1,26 @@
-//! Owner ceremony commands of the plugin index: `catalog keygen`,
-//! `index endorse`, `index revoke` and `index channel`.
+//! Plugin index commands: the owner ceremony (`catalog keygen`,
+//! `index endorse`, `index revoke`, `index channel`) and the index tooling
+//! (`index build`, `message`, `attach`, `verify`, `throwaway`).
 //!
 //! The commands run on the owner's machine in the key ceremony. A seed is read
 //! only from a key file under the rules of [`crate::catalog_key`] and is never
 //! printed, logged or taken from an argument. Every document is verified with
 //! the rules the daemon's index verifier applies before it is written, and is
 //! written to a path that must not exist yet, so a refused input leaves no
-//! file and a finished document is never overwritten.
+//! file and a finished document is never overwritten. The index tooling never
+//! reads a key file: signing happens outside the process.
 
 // Rust guideline compliant 2026-11-06
+
+mod build;
+mod sign;
+mod throwaway;
+
+pub(crate) use build::{build, print_source, BuildArgs};
+pub(crate) use sign::{
+    attach, message, verify_material, verify_whole, AttachArgs, VerifyIndexArgs, VerifyMaterialArgs,
+};
+pub(crate) use throwaway::{write as throwaway, ThrowawayArgs};
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -307,6 +319,31 @@ fn read_previous(path: &Path, endorser: &VerifyingKey) -> Result<RevocationBody,
     Ok(document.revocations)
 }
 
+/// Refuses a revocation list that does not extend `previous`: its sequence
+/// must rise and it must keep every previously revoked id.
+fn check_successor(
+    previous: &RevocationBody,
+    sequence: u64,
+    revoked: &BTreeSet<KeyId>,
+) -> Result<(), XtaskError> {
+    if sequence <= previous.sequence {
+        return Err(XtaskError::Usage(format!(
+            "--sequence must be greater than the previous sequence {}",
+            previous.sequence
+        )));
+    }
+    if let Some(dropped) = previous
+        .revoked_key_ids
+        .iter()
+        .find(|id| !revoked.contains(*id))
+    {
+        return Err(XtaskError::Usage(format!(
+            "a revocation list never shrinks: key id {dropped} of the previous document is missing"
+        )));
+    }
+    Ok(())
+}
+
 /// Writes the next revocation document, signed by the endorser.
 ///
 /// The new list is exactly `args.key_ids`. With `--previous` the sequence must
@@ -342,21 +379,7 @@ pub(crate) fn revoke(args: &RevokeArgs) -> Result<Revoked, XtaskError> {
         None => {}
         Some(path) => {
             let previous = read_previous(path, &endorser_public)?;
-            if args.sequence <= previous.sequence {
-                return Err(XtaskError::Usage(format!(
-                    "--sequence must be greater than the previous sequence {}",
-                    previous.sequence
-                )));
-            }
-            if let Some(dropped) = previous
-                .revoked_key_ids
-                .iter()
-                .find(|id| !revoked.contains(*id))
-            {
-                return Err(XtaskError::Usage(format!(
-                    "a revocation list never shrinks: key id {dropped} of the previous document is missing"
-                )));
-            }
+            check_successor(&previous, args.sequence, &revoked)?;
         }
     }
 
