@@ -3348,6 +3348,7 @@ async fn keep_local_args_follow_each_launch_and_are_not_frozen() {
 }
 
 /// Filter word that marks a launch of this binary as the listening image.
+#[cfg(target_os = "linux")]
 const LISTENER_IMAGE: &str = "placement_listener_image";
 
 /// The daemon-shaped fixture image: listens on a unix socket and lives while
