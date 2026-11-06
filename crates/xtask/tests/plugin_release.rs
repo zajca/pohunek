@@ -496,7 +496,19 @@ fn a_release_directory_that_cannot_run_fails_at_host_and_is_removed() {
     let missing = plugin.dir("missing");
     for name in ["pohunek", "pohunekd", "pohunek-sessiond"] {
         let script = "#!/bin/sh\nexit 3\n";
-        fs::write(exits.join(name), script).expect("fake binary");
+        // The daemon answers `--version` and then exits: it is copied and
+        // started, but never ready.
+        let daemon_script =
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 'pohunekd 0' && exit 0\nexit 3\n";
+        fs::write(
+            exits.join(name),
+            if name == "pohunekd" {
+                daemon_script
+            } else {
+                script
+            },
+        )
+        .expect("fake binary");
         fs::set_permissions(exits.join(name), fs::Permissions::from_mode(0o755)).expect("mode");
         if name != "pohunekd" {
             fs::write(missing.join(name), script).expect("fake binary");

@@ -105,7 +105,7 @@ impl std::error::Error for Verdict {}
 struct Evidence<'a> {
     schema: u32,
     /// First line of `pohunekd --version`; null when the proof ended before
-    /// the release executables were copied.
+    /// `pohunekd --version` ran.
     core_version: Option<&'a str>,
     package_id: &'a str,
     version: &'a str,
