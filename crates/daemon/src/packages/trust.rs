@@ -20,21 +20,6 @@ use crate::catalog_anchor::IndexTrust;
 /// Core version a catalog entry's compatibility range is checked against.
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Operating system names of [`std::env::consts::OS`] the catalog platform
-/// names cover.
-const OS_LINUX: &str = "linux";
-const OS_MACOS: &str = "macos";
-
-/// Vendor and system part of a Linux platform name.
-const LINUX_PLATFORM_SYSTEM: &str = "unknown-linux";
-
-/// C library part of a Linux platform name.
-const LINUX_GLIBC: &str = "gnu";
-const LINUX_MUSL: &str = "musl";
-
-/// Vendor and system part of a macOS platform name.
-const MACOS_PLATFORM_SYSTEM: &str = "apple-darwin";
-
 /// The root keys and revoked key ids the host trusts independently of any
 /// catalog.
 ///
@@ -304,51 +289,12 @@ pub(super) fn core_version() -> Result<Version, PackageErrorKind> {
 /// Returns [`PackageErrorKind::Incompatible`] on a platform the catalog does
 /// not name.
 pub(super) fn host_platform() -> Result<String, PackageErrorKind> {
-    platform_name(
-        std::env::consts::ARCH,
-        std::env::consts::OS,
-        cfg!(target_env = "musl"),
-    )
-    .ok_or(PackageErrorKind::Incompatible)
-}
-
-/// Builds the catalog platform name from the architecture and operating system
-/// names of [`std::env::consts`] and whether the C library is musl.
-fn platform_name(arch: &str, os: &str, musl: bool) -> Option<String> {
-    match os {
-        OS_LINUX => {
-            let libc = if musl { LINUX_MUSL } else { LINUX_GLIBC };
-            Some(format!("{arch}-{LINUX_PLATFORM_SYSTEM}-{libc}"))
-        }
-        OS_MACOS => Some(format!("{arch}-{MACOS_PLATFORM_SYSTEM}")),
-        _ => None,
-    }
+    package::host_platform().ok_or(PackageErrorKind::Incompatible)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn platform_names_follow_the_catalog_style() {
-        assert_eq!(
-            platform_name("x86_64", "linux", false).as_deref(),
-            Some("x86_64-unknown-linux-gnu")
-        );
-        assert_eq!(
-            platform_name("x86_64", "linux", true).as_deref(),
-            Some("x86_64-unknown-linux-musl")
-        );
-        assert_eq!(
-            platform_name("aarch64", "linux", false).as_deref(),
-            Some("aarch64-unknown-linux-gnu")
-        );
-        assert_eq!(
-            platform_name("aarch64", "macos", false).as_deref(),
-            Some("aarch64-apple-darwin")
-        );
-        assert_eq!(platform_name("x86_64", "windows", false), None);
-    }
 
     #[test]
     fn an_anchor_without_roots_is_refused() {

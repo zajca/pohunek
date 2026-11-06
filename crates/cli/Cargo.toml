@@ -30,6 +30,8 @@ reqwest.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 semver = { workspace = true }
+# Staging directory of the files an install by package id downloads.
+tempfile.workspace = true
 pohunek-hostcheck = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-package = { workspace = true }
@@ -84,7 +86,6 @@ path = "tests/release_upgrade.rs"
 # Enables `test-util` for this package's own integration tests.
 pohunek-cli = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
-tempfile.workspace = true
 # `attach_stream_input.rs` shrinks the CLI's stdout pipe and counts its queued bytes.
 rustix = { workspace = true, features = ["fs", "pipe"] }
 portable-pty = { workspace = true }

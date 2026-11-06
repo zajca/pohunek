@@ -581,6 +581,22 @@ repeating the command; the CLI never retries an install on its own.
   declares commands (`package_untrusted`). A host without the channel file
   refuses it (`official_trust_unavailable`) and `pohunek doctor` reports the
   `plugin_index_channel` check as `warn`; catalog installs are unaffected.
+- `pohunek plugin install --index <file>` sends a local signed index to the
+  daemon with a local archive. `pohunek plugin install <package-id>[@<version>]`
+  fetches the official plugin index and the archive it lists first, over
+  `https` (or `http` to the local machine, which tests use), and then does the
+  same: the transport carries no trust, the daemon verifies the index
+  signature, the revocations and the archive digest. The CLI checks
+  `host.inspect` for `package_install_index_supported` before it fetches
+  anything and fails with `plugin_index_unsupported` when it is absent, which
+  means a daemon older than 0.40 or a host without the channel file. It parses
+  the index with the same strict parser the daemon uses, skips entries that do
+  not list this platform or whose `core` range excludes this core version, takes
+  the highest semantic version (a pre-release core such as `0.41.0-rc.1` does
+  not match `>=0.40.0`), and compares the download with the listed digest
+  before anything reaches the daemon. The review prints the resolved
+  `<package-id>@<version>` and digest, and the command to repeat names that
+  exact version.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 
