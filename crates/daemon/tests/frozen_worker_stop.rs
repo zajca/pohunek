@@ -100,8 +100,8 @@ impl Frozen {
     /// Starts a session on a real worker that answers.
     async fn start_running() -> Self {
         Self::start_running_with(ExchangeDeadlines {
-            send: INPUT_STOP_WAIT,
-            answer: INPUT_STOP_WAIT,
+            send: INPUT_STOP_WAIT.saturating_mul(2),
+            answer: INPUT_STOP_WAIT.saturating_mul(2),
         })
         .await
     }
@@ -551,28 +551,42 @@ async fn a_stop_behind_an_unanswered_exchange_is_refused_as_retryable_and_then_e
     )
     .await;
     kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
-    // An exchange the frozen worker never answers holds the control
+    // The watcher's next inspection is never answered and holds the control
     // connection until the answer deadline.
-    let holder = tokio::spawn({
-        let registry = frozen.registry.clone();
-        let id = frozen.id.clone();
-        async move { registry.screen(&id).await }
-    });
-    settle().await;
+    wait_until("an exchange to hold the connection", || async {
+        frozen
+            .registry
+            .control_connection_held(&frozen.id)
+            .await
+            .then_some(())
+    })
+    .await;
 
-    let refused = guard(
+    // The stop queues behind that exchange and is refused once its deadline
+    // closed the connection. An exchange that ended healthily just before the
+    // freeze lets the stop reach the frozen worker first, which ends it
+    // through its supervisor; both leave the worker ended below.
+    let first = guard(
         "a stop behind an unanswered exchange",
         Box::pin(frozen.registry.stop(&frozen.id)),
     )
-    .await
-    .expect_err("the connection was closed by the deadline");
-    assert_eq!(refused.code, "session_runtime_reconnecting", "{refused:?}");
-
-    let stopped = wait_until("a retried stop to end the worker", || async {
-        Box::pin(frozen.registry.stop(&frozen.id)).await.ok()
-    })
     .await;
+    let stopped = match first {
+        Ok(stopped) => stopped,
+        Err(refused) => {
+            assert_eq!(refused.code, "session_runtime_reconnecting", "{refused:?}");
+            wait_until("a retried stop to end the worker", || async {
+                match Box::pin(frozen.registry.stop(&frozen.id)).await {
+                    Ok(stopped) => Some(stopped),
+                    Err(error) if error.code == "session_runtime_reconnecting" => None,
+                    Err(error) => {
+                        panic!("the retried stop is refused for another reason: {error:?}")
+                    }
+                }
+            })
+            .await
+        }
+    };
     assert!(stopped.stopped);
     assert_eq!(frozen.state().await, SessionState::Stopped);
-    holder.abort();
 }

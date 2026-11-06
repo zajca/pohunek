@@ -8524,11 +8524,18 @@ async fn delayed_plain_input_reports_a_lost_control_connection_to_a_surviving_wo
         .expect_err("Enter cannot reach a worker whose connection was lost");
     assert_eq!(error.code, "worker_operation_failed", "{error:?}");
     // A stop before the watcher reconnected is refused as retryable.
-    Box::pin(wait_until(
+    let stopped = Box::pin(wait_until(
         "the stop to reach the reconnected worker",
-        || async { Box::pin(registry.stop(&id)).await.ok() },
+        || async {
+            match Box::pin(registry.stop(&id)).await {
+                Ok(stopped) => Some(stopped),
+                Err(error) if error.code == "session_runtime_reconnecting" => None,
+                Err(error) => panic!("the stop is refused for another reason: {error:?}"),
+            }
+        },
     ))
     .await;
+    assert!(stopped.stopped);
 }
 
 #[tokio::test]

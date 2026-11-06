@@ -5751,6 +5751,22 @@ impl SessionRegistry {
         }
     }
 
+    /// Whether an exchange holds the control connection of session `id`, for
+    /// integration assertions on the order of lifecycle waits.
+    pub async fn control_connection_held(&self, id: &SessionId) -> bool {
+        match self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|e| e.runtime.clone())
+        {
+            Some(RuntimeHandle::Worker(worker)) => worker.connection_is_held(),
+            _ => false,
+        }
+    }
+
     /// Whether the registry holds a managed session `id`.
     pub(crate) async fn holds(&self, id: &SessionId) -> bool {
         self.inner.sessions.lock().await.contains_key(id)
