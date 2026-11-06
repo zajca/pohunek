@@ -461,7 +461,7 @@ fn a_fixtures_tree_is_built_signed_outside_and_verified() {
 fn versions_of_one_package_are_ordered_by_version_not_by_file_name() {
     let tooling = Tooling::new();
     // `0.2.0-rc.toml` sorts before `0.2.0.toml` by file name, but the version
-    // `0.2.0` sorts before `0.2.0-rc`.
+    // strings sort the other way in byte order (`0.2.0` is a prefix of `0.2.0-rc`).
     let tree = tooling.tree("tree");
     let muse = tree.join("official/pohunek.runtime.muse");
     let text = std::fs::read_to_string(muse.join("0.2.0.toml")).expect("read");

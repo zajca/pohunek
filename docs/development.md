@@ -869,8 +869,8 @@ the caller's version tag. A `build` job with read-only permissions builds the
 archive with the `xtask` of the checked-out core tag (`cargo xtask plugin
 build`); a second `release` job, which runs no build code and holds the write,
 attestation and OIDC permissions, checks the checksums, attests the archive and
-publishes the GitHub release of the plugin repository. Every action is pinned by
-commit sha, no cache is restored, and neither job has a secret or a path to the
+publishes the GitHub release of the plugin repository. Every external action is pinned by
+commit sha, the toolchain install is the core tag's own `setup-rust` action, no cache is restored, and neither job has a secret or a path to the
 plugin index. The
 `plugin_release` scenarios of `xtask` cover `cargo xtask plugin build` and
 `plugin prove` against the workspace binaries; they never run the workflow's
