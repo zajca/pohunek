@@ -5,6 +5,64 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.40.0
+
+### 2026-11-06, trusted checkout arguments, #1925
+
+- Runtime feature `checkout-trust-args-v1`: a descriptor declares `[runtime] trusted_checkout_args` and `trusted_checkout_paths`, and the daemon appends the arguments at create, resume and fork only when the checkout's origin is a GitHub repository in `service.toml` `[checkout_trust] trusted_repositories` and the declared paths equal the tree of the commit the remote `HEAD` names. See [runtime packages](guides/runtime-packages.md#trusted-checkout-arguments) and [setup](guides/setup.md).
+
+### 2026-11-06, daemon plugin index authorization, #1931
+
+- `package.install` accepts `{"kind":"index","index_path":...}`; `host.inspect` reports `package_install_index_supported`; `daemon.doctor` reports `plugin_index_channel`. See [Runtime packages](guides/runtime-packages.md) and [Plugin index](concepts/runtime-catalog.md#plugin-index).
+
+### 2026-11-06, plugin install by id, #1932
+
+- `pohunek plugin install` takes `--index <file>` and `--index-url <url>`, and installs `<package-id>[@<version>]` through the plugin index; `plugin update` takes `--index <file>`. See [Runtime packages](guides/runtime-packages.md#trust-model).
+
+### 2026-11-06, plugin index channel file in daemon archives, #1933
+
+- Daemon archives carry `plugin-index-channel.json` beside the trust anchor; `service install` and `upgrade` install it and treat it like the anchor, with the new codes `service_staged_index_channel_invalid` and `service_version_lacks_index_channel`. See [Runtime catalog](concepts/runtime-catalog.md) and [Update after release](runbooks/update-after-release.md#plugin-index-channel-file-from-040).
+
+### 2026-11-06, plugin index owner ceremony commands, #1934
+
+- New runbook [Plugin index key ceremony and compromise procedure](runbooks/plugin-index-keys.md) for the `catalog keygen`, `index endorse`, `index revoke` and `index channel` xtask commands. No daemon, CLI or protocol surface changes.
+
+### 2026-11-06, plugin index tooling, #1935
+
+- New `cargo xtask index build|message|attach|verify|throwaway` commands and the entry file schema in [Plugin index](concepts/runtime-catalog.md#plugin-index); the runbook [Plugin index key ceremony and compromise procedure](runbooks/plugin-index-keys.md) gains the signing flow. The package crate exports `index_document_signing_message`, `verify_key_record_document`, `verify_revocation_document` and `check_index_body`, which the daemon's verifier shares. No daemon, CLI or protocol surface changes.
+
+### 2026-11-06, plugin build, prove and release workflow, #1936
+
+- New `cargo xtask plugin build|prove` commands and the reusable `.github/workflows/plugin-release.yml`; the attestation identity that index admission checks is in [Plugin repositories](guides/plugin-repositories.md#admission-through-the-index) and the proof steps and evidence in the [index runbook](runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive). No daemon, CLI or protocol surface changes.
+
+### 2026-11-06, session placement, #1947
+
+- Runtime descriptors declare how a session stays out of a shared host daemon with `[placement]` (runtime feature `placement-v1`); see [Runtime packages](guides/runtime-packages.md#session-placement) and the `SessionInfo.placement` field in the public API. `session.inspect` of a live session and `daemon.doctor` (`placement_escape`) report a process of the generation that left the PTY's POSIX session as a daemon; the check never signals a process. The official Claude Code, Codex, Pi and Hermes packages declare `in_process` placement.
+
+### 2026-11-06, Cline hook handler, #1953
+
+- Runtime feature `integration-cline-hook-v1` adds the `cline-hook-v1` handler, which keeps a Cline session local: it contributes `CLINE_SANDBOX=1` and `CLINE_SANDBOX_DATA_DIR` to every launch (refusals `cline_launch_arg_refused`, `cline_launch_env_refused`, `cline_data_root_invalid`, `cline_config_home_missing`) and installs a stateless reporter as six hook files in `<CLINE_DIR>/hooks/` (`integration_hook_path_conflict` for a file it does not own). See [Runtime packages](guides/runtime-packages.md) and the integration handler section of the public API.
+
+### 2026-11-06, control connection deadlock, #1983
+
+- The daemon reads each worker control connection continuously and the worker writes events without pausing its request loop, so a large request after an output burst no longer wedges `session screen`, `session input` and `session stop`. New optional `service.toml` `[deadlines]` keys `worker_send_ms` (15000) and `worker_answer_ms` (60000) close a control connection whose request write or answer does not finish; the watcher reconnects. `session stop` of a worker that does not answer ends its supervised job after the recorded identity is proven, and the session ends `stopped`. Documented in `docs/public-api.md` and `docs/architecture.md`.
+
+### 2026-11-06, checkout trust refusals, #1985
+
+- The [runtime packages guide](guides/runtime-packages.md#trusted-checkout-arguments) and `docs/public-api.md` list the on-disk checks that withhold trusted checkout arguments (case-folded entries, a declared path opened under another spelling) and state that the git calls and the on-disk walk share one 30 second deadline.
+
+### 2026-11-05, package authority extraction, #1627
+
+- The `package.*` operations moved from `crates/daemon/src/session/package_lifecycle/` to `crates/daemon/src/packages/`; the source map and the package recovery runbook name the new paths. No behavior, wire or CLI change.
+
+### 2026-11-05, signed plugin index verifier, #1929
+
+- `crates/package/src/plugin_index.rs` adds the pure `verify_index`, `parse_index_envelope` and `VerifiedIndex::authorize`; see [Plugin index](concepts/runtime-catalog.md#plugin-index). No daemon, CLI or protocol surface changes.
+
+### 2026-11-05, plugin index state and channel parser, #1930
+
+- `crates/package/src/index_state.rs` adds `Registry::index_state` and `Registry::record_index`; `crates/package/src/index_channel.rs` adds `parse_index_channel`; see [Plugin index](concepts/runtime-catalog.md#plugin-index) and [Index state](concepts/runtime-package-archive.md#index-state). No daemon, CLI or protocol surface changes.
+
 ## 0.39.0
 
 ### 2026-11-02, one state for a crashed session, #422

@@ -1,3 +1,0 @@
-## Unreleased (2026-11-06, control connection deadlock, #1983)
-
-- The daemon reads each worker control connection continuously and the worker writes events without pausing its request loop, so a large request after an output burst no longer wedges `session screen`, `session input` and `session stop`. New optional `service.toml` `[deadlines]` keys `worker_send_ms` (15000) and `worker_answer_ms` (60000) close a control connection whose request write or answer does not finish; the watcher reconnects. `session stop` of a worker that does not answer ends its supervised job after the recorded identity is proven, and the session ends `stopped`. Documented in `docs/public-api.md` and `docs/architecture.md`.
