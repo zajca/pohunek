@@ -861,4 +861,16 @@ page `concepts/release-attestation.md`.
 
 `cargo xtask release assemble` turns the producer artifacts into the release bundle: it requires exactly the inventory that `packaging/release-policy.json` and `compat/matrix.json` imply, recomputes every checksum, binary-set digest and attestation from bytes, signs the catalog, rebuilds the daemon archives with the catalog and packages and writes `release-inventory.sha256`; `cargo xtask release verify-inventory --dir <bundle> --anchor <file>` re-checks a bundle against the pinned trust anchor. See the knowledge page `concepts/release-bundle.md`.
 
+Plugin repositories release through `.github/workflows/plugin-release.yml`
+(reusable, `workflow_call` only; inputs `core-tag` and `package-dir`). It runs on
+the caller's version tag. A `build` job with read-only permissions builds the
+archive with the `xtask` of the checked-out core tag (`cargo xtask plugin
+build`); a second `release` job, which runs no build code and holds the write,
+attestation and OIDC permissions, checks the checksums, attests the archive and
+publishes the GitHub release of the plugin repository. Every action is pinned by
+commit sha, no cache is restored, and neither job has a secret or a path to the
+plugin index. It is
+rehearsed by the `plugin_release` scenarios of `xtask` (`cargo xtask plugin build`
+and `plugin prove` against the workspace binaries), not by a core release run.
+
 After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.

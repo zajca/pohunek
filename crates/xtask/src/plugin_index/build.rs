@@ -299,6 +299,12 @@ fn index_entry(entry: EntryFile) -> IndexEntry {
     }
 }
 
+/// The signed entry of the single entry file `path`, checked like `index
+/// build` checks an entry of a tree.
+pub(crate) fn entry_of(path: &Path) -> Result<IndexEntry, XtaskError> {
+    read_entry(path).map(index_entry)
+}
+
 /// The signed entries of the tree at `root`, in `(package_id, version)` order,
 /// each checked like `index build` checks it.
 pub(super) fn entries_of(root: &Path) -> Result<Vec<IndexEntry>, XtaskError> {
