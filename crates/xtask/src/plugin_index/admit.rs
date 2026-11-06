@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 use package::{
     check_index_body, parse_core_range, IndexBody, IndexEntry, INDEX_REFUSED_RUNTIME_IDS,
-    INDEX_SCHEMA_VERSION, OFFICIAL_RUNTIME_PACKAGE_PREFIX, OFFICIAL_SCOPE,
+    INDEX_SCHEMA_VERSION, MAX_INDEX_BYTES, MAX_INDEX_ENTRIES, OFFICIAL_RUNTIME_PACKAGE_PREFIX,
+    OFFICIAL_SCOPE,
 };
 use semver::{Comparator, Op, Version};
 
@@ -51,8 +52,12 @@ pub(crate) struct CheckArgs {
     pub(crate) stage: CheckStage,
 }
 
+/// A refusal of `predicate`. The detail can quote names and keys of the pull
+/// request, so control characters are escaped: a line of the log never starts
+/// with text the pull request chose.
 fn refuse(predicate: &str, detail: impl std::fmt::Display) -> XtaskError {
-    XtaskError::Admission(format!("predicate={predicate}: {detail}"))
+    let detail = detail.to_string();
+    XtaskError::Admission(format!("predicate={predicate}: {}", detail.escape_debug()))
 }
 
 /// Parses `text` as a release version: no pre-release, no build metadata.
@@ -208,6 +213,12 @@ fn version_order(added: &EntryFile, existing: &[EntryFile]) -> Result<(), XtaskE
 
 /// Runs the daemon's structural entry rules over `entries`.
 fn probe(entries: &[IndexEntry]) -> Result<(), XtaskError> {
+    if entries.len() > MAX_INDEX_ENTRIES {
+        return Err(XtaskError::Usage(format!(
+            "the index would hold {} entries, above the limit of {MAX_INDEX_ENTRIES}",
+            entries.len()
+        )));
+    }
     let now = unix_now()?;
     let body = IndexBody {
         schema_version: INDEX_SCHEMA_VERSION,
@@ -216,7 +227,12 @@ fn probe(entries: &[IndexEntry]) -> Result<(), XtaskError> {
         expires_at: now + PROBE_LIFETIME_SECONDS,
         entries: entries.to_vec(),
     };
-    check_index_body(&body, now).map_err(XtaskError::Index)
+    check_index_body(&body, now).map_err(XtaskError::Index)?;
+    let bytes = serde_json::to_vec(&body).map_err(XtaskError::Json)?;
+    if bytes.len() > MAX_INDEX_BYTES {
+        return Err(XtaskError::Index(package::IndexError::TooLarge));
+    }
+    Ok(())
 }
 
 /// The smallest version `comparator` admits, or `None` when it has no lower
@@ -227,12 +243,32 @@ fn lower_bound(comparator: &Comparator) -> Option<Version> {
         Op::Exact | Op::GreaterEq | Op::Tilde | Op::Caret | Op::Wildcard => {
             Some(Version::new(comparator.major, minor, patch))
         }
-        Op::Greater => Some(match (comparator.minor, comparator.patch) {
-            (Some(minor), Some(patch)) => Version::new(comparator.major, minor, patch + 1),
-            (Some(minor), None) => Version::new(comparator.major, minor + 1, 0),
-            (None, _) => Version::new(comparator.major + 1, 0, 0),
-        }),
+        Op::Greater => greater_bound(comparator),
         _ => None,
+    }
+}
+
+/// The smallest version a `>` comparator admits: the next patch, minor or
+/// major of the named part, carrying into the next part when the component is
+/// `u64::MAX`. `None` when nothing is above the comparator.
+fn greater_bound(comparator: &Comparator) -> Option<Version> {
+    let major = comparator.major;
+    let next_major = || major.checked_add(1).map(|next| Version::new(next, 0, 0));
+    match (comparator.minor, comparator.patch) {
+        (Some(minor), Some(patch)) => patch
+            .checked_add(1)
+            .map(|next| Version::new(major, minor, next))
+            .or_else(|| {
+                minor
+                    .checked_add(1)
+                    .map(|next| Version::new(major, next, 0))
+            })
+            .or_else(next_major),
+        (Some(minor), None) => minor
+            .checked_add(1)
+            .map(|next| Version::new(major, next, 0))
+            .or_else(next_major),
+        (None, _) => next_major(),
     }
 }
 

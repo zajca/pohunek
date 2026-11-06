@@ -170,7 +170,7 @@ install by id.
   `schema` refuses a package id that is not `pohunek.runtime.` plus the runtime
   id, a refused runtime id, an identity or digest already admitted, a version
   that is not a release semver above every admitted version of the package id,
-  refuses a `url` outside letters, digits and `:/._+-`, and prints the validated
+  refuses an entry that would take the index past its entry or size limit, refuses a `url` outside letters, digits and `:/._+-`, and prints the validated
   fields as `key=value` lines for `IFS== read -r`, never for `eval`. Stage `core-range`
   refuses a range that does not parse, names a pre-release, does not admit the
   pinned core or admits a core below `0.40.0`. A refusal exits 1 and prints

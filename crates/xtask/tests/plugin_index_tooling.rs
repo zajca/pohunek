@@ -1565,6 +1565,7 @@ fn check_entry_judges_the_core_range_by_its_lower_bound() {
         ">=0.40.0, <0.50.0",
         ">0.39",
         "0.40.*",
+        ">0.39.18446744073709551615",
     ];
     for core in accepted {
         let text = admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', core);
@@ -1681,4 +1682,129 @@ fn check_entry_refuses_an_identity_the_admitted_tree_binds_elsewhere() {
     ]);
     assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&result.stderr).contains("predicate=identity-conflict"));
+}
+
+impl Tooling {
+    /// A tree that holds `text` as its only entry.
+    fn added_tree(&self, name: &str, text: &str) -> PathBuf {
+        let tree = self.path(name);
+        let file = tree.join("official/pohunek.runtime.muse/0.3.0.toml");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, text).expect("entry");
+        tree
+    }
+
+    /// Runs `check-entry --stage schema` and returns exit code, stdout, stderr.
+    fn check_schema(&self, added: &Path, existing: &Path) -> (Option<i32>, String, String) {
+        let result = self.xtask(&[
+            "index",
+            "check-entry",
+            "--entries",
+            s(added),
+            "--existing",
+            s(existing),
+            "--core-version",
+            "0.40.0",
+            "--stage",
+            "schema",
+        ]);
+        (
+            result.status.code(),
+            String::from_utf8_lossy(&result.stdout).into_owned(),
+            String::from_utf8_lossy(&result.stderr).into_owned(),
+        )
+    }
+}
+
+fn muse_entry() -> String {
+    admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', ">=0.40.0")
+}
+
+#[test]
+fn check_entry_accepts_the_first_entry_into_an_index_that_holds_only_the_gitkeep() {
+    let tooling = Tooling::new();
+    let existing = tooling.path("empty-index");
+    std::fs::create_dir_all(existing.join("official")).expect("mkdir");
+    std::fs::write(existing.join("official/.gitkeep"), b"").expect("gitkeep");
+    let added = tooling.added_tree("first-entry", &muse_entry());
+    let (code, stdout, stderr) = tooling.check_schema(&added, &existing);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("package_id=pohunek.runtime.muse\n"));
+}
+
+#[test]
+fn check_entry_refuses_an_added_tree_that_is_not_one_entry_file_and_every_source_fault() {
+    let tooling = Tooling::new();
+    let existing = tooling.path("empty-existing");
+    std::fs::create_dir_all(existing.join("official")).expect("mkdir");
+
+    let extra = tooling.added_tree("extra-file", &muse_entry());
+    std::fs::write(extra.join("official/pohunek.runtime.muse/notes.txt"), b"x").expect("file");
+    let linked = tooling.added_tree("symlinked", &muse_entry());
+    symlink(
+        "0.3.0.toml",
+        linked.join("official/pohunek.runtime.muse/0.4.0.toml"),
+    )
+    .expect("link");
+    let mut trees = vec![("extra file", extra), ("symlink", linked)];
+    for (name, from, to) in [
+        (
+            "uppercase commit",
+            "commit = \"cccccccccccccccccccccccccccccccccccccccc\"",
+            "commit = \"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\"",
+        ),
+        (
+            "dotdot repo",
+            "repo = \"pohunekd/plugin-x\"",
+            "repo = \"pohunekd/..\"",
+        ),
+        ("wrong tag", "tag = \"v0.3.0\"", "tag = \"v0.9.9\""),
+        ("zero repo id", "repo_id = 1", "repo_id = 0"),
+    ] {
+        trees.push((
+            name,
+            tooling.added_tree(name, &muse_entry().replace(from, to)),
+        ));
+    }
+    for (name, tree) in trees {
+        let (code, stdout, stderr) = tooling.check_schema(&tree, &existing);
+        assert_eq!(code, Some(1), "{name}: {stderr}");
+        assert!(stderr.contains("predicate=schema"), "{name}: {stderr}");
+        assert!(stdout.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn check_entry_refuses_an_entry_beyond_the_index_entry_limit() {
+    let tooling = Tooling::new();
+    let existing = tooling.path("full-index");
+    for n in 0..256_u32 {
+        let name = format!("r{n:04}");
+        let package = format!("pohunek.runtime.{name}");
+        let text = admission_entry(&name, &package, "0.1.0", '0', ">=0.40.0")
+            .replace(&"0".repeat(64), &format!("{n:064x}"));
+        let file = existing.join(format!("official/{package}/0.1.0.toml"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(file, text).expect("entry");
+    }
+    let added = tooling.added_tree("entry-257", &muse_entry());
+    let (code, _, stderr) = tooling.check_schema(&added, &existing);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("predicate=schema"), "{stderr}");
+    assert!(stderr.contains("above the limit"), "{stderr}");
+}
+
+#[test]
+fn check_entry_never_lets_a_pull_request_name_start_a_log_line() {
+    let tooling = Tooling::new();
+    let text = muse_entry() + "\"x\\n::error title=spoof::admission ok\" = 1\n";
+    let added = tooling.added_tree("hostile-key", &text);
+    let (code, _, stderr) = tooling.check_schema(&added, &fixtures());
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("predicate=schema"), "{stderr}");
+    assert!(
+        stderr.lines().all(|line| !line.starts_with("::")),
+        "a log line starts with a workflow command: {stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
 }
