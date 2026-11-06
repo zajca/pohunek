@@ -11,6 +11,11 @@
   policy (section 16.6), the `task.input_control` human control mode (section
   8.9), protected audit-reserve accounting and the versioned run manifest and
   bounded progress policy of the factory RFC (its sections 8.5, 12.5, 12.6).
+  Amended 2026-11-06 (#1988, with the
+  [ask channel RFC](ask-channel-rfc.md)): the owner answers (section 5), a
+  routed ask is the addressed answer path for Claude and Codex attentions
+  (section 8.5), and `pohunek mcp` also hosts the ask tools and gains a
+  worker-attested channel for session-bound calls (section 13.4).
   Design-only: nothing here claims a shipped surface, and none of it changes
   existing section numbering.
 - **Date:** 2026-09-24
@@ -171,7 +176,15 @@ the polling entirely.
 - A non-interactive runtime path. Tasks run in PTY sessions; there is no
   "headless run" mode.
 - Automatic commit, push, merge, pull-request creation or worktree cleanup.
-- Automatic approval of provider permission prompts on the owner's behalf.
+- Automatic approval of provider permission prompts on the owner's behalf. The
+  daemon never answers an attention on its own. Task attentions keep the
+  answer authority of section 11.3, except that the attention of a routed ask
+  follows the answerer table of the [ask channel RFC](ask-channel-rfc.md)
+  (section 3.4; see section 8.5). `confirm` asks, which include routed
+  approvals, and `secret` asks are answered by the owner only, and the ask
+  channel adds no daemon-side answerer; an expiry default is the asker's own
+  declared choice applied by the store, never an answer (ask channel RFC,
+  section 3.1).
 - Model or profile routing, experiments and A/B assignment.
 - A hostile-workload sandbox (owned by #88).
 - Replacing `session.wait`, `session.screen` or `session.output`; they remain
@@ -908,6 +921,10 @@ only once waiting is **confirmed**:
   OpenCode `permission.asked` and `form.created`; Claude `Notification` with
   matcher `permission_prompt` or `elicitation_dialog` carrying the same
   `prompt_id`;
+- or by a routed ask whose hook is still live after
+  `tasks.attention_confirm_ms` (see Routed asks below): the hook is the
+  waiting point, but another hook or rule can still decide while it waits, so
+  a routed ask is a pending decision until then;
 - or, when the provider has no such signal (Codex), by a detection `blocked`
   transition after the pending decision with no tool progress within
   `tasks.attention_confirm_ms`.
@@ -946,10 +963,39 @@ the provider:
   permission reply and form reply APIs, keyed by the provider's request or
   form id — the daemon sends the answer to that id. The provider itself
   rejects it if the request is no longer pending, and that rejection is
-  returned as `task_attention_stale`. This is the only path on which a stale
-  answer is **guaranteed** never to reach another question.
+  returned as `task_attention_stale`. This and routed asks (below) are the
+  paths on which a stale answer is **guaranteed** never to reach another
+  question.
+- **Routed asks (`verification: provider_addressed`, Claude and Codex).**
+  Where a core runtime handler routes the provider's own prompt through a hook
+  that can return the decision (Claude `PermissionRequest`, Codex
+  `PermissionRequest`; the routing and its per-runtime limits are in the
+  [ask channel RFC](ask-channel-rfc.md), sections 4.4 and 4.7), the prompt
+  becomes a routed ask while the hook waits, and the ask is the **addressed**
+  answer path for the attention: the hook holds that one provider request and
+  returns the owner's decision to it, so a stale answer cannot reach another
+  prompt. A running task's routed ask is the source of the task attention;
+  `task.answer` on such an attention answers or closes the ask only from a
+  caller the answerer table of the ask channel RFC (section 3.4) allows, and
+  every other caller gets a typed refusal. This includes callers that section
+  11.3 would let answer a keystroke attention and relay principals answering
+  on a share with `allow_delegated_answers`, until open question 3 is
+  decided. The answer travels
+  as the hook's output, never as keystrokes. A routed ask is the
+  waiting point only while its hook lives: another hook, a permission rule or
+  the permission mode may still decide, and the provider's own decision wins.
+  When something other than the owner's answer decided (the pending-decision
+  rules above), the ask closes as `resolved_elsewhere` and the owner's answer
+  is not applied. If the attention was already settled it is marked
+  `resolved_elsewhere` as above; a routed ask that closes before confirmation
+  is discarded like any pending decision and does not count toward
+  `tasks.max_settlement_revisions_per_turn`. When
+  the hook exits or times out before an answer, the ask closes as
+  `cancelled: hook_timeout`, and the native dialog is the only answer source
+  again; the keystroke rules below apply to it.
 - **Keystroke answers (`verification: unverified`).** Claude, Codex and
-  detection-only agents are answered by writing keys into the PTY. No
+  detection-only agents whose prompt no hook routes are answered by writing
+  keys into the PTY. No
   provider-side check ties those keys to request A; if the provider has
   already moved to B, they answer B. The daemon cannot close this window, so
   it does not pretend to: a keystroke answer is refused with
@@ -2295,7 +2341,10 @@ to run `task gc --orphans` after a crashed manager session.
 
 `pohunek mcp` is a stdio MCP server inside the CLI binary that exposes
 `task_run`, `task_continue`, `task_wait`, `task_show`, `task_answer` and
-`task_review` as tools. It is a thin client of the public protocol: no state,
+`task_review` as tools. It is also the one MCP server of a session: the ask
+tools of the [ask channel RFC](ask-channel-rfc.md) (`ask`, `ask_wait`,
+`ask_cancel`, `ask_get`) and, later, its rights-checked session tools are
+added to this command, never to a second server. It is a thin client of the public protocol: no state,
 no daemon-side MCP, same host targeting and origin guard. It forwards the
 origin markers of the session it runs in, so origin, loop guards and
 investigation-mode monotonicity (sections 11.2, 13.1) apply to its calls; in
@@ -2305,6 +2354,17 @@ same daemon ceiling and by the MCP client's own tool timeout, which the
 adapter reports in its tool descriptions. A blocking tool call gives no
 background wake, so for agents that have one (section 13.3) the CLI wait is
 preferred.
+
+**Worker-attested channel (2026-11-06 amendment).** The task tools stay a thin
+client of the public protocol and forward origin markers, which are not
+authentication. The ask tools (and any other session-bound call) additionally
+use a worker-attested channel: the server connects to the worker socket it
+finds in the session environment, and the worker accepts the request only from
+a process inside the session's PTY tree (kernel peer plus ancestry) and binds
+it to its own session id. The server sends no session id of its own and
+carries no token. The task tools keep their current path; the channel adds a
+second one beside it. The ask RFC (section 9.3) states the attestation rules
+and their limits.
 
 This does not conflict with the universal assistant's "no MCP knowledge server"
 decision, which concerns serving documentation, not delegating work. The
@@ -3071,10 +3131,15 @@ present, no detection-only settlement for OpenCode, and the share of
    `keepalive_*` keys of `service.toml` (§8.3).
 2. Whether investigation mode should refuse to start when a profile declares
    only `provider_rules` enforcement for an untrusted project.
+3. Who may answer a routed ask over the relay: the relay dark factory RFC
+   (sections 7.3 and 11) lets a share with `allow_delegated_answers` answer
+   provider-addressed attentions, while the ask channel RFC scopes the relay
+   out (its assumption 1). Until decided, over the relay only a relay attach
+   answers a routed ask; the owner path answers it as usual.
 
 Resolved elsewhere: relay-path `task.answer` authority and relay delegation
 budget scopes are defined by the relay dark factory RFC (sections 7.3 and
-8.1); review verdict retention is `tasks.metadata_retention` (section 14).
+8.1), except for routed asks (open question 3); review verdict retention is `tasks.metadata_retention` (section 14).
 Codex exposes `UserPromptSubmit` with `turn_id` (section 9.2), so Codex
 settlement is correlated like Claude's. The MCP adapter ships in this epic
 after the CLI and skill workstream (section 13.4, amendment #510).

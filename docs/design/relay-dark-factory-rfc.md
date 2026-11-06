@@ -480,6 +480,10 @@ separately authorized capability, not a free parameter:
 - the flag is part of the request fingerprint (section 8.2), and the audit
   record states the answer's `answer_verification` (section 9).
 
+Routed asks of the ask channel RFC are excluded from this grant until task
+RFC open question 3 is decided: only the owner path and a relay attach answer
+them.
+
 Without that capability a factory can answer OpenCode prompts (addressed
 answers) but not Claude or Codex prompts, whose attentions then escalate to
 humans (section 11). Operators choose that trade-off explicitly per share
