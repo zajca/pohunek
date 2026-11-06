@@ -90,9 +90,35 @@ The template's CI is required on every pull request and is not edited away:
 - the screen detection corpus for a runtime package;
 - a version-bump check, so a changed archive carries a new version.
 
-A release is published by the template's release workflow, which builds the
-archive, attests it, and publishes it with its digest and a compatibility
-vector.
+A release is published on a version tag `vX.Y.Z` by the template's release
+workflow, which calls the reusable
+`zajca/pohunek/.github/workflows/plugin-release.yml@<core tag>`:
+
+| Input | Meaning |
+|---|---|
+| `core-tag` (required) | The core release tag whose `xtask` builds the archive; it equals the tag in the caller's `uses:`. The workflow checks out that tag only, never a branch or a commit sha. |
+| `package-dir` (default `package`) | The package directory, a path below the repository root. |
+
+The workflow builds the archive with `cargo xtask plugin build` of that core
+tag, requires the pushed tag to equal `v` plus the archive's version, attests
+`<package_id>-<version>.tar.zst`, and publishes it with `SHA256SUMS` as a GitHub
+release of the plugin repository. It needs write access to `contents` and
+`attestations` and the OIDC `id-token` permission, restores no cache, uses no secret and has no access to
+the plugin index.
+
+The same two commands run locally:
+
+- `cargo xtask plugin build --dir <package dir> --output-dir <dir>` writes the
+  canonical archive and prints
+  `plugin build ok: <package_id> <version> <digest> <path>`. Two builds of one
+  directory are byte-identical, and an existing archive is never replaced.
+- `cargo xtask plugin prove --archive <file> --entry <entry.toml> --release-dir
+  <dir> --evidence <file>` installs the archive through the index path on an
+  isolated daemon started from the `pohunek`, `pohunekd` and `pohunek-sessiond`
+  in `--release-dir`, and writes the verdict as evidence JSON. It never launches
+  the runtime program and never talks to your own daemon. The
+  [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
+  lists the steps, the evidence fields and the exit statuses.
 
 ## Compatibility declaration
 
@@ -122,6 +148,20 @@ install by id.
   current core release and the nightly core. A named reviewer approves.
 - An official entry (a `pohunek.*` id) is admitted to the official tier. Every
   other entry is admitted to the verified tier.
+- A plugin archive is accepted only when both of these hold:
+  - `gh attestation verify <archive> --repo <source.repo> --signer-workflow
+    zajca/pohunek/.github/workflows/plugin-release.yml --signer-digest <commit
+    of the zajca/pohunek tag source.built_with> --source-ref
+    refs/tags/<source.tag> --source-digest <source.commit>
+    --deny-self-hosted-runners` succeeds. The commit is resolved only through
+    the qualified tag ref of `zajca/pohunek` itself, never through a bare sha,
+    so a commit of a fork network cannot satisfy it. Whether `--signer-digest`
+    matches the commit of a reusable workflow is checked by the first plugin
+    release; admission is not trusted before that check has passed.
+  - `cargo xtask plugin build` at `zajca/pohunek` tag `source.built_with`, run on
+    `source.commit`, reproduces the entry digest. A build by other code cannot
+    match this rebuild, so the `core-tag` input and the workflow commit do not
+    decide integrity.
 - Without admission, an owner can still install a published archive by its
   digest (community tier); such an install never serves a reserved runtime id.
 

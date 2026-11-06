@@ -1,0 +1,102 @@
+# Reusable release workflow of a plugin repository. A plugin repository calls it
+# from a workflow that runs on a version tag:
+#
+#   jobs:
+#     release:
+#       uses: zajca/pohunek/.github/workflows/plugin-release.yml@<core tag>
+#       with:
+#         core-tag: <the same core tag>
+#       permissions: { contents: write, id-token: write, attestations: write }
+#
+# It builds the plugin's archive with `xtask plugin build` of that core tag,
+# attests the archive and publishes it as a GitHub release of the plugin
+# repository. It never writes to the plugin index: admission is a pull request
+# to the index repository that checks this attestation and rebuilds the archive
+# (docs/knowledge/guides/plugin-repositories.md, "Admission through the index").
+
+name: plugin-release
+
+on:
+  workflow_call:
+    inputs:
+      core-tag:
+        description: Core release tag (vX.Y.Z) whose xtask builds the archive; equals the tag in the caller's `uses:`.
+        required: true
+        type: string
+      package-dir:
+        description: Package directory in the plugin repository, relative to its root.
+        required: false
+        type: string
+        default: package
+
+permissions: {}
+
+jobs:
+  release:
+    name: build, attest and publish the plugin archive
+    # Linux jobs are pinned to ubuntu-24.04 (#1731), never ubuntu-latest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Refuse a non-tag ref
+        run: test "$GITHUB_REF_TYPE" = tag
+
+      - name: Check out the plugin repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: plugin
+          persist-credentials: false
+
+      # Only a tag of the core repository: a branch or a bare commit sha never
+      # names the xtask that builds the archive.
+      - name: Check out the core tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: refs/tags/${{ inputs.core-tag }}
+          path: core
+          persist-credentials: false
+
+      # No cache is restored in this job (the rule of release-evidence.yml).
+      - name: Build the archive
+        timeout-minutes: 20
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_DIR" in
+            "" | /* | .. | ../* | */.. | */../*) echo "package-dir must be a path below the repository root" >&2; exit 1 ;;
+          esac
+          test -d "plugin/$PACKAGE_DIR"
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          (cd core && cargo build --locked -p xtask)
+          mkdir dist
+          # xtask runs only inside a pohunek checkout, so it runs from `core`.
+          line="$(cd core && ./target/debug/xtask plugin build --dir "$GITHUB_WORKSPACE/plugin/$PACKAGE_DIR" --output-dir "$GITHUB_WORKSPACE/dist")"
+          printf '%s\n' "$line"
+          read -r _ _ _ _ version _ _ <<<"$line"
+          test "$GITHUB_REF_NAME" = "v$version"
+          (cd dist && sha256sum -- *.tar.zst > SHA256SUMS)
+
+      - name: Attest the archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.tar.zst
+
+      - name: Publish the release
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_TAG: ${{ inputs.core-tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes "Built by zajca/pohunek plugin-release.yml at $CORE_TAG."
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" dist/*.tar.zst dist/SHA256SUMS
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

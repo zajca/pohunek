@@ -153,3 +153,43 @@ reaches the index; `index build --print-source` is how admission reads it.
 `index throwaway` is for proofs only: its root and key exist for the run, its
 output lies outside the checkout, and the committed anchor and channel do not
 name its root, so `index verify` against them fails.
+
+## 6. Build and prove a plugin archive
+
+Neither command reads a key file or the network. They run from a checkout at a
+core release tag, the way `plugin-release.yml` and the index admission run them.
+
+| Command | Writes | Checks |
+|---|---|---|
+| `plugin build --dir <package dir> --output-dir <dir>` | `<dir>/<package_id>-<version>.tar.zst` (mode 0644, never replaces a file) | the canonical archive of the directory; the identity comes from its `runtime.toml` |
+| `plugin prove --archive <file> --entry <entry.toml> --release-dir <dir> --evidence <file>` | the evidence JSON | the steps below |
+
+`plugin prove` takes the entry file of the index repository (with its `[source]`
+table) and runs these steps in a private root under `$TMPDIR`; each failure
+names its step in the evidence:
+
+1. `digest`: the SHA-256 of the archive equals the entry's digest, the archive
+   reads under the strict reader, and its descriptor has the entry's package id,
+   runtime id and version. Nothing is created before this step passes.
+2. `trust`: `index throwaway` signs an index of exactly this entry.
+3. `host`: `pohunek`, `pohunekd` and `pohunek-sessiond` of `--release-dir` are
+   copied beside the throwaway anchor and channel, and the daemon starts with a
+   cleared environment, its own home, XDG directories and control socket.
+4. `install`: `pohunek plugin install <archive> --index <index> --yes --json`
+   reports `installed`, origin `official`, enabled and selected.
+5. `inspect`: `pohunek plugin inspect <package_id> --json` reports the entry's
+   runtime without a fault, and `pohunek plugin doctor <package_id>` finds
+   nothing.
+6. `cleanup`: the daemon stops and the root is removed. A failure here is a
+   failure of the proof, also when the earlier steps passed.
+
+The root is removed on every path. The evidence is
+`{"schema":1,"core_version":...,"package_id":...,"version":...,"digest":...,
+"platform":...,"result":"pass"|"fail","failed_step":null|"<step>"}`;
+`core_version` is the first line of `pohunekd --version` and is `null` when the
+proof ended before the daemon copy ran. The exit status is 0 for a pass, 1 for a
+failed step and 2 for a refused invocation (an unreadable input, or an evidence
+file that exists); a refused invocation writes no evidence. The runtime program
+of the package is never launched, so no model runs. A runtime id an index never
+authorizes (`codex`, `claude`, `hermes`, `pi`, `shell`) fails at `install` with
+`package_runtime_not_claimable`.

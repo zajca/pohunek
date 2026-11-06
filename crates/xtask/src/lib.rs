@@ -18,6 +18,7 @@ mod package_affected;
 mod package_baseline;
 mod package_bump;
 mod package_evidence;
+mod plugin;
 mod plugin_index;
 pub mod ratchet;
 mod release;
@@ -115,6 +116,8 @@ pub enum XtaskError {
     Anchor(::package::AnchorFileError),
     /// A plugin index document failed the daemon's verification rules.
     Index(::package::IndexError),
+    /// A plugin proof ran and failed at a step; its evidence was written.
+    Prove(plugin::Verdict),
     /// A key file was refused; never carries key material.
     KeyFile {
         path: PathBuf,
@@ -139,6 +142,10 @@ const FAILURE_EXIT_CODE: i32 = 2;
 /// workflow tells a refused document from a refused invocation.
 const INDEX_REFUSED_EXIT_CODE: i32 = 1;
 
+/// Process exit code of a plugin proof that ran and failed, so a workflow
+/// tells a failed proof from a refused invocation.
+const PROVE_FAILED_EXIT_CODE: i32 = 1;
+
 /// Shell convention for a child killed by a signal: 128 plus the signal number.
 const SIGNAL_EXIT_BASE: i32 = 128;
 
@@ -155,6 +162,7 @@ impl XtaskError {
                 SIGNAL_EXIT_BASE + status.signal().unwrap_or(0)
             }),
             Self::Index(_) => INDEX_REFUSED_EXIT_CODE,
+            Self::Prove(_) => PROVE_FAILED_EXIT_CODE,
             _ => FAILURE_EXIT_CODE,
         }
     }
@@ -181,6 +189,7 @@ impl fmt::Display for XtaskError {
             Self::Catalog(error) => write!(f, "catalog: {error}"),
             Self::Anchor(error) => write!(f, "trust anchor: {error}"),
             Self::Index(error) => write!(f, "{error}"),
+            Self::Prove(verdict) => write!(f, "{verdict}"),
             Self::KeyFile { path, fault } => {
                 write!(f, "key file `{}` was refused: {fault}", path.display())
             }
@@ -217,6 +226,7 @@ impl Error for XtaskError {
             Self::Catalog(error) => Some(error),
             Self::Anchor(error) => Some(error),
             Self::Index(error) => Some(error),
+            Self::Prove(verdict) => Some(verdict),
             Self::Usage(_)
             | Self::KeyFile { .. }
             | Self::UnsupportedFileType(_)
@@ -476,6 +486,7 @@ where
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
         TopCommand::Index { action } => run_index(action),
+        TopCommand::Plugin { action } => run_plugin(action),
         TopCommand::Compat { action } => attestation::run(action, &root),
         TopCommand::Release { action } => release::run(action, &root),
         TopCommand::AgentSkill { action } => match action {
@@ -604,6 +615,16 @@ enum TopCommand {
     Index {
         #[command(subcommand)]
         action: IndexAction,
+    },
+    /// Build and prove the archive of a plugin release.
+    ///
+    /// `build` writes the canonical archive of a package directory; `prove`
+    /// installs an archive through the plugin index path on an isolated daemon
+    /// and writes the verdict as evidence. Neither reads a key file, and
+    /// `prove` never launches the runtime program of the package.
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
     },
     /// Attest, verify and matrix-check runtime package compatibility.
     ///
@@ -923,6 +944,47 @@ enum IndexAction {
         /// Channel file to write.
         #[arg(short, long, value_name = "FILE")]
         output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginAction {
+    /// Build the canonical archive of a package directory.
+    ///
+    /// The archive is written as `<package_id>-<version>.tar.zst` into
+    /// `--output-dir`, which must exist and lie outside the package directory.
+    /// An existing file is an error and is left unchanged. Prints
+    /// `plugin build ok: <package_id> <version> <digest> <path>`.
+    Build {
+        /// Package directory holding `runtime.toml` and the package files.
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+        /// Existing directory that receives the archive.
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+    },
+    /// Install an archive through the index path on an isolated daemon.
+    ///
+    /// Steps: `digest` (the archive is the one the entry lists), `trust` (a
+    /// throwaway index that lists only that entry), `host` (the release
+    /// executables from `--release-dir` start in a private prefix),
+    /// `install`, `inspect`, and `cleanup` (the daemon stops and the prefix
+    /// is removed). The evidence file is written for a pass and for a failed
+    /// step; the exit status is 0 only for a pass, 1 for a failed step and 2
+    /// for a refused invocation.
+    Prove {
+        /// Package archive to prove.
+        #[arg(long, value_name = "FILE")]
+        archive: PathBuf,
+        /// Index entry file of the archive, as in the index repository.
+        #[arg(long, value_name = "FILE")]
+        entry: PathBuf,
+        /// Directory that holds `pohunek`, `pohunekd` and `pohunek-sessiond`.
+        #[arg(long, value_name = "DIR")]
+        release_dir: PathBuf,
+        /// Evidence file to write; it must not exist yet.
+        #[arg(long, value_name = "FILE")]
+        evidence: PathBuf,
     },
 }
 
@@ -1292,6 +1354,30 @@ fn run_index_tooling(action: IndexAction) -> Result<(), XtaskError> {
         }
         IndexAction::Endorse { .. } | IndexAction::Revoke { .. } | IndexAction::Channel { .. } => {
             unreachable!("run_index sends only the tooling commands here")
+        }
+    }
+    Ok(())
+}
+
+fn run_plugin(action: PluginAction) -> Result<(), XtaskError> {
+    match action {
+        PluginAction::Build { dir, output_dir } => {
+            let built = plugin::build(&plugin::BuildArgs { dir, output_dir })?;
+            println!("{}", built.line());
+        }
+        PluginAction::Prove {
+            archive,
+            entry,
+            release_dir,
+            evidence,
+        } => {
+            let report = plugin::prove(&plugin::ProveArgs {
+                archive,
+                entry,
+                release_dir,
+                evidence,
+            })?;
+            println!("{report}");
         }
     }
     Ok(())

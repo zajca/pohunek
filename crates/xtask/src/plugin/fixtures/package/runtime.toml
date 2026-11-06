@@ -1,0 +1,35 @@
+# Fixture runtime of the `xtask plugin` tests: a core test package, not a
+# plugin. `prove` installs it and never launches the program.
+
+schema = 1
+id = "pohunek.runtime.kitfixture"
+version = "0.1.0"
+runtime_api = 1
+
+[runtime]
+id = "kitfixture"
+name = "Kit fixture"
+program = "true"
+args = []
+detect_manifest = "detect.toml"
+prompt_arg = true
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--session", "{reference}"]
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "assigned"
+launch_args = ["--session-id", "{reference}"]
+
+[native_reference.existence]
+check = "none"

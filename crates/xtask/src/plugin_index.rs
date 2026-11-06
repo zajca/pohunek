@@ -16,7 +16,7 @@ mod build;
 mod sign;
 mod throwaway;
 
-pub(crate) use build::{build, print_source, BuildArgs};
+pub(crate) use build::{build, entry_of, print_source, BuildArgs};
 pub(crate) use sign::{
     attach, message, verify_material, verify_whole, AttachArgs, VerifyIndexArgs, VerifyMaterialArgs,
 };
@@ -69,7 +69,7 @@ fn parse_key_id(text: &str, what: &str) -> Result<KeyId, XtaskError> {
 ///
 /// The create is exclusive, so an existing path is refused and never changed.
 /// A failure after the file was created removes it again.
-fn write_new_document(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+pub(crate) fn write_new_document(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -95,7 +95,7 @@ fn write_new_document(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
 }
 
 /// The document bytes: indented JSON with one trailing newline.
-fn document_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, XtaskError> {
+pub(crate) fn document_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, XtaskError> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(XtaskError::Json)?;
     bytes.push(b'\n');
     Ok(bytes)
