@@ -351,7 +351,6 @@ impl Tooling {
     }
 }
 
-/// A named change that breaks the entries tree layout.
 /// A named damage of an entries tree, the reason its refusal must give and
 /// the function that applies it.
 type Damage = (&'static str, &'static str, Box<dyn Fn(&Path)>);

@@ -225,15 +225,19 @@ class _SmokeArchiveFixture:
 
     # -- fixtures -----------------------------------------------------------
 
-    def build_archive(self, runtimes, catalog_digest_override=None):
+    def build_archive(self, runtimes, catalog_digest_override=None, omit=()):
         tree = self.base / "tree" / NAME
         shutil.rmtree(self.base / "tree", ignore_errors=True)
         tree.mkdir(parents=True)
         for binary in BINARIES:
             (tree / binary).write_text(f"#!/bin/sh\n# {binary}\n")
             (tree / binary).chmod(0o755)
-        (tree / "runtime-catalog-anchor.json").write_text('{"anchor":"fixture"}\n')
-        (tree / "plugin-index-channel.json").write_text('{"channel":"fixture"}\n')
+        for name, content in (
+            ("runtime-catalog-anchor.json", '{"anchor":"fixture"}\n'),
+            ("plugin-index-channel.json", '{"channel":"fixture"}\n'),
+        ):
+            if name not in omit:
+                (tree / name).write_text(content)
         (tree / "packaging").mkdir()
         shutil.copy(PACKAGING / "verify-archive", tree / "packaging" / "verify-archive")
         (tree / "runtime" / "packages").mkdir(parents=True)
@@ -537,6 +541,15 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         result = self.smoke("--runtime", "claude")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not shipped", result.stderr)
+
+    def test_an_archive_without_the_anchor_or_the_channel_file_is_refused(self):
+        for member in ("runtime-catalog-anchor.json", "plugin-index-channel.json"):
+            with self.subTest(member=member):
+                archive = self.build_archive(["pi", "codex"], omit=(member,))
+                result = self.smoke(archive=archive)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"the archive lacks {member}", result.stderr)
+                self.assert_cleaned_up()
 
     def test_a_shipped_package_without_a_staged_upstream_is_refused(self):
         shutil.rmtree(self.stage / "codex")

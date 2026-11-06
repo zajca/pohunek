@@ -416,7 +416,9 @@ async fn fill(staging: &TrustedDir, from: &Path, version: &str) -> Result<(), Er
 /// # Errors
 ///
 /// Returns [`Error::VersionConflict`] when an existing version directory
-/// holds different binaries; the staging directory is removed either way.
+/// holds different binaries, and [`Error::VersionLacksChannel`] when it lacks
+/// only the plugin index channel file the staged tree ships; the staging
+/// directory is removed either way.
 pub fn publish(layout: &InstallLayout, staged: &Staged, version: &str) -> Result<bool, Error> {
     let versions = open_owner_dir(&layout.versions_dir(), PUBLIC_MODE)?;
     let outcome = versions
@@ -449,9 +451,10 @@ pub fn publish(layout: &InstallLayout, staged: &Staged, version: &str) -> Result
 ///
 /// # Errors
 ///
-/// Returns [`Error::VersionConflict`] when contents differ or are missing, and
-/// [`Error::UntrustedVersion`] when the directory or a binary is not exactly
-/// what publishing creates.
+/// Returns [`Error::VersionConflict`] when contents differ or are missing,
+/// [`Error::VersionLacksChannel`] when only the plugin index channel file the
+/// staged tree ships is missing, and [`Error::UntrustedVersion`] when the
+/// directory or a binary is not exactly what publishing creates.
 pub fn verify_existing(
     layout: &InstallLayout,
     staged: &Staged,

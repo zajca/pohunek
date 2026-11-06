@@ -124,8 +124,19 @@ The install is refused before anything is recorded; the registry is unchanged.
   Recompute the digest of the file you have (`sha256sum`), compare it with the
   digest its publisher announced, and download the archive again on a
   mismatch. Never adjust `--sha256` to match a file you cannot vouch for.
-- `plugin_source_invalid`: the archive or catalog path does not exist or is not
-  a file; the CLI refuses it before contacting the daemon.
+- `plugin_source_invalid`: the archive, catalog or `--index` path does not
+  exist or is not a file, or a source without a trust flag is not a valid
+  `<package-id>[@<version>]` reference; the CLI refuses it before contacting
+  the daemon.
+- `plugin_trust_required`: the source is an archive file (a `.tar.zst` name or
+  an existing path) and no `--sha256`, `--catalog` or `--index` flag was given.
+  Nothing was fetched. Repeat the command with the trust flag that matches how
+  you obtained the archive.
+- `plugin_archive_digest_mismatch`: an install by package id downloaded an
+  archive whose SHA-256 differs from the digest the plugin index lists. This
+  is the by-id counterpart of the `package_archive_invalid` digest row above.
+  Do not retry with another source and do not work around it with
+  `--sha256`; report it to the index maintainers.
 - `package_source_unreadable`: the daemon cannot open the resolved path as a
   regular file, for example a file its user cannot read.
 - `package_descriptor_invalid`: the archive is intact but its runtime
@@ -155,7 +166,9 @@ The checks are in `crates/daemon/src/packages/trust.rs` and
      `<prefix>/libexec/pohunek/<version>/`. A version directory is immutable,
      so a version already installed without an anchor (a source build of the
      same version) cannot be republished with one: the install fails with
-     `service_version_conflict`. Remove it first with
+     `service_version_conflict`. The same applies to a directory that lacks
+     only the `plugin-index-channel.json` the release ships; it fails with
+     `service_version_lacks_index_channel`. Remove it first with
      `pohunek service uninstall`, which deletes every version directory no
      live session worker still uses and refuses while sessions are live unless
      `--stop-sessions` is given, then run the release installer.

@@ -277,6 +277,10 @@ log or an output:
   file. The roots are written in ascending key id order, so the argument order
   does not change the bytes.
 - `catalog public-key --key-file <file>` prints the key id and public key.
+- `catalog keygen --output <file>` writes a new random Ed25519 seed as a
+  `0600` key file that must not exist yet and prints the key id and public
+  key. The plugin index owner ceremony (`index endorse|revoke|channel`) is in
+  the [key ceremony runbook](../runbooks/plugin-index-keys.md).
 
 `cargo xtask release assemble` builds the release catalog from the producer
 artifacts with the same build, sign and verify code: the sequence is derived

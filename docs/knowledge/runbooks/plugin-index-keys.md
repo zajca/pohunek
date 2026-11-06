@@ -55,21 +55,27 @@ umask 077; d=$(mktemp -d /dev/shm/pohunek-index-XXXXXX)
 cargo xtask catalog keygen --output "$d/official-index.key"
 ```
 
-It prints `key_id=<64 hex>` and `public_key=<64 hex>`. Make the primary seed
-available as `<primary-seed>` (mode `0600`, owned by you), then:
+It prints `key_id=<64 hex>` and `public_key=<64 hex>`. Stage the primary seed
+as `$d/primary.key`, in the same RAM-backed directory and under the same
+`umask 077`. An offline medium (a vfat or exFAT USB stick) normally fails the
+reader's `0600`, own-uid and one-link rules, so copy the seed from it
+(`cp <offline-medium>/<primary-seed> "$d/primary.key"`) rather than pointing a
+command at the medium. Then:
 
 ```sh
 now=$(date -u +%s)
-cargo xtask index endorse --endorser-key-file <primary-seed> \
+cargo xtask index endorse --endorser-key-file "$d/primary.key" \
   --key-file "$d/official-index.key" --scope official \
   --not-before "$now" --not-after $((now + 31536000)) \
   --output official.record.json
-cargo xtask index revoke --endorser-key-file <primary-seed> --sequence 1 \
+cargo xtask index revoke --endorser-key-file "$d/primary.key" --sequence 1 \
   --output revocations.json
+shred -u "$d/primary.key"
 ```
 
 `endorse` prints the record's `key_id` and `endorsed_by`; the second must be the
-primary's key id. Put the primary seed back offline now. Open a pull request to
+primary's key id. `shred -u` destroys the staged copy of the primary seed after
+the last command that reads it; put the offline medium away. Open a pull request to
 the index repository that adds `keys/official.record.json` and
 `revocations/revocations.json` (both are public). Keep `$d` for the next step.
 
@@ -93,16 +99,19 @@ key is replaced (sections 1 and 3), never restored.
 Revoke `K`, introduce its replacement `K'` and swap the secret in one step, so
 there is no window in which the published index is signed by a revoked key:
 
-1. Create `K'` and its record as in section 1 (`catalog keygen`, then
-   `index endorse` with a fresh window).
+1. Create `K'` and its record as in section 1 (the private `$d`,
+   `catalog keygen`, the staged `$d/primary.key`, then `index endorse` with a
+   fresh window). Skip section 1's `index revoke` and `shred -u`: the primary
+   seed stays staged until step 2 has run.
 2. Write the next revocation list with the primary, keeping every id of the
-   previous list:
+   previous list, then destroy the staged primary seed:
 
    ```sh
-   cargo xtask index revoke --endorser-key-file <primary-seed> \
+   cargo xtask index revoke --endorser-key-file "$d/primary.key" \
      --previous revocations/revocations.json --sequence <n+1> \
      --key-id <K> [--key-id <earlier-revoked-id>]... \
      --output revocations.next.json
+   shred -u "$d/primary.key"
    ```
 
 3. In one pull request to the index repository, add the record of `K'` and
