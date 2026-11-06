@@ -1314,9 +1314,11 @@ content object id, with executable bits) that the tree of the commit `HEAD` name
 (one commit, trees only, https only, objects verified) into a private bare repository below the worker state root
 and runs no git command against the checkout, so its refs, index, objects and
 configuration cannot influence the answer; symbolic links, submodules, special files,
-untracked or ignored files and letter-case collisions refuse. Any error, timeout or
-missing fact withholds the arguments, all git calls of one evaluation share a 30 second
-deadline, and a failure logs one `checkout_trust.failed` warning. The arguments are
+untracked or ignored files, letter-case collisions, an entry on disk that differs from a
+declared component only by letter case, and a declared path that the file system opens
+under another spelling (case or normalization folding) refuse. Any error, timeout or
+missing fact withholds the arguments, the git calls and the on-disk walk of one
+evaluation share a 30 second deadline, and a failure logs one `checkout_trust.failed` warning. The arguments are
 evaluated at every launch and never persisted: no store or protocol change. A descriptor
 without the keys keeps its digest.
 

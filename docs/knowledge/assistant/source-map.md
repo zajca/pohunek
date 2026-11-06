@@ -916,6 +916,7 @@ Workspace crates by role (every workspace crate has an entry in this map;
 Design inputs:
 
 - `docs/design/delegated-task-runs-rfc.md`
+- `docs/design/ask-channel-rfc.md`
 - `docs/design/universal-assistant.md`
 - `docs/design/universal-assistant-plan.md`
 - `docs/design/durable-session-workers-rfc.md`

@@ -88,7 +88,16 @@ multi-team control plane without replacing either owner path.
   manager/auditor composition above the daemon (the relay dark factory).
   Amended 2026-10-08 (design-only): durable client work items, a client
   acceptance eligibility policy, and host-enforced human input control
-  (`task.input_control`).
+  (`task.input_control`). Amended 2026-11-06 (design-only): the owner answers,
+  routed asks as the addressed answer path, and the shared `task` and ask MCP server.
+- [Ask channel RFC](design/ask-channel-rfc.md) — accepted: a durable ask
+  primitive between a running agent and its operator (answer kinds, outcomes,
+  expiry, refine), emission through the MCP server and a CLI ask command, routing
+  of native permission prompts where a hook can answer them, owner surfaces, a
+  `secret` answer kind that returns references, and the Pohunek MCP server with
+  per-session rights (a guardrail, not a boundary); MCP now, an A2A gateway
+  later. Amends the delegated task runs RFC (owner answers, routed asks as the
+  addressed answer path, the shared MCP server).
 - [Relay dark factory RFC](design/relay-dark-factory-rfc.md) — accepted:
   relay authorization, budgets, audit, task projections and escalation for
   unattended manager/auditor delegation over the team relay; the factory is a
