@@ -60,6 +60,38 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Runner disk headroom (#1923). The Test step can exhaust the hosted
+      # runner's root disk: clippy, the nextest archive and the doctests each
+      # build the workspace, and six shards run from one archive. The
+      # preinstalled Android SDK, .NET, GHC and CodeQL trees are unused by
+      # this job, so they are removed first. Every `df` is logged under a
+      # "disk:" line; read those lines of a run to see free space at each
+      # stage. Measured on the 145G root disk of run 42207012636
+      # (2026-11-06): 86G free before pruning (59G used), 108G after (the
+      # prune freed 21G in 109 s); 94G free after the archive (target 12G,
+      # archive 1.5G); 93G free after every shard, the minimum of the job.
+      # Peak use is about 52G, so a healthy runner has ample headroom. The
+      # run that failed with "No space left on device" (#1923) was on a
+      # runner whose free space this job cannot predict: the `disk:` lines
+      # of any failing run show whether the starting free space was low.
+      - name: Free preinstalled toolchains
+        timeout-minutes: 10
+        env:
+          # Each removal is bounded well below the step bound, so a slow
+          # prune on a degraded runner becomes a warning, not a red gate.
+          PRUNE_TIMEOUT_SECONDS: "300"
+        run: |
+          set -uo pipefail
+          echo "disk: before pruning"
+          df -h / "$RUNNER_TEMP" || true
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$dir" ]; then
+              timeout "$PRUNE_TIMEOUT_SECONDS" sudo rm -rf -- "$dir" || echo "::warning::could not prune $dir"
+            fi
+          done
+          echo "disk: after pruning"
+          df -h / || true
+
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -93,6 +125,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Measure disk before clippy
+        timeout-minutes: 5
+        run: |
+          echo "disk: before clippy"
+          df -h / || true
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
@@ -108,6 +146,13 @@ jobs:
       # its absence a build error).
       - name: Archive workspace test binaries
         run: cargo nextest archive --profile ci --workspace --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+
+      - name: Measure disk after the archive
+        timeout-minutes: 5
+        run: |
+          echo "disk: after the nextest archive"
+          df -h / || true
+          timeout 120 du -sh target "$RUNNER_TEMP/nextest-archive.tar.zst" ~/.cargo/registry || true
 
       - name: Verify exhaustive disjoint test partitions
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" check
@@ -133,6 +178,8 @@ jobs:
               python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
             fi
             echo "::endgroup::"
+            echo "disk: after shard $shard"
+            df -h / || true
             if [ "$shard" = heavy ]; then
               python3 scripts/junit-flaky-summary --label "$shard" target/nextest/heavy/junit.xml
             elif [ "$shard" = relay-db ]; then
@@ -149,6 +196,12 @@ jobs:
       # nextest runs no doctests.
       - name: Documentation tests
         run: cargo test --doc --workspace --all-features
+
+      - name: Measure disk after the doctests
+        timeout-minutes: 5
+        run: |
+          echo "disk: after the doctests"
+          df -h / || true
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
