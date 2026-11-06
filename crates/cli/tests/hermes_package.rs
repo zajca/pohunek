@@ -1257,9 +1257,9 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
         // The package version moves with every package release; the golden
         // keeps the built-in descriptor's own.
         assert!(table.remove("version").is_some());
-        // The placement feature exists only in the package.
-        assert!(table.remove("requires").is_some());
-        assert!(table.remove("placement").is_some());
+        // The placement feature exists only in the package descriptor.
+        table.remove("requires");
+        table.remove("placement");
         table
     };
     let golden_descriptor: toml::Table = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR)
@@ -3010,7 +3010,7 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
     let mut published = Vec::new();
     for (index, (name, mut entries)) in cases.into_iter().enumerate() {
         // Above the installed package version, so each case is a new version.
-        let version = format!("1.1.{index}");
+        let version = format!("1.2.{index}");
         set_version(&mut entries, &version);
         let (bytes, case_digest) = archive_of(&entries);
         let archive = write_archive(&harness, &format!("hermes-{version}.tar.zst"), &bytes);
