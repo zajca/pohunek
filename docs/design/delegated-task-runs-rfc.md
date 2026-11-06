@@ -178,11 +178,13 @@ the polling entirely.
 - Automatic commit, push, merge, pull-request creation or worktree cleanup.
 - Automatic approval of provider permission prompts on the owner's behalf. The
   daemon never answers an attention on its own. Task attentions keep the
-  answer authority of section 11.3. A routed ask, a `confirm` ask and a
-  `secret` ask of the [ask channel RFC](ask-channel-rfc.md) (section 3.4) are
-  answered by the owner only, and the ask channel adds no daemon-side
-  answerer; an expiry default is the asker's own declared choice applied by
-  the store, never an answer (ask channel RFC, section 3.1).
+  answer authority of section 11.3, except that the attention of a routed ask
+  follows the answerer table of the [ask channel RFC](ask-channel-rfc.md)
+  (section 3.4; see section 8.5). `confirm` asks, which include routed
+  approvals, and `secret` asks are answered by the owner only, and the ask
+  channel adds no daemon-side answerer; an expiry default is the asker's own
+  declared choice applied by the store, never an answer (ask channel RFC,
+  section 3.1).
 - Model or profile routing, experiments and A/B assignment.
 - A hostile-workload sandbox (owned by #88).
 - Replacing `session.wait`, `session.screen` or `session.output`; they remain
@@ -976,8 +978,9 @@ the provider:
   `task.answer` on such an attention answers or closes the ask only from a
   caller the answerer table of the ask channel RFC (section 3.4) allows, and
   every other caller gets a typed refusal. This includes callers that section
-  11.3 would let answer a keystroke attention and relay principals with
-  `allow_delegated_answers`, until open question 3 is decided. The answer travels
+  11.3 would let answer a keystroke attention and relay principals answering
+  on a share with `allow_delegated_answers`, until open question 3 is
+  decided. The answer travels
   as the hook's output, never as keystrokes. A routed ask is the
   waiting point only while its hook lives: another hook, a permission rule or
   the permission mode may still decide, and the provider's own decision wins.
@@ -3131,12 +3134,12 @@ present, no detection-only settlement for OpenCode, and the share of
 3. Who may answer a routed ask over the relay: the relay dark factory RFC
    (sections 7.3 and 11) lets a share with `allow_delegated_answers` answer
    provider-addressed attentions, while the ask channel RFC scopes the relay
-   out (its assumption 1). Until decided, only the owner path and a relay
-   attach answer a routed ask.
+   out (its assumption 1). Until decided, over the relay only a relay attach
+   answers a routed ask; the owner path answers it as usual.
 
 Resolved elsewhere: relay-path `task.answer` authority and relay delegation
 budget scopes are defined by the relay dark factory RFC (sections 7.3 and
-8.1); review verdict retention is `tasks.metadata_retention` (section 14).
+8.1), except for routed asks (open question 3); review verdict retention is `tasks.metadata_retention` (section 14).
 Codex exposes `UserPromptSubmit` with `turn_id` (section 9.2), so Codex
 settlement is correlated like Claude's. The MCP adapter ships in this epic
 after the CLI and skill workstream (section 13.4, amendment #510).

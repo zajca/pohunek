@@ -200,7 +200,8 @@ defines three things this design must reuse rather than duplicate:
 | `revision`, `state`, `outcome` | See 3.3 | |
 
 An `on_expire = default` outcome is the asker's own declared choice, applied by the store when the deadline
-passes; it is not an answer given on the owner's behalf, and it never applies to approvals or secrets.
+passes; it is not an answer given on the owner's behalf, and it never applies to routed or backend asks,
+`secret` items or a `destructive` `confirm`.
 
 ### 3.2 Answer kinds
 
@@ -426,8 +427,8 @@ are verbatim, everything marked UNVERIFIED was not readable verbatim.
   message) as choices. "Always allow" changes the runtime's own permission rules, so it is offered only when
   the provider offers it and only to the owner.
 - **The routed hook is the waiting point.** A `PermissionRequest` hook runs "when Claude Code is about to
-  ask you for permission", so the dialog most likely does not render while the hook waits (to be measured,
-  the AC-06 measurement). The task RFC's rule that a decision request "is not waiting" (`delegated-task-runs-rfc.md`, section 8.5)
+  ask you for permission", so the dialog most likely does not render while the hook waits (to be measured
+  in the AC-06 measurement, together with whether another hook, rule or mode decides while the routed hook waits). The task RFC's rule that a decision request "is not waiting" (`delegated-task-runs-rfc.md`, section 8.5)
   still holds: another hook, a deny rule or the mode can decide first ("any `deny` wins" in Codex). The ask
   therefore records what the provider actually did. A decision made elsewhere closes it as
   `cancelled: resolved_elsewhere`, the owner's answer is not applied, and the attention record is marked `resolved_elsewhere`.
@@ -466,7 +467,9 @@ The same card over the overlay owner path. A secret item is accepted remotely on
 
 A new ask produces an attention record (kind `approval_required` for `confirm`, `agent_blocked` otherwise,
 until a dedicated `ask_pending` kind exists behind tolerant decoding,
-`crates/protocol/src/notification.rs:21-49`). Closing the ask updates the record. Desktop and phone pushes
+`crates/protocol/src/notification.rs:21-49`). Closing the ask updates the record. A routed ask produces its record, and its
+push, only once its hook is still live after the confirmation window of the task RFC (section 8.5), so a
+prompt that another hook or rule decides at once never notifies the owner. Desktop and phone pushes
 carry the title and the session only, never the context or any value.
 
 ### 5.5 "Extend the question"
