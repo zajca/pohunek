@@ -165,7 +165,8 @@ core release tag, the way `plugin-release.yml` and the index admission run them.
 | `plugin prove --archive <file> --entry <entry.toml> --release-dir <dir> --evidence <file>` | the evidence JSON | the steps below |
 
 `plugin prove` takes the entry file of the index repository (with its `[source]`
-table) and runs these steps in a private root under `$TMPDIR`; each failure
+table) and runs these steps in a private root under `$TMPDIR`, or under `/tmp` when the
+control socket path would not fit there (a stock macOS `$TMPDIR`); each failure
 names its step in the evidence:
 
 1. `digest`: the SHA-256 of the archive equals the entry's digest, the archive

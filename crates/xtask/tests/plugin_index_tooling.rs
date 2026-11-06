@@ -61,6 +61,10 @@ fn production_anchor() -> PathBuf {
     pohunek_test_support::workspace_root().join("packaging/runtime-catalog-anchor.json")
 }
 
+fn production_channel() -> PathBuf {
+    pohunek_test_support::workspace_root().join("packaging/plugin-index-channel.json")
+}
+
 /// A key created by `catalog keygen`.
 struct OwnerKey {
     file: PathBuf,
@@ -348,7 +352,9 @@ impl Tooling {
 }
 
 /// A named change that breaks the entries tree layout.
-type Damage = (&'static str, Box<dyn Fn(&Path)>);
+/// A named damage of an entries tree, the reason its refusal must give and
+/// the function that applies it.
+type Damage = (&'static str, &'static str, Box<dyn Fn(&Path)>);
 
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).expect("mkdir");
@@ -449,6 +455,30 @@ fn a_fixtures_tree_is_built_signed_outside_and_verified() {
             );
         }
     }
+}
+
+#[test]
+fn versions_of_one_package_are_ordered_by_version_not_by_file_name() {
+    let tooling = Tooling::new();
+    // `0.2.0-rc.toml` sorts before `0.2.0.toml` by file name, but the version
+    // strings sort the other way in byte order (`0.2.0` is a prefix of `0.2.0-rc`).
+    let tree = tooling.tree("tree");
+    let muse = tree.join("official/pohunek.runtime.muse");
+    let text = std::fs::read_to_string(muse.join("0.2.0.toml")).expect("read");
+    let text = text
+        .replace("version = \"0.2.0\"", "version = \"0.2.0-rc\"")
+        .replace("tag = \"v0.2.0\"", "tag = \"v0.2.0-rc\"")
+        .replace(&"1".repeat(64), &"3".repeat(64));
+    std::fs::write(muse.join("0.2.0-rc.toml"), text).expect("write");
+    let unsigned = tooling.build_ok(&tree, "unsigned.json");
+
+    let versions: Vec<String> = read_envelope(&unsigned)
+        .index
+        .entries
+        .iter()
+        .map(|entry| entry.version.as_str().to_owned())
+        .collect();
+    assert_eq!(versions, ["0.1.0", "0.2.0", "0.2.0-rc"]);
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -686,16 +716,19 @@ fn build_refuses_a_tree_that_is_not_exactly_the_entry_layout() {
     let mut damaged: Vec<Damage> = Vec::new();
     damaged.push((
         "stray file",
+        "holds only package directories",
         Box::new(|tree: &Path| std::fs::write(tree.join("official/README.md"), "x").expect("w")),
     ));
     damaged.push((
         "non-toml file",
+        "a package directory holds only",
         Box::new(|tree: &Path| {
             std::fs::write(tree.join("official/pohunek.runtime.muse/0.2.0.json"), "{}").expect("w");
         }),
     ));
     damaged.push((
         "deeper file",
+        "a package directory holds only",
         Box::new(|tree: &Path| {
             let deeper = tree.join("official/pohunek.runtime.muse/extra");
             std::fs::create_dir_all(&deeper).expect("mkdir");
@@ -704,20 +737,25 @@ fn build_refuses_a_tree_that_is_not_exactly_the_entry_layout() {
     ));
     damaged.push((
         "directory beside official",
+        "only the `official` directory is allowed",
         Box::new(|tree: &Path| std::fs::create_dir_all(tree.join("unofficial")).expect("mkdir")),
     ));
     damaged.push((
         "symbolic link entry",
+        "a symbolic link",
         Box::new(|tree: &Path| {
-            symlink(
-                tree.join("official/pohunek.runtime.muse/0.2.0.toml"),
-                tree.join("official/pohunek.runtime.muse/0.3.0.toml"),
-            )
-            .expect("symlink");
+            // The link points at an identical copy outside the tree, so only
+            // the link rule can refuse it.
+            let entry = tree.join("official/pohunek.runtime.muse/0.2.0.toml");
+            let copy = tree.with_file_name("outside-0.2.0.toml");
+            std::fs::copy(&entry, &copy).expect("copy");
+            std::fs::remove_file(&entry).expect("remove");
+            symlink(&copy, &entry).expect("symlink");
         }),
     ));
     damaged.push((
         "directory name differs from package id",
+        "but its directory is",
         Box::new(|tree: &Path| {
             std::fs::rename(
                 tree.join("official/pohunek.runtime.muse"),
@@ -728,6 +766,7 @@ fn build_refuses_a_tree_that_is_not_exactly_the_entry_layout() {
     ));
     damaged.push((
         "file stem differs from version",
+        "but its file stem is",
         Box::new(|tree: &Path| {
             std::fs::rename(
                 tree.join("official/pohunek.runtime.muse/0.2.0.toml"),
@@ -736,14 +775,19 @@ fn build_refuses_a_tree_that_is_not_exactly_the_entry_layout() {
             .expect("rename");
         }),
     ));
-    for (index, (name, damage)) in damaged.iter().enumerate() {
+    for (index, (name, reason, damage)) in damaged.iter().enumerate() {
         let tree = tooling.tree(&format!("tree-{index}"));
         damage(&tree);
         let output = tooling.path(&format!("unsigned-{index}.json"));
         let args = tooling.build_args(&tree, at, at + 7 * DAY, &output);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = tooling.xtask(&args);
+        let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(!result.status.success(), "{name} must be refused");
+        assert!(
+            stderr.contains(reason),
+            "{name}: expected {reason:?} in: {stderr}"
+        );
         assert!(!output.exists(), "{name} left an output");
     }
 }
@@ -1149,30 +1193,15 @@ fn the_throwaway_trust_verifies_against_itself_and_against_no_release_anchor() {
     let envelope = read_envelope(&index);
     assert_eq!(envelope.signatures.len(), 1);
 
-    // The production primary, named by a channel of the production anchor,
-    // is not the endorser of this index.
+    // The committed channel names the production primary as the endorser,
+    // and that root is not the endorser of this index.
     let production = production_anchor();
-    let production_text = std::fs::read_to_string(&production).expect("production anchor");
+    let production_channel = production_channel();
+    let channel_text = std::fs::read_to_string(&production_channel).expect("production channel");
     assert!(
-        production_text.contains(PRODUCTION_PRIMARY),
-        "primary root id moved"
+        channel_text.contains(PRODUCTION_PRIMARY),
+        "the committed channel names another endorser"
     );
-    let primary_id = production_text
-        .split('"')
-        .find(|word| word.starts_with(PRODUCTION_PRIMARY) && word.len() == 64)
-        .expect("primary key id")
-        .to_owned();
-    let production_channel = tooling.path("production-channel.json");
-    tooling.xtask_ok(&[
-        "index",
-        "channel",
-        "--anchor",
-        s(&production),
-        "--endorser-key-id",
-        &primary_id,
-        "--output",
-        s(&production_channel),
-    ]);
     let result = tooling.xtask(&[
         "index",
         "verify",

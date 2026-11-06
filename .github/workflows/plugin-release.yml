@@ -62,6 +62,10 @@ jobs:
           path: core
           persist-credentials: false
 
+      # Installs the channel the core tag pins in its rust-toolchain.toml.
+      - name: Install the pinned Rust toolchain
+        uses: ./core/.github/actions/setup-rust
+
       # No cache is restored in this job (the rule of release-evidence.yml).
       - name: Build the archive
         timeout-minutes: 20
@@ -73,9 +77,7 @@ jobs:
             "" | /* | .. | ../* | */.. | */../*) echo "package-dir must be a path below the repository root" >&2; exit 1 ;;
           esac
           test -d "plugin/$PACKAGE_DIR"
-          # The core checkout pins its toolchain in rust-toolchain.toml; rustup
-          # installs exactly that channel on first use inside `core`.
-          (cd core && rustup show active-toolchain && cargo build --locked -p xtask)
+          (cd core && cargo build --locked -p xtask)
           mkdir dist
           # xtask runs only inside a pohunek checkout, so it runs from `core`.
           line="$(cd core && ./target/debug/xtask plugin build --dir "$GITHUB_WORKSPACE/plugin/$PACKAGE_DIR" --output-dir "$GITHUB_WORKSPACE/dist")"
