@@ -32,6 +32,8 @@
 //! create_drain_ms = 10000                          # optional; 1..=600000
 //! driver_shutdown_ms = 5000                        # optional; 1..=600000
 //! event_log_flush_ms = 5000                        # optional; 1..=600000
+//! worker_send_ms = 15000                           # optional; 1..=600000
+//! worker_answer_ms = 60000                         # optional; 35000..=600000
 //!
 //! [environment]
 //! search_path = ["/opt/homebrew/bin", "/usr/bin"]  # absolute normalized directories; may be empty
@@ -556,6 +558,31 @@ pub const DEFAULT_DRIVER_SHUTDOWN: Duration = Duration::from_secs(5);
 /// the event-log drains to flush what they buffered.
 pub const DEFAULT_EVENT_LOG_FLUSH: Duration = Duration::from_secs(5);
 
+/// Default `deadlines.worker_send_ms`: how long writing one request to a
+/// worker's control connection may take.
+///
+/// A healthy worker is idle between requests and reads a request as fast as
+/// the daemon writes it, so a write that makes no end within this bound means
+/// the worker stopped reading.
+pub const DEFAULT_WORKER_SEND: Duration = Duration::from_secs(15);
+
+/// Default `deadlines.worker_answer_ms`: how long a worker may take to answer
+/// a request other than an input write or a stop.
+///
+/// The slowest such request is `Initialize` (PTY spawn plus journal write);
+/// the rest answer in milliseconds, except the acknowledgement of an exited
+/// session, which waits for the output drain ([`MIN_WORKER_ANSWER`]). An input
+/// write is bounded by the worker's own stall policy and a stop by the stop
+/// policy, so neither uses this.
+pub const DEFAULT_WORKER_ANSWER: Duration = Duration::from_secs(60);
+
+/// Smallest accepted `deadlines.worker_answer_ms`.
+///
+/// The worker answers the acknowledgement of an exited session only after its
+/// post-exit output drain, up to 30 s when an attached client does not read;
+/// a shorter answer deadline would tear a healthy connection then.
+pub const MIN_WORKER_ANSWER: Duration = Duration::from_secs(35);
+
 /// Part of `deadlines.daemon_exit_timeout_ms` that no shutdown phase may use.
 ///
 /// It covers process teardown after the last phase and scheduling delay on a
@@ -721,6 +748,12 @@ pub struct Deadlines {
     pub driver_shutdown: Duration,
     /// How long daemon shutdown waits for the event-log drains to flush.
     pub event_log_flush: Duration,
+    /// How long writing one request to a worker's control connection may take
+    /// before the daemon closes the connection.
+    pub worker_send: Duration,
+    /// How long a worker may take to answer a request other than an input
+    /// write or a stop before the daemon closes the connection.
+    pub worker_answer: Duration,
 }
 
 impl Deadlines {
@@ -1182,6 +1215,8 @@ impl ServiceConfig {
         validate_duration("deadlines.create_drain_ms", deadlines.create_drain)?;
         validate_duration("deadlines.driver_shutdown_ms", deadlines.driver_shutdown)?;
         validate_duration("deadlines.event_log_flush_ms", deadlines.event_log_flush)?;
+        validate_duration("deadlines.worker_send_ms", deadlines.worker_send)?;
+        validate_worker_answer(deadlines.worker_answer)?;
         validate_allowlist(&spec.environment_allowlist)?;
         validate_duration("sweep.grace_ms", spec.sweep_grace)?;
         validate_duration(
@@ -1408,6 +1443,8 @@ impl ServiceConfig {
                 create_drain_ms: millis(self.deadlines.create_drain),
                 driver_shutdown_ms: millis(self.deadlines.driver_shutdown),
                 event_log_flush_ms: millis(self.deadlines.event_log_flush),
+                worker_send_ms: millis(self.deadlines.worker_send),
+                worker_answer_ms: millis(self.deadlines.worker_answer),
             },
             environment: RawEnvironment {
                 search_path: self
@@ -1822,7 +1859,7 @@ struct RawNamespace {
 /// On-disk `[deadlines]` table in milliseconds.
 ///
 /// `registry_shutdown_ms`, `create_drain_ms`, `driver_shutdown_ms` and
-/// `event_log_flush_ms` are optional: a file that lacks one means its default,
+/// `event_log_flush_ms`, `worker_send_ms` and `worker_answer_ms` are optional: a file that lacks one means its default,
 /// and the writer omits it while it equals the default, so a file written
 /// without a deliberate setting stays readable by a release that predates the
 /// key.
@@ -1858,6 +1895,16 @@ struct RawDeadlines {
         skip_serializing_if = "is_default_event_log_flush_ms"
     )]
     event_log_flush_ms: u64,
+    #[serde(
+        default = "default_worker_send_ms",
+        skip_serializing_if = "is_default_worker_send_ms"
+    )]
+    worker_send_ms: u64,
+    #[serde(
+        default = "default_worker_answer_ms",
+        skip_serializing_if = "is_default_worker_answer_ms"
+    )]
+    worker_answer_ms: u64,
 }
 
 fn default_registry_shutdown_ms() -> u64 {
@@ -1906,6 +1953,30 @@ fn default_event_log_flush_ms() -> u64 {
 )]
 fn is_default_event_log_flush_ms(value: &u64) -> bool {
     *value == default_event_log_flush_ms()
+}
+
+fn default_worker_send_ms() -> u64 {
+    millis(DEFAULT_WORKER_SEND)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_worker_send_ms(value: &u64) -> bool {
+    *value == default_worker_send_ms()
+}
+
+fn default_worker_answer_ms() -> u64 {
+    millis(DEFAULT_WORKER_ANSWER)
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_worker_answer_ms(value: &u64) -> bool {
+    *value == default_worker_answer_ms()
 }
 
 /// On-disk `[environment]` table.
@@ -2482,6 +2553,8 @@ impl RawConfig {
                 create_drain_ms: default_create_drain_ms() + 1,
                 driver_shutdown_ms: default_driver_shutdown_ms() + 1,
                 event_log_flush_ms: default_event_log_flush_ms() + 1,
+                worker_send_ms: default_worker_send_ms() + 1,
+                worker_answer_ms: default_worker_answer_ms() + 1,
             },
             environment: RawEnvironment {
                 search_path: Vec::new(),
@@ -2808,6 +2881,8 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             create_drain: Duration::from_millis(raw.deadlines.create_drain_ms),
             driver_shutdown: Duration::from_millis(raw.deadlines.driver_shutdown_ms),
             event_log_flush: Duration::from_millis(raw.deadlines.event_log_flush_ms),
+            worker_send: Duration::from_millis(raw.deadlines.worker_send_ms),
+            worker_answer: Duration::from_millis(raw.deadlines.worker_answer_ms),
         },
         environment_allowlist: raw.environment.allowlist,
         search_path,
@@ -3027,6 +3102,22 @@ fn path_error(path: &Path) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Validates `deadlines.worker_answer_ms`: a duration at least
+/// [`MIN_WORKER_ANSWER`].
+fn validate_worker_answer(value: Duration) -> Result<(), ConfigError> {
+    const KEY: &str = "deadlines.worker_answer_ms";
+    validate_duration(KEY, value)?;
+    if value < MIN_WORKER_ANSWER {
+        return Err(ConfigError::OutOfRange {
+            key: KEY,
+            value: millis(value),
+            min: millis(MIN_WORKER_ANSWER),
+            max: millis(MAX_DEADLINE),
+        });
+    }
+    Ok(())
 }
 
 /// Validates one recorded duration key.

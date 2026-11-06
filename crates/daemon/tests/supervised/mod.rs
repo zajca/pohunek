@@ -1188,6 +1188,8 @@ fn service_config(
             create_drain: settings.daemon_exit / 8,
             driver_shutdown: settings.daemon_exit / 8,
             event_log_flush: settings.daemon_exit / 8,
+            worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+            worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
         },
         environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
             .iter()

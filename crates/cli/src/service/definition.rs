@@ -97,6 +97,8 @@ pub(crate) fn config_with_search_path(
             create_drain: pohunek_service_config::DEFAULT_CREATE_DRAIN,
             driver_shutdown: pohunek_service_config::DEFAULT_DRIVER_SHUTDOWN,
             event_log_flush: pohunek_service_config::DEFAULT_EVENT_LOG_FLUSH,
+            worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+            worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
         },
         environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
             .iter()

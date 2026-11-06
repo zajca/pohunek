@@ -3904,7 +3904,12 @@ impl SessionRegistry {
                 deadline,
                 Worker::connect_discovered(socket_path, self.daemon_instance_id()),
             )
-            .await;
+            .await
+            .inspect(|connected| {
+                if let Ok(worker) = connected {
+                    worker.set_exchange_deadlines(self.inner.config.worker_exchange_deadlines);
+                }
+            });
             match attempt {
                 Ok(Ok(worker)) => return Ok(worker),
                 Ok(Err(
@@ -7394,6 +7399,7 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::NotInitialized
         | WorkerError::AttachReadyTimeout { .. }
         | WorkerError::StopUnanswered { .. }
+        | WorkerError::ExchangeTimedOut { .. }
         | WorkerError::AnswerLost(_)
         | WorkerError::TornStream => (RuntimeState::Lost, UNREACHABLE_SOCKET),
     }

@@ -516,6 +516,26 @@ invoke native resume. A job whose worker is proven dead has its generation's
 leftover processes swept by ownership marker before the session is reported
 `lost`; unavailable or ambiguous supervisor evidence never kills anything.
 
+The control connection between the daemon and one worker never waits on a peer
+that is not reading. The daemon drains the connection with one reader task per
+lease: events are discarded and each response reaches the exchange that waits
+for it, so a request write cannot block on unread events. The worker queues an
+event as a pending line that it writes in steps beside reading the next request,
+so a daemon that reads only inside an exchange (a previous release) cannot stall
+its request loop; events carry absolute watermarks, and the broadcast channel's
+lag skip bounds the backlog. Two daemon deadlines end an exchange that cannot
+finish: `worker_send_ms` for writing the request and `worker_answer_ms` for the
+answer to any request except an input write (the worker's stall policy bounds it)
+and a stop (the stop bound). On expiry the daemon logs the session, the request
+and the phase, and shuts the socket down; the worker sees the end of the
+connection, releases its lease, and the watcher reconnects. A stop behind an
+exchange the worker never answers gets the connection once that exchange's
+deadline closed it and is refused with the retryable
+`session_runtime_reconnecting`. A stop that the
+worker leaves unanswered, or whose own exchange expires, proves the recorded
+worker identity from its journal and job, retires the job through the service
+manager, and commits the session `stopped`; a refused proof retires nothing.
+
 The daemon stops its own background work through one tree (`crates/daemon/src/shutdown.rs`).
 The session registry spawns every watcher, exit committer, forwarder and retry
 through a tracker it owns, and runs its blocking store writes through the same

@@ -647,6 +647,7 @@ impl Harness {
             state_root: &self.state_root,
             daemon_instance_id: "lifecycle-test",
             connect_deadline: self.connect_deadline,
+            exchange_deadlines: crate::runtime::ExchangeDeadlines::default(),
             inspector: &self.inspector,
         }
     }
@@ -1942,6 +1943,7 @@ async fn a_subprocess_worker_that_exits_at_once_ends_the_wait_with_its_status_an
         state_root: &state_root,
         daemon_instance_id: "lifecycle-test",
         connect_deadline: NEVER,
+        exchange_deadlines: crate::runtime::ExchangeDeadlines::default(),
         inspector: &inspector,
     };
     let generation = Generation::mint("s-1", executable).expect("mint");
@@ -2232,11 +2234,11 @@ async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
         drop(inhibitor);
     };
 
-    let ((outcome, ended), ()) =
-        wait::guard("a busy lease never extends the attempt deadline", async {
-            tokio::join!(attempt, timeline)
-        })
-        .await;
+    let ((outcome, ended), ()) = Box::pin(wait::guard(
+        "a busy lease never extends the attempt deadline",
+        async { tokio::join!(attempt, timeline) },
+    ))
+    .await;
 
     assert!(
         outcome.is_none(),

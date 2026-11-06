@@ -8523,7 +8523,19 @@ async fn delayed_plain_input_reports_a_lost_control_connection_to_a_surviving_wo
         .expect("input task joins")
         .expect_err("Enter cannot reach a worker whose connection was lost");
     assert_eq!(error.code, "worker_operation_failed", "{error:?}");
-    registry.stop(&id).await.expect("stop the session");
+    // A stop before the watcher reconnected is refused as retryable.
+    let stopped = Box::pin(wait_until(
+        "the stop to reach the reconnected worker",
+        || async {
+            match Box::pin(registry.stop(&id)).await {
+                Ok(stopped) => Some(stopped),
+                Err(error) if error.code == "session_runtime_reconnecting" => None,
+                Err(error) => panic!("the stop is refused for another reason: {error:?}"),
+            }
+        },
+    ))
+    .await;
+    assert!(stopped.stopped);
 }
 
 #[tokio::test]
@@ -10378,7 +10390,7 @@ async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live
         .expect("durable record");
     assert_eq!(durable.runtime.state, RuntimeState::Live);
 
-    assert_stop_refused(&registry, &created.id, "worker_operation_failed").await;
+    assert_stop_refused(&registry, &created.id, "session_runtime_reconnecting").await;
 }
 
 /// Applies `snapshot` the way the exit watcher does: an outcome that says the

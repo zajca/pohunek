@@ -153,6 +153,10 @@ pub struct ControlWriter<W> {
     inner: W,
     buffer: Vec<u8>,
     maximum: usize,
+    /// Bytes of `buffer` already accepted by the stream while a line queued by
+    /// [`Self::queue`] is pending.
+    written: usize,
+    pending: bool,
 }
 
 impl<W> ControlWriter<W>
@@ -166,6 +170,8 @@ where
             inner,
             buffer: Vec::new(),
             maximum: MAX_CONTROL_LINE_BYTES,
+            written: 0,
+            pending: false,
         }
     }
 
@@ -181,16 +187,86 @@ where
             inner,
             buffer: Vec::with_capacity(maximum.min(INITIAL_CONTROL_BUFFER_BYTES)),
             maximum,
+            written: 0,
+            pending: false,
         })
     }
 
-    /// Serializes and writes one newline-delimited control value.
+    /// Whether a line queued by [`Self::queue`] is not completely written.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Serializes one value as the pending line without writing it.
+    ///
+    /// [`Self::write_pending`] then moves the line to the stream in steps that
+    /// can each be abandoned, so a caller can keep serving other work while
+    /// the peer does not read. The next [`Self::write`] completes the pending
+    /// line first, so lines never interleave.
     ///
     /// # Errors
     ///
-    /// Returns [`ControlCodecError`] for serialization failures, oversized
-    /// encoded values, or I/O failures. Partial writes are retried.
-    pub async fn write<T>(&mut self, value: &T) -> Result<(), ControlCodecError>
+    /// Returns [`ControlCodecError`] for serialization failures or an oversized
+    /// encoded value, and [`ControlCodecError::PendingLine`] when a line is
+    /// already pending.
+    pub fn queue<T>(&mut self, value: &T) -> Result<(), ControlCodecError>
+    where
+        T: Serialize + Sync,
+    {
+        if self.pending {
+            return Err(ControlCodecError::PendingLine);
+        }
+        self.encode(value)?;
+        self.written = 0;
+        self.pending = true;
+        Ok(())
+    }
+
+    /// Hands the stream the next part of the pending line.
+    ///
+    /// Does nothing when no line is pending.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel-safe: one `write` call is the only await, and a
+    /// dropped future has written nothing that is not accounted for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlCodecError::Io`] when the stream fails or accepts no
+    /// byte.
+    pub async fn write_pending(&mut self) -> Result<(), ControlCodecError> {
+        if !self.pending {
+            return Ok(());
+        }
+        let accepted = self.inner.write(&self.buffer[self.written..]).await;
+        match accepted {
+            Ok(0) => {
+                self.discard_pending();
+                Err(ControlCodecError::Io(std::io::ErrorKind::WriteZero.into()))
+            }
+            Ok(count) => {
+                self.written += count;
+                if self.written == self.buffer.len() {
+                    self.discard_pending();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.discard_pending();
+                Err(ControlCodecError::Io(error))
+            }
+        }
+    }
+
+    fn discard_pending(&mut self) {
+        scrub(&mut self.buffer);
+        self.written = 0;
+        self.pending = false;
+    }
+
+    fn encode<T>(&mut self, value: &T) -> Result<(), ControlCodecError>
     where
         T: Serialize + Sync,
     {
@@ -208,6 +284,24 @@ where
             return Err(error);
         }
         self.buffer.push(b'\n');
+        Ok(())
+    }
+
+    /// Serializes and writes one newline-delimited control value, after any
+    /// line queued by [`Self::queue`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlCodecError`] for serialization failures, oversized
+    /// encoded values, or I/O failures. Partial writes are retried.
+    pub async fn write<T>(&mut self, value: &T) -> Result<(), ControlCodecError>
+    where
+        T: Serialize + Sync,
+    {
+        while self.pending {
+            self.write_pending().await?;
+        }
+        self.encode(value)?;
         let result = self.inner.write_all(&self.buffer).await;
         scrub(&mut self.buffer);
         result.map_err(ControlCodecError::Io)
@@ -270,6 +364,9 @@ pub enum ControlCodecError {
         /// Configured maximum line length.
         maximum: usize,
     },
+    /// A line was queued while another one was still pending.
+    #[error("worker control writer already holds a pending line")]
+    PendingLine,
     /// A caller requested an invalid configured bound.
     #[error("worker control limit {requested} is invalid; valid range is 1..={protocol_maximum}")]
     InvalidLimit {

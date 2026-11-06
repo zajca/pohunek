@@ -613,6 +613,7 @@ impl SessionRegistry {
                     state_root,
                     daemon_instance_id: self.daemon_instance_id(),
                     connect_deadline: config.worker_connect_deadline,
+                    exchange_deadlines: config.worker_exchange_deadlines,
                     inspector: self.inner.inspector.as_ref(),
                 })
             }

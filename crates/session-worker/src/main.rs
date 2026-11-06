@@ -371,6 +371,8 @@ mod tests {
                 create_drain: other,
                 driver_shutdown: other,
                 event_log_flush: other,
+                worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+                worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
             },
             environment_allowlist: vec!["PATH".to_owned()],
             search_path: pohunek_platform::shell_env::SearchPath::default(),

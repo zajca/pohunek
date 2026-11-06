@@ -667,6 +667,8 @@ pub struct Lifecycle<'a> {
     pub daemon_instance_id: &'a str,
     /// Bound on waiting for a new generation's authenticated socket.
     pub connect_deadline: Duration,
+    /// Deadlines applied to every exchange on the workers this engine connects.
+    pub exchange_deadlines: super::ExchangeDeadlines,
     /// Process observer used to prove a previous worker ended.
     pub inspector: &'a dyn ProcessInspector,
 }
@@ -1157,7 +1159,12 @@ impl Lifecycle<'_> {
                 until,
                 Worker::connect(&socket, generation.session_id(), self.daemon_instance_id),
             )
-            .await;
+            .await
+            .inspect(|connected| {
+                if let Ok(worker) = connected {
+                    worker.set_exchange_deadlines(self.exchange_deadlines);
+                }
+            });
             match attempt {
                 Ok(Err(
                     error @ WorkerError::Rejected {

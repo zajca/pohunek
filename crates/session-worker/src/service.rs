@@ -208,6 +208,8 @@ mod tests {
                 create_drain: deadline,
                 driver_shutdown: deadline,
                 event_log_flush: deadline,
+                worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+                worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
             },
             environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
             search_path: pohunek_platform::shell_env::SearchPath::default(),

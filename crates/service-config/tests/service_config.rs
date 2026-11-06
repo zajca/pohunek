@@ -17,7 +17,7 @@ use pohunek_service_config::{
     DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE,
     DEFAULT_KEEPALIVE_TIMING, DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING,
     DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE,
-    MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES, MIN_WORKER_ANSWER,
 };
 use tempfile::TempDir;
 
@@ -175,6 +175,8 @@ fn spec() -> ConfigSpec {
             create_drain: pohunek_service_config::DEFAULT_CREATE_DRAIN,
             driver_shutdown: pohunek_service_config::DEFAULT_DRIVER_SHUTDOWN,
             event_log_flush: pohunek_service_config::DEFAULT_EVENT_LOG_FLUSH,
+            worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+            worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
         },
         environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
         search_path: SearchPath::empty(),
@@ -3047,18 +3049,26 @@ fn shutdown_phase_keys_round_trip_and_reject_out_of_range() {
         "deadlines.create_drain_ms",
         "deadlines.driver_shutdown_ms",
         "deadlines.event_log_flush_ms",
+        "deadlines.worker_send_ms",
+        "deadlines.worker_answer_ms",
     ] {
         let line = key.trim_start_matches("deadlines.");
-        for value in [0_u64, 600_001] {
+        let floor = if key == "deadlines.worker_answer_ms" {
+            u64::try_from(MIN_WORKER_ANSWER.as_millis()).expect("fits")
+        } else {
+            1
+        };
+        // `floor - 1` is zero when the key has no floor above 1.
+        for (value, min) in [(0_u64, 1_u64), (floor - 1, floor), (600_001, 1)] {
             match fixture.load(&with_registry_shutdown(&format!("{line} = {value}"))) {
                 Err(ConfigError::OutOfRange {
                     key: rejected,
                     value: rejected_value,
-                    min,
+                    min: rejected_min,
                     max,
                 }) => assert_eq!(
-                    (rejected, rejected_value, min, max),
-                    (key, value, 1, 600_000)
+                    (rejected, rejected_value, rejected_min, max),
+                    (key, value, min, 600_000)
                 ),
                 other => panic!("{key} = {value}: {other:?}"),
             }
@@ -3066,20 +3076,28 @@ fn shutdown_phase_keys_round_trip_and_reject_out_of_range() {
     }
     let loaded = fixture
         .load(&with_registry_shutdown(
-            "create_drain_ms = 3000\ndriver_shutdown_ms = 2000\nevent_log_flush_ms = 1000",
+            "create_drain_ms = 3000\ndriver_shutdown_ms = 2000\nevent_log_flush_ms = 1000\nworker_send_ms = 7000\nworker_answer_ms = 40000",
         ))
         .expect("load custom phase bounds");
     let deadlines = loaded.deadlines();
     assert_eq!(deadlines.create_drain, Duration::from_secs(3));
     assert_eq!(deadlines.driver_shutdown, Duration::from_secs(2));
     assert_eq!(deadlines.event_log_flush, Duration::from_secs(1));
+    assert_eq!(deadlines.worker_send, Duration::from_secs(7));
+    assert_eq!(deadlines.worker_answer, Duration::from_secs(40));
     assert!(loaded.unknown_keys().is_empty());
     let rendered = loaded.to_toml();
     assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
 
     let default = fixture.load(GOLDEN).expect("load the golden file");
     let rendered = default.to_toml();
-    for key in ["create_drain", "driver_shutdown", "event_log_flush"] {
+    for key in [
+        "create_drain",
+        "driver_shutdown",
+        "event_log_flush",
+        "worker_send",
+        "worker_answer",
+    ] {
         assert!(!rendered.contains(key), "{key} written at its default");
     }
     assert_eq!(default.deadlines().create_drain, DEFAULT_CREATE_DRAIN);
