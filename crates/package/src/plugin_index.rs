@@ -669,38 +669,7 @@ fn build_key_set(
 ) -> Result<BTreeMap<KeyId, TrustedIndexKey>, IndexError> {
     let mut keys: BTreeMap<KeyId, TrustedIndexKey> = BTreeMap::new();
     for record in records {
-        let public = decode_hex::<PUBLIC_KEY_BYTES>(&record.public_key)
-            .ok_or(IndexError::MalformedKeyMaterial)?;
-        let key =
-            VerifyingKey::from_bytes(&public).map_err(|_cause| IndexError::MalformedKeyMaterial)?;
-        if key.is_weak() {
-            return Err(IndexError::MalformedKeyMaterial);
-        }
-        if KeyId::derive(&key) != record.key_id {
-            return Err(IndexError::KeyIdMismatch);
-        }
-        if &record.key_id == endorser.id() || keys.contains_key(&record.key_id) {
-            return Err(IndexError::DuplicateKeyId);
-        }
-        if record.not_after <= record.not_before {
-            return Err(IndexError::EmptyKeyWindow);
-        }
-        if record.not_after - record.not_before > MAX_INDEX_KEY_WINDOW_SECONDS {
-            return Err(IndexError::KeyWindowTooLong);
-        }
-        if record.scope != OFFICIAL_SCOPE {
-            return Err(IndexError::ScopeMismatch);
-        }
-        if &record.endorsed_by != endorser.id() {
-            return Err(IndexError::UnknownEndorser);
-        }
-        let signature = decode_hex::<SIGNATURE_BYTES>(&record.signature)
-            .map(|raw| ed25519_dalek::Signature::from_bytes(&raw))
-            .ok_or(IndexError::MalformedKeyMaterial)?;
-        endorser
-            .verifying_key()
-            .verify_strict(&index_key_record_signing_message(record), &signature)
-            .map_err(|_cause| IndexError::BadEndorsement)?;
+        let key = check_key_record(record, endorser, keys.contains_key(&record.key_id))?;
         keys.insert(
             record.key_id.clone(),
             TrustedIndexKey {
@@ -711,6 +680,140 @@ fn build_key_set(
         );
     }
     Ok(keys)
+}
+
+/// The rules one key record must satisfy under `endorser`, in verification
+/// order. `duplicate` says an earlier record of the same document already has
+/// this key id.
+fn check_key_record(
+    record: &IndexKeyRecord,
+    endorser: &RootKey,
+    duplicate: bool,
+) -> Result<VerifyingKey, IndexError> {
+    let public = decode_hex::<PUBLIC_KEY_BYTES>(&record.public_key)
+        .ok_or(IndexError::MalformedKeyMaterial)?;
+    let key =
+        VerifyingKey::from_bytes(&public).map_err(|_cause| IndexError::MalformedKeyMaterial)?;
+    if key.is_weak() {
+        return Err(IndexError::MalformedKeyMaterial);
+    }
+    if KeyId::derive(&key) != record.key_id {
+        return Err(IndexError::KeyIdMismatch);
+    }
+    if &record.key_id == endorser.id() || duplicate {
+        return Err(IndexError::DuplicateKeyId);
+    }
+    if record.not_after <= record.not_before {
+        return Err(IndexError::EmptyKeyWindow);
+    }
+    if record.not_after - record.not_before > MAX_INDEX_KEY_WINDOW_SECONDS {
+        return Err(IndexError::KeyWindowTooLong);
+    }
+    if record.scope != OFFICIAL_SCOPE {
+        return Err(IndexError::ScopeMismatch);
+    }
+    if &record.endorsed_by != endorser.id() {
+        return Err(IndexError::UnknownEndorser);
+    }
+    let signature = decode_hex::<SIGNATURE_BYTES>(&record.signature)
+        .map(|raw| ed25519_dalek::Signature::from_bytes(&raw))
+        .ok_or(IndexError::MalformedKeyMaterial)?;
+    endorser
+        .verifying_key()
+        .verify_strict(&index_key_record_signing_message(record), &signature)
+        .map_err(|_cause| IndexError::BadEndorsement)?;
+    Ok(key)
+}
+
+/// Parses `bytes` as one index key record and verifies it under `endorser`
+/// with the rules [`verify_index`] applies to each record of a document.
+///
+/// The endorser's own validity window and the revocation lists are not
+/// consulted: this checks the record alone.
+///
+/// # Errors
+///
+/// Returns the first violated rule as an [`IndexError`].
+pub fn verify_key_record_document(
+    bytes: &[u8],
+    endorser: &RootKey,
+) -> Result<IndexKeyRecord, IndexError> {
+    if bytes.len() > MAX_INDEX_BYTES {
+        return Err(IndexError::TooLarge);
+    }
+    let value = parse_strict(bytes)?;
+    let record: IndexKeyRecord =
+        serde_json::from_value(value).map_err(|_cause| IndexError::Schema)?;
+    check_key_record(&record, endorser, false)?;
+    Ok(record)
+}
+
+/// Parses `bytes` as one signed revocation list and verifies it under
+/// `endorser` with the rules [`verify_index`] applies to the embedded list.
+///
+/// The signature covers the `revocations` member as parsed. The list's
+/// sequence is returned for the caller to compare; no persisted mark is
+/// consulted.
+///
+/// # Errors
+///
+/// Returns the first violated rule as an [`IndexError`].
+pub fn verify_revocation_document(
+    bytes: &[u8],
+    endorser: &RootKey,
+) -> Result<SignedRevocations, IndexError> {
+    if bytes.len() > MAX_INDEX_BYTES {
+        return Err(IndexError::TooLarge);
+    }
+    let value = parse_strict(bytes)?;
+    if value
+        .pointer("/revocations/schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version != INDEX_SCHEMA_VERSION)
+    {
+        return Err(IndexError::UnsupportedSchemaVersion);
+    }
+    let document: SignedRevocations =
+        serde_json::from_value(value.clone()).map_err(|_cause| IndexError::Schema)?;
+    if document.revocations.schema_version != INDEX_SCHEMA_VERSION {
+        return Err(IndexError::UnsupportedSchemaVersion);
+    }
+    if document.revocations.revoked_key_ids.len() > MAX_REVOKED_KEYS {
+        return Err(IndexError::Limit(IndexLimit::RevokedKeys));
+    }
+    let member = value.get("revocations").ok_or(IndexError::Schema)?;
+    verify_revocations(
+        &document,
+        endorser,
+        &domain_message(REVOCATION_DOMAIN, member),
+    )?;
+    Ok(document)
+}
+
+/// The message an index signature covers for the document `bytes`: the domain
+/// prefix plus the canonical bytes of the `index` member as parsed.
+///
+/// Runs the key-free checks of [`verify_index`] (size, strict JSON, schema
+/// version, typed decode, limits) and nothing else, so a signer outside the
+/// workspace signs exactly what the verifier will later check.
+///
+/// # Errors
+///
+/// Returns the first violated rule as an [`IndexError`].
+pub fn index_document_signing_message(bytes: &[u8]) -> Result<Vec<u8>, IndexError> {
+    parse_document(bytes).map(|parsed| parsed.index_message)
+}
+
+/// Checks `body` as [`verify_index`] does after the signatures: scope,
+/// freshness against `now` (sequence at most a day ahead, lifetime within
+/// bounds, not expired) and entry structure. No persisted mark is consulted.
+///
+/// # Errors
+///
+/// Returns the first violated rule as an [`IndexError`].
+pub fn check_index_body(body: &IndexBody, now: u64) -> Result<(), IndexError> {
+    check_body(body, &IndexVerifierState::default(), now)?;
+    check_entries(&body.entries)
 }
 
 /// Returns the id of the first signature that verifies from a valid,

@@ -113,6 +113,8 @@ pub enum XtaskError {
     Catalog(::package::CatalogError),
     /// A trust anchor could not be built or read.
     Anchor(::package::AnchorFileError),
+    /// A plugin index document failed the daemon's verification rules.
+    Index(::package::IndexError),
     /// A key file was refused; never carries key material.
     KeyFile {
         path: PathBuf,
@@ -133,6 +135,10 @@ pub enum XtaskError {
 /// Process exit code for xtask failures that are not a delegated command's own exit.
 const FAILURE_EXIT_CODE: i32 = 2;
 
+/// Process exit code of a plugin index document that fails verification, so a
+/// workflow tells a refused document from a refused invocation.
+const INDEX_REFUSED_EXIT_CODE: i32 = 1;
+
 /// Shell convention for a child killed by a signal: 128 plus the signal number.
 const SIGNAL_EXIT_BASE: i32 = 128;
 
@@ -148,6 +154,7 @@ impl XtaskError {
                 use std::os::unix::process::ExitStatusExt as _;
                 SIGNAL_EXIT_BASE + status.signal().unwrap_or(0)
             }),
+            Self::Index(_) => INDEX_REFUSED_EXIT_CODE,
             _ => FAILURE_EXIT_CODE,
         }
     }
@@ -173,6 +180,7 @@ impl fmt::Display for XtaskError {
             Self::Release(error) => write!(f, "release: {error}"),
             Self::Catalog(error) => write!(f, "catalog: {error}"),
             Self::Anchor(error) => write!(f, "trust anchor: {error}"),
+            Self::Index(error) => write!(f, "{error}"),
             Self::KeyFile { path, fault } => {
                 write!(f, "key file `{}` was refused: {fault}", path.display())
             }
@@ -208,6 +216,7 @@ impl Error for XtaskError {
             Self::Release(error) => Some(error),
             Self::Catalog(error) => Some(error),
             Self::Anchor(error) => Some(error),
+            Self::Index(error) => Some(error),
             Self::Usage(_)
             | Self::KeyFile { .. }
             | Self::UnsupportedFileType(_)
@@ -585,11 +594,13 @@ enum TopCommand {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    /// Owner ceremony commands of the plugin index.
+    /// Owner ceremony and index tooling commands of the plugin index.
     ///
     /// Keys are read only from files that pass the same rules as
-    /// `catalog sign` and are never printed. Every output path must not exist
-    /// yet; a refused input writes nothing.
+    /// `catalog sign` and are never printed; the index tooling (`build`,
+    /// `message`, `attach`, `verify`, `throwaway`) reads no key file at all.
+    /// Every output file must not exist yet (`throwaway` takes an existing empty
+    /// directory); a refused input writes nothing.
     Index {
         #[command(subcommand)]
         action: IndexAction,
@@ -755,6 +766,148 @@ enum IndexAction {
         previous: Option<PathBuf>,
         /// Revocation document to write.
         #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Build the unsigned index document from an entries tree.
+    ///
+    /// The tree is `<entries>/official/<package_id>/<version>.toml` and
+    /// nothing else. The `[source]` table of each entry is validated and left
+    /// out of the document. The result must pass the daemon's body rules
+    /// before it is written. With `--print-source`, print the validated
+    /// `[source]` of the tree's only entry as `key=value` lines instead.
+    Build {
+        /// Entries tree.
+        #[arg(long, value_name = "DIR")]
+        entries: PathBuf,
+        /// Print the validated `[source]` of the only entry and write nothing.
+        #[arg(
+            long,
+            conflicts_with_all = ["revocations", "key_record", "sequence", "expires_at", "output"]
+        )]
+        print_source: bool,
+        /// Signed revocation list to embed.
+        #[arg(long, value_name = "FILE", required_unless_present = "print_source")]
+        revocations: Option<PathBuf>,
+        /// Index key record to embed; repeatable, 1 to 4.
+        #[arg(
+            long = "key-record",
+            value_name = "FILE",
+            required_unless_present = "print_source"
+        )]
+        key_record: Vec<PathBuf>,
+        /// Anti-rollback sequence: the Unix second of signing.
+        #[arg(
+            long,
+            value_name = "UNIX_SECONDS",
+            required_unless_present = "print_source"
+        )]
+        sequence: Option<u64>,
+        /// Unix second from which the document must no longer be accepted.
+        #[arg(
+            long,
+            value_name = "UNIX_SECONDS",
+            required_unless_present = "print_source"
+        )]
+        expires_at: Option<u64>,
+        /// Unsigned index file to write.
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            required_unless_present = "print_source"
+        )]
+        output: Option<PathBuf>,
+    },
+    /// Write the message an index signature covers.
+    ///
+    /// The file is the index domain prefix followed by the canonical bytes of
+    /// the document's `index` member as parsed. The signing key never reaches
+    /// this tool: sign the file with a tool outside the workspace.
+    Message {
+        /// Unsigned index file.
+        #[arg(long, value_name = "FILE")]
+        unsigned: PathBuf,
+        /// Message file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Attach an externally produced signature to an unsigned index.
+    ///
+    /// The signature file holds 128 lowercase hex characters and an optional
+    /// newline. The signed document is verified with the daemon's rules under
+    /// the endorser the channel file names, and written only when the signer
+    /// is `--key-id`.
+    Attach {
+        /// Unsigned index file.
+        #[arg(long, value_name = "FILE")]
+        unsigned: PathBuf,
+        /// Key id of the index key record that signed.
+        #[arg(long, value_name = "HEX")]
+        key_id: String,
+        /// File with the signature in hex.
+        #[arg(long, value_name = "FILE")]
+        signature: PathBuf,
+        /// Trust anchor file.
+        #[arg(long, value_name = "FILE")]
+        anchor: PathBuf,
+        /// Plugin index channel file.
+        #[arg(long, value_name = "FILE")]
+        channel: PathBuf,
+        /// Signed index file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Verify a signed index, or a key record and a revocation list.
+    ///
+    /// `--index` runs the daemon's verifier at the current time with the
+    /// anchor's revoked key ids. `--record` and `--revocations` check key
+    /// material for an index repository change; `--previous-revocations`
+    /// additionally requires a higher sequence and a superset of revoked ids.
+    Verify {
+        /// Signed index file.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["record", "revocations", "previous_revocations"],
+            required_unless_present_any = ["record", "revocations"]
+        )]
+        index: Option<PathBuf>,
+        /// Index key record file.
+        #[arg(long, value_name = "FILE", requires = "revocations")]
+        record: Option<PathBuf>,
+        /// Signed revocation list file.
+        #[arg(long, value_name = "FILE", requires = "record")]
+        revocations: Option<PathBuf>,
+        /// Previous signed revocation list file.
+        #[arg(long, value_name = "FILE", requires = "revocations")]
+        previous_revocations: Option<PathBuf>,
+        /// Trust anchor file.
+        #[arg(long, value_name = "FILE")]
+        anchor: PathBuf,
+        /// Plugin index channel file.
+        #[arg(long, value_name = "FILE")]
+        channel: PathBuf,
+        /// Highest index sequence accepted before.
+        #[arg(long, value_name = "N", requires = "index")]
+        index_high_water: Option<u64>,
+        /// Highest revocation sequence accepted before.
+        #[arg(long, value_name = "N", requires = "index")]
+        revocation_high_water: Option<u64>,
+    },
+    /// Create a throwaway trust root and a signed index for proofs.
+    ///
+    /// A random root and index key sign the index of `--entries` and are
+    /// discarded; neither seed is written. `--output` must be an existing
+    /// empty directory outside the checkout. It receives
+    /// `runtime-catalog-anchor.json` (the throwaway root only),
+    /// `plugin-index-channel.json` and `official-index-v1.json`; no release
+    /// anchor trusts them.
+    Throwaway {
+        /// Entries tree.
+        #[arg(long, value_name = "DIR")]
+        entries: PathBuf,
+        /// Existing empty directory that receives the three files.
+        #[arg(long, value_name = "DIR")]
         output: PathBuf,
     },
     /// Write the channel document that names the index endorser root.
@@ -1010,6 +1163,140 @@ fn run_catalog(action: CatalogAction) -> Result<(), XtaskError> {
     Ok(())
 }
 
+/// `index build`, with or without `--print-source`.
+fn run_index_build(action: IndexAction) -> Result<(), XtaskError> {
+    let IndexAction::Build {
+        entries,
+        print_source,
+        revocations,
+        key_record,
+        sequence,
+        expires_at,
+        output,
+    } = action
+    else {
+        return Ok(());
+    };
+
+    if print_source {
+        print!("{}", plugin_index::print_source(&entries)?);
+    } else {
+        // clap requires each of these unless `--print-source` is given.
+        let (Some(revocations), Some(sequence), Some(expires_at), Some(output)) =
+            (revocations, sequence, expires_at, output)
+        else {
+            return Err(XtaskError::Usage(
+                "index build needs --revocations, --sequence, --expires-at and --output".into(),
+            ));
+        };
+        let count = plugin_index::build(
+            &plugin_index::BuildArgs {
+                entries,
+                revocations,
+                key_records: key_record,
+                sequence,
+                expires_at,
+                output,
+            },
+            catalog::unix_now()?,
+        )?;
+        println!("index build ok: entries={count}");
+    }
+    Ok(())
+}
+
+/// The index commands that read no key file.
+fn run_index_tooling(action: IndexAction) -> Result<(), XtaskError> {
+    match action {
+        build @ IndexAction::Build { .. } => run_index_build(build)?,
+        IndexAction::Message { unsigned, output } => {
+            let written = plugin_index::message(&unsigned, &output)?;
+            println!(
+                "index message ok: sha256={} bytes={}",
+                written.sha256, written.bytes
+            );
+        }
+        IndexAction::Attach {
+            unsigned,
+            key_id,
+            signature,
+            anchor,
+            channel,
+            output,
+        } => {
+            plugin_index::attach(
+                &plugin_index::AttachArgs {
+                    unsigned,
+                    key_id,
+                    signature,
+                    anchor,
+                    channel,
+                    output,
+                },
+                catalog::unix_now()?,
+            )?;
+            println!("index attach ok");
+        }
+        IndexAction::Verify {
+            index,
+            record,
+            revocations,
+            previous_revocations,
+            anchor,
+            channel,
+            index_high_water,
+            revocation_high_water,
+        } => match (index, record, revocations) {
+            (Some(index), None, None) => {
+                let verified = plugin_index::verify_whole(
+                    &plugin_index::VerifyIndexArgs {
+                        index,
+                        anchor,
+                        channel,
+                        index_high_water,
+                        revocation_high_water,
+                    },
+                    catalog::unix_now()?,
+                )?;
+                println!(
+                    "index verify ok: sequence={} expires_at={} signer={} entries={}",
+                    verified.sequence, verified.expires_at, verified.signer, verified.entries
+                );
+            }
+            (None, Some(record), Some(revocations)) => {
+                let verified = plugin_index::verify_material(&plugin_index::VerifyMaterialArgs {
+                    record,
+                    revocations,
+                    previous_revocations,
+                    anchor,
+                    channel,
+                })?;
+                println!(
+                    "material verify ok: key_id={} revocation_sequence={}",
+                    verified.key_id, verified.revocation_sequence
+                );
+            }
+            _ => {
+                return Err(XtaskError::Usage(
+                    "index verify takes --index, or --record with --revocations".into(),
+                ));
+            }
+        },
+        IndexAction::Throwaway { entries, output } => {
+            let written =
+                plugin_index::throwaway(&plugin_index::ThrowawayArgs { entries, output })?;
+            println!(
+                "index throwaway ok: entries={} endorser={} signer={}",
+                written.entries, written.endorser, written.signer
+            );
+        }
+        IndexAction::Endorse { .. } | IndexAction::Revoke { .. } | IndexAction::Channel { .. } => {
+            unreachable!("run_index sends only the tooling commands here")
+        }
+    }
+    Ok(())
+}
+
 fn run_index(action: IndexAction) -> Result<(), XtaskError> {
     match action {
         IndexAction::Endorse {
@@ -1053,6 +1340,11 @@ fn run_index(action: IndexAction) -> Result<(), XtaskError> {
                 revoked.sequence, revoked.revoked
             );
         }
+        tooling @ (IndexAction::Build { .. }
+        | IndexAction::Message { .. }
+        | IndexAction::Attach { .. }
+        | IndexAction::Verify { .. }
+        | IndexAction::Throwaway { .. }) => run_index_tooling(tooling)?,
         IndexAction::Channel {
             anchor,
             endorser_key_id,

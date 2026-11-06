@@ -317,7 +317,7 @@ fn check_runtimes(root: &Path, runtimes: &[String]) -> Result<(), XtaskError> {
 /// tree or bundle: the canonical output path, and every directory above it,
 /// must not hold a [`RELEASE_TREE_MARKERS`] entry. Canonicalizing resolves
 /// symlinks, so a link into the checkout is refused as well.
-fn check_output_location(root: &Path, output: &Path) -> Result<(), XtaskError> {
+pub(crate) fn check_output_location(root: &Path, output: &Path) -> Result<(), XtaskError> {
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |source| XtaskError::Io { path, source }
@@ -326,7 +326,7 @@ fn check_output_location(root: &Path, output: &Path) -> Result<(), XtaskError> {
     let checkout = fs::canonicalize(root).map_err(io(root))?;
     if resolved.starts_with(&checkout) {
         return Err(XtaskError::Usage(format!(
-            "the test runtime output `{}` lies inside the checkout",
+            "the output `{}` lies inside the checkout",
             output.display()
         )));
     }
@@ -334,7 +334,7 @@ fn check_output_location(root: &Path, output: &Path) -> Result<(), XtaskError> {
         for marker in RELEASE_TREE_MARKERS {
             if fs::symlink_metadata(directory.join(marker)).is_ok() {
                 return Err(XtaskError::Usage(format!(
-                    "the test runtime output `{}` lies inside a release tree (`{}` holds `{marker}`)",
+                    "the output `{}` lies inside a release tree (`{}` holds `{marker}`)",
                     output.display(),
                     directory.display()
                 )));
