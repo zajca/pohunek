@@ -89,8 +89,10 @@ impl Rig {
                 &hook_runs,
                 &launches,
                 &cline_home.join("hooks"),
+                &dir.join("detached.sh"),
             ),
         );
+        write_executable(&dir.join("detached.sh"), DETACHED_WRAPPER);
         let program = dir.join(CLINE_BIN);
         pohunek_test_support::fs::copy_shell_image(native_supersede::bash_path(), &program)
             .expect("copy the fixture agent image");
@@ -285,7 +287,14 @@ fn fixture_path(name: &str) -> PathBuf {
 /// with the payload on stdin as a direct child, so the hook's `$PPID` is the
 /// fake Cline. Each hook's exit status and combined output size is appended to
 /// `hook_runs`.
-fn fake_cline(fifo: &Path, acks: &Path, hook_runs: &Path, launches: &Path, hooks: &Path) -> String {
+fn fake_cline(
+    fifo: &Path,
+    acks: &Path,
+    hook_runs: &Path,
+    launches: &Path,
+    hooks: &Path,
+    wrapper: &Path,
+) -> String {
     format!(
         r#"#!/bin/bash
 printf '%s\n' "$*" >> '{launches}'
@@ -306,9 +315,10 @@ while read -r command event payload mode < '{fifo}'; do
         noinstance) env -u POHUNEK_WORKER_INSTANCE_ID "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
         nokind) env -u POHUNEK_NATIVE_REFERENCE_KIND "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
         detached)
-          # The wrapper runs the hook once the subshell that started it (its $5)
-          # has exited, so the hook's parent is a process outside the PTY's tree.
-          ( p=$BASHPID; bash -c 'while kill -0 "$5" 2>/dev/null; do :; done; "$0" < "$1" > "$2.out" 2>&1; st=$?; printf "rc=%s bytes=%s\n" "$st" "$(wc -c < "$2.out" | tr -d " ")" >> "$2"; printf "fired %s\n" "$3" >> "$4"' "$hook" "$payload" '{hook_runs}' "$event" '{acks}' "$p" & ) ;;
+          # The launcher shell backgrounds the wrapper with its own pid (`$$`, a
+          # POSIX parameter) and exits; the wrapper runs the hook once that pid
+          # is gone, so the hook's parent is a process outside the PTY's tree.
+          sh -c '"$0" "$@" "$$" &' '{wrapper}' "$hook" "$payload" '{hook_runs}' "$event" '{acks}' ;;
         *) "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
       esac ;;
     exit) exit 0 ;;
@@ -320,8 +330,20 @@ done
         hook_runs = hook_runs.display(),
         launches = launches.display(),
         hooks = hooks.display(),
+        wrapper = wrapper.display(),
     )
 }
+
+/// The script that runs a hook after its launcher is gone: `hook payload
+/// hook_runs event acks launcher_pid`.
+const DETACHED_WRAPPER: &str = r#"#!/bin/sh
+hook=$1; payload=$2; runs=$3; event=$4; acks=$5; launcher=$6
+while kill -0 "$launcher" 2>/dev/null; do :; done
+"$hook" < "$payload" > "$runs.out" 2>&1
+st=$?
+printf 'rc=%s bytes=%s\n' "$st" "$(wc -c < "$runs.out" | tr -d ' ')" >> "$runs"
+printf 'fired %s\n' "$event" >> "$acks"
+"#;
 
 #[tokio::test]
 async fn a_launch_runs_in_sandbox_mode_on_the_users_data_root_without_auto_approve() {
