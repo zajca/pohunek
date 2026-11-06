@@ -31,10 +31,11 @@ pub(crate) struct Armed {
 
 /// Runs one check over the same-user process table.
 ///
-/// A process is an escape when it is outside the PTY's POSIX session, is named
-/// for the provider (`named_for_provider`) or holds a listening socket, and
-/// carries the generation's marker. The cheap tests run first so the
-/// environment of an unrelated process is never read.
+/// A process is an escape when it is outside the PTY's POSIX session, carries
+/// the generation's marker, and is named for the provider
+/// (`named_for_provider`) or holds a listening socket. The tests run from the
+/// cheapest to the dearest, so the socket tables are read only for processes
+/// that already belong to the generation.
 ///
 /// A process whose facts the host withholds cannot be attributed to the
 /// generation and is skipped: another session's agent of the same provider
@@ -65,30 +66,29 @@ pub(crate) fn survey(
             Err(PlatformError::Unavailable { .. }) => return unobservable(),
             Ok(None) | Err(_) => continue,
         }
-        let mut listener_unknown = false;
-        if !named_for_provider(fact.pid) {
-            match inspector.holds_listener(fact.pid) {
-                Ok(Some(true)) => {}
-                Err(PlatformError::Unavailable { .. }) => return unobservable(),
-                Ok(Some(false) | None) | Err(PlatformError::Race { .. }) => continue,
-                Err(_) => listener_unknown = true,
-            }
-        }
+        // The marker is a single small read, so it filters before the listener
+        // test, which parses the socket tables.
         match inspector.ownership_markers(fact.pid) {
             Ok(markers)
                 if markers.worker_instance_id.as_deref()
-                    == Some(armed.worker_instance_id.as_str()) =>
-            {
-                if listener_unknown {
-                    unclassified += 1;
-                } else {
-                    escaped.push(EscapedProcess {
-                        pid: fact.pid,
-                        comm: fact.comm,
-                    });
-                }
-            }
-            Ok(_) | Err(_) => {}
+                    == Some(armed.worker_instance_id.as_str()) => {}
+            Ok(_) | Err(_) => continue,
+        }
+        if named_for_provider(fact.pid) {
+            escaped.push(EscapedProcess {
+                pid: fact.pid,
+                comm: fact.comm,
+            });
+            continue;
+        }
+        match inspector.holds_listener(fact.pid) {
+            Ok(Some(true)) => escaped.push(EscapedProcess {
+                pid: fact.pid,
+                comm: fact.comm,
+            }),
+            Err(PlatformError::Unavailable { .. }) => return unobservable(),
+            Ok(Some(false) | None) | Err(PlatformError::Race { .. }) => {}
+            Err(_) => unclassified += 1,
         }
     }
     if !escaped.is_empty() {
