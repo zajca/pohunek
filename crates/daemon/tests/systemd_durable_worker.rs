@@ -1305,6 +1305,7 @@ impl Fixture {
                         pohunek_daemon::agent::NativeReferenceProvenance::default(),
                     profile_revision: None,
                     native_launch_unresolved: false,
+                    launch_checkout: None,
                 }),
                 active_agent_origin: None,
                 native_identity_ordering: None,

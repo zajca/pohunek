@@ -1688,6 +1688,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         profile_revision: None,
         native_launch_unresolved: false,
+        launch_checkout: None,
     };
     let package_pin = |runtime: &str| {
         LaunchPin::Pinned(Box::new(LaunchBinding {
@@ -19388,6 +19389,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         profile_revision: None,
         native_launch_unresolved: false,
+        launch_checkout: None,
     };
 
     let err = registry
@@ -19960,6 +19962,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         profile_revision: None,
         native_launch_unresolved: false,
+        launch_checkout: None,
     };
 
     for (program, version_output) in [
@@ -20378,6 +20381,7 @@ async fn resume_binding_restores_metadata_from_store() {
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
+            launch_checkout: None,
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())

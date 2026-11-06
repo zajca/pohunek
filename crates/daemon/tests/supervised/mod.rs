@@ -895,6 +895,7 @@ impl Installation {
             ),
             profile_revision: None,
             native_launch_unresolved: false,
+            launch_checkout: None,
         }
     }
 

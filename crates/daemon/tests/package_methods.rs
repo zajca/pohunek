@@ -93,6 +93,9 @@ struct Servers {
     /// The path of the repository the checkout-trust predicate fetches the
     /// remote `HEAD` from; `None` is a failed lookup.
     remote_source: Arc<std::sync::Mutex<Option<String>>>,
+    /// The registry the servers answer from, for a scenario that restarts the
+    /// daemon over its store.
+    registry: SessionRegistry,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -212,7 +215,7 @@ async fn spawn_servers_configured(
     );
     let state = DaemonState::new(
         HealthInfo::new("0.0.0-test"),
-        registry,
+        registry.clone(),
         governance,
         support::overlay_registry(),
         pohunek_daemon::api::OverlaySource::Default,
@@ -252,6 +255,7 @@ async fn spawn_servers_configured(
         shutdown,
         task,
         remote_source,
+        registry,
         _dirs: (socket_dir, worker_home_dir),
     }
 }
@@ -3561,6 +3565,9 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
 
 const CHECKOUT_TRUST_FEATURE: &str = "\"checkout-trust-args-v1\"";
 
+/// Largest declared file the predicate compares, in bytes.
+const MAX_COMPARED_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The argument the fixture runtime adds to a trusted checkout.
 const TRUST_ARG: &str = "--trust-workspace";
 
@@ -3982,6 +3989,38 @@ async fn only_a_clean_checkout_of_a_trusted_repository_gets_the_trusted_args() {
     assert!(!carries_trust_arg(
         &created_argv(&mut local, &servers, &executable).await
     ));
+    // A special file below a declared path is refused without being read.
+    let fifo = checkout(root, "fifo", own);
+    std::fs::remove_file(fifo.join(".agents/rules.md")).expect("remove rules");
+    nix::unistd::mkfifo(
+        &fifo.join(".agents/rules.md"),
+        nix::sys::stat::Mode::from_bits_truncate(0o644),
+    )
+    .expect("create a fifo");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &fifo).await
+    ));
+    // A declared file is hashed up to the size bound and refused above it,
+    // although the remote tree holds the same bytes.
+    for (name, size, trusted) in [
+        ("file-at-bound", MAX_COMPARED_FILE_BYTES, true),
+        ("file-over-bound", MAX_COMPARED_FILE_BYTES + 1, false),
+    ] {
+        let big = checkout(root, name, own);
+        std::fs::write(
+            big.join(".muse/big.bin"),
+            vec![b'x'; usize::try_from(size).expect("size fits")],
+        )
+        .expect("write a large file");
+        git_in(&big, &["add", "."]);
+        git_in(&big, &["commit", "-q", "-m", "large"]);
+        git_in(&big, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        assert_eq!(
+            carries_trust_arg(&created_argv(&mut local, &servers, &big).await),
+            trusted,
+            "{name}"
+        );
+    }
     // Forged local refs and index do not help: the checkout's `origin/main`
     // follows a malicious commit, but the remote reports the real one.
     let forged = checkout(root, "forged-refs", own);
@@ -4504,10 +4543,11 @@ async fn a_frozen_trusted_arg_is_withheld_from_an_untrusted_resume() {
     let dir = checkout(root, "frozen", "https://github.com/acme/widgets.git");
     announce_remote_source(&servers, Some(remote_snapshot(&dir)));
 
-    // The fixed argument is part of the create; the host trusts no repository,
-    // so a resume drops it.
+    // The fixed argument is frozen into the session, but the host trusts no
+    // repository, so neither the create nor a resume launches with it.
     let created = start_named_session(&mut local, RUNTIME, &dir, None).await;
-    assert!(carries_trust_arg(&printed_argv(&mut local, &created).await));
+    let argv = printed_argv(&mut local, &created).await;
+    assert!(!carries_trust_arg(&argv), "{argv:?}");
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(created)).await;
     let resumed: protocol::SessionResumeResult =
@@ -4517,6 +4557,487 @@ async fn a_frozen_trusted_arg_is_withheld_from_an_untrusted_resume() {
 
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+/// Occurrences of [`TRUST_ARG`] in `argv`.
+fn trust_arg_count(argv: &[String]) -> usize {
+    argv.iter().filter(|arg| *arg == TRUST_ARG).count()
+}
+
+#[tokio::test]
+async fn a_trusted_arg_in_fixed_args_or_a_profile_is_added_only_by_the_predicate() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-fixed",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = argv_program(&servers.plugins);
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &trusting_keys())
+        .replace(
+            "args = [\"--model\", \"fast\"]\n",
+            &format!("args = [\"--model\", \"fast\", \"{TRUST_ARG}\"]\n"),
+        );
+    let (digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-fixed",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    std::fs::write(
+        servers.agents.join("profiled.toml"),
+        format!(
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\nprogram = \"{}\"\nargs = [\"--from-profile\", \"{TRUST_ARG}\"]\n",
+            digest.as_str(),
+            program.display()
+        ),
+    )
+    .expect("write the profile");
+    let root = servers.plugins.parent().expect("the socket directory");
+
+    // A checkout the predicate does not accept launches without the argument,
+    // whichever of the descriptor and the profile holds it.
+    let fork = checkout(root, "fixed-fork", "https://github.com/mallory/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&fork)));
+    for agent in [RUNTIME, "profiled"] {
+        let id = start_named_session(&mut local, agent, &fork, None).await;
+        let argv = printed_argv(&mut local, &id).await;
+        assert_eq!(trust_arg_count(&argv), 0, "{agent}: {argv:?}");
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+
+    // A trusted checkout gets it once, from the predicate, after the fixed
+    // arguments.
+    let own = checkout(root, "fixed-own", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&own)));
+    for (agent, fixed) in [
+        (RUNTIME, strings(&["--model", "fast"])),
+        ("profiled", strings(&["--from-profile"])),
+    ] {
+        let id = start_named_session(&mut local, agent, &own, None).await;
+        let argv = printed_argv(&mut local, &id).await;
+        assert_eq!(trust_arg_count(&argv), 1, "{agent}: {argv:?}");
+        assert_eq!(
+            without_reference(&argv, &["--session-id"]),
+            [fixed, strings(&[TRUST_ARG, "--session-id"])].concat(),
+            "{agent}"
+        );
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Trusted checkout arguments follow the directory a session was created in
+// ---------------------------------------------------------------------------
+
+/// A runtime program that prints its arguments, then moves its own working
+/// directory on request: `osc <dir>` prints an OSC 7 hint for `dir`, `cd <dir>`
+/// changes the directory of the process.
+fn drifting_program(plugins: &Path) -> PathBuf {
+    write_program(
+        plugins,
+        "agent-drift",
+        "#!/bin/sh\nfor a in \"$@\"; do printf 'ARG<%s>\\n' \"$a\"; done\nprintf 'ARGV_END\\n'\nwhile read -r mode dir; do\n  case \"$mode\" in\n    osc) printf '\\033]7;file://%s\\007' \"$dir\" ;;\n    cd) cd \"$dir\" ;;\n  esac\ndone\nexec sleep 600\n",
+    )
+}
+
+/// Installs the runtime that declares the trusted-checkout keys, holds
+/// [`TRUST_ARG`] in its fixed arguments, assigns its forks a reference and
+/// drifts its directory on request. `program` is the same path for every
+/// daemon of a scenario, so a package installed again keeps its digest.
+async fn install_drifting_runtime<S>(
+    servers: &Servers,
+    local: &mut Framed<S, LinesCodec>,
+    program: &Path,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let document = checkout_trust_descriptor(program, CHECKOUT_TRUST_FEATURE, &trusting_keys())
+        .replace(
+            "args = [\"--model\", \"fast\"]\n",
+            &format!("args = [\"--model\", \"fast\", \"{TRUST_ARG}\"]\n"),
+        )
+        .replace(
+            "launch_args = [\"--session-id\", \"{reference}\"]\n",
+            "launch_args = [\"--session-id\", \"{reference}\"]\nassign_fork = true\n",
+        );
+    let (_digest, installed) =
+        install_descriptor(local, &servers.plugins, "agent-drifting", &document, false).await;
+    installed.expect("the package installs");
+}
+
+/// Registers the project of `dir` by creating and stopping a session there, so
+/// a later move into it resolves a project whose origin is trusted.
+async fn register_project<S>(framed: &mut Framed<S, LinesCodec>, dir: &Path)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let id = start_named_session(framed, RUNTIME, dir, None).await;
+    let _: protocol::SessionStopResult = call(framed, method::SESSION_STOP, json!(id)).await;
+}
+
+/// The working directory the daemon reports for the session.
+async fn reported_cwd<S>(framed: &mut Framed<S, LinesCodec>, id: &protocol::SessionId) -> PathBuf
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let info: protocol::SessionInfo = call(framed, method::SESSION_INSPECT, json!(id)).await;
+    info.cwd
+}
+
+/// Moves the running session's reported directory to `dir` through the
+/// terminal (`osc`) or the process (`cd`), and waits until the daemon reports
+/// it.
+async fn drift<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+    how: &str,
+    dir: &Path,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let accepted: Value = call(
+        framed,
+        method::SESSION_INPUT,
+        json!({ "session_id": id, "text": format!("{how} {}", dir.display()) }),
+    )
+    .await;
+    drop(accepted);
+    let shared = tokio::sync::Mutex::new(framed);
+    let shared = &shared;
+    pohunek_test_support::wait::wait_until(
+        "the daemon to report the moved directory",
+        || async move {
+            let mut framed = shared.lock().await;
+            (reported_cwd(&mut **framed, id).await == dir).then_some(())
+        },
+    )
+    .await;
+}
+
+/// Stops the running session `id`, resumes it and returns the arguments the
+/// resumed process printed with the id of the resumed session.
+async fn resumed_argv<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+) -> Vec<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let _: protocol::SessionStopResult = call(framed, method::SESSION_STOP, json!(id)).await;
+    let resumed: protocol::SessionResumeResult =
+        call(framed, method::SESSION_RESUME, json!(id)).await;
+    printed_argv(framed, &resumed.session.id).await
+}
+
+/// How many `checkout_trust.failed` lines the daemon logged for `dir`.
+fn failure_lines(dir: &Path) -> usize {
+    let log =
+        String::from_utf8(captured_log().0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    log.lines()
+        .filter(|line| {
+            line.contains("checkout_trust.failed") && line.contains(&*dir.to_string_lossy())
+        })
+        .count()
+}
+
+/// The create-time directory and project the store holds for session `id`.
+fn recorded_launch_checkout(store: &str, id: &protocol::SessionId) -> Option<Value> {
+    store
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["kind"] == "session" && line["session_id"] == json!(id))
+        .and_then(|line| line["recovery"].get("launch_checkout").cloned())
+}
+
+#[tokio::test]
+async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
+    let _ = captured_log();
+    let servers = spawn_servers_configured("pkg-trust-anchor", Some(""), |config| {
+        config.trusted_repositories = host_trusting(&["acme/widgets"]);
+        config.procwatch_poll = std::time::Duration::from_millis(50);
+    })
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = drifting_program(&servers.plugins);
+    install_drifting_runtime(&servers, &mut local, &program).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let own = "https://github.com/acme/widgets.git";
+    let anchor = checkout(root, "anchor", own);
+    // A second clone of the same upstream: its declared paths equal the remote.
+    let second = checkout(root, "second-clone", own);
+    announce_remote_source(&servers, Some(remote_snapshot(&anchor)));
+    register_project(&mut local, &second).await;
+
+    // Rows 1, 2: create and an unmoved resume get the arguments once, from the
+    // predicate, although the fixed arguments hold them too; the store holds
+    // the create-time pair.
+    let created = start_named_session(&mut local, RUNTIME, &anchor, None).await;
+    let argv = printed_argv(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
+    let recorded = recorded_launch_checkout(&store_text(&servers), &created)
+        .expect("the store records the launch checkout");
+    assert_eq!(recorded["cwd"], json!(anchor));
+    assert!(recorded["project_id"].is_string(), "{recorded}");
+    let argv = resumed_argv(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
+
+    // Row 3: an OSC 7 hint moves the session into a second clone with trusted
+    // content; the resume launches there without the arguments and logs one
+    // failure.
+    drift(&mut local, &created, "osc", &second).await;
+    assert_eq!(failure_lines(&second), 0);
+    let argv = resumed_argv(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
+    assert_eq!(reported_cwd(&mut local, &created).await, second);
+    assert_eq!(failure_lines(&second), 1);
+
+    // Row 6: the resume reset the cwd source to the launch, yet the next
+    // resume in the moved directory still withholds the arguments.
+    let argv = resumed_argv(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
+    assert_eq!(failure_lines(&second), 2);
+
+    // Rows 5, 7: back in the launch directory (the project association
+    // followed the moves), the arguments return.
+    drift(&mut local, &created, "osc", &anchor).await;
+    let argv = resumed_argv(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
+
+    // Row 4: the same move reported by the focus process withholds too.
+    drift(&mut local, &created, "cd", &second).await;
+    let argv = resumed_argv(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
+    assert_eq!(
+        recorded_launch_checkout(&store_text(&servers), &created),
+        Some(recorded),
+        "the launch checkout is never refreshed"
+    );
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+/// The fork of the running session `id`, with the id of the fork.
+async fn fork_of<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+) -> protocol::SessionId
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let forked: protocol::SessionForkResult = call(
+        framed,
+        method::SESSION_FORK,
+        json!({ "session_id": id, "name": null, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    forked.session.id
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one session walks fork, restart and a store without the launch checkout"
+)]
+async fn a_fork_inherits_the_launch_checkout_and_a_store_without_one_withholds_the_args() {
+    let _ = captured_log();
+    let base = pohunek_test_support::tempdir().expect("checkout root");
+    let own = "https://github.com/acme/widgets.git";
+    let anchor = checkout(base.path(), "anchor", own);
+    let second = checkout(base.path(), "second-clone", own);
+    let trusting = |config: &mut pohunek_daemon::session::SessionRegistryConfig| {
+        config.trusted_repositories = host_trusting(&["acme/widgets"]);
+    };
+    let program = drifting_program(&base.path().join("plugins"));
+    let servers = spawn_servers_configured("pkg-trust-fork", Some(""), trusting).await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_drifting_runtime(&servers, &mut local, &program).await;
+    announce_remote_source(&servers, Some(remote_snapshot(&anchor)));
+    register_project(&mut local, &second).await;
+
+    // Row 8: a fork of an unmoved session gets the arguments, records the
+    // source's launch checkout, and its own resume gets them too.
+    let created = start_named_session(&mut local, RUNTIME, &anchor, None).await;
+    assert_eq!(
+        trust_arg_count(&printed_argv(&mut local, &created).await),
+        1
+    );
+    let fork = fork_of(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&printed_argv(&mut local, &fork).await), 1);
+    let store = store_text(&servers);
+    assert_eq!(
+        recorded_launch_checkout(&store, &fork),
+        recorded_launch_checkout(&store, &created)
+    );
+    assert_eq!(trust_arg_count(&resumed_argv(&mut local, &fork).await), 1);
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(fork)).await;
+
+    // Row 9: a fork of a moved session launches in the moved directory without
+    // the arguments, and neither does the resume of that fork.
+    drift(&mut local, &created, "osc", &second).await;
+    let moved_fork = fork_of(&mut local, &created).await;
+    assert_eq!(
+        trust_arg_count(&printed_argv(&mut local, &moved_fork).await),
+        0
+    );
+    assert_eq!(
+        trust_arg_count(&resumed_argv(&mut local, &moved_fork).await),
+        0
+    );
+    let store = store_text(&servers);
+    assert_eq!(
+        recorded_launch_checkout(&store, &moved_fork).expect("the fork records a launch checkout")
+            ["cwd"],
+        json!(anchor)
+    );
+
+    // Row 10: after a daemon restart the stored launch checkout still lets the
+    // unmoved session resume with the arguments.
+    drift(&mut local, &created, "osc", &anchor).await;
+    for id in [&created, &moved_fork] {
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+    let store = store_text(&servers);
+    drop(local);
+    servers.stop().await;
+    let servers = spawn_servers_configured("pkg-trust-restart", Some(&store), trusting).await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_drifting_runtime(&servers, &mut local, &program).await;
+    servers
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciles the stored sessions");
+    announce_remote_source(&servers, Some(remote_snapshot(&anchor)));
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
+    let store = store_text(&servers);
+    drop(local);
+    servers.stop().await;
+
+    // Row 11: the same store as an older daemon wrote it, without any launch
+    // checkout, migrates to the current schema and keeps launching, with no
+    // arguments and one failure per resume and per fork.
+    let older: Vec<String> = store
+        .lines()
+        .map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(mut record) if record["kind"] == "session" => {
+                record["recovery"]
+                    .as_object_mut()
+                    .expect("a recovery binding")
+                    .remove("launch_checkout");
+                record["schema_version"] = json!(15);
+                record.to_string()
+            }
+            _ => line.to_owned(),
+        })
+        .collect();
+    let migrated = base.path().join("migrated");
+    std::fs::create_dir(&migrated).expect("create the migration directory");
+    let migrated_store = write_data_store(&migrated, &older.join("\n"));
+    let outcome = pohunek_daemon::store::Store::new(migrated_store.clone())
+        .migrate_to_current()
+        .expect("the older store migrates");
+    let pohunek_daemon::store::SchemaMigration::Migrated { from, backup, .. } = outcome else {
+        panic!("a schema-15 store must migrate");
+    };
+    assert_eq!(from, 15);
+    assert!(
+        backup.ends_with("metadata.jsonl.pre-schema-15"),
+        "{backup:?}"
+    );
+    let migrated_text = std::fs::read_to_string(&migrated_store).expect("read the migrated store");
+    assert!(recorded_launch_checkout(&migrated_text, &created).is_none());
+    let servers =
+        spawn_servers_configured("pkg-trust-migrated", Some(&migrated_text), trusting).await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_drifting_runtime(&servers, &mut local, &program).await;
+    servers
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciles the stored sessions");
+    announce_remote_source(&servers, Some(remote_snapshot(&anchor)));
+    let before = failure_lines(&anchor);
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
+    assert_eq!(failure_lines(&anchor), before + 1);
+    let fork = fork_of(&mut local, &created).await;
+    assert_eq!(trust_arg_count(&printed_argv(&mut local, &fork).await), 0);
+    assert_eq!(failure_lines(&anchor), before + 2);
+    for id in [&fork, &created] {
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_nothing() {
+    let _ = captured_log();
+    let servers = spawn_servers_configured("pkg-trust-plain", Some(""), |config| {
+        config.trusted_repositories = host_trusting(&["acme/widgets"]);
+    })
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = argv_program(&servers.plugins);
+    let document = checkout_trust_descriptor(&program, "", "");
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-plain",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "plain", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    // Row 14: no arguments and no failure line, but the pair is recorded so a
+    // later descriptor that declares the keys works for this session.
+    let created = start_named_session(&mut local, RUNTIME, &dir, None).await;
+    assert_eq!(
+        trust_arg_count(&printed_argv(&mut local, &created).await),
+        0
+    );
+    assert_eq!(
+        trust_arg_count(&resumed_argv(&mut local, &created).await),
+        0
+    );
+    assert_eq!(
+        recorded_launch_checkout(&store_text(&servers), &created)
+            .expect("the store records the launch checkout")["cwd"],
+        json!(dir)
+    );
+    assert_eq!(failure_lines(&dir), 0);
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
     drop(local);
     servers.stop().await;
 }

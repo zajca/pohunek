@@ -751,6 +751,7 @@ fn collect_probe(
         seeded_env,
         limits: RunLimits::new(timeout, VERSION_OUTPUT_LIMIT),
         stderr: StderrPolicy::Discard,
+        stdin: None,
     };
     match bounded_run::run(&spec, now, None) {
         RunOutcome::Exited(output) if output.status().success() => {

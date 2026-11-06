@@ -62,9 +62,9 @@ use crate::runtime::{
     DimensionUpdate, StopWaits, SupervisionConfig, Worker, WorkerError, WorkerLauncher,
 };
 use crate::store::{
-    ActiveAgentOrigin, CreateRequest, DesiredState, ProjectRecord, ReportTransport, ResumeBinding,
-    RuntimeRecord, SessionRecord, SessionTransaction, SessionWriteOutcome, Store, TransactionKind,
-    WorktreeStatus,
+    ActiveAgentOrigin, CreateRequest, DesiredState, LaunchCheckout, ProjectRecord, ReportTransport,
+    ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction, SessionWriteOutcome, Store,
+    TransactionKind, WorktreeStatus,
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
@@ -4466,6 +4466,10 @@ impl SessionRegistry {
                 NativeReferenceProvenance::Reported
             },
             profile_revision,
+            launch_checkout: Some(Box::new(LaunchCheckout {
+                cwd: launch_cwd.clone(),
+                project_id: project_id.clone(),
+            })),
         };
         // The detection-manifest override is consumed only by the detector, on
         // both the launch and resume paths; never persisted (re-resolved by name).

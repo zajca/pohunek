@@ -1319,7 +1319,17 @@ declared component only by letter case, and a declared path that the file system
 under another spelling (case or normalization folding) refuse. Any error, timeout or
 missing fact withholds the arguments, the git calls and the on-disk walk of one
 evaluation share a 30 second deadline, and a failure logs one `checkout_trust.failed` warning. The arguments are
-evaluated at every launch and never persisted: no store or protocol change. A descriptor
+evaluated at every launch and never persisted. The directory and project a session was
+created in are persisted (store schema 16, no protocol change): `session.new` evaluates
+the predicate on its launch directory, and `session.resume` and `session.fork` evaluate
+it on that create-time directory and project, never on the session's current ones, and
+append the arguments only when the relaunch directory is byte-equal to the create-time
+directory. A session whose current directory moved (an OSC 7 hint or the focus process)
+therefore relaunches there without the arguments, a fork inherits its source's
+create-time pair, and a session stored before schema 16 has none, so it resumes and forks
+without the arguments until it is created again; each withheld relaunch logs one
+`checkout_trust.failed` warning. A run of the arguments in the descriptor's `args` or a
+host profile's `args` is dropped from every launch, so only the predicate adds it. A descriptor
 without the keys keeps its digest.
 
 ### Secret session environment

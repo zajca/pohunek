@@ -9807,6 +9807,7 @@ while os.getppid() == parent:
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
+            launch_checkout: None,
         };
         store
             .record_session(&SessionRecord {
@@ -11386,6 +11387,7 @@ while os.getppid() == parent:
                 native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
                 profile_revision: None,
                 native_launch_unresolved: false,
+                launch_checkout: None,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -12970,6 +12972,7 @@ handler = "codex-hook-v1"
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
+            launch_checkout: None,
         };
         store
             .record_resume(&recoverable_binding)
@@ -13289,6 +13292,7 @@ handler = "codex-hook-v1"
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
+            launch_checkout: None,
         }
     }
 

@@ -21,6 +21,7 @@ use crate::integration::launch_input::{
     place, LaunchInput, LaunchInputContext, LaunchKind, LAUNCH_INPUT_UNAVAILABLE_CODE,
 };
 use crate::runtime::environment::effective_variable;
+use crate::store::ResumeBinding;
 
 /// What a launch of one session runs: its kind, the arguments it would
 /// otherwise run with and the session name it uses.
@@ -61,6 +62,46 @@ impl SessionRegistry {
         if let Ok(mut slot) = self.inner.checkout_remote_source.lock() {
             *slot = Some(crate::checkout_trust::RemoteSourceResolver::new(resolver));
         }
+    }
+
+    /// The runtime's `trusted_checkout_args` for a relaunch of `binding`: the
+    /// arguments when the relaunch directory is the directory the session was
+    /// created in and that checkout is trusted, else empty.
+    ///
+    /// The predicate runs on the create-time directory and project of
+    /// `binding`, never on the current ones, which terminal output and the
+    /// focus process can move. A binding without them, or one relaunched in
+    /// another directory, gets no arguments and one `checkout_trust.failed`
+    /// warning; a runtime without trusted arguments and a host that trusts no
+    /// repository stay silent.
+    pub(super) async fn trusted_relaunch_args(
+        &self,
+        definition: &RuntimeDefinition,
+        binding: &ResumeBinding,
+    ) -> Vec<String> {
+        if definition.checkout_trust().is_none()
+            || self.inner.config.trusted_repositories.is_empty()
+        {
+            return Vec::new();
+        }
+        let reason = match &binding.launch_checkout {
+            None => "the session has no recorded launch checkout",
+            Some(launch) if launch.cwd.as_os_str() != binding.cwd.as_os_str() => {
+                "the relaunch directory is not the launch directory"
+            }
+            Some(launch) => {
+                return self
+                    .trusted_checkout_args(definition, &launch.cwd, launch.project_id.as_deref())
+                    .await;
+            }
+        };
+        warn!(
+            event = "checkout_trust.failed",
+            checkout = %binding.cwd.display(),
+            reason,
+            "the checkout trust predicate could not be evaluated; the checkout is not trusted"
+        );
+        Vec::new()
     }
 
     /// The runtime's `trusted_checkout_args` when the checkout at `cwd` is
