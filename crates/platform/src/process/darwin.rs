@@ -1650,6 +1650,7 @@ mod native {
     /// wrote a record shorter than the fields read from it.
     pub(super) fn holds_listening_socket(pid: i32) -> io::Result<bool> {
         let entry_bytes = buffer_length(size_of::<libc::proc_fdinfo>())?;
+        clear_errno();
         // SAFETY: a null buffer with zero size asks only for the byte count.
         let needed = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, ptr::null_mut(), 0) };
         // libproc reports failure as 0 with `errno` set; 0 with no `errno` is
@@ -1669,6 +1670,7 @@ mod native {
             capacity
         ];
         let table_bytes = buffer_length(capacity * size_of::<libc::proc_fdinfo>())?;
+        clear_errno();
         // SAFETY: `proc_pidinfo` writes at most `table_bytes` bytes, and
         // `table` owns exactly that many.
         let written = unsafe {
@@ -1691,6 +1693,7 @@ mod native {
             }
             let mut record = [0_u8; SOCKET_FDINFO_BUFFER_BYTES];
             let record_bytes = buffer_length(record.len())?;
+            clear_errno();
             // SAFETY: `proc_pidfdinfo` writes at most `record_bytes` bytes and
             // `record` owns exactly that many.
             let got = unsafe {
@@ -1703,8 +1706,12 @@ mod native {
                 )
             };
             if got <= 0 {
-                // A descriptor closed since the table was read.
-                if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+                // A descriptor closed, or reused by a file that is no socket,
+                // since the table was read.
+                if matches!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF | libc::ENOTSOCK)
+                ) {
                     continue;
                 }
                 return Err(last_os_error());
@@ -1742,12 +1749,9 @@ mod native {
             .map_err(|_range| io::Error::from(io::ErrorKind::InvalidInput))
     }
 
-    /// Returns the current errno, or a typed failure when the kernel set none.
-    ///
-    /// The `libproc` calls report failure by returning a non-positive count,
-    /// which is not always accompanied by an errno.
     /// The operating-system error of a failed libproc call, or `empty` when the
-    /// call left no `errno`.
+    /// call left no `errno`. Only meaningful after [`clear_errno`] preceded the
+    /// call.
     fn failure_or(empty: io::Result<bool>) -> io::Result<bool> {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(0) {
@@ -1757,6 +1761,19 @@ mod native {
         }
     }
 
+    /// Zeroes the calling thread's `errno`, so a zero return of a libproc call
+    /// that sets it only on failure is read as "nothing" rather than as the
+    /// failure a stale value names.
+    fn clear_errno() {
+        // SAFETY: `__error` returns the calling thread's `errno` slot, which is
+        // valid for writes for the thread's lifetime.
+        unsafe { *libc::__error() = 0 };
+    }
+
+    /// Returns the current errno, or a typed failure when the kernel set none.
+    ///
+    /// The `libproc` calls report failure by returning a non-positive count,
+    /// which is not always accompanied by an errno.
     fn last_os_error() -> io::Error {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(0) {
