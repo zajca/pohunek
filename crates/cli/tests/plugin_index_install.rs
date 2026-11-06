@@ -494,21 +494,14 @@ impl Rig {
     }
 }
 
-/// A loopback address this test owns and keeps closed: the socket is bound but
-/// never listens, so a connect to it is refused.
-fn held_closed_address() -> (socket2::Socket, SocketAddr) {
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-        .expect("create the closed socket");
-    socket
-        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .expect("bind the closed socket");
-    let address = socket
-        .local_addr()
-        .expect("read the closed socket address")
-        .as_socket()
-        .expect("an inet address");
-    (socket, address)
-}
+/// Loopback port the closed-address scenario connects to.
+///
+/// Below the range the OS assigns to `bind(0)` and to outgoing connections, so
+/// no test is handed it, and nothing in the rig listens there: the connect is
+/// refused immediately on Linux and macOS. A port that a test holds bound
+/// without listening is not used because macOS drops, instead of refusing, a
+/// connect to it and the request times out.
+const CLOSED_PORT: u16 = 1;
 
 fn archive_path(version: &str) -> String {
     format!("/{version}.tar.zst")
@@ -791,10 +784,7 @@ async fn oversized_and_unavailable_downloads_fail_without_a_daemon_call() {
     assert_eq!(err_code(&document), "plugin_index_unavailable");
 
     // A connection that cannot be made is the same failure as a status error.
-    // The socket is bound and never listens, so the connect is refused and no
-    // other test can be given the port while this one holds it.
-    let (closed, address) = held_closed_address();
-    let unreachable = format!("http://{address}{INDEX_PATH}");
+    let unreachable = format!("http://127.0.0.1:{CLOSED_PORT}{INDEX_PATH}");
     let (code, document) = rig
         .install
         .json(&[
@@ -815,8 +805,6 @@ async fn oversized_and_unavailable_downloads_fail_without_a_daemon_call() {
             .is_some_and(|message| message.contains("cannot be reached")),
         "{document}"
     );
-
-    drop(closed);
 
     rig.publish(&[rig.listing("0.1.0")]);
     rig.server

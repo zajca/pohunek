@@ -98,8 +98,6 @@ pohunek-daemon = { path = "../daemon" }
 pohunek-knowledge = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
-# `plugin_index_install.rs` holds a bound, never-listening socket as a closed address.
-socket2 = { workspace = true }
 # `release_upgrade.rs` reads the previous release's archive, whose frame the
 # current encoder does not reproduce, without the strict canonical reader.
 ruzstd = { workspace = true }
