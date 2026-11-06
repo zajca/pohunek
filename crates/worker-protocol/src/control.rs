@@ -1359,6 +1359,30 @@ pub enum RequestKind {
     },
 }
 
+impl RequestKind {
+    /// The wire name of this operation, for logs and errors that must not
+    /// carry the request's payload.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Negotiate { .. } => "negotiate",
+            Self::AcquireController { .. } => "acquire_controller",
+            Self::Inspect { .. } => "inspect",
+            Self::Initialize { .. } => "initialize",
+            Self::OpenDataStream { .. } => "open_data_stream",
+            Self::TerminalSnapshot { .. } => "terminal_snapshot",
+            Self::ReadOutput { .. } => "read_output",
+            Self::WritePlan { .. } => "write_plan",
+            Self::Resize { .. } => "resize",
+            Self::Stop { .. } => "stop",
+            Self::AcknowledgeTerminal { .. } => "acknowledge_terminal",
+            Self::ReleaseController { .. } => "release_controller",
+            Self::RecordActiveIdentity { .. } => "record_active_identity",
+            Self::ReleaseActiveIdentity { .. } => "release_active_identity",
+        }
+    }
+}
+
 /// Defines one worker-to-daemon response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlResponse {

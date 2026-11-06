@@ -14,7 +14,8 @@ pub mod lifecycle;
 
 pub(crate) use client::WriteReservation;
 pub use client::{
-    DataStream, DimensionUpdate, ExchangeOrder, SentAt, StopWaits, Worker, WorkerError,
+    DataStream, DimensionUpdate, ExchangeDeadlines, ExchangeOrder, ExchangePhase, SentAt,
+    StopWaits, Worker, WorkerError,
 };
 pub use environment::{EnvironmentSource, LaunchEnvironment};
 #[cfg(test)]

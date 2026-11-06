@@ -212,6 +212,12 @@ pub struct WorkerConfig {
     pub notification_forward_timeout: Duration,
     /// Maximum serialized size of one forwarded notification's parameters.
     pub max_notification_params_bytes: usize,
+    /// Send and receive buffer size applied to every accepted socket, or
+    /// `None` for the kernel default.
+    ///
+    /// The kernel default differs by platform (about 208 KiB on Linux, 8 KiB
+    /// on macOS), so a scenario sets it to see the same buffering everywhere.
+    pub control_socket_buffer_bytes: Option<usize>,
 }
 
 impl WorkerConfig {
@@ -244,6 +250,7 @@ impl WorkerConfig {
             identity_reporters: DEFAULT_IDENTITY_REPORTERS,
             notification_forward_timeout: DEFAULT_NOTIFICATION_FORWARD_TIMEOUT,
             max_notification_params_bytes: DEFAULT_MAX_NOTIFICATION_PARAMS_BYTES,
+            control_socket_buffer_bytes: None,
         }
     }
 

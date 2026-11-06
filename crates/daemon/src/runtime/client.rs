@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use pohunek_worker_protocol::{
@@ -16,7 +16,8 @@ use pohunek_worker_protocol::{
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
+use tokio::task::JoinSet;
 
 // Rust guideline compliant 2026-10-13
 
@@ -30,6 +31,13 @@ const RESIZE_SOURCE_ID_PREFIX: &str = "daemon-resize";
 /// healthy local worker should respond promptly. Bounding it prevents an
 /// unresponsive worker from indefinitely retaining the dimension-order gate.
 const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Control messages the reader task holds for the exchange that waits for them.
+///
+/// Exchanges are serialized, so at most one response is unread at any time
+/// (an abandoned one, or the one being awaited). A second queued message is a
+/// peer that answers without being asked.
+const RESPONSE_QUEUE: usize = 1;
 
 /// Controller connections acquired by this process, counted in the order their
 /// leases were granted.
@@ -106,6 +114,18 @@ pub enum WorkerError {
         /// Which wait elapsed.
         stage: &'static str,
     },
+    /// A phase of one control exchange outlasted its deadline, so the daemon
+    /// closed the connection: the worker sees the end of it, releases the
+    /// lease, and the session's watcher reconnects.
+    #[error("worker control exchange {request} did not finish its {phase} phase within {bound:?}; the connection was closed")]
+    ExchangeTimedOut {
+        /// Wire name of the request that did not finish.
+        request: &'static str,
+        /// Phase that outlasted its deadline.
+        phase: ExchangePhase,
+        /// Deadline of that phase.
+        bound: Duration,
+    },
     /// The worker runtime has not been initialized.
     #[error("worker has no live runtime generation")]
     NotInitialized,
@@ -127,6 +147,45 @@ pub enum WorkerError {
         /// Protocol version selected for this daemon-worker connection.
         selected_version: Version,
     },
+}
+
+/// The transport phase of a control exchange a deadline bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangePhase {
+    /// Writing the request to the worker.
+    Send,
+    /// Waiting for the worker's answer to a request it received.
+    Answer,
+}
+
+impl std::fmt::Display for ExchangePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Send => "send",
+            Self::Answer => "answer",
+        })
+    }
+}
+
+/// Deadlines of the transport phases of one control exchange.
+///
+/// An input write and a stop are not bounded by `answer`: the worker delivers
+/// an input on its own stall policy, and a stop has its own bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExchangeDeadlines {
+    /// Time to write one request completely.
+    pub send: Duration,
+    /// Time for the worker to answer a request that is not an input or a stop.
+    pub answer: Duration,
+}
+
+impl Default for ExchangeDeadlines {
+    fn default() -> Self {
+        Self {
+            send: pohunek_service_config::DEFAULT_WORKER_SEND,
+            answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
+        }
+    }
 }
 
 /// Runtime-bound output page returned by a private worker.
@@ -174,6 +233,9 @@ struct Counters {
     /// worker's own stall policy, so a stop queued behind one keeps waiting;
     /// any other holder is bounded by the stop's exchange wait.
     input_holds: Arc<AtomicUsize>,
+    /// Deadlines every exchange of this worker reads when it starts; shared
+    /// with the connection.
+    deadlines: Arc<StdMutex<ExchangeDeadlines>>,
 }
 
 /// How long a stop waits at each stage of reaching a worker.
@@ -212,8 +274,11 @@ impl Drop for WriteReservation {
 
 #[derive(Debug)]
 struct Inner {
-    reader: ControlReader<OwnedReadHalf>,
+    responses: Responses,
     writer: ControlWriter<OwnedWriteHalf>,
+    /// The control socket, shut down when an exchange outlasts its deadline.
+    socket: Arc<std::os::fd::OwnedFd>,
+    deadlines: Arc<StdMutex<ExchangeDeadlines>>,
     selected_version: Version,
     session_id: SessionId,
     worker_id: WorkerId,
@@ -228,11 +293,170 @@ struct Inner {
     exchanges: u64,
     /// Byte-stream state between exchanges; see [`StreamState`].
     stream_state: StreamState,
+    /// The deadline that closed this connection, once one did.
+    expired: Option<Expiry>,
     /// Shared send-phase marker the send guard flips when a future is
     /// dropped mid-write; see [`SEND_IN_FLIGHT`].
     send_state: Arc<AtomicU8>,
     /// Input writes holding the control connection; shared with [`Worker`].
     input_holds: Arc<AtomicUsize>,
+}
+
+impl Inner {
+    /// The deadlines in force when an exchange starts.
+    fn current_deadlines(&self) -> ExchangeDeadlines {
+        *self
+            .deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Gives up on the connection after `phase` of `request` outlasted `bound`.
+    ///
+    /// Shutting the socket down, not only dropping the future, is what lets the
+    /// worker see the end of the connection and release its lease: the
+    /// reader task keeps the read half open otherwise. The cause is kept, so
+    /// every later exchange on the connection reports the expiry instead of a
+    /// bare torn stream.
+    fn expire(
+        &mut self,
+        request: &'static str,
+        phase: ExchangePhase,
+        bound: Duration,
+    ) -> WorkerError {
+        self.stream_state = StreamState::Torn;
+        self.expired = Some(Expiry {
+            request,
+            phase,
+            bound,
+        });
+        tracing::warn!(
+            session_id = %self.session_id,
+            request,
+            phase = %phase,
+            bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            "worker control exchange did not finish; closing the control connection"
+        );
+        shut_down(&self.socket);
+        WorkerError::ExchangeTimedOut {
+            request,
+            phase,
+            bound,
+        }
+    }
+}
+
+/// The exchange phase whose deadline closed a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Expiry {
+    request: &'static str,
+    phase: ExchangePhase,
+    bound: Duration,
+}
+
+impl Expiry {
+    const fn error(self) -> WorkerError {
+        WorkerError::ExchangeTimedOut {
+            request: self.request,
+            phase: self.phase,
+            bound: self.bound,
+        }
+    }
+}
+
+/// Longest an exchange waits for the answer to an abandoned input write or
+/// stop, which has no deadline of its own: the longest bound any worker
+/// operation carries.
+const ABANDONED_ANSWER_LIMIT: Duration = pohunek_service_config::MAX_DEADLINE;
+
+/// Shuts both directions of a control socket down.
+fn shut_down(socket: &std::os::fd::OwnedFd) {
+    match socket.try_clone() {
+        Ok(duplicate) => {
+            if let Err(error) =
+                std::os::unix::net::UnixStream::from(duplicate).shutdown(std::net::Shutdown::Both)
+            {
+                tracing::debug!(error = %error, "shutting the worker control socket down failed");
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "duplicating the worker control socket failed");
+        }
+    }
+}
+
+/// Messages of the worker control connection other than events, read by a
+/// task that never waits for the exchange.
+///
+/// The worker writes events whenever it likes and stops reading requests while
+/// one blocks, so the read half is drained at all times instead of only inside
+/// an exchange.
+#[derive(Debug)]
+struct Responses {
+    messages: mpsc::Receiver<ControlMessage>,
+    /// Why the reader task ended, set before the channel closes.
+    end: Arc<OnceLock<String>>,
+    /// Holds the reader task; dropping the set aborts it.
+    _reader: JoinSet<()>,
+}
+
+impl Responses {
+    /// Starts draining `reader`.
+    fn spawn(reader: ControlReader<OwnedReadHalf>, socket: Arc<std::os::fd::OwnedFd>) -> Self {
+        let (sender, messages) = mpsc::channel(RESPONSE_QUEUE);
+        let end = Arc::new(OnceLock::new());
+        let mut tasks = JoinSet::new();
+        tasks.spawn(drain_control_reads(
+            reader,
+            sender,
+            Arc::clone(&end),
+            socket,
+        ));
+        Self {
+            messages,
+            end,
+            _reader: tasks,
+        }
+    }
+
+    /// The next response or request-shaped message the worker sent.
+    async fn next(&mut self) -> Result<ControlMessage, WorkerError> {
+        self.messages.recv().await.ok_or_else(|| {
+            WorkerError::Protocol(
+                self.end
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| "worker control connection closed".to_owned()),
+            )
+        })
+    }
+}
+
+/// Reads the control connection until it ends, discarding events.
+///
+/// The task never awaits the channel: a second unread message means the worker
+/// answers without being asked, which tears the connection down instead of
+/// blocking the reads.
+async fn drain_control_reads(
+    mut reader: ControlReader<OwnedReadHalf>,
+    sender: mpsc::Sender<ControlMessage>,
+    end: Arc<OnceLock<String>>,
+    socket: Arc<std::os::fd::OwnedFd>,
+) {
+    let reason = loop {
+        match reader.read::<ControlMessage>().await {
+            Ok(Some(ControlMessage::Event(_))) => {}
+            Ok(Some(message)) => {
+                if sender.try_send(message).is_err() {
+                    shut_down(&socket);
+                    break "worker sent a control message nobody was waiting for".to_owned();
+                }
+            }
+            Ok(None) => break "worker control connection closed".to_owned(),
+            Err(error) => break error.to_string(),
+        }
+    };
+    let _ = end.set(reason);
 }
 
 /// Byte-stream state of the shared control connection between exchanges.
@@ -244,10 +468,19 @@ enum StreamState {
     /// next exchange must drain that response first. The marker is cleared
     /// only after the drain actually succeeded, so a caller cancelled again
     /// during the drain leaves it marked.
-    Unread(RequestId),
+    Unread(Abandoned),
     /// A cancelled or failed send may have torn the request stream; no
     /// further exchange can be trusted on this connection.
     Torn,
+}
+
+/// The request of a caller that was dropped before reading its response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Abandoned {
+    request_id: RequestId,
+    /// Whether the answer is bounded by the answer deadline; an input write's
+    /// is not.
+    bounded: bool,
 }
 
 /// The shared control connection is not being written to.
@@ -365,8 +598,58 @@ impl Worker {
             daemon_instance_id,
             SUPPORTED_RANGE.minimum(),
             SUPPORTED_RANGE.maximum(),
+            None,
         )
         .await
+    }
+
+    /// Connects like [`Self::connect`] with the send and receive buffers of the
+    /// control socket set to `bytes`.
+    ///
+    /// The kernel default buffer size differs by platform, so a scenario that
+    /// needs the same buffering everywhere sets it. The size the kernel
+    /// granted is readable through [`Self::socket_buffer_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError`] when the buffers cannot be set or the
+    /// connection cannot be established.
+    pub async fn connect_with_socket_buffers(
+        socket_path: impl AsRef<Path>,
+        expected_session_id: &str,
+        daemon_instance_id: &str,
+        bytes: usize,
+    ) -> Result<Self, WorkerError> {
+        let worker = Self::connect_discovered_with_range(
+            socket_path,
+            daemon_instance_id,
+            SUPPORTED_RANGE.minimum(),
+            SUPPORTED_RANGE.maximum(),
+            Some(bytes),
+        )
+        .await?;
+        if worker.session_id().await.as_str() != expected_session_id {
+            return Err(WorkerError::ResponseMismatch);
+        }
+        Ok(worker)
+    }
+
+    /// The send and receive buffer sizes the kernel granted the control socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::Socket`] when the sizes cannot be read.
+    pub async fn socket_buffer_bytes(&self) -> Result<(usize, usize), WorkerError> {
+        let inner = self.inner.lock().await;
+        let socket = socket2::SockRef::from(inner.socket.as_ref());
+        let read = |source| WorkerError::Socket {
+            path: self.socket_path.clone(),
+            source,
+        };
+        Ok((
+            socket.send_buffer_size().map_err(read)?,
+            socket.recv_buffer_size().map_err(read)?,
+        ))
     }
 
     /// Connects with an explicit compatibility range for upgrade/rollback tests.
@@ -387,6 +670,7 @@ impl Worker {
             daemon_instance_id,
             minimum_version,
             maximum_version,
+            None,
         )
         .await?;
         if worker.session_id().await.as_str() != expected_session_id {
@@ -404,6 +688,7 @@ impl Worker {
         daemon_instance_id: &str,
         minimum_version: Version,
         maximum_version: Version,
+        socket_buffers: Option<usize>,
     ) -> Result<Self, WorkerError> {
         let socket_path = socket_path.as_ref().to_path_buf();
         let stream =
@@ -413,8 +698,16 @@ impl Worker {
                     path: socket_path.clone(),
                     source,
                 })?;
-        #[cfg(test)]
-        let severable = duplicate_socket(&stream, &socket_path)?;
+        if let Some(bytes) = socket_buffers {
+            let sock = socket2::SockRef::from(&stream);
+            sock.set_send_buffer_size(bytes)
+                .and_then(|()| sock.set_recv_buffer_size(bytes))
+                .map_err(|source| WorkerError::Socket {
+                    path: socket_path.clone(),
+                    source,
+                })?;
+        }
+        let socket = duplicate_socket(&stream, &socket_path)?;
         let (read_half, write_half) = stream.into_split();
         let mut reader = ControlReader::new(read_half);
         let mut writer = ControlWriter::new(write_half);
@@ -480,10 +773,13 @@ impl Worker {
         };
 
         let input_holds = Arc::new(AtomicUsize::new(0));
+        let deadlines = Arc::new(StdMutex::new(ExchangeDeadlines::default()));
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
-                reader,
+                responses: Responses::spawn(reader, Arc::clone(&socket)),
                 writer,
+                socket: Arc::clone(&socket),
+                deadlines: Arc::clone(&deadlines),
                 selected_version,
                 session_id,
                 worker_id,
@@ -494,6 +790,7 @@ impl Worker {
                 connection: next_connection(),
                 exchanges: 0,
                 stream_state: StreamState::Ready,
+                expired: None,
                 send_state: Arc::new(AtomicU8::new(SEND_IDLE)),
                 input_holds: Arc::clone(&input_holds),
             })),
@@ -501,10 +798,11 @@ impl Worker {
             counters: Arc::new(Counters {
                 request_sequence: AtomicU64::new(1),
                 input_holds,
+                deadlines,
             }),
             dimension_order: Arc::new(Mutex::new(())),
             #[cfg(test)]
-            severable,
+            severable: socket,
         })
     }
 
@@ -520,6 +818,21 @@ impl Worker {
         std::os::unix::net::UnixStream::from(socket)
             .shutdown(std::net::Shutdown::Both)
             .expect("shut the control socket down");
+    }
+
+    /// Whether `other` is a handle to the same control connection.
+    #[must_use]
+    pub(crate) fn is_same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Sets the deadlines every later exchange of this worker uses.
+    pub fn set_exchange_deadlines(&self, deadlines: ExchangeDeadlines) {
+        *self
+            .counters
+            .deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadlines;
     }
 
     /// Whether an exchange holds the control connection right now.
@@ -931,6 +1244,29 @@ impl Worker {
             }
         };
         let scope = scope(&inner)?;
+        // An abandoned input write is delivered on the worker's stall policy
+        // and the worker reads the stop only after it, so it gets the input
+        // wait, not the stop's own bound.
+        // A connection an earlier exchange tore down says nothing about this
+        // stop: it is refused as torn so the watcher reconnects, and nothing
+        // is escalated.
+        if matches!(inner.stream_state, StreamState::Torn) {
+            return Err(WorkerError::TornStream);
+        }
+        match drain_marked(&mut inner, waits.input).await {
+            Ok(()) => {}
+            Err(WorkerError::ExchangeTimedOut {
+                phase: ExchangePhase::Answer,
+                request: "abandoned_response",
+                ..
+            }) => {
+                return Err(WorkerError::StopUnanswered {
+                    bound: waits.input,
+                    stage: "because an abandoned request kept the control connection busy",
+                });
+            }
+            Err(error) => return Err(error),
+        }
         let exchange = request_locked(
             &mut inner,
             self.next_request_id("stop")?,
@@ -939,12 +1275,20 @@ impl Worker {
                 stop: StopRequest { transaction_id },
             },
         );
-        let response = tokio::time::timeout(bound, exchange)
-            .await
-            .map_err(|_elapsed| WorkerError::StopUnanswered {
-                bound,
-                stage: "after the request was sent",
-            })??;
+        let stopped = tokio::time::timeout(bound, exchange).await;
+        let response = match stopped {
+            Ok(response) => response?,
+            Err(_elapsed) => {
+                // The abandoned exchange would leave the next caller waiting
+                // for an answer that may never come; closing the connection
+                // lets the worker release its lease and the watcher reconnect.
+                inner.expire("stop", ExchangePhase::Answer, bound);
+                return Err(WorkerError::StopUnanswered {
+                    bound,
+                    stage: "after the request was sent",
+                });
+            }
+        };
         match response {
             ResponseKind::Stopped { exit } => Ok(exit),
             other => response_error(other),
@@ -1623,11 +1967,17 @@ async fn exchange_tracked<F>(
 where
     F: FnOnce(),
 {
-    drain_marked(inner).await?;
+    drain_marked(inner, ABANDONED_ANSWER_LIMIT).await?;
     let expected = request.request_id.clone();
-    let send = SendGuard::arm(Arc::clone(&inner.send_state));
+    let label = request.kind.label();
+    let bounded = answer_is_bounded(&request.kind);
+    let deadlines = inner.current_deadlines();
+    let guard = SendGuard::arm(Arc::clone(&inner.send_state));
     send_started();
-    send_request(&mut inner.writer, request).await?;
+    match tokio::time::timeout(deadlines.send, send_request(&mut inner.writer, request)).await {
+        Ok(sent) => sent?,
+        Err(_elapsed) => return Err(inner.expire(label, ExchangePhase::Send, deadlines.send)),
+    }
     inner.exchanges += 1;
     let _ = completed.set(ExchangeOrder {
         connection: inner.connection,
@@ -1635,10 +1985,14 @@ where
     });
     // No await separates the completed send from the marker, so a dropped
     // caller can only abandon the response, never tear the stream.
-    inner.stream_state = StreamState::Unread(expected.clone());
+    inner.stream_state = StreamState::Unread(Abandoned {
+        request_id: expected.clone(),
+        bounded,
+    });
     inner.send_state.store(SEND_IDLE, Ordering::Release);
-    drop(send);
-    let response = read_response(&mut inner.reader, &expected).await;
+    drop(guard);
+    let answer_bound = bounded.then(|| inner.current_deadlines().answer);
+    let response = read_bounded_response(inner, &expected, answer_bound, label).await;
     inner.stream_state = match response {
         Ok(_) => StreamState::Ready,
         Err(_) => StreamState::Torn,
@@ -1646,18 +2000,60 @@ where
     response.map(|response| response.kind)
 }
 
+/// Whether the worker's answer to `kind` is bounded by the answer deadline.
+///
+/// An input write is delivered on the worker's own stall policy and a stop has
+/// its own bound, so neither is cut short by the generic deadline.
+const fn answer_is_bounded(kind: &RequestKind) -> bool {
+    !matches!(
+        kind,
+        RequestKind::WritePlan { .. } | RequestKind::Stop { .. }
+    )
+}
+
+/// Reads the response to `expected`, closing the connection when `bound`
+/// elapses first; `None` waits for the worker's own policy.
+async fn read_bounded_response(
+    inner: &mut Inner,
+    expected: &RequestId,
+    bound: Option<Duration>,
+    label: &'static str,
+) -> Result<ControlResponse, WorkerError> {
+    let Some(bound) = bound else {
+        return read_response(&mut inner.responses, expected).await;
+    };
+    match tokio::time::timeout(bound, read_response(&mut inner.responses, expected)).await {
+        Ok(response) => response,
+        Err(_elapsed) => Err(inner.expire(label, ExchangePhase::Answer, bound)),
+    }
+}
+
 /// Drains the marked response of a dropped caller, if one is pending.
 ///
 /// The marker is cleared only after the stale response was fully read, so a
 /// caller cancelled again during the drain leaves it marked for the next
-/// exchange. A torn stream refuses every exchange instead.
-async fn drain_marked(inner: &mut Inner) -> Result<(), WorkerError> {
+/// exchange. A torn stream refuses every exchange instead, naming the deadline
+/// that closed it when there was one. The answer to an abandoned input write
+/// or stop waits at most `unbounded_limit`.
+async fn drain_marked(inner: &mut Inner, unbounded_limit: Duration) -> Result<(), WorkerError> {
     reconcile_interrupted_send(inner);
     match inner.stream_state.clone() {
-        StreamState::Torn => Err(WorkerError::TornStream),
+        StreamState::Torn => Err(inner.expired.map_or(WorkerError::TornStream, Expiry::error)),
         StreamState::Ready => Ok(()),
         StreamState::Unread(abandoned) => {
-            if let Err(error) = read_response(&mut inner.reader, &abandoned).await {
+            let bound = if abandoned.bounded {
+                inner.current_deadlines().answer
+            } else {
+                unbounded_limit
+            };
+            if let Err(error) = read_bounded_response(
+                inner,
+                &abandoned.request_id,
+                Some(bound),
+                "abandoned_response",
+            )
+            .await
+            {
                 // A failed read leaves the framing unproven.
                 inner.stream_state = StreamState::Torn;
                 return Err(error);
@@ -1691,11 +2087,11 @@ async fn exchange(
 ) -> Result<ControlResponse, WorkerError> {
     let expected = request.request_id.clone();
     send_request(writer, request).await?;
-    read_response(reader, &expected).await
+    read_handshake_response(reader, &expected).await
 }
 
-/// A duplicate of `stream` that [`Worker::sever_connection`] shuts down.
-#[cfg(test)]
+/// A duplicate of `stream` that can shut the connection down while the halves
+/// are owned elsewhere.
 fn duplicate_socket(
     stream: &UnixStream,
     socket_path: &Path,
@@ -1724,6 +2120,25 @@ async fn send_request(
 }
 
 async fn read_response(
+    responses: &mut Responses,
+    expected: &RequestId,
+) -> Result<ControlResponse, WorkerError> {
+    loop {
+        match responses.next().await? {
+            ControlMessage::Response(response) if &response.request_id == expected => {
+                return Ok(response);
+            }
+            ControlMessage::Event(_) => {}
+            ControlMessage::Response(_) | ControlMessage::Request(_) => {
+                return Err(WorkerError::ResponseMismatch);
+            }
+        }
+    }
+}
+
+/// Reads the response to `expected` directly from a connection no reader task
+/// owns yet.
+async fn read_handshake_response(
     reader: &mut ControlReader<OwnedReadHalf>,
     expected: &RequestId,
 ) -> Result<ControlResponse, WorkerError> {

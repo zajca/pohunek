@@ -924,6 +924,10 @@ fn apply_input_timing(config: &mut SessionRegistryConfig, timing: InputTiming) {
 /// Applies every registry setting `service.toml` carries to `config`.
 fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceConfig) {
     config.worker_connect_deadline = service.deadlines().worker_connect;
+    config.worker_exchange_deadlines = pohunek_daemon::runtime::ExchangeDeadlines {
+        send: service.deadlines().worker_send,
+        answer: service.deadlines().worker_answer,
+    };
     let shutdown = service.deadlines().fitted_shutdown();
     config.shutdown_timeout = shutdown.registry_shutdown;
     config.create_drain_timeout = shutdown.create_drain;

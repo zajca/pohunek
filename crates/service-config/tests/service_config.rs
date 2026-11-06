@@ -175,6 +175,8 @@ fn spec() -> ConfigSpec {
             create_drain: pohunek_service_config::DEFAULT_CREATE_DRAIN,
             driver_shutdown: pohunek_service_config::DEFAULT_DRIVER_SHUTDOWN,
             event_log_flush: pohunek_service_config::DEFAULT_EVENT_LOG_FLUSH,
+            worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+            worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
         },
         environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
         search_path: SearchPath::empty(),
@@ -3047,6 +3049,8 @@ fn shutdown_phase_keys_round_trip_and_reject_out_of_range() {
         "deadlines.create_drain_ms",
         "deadlines.driver_shutdown_ms",
         "deadlines.event_log_flush_ms",
+        "deadlines.worker_send_ms",
+        "deadlines.worker_answer_ms",
     ] {
         let line = key.trim_start_matches("deadlines.");
         for value in [0_u64, 600_001] {
@@ -3066,20 +3070,28 @@ fn shutdown_phase_keys_round_trip_and_reject_out_of_range() {
     }
     let loaded = fixture
         .load(&with_registry_shutdown(
-            "create_drain_ms = 3000\ndriver_shutdown_ms = 2000\nevent_log_flush_ms = 1000",
+            "create_drain_ms = 3000\ndriver_shutdown_ms = 2000\nevent_log_flush_ms = 1000\nworker_send_ms = 7000\nworker_answer_ms = 9000",
         ))
         .expect("load custom phase bounds");
     let deadlines = loaded.deadlines();
     assert_eq!(deadlines.create_drain, Duration::from_secs(3));
     assert_eq!(deadlines.driver_shutdown, Duration::from_secs(2));
     assert_eq!(deadlines.event_log_flush, Duration::from_secs(1));
+    assert_eq!(deadlines.worker_send, Duration::from_secs(7));
+    assert_eq!(deadlines.worker_answer, Duration::from_secs(9));
     assert!(loaded.unknown_keys().is_empty());
     let rendered = loaded.to_toml();
     assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
 
     let default = fixture.load(GOLDEN).expect("load the golden file");
     let rendered = default.to_toml();
-    for key in ["create_drain", "driver_shutdown", "event_log_flush"] {
+    for key in [
+        "create_drain",
+        "driver_shutdown",
+        "event_log_flush",
+        "worker_send",
+        "worker_answer",
+    ] {
         assert!(!rendered.contains(key), "{key} written at its default");
     }
     assert_eq!(default.deadlines().create_drain, DEFAULT_CREATE_DRAIN);

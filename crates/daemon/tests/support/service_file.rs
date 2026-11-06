@@ -48,6 +48,8 @@ pub(crate) fn write_service_file(
             create_drain: Duration::from_secs(1),
             driver_shutdown: Duration::from_secs(1),
             event_log_flush: Duration::from_secs(1),
+            worker_send: pohunek_service_config::DEFAULT_WORKER_SEND,
+            worker_answer: pohunek_service_config::DEFAULT_WORKER_ANSWER,
         },
         environment_allowlist: allowlist.to_vec(),
         search_path: SearchPath::default(),

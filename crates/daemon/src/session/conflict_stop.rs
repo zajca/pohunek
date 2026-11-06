@@ -264,6 +264,112 @@ impl SessionRegistry {
         Ok(SessionStopResult { stopped: true })
     }
 
+    /// Ends the supervised job of a worker that did not answer a stop, once
+    /// the recorded identity is proven the job's.
+    ///
+    /// The caller holds the stop intent. Nothing is retired unless the journal
+    /// of the recorded generation names the recorded worker and the job is
+    /// that worker's ([`Self::prove_conflicted_runtime`]); a refusal, a changed
+    /// runtime or a failed release is returned with the stop cleared, and a
+    /// release that may have retired the job also schedules the supervision
+    /// retry that finishes the stop from the durable intent.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prove_conflicted_runtime`] and
+    /// [`Self::release_conflicted_runtime`], and `session_runtime_transition_busy`
+    /// when the watcher reconnected the worker meanwhile.
+    pub(super) async fn end_unresponsive_worker(
+        &self,
+        id: &SessionId,
+        transaction_id: &str,
+        stop_runtime: Option<&RuntimeWatchIdentity>,
+        unresponsive: &crate::runtime::Worker,
+    ) -> Result<(), ProtocolError> {
+        let outcome = Box::pin(self.release_unresponsive_worker(id, unresponsive)).await;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.clear_stopping(id, transaction_id, stop_runtime).await;
+                match failure {
+                    ReleaseFailure::NotStopped(error) => Err(error),
+                    ReleaseFailure::PartiallyStopped(error) => {
+                        self.schedule_supervision_retry(id);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn release_unresponsive_worker(
+        &self,
+        id: &SessionId,
+        unresponsive: &crate::runtime::Worker,
+    ) -> Result<(), ReleaseFailure> {
+        let target = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get(id)
+                .ok_or_else(|| ReleaseFailure::NotStopped(session_not_found(&id.0)))?;
+            let still_connected = matches!(
+                &entry.runtime,
+                RuntimeHandle::Worker(current) if current.is_same_connection(unresponsive)
+            );
+            if !still_connected {
+                return Err(ReleaseFailure::NotStopped(runtime_error(
+                    "session_runtime_transition_busy",
+                    format!(
+                        "session {} reconnected its worker while the stop waited for it; retry the stop",
+                        id.0
+                    ),
+                )));
+            }
+            ConflictedRuntime::of(id, entry).map_err(ReleaseFailure::NotStopped)?
+        };
+        let lifecycle = self.lifecycle().map_err(|_unsupervised| {
+            ReleaseFailure::NotStopped(refusal(id, "no worker supervisor is configured"))
+        })?;
+        self.prove_conflicted_runtime(
+            id,
+            &target.generation,
+            &target.worker_id,
+            target.worker_instance_id.as_deref(),
+            &lifecycle,
+        )
+        .await
+        .map_err(ReleaseFailure::NotStopped)?;
+        {
+            // The proof took awaits: a watcher that reconnected the worker or
+            // reclassified the runtime meanwhile makes it stale.
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get(id)
+                .ok_or_else(|| ReleaseFailure::NotStopped(session_not_found(&id.0)))?;
+            let unchanged = target.expected.matches(entry)
+                && matches!(
+                    &entry.runtime,
+                    RuntimeHandle::Worker(current) if current.is_same_connection(unresponsive)
+                );
+            if !unchanged {
+                return Err(ReleaseFailure::NotStopped(runtime_error(
+                    "session_runtime_transition_busy",
+                    format!(
+                        "session {} changed while its worker identity was being proven; retry the stop",
+                        id.0
+                    ),
+                )));
+            }
+        }
+        warn!(
+            session_id = %id.0,
+            service_id = %target.generation.service_id(),
+            "ending a worker that did not answer the stop through its supervisor"
+        );
+        self.release_conflicted_runtime(id, &target, &lifecycle)
+            .await
+    }
+
     /// Settles a stop whose release failed and returns the error to report.
     ///
     /// `records` are the committed stop intent and the durable record it

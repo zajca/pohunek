@@ -593,6 +593,9 @@ pub struct SessionRegistryConfig {
     /// Bound on a worker generation's socket negotiation, on reconnecting to
     /// a live worker, and on startup discovery.
     pub worker_connect_deadline: Duration,
+    /// Deadlines of the transport phases of one exchange on a worker's control
+    /// connection; the connection is closed when one is exceeded.
+    pub worker_exchange_deadlines: crate::runtime::ExchangeDeadlines,
     /// Bound on the wait for a worker's hook schema when a hook report opted
     /// into the retryable `hook_schema_unavailable` answer.
     pub hook_admission_wait: Duration,
@@ -708,6 +711,7 @@ impl Default for SessionRegistryConfig {
             worker_runtime_root: None,
             worker_state_root: None,
             worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
+            worker_exchange_deadlines: crate::runtime::ExchangeDeadlines::default(),
             hook_admission_wait: pohunek_service_config::DEFAULT_HOOK_ADMISSION_WAIT,
             supervision: None,
             supervision_retry_initial: supervision::SUPERVISION_RETRY_INITIAL,
@@ -6329,8 +6333,8 @@ impl SessionRegistry {
                     input: self.inner.config.worker_input_stop_wait,
                     answer: bound,
                 };
-                let status = match Box::pin(worker.stop_within(transaction, waits)).await {
-                    Ok(Some(status)) => status,
+                match Box::pin(worker.stop_within(transaction, waits)).await {
+                    Ok(Some(status)) => ObservedExit::from_status(&status),
                     Ok(None) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;
@@ -6339,13 +6343,31 @@ impl SessionRegistry {
                             format!("worker for {} did not return a terminal outcome", id.0),
                         ));
                     }
+                    Err(
+                        WorkerError::StopUnanswered { .. } | WorkerError::ExchangeTimedOut { .. },
+                    ) if transaction_kind == TransactionKind::Stop => {
+                        // The worker is frozen, not slow: it is ended through its
+                        // supervisor and the stop commits the terminal outcome of
+                        // a runtime that was lost.
+                        Box::pin(self.end_unresponsive_worker(
+                            id,
+                            &transaction_id,
+                            stop_runtime.as_ref(),
+                            &worker,
+                        ))
+                        .await?;
+                        RuntimeExit {
+                            exit_code: None,
+                            success: false,
+                        }
+                        .into()
+                    }
                     Err(error) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;
                         return Err(worker_error_to_protocol(error));
                     }
-                };
-                ObservedExit::from_status(&status)
+                }
             }
             RuntimeHandle::Unavailable(state) => {
                 self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
@@ -7079,7 +7101,11 @@ impl SessionRegistry {
                 attempt = tokio::time::timeout_at(
                     deadline,
                     Worker::connect(socket_path, &id.0, self.daemon_instance_id()),
-                ) => attempt,
+                ) => attempt.inspect(|connected| {
+                    if let Ok(worker) = connected {
+                        worker.set_exchange_deadlines(self.inner.config.worker_exchange_deadlines);
+                    }
+                }),
             };
             let unreachable = match attempt {
                 Ok(Ok(worker)) => {

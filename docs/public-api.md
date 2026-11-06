@@ -2991,7 +2991,12 @@ leaves `schema_version` at 7 and the writer omits it while it equals its
 default. The optional `[deadlines]` keys `create_drain_ms` (10000),
 `driver_shutdown_ms` (5000) and `event_log_flush_ms` (5000), all `1..=600000`,
 bound the other daemon shutdown phases the same way (see the shutdown tree in
-the architecture). The four phase bounds plus a 2000 ms margin should not exceed
+the architecture). The optional `[deadlines]` keys `worker_send_ms` (15000) and
+`worker_answer_ms` (60000), both `1..=600000`, bound writing one request to a
+worker's control connection and waiting for the answer to a request that is not
+an input write or a stop; the daemon closes the connection when one elapses
+(additive: they leave `schema_version` at 7 and the writer omits each while it
+equals its default). The four phase bounds plus a 2000 ms margin should not exceed
 `daemon_exit_timeout_ms`. A file that exceeds it stays valid: `pohunekd` logs a
 warning at start and shortens the phase bounds in proportion so the service
 manager does not kill it before its event log flushed, and the

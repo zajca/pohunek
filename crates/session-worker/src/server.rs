@@ -552,7 +552,14 @@ impl Server {
                     })?;
                     let shared = Arc::clone(&self.shared);
                     self.shared.spawn_task(async move {
-                        if let Err(error) = serve_connection(shared, stream).await {
+                        let served = match shared.config.control_socket_buffer_bytes {
+                            Some(bytes) => match set_socket_buffers(&stream, bytes) {
+                                Ok(()) => serve_connection(shared, stream).await,
+                                Err(error) => Err(error),
+                            },
+                            None => serve_connection(shared, stream).await,
+                        };
+                        if let Err(error) = served {
                             event!(
                                 name: "worker.connection.failed",
                                 Level::WARN,
@@ -566,6 +573,15 @@ impl Server {
             }
         }
     }
+}
+
+/// Sets the send and receive buffer sizes of one accepted socket.
+fn set_socket_buffers(stream: &UnixStream, bytes: usize) -> Result<(), WorkerError> {
+    nix::sys::socket::setsockopt(stream, nix::sys::socket::sockopt::SndBuf, &bytes)
+        .and_then(|()| {
+            nix::sys::socket::setsockopt(stream, nix::sys::socket::sockopt::RcvBuf, &bytes)
+        })
+        .map_err(|errno| WorkerError::Protocol(format!("socket buffer size was refused: {errno}")))
 }
 
 /// Ends a running [`Server`] the way the death of its process would.
@@ -1028,20 +1044,27 @@ where
                         None => None,
                     }
                 }
-                event = events.recv() => {
+                // The broadcast receiver is not polled while an event line is
+                // pending, so a peer that does not read bounds the backlog by
+                // the channel's own lag skip instead of stalling this loop.
+                event = events.recv(), if !writer.has_pending() => {
                     match event {
                         Ok(event) => {
                             if !event_visible_to_connection(&event, connection) {
                                 continue;
                             }
                             authorize_control_request(shared, connection)?;
-                            writer.write(&ControlMessage::Event(event)).await
+                            writer.queue(&ControlMessage::Event(event))
                                 .map_err(|error| WorkerError::Protocol(error.to_string()))?;
                             continue;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => None,
                     }
+                }
+                written = writer.write_pending(), if writer.has_pending() => {
+                    written.map_err(|error| WorkerError::Protocol(error.to_string()))?;
+                    continue;
                 }
                 () = tokio::time::sleep(LEASE_PEER_RECHECK) => {
                     // A handed-off descriptor can simply go quiet: no request,

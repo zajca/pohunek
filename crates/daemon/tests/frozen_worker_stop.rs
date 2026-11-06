@@ -1,12 +1,14 @@
-//! A stop or removal whose worker stops answering ends with a typed error
-//! instead of waiting for the caller's lifecycle budget.
+//! A stop whose worker stops answering ends the worker through its supervisor;
+//! a removal ends with a typed error instead of waiting for the caller's
+//! lifecycle budget.
 //!
 //! The scenario freezes a real `pohunek-sessiond` with `SIGSTOP` while its
 //! control socket stays open, as a worker stuck in uninterruptible I/O is.
 //! The daemon bounds its wait for the worker's stop answer by the stop policy
-//! it sent plus the worker's terminal-commit wait, so the call returns a typed
-//! runtime error, the session stays listed and stoppable, and a retry after
-//! `SIGCONT` succeeds.
+//! it sent plus the worker's terminal-commit wait. A stop then proves the
+//! recorded identity, retires the worker's job and commits the session
+//! `stopped`; a removal returns a typed runtime error, keeps the session listed
+//! and succeeds on a retry after `SIGCONT`.
 
 // Rust guideline compliant 2026-10-20
 
@@ -20,7 +22,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
-    EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
+    EnvironmentSource, ExchangeDeadlines, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
@@ -85,6 +87,10 @@ struct Frozen {
 
 impl Frozen {
     /// Starts a session on a real worker and freezes the worker.
+    ///
+    /// The exchange deadlines stay above every stop bound, so a stop reaches
+    /// the frozen worker before a periodic inspection's deadline closes the
+    /// connection.
     async fn start() -> Self {
         let frozen = Self::start_running().await;
         kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
@@ -93,6 +99,27 @@ impl Frozen {
 
     /// Starts a session on a real worker that answers.
     async fn start_running() -> Self {
+        Self::start_running_with(ExchangeDeadlines {
+            send: INPUT_STOP_WAIT,
+            answer: INPUT_STOP_WAIT,
+        })
+        .await
+    }
+
+    /// Starts a session on a real worker that answers, with `deadlines` on
+    /// every exchange.
+    async fn start_running_with(deadlines: ExchangeDeadlines) -> Self {
+        Self::start_with(
+            deadlines,
+            SessionRegistryConfig::default().worker_connect_deadline,
+        )
+        .await
+    }
+
+    /// Starts a session on a real worker that answers, with `deadlines` on
+    /// every exchange and `connect_deadline` as the time the watcher keeps
+    /// reconnecting before it classifies the worker.
+    async fn start_with(deadlines: ExchangeDeadlines, connect_deadline: Duration) -> Self {
         let env = TestEnv::new().expect("create the test environment");
         let config = SessionRegistryConfig {
             shell_command: ShellCommand::new(
@@ -106,6 +133,8 @@ impl Frozen {
             worker_exchange_wait: EXCHANGE_WAIT,
             worker_input_stop_wait: INPUT_STOP_WAIT,
             input_write_stall_timeout: INPUT_STALL,
+            worker_exchange_deadlines: deadlines,
+            worker_connect_deadline: connect_deadline,
             ..SessionRegistryConfig::default()
         };
         let launcher = Arc::new(SubprocessWorkerLauncher::new());
@@ -195,38 +224,29 @@ impl Drop for Frozen {
 }
 
 #[tokio::test]
-async fn a_stop_of_a_frozen_worker_is_a_typed_error_and_retryable() {
+async fn a_stop_of_a_frozen_worker_ends_it_through_its_supervisor() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
     let frozen = Frozen::start().await;
 
-    let error = guard(
+    let stopped = guard(
         "a stop of a frozen worker",
         Box::pin(frozen.registry.stop(&frozen.id)),
     )
     .await
-    .expect_err("a frozen worker cannot answer the stop");
+    .expect("a stop ends a worker that cannot answer");
 
-    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
-    assert!(error.msg.contains(NO_ANSWER), "{error:?}");
-    assert_eq!(
-        frozen.state().await,
-        SessionState::Running,
-        "the session is still live and listed"
+    assert!(stopped.stopped);
+    assert_eq!(frozen.state().await, SessionState::Stopped);
+    assert!(
+        frozen
+            .launcher
+            .worker_process_id(&frozen.id.0)
+            .await
+            .is_none(),
+        "the frozen worker process is gone"
     );
-
-    frozen.thaw();
-    guard(
-        "a retried stop after the worker thawed",
-        Box::pin(frozen.registry.stop(&frozen.id)),
-    )
-    .await
-    .expect("a retried stop succeeds once the worker answers");
-    wait_until("the session to end stopped", || async {
-        (frozen.state().await == SessionState::Stopped).then_some(())
-    })
-    .await;
 }
 
 #[tokio::test]
@@ -251,6 +271,10 @@ async fn a_remove_of_a_frozen_worker_is_a_typed_error_and_keeps_the_record() {
     );
 
     frozen.thaw();
+    wait_until("the thawed worker to answer the watcher", || async {
+        frozen.registry.screen(&frozen.id).await.ok().map(|_| ())
+    })
+    .await;
     guard(
         "a retried removal after the worker thawed",
         Box::pin(frozen.registry.remove(&frozen.id)),
@@ -349,7 +373,7 @@ async fn a_stop_behind_an_input_outlasts_the_exchange_wait_and_proceeds_once_it_
 }
 
 #[tokio::test]
-async fn a_worker_frozen_during_an_input_ends_the_stop_at_the_input_wait() {
+async fn a_worker_frozen_during_an_input_is_ended_at_the_input_wait() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -364,15 +388,145 @@ async fn a_worker_frozen_during_an_input_ends_the_stop_at_the_input_wait() {
     tokio::time::pause();
     let inhibitor = AutoAdvanceInhibitor::new();
     advance_until_finished("the stop behind a frozen input", &stopping, EXCHANGE_WAIT).await;
-    let error = guard("the stop behind a frozen input", stopping)
+    let stopped = guard("the stop behind a frozen input", stopping)
         .await
         .expect("stop task joins")
-        .expect_err("a frozen worker cannot finish the input the stop waits behind");
+        .expect("a stop ends a worker frozen during the input it waits behind");
 
-    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
-    assert!(error.msg.contains(NO_ANSWER), "{error:?}");
-    assert!(error.msg.contains("input write"), "{error:?}");
-    frozen.thaw();
+    assert!(stopped.stopped);
+    assert_eq!(frozen.state().await, SessionState::Stopped);
     let _ = input.await;
     inhibitor.release().await;
+}
+
+/// A worker frozen between exchanges ends the watcher's exchange at the answer
+/// deadline, the daemon closes the connection, and the worker, once it runs
+/// again, releases its lease so the watcher reconnects and the session answers.
+#[tokio::test]
+async fn a_deadline_closes_the_connection_of_a_frozen_worker_and_the_watcher_reconnects() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let frozen = Frozen::start_running_with(ExchangeDeadlines {
+        send: EXCHANGE_WAIT,
+        answer: EXCHANGE_WAIT,
+    })
+    .await;
+    kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
+    // The watcher's periodic inspection is the exchange the frozen worker
+    // cannot answer; its deadline closes the connection.
+    wait_until(
+        "the closed connection to end the watcher's exchange",
+        || async {
+            (frozen.registry.input_writes_in_flight(&frozen.id).await == 0
+                && frozen.registry.screen(&frozen.id).await.is_err())
+            .then_some(())
+        },
+    )
+    .await;
+    frozen.thaw();
+
+    wait_until("the watcher to reconnect to the thawed worker", || async {
+        frozen.registry.screen(&frozen.id).await.ok().map(|_| ())
+    })
+    .await;
+    assert_eq!(frozen.state().await, SessionState::Running);
+}
+
+/// A stop does not end a worker whose recorded identity it cannot prove: the
+/// worker keeps running and the error names the missing proof.
+#[tokio::test]
+async fn a_stop_of_a_frozen_worker_with_an_unproven_identity_ends_nothing() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let frozen = Frozen::start().await;
+    let journals = frozen
+        .env
+        .state_home()
+        .join("pohunek/workers")
+        .join(&frozen.id.0);
+    std::fs::remove_dir_all(&journals).expect("remove the worker journals");
+
+    let error = guard(
+        "a stop whose identity cannot be proven",
+        Box::pin(frozen.registry.stop(&frozen.id)),
+    )
+    .await
+    .expect_err("an unproven worker is not ended");
+
+    assert!(
+        error.code.starts_with("runtime_"),
+        "the error names the missing proof: {error:?}"
+    );
+    assert!(
+        frozen
+            .launcher
+            .worker_process_id(&frozen.id.0)
+            .await
+            .is_some(),
+        "the worker was not retired"
+    );
+    assert_eq!(frozen.state().await, SessionState::Running);
+
+    // The refused stop leaves no unanswered exchange behind: the next caller
+    // gets an answer or an error, never an endless wait.
+    let _ = guard(
+        "a screen read after the refused stop",
+        frozen.registry.screen(&frozen.id),
+    )
+    .await;
+}
+
+/// Time the watcher keeps reconnecting to a frozen worker before it classifies
+/// it.
+const CONNECT_DEADLINE: Duration = EXCHANGE_WAIT.saturating_mul(2);
+
+/// A frozen worker the watcher stopped reconnecting to is classified as
+/// possibly still live, and a stop of that session ends it.
+#[tokio::test]
+async fn a_stop_ends_a_frozen_worker_the_watcher_gave_up_on() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let frozen = Frozen::start_with(
+        ExchangeDeadlines {
+            send: EXCHANGE_WAIT,
+            answer: EXCHANGE_WAIT,
+        },
+        CONNECT_DEADLINE,
+    )
+    .await;
+    let frozen_at = std::time::Instant::now();
+    kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
+
+    let seen = std::sync::Mutex::new(Vec::new());
+    wait_until("the watcher to classify the frozen worker", || async {
+        let runtime = frozen.registry.inspect(&frozen.id).await.ok()?.runtime?;
+        let mut seen = seen.lock().expect("state log");
+        if seen.last() != Some(&runtime.state) {
+            eprintln!("{:?} after {:?}", runtime.state, frozen_at.elapsed());
+            seen.push(runtime.state);
+        }
+        (runtime.state == protocol::RuntimeState::Conflict).then_some(())
+    })
+    .await;
+
+    let stopped = guard(
+        "a stop of the classified worker",
+        Box::pin(frozen.registry.stop(&frozen.id)),
+    )
+    .await
+    .expect("a stop ends the worker the watcher gave up on");
+    eprintln!("stopped after {:?}", frozen_at.elapsed());
+    assert!(stopped.stopped);
+    assert_eq!(frozen.state().await, SessionState::Stopped);
+    assert!(
+        frozen
+            .launcher
+            .worker_process_id(&frozen.id.0)
+            .await
+            .is_none(),
+        "the frozen worker process is gone"
+    );
 }
