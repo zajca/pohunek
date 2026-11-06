@@ -1961,6 +1961,21 @@ async fn start_named_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    start_session_in(framed, agent, cwd, name, None).await
+}
+
+/// [`start_named_session`] by project reference `project`, which names the
+/// project the session belongs to while `cwd` is where it starts.
+async fn start_session_in<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    agent: &str,
+    cwd: &Path,
+    name: Option<&str>,
+    project: Option<&str>,
+) -> protocol::SessionId
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let params = protocol::SessionNewParams {
         client_request_id: None,
         name: name.map(str::to_owned),
@@ -1968,7 +1983,7 @@ where
         cwd: Some(cwd.to_path_buf()),
         cols: 80,
         rows: 24,
-        project: None,
+        project: project.map(str::to_owned),
         repo: None,
         branch: None,
         base_branch: None,
@@ -4643,13 +4658,15 @@ async fn a_trusted_arg_in_fixed_args_or_a_profile_is_added_only_by_the_predicate
 // ---------------------------------------------------------------------------
 
 /// A runtime program that prints its arguments, then moves its own working
-/// directory on request: `osc <dir>` prints an OSC 7 hint for `dir`, `cd <dir>`
-/// changes the directory of the process.
+/// directory on request: `osc <dir>` changes the directory of the process and
+/// prints an OSC 7 hint for it, so the focus process agrees with the hint and
+/// no procwatch tick can move the session back; `cd <dir>` changes the
+/// directory of the process alone.
 fn drifting_program(plugins: &Path) -> PathBuf {
     write_program(
         plugins,
         "agent-drift",
-        "#!/bin/sh\nfor a in \"$@\"; do printf 'ARG<%s>\\n' \"$a\"; done\nprintf 'ARGV_END\\n'\nwhile read -r mode dir; do\n  case \"$mode\" in\n    osc) printf '\\033]7;file://%s\\007' \"$dir\" ;;\n    cd) cd \"$dir\" ;;\n  esac\ndone\nexec sleep 600\n",
+        "#!/bin/sh\nfor a in \"$@\"; do printf 'ARG<%s>\\n' \"$a\"; done\nprintf 'ARGV_END\\n'\nwhile read -r mode dir; do\n  case \"$mode\" in\n    osc) cd \"$dir\"; printf '\\033]7;file://%s\\007' \"$dir\" ;;\n    cd) cd \"$dir\" ;;\n  esac\ndone\nexec sleep 600\n",
     )
 }
 
@@ -4679,13 +4696,16 @@ async fn install_drifting_runtime<S>(
 }
 
 /// Registers the project of `dir` by creating and stopping a session there, so
-/// a later move into it resolves a project whose origin is trusted.
-async fn register_project<S>(framed: &mut Framed<S, LinesCodec>, dir: &Path)
+/// a later move into it resolves a project whose origin is trusted or not as
+/// the checkout's is. Returns the project id the session was bound to.
+async fn register_project<S>(framed: &mut Framed<S, LinesCodec>, dir: &Path) -> Option<String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let id = start_named_session(framed, RUNTIME, dir, None).await;
+    let info: protocol::SessionInfo = call(framed, method::SESSION_INSPECT, json!(id)).await;
     let _: protocol::SessionStopResult = call(framed, method::SESSION_STOP, json!(id)).await;
+    info.project_id
 }
 
 /// The working directory the daemon reports for the session.
@@ -4790,7 +4810,10 @@ async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
     let recorded = recorded_launch_checkout(&store_text(&servers), &created)
         .expect("the store records the launch checkout");
     assert_eq!(recorded["cwd"], json!(anchor));
-    assert!(recorded["project_id"].is_string(), "{recorded}");
+    let project = recorded["project_id"]
+        .as_str()
+        .expect("the store records the project")
+        .to_owned();
     let argv = resumed_argv(&mut local, &created).await;
     assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
 
@@ -4810,8 +4833,7 @@ async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
     assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
     assert_eq!(failure_lines(&second), 2);
 
-    // Rows 5, 7: back in the launch directory (the project association
-    // followed the moves), the arguments return.
+    // Row 5: back in the launch directory, the arguments return.
     drift(&mut local, &created, "osc", &anchor).await;
     let argv = resumed_argv(&mut local, &created).await;
     assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
@@ -4826,8 +4848,37 @@ async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
         "the launch checkout is never refreshed"
     );
 
-    let _: protocol::SessionStopResult =
-        call(&mut local, method::SESSION_STOP, json!(created)).await;
+    // Row 7: a session of the trusted project started in a checkout of another
+    // origin records that project with that directory. After a move away and
+    // back, its current project is the directory's own untrusted one, yet the
+    // relaunch is evaluated on the recorded project and gets the arguments.
+    let foreign = checkout(
+        root,
+        "foreign-origin",
+        "https://github.com/mallory/widgets.git",
+    );
+    let foreign_project = register_project(&mut local, &foreign)
+        .await
+        .expect("the foreign checkout is a project");
+    let by_reference = start_session_in(&mut local, RUNTIME, &foreign, None, Some(&project)).await;
+    let argv = printed_argv(&mut local, &by_reference).await;
+    assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
+    assert_eq!(
+        recorded_launch_checkout(&store_text(&servers), &by_reference),
+        Some(json!({ "cwd": foreign, "project_id": project }))
+    );
+    drift(&mut local, &by_reference, "osc", &second).await;
+    drift(&mut local, &by_reference, "osc", &foreign).await;
+    let info: protocol::SessionInfo =
+        call(&mut local, method::SESSION_INSPECT, json!(by_reference)).await;
+    assert_eq!(info.project_id.as_deref(), Some(foreign_project.as_str()));
+    let argv = resumed_argv(&mut local, &by_reference).await;
+    assert_eq!(trust_arg_count(&argv), 1, "{argv:?}");
+
+    for id in [&created, &by_reference] {
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
     drop(local);
     servers.stop().await;
 }
