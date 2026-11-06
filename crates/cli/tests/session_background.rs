@@ -243,6 +243,40 @@ async fn send_hook(harness: &Harness, id: &str, hook: &str) {
     assert_eq!(code, 0, "{sent}");
 }
 
+/// How long a hook may stay unobserved before [`send_hook_until_inspected`] sends it again.
+///
+/// The installed state hook is best effort: it gives the worker one 0.5 s
+/// socket exchange and drops the report on a timeout, so a loaded host can lose
+/// a single send. Each Stop fixture carries the whole task list, so a repeat
+/// only replaces the snapshot with the same one.
+const HOOK_RESEND_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sends `hook` and waits for the session's `inspect` document to satisfy
+/// `ready`, sending the hook again every [`HOOK_RESEND_AFTER`] while it does
+/// not. Returns the document that satisfied `ready`.
+async fn send_hook_until_inspected(
+    harness: &Harness,
+    id: &str,
+    hook: &str,
+    what: &str,
+    ready: impl Fn(&Value) -> bool,
+) -> Value {
+    send_hook(harness, id, hook).await;
+    let last_sent = std::cell::Cell::new(std::time::Instant::now());
+    wait_until(what, || async {
+        let info = inspect(harness, id).await;
+        if ready(&info) {
+            return Some(info);
+        }
+        if last_sent.get().elapsed() >= HOOK_RESEND_AFTER {
+            send_hook(harness, id, hook).await;
+            last_sent.set(std::time::Instant::now());
+        }
+        None
+    })
+    .await
+}
+
 /// The `SessionInfo` of `id`, from `session inspect --json`.
 async fn inspect(harness: &Harness, id: &str) -> Value {
     let (code, document) = harness.json(&["session", "inspect", id]).await;
@@ -751,11 +785,13 @@ async fn a_killed_worker_clears_the_background_it_held() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    let held = wait_until("the snapshot before the worker dies", || async {
-        let info = inspect(&harness, &id).await;
-        info["background"].is_object().then_some(info)
-    })
+    let held = send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the snapshot before the worker dies",
+        |info| info["background"].is_object(),
+    )
     .await;
     wait_for_background_state(&collected, &id, "the snapshot event", Value::is_object).await;
 

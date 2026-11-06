@@ -494,6 +494,16 @@ impl Rig {
     }
 }
 
+/// Loopback port the closed-address scenario connects to.
+///
+/// A privileged port below the range the OS assigns to `bind(0)` and to
+/// outgoing connections, so no unprivileged test can bind or be handed it, and
+/// nothing in the rig listens there: the connect is
+/// refused immediately on Linux and macOS. A port that a test holds bound
+/// without listening is not used because macOS drops, instead of refusing, a
+/// connect to it and the request times out.
+const CLOSED_PORT: u16 = 1;
+
 fn archive_path(version: &str) -> String {
     format!("/{version}.tar.zst")
 }
@@ -775,9 +785,7 @@ async fn oversized_and_unavailable_downloads_fail_without_a_daemon_call() {
     assert_eq!(err_code(&document), "plugin_index_unavailable");
 
     // A connection that cannot be made is the same failure as a status error.
-    // The server listens on 127.0.0.1 only, so nothing answers on `[::1]` at
-    // its port: the connect is refused, or fails outright on a host without IPv6.
-    let unreachable = format!("http://[::1]:{}{INDEX_PATH}", rig.server.addr.port());
+    let unreachable = format!("http://127.0.0.1:{CLOSED_PORT}{INDEX_PATH}");
     let (code, document) = rig
         .install
         .json(&[
