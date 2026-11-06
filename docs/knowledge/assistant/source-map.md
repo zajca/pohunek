@@ -774,6 +774,7 @@ Signed runtime catalog:
 - `crates/xtask/src/catalog.rs` — `cargo xtask catalog build|sign|verify|anchor|public-key`.
 - `crates/xtask/src/catalog_key.rs` — owner-private signing key file reader.
 - `crates/xtask/src/plugin_index.rs` — the plugin index owner ceremony commands (`catalog keygen`, `index endorse|revoke|channel`) and the shared document writer.
+- `crates/xtask/src/plugin_index/admit.rs` — `index check-entry`: the pure admission predicates of one added index entry (schema, identity, version order, core range).
 - `crates/xtask/src/plugin_index/build.rs` — `index build`: the entries tree reader, the typed `[source]` checks and `--print-source`.
 - `crates/xtask/src/plugin_index/sign.rs` — `index message|attach|verify`: the signing message, the external-signature attach and the index and key-material verification.
 - `crates/xtask/src/plugin_index/throwaway.rs` — `index throwaway`: a random root and index key for proofs.

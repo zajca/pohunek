@@ -1064,7 +1064,12 @@ fn validate_entries(
     Ok(verified)
 }
 
-pub(crate) fn parse_core_range(text: &str) -> Option<VersionReq> {
+/// Parses the core range of a catalog or index entry.
+///
+/// Returns `None` for text that is empty, longer than [`MAX_CORE_RANGE_BYTES`],
+/// not a semver requirement, or a requirement without a comparator (`*`).
+#[must_use]
+pub fn parse_core_range(text: &str) -> Option<VersionReq> {
     if text.is_empty() || text.len() > MAX_CORE_RANGE_BYTES {
         return None;
     }

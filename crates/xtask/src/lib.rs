@@ -116,6 +116,8 @@ pub enum XtaskError {
     Anchor(::package::AnchorFileError),
     /// A plugin index document failed the daemon's verification rules.
     Index(::package::IndexError),
+    /// An index entry failed an admission predicate; the text names it.
+    Admission(String),
     /// A plugin proof ran and failed at a step; its evidence was written.
     Prove(plugin::Verdict),
     /// A key file was refused; never carries key material.
@@ -161,7 +163,7 @@ impl XtaskError {
                 use std::os::unix::process::ExitStatusExt as _;
                 SIGNAL_EXIT_BASE + status.signal().unwrap_or(0)
             }),
-            Self::Index(_) => INDEX_REFUSED_EXIT_CODE,
+            Self::Index(_) | Self::Admission(_) => INDEX_REFUSED_EXIT_CODE,
             Self::Prove(_) => PROVE_FAILED_EXIT_CODE,
             _ => FAILURE_EXIT_CODE,
         }
@@ -171,7 +173,7 @@ impl XtaskError {
 impl fmt::Display for XtaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage(message) => write!(f, "{message}"),
+            Self::Usage(message) | Self::Admission(message) => write!(f, "{message}"),
             Self::BundleValidation(error) => write!(f, "{error}"),
             Self::KnowledgeLog(error) => write!(f, "knowledge log: {error}"),
             Self::Io { path, source } => {
@@ -228,6 +230,7 @@ impl Error for XtaskError {
             Self::Index(error) => Some(error),
             Self::Prove(verdict) => Some(verdict),
             Self::Usage(_)
+            | Self::Admission(_)
             | Self::KeyFile { .. }
             | Self::UnsupportedFileType(_)
             | Self::InvalidPath(_)
@@ -739,6 +742,13 @@ enum CatalogAction {
     },
 }
 
+/// Predicate group of `index check-entry`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CheckStageArg {
+    Schema,
+    CoreRange,
+}
+
 #[derive(Debug, Subcommand)]
 enum IndexAction {
     /// Endorse an index key: write its signed `official` key record.
@@ -838,6 +848,26 @@ enum IndexAction {
             required_unless_present = "print_source"
         )]
         output: Option<PathBuf>,
+    },
+    /// Check the admission predicates of one added index entry.
+    ///
+    /// `--entries` holds exactly the added entry and `--existing` the admitted
+    /// `official/` tree. Stage `schema` is step 1 of the admission and prints
+    /// the validated entry fields as `key=value` lines; stage `core-range` is
+    /// step 7. A refused entry exits 1 and names `predicate=<name>`.
+    CheckEntry {
+        /// Entries tree holding only the added entry.
+        #[arg(long, value_name = "DIR")]
+        entries: PathBuf,
+        /// Entries tree of the admitted entries.
+        #[arg(long, value_name = "DIR")]
+        existing: PathBuf,
+        /// Version of the pinned core, without the leading `v`.
+        #[arg(long, value_name = "X.Y.Z")]
+        core_version: String,
+        /// Predicate group to run.
+        #[arg(long, value_enum)]
+        stage: CheckStageArg,
     },
     /// Write the message an index signature covers.
     ///
@@ -1267,6 +1297,33 @@ fn run_index_build(action: IndexAction) -> Result<(), XtaskError> {
     Ok(())
 }
 
+/// `index check-entry`: prints the validated fields or the success line.
+fn run_index_check_entry(action: IndexAction) -> Result<(), XtaskError> {
+    let IndexAction::CheckEntry {
+        entries,
+        existing,
+        core_version,
+        stage,
+    } = action
+    else {
+        return Ok(());
+    };
+    let stage = match stage {
+        CheckStageArg::Schema => plugin_index::CheckStage::Schema,
+        CheckStageArg::CoreRange => plugin_index::CheckStage::CoreRange,
+    };
+    print!(
+        "{}",
+        plugin_index::check_entry(&plugin_index::CheckArgs {
+            entries,
+            existing,
+            core_version,
+            stage,
+        })?
+    );
+    Ok(())
+}
+
 /// The index commands that read no key file.
 fn run_index_tooling(action: IndexAction) -> Result<(), XtaskError> {
     match action {
@@ -1344,6 +1401,7 @@ fn run_index_tooling(action: IndexAction) -> Result<(), XtaskError> {
                 ));
             }
         },
+        check @ IndexAction::CheckEntry { .. } => run_index_check_entry(check)?,
         IndexAction::Throwaway { entries, output } => {
             let written =
                 plugin_index::throwaway(&plugin_index::ThrowawayArgs { entries, output })?;
@@ -1427,6 +1485,7 @@ fn run_index(action: IndexAction) -> Result<(), XtaskError> {
             );
         }
         tooling @ (IndexAction::Build { .. }
+        | IndexAction::CheckEntry { .. }
         | IndexAction::Message { .. }
         | IndexAction::Attach { .. }
         | IndexAction::Verify { .. }

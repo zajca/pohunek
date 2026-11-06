@@ -454,6 +454,15 @@ the document. `index build --entries <dir> --print-source` prints it as
 by `(package_id, version)`, and the result must pass the daemon's body rules
 (freshness, lifetime, entry structure) before it is written.
 
+`index check-entry --entries <tree of one entry> --existing <admitted tree>
+--core-version <X.Y.Z> --stage schema|core-range` runs the admission predicates
+that need the daemon's own definitions: package-id binding, refused runtime
+ids, identity and digest uniqueness against the admitted tree, release-semver
+version order, and the core range (parsed with the daemon's parser, a lower
+bound of at least 0.40.0 that admits the pinned core). A refusal exits 1 with
+`predicate=<name>`; success of stage `schema` prints the validated entry
+fields as `key=value` lines.
+
 Signing never happens in an xtask process. `index message` writes the file a
 signature covers (the index domain prefix and the canonical bytes of the
 `index` member as parsed), `index attach` inserts a signature made over that
