@@ -690,7 +690,7 @@ ways: it runs the full set (no selection, no sparse tree), it runs in the
 checkout that built the archive, it builds with the job's `-C
 link-arg=-fuse-ld=mold` and sccache, and it uploads no artifact: the step
 summary holds only the flaky and failed tests of each shard (`target/nextest` is
-removed before each shard). It does not run the script regressions or the
+removed before each shard). It starts by removing the preinstalled Android SDK, .NET, GHC and CodeQL trees and logs `df` under `disk:` lines at each stage, so a run shows its disk headroom. It does not run the script regressions or the
 toolchain-pin check, which the `core` shard job runs, nor CI's ignored-test
 jobs (real systemd supervision, the four `*-package` jobs with
 `--run-ignored all`, the macOS lane and tier, the test selection audit); the
