@@ -793,36 +793,6 @@ fn the_channel_names_a_root_of_the_anchor_and_matches_the_package_bytes() {
     );
     assert_eq!(mode_of(&channel), 0o644);
 
-    // A root that the same anchor revokes cannot verify any index.
-    let revoking = ceremony.path("revoking-anchor.json");
-    ceremony.xtask_ok(&[
-        "catalog",
-        "anchor",
-        "--root",
-        &format!("{}:0:4000000000", public.display()),
-        "--revoked-key-id",
-        &primary.key_id,
-        "--output",
-        revoking.to_str().expect("utf-8"),
-    ]);
-    ceremony.assert_refused(
-        &[
-            "index",
-            "channel",
-            "--anchor",
-            revoking.to_str().expect("utf-8"),
-            "--endorser-key-id",
-            &primary.key_id,
-            "--output",
-            ceremony
-                .path("revoked-channel.json")
-                .to_str()
-                .expect("utf-8"),
-        ],
-        &ceremony.path("revoked-channel.json"),
-        "revoked by the trust anchor",
-    );
-
     // An id that is not a root, a malformed id and an existing output.
     let refused = ceremony.path("refused.json");
     for id in [other.key_id.as_str(), "not-a-key-id"] {
@@ -860,4 +830,38 @@ fn the_channel_names_a_root_of_the_anchor_and_matches_the_package_bytes() {
         "failed to access",
     );
     assert_eq!(std::fs::read(&channel).expect("channel"), expected);
+}
+
+#[test]
+fn the_channel_refuses_a_root_that_the_same_anchor_revokes() {
+    let ceremony = Ceremony::new();
+    let primary = ceremony.keygen("primary.key");
+    let public = ceremony.path("primary.pub");
+    std::fs::write(&public, format!("{}\n", primary.public_key)).expect("write");
+    let anchor = ceremony.path("revoking-anchor.json");
+    ceremony.xtask_ok(&[
+        "catalog",
+        "anchor",
+        "--root",
+        &format!("{}:0:4000000000", public.display()),
+        "--revoked-key-id",
+        &primary.key_id,
+        "--output",
+        anchor.to_str().expect("utf-8"),
+    ]);
+    let channel = ceremony.path("revoked-channel.json");
+    ceremony.assert_refused(
+        &[
+            "index",
+            "channel",
+            "--anchor",
+            anchor.to_str().expect("utf-8"),
+            "--endorser-key-id",
+            &primary.key_id,
+            "--output",
+            channel.to_str().expect("utf-8"),
+        ],
+        &channel,
+        "revoked by the trust anchor",
+    );
 }
