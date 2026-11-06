@@ -35,6 +35,8 @@ pub(super) async fn handle_host_inspect(
     if params.and_then(|params| params.skip_runtime_probes) == Some(true) {
         let mut capabilities = crate::capabilities::host_capability_flags(&daemon_version);
         capabilities.protocol_version = protocol_version;
+        capabilities.package_install_index_supported =
+            sessions.package_authority().index_install_supported();
         return ok_value(request, &capabilities);
     }
     let sessions = sessions.clone();
@@ -48,6 +50,8 @@ pub(super) async fn handle_host_inspect(
                 sessions.probe_cache(),
             );
             capabilities.protocol_version = protocol_version;
+            capabilities.package_install_index_supported =
+                sessions.package_authority().index_install_supported();
             Ok(capabilities)
         },
         "host_inspect_task_panicked",

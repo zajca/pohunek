@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use package::{
-    archive_digest, build_archive, read_archive, AnchorFile, ArchiveEntry, CatalogEntry, Limits,
-    PackageDigest, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES,
+    archive_digest, build_archive, read_archive, AnchorFile, ArchiveEntry, CatalogEntry,
+    IndexChannel, Limits, PackageDigest, ANCHOR_FILE_NAME, INDEX_CHANNEL_FILE_NAME,
+    MAX_ANCHOR_BYTES,
 };
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::fs::{write_executable, write_file};
@@ -143,8 +144,19 @@ struct Install {
     _daemon: tokio::process::Child,
 }
 
+/// The plugin index channel file beside the anchor: `bytes` with the
+/// permission bits `mode`.
+struct Channel<'a> {
+    bytes: &'a [u8],
+    mode: u32,
+}
+
 impl Install {
     async fn start(anchor: &Anchor) -> Self {
+        Self::start_with_channel(anchor, None).await
+    }
+
+    async fn start_with_channel(anchor: &Anchor, channel: Option<Channel<'_>>) -> Self {
         let env = TestEnv::new().expect("create the hermetic environment");
         let release = env.root().join("release");
         fs::create_dir(&release).expect("create the release directory");
@@ -205,6 +217,12 @@ impl Install {
                     .expect("apply native ACL entry");
                 assert!(status.success(), "apply native ACL entry: {entry}");
             }
+        }
+        if let Some(channel) = channel {
+            let channel_path = release.join(INDEX_CHANNEL_FILE_NAME);
+            write_file(&channel_path, channel.bytes).expect("write the channel");
+            fs::set_permissions(&channel_path, fs::Permissions::from_mode(channel.mode))
+                .expect("channel mode");
         }
         let mut command = env.tokio_command(&daemon);
         command
@@ -306,14 +324,27 @@ impl Install {
 
     /// The `catalog_trust_anchor` check of `pohunek doctor`.
     async fn trust_check(&self) -> Value {
+        self.doctor_check("catalog_trust_anchor")
+            .await
+            .expect("doctor reports the trust anchor")
+    }
+
+    /// The doctor check `name`, if the daemon reports it.
+    async fn doctor_check(&self, name: &str) -> Option<Value> {
         let (_code, document) = self.json(&["doctor"]).await;
         document["ok"]["checks"]
             .as_array()
             .unwrap_or_else(|| panic!("doctor lists checks: {document}"))
             .iter()
-            .find(|check| check["name"] == "catalog_trust_anchor")
-            .unwrap_or_else(|| panic!("doctor reports the trust anchor: {document}"))
-            .clone()
+            .find(|check| check["name"] == name)
+            .cloned()
+    }
+
+    /// Whether `host inspect local` reports plugin index installs.
+    async fn index_installs_supported(&self) -> bool {
+        let (code, hosts) = self.json(&["host", "inspect", "local"]).await;
+        assert_eq!(code, 0, "{hosts}");
+        hosts["ok"]["package_install_index_supported"] == true
     }
 
     /// Asserts a refused install: the typed error code, nothing recorded.
@@ -888,4 +919,90 @@ async fn an_anchor_that_revokes_the_signer_or_whose_root_window_has_passed_refus
         let check = install.trust_check().await;
         assert_eq!(check["status"], "ok", "{label}: {check}");
     }
+}
+
+#[tokio::test]
+async fn the_plugin_index_channel_beside_the_anchor_enables_installs_by_index() {
+    let key = test_key();
+    let other = test_key();
+    let channel_for = |endorser: &ed25519_dalek::SigningKey| {
+        IndexChannel::new(key_id(endorser))
+            .to_bytes()
+            .expect("channel bytes")
+    };
+
+    // A channel naming an anchor root is loaded.
+    let loaded = channel_for(&key);
+    let install = Install::start_with_channel(
+        &file_anchor(anchor_for(&key), 0o644),
+        Some(Channel {
+            bytes: &loaded,
+            mode: 0o644,
+        }),
+    )
+    .await;
+    let check = install
+        .doctor_check("plugin_index_channel")
+        .await
+        .expect("a loaded anchor reports the channel");
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(install.index_installs_supported().await);
+
+    // No channel file: a warning, installs by id off, catalog installs intact.
+    let install = Install::start(&file_anchor(anchor_for(&key), 0o644)).await;
+    let check = install
+        .doctor_check("plugin_index_channel")
+        .await
+        .expect("a loaded anchor reports the channel");
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(!install.index_installs_supported().await);
+
+    // A channel that names no anchor root, or that the policy refuses, fails
+    // and leaves catalog installs alone.
+    let unknown_endorser = channel_for(&other);
+    for (name, bytes, mode) in [
+        ("an endorser outside the anchor", &unknown_endorser, 0o644),
+        ("a group-writable channel", &loaded, 0o664),
+        ("a malformed channel", &b"{}".to_vec(), 0o644),
+    ] {
+        let install = Install::start_with_channel(
+            &file_anchor(anchor_for(&key), 0o644),
+            Some(Channel { bytes, mode }),
+        )
+        .await;
+        let check = install
+            .doctor_check("plugin_index_channel")
+            .await
+            .expect("a loaded anchor reports the channel");
+        assert_eq!(check["status"], "fail", "{name}: {check}");
+        assert!(!install.index_installs_supported().await, "{name}");
+        let anchor_check = install.trust_check().await;
+        assert_eq!(anchor_check["status"], "ok", "{name}: {anchor_check}");
+        let built = install.archive("1.0.0");
+        let catalog = install.write(
+            "runtime-catalog.json",
+            &signed(
+                &key,
+                catalog_of(
+                    1,
+                    WINDOW_END,
+                    vec![entry_for(&built, "1.0.0", &host_platform(), ANY_CORE)],
+                ),
+            ),
+        );
+        let (code, document) = install.install_catalog(&built, &catalog).await;
+        assert_eq!(code, 0, "{name}: {document}");
+    }
+
+    // Without an anchor the channel is not read and not reported.
+    let install = Install::start_with_channel(
+        &Anchor::None,
+        Some(Channel {
+            bytes: &loaded,
+            mode: 0o644,
+        }),
+    )
+    .await;
+    assert!(install.doctor_check("plugin_index_channel").await.is_none());
+    assert!(!install.index_installs_supported().await);
 }

@@ -414,3 +414,14 @@ material: `IndexChannel::endorser(&anchor)` returns the anchor root with that id
 and fails with `EndorserNotInAnchor` when there is none. There is no compiled
 fallback, so a missing channel file leaves index installs refused (the reader of
 the file owns that refusal).
+
+The daemon reads the channel file in the anchor's directory, after a loaded
+anchor only, under the anchor's file policy (regular, size-bounded, owned by
+the daemon user or root, not writable by others, one link, safe directory
+chain). A missing file leaves index installs refused with
+`official_trust_unavailable`; a file the policy or the parser refuses, or one
+naming an endorser the anchor lacks, refuses them with
+`official_trust_anchor_invalid`. Neither affects catalog installs. `host.inspect`
+reports `package_install_index_supported` only for a loaded channel, and
+`pohunek doctor` reports the `plugin_index_channel` check (`ok`, `warn`,
+`fail`) only beside a loaded anchor.

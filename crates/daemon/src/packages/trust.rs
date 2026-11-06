@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use package::catalog_state::CatalogState;
 use package::{
-    verify_catalog, Authorization, KeyId, PackageDigest, RootKey, TrustAnchor, TrustAnchorError,
-    VerifiedCatalog,
+    verify_catalog, verify_index, Authorization, IndexEntryRefusal, IndexVerifierState, KeyId,
+    PackageDigest, RootKey, TrustAnchor, TrustAnchorError, VerifiedCatalog, VerifiedIndex,
 };
 use protocol::{PackageErrorKind, PackageIdentity, RuntimeId};
 use semver::Version;
 use tracing::warn;
+
+use crate::catalog_anchor::IndexTrust;
 
 /// Core version a catalog entry's compatibility range is checked against.
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,6 +50,7 @@ pub struct HostTrustAnchor {
 struct AnchorInputs {
     roots: Vec<RootKey>,
     revoked: BTreeSet<KeyId>,
+    index: IndexTrust,
 }
 
 impl HostTrustAnchor {
@@ -63,8 +66,27 @@ impl HostTrustAnchor {
             inputs: Arc::new(AnchorInputs {
                 roots,
                 revoked: revoked.into_iter().collect(),
+                index: IndexTrust::Absent,
             }),
         })
+    }
+
+    /// The anchor with `index` as its plugin index channel.
+    #[must_use]
+    pub fn with_index(self, index: IndexTrust) -> Self {
+        Self {
+            inputs: Arc::new(AnchorInputs {
+                roots: self.inputs.roots.clone(),
+                revoked: self.inputs.revoked.clone(),
+                index,
+            }),
+        }
+    }
+
+    /// What the host trusts to authorize plugin index installs.
+    #[must_use]
+    pub fn index(&self) -> &IndexTrust {
+        &self.inputs.index
     }
 
     /// The anchor with the base revocations plus `persisted`.
@@ -109,6 +131,91 @@ pub(super) fn verify_catalog_document(
         warn!(%error, "a package catalog was refused");
         PackageErrorKind::Untrusted
     })
+}
+
+/// Verifies a plugin index document against the channel's `endorser`, the
+/// persisted marks and the key ids revoked by the anchor, by catalogs
+/// recorded earlier and by indexes recorded earlier.
+///
+/// # Errors
+///
+/// Returns [`PackageErrorKind::Untrusted`] for an index that fails
+/// verification.
+pub(super) fn verify_index_document(
+    bytes: &[u8],
+    endorser: &RootKey,
+    anchor: &HostTrustAnchor,
+    catalog_state: &CatalogState,
+    state: &IndexVerifierState,
+    now: u64,
+) -> Result<VerifiedIndex, PackageErrorKind> {
+    let base_revoked: BTreeSet<KeyId> = anchor
+        .inputs
+        .revoked
+        .union(catalog_state.revoked_key_ids())
+        .cloned()
+        .collect();
+    verify_index(bytes, endorser, &base_revoked, state, now).map_err(|error| {
+        warn!(%error, "a plugin index was refused");
+        PackageErrorKind::Untrusted
+    })
+}
+
+/// Checks that the verified index lists the raw archive `digest`.
+///
+/// The archive is decompressed only after this check passes.
+///
+/// # Errors
+///
+/// Returns [`PackageErrorKind::Untrusted`] when no entry carries `digest`.
+pub(super) fn require_indexed(
+    index: &VerifiedIndex,
+    digest: &PackageDigest,
+) -> Result<(), PackageErrorKind> {
+    if index.lists(digest) {
+        Ok(())
+    } else {
+        warn!("a package archive was refused: the plugin index does not list its digest");
+        Err(PackageErrorKind::Untrusted)
+    }
+}
+
+/// Checks that the verified index authorizes the decoded package and that its
+/// entry supports this core version and platform.
+///
+/// # Errors
+///
+/// Returns [`PackageErrorKind::RuntimeNotClaimable`] for a runtime id an index
+/// never authorizes, [`PackageErrorKind::Incompatible`] when the entry does
+/// not support `core` or `platform`, and [`PackageErrorKind::Untrusted`] for
+/// every other refusal.
+pub(super) fn authorize_indexed(
+    index: &VerifiedIndex,
+    identity: &PackageIdentity,
+    runtime_id: &RuntimeId,
+    digest: &PackageDigest,
+    core: &Version,
+    platform: &str,
+) -> Result<(), PackageErrorKind> {
+    index
+        .authorize(
+            &identity.id,
+            runtime_id,
+            &identity.version,
+            digest,
+            core,
+            platform,
+        )
+        .map_err(|refusal| {
+            warn!(%refusal, "a package was refused by the plugin index");
+            match refusal {
+                IndexEntryRefusal::RuntimeRefused => PackageErrorKind::RuntimeNotClaimable,
+                IndexEntryRefusal::CoreRange
+                | IndexEntryRefusal::CoreExcluded
+                | IndexEntryRefusal::Platform => PackageErrorKind::Incompatible,
+                _ => PackageErrorKind::Untrusted,
+            }
+        })
 }
 
 /// Checks that the verified catalog lists the raw archive `digest` and does
@@ -196,7 +303,7 @@ pub(super) fn core_version() -> Result<Version, PackageErrorKind> {
 ///
 /// Returns [`PackageErrorKind::Incompatible`] on a platform the catalog does
 /// not name.
-pub(crate) fn host_platform() -> Result<String, PackageErrorKind> {
+pub(super) fn host_platform() -> Result<String, PackageErrorKind> {
     platform_name(
         std::env::consts::ARCH,
         std::env::consts::OS,

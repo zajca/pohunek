@@ -9,7 +9,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard};
 
 use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::agent::ProfileRegistry;
-use crate::catalog_anchor::CatalogTrust;
+use crate::catalog_anchor::{CatalogTrust, IndexTrust};
 use crate::session::SessionRegistry;
 
 /// Owns the package registry handle, the catalog trust and the lifecycle lock.
@@ -63,6 +63,16 @@ impl PackageAuthority {
     #[must_use]
     pub(crate) fn catalog_trust(&self) -> &CatalogTrust {
         &self.trust
+    }
+
+    /// Whether `package.install` can authorize an archive by a plugin index:
+    /// the anchor and the channel beside it are both loaded.
+    #[must_use]
+    pub(crate) fn index_install_supported(&self) -> bool {
+        matches!(
+            &self.trust,
+            CatalogTrust::Loaded(anchor) if matches!(anchor.index(), IndexTrust::Loaded(_))
+        )
     }
 
     /// The lifecycle lock, for scenarios that observe who holds it.

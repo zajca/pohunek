@@ -30,9 +30,11 @@ use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::catalog_anchor::{CatalogTrust, IndexTrust};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
-use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::session::{HostTrustAnchor, SessionRegistry, SessionRegistryConfig};
+use pohunek_test_support::catalog::{root_of, test_key, WINDOW_END, WINDOW_START};
 use pohunek_test_support::worker_binary;
 
 /// Runtime id of the fixture package.
@@ -118,6 +120,15 @@ fn write_data_store(root: &Path, content: &str) -> PathBuf {
 }
 
 async fn spawn_servers_over(tag: &str, store_content: Option<&str>) -> Servers {
+    spawn_servers_trusting(tag, store_content, CatalogTrust::Absent).await
+}
+
+/// [`spawn_servers_over`] over a registry whose catalog trust is `trust`.
+async fn spawn_servers_trusting(
+    tag: &str,
+    store_content: Option<&str>,
+    trust: CatalogTrust,
+) -> Servers {
     let socket_dir = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
         .expect("create the socket directory");
     let socket = socket_dir.path().join("daemon.sock");
@@ -147,6 +158,7 @@ async fn spawn_servers_over(tag: &str, store_content: Option<&str>) -> Servers {
         socket_path: Some(socket.clone()),
         store_path: store.clone(),
         plugins_dir: Some(plugins.clone()),
+        catalog_trust: trust,
         agents_dir: Some(agents.clone()),
         host_state_dir: Some(host_state),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
@@ -3039,4 +3051,80 @@ async fn a_session_pinned_before_naming_args_resumes_without_the_name() {
         call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
     drop(local);
     servers.stop().await;
+}
+
+/// The trust of a host whose anchor holds a throwaway root, with the plugin
+/// index channel naming that root when `channel` is set.
+fn index_trust(channel: bool) -> CatalogTrust {
+    let root = root_of(&test_key(), WINDOW_START, WINDOW_END);
+    let anchor = HostTrustAnchor::new(vec![root.clone()], Vec::new()).expect("anchor");
+    CatalogTrust::Loaded(if channel {
+        anchor.with_index(IndexTrust::Loaded(Box::new(root)))
+    } else {
+        anchor
+    })
+}
+
+/// Whether `host.inspect` reports plugin index installs, over a request that
+/// probes runtimes (`full`) or only asks for the flags.
+async fn index_flag<S>(framed: &mut Framed<S, LinesCodec>, params: Value) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let capabilities: HostCapabilities = call(framed, method::HOST_INSPECT, params).await;
+    capabilities.package_install_index_supported
+}
+
+#[tokio::test]
+async fn the_index_trust_kind_is_served_only_with_a_loaded_channel() {
+    let (bytes, _digest) = archive("/bin/sh");
+    for (tag, trust, flag, code) in [
+        (
+            "index-wire-channel",
+            index_trust(true),
+            true,
+            "package_source_unreadable",
+        ),
+        (
+            "index-wire-no-channel",
+            index_trust(false),
+            false,
+            "official_trust_unavailable",
+        ),
+        (
+            "index-wire-no-anchor",
+            CatalogTrust::Absent,
+            false,
+            "official_trust_unavailable",
+        ),
+    ] {
+        let servers = spawn_servers_trusting(tag, None, trust).await;
+        let mut local = connect_unix(&servers.socket).await;
+        assert_eq!(index_flag(&mut local, Value::Null).await, flag, "{tag}");
+        assert_eq!(
+            index_flag(&mut local, json!({ "skip_runtime_probes": true })).await,
+            flag,
+            "{tag}"
+        );
+
+        // A missing index file is refused as unreadable only when the host
+        // serves the kind; the dispatch itself is what the code proves.
+        let archive_path = servers.plugins.with_file_name("pi.tar.zst");
+        std::fs::write(&archive_path, &bytes).expect("write the archive");
+        let missing = servers.plugins.with_file_name("absent-index.json");
+        let refused = refusal(
+            &mut local,
+            method::PACKAGE_INSTALL,
+            json!({
+                "archive_path": archive_path,
+                "trust": { "kind": "index", "index_path": missing },
+                "enable": false,
+                "select": false,
+                "dry_run": false
+            }),
+        )
+        .await;
+        assert_eq!(refused, code, "{tag}");
+        servers.stop().await;
+    }
 }

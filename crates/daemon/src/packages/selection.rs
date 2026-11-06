@@ -35,14 +35,14 @@ use crate::integration::RetainedSchemas;
 
 /// The integration a package declares: its handler id and hook schema id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Declared {
+pub(super) struct Declared {
     handler: String,
     schema: &'static pohunek_worker_protocol::HookSchema,
 }
 
 /// What the integration of a package resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Integration {
+pub(super) enum Integration {
     /// The package declares this integration, or none.
     Known(Option<Declared>),
     /// The descriptor cannot be read, so nothing is known about the package.
@@ -50,7 +50,7 @@ pub(crate) enum Integration {
 }
 
 /// The integration `definition` declares.
-pub(crate) fn declared_by(definition: &RuntimeDefinition) -> Integration {
+pub(super) fn declared_by(definition: &RuntimeDefinition) -> Integration {
     Integration::Known(
         definition
             .integration_handler()
@@ -69,7 +69,7 @@ pub(crate) fn declared_by(definition: &RuntimeDefinition) -> Integration {
 /// roots are content addressed, so a cached entry stays valid for the life of
 /// the request.
 #[derive(Debug, Default)]
-pub(crate) struct Integrations {
+pub(super) struct Integrations {
     resolved: BTreeMap<PackageDigest, Integration>,
 }
 
@@ -80,7 +80,7 @@ impl Integrations {
     /// `[integration] hook_schema` resolves through the handler it names, the
     /// same way a live worker launched from it does; anything else that cannot
     /// be read is [`Integration::Unresolvable`].
-    pub(crate) fn of(&mut self, context: &Context, record: &PackageRecord) -> Integration {
+    pub(super) fn of(&mut self, context: &Context, record: &PackageRecord) -> Integration {
         self.resolved
             .entry(record.digest().clone())
             .or_insert_with(|| resolve(context, record))
@@ -126,7 +126,7 @@ fn legacy(context: &Context, record: &PackageRecord) -> Integration {
 /// the candidate itself take no part: the first has no declaration to compare
 /// and resolves to the uninstalled runtime at launch, and the others do not
 /// share the candidate's runtime.
-pub(crate) fn conflict(
+pub(super) fn conflict(
     context: &Context,
     state: &RegistryState,
     retained: &RetainedDigests,
@@ -218,4 +218,153 @@ pub(super) fn retained_schemas(
         }
     }
     schemas
+}
+
+#[cfg(test)]
+mod tests {
+    //! A descriptor written before `[integration] hook_schema` existed can only
+    //! reach the registry directly (an install refuses it), so its resolution
+    //! is observed against a plugin root and a package context built here.
+
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use package::registry::{InstallRequest, PackageSource};
+    use package::{build_archive, read_archive, ArchiveEntry, Limits};
+
+    use super::*;
+    use crate::agent::host::definition_from_archive;
+    use crate::agent::host::fixture::{
+        config_home_table, installed_pi_host, pi_shaped_document, PI_SHAPED_NO_CHECK,
+        PI_SHAPED_PACKAGE_ID,
+    };
+    use crate::catalog_anchor::CatalogTrust;
+    use crate::test_support::thread_scoped_dir;
+
+    /// Handler and schema of an integration that reports subagents.
+    const SUBAGENT: (&str, &str) = ("codex-hook-v1", "identity-subagent-v1");
+
+    /// Handler and schema of an integration that reports identity only.
+    const IDENTITY: (&str, &str) = ("hermes-hook-v1", "identity-v1");
+
+    /// A program that is never launched.
+    const INERT_PROGRAM: &str = "/bin/sh";
+
+    /// Detection manifest every fixture archive ships.
+    const DETECT_MANIFEST: &str = "[[rules]]\nid = \"idle_prompt\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n";
+
+    fn archive_of(version: &str, integration: &str) -> (Vec<u8>, PackageDigest) {
+        let document = pi_shaped_document(Path::new(INERT_PROGRAM), PI_SHAPED_NO_CHECK)
+            .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
+            .replace(
+                "detect_manifest = \"any\"",
+                "detect_manifest = \"detect.toml\"",
+            );
+        let entries = [
+            ArchiveEntry {
+                path: "runtime.toml".to_owned(),
+                contents: format!("{document}\n{integration}").into_bytes(),
+                executable: false,
+            },
+            ArchiveEntry {
+                path: "detect.toml".to_owned(),
+                contents: DETECT_MANIFEST.as_bytes().to_vec(),
+                executable: false,
+            },
+        ];
+        let bytes = build_archive(&entries, &Limits::DEFAULT).expect("the archive builds");
+        let digest = read_archive(&bytes, &Limits::DEFAULT)
+            .expect("the archive reads")
+            .digest()
+            .clone();
+        (bytes, digest)
+    }
+
+    fn legacy(version: &str, handler: &str) -> (Vec<u8>, PackageDigest) {
+        archive_of(
+            version,
+            &format!("[integration]\nhandler = \"{handler}\"\n"),
+        )
+    }
+
+    fn current(version: &str, (handler, schema): (&str, &str)) -> RuntimeDefinition {
+        let integration = format!(
+            "[integration]\nhandler = \"{handler}\"\nhook_schema = \"{schema}\"\n{}",
+            config_home_table(handler)
+        );
+        let (bytes, digest) = archive_of(version, &integration);
+        let archive = read_archive(&bytes, &Limits::DEFAULT).expect("the archive reads");
+        definition_from_archive(archive.entries(), &digest).expect("definition")
+    }
+
+    #[test]
+    fn a_descriptor_that_predates_the_hook_schema_resolves_through_its_handler() {
+        let plugins = thread_scoped_dir("pohunek-selection-legacy-").join("plugins");
+        let (host, installed) = installed_pi_host(&plugins, Path::new(INERT_PROGRAM));
+        let store = host.package_store().expect("store").clone();
+        let known = legacy("1.1.0", SUBAGENT.0);
+        let ambiguous = legacy("1.2.0", "acme-unknown-v1");
+        for (bytes, digest) in [&known, &ambiguous] {
+            store
+                .registry()
+                .install(&InstallRequest {
+                    archive: bytes,
+                    expected: digest,
+                    identity: protocol::PackageIdentity {
+                        id: PackageId::parse(PI_SHAPED_PACKAGE_ID).expect("package id"),
+                        version: protocol::PackageVersion::parse(if digest == &known.1 {
+                            "1.1.0"
+                        } else {
+                            "1.2.0"
+                        })
+                        .expect("version"),
+                    },
+                    source: PackageSource::ExplicitDigest,
+                    enabled: true,
+                    select: false,
+                    installed_at_unix_seconds: 1,
+                })
+                .expect("install the pre-schema package");
+        }
+        let state = store.registry().state().expect("state");
+        let context = Context {
+            store,
+            runtimes: host,
+            trust: CatalogTrust::Absent,
+            integrations: Mutex::default(),
+        };
+        let mut integrations = Integrations::default();
+        let mut resolve = |digest: &PackageDigest| {
+            integrations.of(&context, state.package(digest).expect("installed"))
+        };
+
+        let resolved = resolve(&known.1);
+        assert!(
+            matches!(&resolved, Integration::Known(Some(Declared { .. }))),
+            "{resolved:?}"
+        );
+        assert_eq!(
+            resolve(&ambiguous.1),
+            Integration::Unresolvable,
+            "a handler no schema is driven by is unresolvable"
+        );
+
+        // A retained pre-schema version is compatible with the integration its
+        // handler resolves to and incompatible with any other.
+        let retained = RetainedDigests::from_iter([known.1.clone()]);
+        let package = PackageId::parse(PI_SHAPED_PACKAGE_ID).expect("package id");
+        let same = current("2.0.0", SUBAGENT);
+        let other = current("2.1.0", IDENTITY);
+        let candidate = |definition: &RuntimeDefinition, digest: &PackageDigest| {
+            conflict(
+                &context,
+                &state,
+                &retained,
+                (digest, &package),
+                &declared_by(definition),
+            )
+        };
+        assert_eq!(candidate(&same, &installed), None);
+        assert_eq!(candidate(&other, &installed), Some(known.1));
+    }
 }

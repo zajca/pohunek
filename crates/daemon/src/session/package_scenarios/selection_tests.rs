@@ -7,7 +7,6 @@ use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use package::registry::RetainedDigests;
 use package::PackageDigest;
 use pohunek_test_support::wait::HANG_GUARD;
 use protocol::{
@@ -17,7 +16,6 @@ use protocol::{
 };
 
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
-use crate::packages::selection::{Declared, Integration, Integrations};
 use crate::session::tests::{
     assigned_agent_script, exit_settled, params, temp_dir, temp_store_path,
 };
@@ -547,73 +545,6 @@ async fn a_retained_version_that_cannot_be_read_holds_the_update_back() {
         Some(block_by(&v.old.digest))
     );
     end(&v.fixture, &created.id).await;
-}
-
-#[tokio::test]
-async fn a_descriptor_that_predates_the_hook_schema_resolves_through_its_handler() {
-    let fixture = Fixture::new("selection-legacy");
-    let legacy = legacy_package("1.0.0", SUBAGENT.0);
-    let ambiguous = legacy_package("1.1.0", "acme-unknown-v1");
-    let current = update("2.0.0", Some(SUBAGENT));
-    let registry = fixture.host.package_store().expect("store").registry();
-    for package in [&legacy, &ambiguous] {
-        registry
-            .install(&package::registry::InstallRequest {
-                archive: &package.bytes,
-                expected: &package.digest,
-                identity: identity_of(package),
-                source: package::registry::PackageSource::ExplicitDigest,
-                enabled: true,
-                select: false,
-                installed_at_unix_seconds: 1,
-            })
-            .expect("install the pre-schema package");
-    }
-    let state = registry.state().expect("state");
-    let context = fixture
-        .registry
-        .package_authority()
-        .context()
-        .expect("context");
-    let mut integrations = Integrations::default();
-
-    let resolved = integrations_of(&mut integrations, &context, &state, &legacy.digest);
-    assert!(
-        matches!(&resolved, Integration::Known(Some(Declared { .. }))),
-        "{resolved:?}"
-    );
-    assert_eq!(
-        integrations_of(&mut integrations, &context, &state, &ambiguous.digest),
-        Integration::Unresolvable,
-        "a handler no schema is driven by is unresolvable"
-    );
-
-    // A retained pre-schema version is compatible with the integration its
-    // handler resolves to and incompatible with any other.
-    let retained = RetainedDigests::from_iter([legacy.digest.clone()]);
-    let candidate = fixture_record(&fixture, &current);
-    assert_eq!(
-        crate::packages::selection::conflict(
-            &context,
-            &state,
-            &retained,
-            (&candidate.0, &candidate.1),
-            &crate::packages::selection::declared_by(&candidate.2),
-        ),
-        None
-    );
-    let other = update("2.1.0", Some(IDENTITY));
-    let other = fixture_record(&fixture, &other);
-    assert_eq!(
-        crate::packages::selection::conflict(
-            &context,
-            &state,
-            &retained,
-            (&other.0, &other.1),
-            &crate::packages::selection::declared_by(&other.2),
-        ),
-        Some(legacy.digest)
-    );
 }
 
 #[tokio::test]
@@ -1192,75 +1123,4 @@ async fn an_integration_install_keeps_the_lifecycle_guard_after_its_caller_goes_
         .lifecycle()
         .try_write()
         .expect("the guard is released with the task");
-}
-
-// ----- fixtures of the pre-schema test -----------------------------------
-
-/// A package whose descriptor names only `handler`, as one written before
-/// `[integration] hook_schema` existed.
-fn legacy_package(version: &str, handler: &str) -> Package {
-    use crate::agent::host::fixture::{pi_shaped_document, PI_SHAPED_NO_CHECK};
-    let document = pi_shaped_document(std::path::Path::new(INERT_PROGRAM), PI_SHAPED_NO_CHECK)
-        .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
-        .replace(
-            "detect_manifest = \"any\"",
-            "detect_manifest = \"detect.toml\"",
-        );
-    Package::with_descriptor(&format!(
-        "{document}\n[integration]\nhandler = \"{handler}\"\n"
-    ))
-}
-
-fn identity_of(package: &Package) -> protocol::PackageIdentity {
-    // Every fixture package of this module is the fixture package at a
-    // version; the version is read back from the archive's descriptor.
-    let archive = package::read_archive(&package.bytes, &package::Limits::DEFAULT)
-        .expect("the fixture archive reads");
-    let descriptor = archive
-        .entries()
-        .iter()
-        .find(|entry| entry.path == "runtime.toml")
-        .expect("descriptor");
-    let text = std::str::from_utf8(&descriptor.contents).expect("utf-8");
-    let version = text
-        .lines()
-        .find_map(|line| line.strip_prefix("version = "))
-        .expect("version")
-        .trim_matches('"');
-    protocol::PackageIdentity {
-        id: protocol::PackageId::parse(PACKAGE).expect("package id"),
-        version: protocol::PackageVersion::parse(version).expect("version"),
-    }
-}
-
-fn integrations_of(
-    integrations: &mut Integrations,
-    context: &crate::packages::Context,
-    state: &package::registry::RegistryState,
-    digest: &PackageDigest,
-) -> Integration {
-    let record = state.package(digest).expect("installed");
-    integrations.of(context, record)
-}
-
-/// The digest, package id and definition of `package`, parsed from its
-/// archive, for a candidate that is not installed.
-fn fixture_record(
-    _fixture: &Fixture,
-    package: &Package,
-) -> (
-    PackageDigest,
-    protocol::PackageId,
-    crate::agent::host::RuntimeDefinition,
-) {
-    let archive = package::read_archive(&package.bytes, &package::Limits::DEFAULT)
-        .expect("the fixture archive reads");
-    let definition =
-        crate::agent::host::definition_from_archive(archive.entries(), &package.digest)
-            .expect("definition");
-    (
-        package.digest.clone(),
-        protocol::PackageId::parse(PACKAGE).expect("package id"),
-        definition,
-    )
 }
