@@ -772,7 +772,7 @@ Signed runtime catalog:
 - `crates/daemon/src/doctor.rs` — the `catalog_trust_anchor` and `plugin_index_channel` doctor checks.
 - `crates/daemon/src/packages/trust.rs` — index verification, listing and entry authorization for `package.install` with the `index` trust kind.
 - `crates/xtask/src/catalog.rs` — `cargo xtask catalog build|sign|verify|anchor|public-key`.
-- `crates/xtask/src/catalog_key.rs` — owner-private signing key file reader.
+- `crates/xtask/src/catalog_key.rs` — owner-private key file reader and new-key file writer.
 - `crates/xtask/src/plugin_index.rs` — the plugin index owner ceremony commands (`catalog keygen`, `index endorse|revoke|channel`) and the shared document writer.
 - `crates/xtask/src/plugin_index/admit.rs` — `index check-entry`: the pure admission predicates of one added index entry (schema, identity, version order, core range).
 - `crates/xtask/src/plugin_index/build.rs` — `index build`: the entries tree reader, the typed `[source]` checks and `--print-source`.

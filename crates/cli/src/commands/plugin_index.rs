@@ -172,7 +172,7 @@ fn redirect_policy() -> Policy {
             let shown = redacted(attempt.url().as_str());
             return attempt.error(RefusedRedirect(shown));
         }
-        if attempt.previous().len() >= MAX_REDIRECTS {
+        if attempt.previous().len() > MAX_REDIRECTS {
             return attempt.error("too many redirects");
         }
         attempt.follow()

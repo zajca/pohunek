@@ -723,13 +723,16 @@ impl Error {
         )
     }
 
-    /// Error class: every plugin-command failure is a usage or configuration mistake.
-    #[expect(
-        clippy::unused_self,
-        reason = "kept beside code() and hint() so every variant can classify itself later"
-    )]
+    /// Error class: a failed or oversized download of the index or an archive is
+    /// a transport failure; every other plugin-command failure is a usage or
+    /// configuration mistake.
     pub(crate) fn class(&self) -> ErrorClass {
-        ErrorClass::Configuration
+        match self {
+            Self::IndexUnavailable { .. }
+            | Self::ArchiveUnavailable { .. }
+            | Self::DownloadTooLarge { .. } => ErrorClass::Transport,
+            _ => ErrorClass::Configuration,
+        }
     }
 }
 

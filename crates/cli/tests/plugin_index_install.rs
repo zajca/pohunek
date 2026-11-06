@@ -684,6 +684,18 @@ async fn an_entry_url_or_redirect_to_a_refused_target_stops_before_the_request()
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_url_refused");
 
+    // A redirect of the archive to a foreign host is refused before the hop and
+    // is not reported as an unavailable archive.
+    rig.publish(&[rig.listing("0.1.0")]);
+    rig.server.set(
+        &archive_path("0.1.0"),
+        Route::Redirect(FOREIGN_URL.to_owned()),
+    );
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_url_refused");
+    rig.assert_nothing_installed().await;
+
     // Redirects between loopback URLs are followed, for the index and the archive.
     let moved = rig.listing("0.1.0");
     rig.publish(std::slice::from_ref(&moved));
@@ -705,6 +717,48 @@ async fn an_entry_url_or_redirect_to_a_refused_target_stops_before_the_request()
 }
 
 #[tokio::test]
+async fn a_chain_of_ten_redirects_is_followed_and_an_eleventh_hop_is_refused() {
+    let rig = Rig::start().await;
+    let listing = rig.listing("0.1.0");
+    rig.publish(std::slice::from_ref(&listing));
+    let signed = rig.keys.signed(vec![listing.entry()]);
+    rig.server.set("/hop-end", Route::Body(signed));
+
+    // INDEX_PATH redirects to /hop-1, which redirects to /hop-2, and so on:
+    // `hops` redirects in all, the last one landing on the index body.
+    let chain = |hops: usize| {
+        for hop in 0..hops {
+            let from = if hop == 0 {
+                INDEX_PATH.to_owned()
+            } else {
+                format!("/hop-{hop}")
+            };
+            let to = if hop + 1 == hops {
+                "/hop-end".to_owned()
+            } else {
+                format!("/hop-{}", hop + 1)
+            };
+            rig.server.set(&from, Route::Redirect(rig.server.url(&to)));
+        }
+    };
+
+    chain(10);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+
+    chain(11);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes", "--no-enable"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_unavailable");
+    assert!(
+        document["err"]["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("too many redirects")),
+        "{document}"
+    );
+}
+
+#[tokio::test]
 async fn oversized_and_unavailable_downloads_fail_without_a_daemon_call() {
     let rig = Rig::start().await;
     rig.publish(&[rig.listing("0.1.0")]);
@@ -713,11 +767,37 @@ async fn oversized_and_unavailable_downloads_fail_without_a_daemon_call() {
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_download_too_large");
+    assert_eq!(document["err"]["class"], "transport", "{document}");
 
     rig.server.set(INDEX_PATH, Route::Status(404));
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_unavailable");
+
+    // A connection that cannot be made is the same failure as a status error.
+    // The server listens on 127.0.0.1 only, so nothing answers on `[::1]` at
+    // its port: the connect is refused, or fails outright on a host without IPv6.
+    let unreachable = format!("http://[::1]:{}{INDEX_PATH}", rig.server.addr.port());
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            PACKAGE_ID,
+            "--index-url",
+            &unreachable,
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_unavailable");
+    assert_eq!(document["err"]["class"], "transport", "{document}");
+    assert!(
+        document["err"]["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be reached")),
+        "{document}"
+    );
 
     rig.publish(&[rig.listing("0.1.0")]);
     rig.server
@@ -730,6 +810,7 @@ async fn oversized_and_unavailable_downloads_fail_without_a_daemon_call() {
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_archive_unavailable");
+    assert_eq!(document["err"]["class"], "transport", "{document}");
     rig.assert_nothing_installed().await;
 }
 
@@ -763,6 +844,21 @@ async fn a_daemon_without_the_channel_refuses_index_installs_before_any_fetch() 
         .json(&[
             "plugin",
             "install",
+            archive_file.to_str().expect("utf-8 path"),
+            "--index",
+            index_file.to_str().expect("utf-8 path"),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_unsupported");
+    assert!(install.packages().await.is_empty());
+
+    let (code, document) = install
+        .json(&[
+            "plugin",
+            "update",
+            PACKAGE_ID,
             archive_file.to_str().expect("utf-8 path"),
             "--index",
             index_file.to_str().expect("utf-8 path"),

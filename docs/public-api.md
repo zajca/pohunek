@@ -3146,7 +3146,11 @@ and uninstall reports list the entries as `refused_entries` (omitted when none
 exists). A missing directory is published without the flag; a refused one
 without it fails with the same code and changes nothing. A directory that passes
 the installed-directory check is never replaced, and one that differs from the
-release still fails with `service_version_conflict`. An upgrade whose `--from`
+release still fails with `service_version_conflict`, except that a directory
+which lacks only the `plugin-index-channel.json` the release ships (an older
+CLI published it) fails with `service_version_lacks_index_channel`. A staged
+`plugin-index-channel.json` that does not parse is refused with
+`service_staged_index_channel_invalid` before any binary is copied. An upgrade whose `--from`
 probes as the active version then makes the daemon job run from the restored
 directory (a missing job is registered again, a stopped one started, a running
 one restarted as a new process when the directory was restored or `--repair` was

@@ -716,6 +716,13 @@ fn revoke_refuses_a_forged_previous_document_the_id_cap_and_the_endorser_itself(
     assert!(String::from_utf8_lossy(&output.stderr).contains("is not a revocation document"));
     assert!(!next.exists());
 
+    // Bytes that are not JSON at all.
+    std::fs::write(&junk, b"\xff\xfenot json").expect("write");
+    let output = ceremony.revoke(&primary, 2, &[&victim.key_id], Some(&junk), &next);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not a revocation document"));
+    assert!(!next.exists());
+
     // The endorser never revokes itself.
     let output = ceremony.revoke(&primary, 1, &[&primary.key_id], None, &next);
     assert!(!output.status.success());
