@@ -496,8 +496,9 @@ impl Rig {
 
 /// Loopback port the closed-address scenario connects to.
 ///
-/// Below the range the OS assigns to `bind(0)` and to outgoing connections, so
-/// no test is handed it, and nothing in the rig listens there: the connect is
+/// A privileged port below the range the OS assigns to `bind(0)` and to
+/// outgoing connections, so no unprivileged test can bind or be handed it, and
+/// nothing in the rig listens there: the connect is
 /// refused immediately on Linux and macOS. A port that a test holds bound
 /// without listening is not used because macOS drops, instead of refusing, a
 /// connect to it and the request times out.
