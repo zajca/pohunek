@@ -174,7 +174,8 @@ install by id.
   fields as `key=value` lines for `IFS== read -r`, never for `eval`. Stage `core-range`
   refuses a range that does not parse, names a pre-release, does not admit the
   pinned core or admits a core below `0.40.0`. A refusal exits 1 and prints
-  `predicate=<name>`.
+  `predicate=<name>: <detail>`, where `<name>` is one of `schema`, `existing-tree`, `package-id-binding`, `refused-runtime-id`, `url-charset`, `identity-conflict`, `duplicate-digest`, `version-not-semver`, `version-not-release`, `duplicate-version`, `version-not-greater`, `core-range-unparsed`, `core-prerelease`, `core-excludes-core-tag`, `core-lower-bound` (the `Predicate` enum in
+  `crates/xtask/src/plugin_index/admit.rs`).
 - Without admission, an owner can still install a published archive by its
   digest (community tier); such an install never serves a reserved runtime id.
 

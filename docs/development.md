@@ -871,8 +871,11 @@ build`); a second `release` job, which runs no build code and holds the write,
 attestation and OIDC permissions, checks the checksums, attests the archive and
 publishes the GitHub release of the plugin repository. Every action is pinned by
 commit sha, no cache is restored, and neither job has a secret or a path to the
-plugin index. It is
-rehearsed by the `plugin_release` scenarios of `xtask` (`cargo xtask plugin build`
-and `plugin prove` against the workspace binaries), not by a core release run.
+plugin index. The
+`plugin_release` scenarios of `xtask` cover `cargo xtask plugin build` and
+`plugin prove` against the workspace binaries; they never run the workflow's
+shell (the tag check, the artifact hand-off, the checksum check, the
+attestation, the publish). The workflow first runs for the first plugin
+release.
 
 After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.

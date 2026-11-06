@@ -52,10 +52,69 @@ pub(crate) struct CheckArgs {
     pub(crate) stage: CheckStage,
 }
 
+/// The name a refusal of `index check-entry` carries as `predicate=<name>`.
+/// The index repository's admission workflow and the docs rely on these
+/// names, so a rename is a contract change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Predicate {
+    /// Refused when the entry does not build, or the tree or the merged index fails the daemon's structural rules.
+    Schema,
+    /// Refused when the admitted tree does not read, or holds a version that is not semver.
+    ExistingTree,
+    /// Refused when the package id is not `pohunek.runtime.` plus the runtime id.
+    PackageIdBinding,
+    /// Refused when the runtime id is one the daemon refuses.
+    RefusedRuntimeId,
+    /// Refused when the url holds a character outside letters, digits and `:/._+-`.
+    UrlCharset,
+    /// Refused when the package id or the runtime id is already bound to another one.
+    IdentityConflict,
+    /// Refused when the digest is already admitted.
+    DuplicateDigest,
+    /// Refused when the version is not semver.
+    VersionNotSemver,
+    /// Refused when the version carries a pre-release or build part.
+    VersionNotRelease,
+    /// Refused when the version is already admitted for the package id.
+    DuplicateVersion,
+    /// Refused when the version is not above an admitted version of the package id.
+    VersionNotGreater,
+    /// Refused when the core range does not parse.
+    CoreRangeUnparsed,
+    /// Refused when the core range names a pre-release.
+    CorePrerelease,
+    /// Refused when the core range does not admit the pinned core.
+    CoreExcludesCoreTag,
+    /// Refused when the core range admits a core below the first index core.
+    CoreLowerBound,
+}
+
+impl std::fmt::Display for Predicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Schema => "schema",
+            Self::ExistingTree => "existing-tree",
+            Self::PackageIdBinding => "package-id-binding",
+            Self::RefusedRuntimeId => "refused-runtime-id",
+            Self::UrlCharset => "url-charset",
+            Self::IdentityConflict => "identity-conflict",
+            Self::DuplicateDigest => "duplicate-digest",
+            Self::VersionNotSemver => "version-not-semver",
+            Self::VersionNotRelease => "version-not-release",
+            Self::DuplicateVersion => "duplicate-version",
+            Self::VersionNotGreater => "version-not-greater",
+            Self::CoreRangeUnparsed => "core-range-unparsed",
+            Self::CorePrerelease => "core-prerelease",
+            Self::CoreExcludesCoreTag => "core-excludes-core-tag",
+            Self::CoreLowerBound => "core-lower-bound",
+        })
+    }
+}
+
 /// A refusal of `predicate`. The detail can quote names and keys of the pull
 /// request, so control characters are escaped: a line of the log never starts
 /// with text the pull request chose.
-fn refuse(predicate: &str, detail: impl std::fmt::Display) -> XtaskError {
+fn refuse(predicate: Predicate, detail: impl std::fmt::Display) -> XtaskError {
     let detail = detail.to_string();
     XtaskError::Admission(format!("predicate={predicate}: {}", detail.escape_debug()))
 }
@@ -75,10 +134,13 @@ fn is_url_safe(byte: u8) -> bool {
 
 /// The single entry of the tree `root`.
 fn only_entry(root: &Path) -> Result<EntryFile, XtaskError> {
-    let mut tree = read_tree(root).map_err(|error| refuse("schema", error))?;
+    let mut tree = read_tree(root).map_err(|error| refuse(Predicate::Schema, error))?;
     match (tree.pop(), tree.is_empty()) {
         (Some(entry), true) => Ok(entry),
-        _ => Err(refuse("schema", "--entries must hold exactly one entry")),
+        _ => Err(refuse(
+            Predicate::Schema,
+            "--entries must hold exactly one entry",
+        )),
     }
 }
 
@@ -95,7 +157,8 @@ pub(crate) fn check_entry(args: &CheckArgs) -> Result<String, XtaskError> {
 }
 
 fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError> {
-    let existing = read_tree(existing_root).map_err(|error| refuse("existing-tree", error))?;
+    let existing =
+        read_tree(existing_root).map_err(|error| refuse(Predicate::ExistingTree, error))?;
 
     let entry = IndexEntry {
         package_id: added.package_id.clone(),
@@ -106,12 +169,12 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
         platforms: added.platforms.clone(),
         core: added.core.clone(),
     };
-    probe(std::slice::from_ref(&entry)).map_err(|error| refuse("schema", error))?;
+    probe(std::slice::from_ref(&entry)).map_err(|error| refuse(Predicate::Schema, error))?;
 
     let expected_package = format!("{OFFICIAL_RUNTIME_PACKAGE_PREFIX}{}", added.runtime_id);
     if added.package_id.as_str() != expected_package {
         return Err(refuse(
-            "package-id-binding",
+            Predicate::PackageIdBinding,
             format!(
                 "package_id `{}` must be `{expected_package}`",
                 added.package_id
@@ -120,13 +183,13 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
     }
     if INDEX_REFUSED_RUNTIME_IDS.contains(&added.runtime_id.as_str()) {
         return Err(refuse(
-            "refused-runtime-id",
+            Predicate::RefusedRuntimeId,
             format!("runtime id `{}` cannot be claimed", added.runtime_id),
         ));
     }
     if !added.url.bytes().all(is_url_safe) {
         return Err(refuse(
-            "url-charset",
+            Predicate::UrlCharset,
             "url may hold only letters, digits and `:/._+-`",
         ));
     }
@@ -135,7 +198,7 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
         let same_runtime = other.runtime_id == added.runtime_id;
         if same_package != same_runtime {
             return Err(refuse(
-                "identity-conflict",
+                Predicate::IdentityConflict,
                 format!(
                     "`{}` and runtime id `{}` are already bound to `{}` and `{}`",
                     added.package_id, added.runtime_id, other.package_id, other.runtime_id
@@ -144,7 +207,10 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
         }
     }
     if existing.iter().any(|other| other.digest == added.digest) {
-        return Err(refuse("duplicate-digest", "digest is already admitted"));
+        return Err(refuse(
+            Predicate::DuplicateDigest,
+            "digest is already admitted",
+        ));
     }
 
     version_order(added, &existing)?;
@@ -154,7 +220,7 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
         .map(index_entry)
         .chain(std::iter::once(entry))
         .collect();
-    probe(&merged).map_err(|error| refuse("schema", error))?;
+    probe(&merged).map_err(|error| refuse(Predicate::Schema, error))?;
 
     Ok(format!(
         "package_id={}\nruntime_id={}\nversion={}\ndigest={}\nurl={}\nplatforms={}\n",
@@ -172,13 +238,13 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
 fn version_order(added: &EntryFile, existing: &[EntryFile]) -> Result<(), XtaskError> {
     let version = Version::parse(added.version.as_str()).map_err(|error| {
         refuse(
-            "version-not-semver",
+            Predicate::VersionNotSemver,
             format!("version `{}`: {error}", added.version),
         )
     })?;
     if !version.pre.is_empty() || !version.build.is_empty() {
         return Err(refuse(
-            "version-not-release",
+            Predicate::VersionNotRelease,
             format!(
                 "version `{}` carries a pre-release or build part",
                 added.version
@@ -191,19 +257,19 @@ fn version_order(added: &EntryFile, existing: &[EntryFile]) -> Result<(), XtaskE
     {
         let admitted = Version::parse(other.version.as_str()).map_err(|error| {
             refuse(
-                "existing-tree",
+                Predicate::ExistingTree,
                 format!("admitted version `{}`: {error}", other.version),
             )
         })?;
         if admitted == version {
             return Err(refuse(
-                "duplicate-version",
+                Predicate::DuplicateVersion,
                 format!("version `{version}` is already admitted"),
             ));
         }
         if admitted > version {
             return Err(refuse(
-                "version-not-greater",
+                Predicate::VersionNotGreater,
                 format!("version `{version}` is not above admitted `{admitted}`"),
             ));
         }
@@ -275,7 +341,7 @@ fn greater_bound(comparator: &Comparator) -> Option<Version> {
 fn core_range(added: &EntryFile, core_version: &Version) -> Result<String, XtaskError> {
     let requirement = parse_core_range(&added.core).ok_or_else(|| {
         refuse(
-            "core-range-unparsed",
+            Predicate::CoreRangeUnparsed,
             "core must be a semver range with at least one comparator",
         )
     })?;
@@ -285,13 +351,13 @@ fn core_range(added: &EntryFile, core_version: &Version) -> Result<String, Xtask
         .any(|comparator| !comparator.pre.is_empty())
     {
         return Err(refuse(
-            "core-prerelease",
+            Predicate::CorePrerelease,
             "a core range must not name a pre-release",
         ));
     }
     if !requirement.matches(core_version) {
         return Err(refuse(
-            "core-excludes-core-tag",
+            Predicate::CoreExcludesCoreTag,
             format!("core range does not admit core {core_version}"),
         ));
     }
@@ -303,7 +369,7 @@ fn core_range(added: &EntryFile, core_version: &Version) -> Result<String, Xtask
         .unwrap_or_else(|| Version::new(0, 0, 0));
     if lowest < FIRST_INDEX_CORE {
         return Err(refuse(
-            "core-lower-bound",
+            Predicate::CoreLowerBound,
             format!("core range admits {lowest}, below the first index core {FIRST_INDEX_CORE}"),
         ));
     }

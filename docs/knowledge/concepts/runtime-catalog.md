@@ -460,8 +460,9 @@ that need the daemon's own definitions: package-id binding, refused runtime
 ids, identity and digest uniqueness against the admitted tree, release-semver
 version order, and the core range (parsed with the daemon's parser, a lower
 bound of at least 0.40.0 that admits the pinned core). A refusal exits 1 with
-`predicate=<name>`; success of stage `schema` prints the validated entry
-fields as `key=value` lines.
+`predicate=<name>: <detail>` with `<name>` one of `schema`, `existing-tree`, `package-id-binding`, `refused-runtime-id`, `url-charset`, `identity-conflict`, `duplicate-digest`, `version-not-semver`, `version-not-release`, `duplicate-version`, `version-not-greater`, `core-range-unparsed`, `core-prerelease`, `core-excludes-core-tag`, `core-lower-bound` (the `Predicate` enum of
+`crates/xtask/src/plugin_index/admit.rs`); success of stage `schema` prints the
+validated entry fields as `key=value` lines.
 
 Signing never happens in an xtask process. `index message` writes the file a
 signature covers (the index domain prefix and the canonical bytes of the
