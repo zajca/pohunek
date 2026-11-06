@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.2.0";
+const PACKAGE_VERSION: &str = "1.3.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -931,10 +931,13 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         naming["launch_args"][0].as_str(),
         Some("--name={session_name}")
     );
+    // Claude Code runs in the TUI process and needs nothing to stay out of a daemon.
+    let placement = package.remove("placement").expect("a [placement] table");
+    assert_eq!(placement["mode"].as_str(), Some("in_process"));
     assert_eq!(
         package["requires"].as_array().map(Vec::len),
-        Some(1),
-        "the descriptor requires exactly the naming feature"
+        Some(2),
+        "the descriptor requires exactly the naming and placement features"
     );
     package.remove("requires");
     // `ready` is the one key the package declares that v0.34.2 does not: the

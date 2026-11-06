@@ -100,6 +100,7 @@ pub(super) async fn handle_session_inspect(
             sessions
                 .enrich_native_activity(std::slice::from_mut(&mut info))
                 .await;
+            info.placement = sessions.live_placement(&id).await;
             ok_value(request, &info)
         }
         Err(err) => error_value(request, err),

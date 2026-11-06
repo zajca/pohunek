@@ -80,6 +80,23 @@ pub type HostInspector = DarwinInspector;
 /// Operating-system process identifier.
 pub type Pid = u32;
 
+/// Opaque POSIX-session identity of a process.
+///
+/// Two processes are in one POSIX session exactly when their keys are equal.
+/// The value is the session id on Linux and the kernel session object on
+/// macOS, so it is only comparable within one host boot and never meaningful
+/// outside an equality test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessSession(u64);
+
+impl ProcessSession {
+    /// Creates a key from its canonical integer representation.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// Opaque same-boot process start identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StartIdentity(u64);
@@ -885,6 +902,41 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     ///
     /// Returns typed process inspection failures.
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error>;
+
+    /// Returns the POSIX session of one same-user process, or `None` if it
+    /// exited.
+    ///
+    /// The result describes the process that holds `pid` when the call
+    /// returns; callers that bind it to a [`ProcessIdentity`] recheck the
+    /// identity afterwards.
+    ///
+    /// The default reports [`Error::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unavailable`] when the host reports no session, or
+    /// another typed failure when the process record cannot be inspected.
+    fn process_session(&self, _pid: Pid) -> Result<Option<ProcessSession>, Error> {
+        Err(Error::Unavailable {
+            operation: "inspect_process_session",
+        })
+    }
+
+    /// Returns whether one same-user process holds a listening socket (TCP or
+    /// a unix stream socket in the listening state), or `None` if it exited.
+    ///
+    /// The default reports [`Error::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unavailable`] when the host cannot list sockets,
+    /// [`Error::Unobservable`] when the kernel withholds the descriptor table,
+    /// or another typed failure when the process record cannot be inspected.
+    fn holds_listener(&self, _pid: Pid) -> Result<Option<bool>, Error> {
+        Err(Error::Unavailable {
+            operation: "inspect_process_listener",
+        })
+    }
 }
 
 #[cfg(test)]

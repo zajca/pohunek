@@ -470,6 +470,7 @@ fn assert_every_field_is_reviewed(
         worktree_path: _,
         warnings,
         capability_refusals: _,
+        placement: _,
         output_force_closed: _,
         metadata: _,
         spawned_by: _,

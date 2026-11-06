@@ -694,6 +694,13 @@ pub struct Initialize {
     /// `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub answers_program_status_probe: bool,
+    /// Milliseconds between the worker's placement escape checks of this
+    /// runtime, or absent to run none.
+    ///
+    /// The daemon sets it when the runtime's descriptor declares `[placement]`.
+    /// A peer that predates the field ignores it and never checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_check_interval_ms: Option<u64>,
 }
 
 #[expect(
@@ -727,6 +734,10 @@ impl Debug for Initialize {
             .field(
                 "answers_program_status_probe",
                 &self.answers_program_status_probe,
+            )
+            .field(
+                "placement_check_interval_ms",
+                &self.placement_check_interval_ms,
             )
             .finish()
     }
@@ -1112,6 +1123,41 @@ pub enum BackgroundStatus {
     Other,
 }
 
+/// Outcome of the worker's latest placement escape check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementOutcome {
+    /// No process of the generation left the PTY's POSIX session as a daemon.
+    Clean,
+    /// At least one process of the generation did.
+    Escaped,
+    /// The host withheld evidence about a candidate, so the check cannot say
+    /// the generation is clean.
+    Unobservable,
+}
+
+/// One process the placement check found outside the PTY's POSIX session.
+///
+/// Only the kernel command name and the process id are reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscapedProcess {
+    /// Process id when the check ran.
+    pub pid: u32,
+    /// Kernel command name.
+    pub comm: String,
+}
+
+/// Latest placement escape check of a runtime generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementReport {
+    /// Outcome of the check.
+    pub outcome: PlacementOutcome,
+    /// Escaped processes, ordered by process id and bounded; empty unless the
+    /// outcome is [`PlacementOutcome::Escaped`].
+    #[serde(default)]
+    pub processes: Vec<EscapedProcess>,
+}
+
 /// Reports current worker and runtime authority facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectSnapshot {
@@ -1178,6 +1224,10 @@ pub struct InspectSnapshot {
     /// only to a worker that reports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub drains_streams_on_terminal_ack: bool,
+    /// Latest placement escape check, absent while the check is not armed for
+    /// the runtime or has not run yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementReport>,
 }
 
 /// Defines one daemon-to-worker request.
@@ -1590,6 +1640,7 @@ mod tests {
             public_protocol_version: 1,
             hook_schema: None,
             answers_program_status_probe: false,
+            placement_check_interval_ms: None,
         }
     }
 

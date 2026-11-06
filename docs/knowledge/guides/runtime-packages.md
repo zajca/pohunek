@@ -113,11 +113,51 @@ The features this core implements:
 | `input-refuse-while-blocked-v1` | 0.39.0 | `[input] refuse_while_blocked` |
 | `transcripts-head-paths-v1` | 0.39.0 | `[transcripts] id_path`, `cwd_path` |
 | `naming-launch-args-v1` | 0.39.0 | `[naming]` |
+| `placement-v1` | 0.40.0 | `[placement]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
 snapshot file that a test compares. Which core version first has a feature is
 not part of the refusal, because an older core cannot know it.
+
+## Session placement
+
+A session's agent must run only in its worker generation's own process tree,
+never in a shared host daemon that outlives the session. A runtime declares how
+it keeps that true with `[placement]` (`requires = ["placement-v1"]`):
+
+```toml
+requires = ["placement-v1"]
+
+[placement]
+mode = "in_process"
+keep_local_args = ["--no-daemon"]
+```
+
+`mode` is required and is `in_process`; `owned_server` is refused
+(`descriptor_invalid`) until the core has a backend for it. An `in_process`
+runtime declares at most one of:
+
+- `keep_local_args`: 1 to 8 literal tokens, validated like `[runtime] args`
+  (no `{session_name}` placeholder). The core adds them on every create, resume
+  and fork launch after the contributor's arguments and before `[naming]`'s,
+  skips them when the frozen arguments already hold all of them, and never
+  freezes them into the resume snapshot, so a session created before the
+  descriptor gained them is covered on its next resume.
+- `keep_local_handler = true`: the runtime's compiled `[integration] handler`
+  contributes the launch input that keeps the agent local (Codex's
+  `codex-hook-v1` adds `--no-daemon`). A descriptor whose handler contributes
+  none is `descriptor_invalid`.
+- neither: the agent has no daemon to keep out (Claude Code, Pi, Hermes).
+
+A descriptor that lists `placement-v1` must declare the table; a descriptor
+that does not list the feature is unaffected, and a `[placement]` table without
+the feature is `runtime_feature_unsupported`.
+
+The worker checks a runtime that declares `[placement]`: a process of the
+generation that left the PTY's POSIX session and is named for the provider or
+listens is reported as `placement_escape` in `session inspect` and
+`pohunek doctor`. The check kills nothing.
 
 ## Config home
 
@@ -681,7 +721,7 @@ expose = "peers"              # "local" (default) or "peers"
   `package_install_commands_supported`; an older CLI does not send it and gets
   the refusal, and an older daemon never sees the field.
 - A runtime-only table (`[integration]`, `[launch_env]`, `[naming]`,
-  `[config_home]`, `[transcripts]`) next to commands without the runtime group is
+  `[placement]`, `[config_home]`, `[transcripts]`) next to commands without the runtime group is
   `descriptor_invalid`.
 
 ## Declaring a version probe

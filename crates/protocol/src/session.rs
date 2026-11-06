@@ -2879,6 +2879,41 @@ impl SessionCapabilityRefusals {
     }
 }
 
+/// The latest placement escape check of a live session.
+///
+/// A runtime that declares `[placement]` is checked by its worker: a process
+/// of the runtime generation that left the PTY's POSIX session as a daemon is
+/// reported here. The check kills nothing. The object is set only on
+/// `session.inspect` responses of a live session whose worker has run the
+/// check; stored records, events and list entries never carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionPlacement.ts"))]
+pub struct SessionPlacement {
+    /// Open string; clients must tolerate a value they do not know. The
+    /// documented values are `clean`, `escaped` and `unobservable` (the host
+    /// withheld evidence about a candidate, so the generation is not reported
+    /// clean).
+    pub outcome: String,
+    /// The escaped processes, ordered by process id and bounded; empty unless
+    /// `outcome` is `escaped`.
+    #[serde(default)]
+    pub processes: Vec<SessionPlacementProcess>,
+}
+
+/// One process a placement check found outside the PTY's POSIX session.
+///
+/// Only the process id and the kernel command name are reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionPlacementProcess.ts"))]
+pub struct SessionPlacementProcess {
+    /// Process id at the time of the check.
+    pub pid: u32,
+    /// Kernel command name.
+    pub comm: String,
+}
+
 /// The origin pair of the request that created a session.
 ///
 /// The daemon copies the pair from the request envelope when it handles
@@ -2924,6 +2959,12 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub capability_refusals: Option<SessionCapabilityRefusals>,
+    /// The latest placement escape check of a live session, set only on
+    /// `session.inspect` responses. Stored records, events and list entries
+    /// never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub placement: Option<SessionPlacement>,
     /// Owner-set display name, or `None` when the session is shown by its id.
     /// Set at `session.new` and changed via `session.rename`; cosmetic only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3810,6 +3851,7 @@ mod tests {
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),

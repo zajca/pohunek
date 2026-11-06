@@ -26,7 +26,8 @@ use super::darwin_layout::{
 };
 use super::{
     BootIdentity, CoalitionId, Error, ExitWatch, OwnershipMarkers, Pid, ProcessCoalitions,
-    ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
+    ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage, ProcessSession, SpawnId,
+    StartIdentity,
 };
 
 /// Bounds consecutive empty kqueue drains after a readiness notification.
@@ -409,6 +410,35 @@ impl ProcessInspector for DarwinInspector {
             fact.terminal_device,
             fact.terminal_group,
         ))
+    }
+
+    fn process_session(&self, pid: Pid) -> Result<Option<ProcessSession>, Error> {
+        const OPERATION: &str = "read_process_session";
+
+        if read_ownership(pid, native::effective_uid(), OPERATION)? != Ownership::SameUser {
+            return Ok(None);
+        }
+        match native::session_leader(native_pid(pid, OPERATION)?) {
+            Ok(leader) => Ok(Some(ProcessSession::new(u64::from(leader)))),
+            Err(error) if is_process_race(&error) => Ok(None),
+            Err(source) => Err(Error::from_io(OPERATION, source)),
+        }
+    }
+
+    fn holds_listener(&self, pid: Pid) -> Result<Option<bool>, Error> {
+        const OPERATION: &str = "read_process_listener";
+
+        if read_ownership(pid, native::effective_uid(), OPERATION)? != Ownership::SameUser {
+            return Ok(None);
+        }
+        match native::holds_listening_socket(native_pid(pid, OPERATION)?) {
+            Ok(listening) => Ok(Some(listening)),
+            Err(error) if is_process_race(&error) => Ok(None),
+            Err(error) if is_permission_denied(&error) => Err(Error::Unobservable {
+                operation: OPERATION,
+            }),
+            Err(source) => Err(Error::from_io(OPERATION, source)),
+        }
     }
 }
 
@@ -1576,6 +1606,131 @@ mod native {
             udata: ptr::null_mut(),
         }
     }
+
+    /// `PROC_PIDLISTFDS` flavor of `proc_pidinfo`.
+    const PROC_PIDLISTFDS: libc::c_int = 1;
+
+    /// `PROC_PIDFDSOCKETINFO` flavor of `proc_pidfdinfo`, unexported by `libc`.
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+
+    /// `PROX_FDTYPE_SOCKET` descriptor type from `<sys/proc_info.h>`.
+    const PROX_FDTYPE_SOCKET: u32 = 2;
+
+    /// Bytes of the kernel `socket_fdinfo` record on every supported release;
+    /// the buffer is larger so a longer record still fits and is rejected by
+    /// its reported length rather than truncated.
+    const SOCKET_FDINFO_BUFFER_BYTES: usize = 1024;
+
+    /// Byte offset of `soi_options` in `socket_fdinfo`: `proc_fileinfo` (24
+    /// bytes) then `socket_info` up to `soi_so`, `soi_pcb` (8 each), `soi_type`,
+    /// `soi_protocol`, `soi_family` (4 each) and the 136-byte `vinfo_stat`.
+    const SOI_OPTIONS_OFFSET: usize = 188;
+
+    /// `SO_ACCEPTCONN` socket option bit: set while a socket listens.
+    const SO_ACCEPTCONN: i16 = 0x0002;
+
+    /// Returns the session leader of `pid`, the POSIX session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, `ESRCH` when the process is gone.
+    pub(super) fn session_leader(pid: i32) -> io::Result<u32> {
+        let target = rustix::process::Pid::from_raw(pid)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let leader = rustix::process::getsid(Some(target)).map_err(io::Error::from)?;
+        Ok(leader.as_raw_nonzero().get().cast_unsigned())
+    }
+
+    /// Whether any socket descriptor of `pid` is in the listening state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, or `InvalidData` when the kernel
+    /// wrote a record shorter than the fields read from it.
+    pub(super) fn holds_listening_socket(pid: i32) -> io::Result<bool> {
+        let entry_bytes = buffer_length(size_of::<libc::proc_fdinfo>())?;
+        // SAFETY: a null buffer with zero size asks only for the byte count.
+        let needed = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, ptr::null_mut(), 0) };
+        if needed < 0 {
+            return Err(last_os_error());
+        }
+        if needed == 0 {
+            return Ok(false);
+        }
+        // The table can grow between the size query and the read, so leave room.
+        let capacity = usize::try_from(needed / entry_bytes)
+            .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?
+            .saturating_add(DESCRIPTOR_TABLE_SLACK);
+        let mut table = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            capacity
+        ];
+        let table_bytes = buffer_length(capacity * size_of::<libc::proc_fdinfo>())?;
+        // SAFETY: `proc_pidinfo` writes at most `table_bytes` bytes, and
+        // `table` owns exactly that many.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTFDS,
+                0,
+                table.as_mut_ptr().cast::<libc::c_void>(),
+                table_bytes,
+            )
+        };
+        if written < 0 {
+            return Err(last_os_error());
+        }
+        let count = usize::try_from(written / entry_bytes)
+            .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?;
+        for entry in table.iter().take(count) {
+            if entry.proc_fdtype != PROX_FDTYPE_SOCKET {
+                continue;
+            }
+            let mut record = [0_u8; SOCKET_FDINFO_BUFFER_BYTES];
+            let record_bytes = buffer_length(record.len())?;
+            // SAFETY: `proc_pidfdinfo` writes at most `record_bytes` bytes and
+            // `record` owns exactly that many.
+            let got = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    entry.proc_fd,
+                    PROC_PIDFDSOCKETINFO,
+                    record.as_mut_ptr().cast::<libc::c_void>(),
+                    record_bytes,
+                )
+            };
+            if got < 0 {
+                let error = last_os_error();
+                // A descriptor closed since the table was read.
+                if error.raw_os_error() == Some(libc::EBADF) {
+                    continue;
+                }
+                return Err(error);
+            }
+            let got = usize::try_from(got)
+                .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?;
+            let Some(bytes) = record.get(SOI_OPTIONS_OFFSET..SOI_OPTIONS_OFFSET + 2) else {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            };
+            if got < SOI_OPTIONS_OFFSET + 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "socket record is shorter than the kernel structure",
+                ));
+            }
+            let options = i16::from_ne_bytes([bytes[0], bytes[1]]);
+            if options & SO_ACCEPTCONN != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Extra descriptor slots read beyond the size query's count.
+    const DESCRIPTOR_TABLE_SLACK: usize = 16;
 
     /// Converts a byte count to the signed length the `libproc` calls take.
     fn buffer_length(bytes: usize) -> io::Result<libc::c_int> {

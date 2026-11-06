@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.5.0";
+const PACKAGE_VERSION: &str = "1.6.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -391,6 +391,10 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
     package.remove("transcripts");
+    // The `--no-daemon` launch input comes from the Codex handler, and the
+    // placement feature exists only in the package.
+    let placement = package.remove("placement").expect("a [placement] table");
+    assert_eq!(placement["keep_local_handler"].as_bool(), Some(true));
     // The feature the transcript head paths need exists only in the package.
     assert!(package.remove("requires").is_some());
     // `ready` is the one key the package declares that v0.34.2 does not: the

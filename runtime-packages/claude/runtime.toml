@@ -6,9 +6,9 @@
 
 schema = 1
 id = "pohunek.runtime.claude"
-version = "1.2.0"
+version = "1.3.0"
 runtime_api = 1
-requires = ["naming-launch-args-v1"]
+requires = ["naming-launch-args-v1", "placement-v1"]
 
 [runtime]
 id = "claude"
@@ -28,6 +28,10 @@ launch_args = ["--name={session_name}"]
 # Claude's Ink TUI takes the pasted text and the submit key as separate
 # writes; a submit delay the daemon is configured with for this runtime
 # replaces `submit_delay_ms`.
+# Claude Code runs the whole session in the TUI process; `--bg` is never passed.
+[placement]
+mode = "in_process"
+
 [input]
 bracketed_paste = false
 submit_delay_ms = 150

@@ -20,6 +20,13 @@ use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::session::{ActiveSupervision, RejectedLinesState};
 use crate::Paths;
 
+/// Name of the check that reports live sessions with a process that left the
+/// PTY's POSIX session as a daemon.
+const PLACEMENT_ESCAPE_CHECK: &str = "placement_escape";
+
+/// Most sessions the placement check names in its detail.
+const MAX_PLACEMENT_SESSIONS_LISTED: usize = 8;
+
 /// Name of the check that reports the metadata-store lines no loader accepts.
 const METADATA_STORE_REJECTED_LINES_CHECK: &str = "metadata_store_rejected_lines";
 
@@ -55,6 +62,7 @@ pub(crate) async fn report(
     overlays: OverlayChecks<'_>,
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
+    placements: &[(protocol::SessionId, protocol::SessionPlacement)],
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
@@ -101,6 +109,7 @@ pub(crate) async fn report(
     checks.push(catalog_trust_check(catalog_trust));
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
+    checks.push(placement_check(placements));
     Ok(bounded_report(checks))
 }
 
@@ -792,6 +801,65 @@ fn invalid_anchor_detail(fault: AnchorFault) -> String {
 
 /// The check that reports the metadata-store lines no loader accepts. It
 /// carries counts and the command that lists them, never a line's text.
+/// The `placement_escape` check over the placement results of live sessions.
+///
+/// An escape is a warning, not a failure: the check kills nothing and the
+/// finding may be a tool's own daemon. A session whose host withheld evidence
+/// is named separately so it is never read as clean.
+fn placement_check(
+    placements: &[(protocol::SessionId, protocol::SessionPlacement)],
+) -> DoctorCheck {
+    let named = |outcome: &str| -> Vec<String> {
+        placements
+            .iter()
+            .filter(|(_, placement)| placement.outcome == outcome)
+            .take(MAX_PLACEMENT_SESSIONS_LISTED)
+            .map(|(id, placement)| {
+                if placement.processes.is_empty() {
+                    id.0.clone()
+                } else {
+                    let processes: Vec<String> = placement
+                        .processes
+                        .iter()
+                        .map(|process| format!("{} ({})", process.pid, process.comm))
+                        .collect();
+                    format!("{} [{}]", id.0, processes.join(", "))
+                }
+            })
+            .collect()
+    };
+    let escaped = named("escaped");
+    if !escaped.is_empty() {
+        return check(
+            PLACEMENT_ESCAPE_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "A process of a live session left its terminal session as a daemon: {}. The agent may have started a shared host daemon; nothing was stopped.",
+                escaped.join("; ")
+            ),
+        );
+    }
+    let unobservable = named("unobservable");
+    if !unobservable.is_empty() {
+        return check(
+            PLACEMENT_ESCAPE_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "The host withheld process evidence, so the placement of these sessions is unverified: {}.",
+                unobservable.join("; ")
+            ),
+        );
+    }
+    check(
+        PLACEMENT_ESCAPE_CHECK,
+        DoctorStatus::Ok,
+        &format!(
+            "{} live session(s) with a placement check report no escaped process.",
+            placements.len()
+        ),
+    )
+}
+
 fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
     match state {
         RejectedLinesState::Counted { total: 0, .. } => check(
@@ -1039,6 +1107,7 @@ mod tests {
                 total: 0,
                 may_pin: 0,
             },
+            &[],
         )
         .await
         .expect("doctor report");
@@ -1120,6 +1189,7 @@ mod tests {
                 total: 0,
                 may_pin: 0,
             },
+            &[],
         )
         .await
         .expect("doctor report");

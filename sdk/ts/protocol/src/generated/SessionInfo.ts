@@ -7,6 +7,7 @@ import type { SessionBackground } from "./SessionBackground";
 import type { SessionCapabilities } from "./SessionCapabilities";
 import type { SessionCapabilityRefusals } from "./SessionCapabilityRefusals";
 import type { SessionId } from "./SessionId";
+import type { SessionPlacement } from "./SessionPlacement";
 import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
 import type { SessionWarning } from "./SessionWarning";
@@ -41,6 +42,12 @@ export type SessionInfo = {
    * cleared. Stored records and events never carry it.
    */
   capability_refusals?: SessionCapabilityRefusals;
+  /**
+   * The latest placement escape check of a live session, set only on
+   * `session.inspect` responses. Stored records, events and list entries
+   * never carry it.
+   */
+  placement?: SessionPlacement;
   /**
    * Owner-set display name, or `None` when the session is shown by its id.
    * Set at `session.new` and changed via `session.rename`; cosmetic only.

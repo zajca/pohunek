@@ -1239,6 +1239,47 @@ arguments, and are never persisted: no store or protocol change. No name, or a
 stored name that fails the session-name rule, omits them. A descriptor without
 `[naming]` keeps its digest.
 
+### Session placement
+
+A runtime declares how its agent stays out of a shared host daemon (runtime
+feature `placement-v1`, listed in `requires`; `runtime_api` stays 1):
+
+```toml
+requires = ["placement-v1"]
+
+[placement]
+mode = "in_process"
+keep_local_args = ["--no-daemon"]
+```
+
+`mode` is required: `in_process`, or `owned_server`, which is refused
+(`descriptor_invalid`) because this core has no backend for it. An `in_process`
+table declares at most one of `keep_local_args` (1 to 8 literal tokens, each at
+most 1024 bytes without control characters and without `{session_name}`) and
+`keep_local_handler = true` (the runtime's integration handler contributes the
+launch input; a handler without one is `descriptor_invalid`). The tokens are
+added to every create, resume and fork launch after the frozen and contributor
+arguments and before `[naming]`'s, omitted when the frozen arguments already
+hold all of them, and never persisted. A descriptor that lists `placement-v1`
+without `[placement]` is `descriptor_invalid`; `[placement]` without the feature
+in `requires` is `runtime_feature_unsupported`; a descriptor that does not list
+the feature keeps its digest and its behavior.
+
+The worker of a runtime that declares `[placement]` reports a process of the
+session's generation that left the PTY's POSIX session and is named for the
+provider or holds a listening socket. `session.inspect` of a live session
+carries it as `placement` (`SessionPlacement`: `outcome`, an open string with
+the documented values `clean`, `escaped` and `unobservable`, and `processes`,
+`{pid, comm}` ordered by pid and bounded at 8, empty unless `escaped`); the field
+is absent for a session whose runtime declares no placement, a session that is
+not live, and every list entry, stored record and event, and protocol 3
+connections never receive it. `unobservable` means the host withheld the PTY
+child's session or the process table, so the generation is not reported clean.
+`daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
+naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`
+otherwise. The check signals nothing. Human `session inspect` adds a `placement`
+row (`placement_escape: <pid> (<comm>), ...` for an escape).
+
 ### Secret session environment
 
 A host profile can declare variables whose values come from the `session.new`

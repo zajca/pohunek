@@ -59,14 +59,15 @@ pub use control::{
     ActiveIdentityClaim, ActiveIdentityOutcome, AttachStart, BackgroundItem, BackgroundKind,
     BackgroundSnapshot, BackgroundStatus, Capability, ClaimOrigin, ControlCode, ControlError,
     ControlEvent, ControlMessage, ControlRequest, ControlResponse, ControlTypeError, Dimensions,
-    EventKind, ExitStatus, ForwardedActiveRelease, ForwardedActiveReport, IdentityRejectReason,
-    Initialize, InitializeLimits, InputFragment, InputPlan, InputPolicy, InspectSnapshot,
-    LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-    ReportedNativeReference, ReportedSession, ReportedSessionKind, RequestKind, ResizeRequest,
-    ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest, StreamMode, SubagentPhase,
-    SubagentSnapshot, WriteAck, BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES,
-    BACKGROUND_MAX_ITEMS, BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_ID_MAX_BYTES,
-    BACKGROUND_TASK_STATUS_MAX_BYTES, BACKGROUND_TASK_TYPE_MAX_BYTES,
+    EscapedProcess, EventKind, ExitStatus, ForwardedActiveRelease, ForwardedActiveReport,
+    IdentityRejectReason, Initialize, InitializeLimits, InputFragment, InputPlan, InputPolicy,
+    InspectSnapshot, LaunchIdentity, OutputGap, PlacementOutcome, PlacementReport, ProcessIdentity,
+    ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference, ReportedSession,
+    ReportedSessionKind, RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope,
+    StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
+    BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_MAX_ITEMS,
+    BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_ID_MAX_BYTES, BACKGROUND_TASK_STATUS_MAX_BYTES,
+    BACKGROUND_TASK_TYPE_MAX_BYTES,
 };
 #[doc(inline)]
 pub use data::{
