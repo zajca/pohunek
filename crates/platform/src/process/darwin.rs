@@ -1622,8 +1622,9 @@ mod native {
     const SOCKET_FDINFO_BUFFER_BYTES: usize = 1024;
 
     /// Byte offset of `soi_options` in `socket_fdinfo`: `proc_fileinfo` (24
-    /// bytes) then `socket_info` up to `soi_so`, `soi_pcb` (8 each), `soi_type`,
-    /// `soi_protocol`, `soi_family` (4 each) and the 136-byte `vinfo_stat`.
+    /// bytes), then `socket_info` up to the option: the 136-byte `vinfo_stat`,
+    /// `soi_so` and `soi_pcb` (8 each), `soi_type`, `soi_protocol` and
+    /// `soi_family` (4 each).
     const SOI_OPTIONS_OFFSET: usize = 188;
 
     /// `SO_ACCEPTCONN` socket option bit: set while a socket listens.
@@ -1651,11 +1652,10 @@ mod native {
         let entry_bytes = buffer_length(size_of::<libc::proc_fdinfo>())?;
         // SAFETY: a null buffer with zero size asks only for the byte count.
         let needed = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, ptr::null_mut(), 0) };
-        if needed < 0 {
-            return Err(last_os_error());
-        }
-        if needed == 0 {
-            return Ok(false);
+        // libproc reports failure as 0 with `errno` set; 0 with no `errno` is
+        // an empty descriptor table.
+        if needed <= 0 {
+            return failure_or(Ok(false));
         }
         // The table can grow between the size query and the read, so leave room.
         let capacity = usize::try_from(needed / entry_bytes)
@@ -1680,8 +1680,8 @@ mod native {
                 table_bytes,
             )
         };
-        if written < 0 {
-            return Err(last_os_error());
+        if written <= 0 {
+            return failure_or(Ok(false));
         }
         let count = usize::try_from(written / entry_bytes)
             .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?;
@@ -1702,13 +1702,12 @@ mod native {
                     record_bytes,
                 )
             };
-            if got < 0 {
-                let error = last_os_error();
+            if got <= 0 {
                 // A descriptor closed since the table was read.
-                if error.raw_os_error() == Some(libc::EBADF) {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
                     continue;
                 }
-                return Err(error);
+                return Err(last_os_error());
             }
             let got = usize::try_from(got)
                 .map_err(|_range| io::Error::from(io::ErrorKind::InvalidData))?;
@@ -1747,6 +1746,17 @@ mod native {
     ///
     /// The `libproc` calls report failure by returning a non-positive count,
     /// which is not always accompanied by an errno.
+    /// The operating-system error of a failed libproc call, or `empty` when the
+    /// call left no `errno`.
+    fn failure_or(empty: io::Result<bool>) -> io::Result<bool> {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(0) {
+            empty
+        } else {
+            Err(error)
+        }
+    }
+
     fn last_os_error() -> io::Error {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(0) {

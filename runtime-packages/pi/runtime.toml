@@ -21,12 +21,12 @@ prompt_arg = true
 # stderr, which the probe discards.
 version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", below = "2.0.0" }
 
-# Pi enables bracketed paste in its terminal UI; the submit key is a separate
-# Enter written after the paste.
 # Pi runs the whole session in the TUI process.
 [placement]
 mode = "in_process"
 
+# Pi enables bracketed paste in its terminal UI; the submit key is a separate
+# Enter written after the paste.
 [input]
 bracketed_paste = true
 submit_delay_ms = 150

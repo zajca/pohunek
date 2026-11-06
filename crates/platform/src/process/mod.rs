@@ -83,8 +83,8 @@ pub type Pid = u32;
 /// Opaque POSIX-session identity of a process.
 ///
 /// Two processes are in one POSIX session exactly when their keys are equal.
-/// The value is the session id on Linux and the kernel session object on
-/// macOS, so it is only comparable within one host boot and never meaningful
+/// The value is the session id on Linux and the session leader's process id
+/// on macOS, so it is only comparable within one host boot and never meaningful
 /// outside an equality test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessSession(u64);

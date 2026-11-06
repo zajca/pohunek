@@ -342,6 +342,9 @@ fn holds_listener_at(root: &Path, pid: Pid) -> Result<Option<bool>, Error> {
     for (table, inode_column, row) in LISTENER_TABLES {
         let text = match fs::read_to_string(proc_path_at(root, pid).join(table)) {
             Ok(text) => text,
+            // A host without IPv6 has no `net/tcp6`; the other tables still
+            // decide.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) if is_process_race(&error) => return Ok(None),
             Err(error) => return Err(process_error(OPERATION, error)),
         };

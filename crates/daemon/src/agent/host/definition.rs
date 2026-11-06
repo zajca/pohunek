@@ -1075,8 +1075,6 @@ fn validated_integration(
     .transpose()
 }
 
-/// Checks the fixed launch arguments: each is a valid token and none holds the
-/// `[naming]` placeholder, which only `[naming] launch_args` may carry.
 /// Refuses `keep_local_handler` on a runtime whose handler contributes no
 /// launch input: nothing would keep the agent local.
 fn validate_placement_handler(definition: &RuntimeDefinition) -> Result<(), DefinitionError> {
@@ -1093,6 +1091,8 @@ fn validate_placement_handler(definition: &RuntimeDefinition) -> Result<(), Defi
     Ok(())
 }
 
+/// Checks the fixed launch arguments: each is a valid token and none holds the
+/// `[naming]` placeholder, which only `[naming] launch_args` may carry.
 fn validate_default_args(args: &[String]) -> Result<(), DefinitionError> {
     for arg in args {
         validate_token(arg, "runtime.args")?;

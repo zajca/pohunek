@@ -799,8 +799,6 @@ fn invalid_anchor_detail(fault: AnchorFault) -> String {
     format!("{fault}; official packages are refused until the anchor file is fixed and the daemon restarts.")
 }
 
-/// The check that reports the metadata-store lines no loader accepts. It
-/// carries counts and the command that lists them, never a line's text.
 /// The `placement_escape` check over the placement results of live sessions.
 ///
 /// An escape is a warning, not a failure: the check kills nothing and the
@@ -860,6 +858,8 @@ fn placement_check(
     )
 }
 
+/// The check that reports the metadata-store lines no loader accepts. It
+/// carries counts and the command that lists them, never a line's text.
 fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
     match state {
         RejectedLinesState::Counted { total: 0, .. } => check(
