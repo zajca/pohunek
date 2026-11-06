@@ -58,6 +58,7 @@ mod compression;
 mod error;
 mod index_channel;
 mod limits;
+mod platform;
 mod plugin_index;
 mod release;
 mod sign;
@@ -110,6 +111,7 @@ pub use limits::{
     Limits, MAX_COMPRESSED_BYTES, MAX_EXPANDED_BYTES, MAX_EXPANSION_RATIO, MAX_FILES,
     MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_WINDOW_BYTES,
 };
+pub use platform::host_platform;
 pub use plugin_index::{
     index_key_record_signing_message, index_signing_message, parse_index_envelope,
     revocation_signing_message, verify_index, IndexBody, IndexEntry, IndexEntryRefusal,

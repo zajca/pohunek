@@ -9,6 +9,7 @@
 
 // Rust guideline compliant 2026-10-18
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,7 @@ use protocol::{
 };
 
 use crate::client::Client;
+use crate::commands::plugin_index::{self, PackageRef, Resolved};
 use crate::commands::plugin_profile::{self, ProfileAction};
 use crate::commands::render_json;
 use crate::error::CliError;
@@ -48,6 +50,9 @@ const DIGEST_HEX_CHARS: usize = 64;
 /// of packages one host holds are not a practical concern, and an ambiguous
 /// prefix is reported rather than guessed.
 const DIGEST_PREFIX_HEX_CHARS: usize = 12;
+
+/// File name suffix of a package archive.
+const ARCHIVE_SUFFIX: &str = ".tar.zst";
 
 /// Archive validation can exceed 5 s on a loaded host; keep each response bounded.
 const INSTALL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,15 +79,21 @@ pub(crate) enum Action {
         json: bool,
     },
 
-    /// Install a package archive.
+    /// Install a package archive, or an official package by id.
     ///
     /// The daemon validates the archive and this command prints what the
     /// package declares, including the program it would launch as you. Nothing
     /// is installed until you repeat the command with `--yes`.
     ///
     /// Trust is explicit: a third-party archive is authorized only by the
-    /// digest you supply with `--sha256`; `--catalog` authorizes official
-    /// packages through a signed catalog file.
+    /// digest you supply with `--sha256`; `--catalog` and `--index` authorize
+    /// official packages through a signed catalog or plugin index file.
+    ///
+    /// Without a trust flag, SOURCE is `<package-id>[@<version>]`: this
+    /// command downloads the official plugin index and the archive it lists,
+    /// and the daemon verifies the index signature and the archive digest
+    /// before anything is installed. The review names the exact version, and
+    /// the command to repeat pins it.
     Install(InstallArgs),
 
     /// Copy a package directory into storage for development.
@@ -205,16 +216,50 @@ pub(crate) struct TrustArgs {
     /// catalog file.
     #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
     catalog: Option<PathBuf>,
+    /// Authorize the archive as an official package through this signed
+    /// plugin index file.
+    #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
+    index: Option<PathBuf>,
+}
+
+/// How an install authorizes its source: at most one flag, because without
+/// one the source is a package id resolved through the plugin index.
+#[derive(Debug, Clone, Args)]
+#[group(required = false, multiple = false)]
+pub(crate) struct InstallTrustArgs {
+    /// Authorize the archive by its SHA-256 digest (`sha256:<64 hex>`, or the
+    /// bare hex `sha256sum` prints). Third-party packages are trusted only by
+    /// a digest the owner supplies; this never authorizes an official runtime.
+    #[arg(long, value_name = "DIGEST", value_parser = parse_archive_digest)]
+    sha256: Option<PackageDigest>,
+    /// Authorize the archive as an official package through this signed
+    /// catalog file.
+    #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
+    catalog: Option<PathBuf>,
+    /// Authorize the archive as an official package through this signed
+    /// plugin index file.
+    #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
+    index: Option<PathBuf>,
 }
 
 /// Arguments of `pohunek plugin install`.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct InstallArgs {
-    /// Package archive to install.
-    #[arg(value_name = "ARCHIVE", value_hint = ValueHint::FilePath)]
-    archive: PathBuf,
+    /// A package archive to install (with `--sha256`, `--catalog` or
+    /// `--index`), or `<package-id>[@<version>]` to install through the
+    /// plugin index.
+    #[arg(value_name = "SOURCE", value_hint = ValueHint::AnyPath)]
+    source: String,
     #[command(flatten)]
-    trust: TrustArgs,
+    trust: InstallTrustArgs,
+    /// Plugin index to resolve a package id through, instead of the official
+    /// one. Only `https` URLs and `http` to this machine are fetched.
+    #[arg(
+        long,
+        value_name = "URL",
+        conflicts_with_all = ["sha256", "catalog", "index"]
+    )]
+    index_url: Option<String>,
     /// Install the package disabled.
     #[arg(long)]
     no_enable: bool,
@@ -356,6 +401,116 @@ pub(crate) enum Error {
         expected: &'static str,
     },
 
+    /// A package id (and version) given as the install source does not parse.
+    #[error("{source_text:?} is not a package id or `<package-id>@<version>`: {detail}")]
+    PackageRefInvalid {
+        /// The source as typed.
+        source_text: String,
+        /// Why the id or version is invalid.
+        detail: String,
+    },
+
+    /// The source names a file but no trust flag was given.
+    #[error("{source_text:?} names a file, so a trust flag is required")]
+    TrustRequired {
+        /// The source as typed.
+        source_text: String,
+    },
+
+    /// A URL is not `https` (or `http` to this machine) or carries credentials.
+    #[error("refusing to fetch {url}: only https URLs are allowed")]
+    IndexUrlRefused {
+        /// The URL with its path and query removed.
+        url: String,
+    },
+
+    /// A download exceeds its size limit.
+    #[error("the {what} download is larger than {limit} bytes")]
+    DownloadTooLarge {
+        /// `index` or `archive`.
+        what: &'static str,
+        /// The limit in bytes.
+        limit: u64,
+    },
+
+    /// The plugin index could not be fetched.
+    #[error("the plugin index cannot be fetched: {detail}")]
+    IndexUnavailable {
+        /// What failed, without the URL.
+        detail: String,
+    },
+
+    /// The archive the index lists could not be fetched.
+    #[error("the package archive cannot be fetched: {detail}")]
+    ArchiveUnavailable {
+        /// What failed, without the URL.
+        detail: String,
+    },
+
+    /// The daemon cannot authorize installs through a plugin index.
+    #[error("the daemon does not support installs through a plugin index")]
+    IndexUnsupported,
+
+    /// The fetched index document is not a valid plugin index.
+    #[error("the plugin index document is invalid: {detail}")]
+    IndexInvalid {
+        /// The parser's reason.
+        detail: String,
+    },
+
+    /// The fetched index has expired.
+    #[error("the plugin index has expired")]
+    IndexExpired,
+
+    /// No entry of the index fits the id on this host and core version.
+    #[error("the plugin index has no {package} for this platform and core version")]
+    IndexPackageNotFound {
+        /// The requested package id.
+        package: String,
+    },
+
+    /// The requested version is not among the matching entries.
+    #[error(
+        "the plugin index has no version {version} of {package} for this platform and core version"
+    )]
+    IndexVersionNotFound {
+        /// The requested package id.
+        package: String,
+        /// The requested version.
+        version: String,
+    },
+
+    /// The downloaded archive is not the one the index lists.
+    #[error("the downloaded archive has digest {actual}, the index lists {expected}")]
+    ArchiveDigestMismatch {
+        /// The digest the index lists.
+        expected: String,
+        /// The digest of the downloaded bytes.
+        actual: String,
+    },
+
+    /// This host has no platform name in the plugin index.
+    #[error("this platform has no plugin index entries")]
+    PlatformUnsupported,
+
+    /// The downloaded files could not be staged for the daemon.
+    #[error("the downloaded files cannot be staged: {detail}")]
+    StagingFailed {
+        /// The failure kind, without a path.
+        detail: String,
+    },
+
+    /// A by-id install needs the owner's consent; the repeat pins the version.
+    #[error("{verb} {summary} needs your consent; nothing was changed")]
+    ConsentRequiredPinned {
+        /// Gerund describing the refused action.
+        verb: &'static str,
+        /// Package id, version, and abbreviated digest.
+        summary: String,
+        /// The command that installs exactly the reviewed version.
+        command: String,
+    },
+
     /// The action needs the owner's consent and `--yes` was not given.
     #[error("{verb} {summary} needs your consent; nothing was changed")]
     ConsentRequired {
@@ -451,8 +606,21 @@ impl Error {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::LocalOnly { .. } => "plugin_local_only",
-            Self::InvalidSource { .. } => "plugin_source_invalid",
-            Self::ConsentRequired { .. } => "consent_required",
+            Self::InvalidSource { .. } | Self::PackageRefInvalid { .. } => "plugin_source_invalid",
+            Self::TrustRequired { .. } => "plugin_trust_required",
+            Self::IndexUrlRefused { .. } => "plugin_index_url_refused",
+            Self::DownloadTooLarge { .. } => "plugin_download_too_large",
+            Self::IndexUnavailable { .. } => "plugin_index_unavailable",
+            Self::ArchiveUnavailable { .. } => "plugin_archive_unavailable",
+            Self::IndexUnsupported => "plugin_index_unsupported",
+            Self::IndexInvalid { .. } => "plugin_index_invalid",
+            Self::IndexExpired => "plugin_index_expired",
+            Self::IndexPackageNotFound { .. } => "plugin_index_package_not_found",
+            Self::IndexVersionNotFound { .. } => "plugin_index_version_not_found",
+            Self::ArchiveDigestMismatch { .. } => "plugin_archive_digest_mismatch",
+            Self::PlatformUnsupported => "plugin_platform_unsupported",
+            Self::StagingFailed { .. } => "plugin_staging_failed",
+            Self::ConsentRequired { .. } | Self::ConsentRequiredPinned { .. } => "consent_required",
             Self::NotInstalled { .. } | Self::NoMatchingVersion { .. } => "package_not_installed",
             Self::Ambiguous { .. } => "plugin_selector_ambiguous",
             Self::UpdateIdMismatch { .. } => "plugin_update_id_mismatch",
@@ -464,14 +632,64 @@ impl Error {
     }
 
     /// Recovery hint shown beneath the error.
-    pub(crate) fn hint(&self) -> &'static str {
+    pub(crate) fn hint(&self) -> Cow<'static, str> {
+        if let Self::ConsentRequiredPinned { command, .. } = self {
+            return Cow::Owned(format!(
+                "review the package details (omit --json to see them), then run `{command}`"
+            ));
+        }
+        Cow::Borrowed(self.fixed_hint())
+    }
+
+    /// Recovery hint that does not depend on the error's fields.
+    fn fixed_hint(&self) -> &'static str {
         match self {
             Self::LocalOnly { .. } => {
                 "run the command on the machine that runs the daemon, without --host"
             }
             Self::InvalidSource { .. } => "pass an existing path of the expected kind",
+            Self::PackageRefInvalid { .. } => {
+                "pass `<package-id>` or `<package-id>@<version>`, or a trust flag with an archive path"
+            }
+            Self::TrustRequired { .. } => {
+                "pass --sha256 <digest>, --catalog <file> or --index <file> to install an archive file"
+            }
+            Self::IndexUrlRefused { .. } => {
+                "use an https URL; plain http is accepted only for 127.0.0.1 and [::1]"
+            }
+            Self::DownloadTooLarge { .. } => {
+                "the server sent more than the package format allows; nothing was installed"
+            }
+            Self::IndexUnavailable { .. } | Self::ArchiveUnavailable { .. } => {
+                "check the network and the URL, then retry; nothing was sent to the daemon"
+            }
+            Self::IndexUnsupported => {
+                "the daemon is older than 0.40 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog"
+            }
+            Self::IndexInvalid { .. } => {
+                "the index is malformed; retry later or report it to the index maintainers"
+            }
+            Self::IndexExpired => {
+                "the index is out of date; retry later or report it to the index maintainers"
+            }
+            Self::IndexPackageNotFound { .. } => {
+                "check the package id; the index may not list it for this platform and core version"
+            }
+            Self::IndexVersionNotFound { .. } => {
+                "omit the version to take the newest one the index lists for this host"
+            }
+            Self::ArchiveDigestMismatch { .. } => {
+                "the download does not match the index; nothing was installed, retry later"
+            }
+            Self::PlatformUnsupported => "plugin indexes list packages for Linux and macOS only",
+            Self::StagingFailed { .. } => {
+                "check that the temporary directory ($TMPDIR) is writable and has free space"
+            }
             Self::ConsentRequired { .. } => {
                 "review the package details (omit --json to see them), then repeat the command with --yes"
+            }
+            Self::ConsentRequiredPinned { .. } => {
+                "review the package details, then repeat the pinned command with --yes"
             }
             Self::NotInstalled { .. } => "list installed packages with `pohunek plugin list`",
             Self::NoMatchingVersion { .. } => {
@@ -494,6 +712,15 @@ impl Error {
                 "list installed packages with `pohunek plugin list` and pass --digest"
             }
         }
+    }
+
+    /// Whether the failure is a mistake in how the command was invoked, which
+    /// exits with the usage status.
+    pub(crate) fn is_usage(&self) -> bool {
+        matches!(
+            self,
+            Self::PackageRefInvalid { .. } | Self::TrustRequired { .. }
+        )
     }
 
     /// Error class: every plugin-command failure is a usage or configuration mistake.
@@ -663,15 +890,112 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
 }
 
 async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
-    let source = Source::Archive {
-        path: canonical_path(&args.archive, "file", Path::is_file)?,
-        trust: trust(&args.trust)?,
-    };
     let ingest = Ingest::Install {
         enable: !args.no_enable,
     };
+    let Some(trust) = install_trust(&args.trust)? else {
+        return run_install_by_id(args, ingest).await;
+    };
+    let source = Source::Archive {
+        path: canonical_path(Path::new(&args.source), "file", Path::is_file)?,
+        trust,
+    };
     let mut client = connect_ingest().await?;
-    ingest_package(&mut client, &source, ingest, None, args.yes, args.json).await
+    require_index_support_for(&mut client, &source).await?;
+    ingest_package(
+        &mut client,
+        &source,
+        ingest,
+        None,
+        None,
+        args.yes,
+        args.json,
+    )
+    .await
+}
+
+/// Install `<package-id>[@<version>]`: fetch the index and the archive it
+/// lists, then hand both to the daemon, which verifies them.
+async fn run_install_by_id(args: &InstallArgs, ingest: Ingest) -> Result<(), CliError> {
+    // A forgotten trust flag must not turn into a network lookup: an archive
+    // file name such as `muse.tar.zst` is also a valid package id.
+    if args.source.ends_with(ARCHIVE_SUFFIX) || std::fs::symlink_metadata(&args.source).is_ok() {
+        return Err(Error::TrustRequired {
+            source_text: args.source.clone(),
+        }
+        .into());
+    }
+    let request = PackageRef::parse(&args.source)?;
+    let mut client = connect_ingest().await?;
+    require_index_support(&mut client).await?;
+    let staged = plugin_index::stage(&request, args.index_url.as_deref()).await?;
+    let source = Source::Archive {
+        path: staged.archive_path.clone(),
+        trust: PackageTrust::Index {
+            index_path: staged.index_path.clone(),
+        },
+    };
+    let pin = Pin {
+        command: pinned_command(&staged.resolved, args),
+        resolved: staged.resolved.clone(),
+    };
+    ingest_package(
+        &mut client,
+        &source,
+        ingest,
+        None,
+        Some(&pin),
+        args.yes,
+        args.json,
+    )
+    .await
+}
+
+/// The reviewed version of a by-id install and the command that installs it.
+struct Pin {
+    resolved: Resolved,
+    command: String,
+}
+
+/// The command that installs exactly `resolved`: it keeps the index the
+/// review used and the enable choice, so the repeat cannot resolve elsewhere.
+fn pinned_command(resolved: &Resolved, args: &InstallArgs) -> String {
+    let mut command = format!("pohunek plugin install {} --yes", resolved.pinned());
+    if args.no_enable {
+        command.push_str(" --no-enable");
+    }
+    if let Some(url) = &args.index_url {
+        let _ = write!(command, " --index-url '{}'", url.replace('\'', "'\\''"));
+    }
+    command
+}
+
+/// Refuse before any fetch or dry run when the daemon cannot take an index
+/// install, which a daemon older than this CLI would otherwise reject only
+/// after the network work.
+async fn require_index_support(client: &mut Client) -> Result<(), CliError> {
+    if client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_install_index_supported
+    {
+        Ok(())
+    } else {
+        Err(Error::IndexUnsupported.into())
+    }
+}
+
+/// [`require_index_support`] for a source that is authorized by an index.
+async fn require_index_support_for(client: &mut Client, source: &Source) -> Result<(), CliError> {
+    match source {
+        Source::Archive {
+            trust: PackageTrust::Index { .. },
+            ..
+        } => require_index_support(client).await,
+        _ => Ok(()),
+    }
 }
 
 async fn run_link(args: &LinkArgs) -> Result<(), CliError> {
@@ -681,6 +1005,7 @@ async fn run_link(args: &LinkArgs) -> Result<(), CliError> {
         &mut client,
         &source,
         Ingest::Link,
+        None,
         None,
         args.yes,
         args.json,
@@ -694,11 +1019,13 @@ async fn run_update(args: &UpdateArgs) -> Result<(), CliError> {
         trust: trust(&args.trust)?,
     };
     let mut client = connect_ingest().await?;
+    require_index_support_for(&mut client, &source).await?;
     ingest_package(
         &mut client,
         &source,
         Ingest::Update,
         Some(&args.package),
+        None,
         args.yes,
         args.json,
     )
@@ -792,17 +1119,46 @@ fn canonical_path(
         .map_err(|_unreadable| invalid())
 }
 
-/// Convert the trust flags to the wire trust, canonicalizing a catalog path.
+/// Convert the trust flags to the wire trust, canonicalizing a document path.
 fn trust(args: &TrustArgs) -> Result<PackageTrust, CliError> {
-    match (&args.sha256, &args.catalog) {
-        (Some(digest), None) => Ok(PackageTrust::ExplicitDigest {
+    wire_trust(
+        args.sha256.as_ref(),
+        args.catalog.as_deref(),
+        args.index.as_deref(),
+    )?
+    // The clap group guarantees one of the three.
+    .ok_or_else(|| unreachable!("clap enforces one of --sha256, --catalog and --index"))
+}
+
+/// The trust of an install, or `None` when no flag was given and the source
+/// is a package id.
+fn install_trust(args: &InstallTrustArgs) -> Result<Option<PackageTrust>, CliError> {
+    wire_trust(
+        args.sha256.as_ref(),
+        args.catalog.as_deref(),
+        args.index.as_deref(),
+    )
+}
+
+/// The wire trust for at most one of the three flags.
+fn wire_trust(
+    sha256: Option<&PackageDigest>,
+    catalog: Option<&Path>,
+    index: Option<&Path>,
+) -> Result<Option<PackageTrust>, CliError> {
+    match (sha256, catalog, index) {
+        (Some(digest), None, None) => Ok(Some(PackageTrust::ExplicitDigest {
             digest: digest.clone(),
-        }),
-        (None, Some(catalog)) => Ok(PackageTrust::Catalog {
+        })),
+        (None, Some(catalog), None) => Ok(Some(PackageTrust::Catalog {
             catalog_path: canonical_path(catalog, "file", Path::is_file)?,
-        }),
-        // The clap group guarantees exactly one of the two.
-        _ => unreachable!("clap enforces exactly one of --sha256 and --catalog"),
+        })),
+        (None, None, Some(index)) => Ok(Some(PackageTrust::Index {
+            index_path: canonical_path(index, "file", Path::is_file)?,
+        })),
+        (None, None, None) => Ok(None),
+        // The clap groups allow at most one of the three.
+        _ => unreachable!("clap enforces at most one of --sha256, --catalog and --index"),
     }
 }
 
@@ -812,6 +1168,7 @@ async fn ingest_package(
     source: &Source,
     ingest: Ingest,
     expected_id: Option<&PackageId>,
+    pin: Option<&Pin>,
     yes: bool,
     json: bool,
 ) -> Result<(), CliError> {
@@ -864,15 +1221,28 @@ async fn ingest_package(
                 .iter()
                 .find(|info| info.digest == preview.package.digest);
             let selected = selection_after(ingest, select, &preview.package, recorded);
+            if let Some(pin) = pin {
+                println!(
+                    "Resolved:    {} (digest {}) from the plugin index",
+                    pin.resolved.pinned(),
+                    pin.resolved.digest.as_str()
+                );
+            }
             print!("{}", render_install_review(&preview, enable, selected));
         }
-        return Err(Error::ConsentRequired {
-            verb: ingest.verb(),
-            summary: summary(
-                id,
-                &preview.package.package.version,
-                &preview.package.digest,
-            ),
+        let verb = ingest.verb();
+        let summary = summary(
+            id,
+            &preview.package.package.version,
+            &preview.package.digest,
+        );
+        return Err(match pin {
+            Some(pin) => Error::ConsentRequiredPinned {
+                verb,
+                summary,
+                command: pin.command.clone(),
+            },
+            None => Error::ConsentRequired { verb, summary },
         }
         .into());
     }
@@ -1589,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn install_requires_exactly_one_trust_source() {
+    fn install_takes_at_most_one_trust_source_and_update_requires_one() {
         let digest = DIGEST_A;
         match parse(&[
             "install",
@@ -1615,8 +1985,15 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        match parse(&["install", "pohunek.runtime.idxfix@0.1.0"]).expect("by id") {
+            Action::Install(args) => {
+                assert!(args.trust.sha256.is_none() && args.trust.catalog.is_none());
+                assert!(args.trust.index.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         assert_eq!(
-            parse_err(&["install", "pkg.tar"]),
+            parse_err(&["update", "acme.pi", "pkg.tar"]),
             clap::error::ErrorKind::MissingRequiredArgument
         );
         assert_eq!(

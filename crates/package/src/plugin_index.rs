@@ -120,6 +120,18 @@ pub struct IndexEntry {
     pub core: String,
 }
 
+impl IndexEntry {
+    /// Whether the entry lists `platform` and its core range parses and
+    /// matches `core`. The same two checks [`VerifiedIndex::authorize`] ends
+    /// with, so a client that selects by this predicate never picks an entry
+    /// the verifier would refuse for those reasons.
+    #[must_use]
+    pub fn supports(&self, core: &Version, platform: &str) -> bool {
+        parse_core_range(&self.core).is_some_and(|range| range.matches(core))
+            && self.platforms.iter().any(|listed| listed == platform)
+    }
+}
+
 /// The signed index body.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

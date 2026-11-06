@@ -117,7 +117,7 @@ fn entry_for(built: &Built, version: &str, platform: &str, core: &str) -> Catalo
 }
 
 /// What a scenario puts beside the daemon executable.
-enum Anchor {
+pub(crate) enum Anchor {
     /// No anchor file.
     None,
     /// A file with `bytes` and the permission bits `mode`.
@@ -139,16 +139,16 @@ enum Anchor {
 
 /// A clean installation: a real daemon in a hermetic environment, with the
 /// `pohunek` CLI pointed at it.
-struct Install {
-    env: TestEnv,
+pub(crate) struct Install {
+    pub(crate) env: TestEnv,
     _daemon: tokio::process::Child,
 }
 
 /// The plugin index channel file beside the anchor: `bytes` with the
 /// permission bits `mode`.
-struct Channel<'a> {
-    bytes: &'a [u8],
-    mode: u32,
+pub(crate) struct Channel<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) mode: u32,
 }
 
 impl Install {
@@ -156,7 +156,7 @@ impl Install {
         Self::start_with_channel(anchor, None).await
     }
 
-    async fn start_with_channel(anchor: &Anchor, channel: Option<Channel<'_>>) -> Self {
+    pub(crate) async fn start_with_channel(anchor: &Anchor, channel: Option<Channel<'_>>) -> Self {
         let env = TestEnv::new().expect("create the hermetic environment");
         let release = env.root().join("release");
         fs::create_dir(&release).expect("create the release directory");
@@ -271,7 +271,7 @@ impl Install {
         Built { path, digest }
     }
 
-    fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+    pub(crate) fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let path = self.env.root().join(name);
         fs::write(&path, bytes).expect("write the file");
         path
@@ -279,7 +279,7 @@ impl Install {
 
     /// Runs `pohunek <arguments> --json` and returns the exit code and the
     /// single JSON document on stdout.
-    async fn json(&self, arguments: &[&str]) -> (i32, Value) {
+    pub(crate) async fn json(&self, arguments: &[&str]) -> (i32, Value) {
         let mut all = arguments.to_vec();
         all.push("--json");
         let output = self
@@ -313,7 +313,7 @@ impl Install {
     }
 
     /// The installed packages as `plugin list` reports them.
-    async fn packages(&self) -> Vec<Value> {
+    pub(crate) async fn packages(&self) -> Vec<Value> {
         let (code, document) = self.json(&["plugin", "list"]).await;
         assert_eq!(code, 0, "{document}");
         document["ok"]["packages"]

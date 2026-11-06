@@ -637,7 +637,7 @@ impl CliError {
                 error.class(),
                 error.code(),
                 error.to_string(),
-                Some(error.hint().to_owned()),
+                Some(error.hint().into_owned()),
             ),
             CliError::Workflow(error) => ProtocolError::new(
                 error.class(),
@@ -1011,6 +1011,15 @@ fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
                 .to_owned(),
         ),
     )
+}
+
+/// The exit status of a failed command: the usage status for a mistake in how
+/// the command was invoked, otherwise a plain failure.
+pub(crate) fn failure_exit_code(error: &CliError) -> ExitCode {
+    match error {
+        CliError::Plugin(plugin) if plugin.is_usage() => ExitCode::from(CLI_USAGE_EXIT_CODE),
+        _ => ExitCode::FAILURE,
+    }
 }
 
 /// Render a clap argument-parse failure, honoring `--json`.

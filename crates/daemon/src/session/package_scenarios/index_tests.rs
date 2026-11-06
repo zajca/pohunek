@@ -104,6 +104,11 @@ impl Keys {
 
     /// The key record of `subject`, endorsed by R.
     fn record(&self, subject: &SigningKey) -> IndexKeyRecord {
+        Self::record_by(&self.root, subject)
+    }
+
+    /// The key record of `subject`, endorsed by `endorser`.
+    fn record_by(endorser: &SigningKey, subject: &SigningKey) -> IndexKeyRecord {
         let start = now() - KEY_BACK_DATE;
         let mut record = IndexKeyRecord {
             key_id: key_id(subject),
@@ -111,17 +116,25 @@ impl Keys {
             scope: "official".to_owned(),
             not_before: start,
             not_after: start + KEY_WINDOW,
-            endorsed_by: key_id(&self.root),
+            endorsed_by: key_id(endorser),
             signature: String::new(),
         };
-        record.signature = hex(&self
-            .root
+        record.signature = hex(&endorser
             .sign(&index_key_record_signing_message(&record))
             .to_bytes());
         record
     }
 
     fn revocations(&self, sequence: u64, revoked: Vec<KeyId>) -> SignedRevocations {
+        Self::revocations_by(&self.root, sequence, revoked)
+    }
+
+    /// A revocation list signed by `endorser`.
+    fn revocations_by(
+        endorser: &SigningKey,
+        sequence: u64,
+        revoked: Vec<KeyId>,
+    ) -> SignedRevocations {
         let body = RevocationBody {
             schema_version: INDEX_SCHEMA_VERSION,
             sequence,
@@ -130,8 +143,8 @@ impl Keys {
         let message = revocation_signing_message(&body).expect("revocation message");
         SignedRevocations {
             signature: CatalogSignature {
-                key_id: key_id(&self.root),
-                signature: hex(&self.root.sign(&message).to_bytes()),
+                key_id: key_id(endorser),
+                signature: hex(&endorser.sign(&message).to_bytes()),
             },
             revocations: body,
         }
@@ -142,6 +155,23 @@ impl Keys {
     fn document(
         &self,
         signer: &SigningKey,
+        sequence: u64,
+        entries: Vec<IndexEntry>,
+        revocations: SignedRevocations,
+    ) -> Vec<u8> {
+        Self::document_with_records(
+            signer,
+            vec![self.record(&self.key)],
+            sequence,
+            entries,
+            revocations,
+        )
+    }
+
+    /// An index document signed by `signer` that carries `key_records`.
+    fn document_with_records(
+        signer: &SigningKey,
+        key_records: Vec<IndexKeyRecord>,
         sequence: u64,
         entries: Vec<IndexEntry>,
         revocations: SignedRevocations,
@@ -161,7 +191,7 @@ impl Keys {
         serde_json::to_vec(&IndexEnvelope {
             schema_version: INDEX_SCHEMA_VERSION,
             index: body,
-            key_records: vec![self.record(&self.key)],
+            key_records,
             signatures: vec![signature],
             revocations,
         })
@@ -659,6 +689,82 @@ async fn revoked_keys_and_replayed_revocation_lists_are_refused() {
         PackageErrorKind::Untrusted
     );
     assert!(!by_index.root(&package.digest).exists());
+
+    // A document signed by the key an earlier index revoked is refused even
+    // though its key record verifies and its own list revokes nothing; the
+    // same document installs on a host that never saw the revocation.
+    let signed_by_revoked = Keys::document_with_records(
+        &second_key,
+        vec![keys.record(&second_key)],
+        sequence + 2,
+        entries(),
+        keys.revocations(6, Vec::new()),
+    );
+    assert_eq!(
+        install_refused(&by_index, &package, &signed_by_revoked).await,
+        PackageErrorKind::Untrusted
+    );
+    assert!(!by_index.root(&package.digest).exists());
+    let control = keys.fixture("index-revoked-control");
+    control
+        .registry
+        .packages()
+        .package_install(index_install(&control, &package, &signed_by_revoked, false))
+        .await
+        .expect("the same document installs where its signer was never revoked");
+}
+
+#[tokio::test]
+async fn only_the_channel_designated_root_endorses_index_keys() {
+    // Both roots of the anchor sign catalogs. The channel designates one of
+    // them to endorse index keys: a document endorsed by the other, the CI
+    // root, is refused, and the designated root is the anchor's first root in
+    // one round and its second in the other.
+    let first = signing_key("index-root-a");
+    let second = signing_key("index-root-b");
+    for (round, (designated, ci_root)) in [(&first, &second), (&second, &first)]
+        .into_iter()
+        .enumerate()
+    {
+        let keys = Keys {
+            root: designated.clone(),
+            key: signing_key("index-key"),
+            outsider: signing_key("index-outsider"),
+        };
+        let fixture = Fixture::with_anchor(
+            &format!("index-two-roots-{round}"),
+            anchor(&[&first, &second], Vec::new())
+                .with_index(IndexTrust::Loaded(Box::new(keys.root_key()))),
+        );
+        let package = idxfix("1.0.0");
+        let sequence = now();
+        let entries = vec![idxfix_entry(&package, "1.0.0")];
+
+        let endorsed_by_ci_root = Keys::document_with_records(
+            &keys.key,
+            vec![Keys::record_by(ci_root, &keys.key)],
+            sequence,
+            entries.clone(),
+            keys.revocations(1, Vec::new()),
+        );
+        assert_eq!(
+            install_refused(&fixture, &package, &endorsed_by_ci_root).await,
+            PackageErrorKind::Untrusted
+        );
+        assert_nothing_recorded(&fixture, &package);
+
+        fixture
+            .registry
+            .packages()
+            .package_install(index_install(
+                &fixture,
+                &package,
+                &keys.signed(sequence, entries),
+                false,
+            ))
+            .await
+            .expect("the designated root's endorsement installs");
+    }
 }
 
 #[tokio::test]
@@ -701,6 +807,10 @@ async fn marks_persisted_before_a_crash_gate_the_retry_and_damaged_state_is_kept
         .await
         .expect("the same document installs after the crash");
     assert_eq!(index_state(&fixture).index_high_water, Some(sequence));
+    assert!(
+        !temporary.exists(),
+        "the stale temporary state file is gone after the retry"
+    );
 
     // A damaged state file is reported and never replaced.
     let damaged = keys.fixture("index-damaged-state");

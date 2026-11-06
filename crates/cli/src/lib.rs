@@ -1983,7 +1983,7 @@ pub async fn run_cli() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             error::render(&err, json);
-            ExitCode::FAILURE
+            error::failure_exit_code(&err)
         }
     }
 }
