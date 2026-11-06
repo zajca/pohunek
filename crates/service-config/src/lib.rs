@@ -61,6 +61,9 @@
 //! max_files = 8                                    # 2..=64; including the active file
 //! max_age_days = 14                                # 1..=3650
 //!
+//! [checkout_trust]                                 # optional table; omitted while empty
+//! trusted_repositories = ["owner/repo"]            # lower-cased GitHub owner/repo; up to 256
+//!
 //! [inventory]                                      # optional table; every key optional
 //! probe_cache_ttl_ms = 120000                      # 1..=600000
 //! probe_failure_ttl_ms = 10000                     # 1..=600000
@@ -91,6 +94,13 @@
 //! a previous release still reads the file unless the operator set it. A
 //! previous release that reads a file with the key reports it as an unknown key
 //! and does not enforce it.
+//!
+//! `[checkout_trust]` lists the GitHub repositories whose checkouts a runtime
+//! may launch with its `trusted_checkout_args`; see [`MAX_TRUSTED_REPOSITORIES`].
+//! The table and its key are optional, an absent or empty list trusts no
+//! repository, and the writer omits the table while the list is empty, so a
+//! previous release still reads the file unless the operator set it. A previous
+//! release that reads a file with the table reports it as an unknown table.
 //!
 //! `[inventory]` bounds the version-probe cache behind `host.inspect`; see
 //! [`InventoryProbe`] and [`DEFAULT_INVENTORY_PROBE`]. The table and each of its
@@ -360,6 +370,17 @@ pub const MIN_EVENT_AGE_DAYS: u64 = 1;
 
 /// Largest accepted `events.max_age_days`: ten years.
 pub const MAX_EVENT_AGE_DAYS: u64 = 3650;
+
+/// Most entries `checkout_trust.trusted_repositories` may list.
+pub const MAX_TRUSTED_REPOSITORIES: usize = 256;
+
+/// Longest `owner` of a `checkout_trust.trusted_repositories` entry: GitHub's
+/// own limit on a login.
+pub const MAX_REPOSITORY_OWNER_BYTES: usize = 39;
+
+/// Longest `repo` of a `checkout_trust.trusted_repositories` entry: GitHub's
+/// own limit on a repository name.
+pub const MAX_REPOSITORY_NAME_BYTES: usize = 100;
 
 /// Version-probe cache settings used when `[inventory]` names none.
 ///
@@ -1065,6 +1086,9 @@ pub struct ConfigSpec {
     pub hook_stderr_tail_bytes: u32,
     /// Hook events whose failure aborts the operation; each event at most once.
     pub hook_required: Vec<RequiredHook>,
+    /// GitHub repositories (`owner/repo`) whose checkouts a runtime may launch
+    /// with its trusted-checkout arguments; empty trusts none.
+    pub trusted_repositories: Vec<String>,
     /// Size, count and age bounds of the event journal.
     pub event_retention: EventRetention,
     /// Version-probe cache of `host.inspect`.
@@ -1097,6 +1121,7 @@ pub struct ServiceConfig {
     wait_timing: WaitTiming,
     hook_stderr_tail_bytes: u32,
     hook_required: Vec<RequiredHook>,
+    trusted_repositories: Vec<String>,
     event_retention: EventRetention,
     inventory_probe: InventoryProbe,
     worker_journal_max_age: Duration,
@@ -1178,6 +1203,7 @@ impl ServiceConfig {
             });
         }
         validate_required_hooks(&spec.hook_required)?;
+        let trusted_repositories = parse_trusted_repositories(&spec.trusted_repositories)?;
         validate_event_retention(spec.event_retention)?;
         validate_inventory_probe(spec.inventory_probe)?;
         validate_worker_journal_max_age(spec.worker_journal_max_age)?;
@@ -1205,6 +1231,7 @@ impl ServiceConfig {
             wait_timing: spec.wait_timing,
             hook_stderr_tail_bytes: spec.hook_stderr_tail_bytes,
             hook_required: spec.hook_required,
+            trusted_repositories,
             event_retention: spec.event_retention,
             inventory_probe: spec.inventory_probe,
             worker_journal_max_age: spec.worker_journal_max_age,
@@ -1409,6 +1436,9 @@ impl ServiceConfig {
                     .collect(),
             },
             events: RawEvents::from(self.event_retention),
+            checkout_trust: RawCheckoutTrust {
+                trusted_repositories: self.trusted_repositories.clone(),
+            },
             inventory: RawInventory::from(self.inventory_probe),
             worker_journals: RawWorkerJournals::from(self.worker_journal_max_age),
             limits: RawLimits {
@@ -1444,6 +1474,7 @@ impl ServiceConfig {
             wait_timing: self.wait_timing,
             hook_stderr_tail_bytes: self.hook_stderr_tail_bytes,
             hook_required: self.hook_required.clone(),
+            trusted_repositories: self.trusted_repositories.clone(),
             event_retention: self.event_retention,
             inventory_probe: self.inventory_probe,
             worker_journal_max_age: self.worker_journal_max_age,
@@ -1598,6 +1629,14 @@ impl ServiceConfig {
         &self.hook_required
     }
 
+    /// Lower-cased `owner/repo` of the GitHub repositories whose checkouts a
+    /// runtime may launch with its trusted-checkout arguments; empty when
+    /// `checkout_trust.trusted_repositories` is absent, which trusts none.
+    #[must_use]
+    pub fn trusted_repositories(&self) -> &[String] {
+        &self.trusted_repositories
+    }
+
     /// Returns the size, count and age bounds of the event journal.
     #[must_use]
     pub fn event_retention(&self) -> EventRetention {
@@ -1684,6 +1723,8 @@ struct RawConfig {
     waits: RawWaits,
     hooks: RawHooks,
     events: RawEvents,
+    #[serde(default, skip_serializing_if = "RawCheckoutTrust::is_default")]
+    checkout_trust: RawCheckoutTrust,
     #[serde(default, skip_serializing_if = "RawInventory::is_default")]
     inventory: RawInventory,
     #[serde(default, skip_serializing_if = "RawWorkerJournals::is_default")]
@@ -1976,6 +2017,28 @@ fn is_default_keepalive_count(value: &u32) -> bool {
     *value == default_keepalive_count()
 }
 
+/// The optional `[checkout_trust]` table: its key is optional and the table is
+/// omitted while the list is empty.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct RawCheckoutTrust {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trusted_repositories: Vec<String>,
+}
+
+impl RawCheckoutTrust {
+    /// Whether the list is empty, so the whole table is omitted.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A non-empty list, used only to derive the set of known keys.
+    fn known_keys_sample() -> Self {
+        Self {
+            trusted_repositories: vec![String::new()],
+        }
+    }
+}
+
 /// On-disk `[inventory]` table in milliseconds.
 ///
 /// Every key is optional: a file that lacks one means its default, and the
@@ -2261,6 +2324,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
@@ -2287,6 +2351,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: previous.waits,
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
@@ -2309,6 +2374,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: previous.waits,
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
@@ -2331,6 +2397,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: previous.waits,
                 hooks: previous.hooks,
                 events: RawEvents::DEFAULT,
+                checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
@@ -2357,6 +2424,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 hooks: RawHooks::DEFAULT,
                 events: RawEvents::DEFAULT,
+                checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 limits: previous.limits,
@@ -2437,6 +2505,7 @@ impl RawConfig {
                 required: vec![String::new()],
             },
             events: RawEvents::DEFAULT,
+            checkout_trust: RawCheckoutTrust::known_keys_sample(),
             inventory: RawInventory::known_keys_sample(),
             worker_journals: RawWorkerJournals::known_keys_sample(),
             limits: RawLimits { open_files: 0 },
@@ -2759,6 +2828,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
         },
         hook_stderr_tail_bytes: raw.hooks.stderr_tail_bytes,
         hook_required: parse_required_hooks(&raw.hooks.required)?,
+        trusted_repositories: raw.checkout_trust.trusted_repositories,
         event_retention: EventRetention {
             max_file_bytes: raw.events.max_file_bytes,
             max_files: raw.events.max_files,
@@ -3130,6 +3200,48 @@ fn parse_required_hooks(entries: &[String]) -> Result<Vec<RequiredHook>, ConfigE
             },
         })
         .collect()
+}
+
+/// Normalizes the `checkout_trust.trusted_repositories` entries to lower-case
+/// `owner/repo`.
+///
+/// An entry is a GitHub `owner/repo`: the owner is 1..=[`MAX_REPOSITORY_OWNER_BYTES`]
+/// ASCII letters, digits or hyphens, the repo 1..=[`MAX_REPOSITORY_NAME_BYTES`]
+/// ASCII letters, digits, `.`, `_` or `-`, and the repo is neither `.` nor `..` and does not end in `.git`.
+/// A rejected entry is reported by position, never echoed.
+fn parse_trusted_repositories(entries: &[String]) -> Result<Vec<String>, ConfigError> {
+    if entries.len() > MAX_TRUSTED_REPOSITORIES {
+        return Err(ConfigError::TooManyTrustedRepositories {
+            max: MAX_TRUSTED_REPOSITORIES,
+        });
+    }
+    let mut normalized: Vec<String> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let lowered = entry.to_ascii_lowercase();
+        let valid = lowered.split_once('/').is_some_and(|(owner, repo)| {
+            (1..=MAX_REPOSITORY_OWNER_BYTES).contains(&owner.len())
+                && owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (1..=MAX_REPOSITORY_NAME_BYTES).contains(&repo.len())
+                && repo
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                && repo != "."
+                && repo != ".."
+                && !std::path::Path::new(repo)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
+        });
+        if !valid {
+            return Err(ConfigError::InvalidTrustedRepository { index });
+        }
+        if let Some(first) = normalized.iter().position(|earlier| *earlier == lowered) {
+            return Err(ConfigError::DuplicateTrustedRepository { index, first });
+        }
+        normalized.push(lowered);
+    }
+    Ok(normalized)
 }
 
 /// Rejects an event listed twice in `hooks.required`.

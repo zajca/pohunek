@@ -8,6 +8,7 @@
 //! source of an official alias.
 
 mod builtin;
+mod checkout_trust;
 mod claim;
 mod commands;
 mod config_home;
@@ -30,6 +31,9 @@ pub use ::package::version_probe::{
     MAX_PROBE_ARGS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
 pub use builtin::BuiltinSource;
+pub use checkout_trust::{
+    CheckoutTrust, MAX_CHECKOUT_TRUST_ARGS, MAX_CHECKOUT_TRUST_PATHS, MAX_CHECKOUT_TRUST_PATH_BYTES,
+};
 pub use claim::{decide_claim, is_reserved, Authority, ClaimRefusal, ServedBy};
 pub use commands::{PackageDescriptor, MAX_PACKAGE_COMMANDS};
 pub use config_home::{ConfigHome, HomeError};

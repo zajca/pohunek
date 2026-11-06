@@ -31,6 +31,7 @@ pub mod assistant;
 pub(crate) mod bounded_run;
 pub mod capabilities;
 pub mod catalog_anchor;
+pub(crate) mod checkout_trust;
 pub mod discovery;
 pub mod doctor;
 

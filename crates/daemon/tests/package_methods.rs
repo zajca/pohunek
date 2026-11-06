@@ -90,6 +90,9 @@ struct Servers {
     agents: PathBuf,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    /// The path of the repository the checkout-trust predicate fetches the
+    /// remote `HEAD` from; `None` is a failed lookup.
+    remote_source: Arc<std::sync::Mutex<Option<String>>>,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -130,6 +133,21 @@ async fn spawn_servers_trusting(
     trust: CatalogTrust,
 ) -> Servers {
     spawn_servers_configured(tag, store_content, |config| config.catalog_trust = trust).await
+}
+
+/// [`spawn_servers_trusting`] over a host whose `checkout_trust` lists
+/// `trusted_repositories`.
+async fn spawn_servers_trusting_repositories(
+    tag: &str,
+    store_content: Option<&str>,
+    trust: CatalogTrust,
+    trusted_repositories: Vec<String>,
+) -> Servers {
+    spawn_servers_configured(tag, store_content, |config| {
+        config.catalog_trust = trust;
+        config.trusted_repositories = trusted_repositories;
+    })
+    .await
 }
 
 /// [`spawn_servers_over`] with `configure` applied to the registry config.
@@ -182,6 +200,11 @@ async fn spawn_servers_configured(
     let registry =
         SessionRegistry::new_production(config, Arc::new(SubprocessWorkerLauncher::new()))
             .expect("the production registry opens the plugin root");
+    let remote_source: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let announced = Arc::clone(&remote_source);
+    registry.set_checkout_remote_source(move |_repository| {
+        announced.lock().expect("remote source").clone()
+    });
     let governance = Arc::new(
         HostGovernanceService::open(socket_dir.path().join("state"))
             .await
@@ -228,6 +251,7 @@ async fn spawn_servers_configured(
         agents,
         shutdown,
         task,
+        remote_source,
         _dirs: (socket_dir, worker_home_dir),
     }
 }
@@ -3527,6 +3551,758 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
     );
 
     let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// `[runtime] trusted_checkout_args`: the arguments a trusted checkout adds.
+// ---------------------------------------------------------------------------
+
+const CHECKOUT_TRUST_FEATURE: &str = "\"checkout-trust-args-v1\"";
+
+/// The argument the fixture runtime adds to a trusted checkout.
+const TRUST_ARG: &str = "--trust-workspace";
+
+/// A `fixture` descriptor launching the argv-printing `program` that declares
+/// `keys` (lines of the `[runtime]` table) next to its fixed arguments.
+fn checkout_trust_descriptor(program: &Path, requires: &str, keys: &str) -> String {
+    descriptor_requiring(requires, "")
+        .replace(
+            "program = \"/bin/sh\"",
+            &format!("program = \"{}\"", program.display()),
+        )
+        .replace(
+            "args = [\"--model\", \"fast\"]\n",
+            &format!("args = [\"--model\", \"fast\"]\n{keys}"),
+        )
+}
+
+/// The `[runtime]` keys of a runtime that adds [`TRUST_ARG`] to a trusted
+/// checkout and compares `.muse` and `.agents` with the remote HEAD.
+fn trusting_keys() -> String {
+    format!(
+        "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\".muse\", \".agents\"]\n"
+    )
+}
+
+/// Runs git in `dir`, failing the test on a non-zero exit.
+fn git_in(dir: &Path, args: &[&str]) {
+    let output = pohunek_test_support::git::command()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A checkout at `parent/name` whose `origin` is `origin` and whose default
+/// branch `origin/HEAD` holds the one commit it has, with `.muse` and
+/// `.agents` tracked. No network is involved: the remote-tracking refs are
+/// written directly.
+fn checkout(parent: &Path, name: &str, origin: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(dir.join(".muse")).expect("create .muse");
+    std::fs::create_dir_all(dir.join(".agents")).expect("create .agents");
+    std::fs::write(dir.join(".muse/hooks.json"), "{}\n").expect("write hooks");
+    std::fs::write(dir.join(".agents/rules.md"), "rules\n").expect("write rules");
+    std::fs::write(dir.join("README.md"), "readme\n").expect("write readme");
+    git_in(&dir, &["init", "-q", "-b", "main"]);
+    git_in(&dir, &["add", "."]);
+    git_in(&dir, &["commit", "-q", "-m", "base"]);
+    git_in(&dir, &["remote", "add", "origin", origin]);
+    git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git_in(
+        &dir,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    dir
+}
+
+/// Installs the argv-printing runtime that declares the trusted-checkout keys.
+async fn install_trusting_runtime<S>(servers: &Servers, local: &mut Framed<S, LinesCodec>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let program = argv_program(&servers.plugins);
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &trusting_keys());
+    let (_digest, installed) =
+        install_descriptor(local, &servers.plugins, "agent-trusting", &document, false).await;
+    installed.expect("the package installs");
+}
+
+/// A bare repository next to `dir` holding the commit `refs/remotes/origin/main`
+/// of the checkout `dir` as its `HEAD`: what GitHub reports in these scenarios.
+fn remote_snapshot(dir: &Path) -> String {
+    let remote = dir.with_file_name(format!(
+        "{}-remote.git",
+        dir.file_name().expect("checkout name").to_string_lossy()
+    ));
+    git_in(
+        dir.parent().expect("checkout parent"),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            &remote.to_string_lossy(),
+        ],
+    );
+    git_in(
+        &remote,
+        &[
+            "fetch",
+            "-q",
+            &dir.to_string_lossy(),
+            "refs/remotes/origin/main:refs/heads/main",
+        ],
+    );
+    remote.to_string_lossy().into_owned()
+}
+
+/// Makes the repository the predicate fetches the remote `HEAD` from `source`.
+fn announce_remote_source(servers: &Servers, source: Option<String>) {
+    *servers.remote_source.lock().expect("remote source") = source;
+}
+
+/// The arguments a new session in `cwd` is launched with when the remote
+/// reports the checkout's own `origin/main`, after which the session is
+/// stopped.
+async fn created_argv<S>(
+    local: &mut Framed<S, LinesCodec>,
+    servers: &Servers,
+    cwd: &Path,
+) -> Vec<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    announce_remote_source(servers, Some(remote_snapshot(cwd)));
+    launched_argv(local, cwd).await
+}
+
+/// The arguments a new session in `cwd` is launched with under the current
+/// remote `HEAD`, after which the session is stopped.
+async fn launched_argv<S>(local: &mut Framed<S, LinesCodec>, cwd: &Path) -> Vec<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let id = start_named_session(local, RUNTIME, cwd, None).await;
+    let argv = printed_argv(local, &id).await;
+    let _: protocol::SessionStopResult = call(local, method::SESSION_STOP, json!(id)).await;
+    argv
+}
+
+fn carries_trust_arg(argv: &[String]) -> bool {
+    argv.iter().any(|arg| arg == TRUST_ARG)
+}
+
+/// The host's trusted repositories in the form the config file records.
+fn host_trusting(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of checkouts walks every case of the predicate against a single daemon"
+)]
+async fn only_a_clean_checkout_of_a_trusted_repository_gets_the_trusted_args() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-create",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let own = "https://github.com/acme/widgets.git";
+
+    // DoD 1: a clean checkout of the trusted repository; the arguments follow
+    // the frozen arguments and precede the native reference.
+    let clean = checkout(root, "clean", own);
+    let argv = created_argv(&mut local, &servers, &clean).await;
+    assert_eq!(
+        without_reference(&argv, &["--session-id"]),
+        strings(&["--model", "fast", TRUST_ARG, "--session-id"])
+    );
+
+    // Both URL forms and any letter case name the same repository.
+    for (name, origin) in [
+        ("scp", "git@github.com:acme/widgets.git"),
+        ("mixed-case", "https://github.com/Acme/Widgets"),
+    ] {
+        let dir = checkout(root, name, origin);
+        assert!(
+            carries_trust_arg(&created_argv(&mut local, &servers, &dir).await),
+            "{name}"
+        );
+    }
+
+    // DoD 2: a fork, a repository the host does not list, and every origin
+    // outside the two exact GitHub forms.
+    for (name, origin) in [
+        ("fork", "https://github.com/mallory/widgets.git"),
+        ("other-repo", "https://github.com/acme/gadgets.git"),
+        ("gitlab", "https://gitlab.com/acme/widgets.git"),
+        ("http", "http://github.com/acme/widgets.git"),
+        (
+            "lookalike-host",
+            "https://github.com.evil.example/acme/widgets.git",
+        ),
+        ("userinfo", "https://token@github.com/acme/widgets.git"),
+        ("extra-segment", "https://github.com/acme/widgets/extra.git"),
+        ("trailing", "https://github.com/acme/widgets.git/"),
+        ("ssh-url", "ssh://git@github.com/acme/widgets.git"),
+    ] {
+        let dir = checkout(root, name, origin);
+        assert!(
+            !carries_trust_arg(&created_argv(&mut local, &servers, &dir).await),
+            "{name}"
+        );
+    }
+
+    // DoD 3: a commit that changes, or adds, what the trust loads.
+    let changed = checkout(root, "pr-changes-muse", own);
+    std::fs::write(changed.join(".muse/hooks.json"), "{\"hooks\": 1}\n").expect("edit hooks");
+    git_in(&changed, &["commit", "-q", "-a", "-m", "pr"]);
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &changed).await
+    ));
+    let added = checkout(root, "pr-adds-agents-file", own);
+    std::fs::write(added.join(".agents/extra.md"), "extra\n").expect("add rule");
+    git_in(&added, &["add", "."]);
+    git_in(&added, &["commit", "-q", "-m", "pr"]);
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &added).await
+    ));
+    // A change outside the declared paths does not matter.
+    let elsewhere = checkout(root, "pr-changes-readme", own);
+    std::fs::write(elsewhere.join("README.md"), "changed\n").expect("edit readme");
+    git_in(&elsewhere, &["commit", "-q", "-a", "-m", "pr"]);
+    assert!(carries_trust_arg(
+        &created_argv(&mut local, &servers, &elsewhere).await
+    ));
+
+    // DoD 4: local changes under a declared path, in every form git knows.
+    let modified = checkout(root, "dirty-modified", own);
+    std::fs::write(modified.join(".muse/hooks.json"), "{\"local\": 1}\n").expect("edit hooks");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &modified).await
+    ));
+    let staged = checkout(root, "dirty-staged", own);
+    std::fs::write(staged.join(".agents/rules.md"), "staged\n").expect("edit rules");
+    git_in(&staged, &["add", ".agents/rules.md"]);
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &staged).await
+    ));
+    let untracked = checkout(root, "dirty-untracked", own);
+    std::fs::write(untracked.join(".muse/new.json"), "{}\n").expect("add file");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &untracked).await
+    ));
+    let ignored = checkout(root, "dirty-ignored", own);
+    std::fs::write(ignored.join(".git/info/exclude"), ".muse/local.json\n").expect("exclude");
+    std::fs::write(ignored.join(".muse/local.json"), "{}\n").expect("add ignored file");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &ignored).await
+    ));
+    let hidden = checkout(root, "dirty-hidden", own);
+    git_in(
+        &hidden,
+        &["update-index", "--assume-unchanged", ".muse/hooks.json"],
+    );
+    std::fs::write(hidden.join(".muse/hooks.json"), "{\"hidden\": 1}\n").expect("edit hooks");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &hidden).await
+    ));
+
+    // A content filter in the repository configuration never runs: the
+    // comparison hashes file contents without filters, and the checkout is
+    // still trusted.
+    let filtered = checkout(root, "local-filter", own);
+    let marker = root.join("filter-ran");
+    git_in(
+        &filtered,
+        &[
+            "config",
+            "filter.x.clean",
+            &format!("touch {}", marker.display()),
+        ],
+    );
+    std::fs::write(filtered.join(".git/info/attributes"), ".muse/** filter=x\n")
+        .expect("write attributes");
+    std::fs::write(filtered.join(".muse/hooks.json"), "{}\n").expect("touch hooks");
+    assert!(carries_trust_arg(
+        &created_argv(&mut local, &servers, &filtered).await
+    ));
+    assert!(!marker.exists(), "no filter ran");
+    // Repository configuration that would run a program through a lazy fetch
+    // is never read: no git command runs against the checkout.
+    let promisor = checkout(root, "promisor", own);
+    let probe = root.join("promisor-ran");
+    let script = root.join("promisor.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", probe.display()),
+    )
+    .expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    git_in(&promisor, &["config", "core.repositoryformatversion", "1"]);
+    git_in(&promisor, &["config", "extensions.partialClone", "evil"]);
+    git_in(
+        &promisor,
+        &["config", "remote.evil.url", &root.to_string_lossy()],
+    );
+    git_in(
+        &promisor,
+        &[
+            "config",
+            "remote.evil.uploadpack",
+            &script.to_string_lossy(),
+        ],
+    );
+    assert!(carries_trust_arg(
+        &created_argv(&mut local, &servers, &promisor).await
+    ));
+    assert!(!probe.exists(), "no program ran");
+    // A submodule below a declared path, in the remote HEAD's own tree.
+    let submodule = checkout(root, "submodule", own);
+    git_in(
+        &submodule,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,.agents/sub",
+        ],
+    );
+    git_in(&submodule, &["commit", "-q", "-m", "gitlink"]);
+    git_in(
+        &submodule,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &submodule).await
+    ));
+    // An entry that differs from a declared path only by letter case, in the
+    // remote HEAD's own tree.
+    let collision = checkout(root, "case-collision", own);
+    std::fs::create_dir_all(collision.join(".MUSE")).expect("create .MUSE");
+    std::fs::write(collision.join(".MUSE/hooks.json"), "{}\n").expect("write hooks");
+    git_in(&collision, &["add", "."]);
+    git_in(&collision, &["commit", "-q", "-m", "pr"]);
+    git_in(
+        &collision,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &collision).await
+    ));
+    // A symbolic link below a declared path.
+    let linked = checkout(root, "symlink", own);
+    std::fs::remove_file(linked.join(".agents/rules.md")).expect("remove rules");
+    std::os::unix::fs::symlink("../README.md", linked.join(".agents/rules.md")).expect("link");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &linked).await
+    ));
+    // An executable bit the remote tree does not have.
+    let executable = checkout(root, "executable", own);
+    std::fs::set_permissions(
+        executable.join(".muse/hooks.json"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod hooks");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &executable).await
+    ));
+    // Forged local refs and index do not help: the checkout's `origin/main`
+    // follows a malicious commit, but the remote reports the real one.
+    let forged = checkout(root, "forged-refs", own);
+    let real_remote = remote_snapshot(&forged);
+    std::fs::write(forged.join(".muse/hooks.json"), "{\"evil\": 1}\n").expect("edit hooks");
+    git_in(&forged, &["commit", "-q", "-a", "-m", "pr"]);
+    git_in(&forged, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    announce_remote_source(&servers, Some(real_remote));
+    assert!(!carries_trust_arg(
+        &launched_argv(&mut local, &forged).await
+    ));
+
+    // DoD 5: the remote repository cannot be fetched from.
+    let unfetched = checkout(root, "unfetched-head", own);
+    announce_remote_source(
+        &servers,
+        Some(root.join("missing.git").to_string_lossy().into_owned()),
+    );
+    assert!(!carries_trust_arg(
+        &launched_argv(&mut local, &unfetched).await
+    ));
+
+    // A launch below the checkout root compares different trees, so it is not
+    // trusted.
+    let nested = clean.join(".muse");
+    announce_remote_source(&servers, Some(remote_snapshot(&clean)));
+    assert!(!carries_trust_arg(
+        &launched_argv(&mut local, &nested).await
+    ));
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn resume_and_fork_evaluate_the_trust_again() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-relaunch",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "relaunched", "https://github.com/acme/widgets.git");
+    let hooks = dir.join(".muse/hooks.json");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    let created = start_named_session(&mut local, RUNTIME, &dir, None).await;
+    assert!(carries_trust_arg(&printed_argv(&mut local, &created).await));
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
+
+    // DoD 7: `.muse` changed after the create, so the resume is not trusted.
+    std::fs::write(&hooks, "{\"changed\": 1}\n").expect("edit hooks");
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert!(!carries_trust_arg(&argv), "{argv:?}");
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+
+    // A fork of the same session is not trusted either.
+    let forked: protocol::SessionForkResult = call(
+        &mut local,
+        method::SESSION_FORK,
+        json!({ "session_id": resumed.session.id, "name": null, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    let argv = printed_argv(&mut local, &forked.session.id).await;
+    assert!(!carries_trust_arg(&argv), "{argv:?}");
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(forked.session.id)).await;
+
+    // Restoring the file makes the next resume and fork trusted again; the
+    // arguments are never part of the persisted snapshot.
+    std::fs::write(&hooks, "{}\n").expect("restore hooks");
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert_eq!(
+        without_reference(&argv, &["--session"]),
+        strings(&["--model", "fast", TRUST_ARG, "--session"])
+    );
+    let forked: protocol::SessionForkResult = call(
+        &mut local,
+        method::SESSION_FORK,
+        json!({ "session_id": resumed.session.id, "name": null, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    let argv = printed_argv(&mut local, &forked.session.id).await;
+    assert_eq!(
+        without_reference(&argv, &["--fork"]),
+        strings(&["--model", "fast", TRUST_ARG, "--fork"])
+    );
+    assert!(
+        !store_text(&servers).contains(TRUST_ARG),
+        "the store holds no trusted argument"
+    );
+
+    for id in [forked.session.id, resumed.session.id] {
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_host_that_trusts_no_repository_never_adds_the_trusted_args() {
+    let servers = spawn_servers_over("pkg-trust-none", Some("")).await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "perfect", "https://github.com/acme/widgets.git");
+
+    // DoD 2: an absent list trusts nothing, even for a perfect checkout.
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &dir).await
+    ));
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// A tracing writer that keeps what the daemon logs.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The log buffer of the process-wide subscriber, installed once so every
+/// test of this binary shares one callsite interest; a scenario finds its own
+/// lines by its checkout path.
+fn captured_log() -> &'static CapturedLog {
+    static LOG: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other subscriber is installed in this test binary");
+        captured
+    })
+}
+
+#[tokio::test]
+async fn a_git_failure_withholds_the_trusted_args_and_logs_one_line() {
+    let captured = captured_log();
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-failure",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(
+        root,
+        "unreachable-remote",
+        "https://github.com/acme/widgets.git",
+    );
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    let created = start_named_session(&mut local, RUNTIME, &dir, None).await;
+    assert!(carries_trust_arg(&printed_argv(&mut local, &created).await));
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
+
+    // DoD 6: the remote HEAD cannot be read.
+    announce_remote_source(&servers, None);
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert!(!carries_trust_arg(&argv), "{argv:?}");
+
+    let log = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains("checkout_trust.failed") && line.contains(&*dir.to_string_lossy())
+        })
+        .collect();
+    assert_eq!(lines.len(), 1, "one trace line for the failure: {log}");
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of descriptors walks every refusal against a single daemon"
+)]
+async fn trusted_checkout_keys_install_only_as_a_valid_declaration() {
+    let servers = spawn_servers("pkg-trust-descriptor").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = argv_program(&servers.plugins);
+
+    let without_requires = checkout_trust_descriptor(&program, "", &trusting_keys());
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "trust-without-requires",
+        &without_requires,
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a gated key without requires").code,
+        "runtime_feature_unsupported"
+    );
+
+    let too_many_paths: Vec<String> = (0..17).map(|n| format!("\"p{n}\"")).collect();
+    let long_path = format!("\"{}\"", "a".repeat(257));
+    for (name, keys) in [
+        ("args-only", format!("trusted_checkout_args = [\"{TRUST_ARG}\"]\n")),
+        (
+            "paths-only",
+            "trusted_checkout_paths = [\".muse\"]\n".to_owned(),
+        ),
+        (
+            "empty-paths",
+            format!("trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = []\n"),
+        ),
+        (
+            "empty-args",
+            "trusted_checkout_args = []\ntrusted_checkout_paths = [\".muse\"]\n".to_owned(),
+        ),
+        (
+            "placeholder",
+            "trusted_checkout_args = [\"--name={session_name}\"]\ntrusted_checkout_paths = [\".muse\"]\n".to_owned(),
+        ),
+        (
+            "too-many-paths",
+            format!(
+                "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [{}]\n",
+                too_many_paths.join(", ")
+            ),
+        ),
+        (
+            "long-path",
+            format!(
+                "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [{long_path}]\n"
+            ),
+        ),
+    ] {
+        let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &keys);
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("trust-{name}"),
+            &document,
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "{name} is refused");
+    }
+    for (name, path) in [
+        ("absolute", "/etc"),
+        ("parent", "../muse"),
+        ("nested-parent", "a/../b"),
+        ("dot", "."),
+        ("current", "./muse"),
+        ("empty-segment", "a//b"),
+        ("trailing-slash", "muse/"),
+        ("git-dir", ".git"),
+        ("git-dir-nested", "x/.GIT/hooks"),
+        ("backslash", "a\\\\b"),
+        ("colon", "a:b"),
+    ] {
+        let keys = format!(
+            "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\"{path}\"]\n"
+        );
+        let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &keys);
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("trust-path-{name}"),
+            &document,
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "the path {name} is refused");
+    }
+    let repeated = format!(
+        "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\".muse\", \".muse\"]\n"
+    );
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &repeated);
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "trust-repeated",
+        &document,
+        false,
+    )
+    .await;
+    assert!(result.is_err(), "a repeated path is refused");
+
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &trusting_keys());
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "trust-valid",
+        &document,
+        false,
+    )
+    .await;
+    result.expect("a valid declaration installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_frozen_trusted_arg_is_withheld_from_an_untrusted_resume() {
+    let servers = spawn_servers_over("pkg-trust-frozen", Some("")).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = argv_program(&servers.plugins);
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &trusting_keys())
+        .replace(
+            "args = [\"--model\", \"fast\"]\n",
+            &format!("args = [\"--model\", \"fast\", \"{TRUST_ARG}\"]\n"),
+        );
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-frozen",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "frozen", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    // The fixed argument is part of the create; the host trusts no repository,
+    // so a resume drops it.
+    let created = start_named_session(&mut local, RUNTIME, &dir, None).await;
+    assert!(carries_trust_arg(&printed_argv(&mut local, &created).await));
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert!(!carries_trust_arg(&argv), "{argv:?}");
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
     drop(local);
     servers.stop().await;
 }

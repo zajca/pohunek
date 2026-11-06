@@ -1280,6 +1280,45 @@ naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`
 otherwise. The check signals nothing. Human `session inspect` adds a `placement`
 row (`placement_escape: <pid> (<comm>), ...` for an escape).
 
+### Trusted checkout arguments
+
+A runtime may add arguments to a launch only for a checkout the operator owns
+(runtime feature `checkout-trust-args-v1`, listed in `requires`; `runtime_api`
+stays 1):
+
+```toml
+requires = ["checkout-trust-args-v1"]
+
+[runtime]
+trusted_checkout_args = ["--trust-workspace"]
+trusted_checkout_paths = [".muse", ".agents"]
+```
+
+`trusted_checkout_args` holds 1 to 8 literal tokens without `{session_name}`.
+`trusted_checkout_paths` is required with it: 1 to 16 distinct relative,
+normalized `/`-separated paths of at most 256 bytes, with no empty, `.`, `..` or
+`.git` component and no backslash, colon or control character. A violation, one
+key without the other, or a key without the feature is refused at install
+(`descriptor_invalid`, `runtime_feature_unsupported`; the diagnostic never reflects
+an entry). At `session.new`, `session.resume` and `session.fork` the daemon
+appends the arguments after the frozen, contributor and `[naming]` arguments and
+before the native reference and prompt arguments, only when the project's stored
+`origin_url` is a GitHub repository in one of the two exact forms
+(`https://github.com/<owner>/<repo>[.git]`, `git@github.com:<owner>/<repo>[.git]`;
+scheme, host and owner are case-insensitive) whose lower-cased `owner/repo` is in
+`service.toml` `[checkout_trust] trusted_repositories`, the launch directory holds a
+`.git` entry, and the files on disk under every declared path are exactly the blobs (by
+content object id, with executable bits) that the tree of the commit `HEAD` names on
+`https://github.com/<owner>/<repo>.git` holds there. The daemon fetches that commit
+(one commit, trees only, https only, objects verified) into a private bare repository below the worker state root
+and runs no git command against the checkout, so its refs, index, objects and
+configuration cannot influence the answer; symbolic links, submodules, special files,
+untracked or ignored files and letter-case collisions refuse. Any error, timeout or
+missing fact withholds the arguments, all git calls of one evaluation share a 30 second
+deadline, and a failure logs one `checkout_trust.failed` warning. The arguments are
+evaluated at every launch and never persisted: no store or protocol change. A descriptor
+without the keys keeps its digest.
+
 ### Secret session environment
 
 A host profile can declare variables whose values come from the `session.new`
@@ -2966,7 +3005,13 @@ once); it is additive, so it leaves `schema_version` at 7 and the writer omits
 the table while every key equals its default. The `[hooks]` table also takes the optional `required` key, a list
 of the hook events whose failure ends `session.new` (only `"post-create"`, #670);
 it is additive, so it leaves `schema_version` at 7, the writer omits it while it
-is empty, and a previous release ignores the key and does not enforce it.
+is empty, and a previous release ignores the key and does not enforce it. The optional
+`[checkout_trust]` table takes `trusted_repositories`, a list of up to 256 GitHub
+`owner/repo` names (owner of 1 to 39 letters, digits or hyphens; repo of 1 to 100
+letters, digits, `.`, `_` or `-`, not ending in `.git`; compared in lower case, so a repeat that differs only
+in case is refused); an absent table or an empty list trusts no repository. It is
+additive too: the writer omits the table while the list is empty, and a previous
+release reports it as an unknown table. See "Trusted checkout arguments".
 `service.toml` tolerates keys this version does not know (#1401). The
 `schema_version` changes only for a breaking change: a removed or renamed key, a
 changed meaning or unit, or validation that rejects a file that was valid

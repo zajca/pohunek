@@ -15,7 +15,9 @@ use std::io;
 use std::sync::Arc;
 
 use super::launch_input::LaunchSubject;
-use crate::agent::host::{LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost};
+use crate::agent::host::{
+    CheckoutTrust, LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost,
+};
 use crate::agent::{
     InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, Pin, ProfilePin, ProfileRegistry,
     ReferenceCheckFailure, ReferenceExistence, StoreRoot,
@@ -910,6 +912,13 @@ impl SessionRegistry {
             ..
         } = relaunch;
         let name = validate_session_name(params.name.as_deref())?;
+        let trusted_args = self
+            .trusted_checkout_args(
+                &relaunch.definition,
+                &binding.cwd,
+                binding.project_id.as_deref(),
+            )
+            .await;
         let inputs = self.launch_inputs(
             &relaunch.definition,
             &env,
@@ -919,6 +928,7 @@ impl SessionRegistry {
                 kind: LaunchKind::Fork,
                 frozen_args: &binding.args,
                 name: name.as_deref(),
+                trusted_args: &trusted_args,
             },
         )?;
         let opts = LaunchOpts {
@@ -930,7 +940,7 @@ impl SessionRegistry {
         };
         let (command, fork_reference) = fork_pty_command_from_launch(
             &program,
-            command_args(&binding.args, &inputs.root_args),
+            command_args(&binding.args, &inputs.root_args, &relaunch.definition),
             &launch,
             &session_ref,
             &opts,
@@ -1295,6 +1305,13 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
+        let trusted_args = self
+            .trusted_checkout_args(
+                &relaunch.definition,
+                &binding.cwd,
+                binding.project_id.as_deref(),
+            )
+            .await;
         let inputs = self.launch_inputs(
             &relaunch.definition,
             &env,
@@ -1304,6 +1321,7 @@ impl SessionRegistry {
                 kind: LaunchKind::Resume,
                 frozen_args: &binding.args,
                 name: binding.name.as_deref(),
+                trusted_args: &trusted_args,
             },
         )?;
         let opts = LaunchOpts {
@@ -1315,7 +1333,7 @@ impl SessionRegistry {
         };
         let command = resume_pty_command_from_launch(
             &program,
-            command_args(&binding.args, &inputs.root_args),
+            command_args(&binding.args, &inputs.root_args, &relaunch.definition),
             &launch,
             &session_ref,
             &opts,
@@ -2093,6 +2111,28 @@ fn join_error_to_io<T>(err: tokio::task::JoinError) -> io::Result<T> {
 
 /// The frozen arguments of a relaunch followed by the launch-input arguments,
 /// for the command only: the snapshot keeps the frozen arguments alone.
-fn command_args(frozen: &[String], root_args: &[String]) -> Vec<String> {
-    frozen.iter().chain(root_args).cloned().collect()
+///
+/// A run of frozen arguments equal to the runtime's `trusted_checkout_args` is
+/// left out: a session whose fixed arguments hold them must not carry them
+/// into a checkout the trust predicate does not accept.
+fn command_args(
+    frozen: &[String],
+    root_args: &[String],
+    definition: &RuntimeDefinition,
+) -> Vec<String> {
+    let withheld = definition
+        .checkout_trust()
+        .map_or(&[][..], CheckoutTrust::args);
+    let mut command = Vec::with_capacity(frozen.len() + root_args.len());
+    let mut index = 0;
+    while index < frozen.len() {
+        if !withheld.is_empty() && frozen[index..].starts_with(withheld) {
+            index += withheld.len();
+        } else {
+            command.push(frozen[index].clone());
+            index += 1;
+        }
+    }
+    command.extend_from_slice(root_args);
+    command
 }

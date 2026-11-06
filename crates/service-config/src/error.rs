@@ -226,6 +226,34 @@ pub enum ConfigError {
         /// Zero-based position of its first occurrence.
         first: usize,
     },
+    /// A `checkout_trust.trusted_repositories` entry is not a GitHub `owner/repo`.
+    #[error(
+        "service config key checkout_trust.trusted_repositories entry {index} is not a GitHub \
+         owner/repo name"
+    )]
+    InvalidTrustedRepository {
+        /// Zero-based position of the rejected entry.
+        index: usize,
+    },
+    /// `checkout_trust.trusted_repositories` lists a repository twice.
+    #[error(
+        "service config key checkout_trust.trusted_repositories entry {index} repeats entry \
+         {first}; list each repository once"
+    )]
+    DuplicateTrustedRepository {
+        /// Zero-based position of the repeated entry.
+        index: usize,
+        /// Zero-based position of its first occurrence.
+        first: usize,
+    },
+    /// `checkout_trust.trusted_repositories` lists more than the allowed entries.
+    #[error(
+        "service config key checkout_trust.trusted_repositories lists more than {max} entries"
+    )]
+    TooManyTrustedRepositories {
+        /// The most entries the list may hold.
+        max: usize,
+    },
     /// `environment.search_path` holds an entry or value the job `PATH` cannot carry.
     #[error("service config key environment.search_path is invalid: {detail}")]
     InvalidSearchPath {

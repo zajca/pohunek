@@ -7,6 +7,7 @@
 
 // Rust guideline compliant 2026-10-27
 
+use std::path::Path;
 use std::sync::Arc;
 
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
@@ -15,6 +16,7 @@ use tracing::warn;
 use super::{validate_session_name, SessionRegistry};
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::LaunchEnv;
+use crate::checkout_trust::CheckoutFacts;
 use crate::integration::launch_input::{
     place, LaunchInput, LaunchInputContext, LaunchKind, LAUNCH_INPUT_UNAVAILABLE_CODE,
 };
@@ -30,6 +32,10 @@ pub(super) struct LaunchSubject<'a> {
     pub(super) frozen_args: &'a [String],
     /// The session name this launch uses, if any.
     pub(super) name: Option<&'a str>,
+    /// The runtime's trusted-checkout arguments when this launch's checkout
+    /// passed the trust predicate, else empty; see
+    /// [`SessionRegistry::trusted_checkout_args`].
+    pub(super) trusted_args: &'a [String],
 }
 
 /// The environment and root-position arguments of one launch.
@@ -44,6 +50,99 @@ pub(super) struct LaunchInputs {
 }
 
 impl SessionRegistry {
+    /// Replaces the GitHub URL the trusted-checkout predicate fetches a
+    /// repository's remote `HEAD` from, for an embedder or a test with no route
+    /// to GitHub; the replacement is a local path. The resolver gets the
+    /// lower-cased `owner/repo`; `None` is a failed lookup, which trusts nothing.
+    pub fn set_checkout_remote_source<F>(&self, resolver: F)
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        if let Ok(mut slot) = self.inner.checkout_remote_source.lock() {
+            *slot = Some(crate::checkout_trust::RemoteSourceResolver::new(resolver));
+        }
+    }
+
+    /// The runtime's `trusted_checkout_args` when the checkout at `cwd` is
+    /// trusted, else empty.
+    ///
+    /// A runtime that declares none, a host that trusts no repository and
+    /// every error or ambiguity give no arguments. The predicate runs git
+    /// against the checkout, so it runs off the async threads. `project_id`
+    /// names the project record whose stored origin the live origin must
+    /// equal.
+    pub(super) async fn trusted_checkout_args(
+        &self,
+        definition: &RuntimeDefinition,
+        cwd: &Path,
+        project_id: Option<&str>,
+    ) -> Vec<String> {
+        let Some(trust) = definition.checkout_trust() else {
+            return Vec::new();
+        };
+        let repositories = self.inner.config.trusted_repositories.clone();
+        let (Some(projects), Some(project_id)) = (self.inner.projects.clone(), project_id) else {
+            return Vec::new();
+        };
+        if repositories.is_empty() {
+            return Vec::new();
+        }
+        let Some(scratch_root) = self
+            .inner
+            .config
+            .worker_state_root
+            .as_deref()
+            .map(|root| root.join(CHECKOUT_TRUST_SCRATCH_DIR))
+        else {
+            return Vec::new();
+        };
+        let remote_source = self
+            .inner
+            .checkout_remote_source
+            .lock()
+            .ok()
+            .and_then(|resolver| resolver.clone());
+        let (cwd, project_id, paths) = (
+            cwd.to_path_buf(),
+            project_id.to_owned(),
+            trust.paths().to_vec(),
+        );
+        let trusted = tokio::task::spawn_blocking(move || {
+            let record = match projects.resolve(&project_id) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(
+                        event = "checkout_trust.project_unavailable",
+                        error = %error.msg,
+                        "the launch's project record cannot be read; the checkout is not trusted"
+                    );
+                    return false;
+                }
+            };
+            crate::checkout_trust::is_trusted(&CheckoutFacts {
+                cwd: &cwd,
+                stored_origin: record.origin_url.as_deref(),
+                trusted_repositories: &repositories,
+                paths: &paths,
+                scratch_root: &scratch_root,
+                remote_source: remote_source.as_ref(),
+            })
+        })
+        .await
+        .unwrap_or_else(|_join_error| {
+            warn!(
+                event = "checkout_trust.task_failed",
+                "the checkout trust predicate task failed; the checkout is not trusted"
+            );
+            false
+        });
+        if trusted {
+            trust.args().to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Composes the environment and root arguments of a launch of `id`.
     ///
     /// A runtime whose handler has no contributor gets exactly
@@ -73,10 +172,12 @@ impl SessionRegistry {
             kind,
             frozen_args,
             name,
+            trusted_args,
         } = subject;
         let base = self.launch_env(definition, profile_env, agent.clone(), id);
         let mut declared_args = placement_args(definition, frozen_args);
         declared_args.extend(naming_args(definition, name, id));
+        declared_args.extend_from_slice(trusted_args);
         let Some(contribution) = self.contribution(definition, &base, id, kind, frozen_args)?
         else {
             return Ok(LaunchInputs {
@@ -220,6 +321,10 @@ fn naming_args(definition: &RuntimeDefinition, name: Option<&str>, id: &SessionI
         }
     }
 }
+
+/// Directory below the worker state root that holds the scratch repositories
+/// of the trusted-checkout predicate.
+const CHECKOUT_TRUST_SCRATCH_DIR: &str = "checkout-trust";
 
 fn unavailable_state_root() -> ProtocolError {
     ProtocolError::new(

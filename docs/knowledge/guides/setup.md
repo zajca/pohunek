@@ -124,6 +124,14 @@ repeated entry makes the configuration load fail with the named key, and
 empty, so a previous release still reads the file. A previous release that reads
 a file with the key reports it as an unknown key and does not enforce it. See
 the hooks guide in [worktrees](../concepts/worktrees.md).
+The optional `[checkout_trust] trusted_repositories = ["owner/repo"]` key lists the
+GitHub repositories whose checkouts a runtime may launch with its
+`trusted_checkout_args` (see [runtime packages](runtime-packages.md#trusted-checkout-arguments)).
+Each entry is `owner/repo` (compared in lower case), at most 256 entries, none twice; an
+invalid or repeated entry makes the configuration load fail with the named key and
+position. An absent table or an empty list trusts no repository, which is also the state of
+a daemon started without `service.toml`. The installer omits the table while the list is
+empty, and a previous release reports it as an unknown table.
 The `[events]` table bounds the event journal `<data>/events/events.jsonl`:
 `max_file_bytes = 33554432` (one file, `1048576..=1073741824`),
 `max_files = 8` (files kept including the active one, `2..=64`) and

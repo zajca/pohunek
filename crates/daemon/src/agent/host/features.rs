@@ -122,6 +122,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "placement-v1",
         since: "0.40.0",
     },
+    RuntimeFeature {
+        id: "checkout-trust-args-v1",
+        since: "0.40.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -188,6 +192,14 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "placement-v1",
         rule: GateRule::Key("placement"),
+    },
+    FeatureGate {
+        feature: "checkout-trust-args-v1",
+        rule: GateRule::Key("runtime.trusted_checkout_args"),
+    },
+    FeatureGate {
+        feature: "checkout-trust-args-v1",
+        rule: GateRule::Key("runtime.trusted_checkout_paths"),
     },
 ];
 
