@@ -69,7 +69,7 @@ const SCHEMA_THREE_TEMPLATE: &str = r#"
 
 schema_version = 3
 prefix = "{PREFIX}"
-active_version = "0.33.1"
+active_version = "0.34.2"
 
 [namespace]
 uid = {UID}
@@ -224,9 +224,18 @@ impl Host {
 
 /// Turns the schema-3 template into a schema-`version` file (4 or later) with
 /// the given `[waits]` values: the input write stall bound exists from schema 5
-/// on, `[hooks]` from schema 6 on and `[events]` from schema 7 on.
+/// on, `[hooks]` from schema 6 on and `[events]` from schema 7 on. The
+/// `active_version` is the release that first shipped the schema: v0.35.0 for
+/// schema 6 and v0.36.0 for schema 7. Schemas 4 and 5 were never released on
+/// their own, so they carry the v0.35.0 release that superseded them.
 fn waits_file(template: &str, version: u32, default_ms: u64, max_ms: u64) -> String {
-    let template = template.replace("schema_version = 3", &format!("schema_version = {version}"));
+    let active_version = if version >= 7 { "0.36.0" } else { "0.35.0" };
+    let template = template
+        .replace("schema_version = 3", &format!("schema_version = {version}"))
+        .replace(
+            "active_version = \"0.34.2\"",
+            &format!("active_version = \"{active_version}\""),
+        );
     let template = if version >= 5 {
         template.replace(
             "submit_delay_ms = 275",

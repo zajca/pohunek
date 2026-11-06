@@ -77,16 +77,24 @@ jobs:
       - name: Free preinstalled toolchains
         timeout-minutes: 10
         env:
-          # Each removal is bounded well below the step bound, so a slow
+          # The whole prune loop shares one budget below the step's
+          # timeout-minutes (600 s). Each removal gets the budget that is
+          # left, and a removal that finds none left is skipped, so a slow
           # prune on a degraded runner becomes a warning, not a red gate.
-          PRUNE_TIMEOUT_SECONDS: "300"
+          PRUNE_BUDGET_SECONDS: "480"
         run: |
           set -uo pipefail
           echo "disk: before pruning"
           df -h / "$RUNNER_TEMP" || true
+          deadline=$((SECONDS + PRUNE_BUDGET_SECONDS))
           for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
             if [ -d "$dir" ]; then
-              timeout "$PRUNE_TIMEOUT_SECONDS" sudo rm -rf -- "$dir" || echo "::warning::could not prune $dir"
+              remaining=$((deadline - SECONDS))
+              if [ "$remaining" -le 0 ]; then
+                echo "::warning::prune budget exhausted, skipping $dir"
+                continue
+              fi
+              timeout "$remaining" sudo rm -rf -- "$dir" || echo "::warning::could not prune $dir"
             fi
           done
           echo "disk: after pruning"
