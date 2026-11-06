@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 15;
+pub const STORE_SCHEMA_VERSION: u32 = 16;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -110,6 +110,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 14,
         apply: migrate_v14_to_v15,
+    },
+    Migration {
+        from: 15,
+        apply: migrate_v15_to_v16,
     },
 ];
 
@@ -221,6 +225,16 @@ fn migrate_v13_to_v14(_record: &mut Map<String, Value>) {}
 /// A record written without the fields has no recorded evidence, which is how
 /// every schema 14 runtime reads, so no record needs rewriting.
 fn migrate_v14_to_v15(_record: &mut Map<String, Value>) {}
+
+/// Schema 15 to 16: a resume binding may record the directory and project its
+/// session was created in (`launch_checkout`), which the trusted checkout
+/// arguments are evaluated on.
+///
+/// A record written without the field has no recorded launch checkout, which
+/// is how every schema 15 session reads, and it is never backfilled from the
+/// session's current directory, which may have moved. Such a session resumes
+/// and forks without the trusted arguments.
+fn migrate_v15_to_v16(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -817,7 +831,7 @@ mod tests {
         let line = V0_33_0_STORE.lines().next().expect("resume line");
         serde_json::from_str::<super::super::Record>(line)
             .map(|record| match record {
-                super::super::Record::Resume(binding) => binding,
+                super::super::Record::Resume(binding) => *binding,
                 _ => unreachable!("the first fixture line is the resume binding"),
             })
             .expect("parse the fixture resume line")

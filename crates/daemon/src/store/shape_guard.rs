@@ -77,6 +77,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (13, include_str!("fixtures/shape/schema-13.txt")),
     (14, include_str!("fixtures/shape/schema-14.txt")),
     (15, include_str!("fixtures/shape/schema-15.txt")),
+    (16, include_str!("fixtures/shape/schema-16.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -124,7 +125,8 @@ fn resume_builtin_json() -> Value {
             }
         },
         "native_reference_provenance": "assigned",
-        "profile_revision": REVISION
+        "profile_revision": REVISION,
+        "launch_checkout": {"cwd": "/work", "project_id": "p-1"}
     })
 }
 
@@ -350,6 +352,7 @@ fn assert_every_field_is_reviewed(
             launch_binding: _,
             native_reference_provenance,
             profile_revision: _,
+            launch_checkout: _,
         } = binding;
         let _: &NativeReferenceProvenance = native_reference_provenance;
         let StoredInputRules {
@@ -620,7 +623,7 @@ fn record_kind_values() -> Vec<String> {
     data_values!(
         Record, Some("kind");
         Record::Session(..) => Record::Session(session()),
-        Record::Resume(..) => Record::Resume(resume()),
+        Record::Resume(..) => Record::Resume(Box::new(resume())),
         Record::Worktree(..) => Record::Worktree(worktree()),
         Record::Project(..) => Record::Project(project()),
     )
@@ -781,6 +784,8 @@ const RESUME_FREE: &[&str] = &[
     "native_session_id",
     "native_session_path",
     "project_id",
+    "launch_checkout.cwd",
+    "launch_checkout.project_id",
     "metadata.*",
     "spawned_by.session_id",
     "spawned_by.daemon_id",
@@ -939,10 +944,12 @@ fn sampled_shape() -> (BTreeSet<String>, Leaves) {
         }
     };
 
-    let (resume_a, paths_a, leaves_a) =
-        typed::<ResumeBinding>(&resume_builtin_json(), Record::Resume);
-    let (resume_b, paths_b, leaves_b) =
-        typed::<ResumeBinding>(&resume_package_json(), Record::Resume);
+    let (resume_a, paths_a, leaves_a) = typed::<ResumeBinding>(&resume_builtin_json(), |binding| {
+        Record::Resume(Box::new(binding))
+    });
+    let (resume_b, paths_b, leaves_b) = typed::<ResumeBinding>(&resume_package_json(), |binding| {
+        Record::Resume(Box::new(binding))
+    });
     let mut resume_leaves = leaves_a;
     for (path, values) in leaves_b {
         resume_leaves.entry(path).or_default().extend(values);

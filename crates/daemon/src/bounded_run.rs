@@ -2,7 +2,8 @@
 //!
 //! Runs one fixed program to completion under hard limits. The caller supplies
 //! the program, its literal arguments and any fixed environment pairs; nothing
-//! else reaches the child. The child gets a closed stdin, a cleared
+//! else reaches the child. The child gets a closed stdin (or the one file the
+//! caller names), a cleared
 //! environment plus a private scratch sandbox, its own process group and a
 //! wall-clock deadline. Its stdout is drained while it runs and capped, so a
 //! flood ends the run at once; its stderr is dropped or kept only as a short
@@ -93,6 +94,8 @@ pub(crate) struct RunSpec<'a> {
     pub(crate) limits: RunLimits,
     /// What happens to stderr.
     pub(crate) stderr: StderrPolicy,
+    /// A file the child reads as its stdin, or none for a closed stdin.
+    pub(crate) stdin: Option<&'a std::fs::File>,
 }
 
 /// The result of a run whose child exited on its own.
@@ -172,7 +175,11 @@ pub(crate) fn run(
     let Some(sandbox) = RunSandbox::create() else {
         return RunOutcome::Unavailable;
     };
-    let mut command = build_command(spec, &sandbox);
+    let stdin = match spec.stdin.map(std::fs::File::try_clone).transpose() {
+        Ok(stdin) => stdin,
+        Err(_uncloneable) => return RunOutcome::Unavailable,
+    };
+    let mut command = build_command(spec, &sandbox, stdin);
     let Ok(mut child) = command.spawn() else {
         return RunOutcome::Unavailable;
     };
@@ -239,9 +246,13 @@ enum Ended {
 }
 
 /// Builds the command: cleared environment, fixed pairs, the sandbox
-/// variables and the optional search path, a closed stdin, and a process group
+/// variables and the optional search path, a closed stdin (or the spec's file), and a process group
 /// of its own.
-fn build_command(spec: &RunSpec<'_>, sandbox: &RunSandbox) -> Command {
+fn build_command(
+    spec: &RunSpec<'_>,
+    sandbox: &RunSandbox,
+    stdin: Option<std::fs::File>,
+) -> Command {
     let mut command = Command::new(spec.program);
     command.envs(spec.seeded_env.iter().copied());
     command.env_clear().envs(spec.env.iter().cloned());
@@ -261,7 +272,7 @@ fn build_command(spec: &RunSpec<'_>, sandbox: &RunSandbox) -> Command {
         command.env(SEARCH_PATH_VAR, search_path);
     }
     command
-        .stdin(Stdio::null())
+        .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
         .stderr(match spec.stderr {
             StderrPolicy::Discard => Stdio::null(),

@@ -25,6 +25,7 @@ use crate::agent::{
 use crate::detect::Manifest;
 use crate::integration::launch_input::LaunchKind;
 use crate::runtime::environment::{base_environment, effective_variable};
+use crate::store::LaunchCheckout;
 use package::PackageDigest;
 use pohunek_worker_protocol::BaseEnv;
 use protocol::ErrorClass;
@@ -56,6 +57,10 @@ pub(super) struct ResumeSnapshot {
     /// Keyed revision of the host profile the session was launched under;
     /// `None` for a session without a profile or a binding that never froze one.
     pub(super) profile_revision: Option<ProfileRevision>,
+    /// The directory and project the session was created with; the trusted
+    /// checkout arguments are evaluated on this pair. Set once at create,
+    /// carried unchanged by every resume and copied by a fork.
+    pub(super) launch_checkout: Option<Box<LaunchCheckout>>,
 }
 
 impl ResumeSnapshot {
@@ -68,6 +73,7 @@ impl ResumeSnapshot {
             launch_binding: host::LaunchPin::Unpinned,
             reference_provenance: NativeReferenceProvenance::Reported,
             profile_revision: None,
+            launch_checkout: None,
         }
     }
 
@@ -80,6 +86,7 @@ impl ResumeSnapshot {
             launch_binding: binding.launch_binding.clone(),
             reference_provenance: binding.native_reference_provenance,
             profile_revision: binding.profile_revision.clone(),
+            launch_checkout: binding.launch_checkout.clone(),
         }
     }
 
@@ -913,11 +920,7 @@ impl SessionRegistry {
         } = relaunch;
         let name = validate_session_name(params.name.as_deref())?;
         let trusted_args = self
-            .trusted_checkout_args(
-                &relaunch.definition,
-                &binding.cwd,
-                binding.project_id.as_deref(),
-            )
+            .trusted_relaunch_args(&relaunch.definition, &binding)
             .await;
         let inputs = self.launch_inputs(
             &relaunch.definition,
@@ -960,6 +963,7 @@ impl SessionRegistry {
                 NativeReferenceProvenance::Reported
             },
             profile_revision: revision,
+            launch_checkout: binding.launch_checkout.clone(),
         };
         let guard = self.lock_lifecycle(&id).await;
         let info = self
@@ -1208,6 +1212,7 @@ impl SessionRegistry {
             native_reference_provenance: entry.snapshot.reference_provenance,
             profile_revision: entry.snapshot.profile_revision.clone(),
             native_launch_unresolved: false,
+            launch_checkout: entry.snapshot.launch_checkout.clone(),
         }
     }
 
@@ -1306,11 +1311,7 @@ impl SessionRegistry {
             ..
         } = relaunch;
         let trusted_args = self
-            .trusted_checkout_args(
-                &relaunch.definition,
-                &binding.cwd,
-                binding.project_id.as_deref(),
-            )
+            .trusted_relaunch_args(&relaunch.definition, &binding)
             .await;
         let inputs = self.launch_inputs(
             &relaunch.definition,
@@ -1348,6 +1349,7 @@ impl SessionRegistry {
             launch_binding: relaunch_pin,
             reference_provenance: binding.native_reference_provenance,
             profile_revision: revision,
+            launch_checkout: binding.launch_checkout.clone(),
         };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
@@ -2112,27 +2114,36 @@ fn join_error_to_io<T>(err: tokio::task::JoinError) -> io::Result<T> {
 /// The frozen arguments of a relaunch followed by the launch-input arguments,
 /// for the command only: the snapshot keeps the frozen arguments alone.
 ///
-/// A run of frozen arguments equal to the runtime's `trusted_checkout_args` is
-/// left out: a session whose fixed arguments hold them must not carry them
-/// into a checkout the trust predicate does not accept.
+/// The frozen arguments go through [`without_trusted_args`].
 fn command_args(
     frozen: &[String],
     root_args: &[String],
     definition: &RuntimeDefinition,
 ) -> Vec<String> {
+    let mut command = without_trusted_args(frozen, definition);
+    command.reserve(root_args.len());
+    command.extend_from_slice(root_args);
+    command
+}
+
+/// `args` without any run equal to the runtime's `trusted_checkout_args`.
+///
+/// Only the trust predicate may add those arguments, so a fixed argument of
+/// the descriptor or a host profile that holds them never reaches a launch:
+/// the launch-input arguments carry them for a checkout the predicate accepts.
+pub(super) fn without_trusted_args(args: &[String], definition: &RuntimeDefinition) -> Vec<String> {
     let withheld = definition
         .checkout_trust()
         .map_or(&[][..], CheckoutTrust::args);
-    let mut command = Vec::with_capacity(frozen.len() + root_args.len());
+    let mut kept = Vec::with_capacity(args.len());
     let mut index = 0;
-    while index < frozen.len() {
-        if !withheld.is_empty() && frozen[index..].starts_with(withheld) {
+    while index < args.len() {
+        if !withheld.is_empty() && args[index..].starts_with(withheld) {
             index += withheld.len();
         } else {
-            command.push(frozen[index].clone());
+            kept.push(args[index].clone());
             index += 1;
         }
     }
-    command.extend_from_slice(root_args);
-    command
+    kept
 }

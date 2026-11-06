@@ -60,6 +60,7 @@ fn schema_14_runtimes_migrate_without_inventing_loss_evidence() {
 fn recorded_loss_evidence_loads_and_survives_a_rewrite() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
     let store = fixture_store(root.path(), SCHEMA_15);
+    store.migrate_to_current().expect("migrate the fixture");
 
     let sessions = store.load_sessions().expect("load the sessions");
     assert_eq!(sessions.len(), 2);

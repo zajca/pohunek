@@ -961,6 +961,7 @@ impl SessionRegistry {
                 native_reference_provenance: snapshot.reference_provenance,
                 profile_revision: snapshot.profile_revision.clone(),
                 native_launch_unresolved: false,
+                launch_checkout: snapshot.launch_checkout.clone(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
@@ -1514,6 +1515,7 @@ pub(super) fn build_launch_command(
         // A bare base kind launches its definition's program and arguments.
         None => host::launch_command(runtimes, &resolved.definition, opts)?,
     };
+    command.args = super::resume::without_trusted_args(&command.args, &resolved.definition);
     command.args.extend_from_slice(root_args);
     command.args.extend_from_slice(native_args);
     Ok(plan_initial_input_delivery(

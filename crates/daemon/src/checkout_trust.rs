@@ -22,6 +22,10 @@
 //!    case all refuse. So does a declared path that the file system resolves
 //!    under another spelling (case or normalization folding).
 //!
+//! A resume or fork evaluates the directory and project the session was created
+//! in, not its current ones, and only when it relaunches in that directory
+//! (`SessionRegistry::trusted_relaunch_args`).
+//!
 //! The scratch repository lives in a daemon-private directory, never in a
 //! directory a launched session can write. No git command runs against the
 //! checkout: its refs, index, objects and configuration are never read, so a
@@ -65,6 +69,11 @@ const MAX_COMPARED_FILES: usize = 2048;
 /// Most directory entries (files and directories) the walk of the declared
 /// paths visits; a checkout with more is not trusted.
 const MAX_WALKED_ENTRIES: usize = 8192;
+
+/// Largest declared file the predicate hashes, in bytes. The declared paths
+/// hold hooks, rules and plugin configuration; a larger file is not trusted
+/// instead of being read.
+const MAX_COMPARED_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Deepest directory nesting the predicate walks below a declared path.
 const MAX_COMPARED_DEPTH: usize = 32;
@@ -211,8 +220,6 @@ pub(crate) struct CheckoutFacts<'a> {
 enum Failure {
     /// The `git` executable could not be resolved.
     NoGit,
-    /// The launch directory is not valid UTF-8, so it cannot be an argument.
-    CwdNotUtf8,
     /// The command ended in a timeout, an overflow or a spawn failure.
     Run,
     /// The total deadline of the evaluation passed.
@@ -231,7 +238,6 @@ impl Failure {
     fn reason(self) -> &'static str {
         match self {
             Self::NoGit => "git is not available",
-            Self::CwdNotUtf8 => "the launch directory is not valid UTF-8",
             Self::Run => "a git command timed out, overflowed or could not run",
             Self::Deadline => "the evaluation passed its total deadline",
             Self::Status => "a git command failed",
@@ -390,37 +396,65 @@ fn contents_match(git: &Git, facts: &CheckoutFacts<'_>, head: &str) -> Result<bo
     let on_disk = walk.files;
     // Set equality: no path is seen twice, every on-disk path is expected
     // (checked with its hash below) and the counts agree.
-    let distinct: std::collections::BTreeSet<&str> =
-        on_disk.iter().map(|(path, _)| path.as_str()).collect();
+    let distinct: std::collections::BTreeSet<&str> = on_disk.iter().map(String::as_str).collect();
     if distinct.len() != on_disk.len()
         || on_disk.len() != expected.len()
         || distinct.iter().any(|path| !expected.contains_key(*path))
     {
         return Ok(false);
     }
-    if on_disk.is_empty() {
-        return Ok(true);
+    for path in &on_disk {
+        let Some((want_executable, want)) = expected.get(path) else {
+            return Ok(false);
+        };
+        let Some(file) = open_declared_file(&facts.cwd.join(path))? else {
+            return Ok(false);
+        };
+        if file.executable != *want_executable {
+            return Ok(false);
+        }
+        let hash = git.hash_blob(&file.handle)?;
+        if hash != *want {
+            return Ok(false);
+        }
     }
-    let root = facts.cwd.to_str().ok_or(Failure::CwdNotUtf8)?;
-    let absolute: Vec<String> = on_disk
-        .iter()
-        .map(|(path, _)| format!("{root}/{path}"))
-        .collect();
-    let mut hashing = vec!["hash-object", "--no-filters", "--"];
-    hashing.extend(absolute.iter().map(String::as_str));
-    let hashes = git.run(&hashing)?;
-    let hashes: Vec<&str> = hashes.success_stdout()?.lines().collect();
-    if hashes.len() != on_disk.len() {
-        return Err(Failure::Output);
+    Ok(true)
+}
+
+/// A declared file opened for hashing.
+struct DeclaredFile {
+    handle: std::fs::File,
+    executable: bool,
+}
+
+/// Opens `path` without following a final symbolic link or blocking on a
+/// special file, and checks the opened descriptor: a regular file no larger
+/// than [`MAX_COMPARED_FILE_BYTES`]. `None` refuses: a symbolic link, a
+/// special file or an oversized file, including one swapped in after the walk.
+///
+/// The returned handle is the object that was checked, so the hash and the
+/// executable bit describe it and not whatever the path names later.
+fn open_declared_file(path: &Path) -> Result<Option<DeclaredFile>, Failure> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let handle = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
+        Ok(handle) => handle,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_unreadable) => return Err(Failure::Disk),
+    };
+    let metadata = handle.metadata().map_err(|_unreadable| Failure::Disk)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_COMPARED_FILE_BYTES {
+        return Ok(None);
     }
-    Ok(on_disk
-        .iter()
-        .zip(hashes)
-        .all(|((path, executable), hash)| {
-            expected.get(path).is_some_and(|(want_executable, want)| {
-                want_executable == executable && want == hash
-            })
-        }))
+    Ok(Some(DeclaredFile {
+        executable: metadata.permissions().mode() & EXECUTE_BITS != 0,
+        handle,
+    }))
 }
 
 /// How a declared path is named on disk.
@@ -454,8 +488,8 @@ struct Walk<'a> {
     deadline: Instant,
     /// Directory entries visited so far, files and directories alike.
     entries: usize,
-    /// The regular files found, relative to `cwd`, with their executable bit.
-    files: Vec<(String, bool)>,
+    /// The regular files found, relative to `cwd`.
+    files: Vec<String>,
 }
 
 impl Walk<'_> {
@@ -517,8 +551,6 @@ impl Walk<'_> {
     /// missing path holds no file. The deadline passing is a
     /// [`Failure::Deadline`].
     fn collect(&mut self, relative: &str, depth: usize) -> Result<bool, Failure> {
-        use std::os::unix::fs::PermissionsExt as _;
-
         if depth > MAX_COMPARED_DEPTH {
             return Ok(false);
         }
@@ -546,10 +578,7 @@ impl Walk<'_> {
             if self.files.len() >= MAX_COMPARED_FILES {
                 return Ok(false);
             }
-            self.files.push((
-                relative.to_owned(),
-                metadata.permissions().mode() & EXECUTE_BITS != 0,
-            ));
+            self.files.push(relative.to_owned());
             return Ok(true);
         }
         if !kind.is_dir() {
@@ -762,7 +791,31 @@ impl Git {
         }
     }
 
+    /// The object id git gives the contents of `file` as a blob, without
+    /// filters. Git reads the descriptor itself, so the hash is of the file
+    /// that was opened and checked.
+    fn hash_blob(&self, file: &std::fs::File) -> Result<String, Failure> {
+        let mut command_args = self.repository_args.clone();
+        command_args.extend(["hash-object", "--no-filters", "--stdin"].map(str::to_owned));
+        let hashed = self.execute_with_stdin(&command_args, &self.env, Some(file))?;
+        let hash = hashed.success_stdout()?.trim();
+        if is_object_id(hash) {
+            Ok(hash.to_owned())
+        } else {
+            Err(Failure::Output)
+        }
+    }
+
     fn execute(&self, args: &[String], env: &[(String, String)]) -> Result<GitResult, Failure> {
+        self.execute_with_stdin(args, env, None)
+    }
+
+    fn execute_with_stdin(
+        &self,
+        args: &[String],
+        env: &[(String, String)],
+        stdin: Option<&std::fs::File>,
+    ) -> Result<GitResult, Failure> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(Failure::Deadline);
@@ -775,6 +828,7 @@ impl Git {
             seeded_env: &[],
             limits: RunLimits::new(GIT_COMMAND_TIMEOUT.min(remaining), GIT_STDOUT_CAP_BYTES),
             stderr: StderrPolicy::Discard,
+            stdin,
         };
         match bounded_run::run(&spec, &Instant::now, None) {
             RunOutcome::Exited(output) => {

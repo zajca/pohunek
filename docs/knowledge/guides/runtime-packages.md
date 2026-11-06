@@ -323,6 +323,12 @@ arguments (after the frozen, contributor and `[naming]` arguments, before the
 native reference and prompt arguments) only when all of these hold; any error,
 timeout, ambiguity or missing fact means they are not appended:
 
+0. A resume or fork evaluates the directory and project the session was created in
+   (recorded once at create, store schema 16, copied by a fork, never refreshed by a
+   cwd change or a resume), not its current ones, and only when the relaunch directory
+   is byte-equal to the create-time directory. A session that moved (OSC 7, the focus
+   process) or one stored before schema 16 relaunches without the arguments and logs
+   one `checkout_trust.failed` warning.
 1. The project record's `origin_url` is exactly `https://github.com/<owner>/<repo>[.git]`
    or `git@github.com:<owner>/<repo>[.git]` (scheme, host and owner compared without
    regard to letter case, a `.git` suffix stripped), that lower-cased `owner/repo` is
@@ -361,9 +367,12 @@ launches without the arguments, and again with them once the path matches again.
 arguments are never frozen into the resume snapshot. A failure (an unreachable remote,
 an unreadable path, the deadline) logs one `checkout_trust.failed` warning naming the
 checkout and the reason, never a URL, and launches without the arguments. A run of
-frozen fixed arguments equal to the `trusted_checkout_args` is dropped from a resume or
-fork command, so a session whose frozen arguments hold them does not carry them into an
-untrusted checkout.
+fixed arguments equal to the `trusted_checkout_args`, in the descriptor's `args` or a host
+profile's `args`, is dropped from a create, resume or fork command, so only the predicate
+adds them and a session whose frozen arguments hold them does not carry them into an
+untrusted checkout. Each declared file is opened without following a symbolic link in its last path component,
+checked on the opened descriptor (a regular file of at most 4 MiB) and hashed from that
+descriptor; a larger file, a special file or a symbolic link refuses.
 
 The keys join the digest of a built-in descriptor only while declared. A core
 older than 0.40 refuses the descriptor with `runtime_feature_unsupported`.

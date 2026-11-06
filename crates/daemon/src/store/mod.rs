@@ -97,6 +97,22 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// record that grew does not reallocate the body.
 const BODY_CAPACITY_SLACK: usize = 4096;
 
+/// The launch directory and project a session was created with.
+///
+/// Recorded once at create and never refreshed by a cwd change or a resume; a
+/// fork copies its source's. The trusted-checkout predicate evaluates this pair,
+/// not the session's current directory, which terminal output and the focus
+/// process can move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchCheckout {
+    /// The directory the session was launched in, as the create passed it to
+    /// the trust predicate.
+    pub cwd: PathBuf,
+    /// The project the create resolved for that directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
 /// One session's native resume and fork recovery binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResumeBinding {
@@ -189,6 +205,10 @@ pub struct ResumeBinding {
     /// agent name when the binding is loaded and clears the flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub native_launch_unresolved: bool,
+    /// The create-time launch directory and project; absent for a session
+    /// stored before it was recorded and for an external session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_checkout: Option<Box<LaunchCheckout>>,
 }
 
 impl ResumeBinding {
@@ -259,6 +279,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             profile_revision: Option<ProfileRevision>,
             #[serde(default)]
             native_launch_unresolved: bool,
+            #[serde(default)]
+            launch_checkout: Option<Box<LaunchCheckout>>,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -296,6 +318,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             native_reference_provenance: raw.native_reference_provenance,
             profile_revision: raw.profile_revision,
             native_launch_unresolved: raw.native_launch_unresolved,
+            launch_checkout: raw.launch_checkout,
         })
     }
 }
@@ -805,7 +828,7 @@ pub enum SessionWriteOutcome {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Record {
     Session(Box<SessionRecord>),
-    Resume(ResumeBinding),
+    Resume(Box<ResumeBinding>),
     Worktree(WorktreeBinding),
     Project(ProjectRecord),
 }
@@ -1803,7 +1826,9 @@ impl Store {
         }
         let mut body = String::with_capacity(capacity + BODY_CAPACITY_SLACK);
         let records = Records {
-            resume: emit_kind(&mut body, records.resume, Record::Resume)?,
+            resume: emit_kind(&mut body, records.resume, |binding| {
+                Record::Resume(Box::new(binding))
+            })?,
             worktrees: emit_kind(&mut body, records.worktrees, Record::Worktree)?,
             projects: emit_kind(&mut body, records.projects, Record::Project)?,
             sessions: emit_kind(&mut body, records.sessions, |record| {
@@ -1829,14 +1854,19 @@ impl Store {
     /// that decode as its line. If a line does not decode to one record of its
     /// kind, nothing is remembered and the next access decodes the file.
     fn remember(&self, body: String, mut records: Records, rejected: Arc<Vec<RejectedLine>>) {
-        let settled = settle(&self.path, &mut records.resume, Record::Resume, |stored| {
-            let (mut resume, worktrees, projects, sessions) = stored;
-            (worktrees.is_empty()
-                && projects.is_empty()
-                && sessions.is_empty()
-                && resume.len() == 1)
-                .then(|| resume.remove(0))
-        }) && settle(
+        let settled = settle(
+            &self.path,
+            &mut records.resume,
+            |binding| Record::Resume(Box::new(binding)),
+            |stored| {
+                let (mut resume, worktrees, projects, sessions) = stored;
+                (worktrees.is_empty()
+                    && projects.is_empty()
+                    && sessions.is_empty()
+                    && resume.len() == 1)
+                    .then(|| resume.remove(0))
+            },
+        ) && settle(
             &self.path,
             &mut records.worktrees,
             Record::Worktree,
@@ -2255,7 +2285,7 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 continue;
             }
             Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {
-                resume.push(binding);
+                resume.push(*binding);
                 continue;
             }
             Ok(record @ (Record::Session(_) | Record::Resume(_))) => {
@@ -2787,6 +2817,7 @@ mod tests {
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
+            launch_checkout: None,
         }
     }
 
@@ -2867,7 +2898,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":15,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":16,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2883,7 +2914,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":15,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":16,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2995,7 +3026,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":15,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":16,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3118,7 +3149,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":15,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":16,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -3720,8 +3751,11 @@ mod tests {
         )
         .expect("project line");
         body.push_str("{not valid json at all\n");
-        super::append_line(&mut body, &super::Record::Resume(resume("s-1", "native-1")))
-            .expect("resume line");
+        super::append_line(
+            &mut body,
+            &super::Record::Resume(Box::new(resume("s-1", "native-1"))),
+        )
+        .expect("resume line");
         write_private(store.path(), body);
 
         assert_eq!(
