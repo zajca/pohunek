@@ -243,7 +243,7 @@ async fn send_hook(harness: &Harness, id: &str, hook: &str) {
     assert_eq!(code, 0, "{sent}");
 }
 
-/// How long a hook may stay unobserved before [`send_hook_until`] sends it again.
+/// How long a hook may stay unobserved before [`send_hook_until_inspected`] sends it again.
 ///
 /// The installed state hook is best effort: it gives the worker one 0.5 s
 /// socket exchange and drops the report on a timeout, so a loaded host can lose
