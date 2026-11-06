@@ -8,7 +8,8 @@
 #         core-tag: <the same core tag>
 #       permissions: { contents: write, id-token: write, attestations: write }
 #
-# It builds the plugin's archive with `xtask plugin build` of that core tag,
+# It builds the plugin's archive with `xtask plugin build` of that core tag in a
+# job that holds no write permission; a second job that runs no build code
 # attests the archive and publishes it as a GitHub release of the plugin
 # repository. It never writes to the plugin index: admission is a pull request
 # to the index repository that checks this attestation and rebuilds the archive
@@ -32,15 +33,15 @@ on:
 permissions: {}
 
 jobs:
-  release:
-    name: build, attest and publish the plugin archive
+  build:
+    name: build the plugin archive
     # Linux jobs are pinned to ubuntu-24.04 (#1731), never ubuntu-latest.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # The build runs code from crates.io, so it holds no token that could sign
+    # or publish.
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     steps:
       - name: Refuse a non-tag ref
         run: test "$GITHUB_REF_TYPE" = tag
@@ -82,6 +83,35 @@ jobs:
           read -r _ _ _ _ version _ _ <<<"$line"
           test "$GITHUB_REF_NAME" = "v$version"
           (cd dist && sha256sum -- *.tar.zst > SHA256SUMS)
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plugin-archive
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: attest and publish the plugin archive
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # This job runs no code of the plugin or of the core checkout: it only
+    # attests and publishes the files the build job produced.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plugin-archive
+          path: dist
+
+      - name: Check the checksums
+        run: cd dist && sha256sum -c SHA256SUMS
 
       - name: Attest the archive
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

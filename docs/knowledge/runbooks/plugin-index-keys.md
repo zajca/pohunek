@@ -187,7 +187,7 @@ The root is removed on every path. The evidence is
 `{"schema":1,"core_version":...,"package_id":...,"version":...,"digest":...,
 "platform":...,"result":"pass"|"fail","failed_step":null|"<step>"}`;
 `core_version` is the first line of `pohunekd --version` and is `null` when the
-proof ended before the daemon copy ran. The exit status is 0 for a pass, 1 for a
+proof ended before the release executables were copied. The exit status is 0 for a pass, 1 for a
 failed step and 2 for a refused invocation (an unreadable input, or an evidence
 file that exists); a refused invocation writes no evidence. The runtime program
 of the package is never launched, so no model runs. A runtime id an index never

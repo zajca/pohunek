@@ -100,10 +100,12 @@ workflow, which calls the reusable
 | `package-dir` (default `package`) | The package directory, a path below the repository root. |
 
 The workflow builds the archive with `cargo xtask plugin build` of that core
-tag, requires the pushed tag to equal `v` plus the archive's version, attests
-`<package_id>-<version>.tar.zst`, and publishes it with `SHA256SUMS` as a GitHub
-release of the plugin repository. It needs write access to `contents` and
-`attestations` and the OIDC `id-token` permission, restores no cache, uses no secret and has no access to
+tag in a job with read-only permissions, and requires the pushed tag to equal
+`v` plus the archive's version. A second job, which runs no build code, checks
+the checksums, attests `<package_id>-<version>.tar.zst`, and publishes it with
+`SHA256SUMS` as a GitHub release of the plugin repository; only that job has
+write access to `contents` and `attestations` and the OIDC `id-token`
+permission. The workflow restores no cache, uses no secret and has no access to
 the plugin index.
 
 The same two commands run locally:

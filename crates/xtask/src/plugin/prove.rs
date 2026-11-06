@@ -104,8 +104,8 @@ impl std::error::Error for Verdict {}
 #[derive(Serialize)]
 struct Evidence<'a> {
     schema: u32,
-    /// First line of `pohunekd --version`; absent when the proof ended before
-    /// the daemon copy ran.
+    /// First line of `pohunekd --version`; null when the proof ended before
+    /// the release executables were copied.
     core_version: Option<&'a str>,
     package_id: &'a str,
     version: &'a str,
@@ -253,7 +253,7 @@ fn prove_in(
     outcome: &mut Outcome,
 ) -> Result<Host, Verdict> {
     let trust = write_trust(&args.entry, entry, root).map_err(fail(Step::Trust))?;
-    let mut host = Host::start(
+    let mut host = Host::prepare(
         root,
         &args.release_dir,
         &trust.join(ANCHOR_FILE_NAME),
@@ -261,6 +261,7 @@ fn prove_in(
     )
     .map_err(fail(Step::Host))?;
     outcome.core_version = Some(host.core_version().map_err(fail(Step::Host))?);
+    host.launch(root).map_err(fail(Step::Host))?;
 
     let archive_path = write_archive(archive, root).map_err(fail(Step::Install))?;
     install(&mut host, entry, &archive_path, &trust).map_err(fail(Step::Install))?;

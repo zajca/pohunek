@@ -53,7 +53,8 @@ const SHORT_TEMP_PARENT: &str = "/tmp";
 /// directory and socket file the daemon appends to it.
 const SOCKET_RELATIVE_PATH: &str = "xdg-runtime/pohunek/daemon.sock";
 
-/// Longest Unix socket path the platform accepts, terminator included.
+/// Socket paths of this length or longer are refused: the platform's `sun_path`
+/// holds the path and its terminator.
 const SOCKET_PATH_MAX_BYTES: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
 
 /// Longest a daemon may take to accept connections. It opens an empty store
@@ -79,6 +80,9 @@ const LOG_TAIL_BYTES: u64 = 4 * 1024;
 
 /// Placeholder that replaces the root path in reported text.
 const ROOT_PLACEHOLDER: &str = "<ISOLATED_ROOT>";
+
+/// Placeholder that replaces the caller's home directory in reported text.
+const HOME_PLACEHOLDER: &str = "<USER_HOME>";
 
 /// Command search path of every child: the system directories only.
 const CHILD_PATH: &str = "/usr/bin:/bin";
@@ -199,7 +203,13 @@ impl Root {
 
     /// Replaces the root path in `text`.
     fn sanitize(&self, text: &str) -> String {
-        text.replace(&*self.path().to_string_lossy(), ROOT_PLACEHOLDER)
+        let text = text.replace(&*self.path().to_string_lossy(), ROOT_PLACEHOLDER);
+        match std::env::var_os("HOME") {
+            Some(home) if !home.is_empty() => {
+                text.replace(&*home.to_string_lossy(), HOME_PLACEHOLDER)
+            }
+            _ => text,
+        }
     }
 }
 
@@ -222,9 +232,9 @@ pub(super) struct Host {
 
 impl Host {
     /// Copies the release executables from `release_dir` into the prefix
-    /// below `root`, puts `anchor` and `channel` beside the daemon, and starts
-    /// the daemon.
-    pub(super) fn start(
+    /// below `root` and puts `anchor` and `channel` beside the daemon. No
+    /// process runs yet.
+    pub(super) fn prepare(
         root: &Root,
         release_dir: &Path,
         anchor: &Path,
@@ -259,35 +269,39 @@ impl Host {
                 .map_err(|error| format!("cannot install `{name}` into the prefix: {error}"))?;
         }
 
+        Ok(Self {
+            root: root.path().to_path_buf(),
+            prefix,
+            environment: root.environment(),
+            daemon: None,
+            commands: 0,
+        })
+    }
+
+    /// Starts the daemon of the prefix and waits until it accepts connections.
+    pub(super) fn launch(&mut self, root: &Root) -> Result<(), String> {
         let log = File::create(root.path().join(DAEMON_LOG_FILE))
             .map_err(|error| format!("cannot create the daemon log: {error}"))?;
         let log_err = log
             .try_clone()
             .map_err(|error| format!("cannot duplicate the daemon log: {error}"))?;
-        let environment = root.environment();
-        let mut command = Command::new(prefix.join("pohunekd"));
+        let mut command = Command::new(self.prefix.join("pohunekd"));
         command
             .current_dir(root.path().join(WORK_DIRECTORY))
             .env_clear()
-            .envs(environment.iter().cloned())
+            .envs(self.environment.iter().cloned())
             .env("SHELL", CHILD_SHELL)
             .env(LAUNCHER_VARIABLE, SUBPROCESS_LAUNCHER)
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(log_err)
             .process_group(0);
-        let daemon = command
-            .spawn()
-            .map_err(|error| format!("cannot start the daemon: {error}"))?;
-        let mut host = Self {
-            root: root.path().to_path_buf(),
-            prefix,
-            environment,
-            daemon: Some(daemon),
-            commands: 0,
-        };
-        host.wait_ready(root)?;
-        Ok(host)
+        self.daemon = Some(
+            command
+                .spawn()
+                .map_err(|error| format!("cannot start the daemon: {error}"))?,
+        );
+        self.wait_ready(root)
     }
 
     /// Runs `pohunekd --version` and returns its first output line.
@@ -363,6 +377,8 @@ impl Host {
                 .as_mut()
                 .and_then(|child| child.try_wait().ok().flatten())
             {
+                // Reaped: its pid may be reused, so Drop must not signal it.
+                self.daemon = None;
                 return Err(format!(
                     "the daemon exited before it accepted connections ({status}):\n{}",
                     self.log_tail(root)

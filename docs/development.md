@@ -863,11 +863,13 @@ page `concepts/release-attestation.md`.
 
 Plugin repositories release through `.github/workflows/plugin-release.yml`
 (reusable, `workflow_call` only; inputs `core-tag` and `package-dir`). It runs on
-the caller's version tag in one job with write access to `contents` and `attestations` and the OIDC
-`id-token` permission, builds the archive with the `xtask` of the checked-out core
-tag (`cargo xtask plugin build`), attests it and publishes the GitHub release of
-the plugin repository. Every action is pinned by commit sha, no cache is
-restored, and the job has no secret and no path to the plugin index. It is
+the caller's version tag. A `build` job with read-only permissions builds the
+archive with the `xtask` of the checked-out core tag (`cargo xtask plugin
+build`); a second `release` job, which runs no build code and holds the write,
+attestation and OIDC permissions, checks the checksums, attests the archive and
+publishes the GitHub release of the plugin repository. Every action is pinned by
+commit sha, no cache is restored, and neither job has a secret or a path to the
+plugin index. It is
 rehearsed by the `plugin_release` scenarios of `xtask` (`cargo xtask plugin build`
 and `plugin prove` against the workspace binaries), not by a core release run.
 

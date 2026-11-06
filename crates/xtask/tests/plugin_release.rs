@@ -235,7 +235,30 @@ fn build_is_deterministic_and_never_replaces_an_archive() {
 
     let output = run(&first);
     assert!(output.status.success(), "{}", stderr_of(&output));
-    assert!(run(&second).status.success());
+    // The second build reads a copy whose files are a year older: an archive
+    // that records modification times would differ.
+    let copy = plugin.variant("copy", "version = \"0.1.0\"", "version = \"0.1.0\"");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_hours(365 * 24);
+    for file in ["runtime.toml", "detect.toml"] {
+        fs::File::options()
+            .write(true)
+            .open(copy.join(file))
+            .and_then(|handle| handle.set_modified(old))
+            .expect("age the copy");
+    }
+    let output_second = plugin.xtask(&[
+        "plugin",
+        "build",
+        "--dir",
+        s(&copy),
+        "--output-dir",
+        s(&second),
+    ]);
+    assert!(
+        output_second.status.success(),
+        "{}",
+        stderr_of(&output_second)
+    );
     let archive = first.join(ARCHIVE_NAME);
     let bytes = fs::read(&archive).expect("the archive exists");
     assert_eq!(
@@ -343,6 +366,26 @@ fn the_fixture_proves_in_isolation_and_leaves_nothing() {
     );
 
     let document = evidence_of(&evidence);
+    let mut keys: Vec<&str> = document
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "core_version",
+            "digest",
+            "failed_step",
+            "package_id",
+            "platform",
+            "result",
+            "schema",
+            "version"
+        ]
+    );
     assert_eq!(document["schema"], 1);
     assert_eq!(document["result"], "pass");
     assert!(document["failed_step"].is_null());
@@ -437,7 +480,7 @@ fn a_differing_digest_or_identity_fails_at_digest_before_any_prefix_exists() {
         let document = evidence_of(&evidence);
         assert_eq!(document["result"], "fail", "{name}");
         assert_eq!(document["failed_step"], "digest", "{name}");
-        assert!(document["core_version"].is_null(), "{name}");
+        assert_eq!(document["core_version"], Value::Null, "{name}");
         assert_eq!(plugin.leftover_roots(), Vec::<String>::new(), "{name}");
     }
 }
