@@ -72,10 +72,9 @@ jobs:
             "" | /* | .. | ../* | */.. | */../*) echo "package-dir must be a path below the repository root" >&2; exit 1 ;;
           esac
           test -d "plugin/$PACKAGE_DIR"
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)"
-          test -n "$toolchain"
-          rustup toolchain install "$toolchain" --profile minimal
-          (cd core && cargo build --locked -p xtask)
+          # The core checkout pins its toolchain in rust-toolchain.toml; rustup
+          # installs exactly that channel on first use inside `core`.
+          (cd core && rustup show active-toolchain && cargo build --locked -p xtask)
           mkdir dist
           # xtask runs only inside a pohunek checkout, so it runs from `core`.
           line="$(cd core && ./target/debug/xtask plugin build --dir "$GITHUB_WORKSPACE/plugin/$PACKAGE_DIR" --output-dir "$GITHUB_WORKSPACE/dist")"
