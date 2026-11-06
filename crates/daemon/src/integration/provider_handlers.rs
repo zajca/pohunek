@@ -27,11 +27,12 @@ const HERMES_REPORTED_ACTIONS: &[HookAction] = &[
 ];
 
 /// The closed handler registry, in a stable order.
-pub(super) static REGISTRY: [Handler; 4] = [
+pub(super) static REGISTRY: [Handler; 5] = [
     Handler::Daemon(&CodexHook),
     Handler::Daemon(&ClaudeHook),
     Handler::CliRun(&HERMES_HOOK),
     Handler::Daemon(&super::muse::MUSE_HOOK),
+    Handler::Daemon(&super::cline::CLINE_HOOK),
 ];
 
 /// Handler of the Codex hook asset set.

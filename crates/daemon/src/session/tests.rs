@@ -57,6 +57,7 @@ use super::{
     MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
+mod cline_hook;
 mod codex_no_daemon;
 mod conflict_cleanup;
 mod data_root_recovery;

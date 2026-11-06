@@ -1,0 +1,27 @@
+{
+  "clineVersion": "",
+  "timestamp": "2026-11-06T00:17:01.792Z",
+  "taskId": "conv_0000000000008_0000000",
+  "sessionContext": {
+    "rootSessionId": "c0ffee00-0000-4000-8000-000000000001"
+  },
+  "workspaceRoots": [
+    "/capture-root____/s/errors/ws"
+  ],
+  "workspaceInfo": {
+    "rootPath": "/capture-root____/s/errors/ws",
+    "hint": "ws",
+    "latestGitCommitHash": "0000000000000000000000000000000000000001",
+    "latestGitBranchName": "main"
+  },
+  "userId": "capture",
+  "agent_id": "agent_00000000-0000-4000-8000-000000000007",
+  "parent_agent_id": null,
+  "hookName": "agent_error",
+  "iteration": 1,
+  "error": {
+    "name": "Error",
+    "message": "capture stub error",
+    "stack": "<129 chars>"
+  }
+}

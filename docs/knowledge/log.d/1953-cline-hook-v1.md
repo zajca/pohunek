@@ -1,0 +1,3 @@
+## Unreleased (2026-11-06, Cline hook handler, #1953)
+
+- Runtime feature `integration-cline-hook-v1` adds the `cline-hook-v1` handler, the first handler-backed `in_process` placement: it contributes `CLINE_SANDBOX=1` and `CLINE_SANDBOX_DATA_DIR` to every launch (refusals `cline_launch_arg_refused`, `cline_launch_env_refused`, `cline_data_root_invalid`, `cline_config_home_missing`) and installs a stateless reporter as six hook files in `<CLINE_DIR>/hooks/` (`integration_hook_path_conflict` for a file it does not own). See [Runtime packages](guides/runtime-packages.md) and the integration handler section of the public API.

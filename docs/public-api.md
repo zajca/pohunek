@@ -1568,7 +1568,7 @@ hooks use when the worker refuses a report. `session.report_agent`,
 / `released: false` for a session whose runtime has no schema, whose schema
 does not admit the action, or whose provider is not admitted, and
 `notification.create` answers `hook_not_admitted` for a create that
-names a session and a hooked provider (`shell`, `codex`, `claude`, `hermes`, `muse`) on
+names a session and a hooked provider (`shell`, `codex`, `claude`, `hermes`, `muse`, `cline`) on
 such a session. The provider is judged by the name the record would be stored
 and ranked under (control characters dropped, whitespace collapsed), and a
 create whose raw provider only normalizes to a hooked provider (for example
@@ -3917,7 +3917,7 @@ creates a disabled kind, `notification.create` returns
 A record ranks as a provider hook when the daemon admitted its create as a hook
 claim (the record's `hook_admitted`, below), or when its `provider` is an
 identity provider of a registered hook schema (today `shell`, `codex`, `claude`,
-`hermes`, and `muse`, matched case-sensitively), which is the rank of a
+`hermes`, `muse`, and `cline`, matched case-sensitively), which is the rank of a
 session-less create from those providers and of a record stored before the
 marker existed. `pohunek` and `daemon` rank as daemon projectors. Every other
 producer ranks as a user/external source.
@@ -4106,8 +4106,18 @@ or any other registered runtime) is `runtime/agent_not_installable`.
 Install, status, doctor, and uninstall dispatch through the integration handler
 the runtime definition names (`integration.handler`), never through the runtime
 id. The handlers are compiled core code and a closed set (`codex-hook-v1`,
-`claude-hook-v1`, and `hermes-hook-v1`, whose lifecycle the CLI runs, so the
-daemon answers `agent_not_installable` for it). A handler owns one active asset
+`claude-hook-v1`, `muse-hook-v1`, `cline-hook-v1`, and `hermes-hook-v1`, whose
+lifecycle the CLI runs, so the daemon answers `agent_not_installable` for it).
+`cline-hook-v1` (runtime feature `integration-cline-hook-v1`) installs one
+reporter under the six Cline hook file names in `<CLINE_DIR>/hooks/`: an install
+reports the `hooks/` directory as `hook_path` and the six files as
+`config_paths`, refuses with `runtime/integration_hook_path_conflict` when a file
+it does not own holds one of the six paths, and an uninstall removes only the
+files that carry its ownership marker. As the first handler-backed `in_process`
+placement it contributes `CLINE_SANDBOX=1` and `CLINE_SANDBOX_DATA_DIR` to every
+launch and refuses a launch that overrides sandbox mode with
+`runtime/cline_launch_arg_refused`, `cline_launch_env_refused`,
+`cline_data_root_invalid` or `cline_config_home_missing`. A handler owns one active asset
 set, its accepted paths and modes, conflict detection, and rollback; a package
 never supplies installer logic. Bare `integration.install`, `status`, and
 `doctor` visit each distinct config home of the daemon-run runtimes once (the
