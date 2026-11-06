@@ -1337,3 +1337,474 @@ fn an_entries_tree_may_carry_the_gitkeep_of_the_index_repository() {
     assert!(!tooling.xtask(&args).status.success());
     assert!(!output.exists());
 }
+
+/// An entry file for `check-entry`; `digit` makes the digest unique.
+fn admission_entry(runtime: &str, package: &str, version: &str, digit: char, core: &str) -> String {
+    format!(
+        "package_id = \"{package}\"\nruntime_id = \"{runtime}\"\nversion = \"{version}\"\n\
+         digest = \"sha256:{}\"\n\
+         url = \"https://github.com/pohunekd/plugin-x/releases/download/v{version}/{package}-{version}.tar.zst\"\n\
+         platforms = [\"x86_64-unknown-linux-gnu\"]\ncore = \"{core}\"\n\n\
+         [source]\nrepo = \"pohunekd/plugin-x\"\nrepo_id = 1\ntag = \"v{version}\"\n\
+         commit = \"cccccccccccccccccccccccccccccccccccccccc\"\nbuilt_with = \"v0.40.0\"\n",
+        digit.to_string().repeat(64)
+    )
+}
+
+impl Tooling {
+    /// Runs `index check-entry` for a tree that holds `text` as the only entry
+    /// and returns the exit code with stdout and stderr.
+    fn check_entry(
+        &self,
+        text: &str,
+        stage: &str,
+        core_version: &str,
+    ) -> (Option<i32>, String, String) {
+        let id = text
+            .lines()
+            .find_map(|line| line.strip_prefix("package_id = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("package_id line");
+        let version = text
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("version line");
+        let tree = self.path(&format!("added-{id}-{version}-{stage}"));
+        let file = tree.join(format!("official/{id}/{version}.toml"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, text).expect("entry");
+        let result = self.xtask(&[
+            "index",
+            "check-entry",
+            "--entries",
+            s(&tree),
+            "--existing",
+            s(&fixtures()),
+            "--core-version",
+            core_version,
+            "--stage",
+            stage,
+        ]);
+        (
+            result.status.code(),
+            String::from_utf8_lossy(&result.stdout).into_owned(),
+            String::from_utf8_lossy(&result.stderr).into_owned(),
+        )
+    }
+}
+
+#[test]
+fn check_entry_accepts_a_new_release_and_prints_only_validated_fields() {
+    let tooling = Tooling::new();
+    let text = admission_entry("muse", "pohunek.runtime.muse", "0.10.0", '3', ">=0.40.0");
+    let (code, stdout, stderr) = tooling.check_entry(&text, "schema", "0.40.0");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "package_id=pohunek.runtime.muse\nruntime_id=muse\nversion=0.10.0\n\
+             digest=sha256:{}\n\
+             url=https://github.com/pohunekd/plugin-x/releases/download/v0.10.0/pohunek.runtime.muse-0.10.0.tar.zst\n\
+             platforms=x86_64-unknown-linux-gnu\n",
+            "3".repeat(64)
+        )
+    );
+    assert!(!stdout.contains("core"), "the core range reached stdout");
+}
+
+/// Requires each case to exit 1 with its predicate on stderr and nothing on stdout.
+fn assert_schema_refusals(tooling: &Tooling, cases: Vec<(&str, String, &str)>) {
+    for (name, text, predicate) in cases {
+        let (code, stdout, stderr) = tooling.check_entry(&text, "schema", "0.40.0");
+        assert_eq!(code, Some(1), "{name}: {stderr}");
+        assert!(
+            stderr.contains(predicate),
+            "{name}: expected {predicate} in {stderr}"
+        );
+        assert!(stdout.is_empty(), "{name}: a refusal printed fields");
+    }
+}
+
+#[test]
+fn check_entry_names_the_predicate_each_schema_refusal_fails() {
+    let tooling = Tooling::new();
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "binding",
+            admission_entry("pix", "pohunek.runtime.pi", "0.1.0", '3', ">=0.40.0"),
+            "predicate=package-id-binding",
+        ),
+        (
+            "refused id codex",
+            admission_entry("codex", "pohunek.runtime.codex", "0.1.0", '3', ">=0.40.0"),
+            "predicate=refused-runtime-id",
+        ),
+        (
+            "refused id pi",
+            admission_entry("pi", "pohunek.runtime.pi", "0.1.0", '3', ">=0.40.0"),
+            "predicate=refused-runtime-id",
+        ),
+        (
+            "runtime owned by another package",
+            admission_entry("muse", "pohunek.runtime.muse2", "0.1.0", '3', ">=0.40.0"),
+            "predicate=package-id-binding",
+        ),
+        (
+            "refused id shell",
+            admission_entry("shell", "pohunek.runtime.shell", "0.1.0", '3', ">=0.40.0"),
+            "predicate=refused-runtime-id",
+        ),
+        (
+            "refused id claude",
+            admission_entry("claude", "pohunek.runtime.claude", "0.1.0", '3', ">=0.40.0"),
+            "predicate=refused-runtime-id",
+        ),
+        (
+            "refused id hermes",
+            admission_entry("hermes", "pohunek.runtime.hermes", "0.1.0", '3', ">=0.40.0"),
+            "predicate=refused-runtime-id",
+        ),
+    ];
+    assert_schema_refusals(&tooling, cases);
+}
+
+#[test]
+fn check_entry_names_the_predicate_each_version_and_url_refusal_fails() {
+    let tooling = Tooling::new();
+    let muse = "pohunek.runtime.muse";
+    let existing_digest = '1';
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "four-part version",
+            admission_entry("muse", muse, "1.0.0.0", '3', ">=0.40.0"),
+            "predicate=version-not-semver",
+        ),
+        (
+            "leading zero version",
+            admission_entry("muse", muse, "01.0.0", '3', ">=0.40.0"),
+            "predicate=version-not-semver",
+        ),
+        (
+            "shell metacharacter in the url",
+            admission_entry("muse", muse, "0.3.0", '3', ">=0.40.0")
+                .replace("/pohunek.runtime.muse-0.3.0.tar.zst", "/$(id).tar.zst"),
+            "predicate=url-charset",
+        ),
+        (
+            "same version",
+            admission_entry("muse", muse, "0.2.0", '3', ">=0.40.0"),
+            "predicate=duplicate-version",
+        ),
+        (
+            "duplicate digest",
+            admission_entry("muse", muse, "0.3.0", existing_digest, ">=0.40.0"),
+            "predicate=duplicate-digest",
+        ),
+        (
+            "lower version",
+            admission_entry("muse", muse, "0.1.0", '3', ">=0.40.0"),
+            "predicate=version-not-greater",
+        ),
+        (
+            "not semver",
+            admission_entry("muse", muse, "1.0", '3', ">=0.40.0"),
+            "predicate=version-not-semver",
+        ),
+        (
+            "pre-release",
+            admission_entry("muse", muse, "1.0.0-rc.1", '3', ">=0.40.0"),
+            "predicate=version-not-release",
+        ),
+        (
+            "build metadata",
+            admission_entry("muse", muse, "1.0.0+b", '3', ">=0.40.0"),
+            "predicate=version-not-release",
+        ),
+        (
+            "source violation",
+            admission_entry("muse", muse, "0.3.0", '3', ">=0.40.0").replace(
+                "built_with = \"v0.40.0\"",
+                "built_with = \"cccccccccccccccccccccccccccccccccccccccc\"",
+            ),
+            "predicate=schema",
+        ),
+        (
+            "unknown field",
+            admission_entry("muse", muse, "0.3.0", '3', ">=0.40.0") + "extra = 1\n",
+            "predicate=schema",
+        ),
+    ];
+    assert_schema_refusals(&tooling, cases);
+}
+
+#[test]
+fn check_entry_orders_versions_as_semver_and_refuses_a_foreign_runtime_owner() {
+    let tooling = Tooling::new();
+    // `0.10.0` is above `0.2.0` although it sorts below it as text.
+    let text = admission_entry("muse", "pohunek.runtime.muse", "0.10.0", '3', ">=0.40.0");
+    assert_eq!(tooling.check_entry(&text, "schema", "0.40.0").0, Some(0));
+
+    let aurora_for_muse =
+        admission_entry("muse", "pohunek.runtime.aurora", "0.2.0", '3', ">=0.40.0");
+    let (code, _, stderr) = tooling.check_entry(&aurora_for_muse, "schema", "0.40.0");
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("predicate=package-id-binding"), "{stderr}");
+}
+
+#[test]
+fn check_entry_judges_the_core_range_by_its_lower_bound() {
+    let tooling = Tooling::new();
+    let accepted = [
+        ">=0.40.0",
+        "^0.40",
+        "^0.40.0",
+        "=0.40.0",
+        "~0.40.0",
+        "0.40.0",
+        ">=0.40.0, <0.50.0",
+        ">0.39",
+        "0.40.*",
+        ">0.39.18446744073709551615",
+    ];
+    for core in accepted {
+        let text = admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', core);
+        let (code, stdout, stderr) = tooling.check_entry(&text, "core-range", "0.40.0");
+        assert_eq!(code, Some(0), "{core}: {stderr}");
+        assert_eq!(stdout, "core range ok: lower_bound=0.40.0\n", "{core}");
+    }
+    let refused = [
+        (">=0.39.0, <0.41.0", "core-lower-bound"),
+        ("<1.0", "core-lower-bound"),
+        ("<=0.40.0", "core-lower-bound"),
+        ("0.*", "core-lower-bound"),
+        ("^0.39", "core-excludes-core-tag"),
+        (">=0.41.0", "core-excludes-core-tag"),
+        (">=0.40.0-rc.1", "core-prerelease"),
+        ("*", "core-range-unparsed"),
+        ("garbage", "core-range-unparsed"),
+    ];
+    for (core, predicate) in refused {
+        let text = admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', core);
+        let (code, stdout, stderr) = tooling.check_entry(&text, "core-range", "0.40.0");
+        assert_eq!(code, Some(1), "{core}: {stderr}");
+        assert!(
+            stderr.contains(&format!("predicate={predicate}")),
+            "{core}: {stderr}"
+        );
+        assert!(stdout.is_empty(), "{core}");
+    }
+    let long = format!(">=0.40.0{}", ", <9.0.0".repeat(20));
+    for core in [long.as_str(), ""] {
+        let text = admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', core);
+        let (code, _, stderr) = tooling.check_entry(&text, "core-range", "0.40.0");
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("predicate=core-range-unparsed"), "{stderr}");
+    }
+}
+
+#[test]
+fn check_entry_refuses_a_malformed_invocation_or_baseline() {
+    let tooling = Tooling::new();
+    let text = admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', ">=0.40.0");
+    let (code, _, stderr) = tooling.check_entry(&text, "schema", "v0.40.0");
+    assert_eq!(code, Some(2), "{stderr}");
+
+    let tree = tooling.path("two-entries");
+    copy_dir(&fixtures(), &tree);
+    let result = tooling.xtask(&[
+        "index",
+        "check-entry",
+        "--entries",
+        s(&tree),
+        "--existing",
+        s(&fixtures()),
+        "--core-version",
+        "0.40.0",
+        "--stage",
+        "schema",
+    ]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("exactly one entry"));
+
+    let broken = tooling.tree("broken-baseline");
+    edit(&muse_file(&broken), "tag = \"v0.2.0\"", "tag = \"main\"");
+    let added = tooling.path("added-for-broken");
+    let file = added.join("official/pohunek.runtime.muse/0.3.0.toml");
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&file, &text).expect("entry");
+    let result = tooling.xtask(&[
+        "index",
+        "check-entry",
+        "--entries",
+        s(&added),
+        "--existing",
+        s(&broken),
+        "--core-version",
+        "0.40.0",
+        "--stage",
+        "schema",
+    ]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("predicate=existing-tree"));
+}
+
+#[test]
+fn check_entry_refuses_an_identity_the_admitted_tree_binds_elsewhere() {
+    let tooling = Tooling::new();
+    let existing = tooling.tree("foreign-owner");
+    let other = existing.join("official/pohunek.legacy/0.1.0.toml");
+    std::fs::create_dir_all(other.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &other,
+        admission_entry("muse", "pohunek.legacy", "0.1.0", '4', ">=0.40.0"),
+    )
+    .expect("entry");
+    std::fs::remove_dir_all(existing.join("official/pohunek.runtime.muse")).expect("remove");
+    std::fs::remove_dir_all(existing.join("official/pohunek.runtime.aurora")).expect("remove");
+
+    let text = admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', ">=0.40.0");
+    let added = tooling.path("added-foreign-owner");
+    let file = added.join("official/pohunek.runtime.muse/0.3.0.toml");
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&file, text).expect("entry");
+    let result = tooling.xtask(&[
+        "index",
+        "check-entry",
+        "--entries",
+        s(&added),
+        "--existing",
+        s(&existing),
+        "--core-version",
+        "0.40.0",
+        "--stage",
+        "schema",
+    ]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("predicate=identity-conflict"));
+}
+
+impl Tooling {
+    /// A tree that holds `text` as its only entry.
+    fn added_tree(&self, name: &str, text: &str) -> PathBuf {
+        let tree = self.path(name);
+        let file = tree.join("official/pohunek.runtime.muse/0.3.0.toml");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, text).expect("entry");
+        tree
+    }
+
+    /// Runs `check-entry --stage schema` and returns exit code, stdout, stderr.
+    fn check_schema(&self, added: &Path, existing: &Path) -> (Option<i32>, String, String) {
+        let result = self.xtask(&[
+            "index",
+            "check-entry",
+            "--entries",
+            s(added),
+            "--existing",
+            s(existing),
+            "--core-version",
+            "0.40.0",
+            "--stage",
+            "schema",
+        ]);
+        (
+            result.status.code(),
+            String::from_utf8_lossy(&result.stdout).into_owned(),
+            String::from_utf8_lossy(&result.stderr).into_owned(),
+        )
+    }
+}
+
+fn muse_entry() -> String {
+    admission_entry("muse", "pohunek.runtime.muse", "0.3.0", '3', ">=0.40.0")
+}
+
+#[test]
+fn check_entry_accepts_the_first_entry_into_an_index_that_holds_only_the_gitkeep() {
+    let tooling = Tooling::new();
+    let existing = tooling.path("empty-index");
+    std::fs::create_dir_all(existing.join("official")).expect("mkdir");
+    std::fs::write(existing.join("official/.gitkeep"), b"").expect("gitkeep");
+    let added = tooling.added_tree("first-entry", &muse_entry());
+    let (code, stdout, stderr) = tooling.check_schema(&added, &existing);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("package_id=pohunek.runtime.muse\n"));
+}
+
+#[test]
+fn check_entry_refuses_an_added_tree_that_is_not_one_entry_file_and_every_source_fault() {
+    let tooling = Tooling::new();
+    let existing = tooling.path("empty-existing");
+    std::fs::create_dir_all(existing.join("official")).expect("mkdir");
+
+    let extra = tooling.added_tree("extra-file", &muse_entry());
+    std::fs::write(extra.join("official/pohunek.runtime.muse/notes.txt"), b"x").expect("file");
+    let linked = tooling.added_tree("symlinked", &muse_entry());
+    symlink(
+        "0.3.0.toml",
+        linked.join("official/pohunek.runtime.muse/0.4.0.toml"),
+    )
+    .expect("link");
+    let mut trees = vec![("extra file", extra), ("symlink", linked)];
+    for (name, from, to) in [
+        (
+            "uppercase commit",
+            "commit = \"cccccccccccccccccccccccccccccccccccccccc\"",
+            "commit = \"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\"",
+        ),
+        (
+            "dotdot repo",
+            "repo = \"pohunekd/plugin-x\"",
+            "repo = \"pohunekd/..\"",
+        ),
+        ("wrong tag", "tag = \"v0.3.0\"", "tag = \"v0.9.9\""),
+        ("zero repo id", "repo_id = 1", "repo_id = 0"),
+    ] {
+        trees.push((
+            name,
+            tooling.added_tree(name, &muse_entry().replace(from, to)),
+        ));
+    }
+    for (name, tree) in trees {
+        let (code, stdout, stderr) = tooling.check_schema(&tree, &existing);
+        assert_eq!(code, Some(1), "{name}: {stderr}");
+        assert!(stderr.contains("predicate=schema"), "{name}: {stderr}");
+        assert!(stdout.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn check_entry_refuses_an_entry_beyond_the_index_entry_limit() {
+    let tooling = Tooling::new();
+    let existing = tooling.path("full-index");
+    for n in 0..256_u32 {
+        let name = format!("r{n:04}");
+        let package = format!("pohunek.runtime.{name}");
+        let text = admission_entry(&name, &package, "0.1.0", '0', ">=0.40.0")
+            .replace(&"0".repeat(64), &format!("{n:064x}"));
+        let file = existing.join(format!("official/{package}/0.1.0.toml"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(file, text).expect("entry");
+    }
+    let added = tooling.added_tree("entry-257", &muse_entry());
+    let (code, _, stderr) = tooling.check_schema(&added, &existing);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("predicate=schema"), "{stderr}");
+    assert!(stderr.contains("above the limit"), "{stderr}");
+}
+
+#[test]
+fn check_entry_never_lets_a_pull_request_name_start_a_log_line() {
+    let tooling = Tooling::new();
+    let text = muse_entry() + "\"x\\n::error title=spoof::admission ok\" = 1\n";
+    let added = tooling.added_tree("hostile-key", &text);
+    let (code, _, stderr) = tooling.check_schema(&added, &fixtures());
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("predicate=schema"), "{stderr}");
+    assert!(
+        stderr.lines().all(|line| !line.starts_with("::")),
+        "a log line starts with a workflow command: {stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+}

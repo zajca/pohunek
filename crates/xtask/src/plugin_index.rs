@@ -12,10 +12,12 @@
 
 // Rust guideline compliant 2026-11-06
 
+mod admit;
 mod build;
 mod sign;
 mod throwaway;
 
+pub(crate) use admit::{check_entry, CheckArgs, CheckStage};
 pub(crate) use build::{build, entry_of, print_source, BuildArgs};
 pub(crate) use sign::{
     attach, message, verify_material, verify_whole, AttachArgs, VerifyIndexArgs, VerifyMaterialArgs,

@@ -94,13 +94,13 @@ pub use archive::{
     VerifiedArchive,
 };
 pub use catalog::{
-    catalog_signing_message, check_catalog, key_record_signing_message, verify_catalog,
-    Authorization, Catalog, CatalogEntry, CatalogEntryRejection, CatalogEnvelope, CatalogError,
-    CatalogLimit, CatalogSignature, KeyId, LocalAuthorization, LocalTrust, LocalTrustError,
-    RootKey, SignedKeyRecord, TrustAnchor, TrustAnchorError, VerifiedCatalog, VerifiedEntry,
-    CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES, MAX_CATALOG_ENTRIES, MAX_CORE_RANGE_BYTES,
-    MAX_KEY_RECORDS, MAX_PLATFORMS_PER_ENTRY, MAX_PLATFORM_BYTES, MAX_REVOKED_DIGESTS,
-    MAX_REVOKED_KEYS, MAX_SIGNATURES, MAX_TRUST_ROOTS,
+    catalog_signing_message, check_catalog, key_record_signing_message, parse_core_range,
+    verify_catalog, Authorization, Catalog, CatalogEntry, CatalogEntryRejection, CatalogEnvelope,
+    CatalogError, CatalogLimit, CatalogSignature, KeyId, LocalAuthorization, LocalTrust,
+    LocalTrustError, RootKey, SignedKeyRecord, TrustAnchor, TrustAnchorError, VerifiedCatalog,
+    VerifiedEntry, CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES, MAX_CATALOG_ENTRIES,
+    MAX_CORE_RANGE_BYTES, MAX_KEY_RECORDS, MAX_PLATFORMS_PER_ENTRY, MAX_PLATFORM_BYTES,
+    MAX_REVOKED_DIGESTS, MAX_REVOKED_KEYS, MAX_SIGNATURES, MAX_TRUST_ROOTS,
 };
 pub use error::{ArchiveError, EntryRejection};
 pub use index_channel::{

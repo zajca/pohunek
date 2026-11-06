@@ -47,14 +47,14 @@ const COMMIT_HEX_LEN: usize = 40;
 /// One entry file: the signed fields and the admission metadata.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EntryFile {
-    package_id: PackageId,
-    runtime_id: RuntimeId,
-    version: PackageVersion,
-    digest: PackageDigest,
-    url: String,
-    platforms: Vec<String>,
-    core: String,
+pub(super) struct EntryFile {
+    pub(super) package_id: PackageId,
+    pub(super) runtime_id: RuntimeId,
+    pub(super) version: PackageVersion,
+    pub(super) digest: PackageDigest,
+    pub(super) url: String,
+    pub(super) platforms: Vec<String>,
+    pub(super) core: String,
     source: Source,
 }
 
@@ -193,7 +193,7 @@ fn kind_of(file_type: fs::FileType) -> &'static str {
 /// that differs from the entry's `package_id` and a file stem that differs
 /// from its `version` is an error. The result is in `(package_id, version)`
 /// order.
-fn read_tree(root: &Path) -> Result<Vec<EntryFile>, XtaskError> {
+pub(super) fn read_tree(root: &Path) -> Result<Vec<EntryFile>, XtaskError> {
     let mut entries = Vec::new();
     let top = read_dir_sorted(root)?;
     for (name, file_type) in &top {
@@ -287,7 +287,7 @@ fn read_entry(path: &Path) -> Result<EntryFile, XtaskError> {
 }
 
 /// The signed entry of an entry file; `[source]` stays behind.
-fn index_entry(entry: EntryFile) -> IndexEntry {
+pub(super) fn index_entry(entry: EntryFile) -> IndexEntry {
     IndexEntry {
         package_id: entry.package_id,
         runtime_id: entry.runtime_id,

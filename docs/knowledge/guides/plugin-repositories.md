@@ -164,6 +164,17 @@ install by id.
     `source.commit`, reproduces the entry digest. A build by other code cannot
     match this rebuild, so the `core-tag` input and the workflow commit do not
     decide integrity.
+- The pure predicates of an added entry are `cargo xtask index check-entry
+  --entries <tree of the entry> --existing <admitted tree> --core-version
+  <X.Y.Z> --stage schema|core-range`, built at the pinned core tag. Stage
+  `schema` refuses a package id that is not `pohunek.runtime.` plus the runtime
+  id, a refused runtime id, an identity or digest already admitted, a version
+  that is not a release semver above every admitted version of the package id,
+  refuses an entry that would take the index past its entry or size limit, refuses a `url` outside letters, digits and `:/._+-`, and prints the validated
+  fields as `key=value` lines for `IFS== read -r`, never for `eval`. Stage `core-range`
+  refuses a range that does not parse, names a pre-release, does not admit the
+  pinned core or admits a core below `0.40.0`. A refusal exits 1 and prints
+  `predicate=<name>`.
 - Without admission, an owner can still install a published archive by its
   digest (community tier); such an install never serves a reserved runtime id.
 
