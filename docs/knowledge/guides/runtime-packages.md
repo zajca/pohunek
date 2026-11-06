@@ -115,6 +115,7 @@ The features this core implements:
 | `naming-launch-args-v1` | 0.39.0 | `[naming]` |
 | `placement-v1` | 0.40.0 | `[placement]` |
 | `checkout-trust-args-v1` | 0.40.0 | `[runtime] trusted_checkout_args`, `trusted_checkout_paths` |
+| `integration-cline-hook-v1` | 0.40.0 | `integration.handler = "cline-hook-v1"` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -147,7 +148,8 @@ runtime declares at most one of:
   descriptor gained them is covered on its next resume.
 - `keep_local_handler = true`: the runtime's compiled `[integration] handler`
   contributes the launch input that keeps the agent local (Codex's
-  `codex-hook-v1` adds `--no-daemon`). A descriptor whose handler contributes
+  `codex-hook-v1` adds `--no-daemon`, Cline's `cline-hook-v1` sets
+  `CLINE_SANDBOX=1` and `CLINE_SANDBOX_DATA_DIR`). A descriptor whose handler contributes
   none is `descriptor_invalid`.
 - neither: the agent has no daemon to keep out (Claude Code, Pi, Hermes).
 
@@ -612,6 +614,59 @@ dropped), reports subagents without a role, and reaches the worker only. A
 foreground `muse` started inside a shell session gets no overlay and no
 identity. The payload fields, the hooks file layout and the `-c` spelling are
 unverified against a real Muse run.
+`cline-hook-v1` (feature `integration-cline-hook-v1`, hook schema
+`identity-subagent-v1`, reference kind `id`) keeps a Cline session in the TUI's
+process tree and reports its identity and subagents. Without sandbox mode Cline
+attaches a session to a shared per-machine hub daemon, or starts one that
+outlives the session, and the hooks of a hub-run session carry neither the
+session's environment nor its process tree. Every create, resume and fork launch
+therefore carries `CLINE_SANDBOX=1` and `CLINE_SANDBOX_DATA_DIR=<data root>` as
+per-launch input, where the data root is `CLINE_DATA_DIR` (an absolute path in a
+profile `[env]`) or else `<config home>/data`, so the session keeps the user's
+store. The launch is refused, before any worker starts, when the frozen
+arguments hold `--data-dir` or `--config` (`cline_launch_arg_refused`), when the
+launch environment sets `CLINE_SANDBOX`, `CLINE_SANDBOX_DATA_DIR`,
+`CLINE_SESSION_DATA_DIR`, `CLINE_DB_DATA_DIR` or `CLINE_PROVIDER_SETTINGS_PATH`
+(`cline_launch_env_refused`, naming the variable and never its value), when
+`CLINE_DATA_DIR` is empty or relative (`cline_data_root_invalid`), or when the
+descriptor declares no `[config_home]` (`cline_config_home_missing`). The handler
+adds no `--auto-approve` argument, so Cline's own approval setting applies.
+
+The handler installs one reporter under six file names in `<CLINE_DIR>/hooks/`
+(`TaskStart.sh`, `TaskResume.sh`, `TaskComplete.sh`, `TaskError.sh`,
+`TaskCancel.sh`, `SessionShutdown.sh`), because Cline runs the files named after
+an event for every turn on the host and offers no flag to select another
+directory. All six carry the same bytes and the ownership marker
+`# POHUNEK_INTEGRATION_ID=cline`. An install refuses with
+`integration_hook_path_conflict`, naming the paths and writing nothing, when any
+of the six holds a file without the marker (a user hook of the same name, a
+symlink or a directory is refused the same way, while any other unreadable entry fails the install with its own error); a file of the same event under
+another name (`TaskResume.py`, `TaskResume`) is not a collision because Cline
+runs both. Uninstall removes only the files that carry the marker and reports
+the others as preserved; the `hooks/` directory stays. `install` reports the
+`hooks/` directory as `hook_path` and the six files as `config_paths`. `status`
+and `doctor` report `current`, `not_installed`, or `outdated` for a missing,
+edited or older file, and `outdated` with `repair_configuration` for a path a
+foreign entry holds. `--profile` and `--all-profiles` act on each `CLINE_DIR` a
+profile names, one transaction per home.
+
+The reporter is stateless and prints nothing, because Cline reads a hook's
+stdout as control output. Outside a Pohunek session (`POHUNEK_ENV` unset) it
+exits 0 without reading its input or touching any file. In a Pohunek session it
+requires `CLINE_SANDBOX=1`; a hook that lacks it was run by a shared hub, so the
+reporter sends nothing and traces `hub_hosted` (the worker's ancestry check
+refuses such a hook as well). It reads the event from the payload's `hookName`.
+A turn start (`agent_start`, `agent_resume`) of the lead (`parent_agent_id`
+null) reports `sessionContext.rootSessionId` as the native reference, every
+turn, so a `/clear` or `/fork` is followed at the next turn; of a subagent it
+reports a subagent start keyed by `agent_id`, without a role. `agent_end`,
+`agent_error`, `agent_abort` and `session_shutdown` of a subagent report a stop
+with the outcome `completed`, `failed`, `cancelled` and `cancelled`. The same
+events of the lead report nothing, because Cline keeps running after an aborted
+turn. Cline's `PreToolUse` and `PostToolUse` are never installed. A subagent
+stop that arrives without a recorded start is recorded as terminal.
+Input that is empty, not JSON, over 64 KiB or without a valid id is traced
+(`input_invalid`, `input_too_large`) and ignored.
 A daemon without the handler (a rollback) reads the session directories of earlier
 launches as unknown entries: garbage collection keeps them, which leaks a few
 small files until the session is removed, and a relaunch served without a

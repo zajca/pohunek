@@ -33,6 +33,7 @@ use pohunek_platform::filesystem::{
     EntryKind, FsError, LockKind, TrustedDir as PlatformTrustedDir,
 };
 
+mod cline;
 #[cfg(unix)]
 mod commit;
 #[cfg(unix)]
@@ -73,6 +74,8 @@ pub(crate) use homes::{Home, LaunchHome};
 pub use uninstall::uninstall;
 #[cfg(unix)]
 pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_in};
+#[cfg(all(test, unix))]
+mod cline_tests;
 #[cfg(all(test, unix))]
 mod handler_tests;
 #[cfg(all(test, unix))]
@@ -339,6 +342,18 @@ pub(crate) const CODEX_HOME_ENV: &str = "CODEX_HOME";
 #[cfg(test)]
 pub(crate) fn muse_hook_env_vars() -> &'static [&'static str] {
     muse::hook_env_vars()
+}
+
+/// Installs the Cline reporter into `cline_dir`.
+///
+/// # Errors
+///
+/// `agent_config_dir_missing` when the directory is absent,
+/// `integration_hook_path_conflict` when a foreign file holds a hook path, or
+/// any underlying I/O error.
+#[cfg(test)]
+pub(crate) fn install_cline(cline_dir: &Path) -> Result<InstallPaths, ProtocolError> {
+    cline::install(cline_dir)
 }
 
 /// Files the installer wrote for one agent.

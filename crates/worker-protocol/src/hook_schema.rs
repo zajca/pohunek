@@ -408,10 +408,10 @@ impl HookSchema {
 /// Provider ids whose hooks may report identity inside any session that has
 /// an identity schema: the session's own runtime and the agents a session can
 /// host in the foreground.
-const HOOKED_PROVIDERS: &[&str] = &["shell", "codex", "claude", "hermes", "muse"];
+const HOOKED_PROVIDERS: &[&str] = &["shell", "codex", "claude", "hermes", "muse", "cline"];
 
 /// Provider ids whose hooks report provider-managed subagents.
-const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude", "muse"];
+const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude", "muse", "cline"];
 
 /// Subagent providers whose stop is admitted only after a recorded start.
 ///
@@ -473,7 +473,12 @@ const IDENTITY_V1: HookSchema = HookSchema {
 /// Identity, release, notification, and subagent lifecycle reports.
 const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
     id: "identity-subagent-v1",
-    handlers: &["codex-hook-v1", "claude-hook-v1", "muse-hook-v1"],
+    handlers: &[
+        "codex-hook-v1",
+        "claude-hook-v1",
+        "muse-hook-v1",
+        "cline-hook-v1",
+    ],
     identity_providers: HOOKED_PROVIDERS,
     subagent_providers: SUBAGENT_PROVIDERS,
     prompt_providers: PROMPT_PROVIDERS,

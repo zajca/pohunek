@@ -126,6 +126,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "checkout-trust-args-v1",
         since: "0.40.0",
     },
+    RuntimeFeature {
+        id: "integration-cline-hook-v1",
+        since: "0.40.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -200,6 +204,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "checkout-trust-args-v1",
         rule: GateRule::Key("runtime.trusted_checkout_paths"),
+    },
+    FeatureGate {
+        feature: "integration-cline-hook-v1",
+        rule: GateRule::Value("integration.handler", "cline-hook-v1"),
     },
 ];
 

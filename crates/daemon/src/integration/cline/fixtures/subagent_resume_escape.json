@@ -1,0 +1,25 @@
+{
+  "clineVersion": "",
+  "timestamp": "2026-11-06T00:17:34.451Z",
+  "taskId": "conv_0000000000012_0000000",
+  "sessionContext": {
+    "rootSessionId": "c0ffee00-0000-4000-8000-000000000001"
+  },
+  "workspaceRoots": [
+    "/capture-root____/s/cancel-escape-subagent/ws"
+  ],
+  "workspaceInfo": {
+    "rootPath": "/capture-root____/s/cancel-escape-subagent/ws",
+    "hint": "ws",
+    "latestGitCommitHash": "0000000000000000000000000000000000000001",
+    "latestGitBranchName": "main"
+  },
+  "userId": "capture",
+  "agent_id": "agent_00000000-0000-4000-8000-000000000011",
+  "parent_agent_id": "agent_00000000-0000-4000-8000-000000000010",
+  "hookName": "agent_resume",
+  "taskResume": {
+    "taskMetadata": {},
+    "previousState": {}
+  }
+}

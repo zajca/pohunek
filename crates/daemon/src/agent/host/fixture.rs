@@ -994,6 +994,131 @@ fn with_integration(document: &str) -> String {
     )
 }
 
+/// An official source serving one fixture definition.
+#[derive(Debug)]
+struct OfficialDefinitionSource(RuntimeDefinition);
+
+impl RuntimeSource for OfficialDefinitionSource {
+    fn trust(&self) -> SourceTrust {
+        SourceTrust::Official
+    }
+
+    fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
+        Ok(vec![self.0.clone()])
+    }
+}
+
+/// The Cline runtime descriptor of the fixture: the shape of the Cline package
+/// with the placement kept local by its handler. `requires` is the feature
+/// list the descriptor declares.
+pub(crate) fn cline_shaped_document(program: &Path, args: &[String], requires: &str) -> String {
+    format!(
+        r#"schema = 1
+id = "pohunek.runtime.cline"
+version = "0.1.0"
+runtime_api = 1
+requires = {requires}
+
+[runtime]
+id = "cline"
+name = "Cline CLI"
+program = {program:?}
+args = {args:?}
+detect_manifest = "any"
+prompt_arg = false
+
+[input]
+bracketed_paste = true
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--id", "{{reference}}"]
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "assigned"
+launch_args = ["--id", "{{reference}}"]
+
+[native_reference.existence]
+check = "none"
+
+[placement]
+mode = "in_process"
+keep_local_handler = true
+
+[integration]
+handler = "cline-hook-v1"
+hook_schema = "identity-subagent-v1"
+
+[config_home]
+env = "CLINE_DIR"
+default = ".cline"
+"#
+    )
+}
+
+/// The feature list of the Cline package descriptor.
+pub(crate) const CLINE_REQUIRES: &str = r#"["integration-cline-hook-v1", "placement-v1"]"#;
+
+/// Parses `document` as an official-package Cline definition.
+///
+/// # Errors
+///
+/// The definition error the document earns.
+pub(crate) fn cline_shaped_definition(
+    document: &str,
+) -> Result<RuntimeDefinition, DefinitionError> {
+    RuntimeDefinition::from_toml(
+        document,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+    )
+}
+
+/// A host serving the Cline fixture runtime as an official package.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn cline_shaped_host(program: &Path, args: &[String]) -> RuntimeHost {
+    cline_shaped_host_with(program, args, true)
+}
+
+/// Like [`cline_shaped_host`], optionally leaving out the `[config_home]` table.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid.
+pub(crate) fn cline_shaped_host_with(
+    program: &Path,
+    args: &[String],
+    declare_home: bool,
+) -> RuntimeHost {
+    let mut document = cline_shaped_document(program, args, CLINE_REQUIRES);
+    if !declare_home {
+        let home = document
+            .find("\n[config_home]")
+            .expect("the fixture declares a config home");
+        document.truncate(home + 1);
+    }
+    let definition =
+        cline_shaped_definition(&document).expect("the Cline-shaped fixture document is valid");
+    let builtin = BuiltinSource::new("/bin/sh");
+    let official = OfficialDefinitionSource(definition);
+    RuntimeHost::new(
+        RuntimeRegistry::from_sources(&[&builtin, &official]).expect("the fixture registry builds"),
+    )
+}
+
 /// The `[config_home]` table a fixture runtime driven by `handler` declares so
 /// its integration has a directory to act on; empty for a handler whose
 /// lifecycle the daemon does not run.
