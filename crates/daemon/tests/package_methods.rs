@@ -3453,21 +3453,23 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
     // provider (the runtime is `pi`) in a session of its own. Each step waits
     // for the previous process to publish its pid, so the escape is only
     // reported by a check that already judged the processes that stay.
+    let filter = pohunek_test_support::exact_test_filter(module_path!(), LISTENER_IMAGE);
     let script = format!(
         "#!/bin/sh\n\
          cd {dir}\n\
          /bin/cp /bin/sleep pi-daemon\n\
          wait_for() {{ until [ -e \"$1\" ]; do /bin/sleep 0.02; done; }}\n\
-         sh -c 'echo $$ > tree.pid; exec {image} {LISTENER_IMAGE} --exact --ignored --nocapture {dir}/tree.sock {barrier}' </dev/null >/dev/null 2>&1 &\n\
+         sh -c 'echo $$ > tree.pid; exec {image} {filter} --ignored --nocapture {dir}/tree.sock {barrier}' </dev/null >/dev/null 2>&1 &\n\
          wait_for tree.pid\n\
          /usr/bin/setsid sh -c 'echo $$ > wrapper.pid; exec /bin/sleep 600' </dev/null >/dev/null 2>&1 &\n\
          wait_for wrapper.pid\n\
-         ( /usr/bin/setsid sh -c 'echo $$ > listener.pid; exec {image} {LISTENER_IMAGE} --exact --ignored --nocapture {dir}/escaped.sock {barrier}' </dev/null >/dev/null 2>&1 & )\n\
+         ( /usr/bin/setsid sh -c 'echo $$ > listener.pid; exec {image} {filter} --ignored --nocapture {dir}/escaped.sock {barrier}' </dev/null >/dev/null 2>&1 & )\n\
          wait_for listener.pid\n\
          /usr/bin/setsid sh -c 'echo $$ > daemon.pid; exec ./pi-daemon 600' </dev/null >/dev/null 2>&1 &\n\
          wait_for daemon.pid\n\
          exec /bin/sleep 600\n",
         barrier = barrier.display(),
+        filter = filter.join(" "),
     );
     let program = write_program(&servers.plugins, "agent-escape", &script);
     let table = placement_table("mode = \"in_process\"");

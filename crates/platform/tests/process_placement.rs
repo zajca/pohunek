@@ -79,7 +79,11 @@ impl Fixture {
         let dir = pohunek_test_support::tempdir().expect("scenario directory");
         std::fs::create_dir(dir.path().join(BARRIER_DIR)).expect("create the barrier");
         let child = Command::new(std::env::current_exe().expect("this test binary"))
-            .args(["image", "--exact", "--ignored", "--nocapture"])
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
+                "image",
+            ))
+            .args(["--ignored", "--nocapture"])
             .env(MODE_ENV, mode)
             .env(DIR_ENV, dir.path())
             .stdin(Stdio::null())
