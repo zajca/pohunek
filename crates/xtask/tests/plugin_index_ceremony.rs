@@ -433,6 +433,25 @@ fn an_endorsed_record_and_a_first_revocation_list_pass_the_index_verifier() {
     );
     assert_eq!(mode_of(&record_file), 0o644);
 
+    // The mode holds under the strict umask of the ceremony shell.
+    let strict = ceremony.path("strict.record.json");
+    let status = ceremony
+        .env
+        .command("/bin/sh")
+        .current_dir(ceremony.env.cwd())
+        .arg("-c")
+        .arg("umask 077; exec \"$0\" index endorse --endorser-key-file \"$1\" --key-file \"$2\" --scope official --not-before \"$3\" --not-after \"$4\" --output \"$5\"")
+        .arg(pohunek_test_support::bin_exe("xtask"))
+        .arg(&primary.file)
+        .arg(&index_key.file)
+        .arg(start.to_string())
+        .arg((start + 365 * DAY).to_string())
+        .arg(&strict)
+        .status()
+        .expect("run xtask under umask 077");
+    assert!(status.success());
+    assert_eq!(mode_of(&strict), 0o644);
+
     let record = read_record(&record_file);
     assert_eq!(record.key_id.as_str(), index_key.key_id);
     assert_eq!(record.public_key, index_key.public_key);
@@ -632,7 +651,7 @@ fn a_revocation_chain_rises_in_sequence_and_never_drops_an_id() {
             Some(&first),
         ),
         ("same.json", 1, vec![other.key_id.as_str()], Some(&first)),
-        ("lower.json", 2, both.to_vec(), Some(&second)),
+        ("lower.json", 1, both.to_vec(), Some(&second)),
         ("equal.json", 2, both.to_vec(), Some(&second)),
         ("no-previous.json", 2, vec![other.key_id.as_str()], None),
         ("zero.json", 0, vec![other.key_id.as_str()], None),
@@ -773,6 +792,36 @@ fn the_channel_names_a_root_of_the_anchor_and_matches_the_package_bytes() {
         primary.key_id
     );
     assert_eq!(mode_of(&channel), 0o644);
+
+    // A root that the same anchor revokes cannot verify any index.
+    let revoking = ceremony.path("revoking-anchor.json");
+    ceremony.xtask_ok(&[
+        "catalog",
+        "anchor",
+        "--root",
+        &format!("{}:0:4000000000", public.display()),
+        "--revoked-key-id",
+        &primary.key_id,
+        "--output",
+        revoking.to_str().expect("utf-8"),
+    ]);
+    ceremony.assert_refused(
+        &[
+            "index",
+            "channel",
+            "--anchor",
+            revoking.to_str().expect("utf-8"),
+            "--endorser-key-id",
+            &primary.key_id,
+            "--output",
+            ceremony
+                .path("revoked-channel.json")
+                .to_str()
+                .expect("utf-8"),
+        ],
+        &ceremony.path("revoked-channel.json"),
+        "revoked by the trust anchor",
+    );
 
     // An id that is not a root, a malformed id and an existing output.
     let refused = ceremony.path("refused.json");

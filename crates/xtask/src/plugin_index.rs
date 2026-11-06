@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
@@ -65,7 +65,12 @@ fn write_new_document(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
         .open(path)
         .map_err(io_error(path))?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // The create mode is masked by the umask; the document is public, so the
+    // mode is set explicitly.
+    let written = file
+        .set_permissions(std::fs::Permissions::from_mode(DOCUMENT_MODE))
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all());
     if let Err(source) = written {
         // The file is ours: it did not exist before the exclusive create.
         let _ = std::fs::remove_file(path);
@@ -395,6 +400,12 @@ pub(crate) fn channel(args: &ChannelArgs) -> Result<(), XtaskError> {
         u64::try_from(MAX_ANCHOR_BYTES).unwrap_or(u64::MAX),
     )?;
     let anchor = parse_anchor(&anchor_bytes).map_err(XtaskError::Anchor)?;
+    if anchor.revoked_key_ids().contains(&endorser_id) {
+        return Err(XtaskError::Usage(
+            "the endorser key is revoked by the trust anchor; no index could verify under it"
+                .into(),
+        ));
+    }
     let channel = IndexChannel::new(endorser_id);
     channel
         .endorser(&anchor)
