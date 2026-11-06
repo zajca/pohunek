@@ -8,7 +8,7 @@
 use protocol::ProtocolError;
 
 use super::*;
-use crate::agent::host::fixture::cline_shaped_host;
+use crate::agent::host::fixture::cline_shaped_host_with;
 
 /// Root session id of the `root_resume` fixture.
 const ROOT: &str = "c0ffee00-0000-4000-8000-000000000001";
@@ -30,6 +30,16 @@ const LOCAL: &str = "local";
 const HUB: &str = "hub";
 /// The environment of a `cline` turn outside any Pohunek session.
 const FOREIGN: &str = "foreign";
+/// A hook run by a process that has been orphaned out of the PTY's tree.
+const DETACHED: &str = "detached";
+/// A hook whose worker socket path names no socket.
+const NO_SOCKET: &str = "nosocket";
+/// A hook without the worker socket variable.
+const UNSET_SOCKET: &str = "unsetsocket";
+/// A hook without the worker instance variable.
+const NO_INSTANCE: &str = "noinstance";
+/// A hook without the native reference kind variable.
+const NO_KIND: &str = "nokind";
 
 /// A launch backed by a real worker and a fake Cline.
 struct Rig {
@@ -52,6 +62,15 @@ impl Rig {
         tag: &str,
         extra_args: &[&str],
         profile_env: &[(&str, &str)],
+    ) -> Result<Self, ProtocolError> {
+        Self::start_with(tag, extra_args, profile_env, true).await
+    }
+
+    async fn start_with(
+        tag: &str,
+        extra_args: &[&str],
+        profile_env: &[(&str, &str)],
+        declare_home: bool,
     ) -> Result<Self, ProtocolError> {
         let dir = temp_dir(tag);
         let cline_home = crate::test_support::thread_environment_home().join(".cline");
@@ -78,7 +97,7 @@ impl Rig {
         let args: Vec<String> = std::iter::once(script.display().to_string())
             .chain(extra_args.iter().map(|arg| (*arg).to_owned()))
             .collect();
-        let host = cline_shaped_host(&program, &args);
+        let host = cline_shaped_host_with(&program, &args, declare_home);
         let mut config = SessionRegistryConfig {
             shell_command: hermetic_shell(),
             store_path: Some(temp_store_path(tag)),
@@ -275,14 +294,23 @@ while read -r command event payload mode < '{fifo}'; do
   case "$command" in
     fire)
       hook='{hooks}'/"$event".sh
+      finish() {{
+        printf 'rc=%s bytes=%s\n' "$1" "$(wc -c < '{hook_runs}.out' | tr -d ' ')" >> '{hook_runs}'
+        printf 'fired %s\n' "$event" >> '{acks}'
+      }}
       case "$mode" in
-        hub) env -u CLINE_SANDBOX -u CLINE_SANDBOX_DATA_DIR "$hook" < "$payload" > '{hook_runs}.out' 2>&1 ;;
-        foreign) env -i PATH="$PATH" HOME="$HOME" "$hook" < "$payload" > '{hook_runs}.out' 2>&1 ;;
-        *) "$hook" < "$payload" > '{hook_runs}.out' 2>&1 ;;
-      esac
-      status=$?
-      printf 'rc=%s bytes=%s\n' "$status" "$(wc -c < '{hook_runs}.out' | tr -d ' ')" >> '{hook_runs}'
-      printf 'fired %s\n' "$event" >> '{acks}' ;;
+        hub) env -u CLINE_SANDBOX -u CLINE_SANDBOX_DATA_DIR "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+        foreign) env -i PATH="$PATH" HOME="$HOME" "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+        nosocket) env POHUNEK_WORKER_SOCKET_PATH=/nonexistent/pohunek.sock "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+        unsetsocket) env -u POHUNEK_WORKER_SOCKET_PATH "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+        noinstance) env -u POHUNEK_WORKER_INSTANCE_ID "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+        nokind) env -u POHUNEK_NATIVE_REFERENCE_KIND "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+        detached)
+          # The wrapper runs the hook once the subshell that started it (its $5)
+          # has exited, so the hook's parent is a process outside the PTY's tree.
+          ( p=$BASHPID; bash -c 'while kill -0 "$5" 2>/dev/null; do :; done; "$0" < "$1" > "$2.out" 2>&1; st=$?; printf "rc=%s bytes=%s\n" "$st" "$(wc -c < "$2.out" | tr -d " ")" >> "$2"; printf "fired %s\n" "$3" >> "$4"' "$hook" "$payload" '{hook_runs}' "$event" '{acks}' "$p" & ) ;;
+        *) "$hook" < "$payload" > '{hook_runs}.out' 2>&1; finish $? ;;
+      esac ;;
     exit) exit 0 ;;
   esac
 done
@@ -388,15 +416,23 @@ async fn a_launch_that_overrides_sandbox_mode_is_refused_with_a_typed_error() {
             error.msg
         );
     }
-    let error = Rig::start(
-        "cline-refused-relative",
-        &[],
-        &[("CLINE_DATA_DIR", "relative/data")],
-    )
-    .await
-    .err()
-    .expect("a relative data root refuses the launch");
-    assert_eq!(error.code, "cline_data_root_invalid");
+    for value in ["relative/data", ""] {
+        let error = Rig::start("cline-refused-data-root", &[], &[("CLINE_DATA_DIR", value)])
+            .await
+            .err()
+            .expect("a relative or empty data root refuses the launch");
+        assert_eq!(error.code, "cline_data_root_invalid", "{value:?}");
+    }
+    let error = Rig::start("cline-refused-empty-sandbox", &[], &[("CLINE_SANDBOX", "")])
+        .await
+        .err()
+        .expect("an empty sandbox value refuses the launch");
+    assert_eq!(error.code, "cline_launch_env_refused");
+    let error = Rig::start_with("cline-no-home", &[], &[], false)
+        .await
+        .err()
+        .expect("a descriptor without a config home refuses the launch");
+    assert_eq!(error.code, "cline_config_home_missing");
 }
 
 #[tokio::test]
@@ -583,6 +619,8 @@ async fn malformed_or_unsupported_input_exits_quietly_and_names_its_reason_in_th
     rig.fire("TaskResume", "malformed_empty").await;
     rig.fire("TaskResume", "root_resume_no_session").await;
     rig.fire("TaskResume", "root_resume_bad_session").await;
+    rig.fire("TaskResume", "root_resume_colon_session").await;
+    rig.fire("TaskResume", "malformed_array").await;
     rig.fire("TaskResume", "tool_call").await;
     rig.fire(
         "TaskResume",
@@ -590,19 +628,24 @@ async fn malformed_or_unsupported_input_exits_quietly_and_names_its_reason_in_th
     )
     .await;
 
-    rig.assert_hooks_quiet(6);
+    rig.assert_hooks_quiet(8);
     let trace = rig.trace();
-    for reason in [
-        "not_json",
-        "empty",
-        "root_session_id_missing",
-        "event_unsupported",
-        "input_too_large",
+    for (detail, lines) in [
+        ("not_json", 1),
+        ("empty", 1),
+        ("not_object", 1),
+        ("root_session_id_missing", 1),
+        // The bad id and the colon id are each refused by the id check alone.
+        ("root_session_id_invalid", 2),
     ] {
-        assert!(
-            trace.contains(reason),
-            "a trace line names {reason}: {trace}"
+        assert_eq!(
+            trace.matches(&format!("\"detail\":\"{detail}\"")).count(),
+            lines,
+            "trace lines naming {detail}: {trace}"
         );
+    }
+    for reason in ["event_unsupported", "input_too_large"] {
+        assert_eq!(trace.matches(reason).count(), 1, "{reason}: {trace}");
     }
     assert!(
         rig.worker()
@@ -640,6 +683,75 @@ async fn every_launch_of_the_conversation_carries_the_sandbox_pair() {
     for argv in log.lines().filter(|line| line.contains("--id ")) {
         assert!(!argv.contains("--auto-approve"), "{argv}");
     }
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn a_hook_outside_the_pty_tree_is_refused_by_the_worker_even_with_the_sandbox_variables() {
+    let rig = Rig::new("cline-detached")
+        .await
+        .expect("create the Cline session");
+
+    rig.fire_as("TaskResume", "root_resume", DETACHED).await;
+
+    rig.assert_hooks_quiet(1);
+    assert!(rig.trace().contains("worker_refused"), "{}", rig.trace());
+    let snapshot = rig.worker().await.inspect().await.expect("inspect");
+    assert!(
+        snapshot.active_identity.is_none(),
+        "an outside hook binds nothing"
+    );
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn a_hook_without_a_usable_worker_route_traces_why_and_reports_nothing() {
+    let rig = Rig::new("cline-route")
+        .await
+        .expect("create the Cline session");
+
+    rig.fire_as("TaskResume", "root_resume", NO_SOCKET).await;
+    rig.fire_as("TaskResume", "root_resume", UNSET_SOCKET).await;
+    rig.fire_as("TaskResume", "root_resume", NO_INSTANCE).await;
+
+    rig.assert_hooks_quiet(3);
+    let trace = rig.trace();
+    assert_eq!(trace.matches("worker_socket_missing").count(), 2, "{trace}");
+    assert_eq!(
+        trace.matches("worker_instance_missing").count(),
+        1,
+        "{trace}"
+    );
+    let snapshot = rig.worker().await.inspect().await.expect("inspect");
+    assert!(snapshot.active_identity.is_none());
+    rig.finish().await;
+    rig.remove().await;
+}
+
+#[tokio::test]
+async fn a_reference_kind_other_than_id_reports_the_identity_without_a_reference() {
+    let rig = Rig::new("cline-kind")
+        .await
+        .expect("create the Cline session");
+
+    rig.fire_as("TaskResume", "root_resume", NO_KIND).await;
+
+    let worker = rig.worker().await;
+    let snapshot = wait_until("the identity to be reported", || async {
+        let snapshot = worker.inspect().await.ok()?;
+        snapshot.active_identity.is_some().then_some(snapshot)
+    })
+    .await;
+    assert_eq!(
+        snapshot
+            .active_identity
+            .as_ref()
+            .and_then(|identity| identity.native_reference.as_deref()),
+        None,
+        "no reference is sent without the kind"
+    );
     rig.finish().await;
     rig.remove().await;
 }

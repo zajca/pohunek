@@ -1,0 +1,25 @@
+{
+  "clineVersion": "",
+  "timestamp": "2026-11-06T00:16:26.876Z",
+  "taskId": "conv_0000000000001_0000000",
+  "sessionContext": {
+    "rootSessionId": "a:b"
+  },
+  "workspaceRoots": [
+    "/capture-root____/s/hooks/ws"
+  ],
+  "workspaceInfo": {
+    "rootPath": "/capture-root____/s/hooks/ws",
+    "hint": "ws",
+    "latestGitCommitHash": "0000000000000000000000000000000000000001",
+    "latestGitBranchName": "main"
+  },
+  "userId": "capture",
+  "agent_id": "agent_00000000-0000-4000-8000-000000000001",
+  "parent_agent_id": null,
+  "hookName": "agent_resume",
+  "taskResume": {
+    "taskMetadata": {},
+    "previousState": {}
+  }
+}

@@ -28,4 +28,6 @@ payload): `subagent_error` (`subagent_complete` with `hookName` `agent_error`),
 `subagent_abort` (`subagent_shutdown` with `hookName` `agent_abort`),
 `root_resume_no_session` (`root_resume` without `sessionContext`),
 `root_resume_bad_session` (`root_resume` with a `rootSessionId` outside the id
-character set), `malformed_empty` and `malformed_not_json`.
+character set), `root_resume_colon_session` (`root_resume` with the
+`rootSessionId` `a:b`), `malformed_empty`, `malformed_not_json` and
+`malformed_array` (a JSON array).

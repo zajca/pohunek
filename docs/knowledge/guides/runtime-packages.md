@@ -640,7 +640,7 @@ directory. All six carry the same bytes and the ownership marker
 `# POHUNEK_INTEGRATION_ID=cline`. An install refuses with
 `integration_hook_path_conflict`, naming the paths and writing nothing, when any
 of the six holds a file without the marker (a user hook of the same name, a
-symlink or a directory is refused the same way); a file of the same event under
+symlink or a directory is refused the same way, while any other unreadable entry fails the install with its own error); a file of the same event under
 another name (`TaskResume.py`, `TaskResume`) is not a collision because Cline
 runs both. Uninstall removes only the files that carry the marker and reports
 the others as preserved; the `hooks/` directory stays. `install` reports the

@@ -73,7 +73,7 @@ STOP_OUTCOMES = {
 # ids are `<epoch ms>_<base36>`, UUIDs and `agent_<uuid>`.
 MAX_ID_CHARS = 128
 ID_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 )
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
@@ -445,17 +445,18 @@ def valid_id(value):
 
 
 def root_session_id():
+    # The id and None, or None and the trace detail that names what is wrong.
     context = hook_input.get("sessionContext")
-    if not isinstance(context, dict):
-        return None
-    value = context.get("rootSessionId")
-    return value if valid_id(value) else None
+    value = context.get("rootSessionId") if isinstance(context, dict) else None
+    if value is None:
+        return None, "root_session_id_missing"
+    return (value, None) if valid_id(value) else (None, "root_session_id_invalid")
 
 
 def report_identity():
-    native = root_session_id()
+    native, problem = root_session_id()
     if native is None:
-        trace(*missing_input("root_session_id_missing"))
+        trace(*missing_input(problem))
         return
     request = base_request("identity_report")
     if request is None:

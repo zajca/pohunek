@@ -1090,8 +1090,28 @@ pub(crate) fn cline_shaped_definition(
 /// Panics when the document or the registry is invalid, which would be a
 /// defect of the fixture.
 pub(crate) fn cline_shaped_host(program: &Path, args: &[String]) -> RuntimeHost {
-    let definition = cline_shaped_definition(&cline_shaped_document(program, args, CLINE_REQUIRES))
-        .expect("the Cline-shaped fixture document is valid");
+    cline_shaped_host_with(program, args, true)
+}
+
+/// Like [`cline_shaped_host`], optionally leaving out the `[config_home]` table.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid.
+pub(crate) fn cline_shaped_host_with(
+    program: &Path,
+    args: &[String],
+    declare_home: bool,
+) -> RuntimeHost {
+    let mut document = cline_shaped_document(program, args, CLINE_REQUIRES);
+    if !declare_home {
+        let home = document
+            .find("\n[config_home]")
+            .expect("the fixture declares a config home");
+        document.truncate(home + 1);
+    }
+    let definition =
+        cline_shaped_definition(&document).expect("the Cline-shaped fixture document is valid");
     let builtin = BuiltinSource::new("/bin/sh");
     let official = OfficialDefinitionSource(definition);
     RuntimeHost::new(

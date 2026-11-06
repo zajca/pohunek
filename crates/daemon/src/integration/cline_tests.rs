@@ -17,6 +17,7 @@ use protocol::{
 
 use super::doctor::doctor_in_with;
 use super::handler::{install_in, install_in_gated, status_in, RetainedSchemas};
+use super::removal_tests::RaceHook;
 use super::tests::{scoped_dir, tree_snapshot, TestDir};
 use super::{uninstall_in, ConfigHomes, HomeSelection};
 use crate::agent::host::fixture::{
@@ -414,25 +415,23 @@ fn a_failure_after_k_files_restores_the_exact_prior_tree() {
 }
 
 #[test]
-fn all_profiles_install_one_transaction_per_home_and_a_conflict_stays_in_its_home() {
-    let rig = Rig::new(&[]);
-    let personal = rig.root.join("personal");
-    let work = rig.root.join("work");
-    for (name, dir) in [("personal", &personal), ("work", &work)] {
+fn all_profiles_install_one_transaction_per_home_and_a_failing_home_stays_in_its_place() {
+    let root = scoped_dir("cline-all-profiles");
+    let personal = root.join("personal");
+    let work = root.join("work");
+    for dir in [&personal, &work] {
         fs::create_dir_all(dir).expect("profile home");
-        fs::write(
-            rig.root.join(format!("agents/{name}.toml")),
-            profile_text(dir),
-        )
-        .expect("write a profile");
     }
     fs::create_dir_all(work.join("hooks")).expect("hooks dir");
     fs::write(hook(&work, "TaskError.sh"), FOREIGN).expect("foreign hook");
     let work_before = tree(&work);
-    // The runtime's own home is absent and is skipped, not created.
+    let relative = format!(
+        "base = \"cline\"\npackage = \"pohunek.runtime.cline\"\ndigest = \"{PACKAGE_DIGEST}\"\n[env]\nCLINE_DIR = \"relative/home\"\n"
+    );
     let rig = Rig::new(&[
         ("personal", profile_text(&personal)),
         ("work", profile_text(&work)),
+        ("relative", relative),
     ]);
 
     let result = rig.install(&HomeSelection::All).expect("per-home result");
@@ -442,20 +441,67 @@ fn all_profiles_install_one_transaction_per_home_and_a_conflict_stays_in_its_hom
         result.installed[0].home.as_ref().expect("label").profiles,
         ["personal"]
     );
-    assert_eq!(result.failed.len(), 1);
-    assert_eq!(result.failed[0].home.profiles, ["work"]);
+    let mut failed: Vec<(&[String], &str)> = result
+        .failed
+        .iter()
+        .map(|failure| {
+            (
+                failure.home.profiles.as_slice(),
+                failure.error.code.as_str(),
+            )
+        })
+        .collect();
+    failed.sort();
     assert_eq!(
-        result.failed[0].error.code,
-        "integration_hook_path_conflict"
+        failed,
+        [
+            (
+                ["relative".to_owned()].as_slice(),
+                "agent_config_dir_invalid"
+            ),
+            (
+                ["work".to_owned()].as_slice(),
+                "integration_hook_path_conflict"
+            ),
+        ]
     );
     assert_eq!(tree(&work), work_before);
     assert!(hook(&personal, "TaskStart.sh").is_file());
-    assert!(!rig.root.join("home/.cline").exists());
+    assert!(
+        !rig.root.join("home/.cline").exists(),
+        "an absent runtime home is skipped"
+    );
     assert_eq!(
         rig.status(&HomeSelection::Profile("personal".to_owned()))
             .state,
         IntegrationInstallState::Current
     );
+}
+
+#[test]
+fn a_user_file_that_appears_while_the_install_runs_is_kept_and_the_install_rolls_back() {
+    let rig = Rig::new(&[]);
+    let dir = rig.home();
+    let before = tree(&dir);
+    let target = hook(&dir, "TaskResume.sh");
+    let planted = target.clone();
+    let _race = RaceHook::install(move |label, name| {
+        if label == "write.decided" && name == "TaskResume.sh" {
+            fs::create_dir_all(planted.parent().expect("hooks dir")).expect("hooks dir");
+            fs::write(&planted, FOREIGN).expect("the user writes a hook");
+        }
+    });
+
+    let error = rig
+        .install(&HomeSelection::Runtime)
+        .expect_err("a collision");
+
+    assert_eq!(error.code, "integration_destination_collision");
+    assert_eq!(fs::read_to_string(&target).expect("read"), FOREIGN);
+    for name in FILES.iter().filter(|name| **name != "TaskResume.sh") {
+        assert!(!hook(&dir, name).exists(), "{name} was rolled back");
+    }
+    assert_ne!(tree(&dir), before, "only the user's own file is new");
 }
 
 #[test]

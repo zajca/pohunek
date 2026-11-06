@@ -207,6 +207,12 @@ impl StagedUpdate for StagedCline {
     }
 }
 
+/// Whether `path` is absent or a regular file, as opposed to a symlink or
+/// another kind of entry.
+fn is_plain_entry(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).map_or(true, |metadata| metadata.is_file())
+}
+
 /// Computes the asset set for the config directory `dir` without changing it.
 fn stage_cline(dir: &Path) -> Result<StagedCline, ProtocolError> {
     let label = "Cline config directory";
@@ -224,16 +230,17 @@ fn stage_cline(dir: &Path) -> Result<StagedCline, ProtocolError> {
     let mut loaded = Vec::with_capacity(HOOK_FILES.len());
     let mut foreign = Vec::new();
     for name in HOOK_FILES {
-        // An entry that cannot be read as a plain owner-safe file (a symlink, a
-        // directory, an unsafe mode) is as much in the way as a foreign file.
         let file = match &trusted_hooks {
             Some(hooks) => match hooks.read_optional(name, "Cline hook") {
                 Ok(file) => file,
-                Err(_unreadable) => {
+                // A symlink or a directory is as much in the way as a foreign
+                // file; any other read failure is reported as it is.
+                Err(_untrusted) if !is_plain_entry(&hooks_dir.join(name)) => {
                     foreign.push(hooks_dir.join(name));
                     loaded.push(None);
                     continue;
                 }
+                Err(error) => return Err(error),
             },
             None => None,
         };
