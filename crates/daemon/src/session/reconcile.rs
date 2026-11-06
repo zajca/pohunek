@@ -7882,7 +7882,6 @@ while os.getppid() == parent:
             continue
         try:
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.settimeout(2.0)
             client.connect(endpoint)
             client.sendall(payload.rstrip() + b"\n")
             answer = client.recv(4096).splitlines()[0]
@@ -25703,7 +25702,8 @@ generation "$1"
                     Some(crate::store::DesiredState::Stopped),
                     "{label}"
                 );
-                assert!(registry.shutdown().await.is_quiescent(), "{label}");
+                let report = registry.shutdown().await;
+                assert!(report.is_quiescent(), "{label}: {report:?}");
                 worker.server_task.finish().await;
                 drop(worker.reporter);
             }

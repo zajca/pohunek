@@ -3871,7 +3871,10 @@ async fn codex_captured_startup_dialog(
         let sessions: Vec<SessionInfo> =
             serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
                 .expect("list sessions");
-        assert!(sessions.is_empty(), "the refused session was rolled back");
+        assert!(
+            sessions.is_empty(),
+            "the refused session was rolled back: {sessions:?}"
+        );
         let captured = std::fs::read(&received).unwrap_or_default();
         assert!(
             captured.is_empty(),
