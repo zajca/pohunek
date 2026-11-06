@@ -46,7 +46,7 @@ struct Ceremony {
 }
 
 /// A key created by `catalog keygen`.
-struct Key {
+struct OwnerKey {
     file: PathBuf,
     key_id: String,
     public_key: String,
@@ -118,7 +118,7 @@ impl Ceremony {
         assert_eq!(output.exists(), existed, "a refusal changed the output");
     }
 
-    fn keygen(&self, name: &str) -> Key {
+    fn keygen(&self, name: &str) -> OwnerKey {
         let file = self.path(name);
         let stdout = self.xtask_ok(&[
             "catalog",
@@ -138,14 +138,20 @@ impl Ceremony {
             .expect("public_key line")
             .to_owned();
         assert_eq!(lines.next(), None, "keygen printed more than two lines");
-        Key {
+        OwnerKey {
             file,
             key_id,
             public_key,
         }
     }
 
-    fn endorse(&self, endorser: &Key, key: &Key, window: (u64, u64), output: &Path) -> Output {
+    fn endorse(
+        &self,
+        endorser: &OwnerKey,
+        key: &OwnerKey,
+        window: (u64, u64),
+        output: &Path,
+    ) -> Output {
         self.xtask(&[
             "index",
             "endorse",
@@ -166,7 +172,7 @@ impl Ceremony {
 
     fn revoke(
         &self,
-        endorser: &Key,
+        endorser: &OwnerKey,
         sequence: u64,
         ids: &[&str],
         previous: Option<&Path>,
@@ -196,7 +202,13 @@ impl Ceremony {
 
     /// The endorsement `endorser` signs for `key` over `window`, written by
     /// the command, checked to succeed.
-    fn endorsed(&self, endorser: &Key, key: &Key, window: (u64, u64), name: &str) -> PathBuf {
+    fn endorsed(
+        &self,
+        endorser: &OwnerKey,
+        key: &OwnerKey,
+        window: (u64, u64),
+        name: &str,
+    ) -> PathBuf {
         let record = self.path(name);
         let output = self.endorse(endorser, key, window, &record);
         assert!(
@@ -209,7 +221,7 @@ impl Ceremony {
 
     fn revoked(
         &self,
-        endorser: &Key,
+        endorser: &OwnerKey,
         sequence: u64,
         ids: &[&str],
         previous: Option<&Path>,
@@ -249,8 +261,8 @@ fn read_revocations(path: &Path) -> SignedRevocations {
 /// `record` and `revocations` and is signed by `index_key`; the endorser is
 /// the root `endorser`.
 fn verify_with_package(
-    endorser: &Key,
-    index_key: &Key,
+    endorser: &OwnerKey,
+    index_key: &OwnerKey,
     record_file: &Path,
     revocations_file: &Path,
     at: u64,
