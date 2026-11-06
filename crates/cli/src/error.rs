@@ -710,6 +710,7 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::StagedBinary { .. }
         | Error::VersionMismatch { .. }
         | Error::VersionConflict { .. }
+        | Error::VersionLacksChannel { .. }
         | Error::AlreadyInstalled { .. }
         | Error::NotInstalled { .. }
         | Error::PendingInstall { .. }

@@ -330,7 +330,7 @@ For a daemon archive upgrade, run its installer
 `pohunek service upgrade --from <archive-dir>`) rather than replacing only `pohunekd`. Before it changes anything, the upgrade
 runs the [upgrade preflight](#upgrade-preflight) with the new binaries and
 refuses when a live session would not survive the switch. It then copies the new
-binaries and the release's catalog trust anchor into their own
+binaries, the release's catalog trust anchor and its plugin index channel file into their own
 `<prefix>/libexec/pohunek/<version>/` directory (the daemon reads the anchor
 only at startup, so the restart below is what makes a new anchor effective),
 switches `active_version` in `service.toml`, rewrites the daemon job to the new
@@ -868,6 +868,28 @@ around both commands and does not print the hook asset step afterwards
 (`pohunek integration doctor`, then `pohunek integration install --agent <agent>`
 for each outdated agent). `--accept-runtime-loss` accepts such sessions only
 after the check has been reviewed.
+
+### Plugin index channel file from 0.40
+
+From 0.40 a daemon archive carries `plugin-index-channel.json` beside
+`runtime-catalog-anchor.json`. The daemon reads it at startup, and without it
+`pohunek plugin install <package-id>` is refused with
+`official_trust_unavailable` (there is no compiled fallback). Installs by
+catalog, by `--sha256` and from a local archive never use the file.
+
+Upgrade to 0.40 through `<archive>/packaging/install-daemon.sh` or
+`<archive>/pohunek service upgrade --from <archive>`: both run the 0.40 CLI,
+which copies the file. A manual `pohunek service upgrade --from <0.40 dir>` run
+by the installed 0.39 CLI publishes the 0.40 version directory without the
+file; the daemon then runs without a plugin index endorser. Running the 0.40
+upgrade again for that version ends in `service_version_lacks_index_channel`
+instead of the generic `service_version_conflict`: the directory is immutable
+and stays as published. To restore installs by id, install the next release, or
+run `pohunek service uninstall` and then `<archive>/packaging/install-daemon.sh`.
+
+A Homebrew install has the file only once the formula installs it with the
+other `libexec` files; until then the host runs without a plugin index
+endorser and fails closed the same way.
 
 ### Official runtime packages during an upgrade
 

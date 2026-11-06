@@ -905,7 +905,7 @@ unsafe=$(find "$root" ! -type f ! -type d -print | head -n 1)
 [ -z "$unsafe" ] || fail "the extracted archive holds a link or special file: $unsafe"
 
 # --- archive checks ----------------------------------------------------------
-for member in MANIFEST packaging/verify-archive runtime-catalog-anchor.json runtime/runtime-catalog.json $binaries; do
+for member in MANIFEST packaging/verify-archive runtime-catalog-anchor.json plugin-index-channel.json runtime/runtime-catalog.json $binaries; do
     [ -f "$root/$member" ] || fail "the archive lacks $member"
 done
 "$root/packaging/verify-archive" "$root" daemon $binaries >/dev/null \

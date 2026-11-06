@@ -233,6 +233,7 @@ class _SmokeArchiveFixture:
             (tree / binary).write_text(f"#!/bin/sh\n# {binary}\n")
             (tree / binary).chmod(0o755)
         (tree / "runtime-catalog-anchor.json").write_text('{"anchor":"fixture"}\n')
+        (tree / "plugin-index-channel.json").write_text('{"channel":"fixture"}\n')
         (tree / "packaging").mkdir()
         shutil.copy(PACKAGING / "verify-archive", tree / "packaging" / "verify-archive")
         (tree / "runtime" / "packages").mkdir(parents=True)

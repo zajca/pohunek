@@ -320,7 +320,11 @@ Daemon archives (`pohunek-daemon-*` for glibc, musl and macOS arm64, the only
 archives holding `pohunekd`) carry `runtime-catalog-anchor.json` at the archive
 root, beside the `pohunekd` executable, with mode `0644`; `packaging/stage-archive`
 refuses to stage a daemon archive without it. CLI and relay archives carry no
-anchor.
+anchor. Daemon archives also carry `plugin-index-channel.json` at the archive
+root beside the anchor, with mode `0644`; `packaging/stage-archive` refuses to
+stage a daemon archive without it, and `release assemble` refuses a daemon
+archive whose channel bytes differ from the committed
+`packaging/plugin-index-channel.json`.
 
 `pohunek service install` and `upgrade` copy the staged anchor into the version
 directory next to the daemon (`<prefix>/libexec/pohunek/<version>/`, mode `0644`)
@@ -330,6 +334,19 @@ layout. An anchor that is not a valid trust anchor is refused with
 installs and the daemon stays in the absent state. A version directory is
 immutable, so republishing it with a different or missing anchor is
 `service_version_conflict`.
+
+The same commands copy the staged `plugin-index-channel.json` next to the
+anchor (mode `0644`, one link) and treat it like the anchor: a channel file that
+does not parse is refused with `service_staged_index_channel_invalid` before any
+binary is copied, a build without one installs and the daemon refuses installs
+by id, and republishing a version with other channel bytes is
+`service_version_conflict`. When the only difference is a channel file that the
+staged build ships and the existing version directory lacks, the error is
+`service_version_lacks_index_channel` instead: an older CLI published that
+directory (a manual `pohunek service upgrade --from <archive>` runs the
+installed CLI, not the archive's), and installs by id stay off for that version.
+The next release restores them, or `pohunek service uninstall` followed by an
+install from `<archive>/packaging/install-daemon.sh` does.
 
 ## Limits
 

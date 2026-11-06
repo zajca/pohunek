@@ -54,6 +54,8 @@ def run(args, cwd=None, env=None, check=True):
 
 ANCHOR_BYTES = b'{"anchor":"fixture"}\n'
 ANCHOR_NAME = "runtime-catalog-anchor.json"
+CHANNEL_BYTES = b'{"channel":"fixture"}\n'
+CHANNEL_NAME = "plugin-index-channel.json"
 
 
 class Workspace:
@@ -83,6 +85,11 @@ class Workspace:
         self.anchor = self.root / "packaging" / "runtime-catalog-anchor.json"
         self.anchor.write_bytes(ANCHOR_BYTES)
         self.anchor.chmod(0o755)
+        # Stand-in for the checked-in plugin index channel file, with the same
+        # executable bit that staging must clear.
+        self.channel = self.root / "packaging" / CHANNEL_NAME
+        self.channel.write_bytes(CHANNEL_BYTES)
+        self.channel.chmod(0o755)
         shutil.copy(PACKAGING / "install-daemon.sh", self.root / "packaging")
         shutil.copy(PACKAGING / "verify-archive", self.root / "packaging")
         (self.root / "scripts").mkdir()
@@ -321,6 +328,32 @@ class StageArchiveTest(unittest.TestCase):
             staging = ws.out / ws.stage(component)
             self.assertFalse(list(staging.rglob(ANCHOR_NAME)), component)
 
+    def test_daemon_archive_carries_the_index_channel_unmodified_and_not_executable(self):
+        ws = Workspace(self)
+        staged = ws.out / ws.stage("daemon") / CHANNEL_NAME
+        self.assertEqual(staged.read_bytes(), CHANNEL_BYTES)
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o644)
+
+    def test_cli_and_relay_archives_carry_no_index_channel(self):
+        for component in ("cli", "relay"):
+            ws = Workspace(self)
+            staging = ws.out / ws.stage(component)
+            self.assertFalse(list(staging.rglob(CHANNEL_NAME)), component)
+
+    def test_a_daemon_archive_without_the_index_channel_is_refused_before_staging(self):
+        ws = Workspace(self)
+        ws.channel.unlink()
+        result = run(
+            [PACKAGING / "stage-archive", "daemon", VERSION, TARGET, ws.bindir, ws.docs, ws.out],
+            cwd=ws.root,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("plugin index channel file is missing", result.stderr)
+        self.assertEqual(list(ws.out.iterdir()), [])
+        # Archives that never carry the channel do not need it.
+        ws.stage("cli")
+
     def test_a_daemon_archive_without_the_anchor_is_refused_before_staging(self):
         ws = Workspace(self)
         ws.anchor.unlink()
@@ -425,6 +458,7 @@ class WriteManifestTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256(data).hexdigest(), digest, path)
         self.assertIn("pohunekd", entries)
         self.assertEqual(entries[ANCHOR_NAME], hashlib.sha256(ANCHOR_BYTES).hexdigest())
+        self.assertEqual(entries[CHANNEL_NAME], hashlib.sha256(CHANNEL_BYTES).hexdigest())
 
     def test_darwin_manifest_records_the_minimum_os(self):
         ws = Workspace(self)
@@ -564,6 +598,7 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(modes["pohunekd"], 0o755)
         self.assertEqual(modes["README.md"], 0o644)
         self.assertEqual(modes[ANCHOR_NAME], 0o644)
+        self.assertEqual(modes[CHANNEL_NAME], 0o644)
         # No AppleDouble or extended-header members.
         self.assertFalse([n for n in names if "/._" in n or "PaxHeaders" in n])
 

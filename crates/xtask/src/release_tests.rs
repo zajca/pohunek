@@ -85,6 +85,8 @@ fn archive_name(component: &str, target: &str) -> String {
 struct Daemon<'a> {
     target: &'a str,
     anchor: &'a [u8],
+    /// The archive's plugin index channel file; `None` ships none.
+    channel: Option<&'a [u8]>,
     /// Mixed into the binaries so builds with different tags differ.
     tag: &'a str,
 }
@@ -96,6 +98,8 @@ fn binary_bytes(target: &str, name: &str, tag: &str) -> Vec<u8> {
 /// One set of consistent producer artifacts in a temporary directory.
 struct Fixture {
     dir: tempfile::TempDir,
+    /// The committed plugin index channel file every daemon archive ships.
+    channel: Vec<u8>,
     anchor: Vec<u8>,
 }
 
@@ -130,7 +134,13 @@ impl Fixture {
         )
         .expect("anchor");
         let anchor = fs::read(&anchor_path).expect("read anchor");
-        let fixture = Self { dir, anchor };
+        let channel =
+            fs::read(root().join("packaging/plugin-index-channel.json")).expect("channel");
+        let fixture = Self {
+            dir,
+            channel,
+            anchor,
+        };
         fs::create_dir(fixture.inputs()).expect("inputs");
         fixture.build_all(COMMIT);
         fixture
@@ -161,6 +171,7 @@ impl Fixture {
             self.write_daemon(&Daemon {
                 target,
                 anchor: &self.anchor,
+                channel: Some(&self.channel),
                 tag: "ci",
             });
         }
@@ -238,6 +249,9 @@ impl Fixture {
             daemon.anchor,
             0o644,
         );
+        if let Some(channel) = daemon.channel {
+            write_file(&top.join("plugin-index-channel.json"), channel, 0o644);
+        }
         write_file(
             &top.join("packaging/verify-archive"),
             &fs::read(root().join("packaging/verify-archive")).expect("verify-archive"),
@@ -706,6 +720,7 @@ fn a_daemon_binary_changed_after_attestation_is_refused() {
     fixture.write_daemon(&Daemon {
         target: GNU,
         anchor: &fixture.anchor,
+        channel: Some(&fixture.channel),
         tag: "rebuilt-after-attestation",
     });
     match fixture.assemble(&fixture.out("bundle")) {
@@ -803,12 +818,47 @@ fn a_daemon_archive_with_another_anchor_is_refused() {
     fixture.write_daemon(&Daemon {
         target: MUSL,
         anchor: &other,
+        channel: Some(&fixture.channel),
         tag: "ci",
     });
     fixture.expect_refused(
         fixture.assemble(&fixture.out("bundle")),
         InputClass::Anchor,
         Fault::Mismatch,
+    );
+}
+
+#[test]
+fn a_daemon_archive_with_another_channel_file_is_refused() {
+    let fixture = Fixture::new();
+    let mut other = fixture.channel.clone();
+    other.push(b'\n');
+    fixture.write_daemon(&Daemon {
+        target: MUSL,
+        anchor: &fixture.anchor,
+        channel: Some(&other),
+        tag: "ci",
+    });
+    fixture.expect_refused(
+        fixture.assemble(&fixture.out("bundle")),
+        InputClass::Channel,
+        Fault::Mismatch,
+    );
+}
+
+#[test]
+fn a_daemon_archive_without_a_channel_file_is_refused() {
+    let fixture = Fixture::new();
+    fixture.write_daemon(&Daemon {
+        target: GNU,
+        anchor: &fixture.anchor,
+        channel: None,
+        tag: "ci",
+    });
+    fixture.expect_refused(
+        fixture.assemble(&fixture.out("bundle")),
+        InputClass::Channel,
+        Fault::Missing,
     );
 }
 

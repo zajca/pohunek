@@ -58,12 +58,16 @@ mkdir -p "$output"
 for extra in $release_files; do
     [ -f "$extra" ] || fail "required release file is missing: $extra (run from the repository root)"
 done
-# Only the daemon archive carries the catalog trust anchor, so it stays out of
-# `release_files` (shared with the CLI and relay archives).
+# Only the daemon archive carries the catalog trust anchor and the plugin
+# index channel file, so they stay out of `release_files` (shared with the CLI
+# and relay archives).
 anchor_file=runtime-catalog-anchor.json
 anchor_source=packaging/$anchor_file
+channel_file=plugin-index-channel.json
+channel_source=packaging/$channel_file
 if [ "$component" = daemon ]; then
     [ -f "$anchor_source" ] || fail "catalog trust anchor is missing: $anchor_source (run from the repository root)"
+    [ -f "$channel_source" ] || fail "plugin index channel file is missing: $channel_source (run from the repository root)"
 fi
 [ -f packaging/verify-archive ] || fail "packaging/verify-archive is missing (run from the repository root)"
 
@@ -95,6 +99,10 @@ case $component in
         # because no execute bit is set.
         cp "$anchor_source" "$staging/$anchor_file"
         chmod 0644 "$staging/$anchor_file"
+        # The channel file sits beside the anchor under the same rules; the
+        # daemon resolves the plugin index endorser from it.
+        cp "$channel_source" "$staging/$channel_file"
+        chmod 0644 "$staging/$channel_file"
         ;;
     relay)
         copy_binary pohunek-relayd

@@ -735,6 +735,33 @@ mod tests {
     }
 
     #[test]
+    fn the_checked_in_channel_names_the_primary_root_of_the_checked_in_anchor() {
+        let packaging = pohunek_test_support::workspace_root().join("packaging");
+        let bytes = fs::read(packaging.join(package::INDEX_CHANNEL_FILE_NAME)).expect("channel");
+        let channel = package::parse_index_channel(&bytes).expect("channel parses");
+        assert_eq!(
+            channel.to_bytes().expect("canonical bytes"),
+            bytes,
+            "the committed file is the canonical document"
+        );
+
+        let anchor_bytes = fs::read(packaging.join("runtime-catalog-anchor.json")).expect("anchor");
+        let anchor = package::parse_anchor(&anchor_bytes).expect("anchor parses");
+        channel
+            .endorser(&anchor)
+            .expect("the endorser is a root of the checked-in anchor");
+
+        let key_id = |file: &str| {
+            let path = packaging.join("catalog-trust").join(file);
+            let bytes = read_public_key(&path).expect("public key");
+            let verifying = ed25519_dalek::VerifyingKey::from_bytes(&bytes).expect("key");
+            KeyId::derive(&verifying)
+        };
+        assert_eq!(channel.index_endorser_key_id(), &key_id("primary.pub"));
+        assert_ne!(channel.index_endorser_key_id(), &key_id("ci.pub"));
+    }
+
+    #[test]
     fn an_entry_takes_its_identity_and_digest_from_the_archive() {
         let release = release();
         let catalog = build(&release.spec).expect("build");
