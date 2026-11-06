@@ -51,10 +51,13 @@ those durable records.
 
 `pohunek service install [--from DIR] [--prefix DIR]` installs the daemon as a
 native login service. It copies `pohunek`, `pohunekd`, and `pohunek-sessiond`,
-plus the build's `runtime-catalog-anchor.json` when it ships one (an invalid
-anchor is refused with `service_staged_anchor_invalid`; re-installing an
-existing version with a different or missing anchor fails with
-`service_version_conflict`), into `<prefix>/libexec/pohunek/<version>/` (prefix
+plus the build's `runtime-catalog-anchor.json` and `plugin-index-channel.json`
+when it ships them (an invalid anchor is refused with
+`service_staged_anchor_invalid`, an invalid channel file with
+`service_staged_index_channel_invalid`; re-installing an existing version with a
+different or missing anchor fails with `service_version_conflict`, and with a
+missing channel file that the build ships with
+`service_version_lacks_index_channel`), into `<prefix>/libexec/pohunek/<version>/` (prefix
 default `$HOME/.local`),
 installs `<prefix>/bin/pohunek`, writes `<config>/pohunek/service.toml`, and
 registers one daemon job: the systemd user unit

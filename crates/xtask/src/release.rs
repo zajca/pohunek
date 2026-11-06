@@ -59,6 +59,13 @@ pub(crate) const CATALOG_FILE: &str = "runtime-catalog.json";
 /// Name of the trust anchor at the top of a daemon archive.
 pub(crate) const ANCHOR_FILE: &str = "runtime-catalog-anchor.json";
 
+/// Name of the plugin index channel file at the top of a daemon archive.
+pub(crate) const CHANNEL_FILE: &str = package::INDEX_CHANNEL_FILE_NAME;
+
+/// Checkout-relative path of the committed plugin index channel file every
+/// daemon archive must ship unchanged.
+const COMMITTED_CHANNEL: &str = "packaging/plugin-index-channel.json";
+
 /// Directory of a daemon archive that carries the catalog, packages and
 /// attestations.
 pub(crate) const BUNDLE_DIR: &str = "runtime";
@@ -107,6 +114,8 @@ pub enum InputClass {
     Matrix,
     /// The trust anchor file.
     Anchor,
+    /// The plugin index channel file.
+    Channel,
     /// The release version.
     Version,
     /// The release commit.
@@ -141,6 +150,7 @@ impl fmt::Display for InputClass {
             Self::Policy => "release policy",
             Self::Matrix => "compatibility matrix",
             Self::Anchor => "trust anchor",
+            Self::Channel => "plugin index channel",
             Self::Version => "release version",
             Self::Commit => "release commit",
             Self::Archive => "release archive",
@@ -476,6 +486,7 @@ fn assemble(args: &AssembleArgs, root: &Path) -> Result<AssembleSummary, XtaskEr
         return Err(refuse(InputClass::Matrix, Fault::Unexpected, &row.target));
     }
     let anchor = read_anchor(&args.anchor)?;
+    let channel = read_committed_channel(root)?;
 
     let output = &args.output;
     ensure_output_free(output)?;
@@ -506,7 +517,7 @@ fn assemble(args: &AssembleArgs, root: &Path) -> Result<AssembleSummary, XtaskEr
         .iter()
         .filter(|slot| slot.component == Component::Daemon)
     {
-        let tree = unpack_daemon(args, slot, &anchor, &work)?;
+        let tree = unpack_daemon(args, slot, (&anchor, &channel), &work)?;
         trees.insert(slot.target.clone(), tree);
     }
 
@@ -568,6 +579,18 @@ fn read_anchor(path: &Path) -> Result<Vec<u8>, XtaskError> {
         .map_err(XtaskError::Anchor)?
         .trust_anchor()
         .map_err(|error| XtaskError::Anchor(package::AnchorFileError::Anchor(error)))?;
+    Ok(bytes)
+}
+
+/// Reads the committed plugin index channel file below the checkout `root`
+/// and requires it to be a valid channel document.
+fn read_committed_channel(root: &Path) -> Result<Vec<u8>, XtaskError> {
+    let bytes = read_input(
+        &root.join(COMMITTED_CHANNEL),
+        u64::try_from(package::MAX_INDEX_CHANNEL_BYTES).unwrap_or(u64::MAX),
+    )?;
+    package::parse_index_channel(&bytes)
+        .map_err(|_cause| refuse(InputClass::Channel, Fault::Malformed, COMMITTED_CHANNEL))?;
     Ok(bytes)
 }
 
@@ -641,12 +664,16 @@ fn parse_checksum(bytes: &[u8], artifact: &str) -> Option<String> {
 }
 
 /// Unpacks and checks the daemon archive of `slot`.
+///
+/// `trust` holds the bytes of the trust anchor and of the plugin index channel
+/// file the archive must ship unchanged.
 fn unpack_daemon(
     args: &AssembleArgs,
     slot: &ArchiveSlot,
-    anchor: &[u8],
+    trust: (&[u8], &[u8]),
     work: &Path,
 ) -> Result<DaemonTree, XtaskError> {
+    let (anchor, channel) = trust;
     let archive = slot.archive_name(&args.version);
     let dest = work.join(&slot.target);
     fs::create_dir(&dest).map_err(io_error(&dest))?;
@@ -672,6 +699,14 @@ fn unpack_daemon(
     .map_err(|_cause| refuse(InputClass::Anchor, Fault::Missing, &archive))?;
     if shipped != anchor {
         return Err(refuse(InputClass::Anchor, Fault::Mismatch, archive));
+    }
+    let shipped = read_input(
+        &top.join(CHANNEL_FILE),
+        u64::try_from(package::MAX_INDEX_CHANNEL_BYTES).unwrap_or(u64::MAX),
+    )
+    .map_err(|_cause| refuse(InputClass::Channel, Fault::Missing, &archive))?;
+    if shipped != channel {
+        return Err(refuse(InputClass::Channel, Fault::Mismatch, archive));
     }
     if fs::symlink_metadata(top.join(BUNDLE_DIR)).is_ok() {
         return Err(refuse(InputClass::Archive, Fault::Unexpected, BUNDLE_DIR));

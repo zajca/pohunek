@@ -199,6 +199,15 @@ pub enum Error {
         detail: String,
     },
 
+    /// The staged plugin index channel file is present but cannot be installed.
+    #[error("staged plugin index channel {} is unusable: {detail}", path.display())]
+    StagedChannel {
+        /// The staged channel file.
+        path: PathBuf,
+        /// Why it was refused; never file content.
+        detail: String,
+    },
+
     /// The staged release `runtime/` tree is present but cannot be installed.
     #[error("staged runtime tree {} is unusable: {detail}", path.display())]
     StagedRuntime {
@@ -237,6 +246,20 @@ pub enum Error {
         path.display()
     )]
     VersionConflict {
+        /// The existing version directory.
+        path: PathBuf,
+    },
+
+    /// An installed version directory lacks the plugin index channel file the
+    /// staged build ships and otherwise equals it.
+    ///
+    /// An older CLI published the directory without the file, so its daemon
+    /// runs without a plugin index endorser and installs by id stay off.
+    #[error(
+        "{} was installed without the plugin index channel file that this build ships",
+        path.display()
+    )]
+    VersionLacksChannel {
         /// The existing version directory.
         path: PathBuf,
     },
@@ -1091,10 +1114,12 @@ impl Error {
             }
             Self::StagedBinary { .. } => "service_staged_binary_missing",
             Self::StagedAnchor { .. } => "service_staged_anchor_invalid",
+            Self::StagedChannel { .. } => "service_staged_index_channel_invalid",
             Self::StagedRuntime { .. } => "service_staged_runtime_invalid",
             Self::VersionProbe { .. } => "service_version_probe_failed",
             Self::VersionMismatch { .. } => "service_version_mismatch",
             Self::VersionConflict { .. } => "service_version_conflict",
+            Self::VersionLacksChannel { .. } => "service_version_lacks_index_channel",
             Self::UntrustedVersion { .. }
             | Self::UntrustedActiveVersion { .. }
             | Self::UntrustedRefreshVersion { .. } => "service_version_untrusted",
@@ -1284,6 +1309,12 @@ impl Error {
             ),
             Self::StagedAnchor { .. } => Some(
                 "restore runtime-catalog-anchor.json of the build being installed, or remove it to install a development build without a catalog trust anchor",
+            ),
+            Self::StagedChannel { .. } => Some(
+                "restore plugin-index-channel.json of the build being installed, or remove it to install a development build without a plugin index endorser",
+            ),
+            Self::VersionLacksChannel { .. } => Some(
+                "this version was installed by an older pohunek, so installs by plugin id stay off for it; the next release restores them, or run `pohunek service uninstall` and then install again from `<archive>/packaging/install-daemon.sh`",
             ),
             Self::DaemonNotReady { .. } => {
                 Some("inspect the daemon logs, then rerun the command to resume or roll back")
