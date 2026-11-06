@@ -1207,7 +1207,9 @@ impl Worker {
     /// Stops like [`Self::stop`], giving up on a worker that does not answer.
     ///
     /// An earlier exchange on the control connection gets `waits.exchange` to
-    /// finish, so a legitimately long one is not mistaken for a frozen worker.
+    /// finish, so a legitimately long one is not mistaken for a frozen worker;
+    /// an exchange the worker does not answer ends at its own deadline, and
+    /// the stop that then finds the connection torn is refused as torn.
     /// An input write holding the connection is delivered on the worker's own
     /// stall policy and gets `waits.input` instead. Once this caller holds
     /// the connection, the worker gets `waits.answer` to answer. The abandoned
@@ -1244,24 +1246,24 @@ impl Worker {
             }
         };
         let scope = scope(&inner)?;
-        // An abandoned input write is delivered on the worker's stall policy
-        // and the worker reads the stop only after it, so it gets the input
-        // wait, not the stop's own bound.
         // A connection an earlier exchange tore down says nothing about this
         // stop: it is refused as torn so the watcher reconnects, and nothing
         // is escalated.
         if matches!(inner.stream_state, StreamState::Torn) {
             return Err(WorkerError::TornStream);
         }
+        // An abandoned input write is delivered on the worker's stall policy
+        // and the worker reads the stop only after it, so it gets the input
+        // wait, not the stop's own bound.
         match drain_marked(&mut inner, waits.input).await {
             Ok(()) => {}
             Err(WorkerError::ExchangeTimedOut {
                 phase: ExchangePhase::Answer,
                 request: "abandoned_response",
-                ..
+                bound,
             }) => {
                 return Err(WorkerError::StopUnanswered {
-                    bound: waits.input,
+                    bound,
                     stage: "because an abandoned request kept the control connection busy",
                 });
             }

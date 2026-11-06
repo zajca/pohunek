@@ -112,14 +112,20 @@ impl Frozen {
         Self::start_with(
             deadlines,
             SessionRegistryConfig::default().worker_connect_deadline,
+            EXCHANGE_WAIT,
         )
         .await
     }
 
     /// Starts a session on a real worker that answers, with `deadlines` on
-    /// every exchange and `connect_deadline` as the time the watcher keeps
-    /// reconnecting before it classifies the worker.
-    async fn start_with(deadlines: ExchangeDeadlines, connect_deadline: Duration) -> Self {
+    /// every exchange, `connect_deadline` as the time the watcher keeps
+    /// reconnecting before it classifies the worker, and `exchange_wait` as the
+    /// time a stop waits for an earlier exchange.
+    async fn start_with(
+        deadlines: ExchangeDeadlines,
+        connect_deadline: Duration,
+        exchange_wait: Duration,
+    ) -> Self {
         let env = TestEnv::new().expect("create the test environment");
         let config = SessionRegistryConfig {
             shell_command: ShellCommand::new(
@@ -130,7 +136,7 @@ impl Frozen {
             kill_reap_deadline: KILL_REAP_DEADLINE,
             terminal_commit_wait: TERMINAL_COMMIT_WAIT,
             worker_stop_headroom: WORKER_STOP_HEADROOM,
-            worker_exchange_wait: EXCHANGE_WAIT,
+            worker_exchange_wait: exchange_wait,
             worker_input_stop_wait: INPUT_STOP_WAIT,
             input_write_stall_timeout: INPUT_STALL,
             worker_exchange_deadlines: deadlines,
@@ -495,19 +501,13 @@ async fn a_stop_ends_a_frozen_worker_the_watcher_gave_up_on() {
             answer: EXCHANGE_WAIT,
         },
         CONNECT_DEADLINE,
+        EXCHANGE_WAIT,
     )
     .await;
-    let frozen_at = std::time::Instant::now();
     kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
 
-    let seen = std::sync::Mutex::new(Vec::new());
     wait_until("the watcher to classify the frozen worker", || async {
         let runtime = frozen.registry.inspect(&frozen.id).await.ok()?.runtime?;
-        let mut seen = seen.lock().expect("state log");
-        if seen.last() != Some(&runtime.state) {
-            eprintln!("{:?} after {:?}", runtime.state, frozen_at.elapsed());
-            seen.push(runtime.state);
-        }
         (runtime.state == protocol::RuntimeState::Conflict).then_some(())
     })
     .await;
@@ -518,7 +518,6 @@ async fn a_stop_ends_a_frozen_worker_the_watcher_gave_up_on() {
     )
     .await
     .expect("a stop ends the worker the watcher gave up on");
-    eprintln!("stopped after {:?}", frozen_at.elapsed());
     assert!(stopped.stopped);
     assert_eq!(frozen.state().await, SessionState::Stopped);
     assert!(
@@ -529,4 +528,51 @@ async fn a_stop_ends_a_frozen_worker_the_watcher_gave_up_on() {
             .is_none(),
         "the frozen worker process is gone"
     );
+}
+
+/// With the production ordering of the waits, a stop's wait for an earlier
+/// exchange is longer than the answer deadline, so the watcher's unanswered
+/// exchange still holds the control connection when the stop arrives. The stop
+/// does not kill a worker that merely answers slowly: once the deadline closed
+/// the connection it is refused as retryable, and the retry ends the worker
+/// after the watcher classified it.
+#[tokio::test]
+async fn a_stop_behind_an_unanswered_exchange_is_refused_as_retryable_and_then_ends_the_worker() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let frozen = Frozen::start_with(
+        ExchangeDeadlines {
+            send: EXCHANGE_WAIT.saturating_mul(2),
+            answer: INPUT_STOP_WAIT,
+        },
+        CONNECT_DEADLINE,
+        INPUT_STOP_WAIT.saturating_mul(4),
+    )
+    .await;
+    kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
+    // An exchange the frozen worker never answers holds the control
+    // connection until the answer deadline.
+    let holder = tokio::spawn({
+        let registry = frozen.registry.clone();
+        let id = frozen.id.clone();
+        async move { registry.screen(&id).await }
+    });
+    settle().await;
+
+    let refused = guard(
+        "a stop behind an unanswered exchange",
+        Box::pin(frozen.registry.stop(&frozen.id)),
+    )
+    .await
+    .expect_err("the connection was closed by the deadline");
+    assert_eq!(refused.code, "session_runtime_reconnecting", "{refused:?}");
+
+    let stopped = wait_until("a retried stop to end the worker", || async {
+        Box::pin(frozen.registry.stop(&frozen.id)).await.ok()
+    })
+    .await;
+    assert!(stopped.stopped);
+    assert_eq!(frozen.state().await, SessionState::Stopped);
+    holder.abort();
 }

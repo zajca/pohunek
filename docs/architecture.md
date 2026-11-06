@@ -528,7 +528,10 @@ finish: `worker_send_ms` for writing the request and `worker_answer_ms` for the
 answer to any request except an input write (the worker's stall policy bounds it)
 and a stop (the stop bound). On expiry the daemon logs the session, the request
 and the phase, and shuts the socket down; the worker sees the end of the
-connection, releases its lease, and the watcher reconnects. A stop that the
+connection, releases its lease, and the watcher reconnects. A stop behind an
+exchange the worker never answers gets the connection once that exchange's
+deadline closed it and is refused with the retryable
+`session_runtime_reconnecting`. A stop that the
 worker leaves unanswered, or whose own exchange expires, proves the recorded
 worker identity from its journal and job, retires the job through the service
 manager, and commits the session `stopped`; a refused proof retires nothing.

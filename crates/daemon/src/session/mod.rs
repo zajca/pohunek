@@ -6362,6 +6362,18 @@ impl SessionRegistry {
                         }
                         .into()
                     }
+                    // A deadline closed the connection before this stop got it;
+                    // the watcher reconnects, and a retry finds the session
+                    // reconnecting or stoppable.
+                    Err(WorkerError::TornStream) => {
+                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                            .await;
+                        return Err(unavailable_runtime_error(
+                            id,
+                            RuntimeState::Reconnecting,
+                            Some(WORKER_CONNECTION_LOST),
+                        ));
+                    }
                     Err(error) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;

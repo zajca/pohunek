@@ -33,7 +33,7 @@
 //! driver_shutdown_ms = 5000                        # optional; 1..=600000
 //! event_log_flush_ms = 5000                        # optional; 1..=600000
 //! worker_send_ms = 15000                           # optional; 1..=600000
-//! worker_answer_ms = 60000                         # optional; 1..=600000
+//! worker_answer_ms = 60000                         # optional; 35000..=600000
 //!
 //! [environment]
 //! search_path = ["/opt/homebrew/bin", "/usr/bin"]  # absolute normalized directories; may be empty
@@ -570,9 +570,18 @@ pub const DEFAULT_WORKER_SEND: Duration = Duration::from_secs(15);
 /// a request other than an input write or a stop.
 ///
 /// The slowest such request is `Initialize` (PTY spawn plus journal write);
-/// the rest answer in milliseconds. An input write is bounded by the worker's
-/// own stall policy and a stop by the stop policy, so neither uses this.
+/// the rest answer in milliseconds, except the acknowledgement of an exited
+/// session, which waits for the output drain ([`MIN_WORKER_ANSWER`]). An input
+/// write is bounded by the worker's own stall policy and a stop by the stop
+/// policy, so neither uses this.
 pub const DEFAULT_WORKER_ANSWER: Duration = Duration::from_secs(60);
+
+/// Smallest accepted `deadlines.worker_answer_ms`.
+///
+/// The worker answers the acknowledgement of an exited session only after its
+/// post-exit output drain, up to 30 s when an attached client does not read;
+/// a shorter answer deadline would tear a healthy connection then.
+pub const MIN_WORKER_ANSWER: Duration = Duration::from_secs(35);
 
 /// Part of `deadlines.daemon_exit_timeout_ms` that no shutdown phase may use.
 ///
@@ -1207,7 +1216,7 @@ impl ServiceConfig {
         validate_duration("deadlines.driver_shutdown_ms", deadlines.driver_shutdown)?;
         validate_duration("deadlines.event_log_flush_ms", deadlines.event_log_flush)?;
         validate_duration("deadlines.worker_send_ms", deadlines.worker_send)?;
-        validate_duration("deadlines.worker_answer_ms", deadlines.worker_answer)?;
+        validate_worker_answer(deadlines.worker_answer)?;
         validate_allowlist(&spec.environment_allowlist)?;
         validate_duration("sweep.grace_ms", spec.sweep_grace)?;
         validate_duration(
@@ -3093,6 +3102,22 @@ fn path_error(path: &Path) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Validates `deadlines.worker_answer_ms`: a duration at least
+/// [`MIN_WORKER_ANSWER`].
+fn validate_worker_answer(value: Duration) -> Result<(), ConfigError> {
+    const KEY: &str = "deadlines.worker_answer_ms";
+    validate_duration(KEY, value)?;
+    if value < MIN_WORKER_ANSWER {
+        return Err(ConfigError::OutOfRange {
+            key: KEY,
+            value: millis(value),
+            min: millis(MIN_WORKER_ANSWER),
+            max: millis(MAX_DEADLINE),
+        });
+    }
+    Ok(())
 }
 
 /// Validates one recorded duration key.

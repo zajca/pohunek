@@ -718,3 +718,24 @@ async fn answer(reader: &mut ControlReader<OwnedReadHalf>) -> ResponseKind {
         }
     }
 }
+
+/// A controller that vanishes while the worker has an event line pending
+/// releases the lease: the worker drops the partial line and the next
+/// controller connects.
+#[tokio::test]
+async fn a_controller_that_vanishes_during_an_event_backlog_releases_the_lease() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let served = Served::start(Some(SOCKET_BUFFER_BYTES)).await;
+    let raw = Raw::start(&served).await;
+    served.printed().await;
+    drop(raw);
+
+    wait_until("the lease to be released", || async {
+        Worker::connect(&served.socket, SESSION_ID, DAEMON_ID)
+            .await
+            .ok()
+    })
+    .await;
+}
