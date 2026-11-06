@@ -1,0 +1,130 @@
+---
+type: Runbook
+id: runbook/plugin-index-keys
+title: Plugin index key ceremony and compromise procedure
+description: Owner procedure to create, endorse, install and rotate the online key that signs the official plugin index, and to revoke it after a leak or loss, using the xtask ceremony commands that read every secret from a file.
+source_kind: manual
+intents: [update, help]
+since: 0.40.0
+---
+
+# Plugin Index Key Ceremony
+
+The official plugin index is signed by an online index key `K`. Hosts trust `K`
+only through a record that the offline primary root `P` signed (scope
+`official`, at most 366 days), and they refuse `K` once a revocation list signed
+by `P` names it. This runbook is for the owner. Agents and CI never run a real
+ceremony: the commands below touch `P`, which stays offline, and create the
+secret that is installed into the signing environment. The trust model is in
+[Plugin index](../concepts/runtime-catalog.md#plugin-index).
+
+All four commands are `cargo xtask` commands run from a checkout at the release
+tag that shipped them:
+
+| Command | Writes | Secret it reads |
+|---|---|---|
+| `catalog keygen --output <key-file>` | a new 0600 key file | none (OS randomness) |
+| `index endorse --endorser-key-file <P> --key-file <K> --scope official --not-before <s> --not-after <s> --output <record.json>` | the signed key record of `K` | the seeds of `P` and `K` |
+| `index revoke --endorser-key-file <P> --sequence <n> [--key-id <id>]... [--previous <revocations.json>] --output <revocations.json>` | the signed revocation list | the seed of `P` |
+| `index channel --anchor <anchor.json> --endorser-key-id <id> --output <channel.json>` | the channel file that names `P` | none |
+
+Rules every command follows:
+
+- A seed is read only from a file: a regular file you own, mode `0600` or
+  stricter, one hard link, not a symbolic link. Anything else is refused with
+  the reason and the path, never the content. There is no flag, environment
+  variable or prompt that takes a key, and no command prints a seed.
+- Every output path must not exist yet. A refused input writes nothing, and a
+  finished document is never overwritten; move or delete the old file
+  deliberately.
+- Documents are verified with the daemon's rules before they are written. A
+  window shorter than one index lifetime (14 days), longer than 366 days, empty
+  or already over is refused.
+- `index revoke` writes exactly the ids given with `--key-id`. With
+  `--previous` it requires a higher sequence and every previously revoked id;
+  a list never shrinks, so repeat the earlier ids on every rotation. Without
+  `--previous` only `--sequence 1` is accepted. At most 64 ids. The primary
+  cannot revoke itself: that is an anchor change in a core release.
+
+## 1. Create and endorse the index key (O4)
+
+Work on the owner's machine, in a private RAM-backed directory:
+
+```sh
+umask 077; d=$(mktemp -d /dev/shm/pohunek-index-XXXXXX)
+cargo xtask catalog keygen --output "$d/official-index.key"
+```
+
+It prints `key_id=<64 hex>` and `public_key=<64 hex>`. Make the primary seed
+available as `<primary-seed>` (mode `0600`, owned by you), then:
+
+```sh
+now=$(date -u +%s)
+cargo xtask index endorse --endorser-key-file <primary-seed> \
+  --key-file "$d/official-index.key" --scope official \
+  --not-before "$now" --not-after $((now + 31536000)) \
+  --output official.record.json
+cargo xtask index revoke --endorser-key-file <primary-seed> --sequence 1 \
+  --output revocations.json
+```
+
+`endorse` prints the record's `key_id` and `endorsed_by`; the second must be the
+primary's key id. Put the primary seed back offline now. Open a pull request to
+the index repository that adds `keys/official.record.json` and
+`revocations/revocations.json` (both are public). Keep `$d` for the next step.
+
+## 2. Install the signing secret (O5)
+
+Create the `index-sign-official` environment in the index repository (branch
+`main` only, administrator bypass off), then store the seed from the file and
+destroy the file:
+
+```sh
+gh secret set INDEX_SIGNING_KEY_OFFICIAL --env index-sign-official \
+  --repo pohunekd/pohunek-plugin-index < "$d/official-index.key"
+shred -u "$d/official-index.key"; rmdir "$d"
+```
+
+The seed never reaches a terminal, an issue, a chat or an agent session. A lost
+key is replaced (sections 1 and 3), never restored.
+
+## 3. Rotate or revoke after a leak or loss
+
+Revoke `K`, introduce its replacement `K'` and swap the secret in one step, so
+there is no window in which the published index is signed by a revoked key:
+
+1. Create `K'` and its record as in section 1 (`catalog keygen`, then
+   `index endorse` with a fresh window).
+2. Write the next revocation list with the primary, keeping every id of the
+   previous list:
+
+   ```sh
+   cargo xtask index revoke --endorser-key-file <primary-seed> \
+     --previous revocations/revocations.json --sequence <n+1> \
+     --key-id <K> [--key-id <earlier-revoked-id>]... \
+     --output revocations.next.json
+   ```
+
+3. In one pull request to the index repository, add the record of `K'` and
+   replace `revocations/revocations.json` with the new list.
+4. Replace `INDEX_SIGNING_KEY_OFFICIAL` with the seed of `K'` (section 2) and
+   dispatch the sign workflow.
+
+Stopping part-way publishes nothing wrong: until both the record and the secret
+match, the sign job refuses to publish and the previous index stays the latest
+one until it expires. Every host that installs by id after the new document
+refuses `K` permanently, because revoked ids accumulate in its index state.
+
+The primary itself is replaced only by a trust anchor change in a core release.
+
+## 4. The channel file
+
+`packaging/plugin-index-channel.json` names the primary as the index endorser.
+Regenerate it only when the anchor changes:
+
+```sh
+cargo xtask index channel --anchor packaging/runtime-catalog-anchor.json \
+  --endorser-key-id <primary key id> --output <new-channel.json>
+```
+
+The command refuses an id that is not a root of the anchor.

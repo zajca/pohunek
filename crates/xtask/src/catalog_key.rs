@@ -16,7 +16,7 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
@@ -226,6 +226,53 @@ pub(crate) fn read_public_key(path: &Path) -> Result<[u8; KEY_BYTES], XtaskError
     let text = read_bounded(file).map_err(|fault| refuse(path, fault))?;
     let key = decode_key_text(&text).map_err(|fault| refuse(path, fault))?;
     Ok(*key)
+}
+
+/// Mode of a new key file: owner read and write only.
+const NEW_KEY_FILE_MODE: u32 = 0o600;
+
+/// Lowercase hexadecimal digits, indexed by nibble.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Writes `seed` to a new key file at `path` in the format [`read_signing_key`]
+/// reads: 64 lowercase hex characters and a final newline.
+///
+/// The file is created exclusively with mode 0600 and without following a
+/// final symbolic link, so an existing path, a link included, is refused and
+/// never written through. The hex text lives in a zeroizing buffer. A failure
+/// after the file was created removes it again, so a truncated key never stays
+/// behind.
+///
+/// # Errors
+///
+/// Returns [`XtaskError::Io`] when the path exists, cannot be created or the
+/// write does not complete; the error never carries key material.
+pub(crate) fn write_new_key_file(path: &Path, seed: &[u8; KEY_BYTES]) -> Result<(), XtaskError> {
+    let mut text = Zeroizing::new(Vec::with_capacity(KEY_BYTES * 2 + 1));
+    for byte in seed {
+        text.push(HEX_DIGITS[usize::from(byte >> 4)]);
+        text.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
+    }
+    text.push(b'\n');
+
+    let io_error = |source| XtaskError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(NEW_KEY_FILE_MODE)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+        .open(path)
+        .map_err(io_error)?;
+    let written = file.write_all(&text).and_then(|()| file.sync_all());
+    if let Err(source) = written {
+        // The file is ours: it did not exist before the exclusive create.
+        let _ = std::fs::remove_file(path);
+        return Err(io_error(source));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ mod package_affected;
 mod package_baseline;
 mod package_bump;
 mod package_evidence;
+mod plugin_index;
 pub mod ratchet;
 mod release;
 mod release_inventory;
@@ -363,6 +364,10 @@ pub fn check_doc_drift(repo: impl AsRef<Path>) -> Result<Vec<&'static str>, Xtas
     doc_drift::check(repo.as_ref())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat dispatch over the top-level commands is clearer than splitting it"
+)]
 pub fn run<I, S>(args: I) -> Result<(), XtaskError>
 where
     I: IntoIterator<Item = S>,
@@ -461,6 +466,7 @@ where
         TopCommand::Affected(options) => affected::run(&root, &options),
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
+        TopCommand::Index { action } => run_index(action),
         TopCommand::Compat { action } => attestation::run(action, &root),
         TopCommand::Release { action } => release::run(action, &root),
         TopCommand::AgentSkill { action } => match action {
@@ -579,6 +585,15 @@ enum TopCommand {
         #[command(subcommand)]
         action: CatalogAction,
     },
+    /// Owner ceremony commands of the plugin index.
+    ///
+    /// Keys are read only from files that pass the same rules as
+    /// `catalog sign` and are never printed. Every output path must not exist
+    /// yet; a refused input writes nothing.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
     /// Attest, verify and matrix-check runtime package compatibility.
     ///
     /// Every digest is recomputed from file bytes; a report or attestation
@@ -673,11 +688,88 @@ enum CatalogAction {
         #[arg(short, long, value_name = "FILE")]
         output: PathBuf,
     },
+    /// Create a new Ed25519 signing key file.
+    ///
+    /// The 32-byte seed comes from operating-system randomness and is written
+    /// as 64 lowercase hex characters and a newline to a new file with mode
+    /// 0600; an existing path is refused. Prints `key_id=<hex>` and
+    /// `public_key=<hex>`, never the seed.
+    Keygen {
+        /// New key file to create; the path must not exist.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
     /// Print the key id and public key of a signing key file.
     PublicKey {
         /// Signing key file (owner-private, 64 hex characters).
         #[arg(long, value_name = "FILE")]
         key_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexAction {
+    /// Endorse an index key: write its signed `official` key record.
+    ///
+    /// The window must span at least one index lifetime (14 days), at most
+    /// 366 days, and end in the future. The record is verified against the
+    /// endorser's public key before it is written.
+    Endorse {
+        /// Key file of the endorsing root (owner-private, 64 hex characters).
+        #[arg(long, value_name = "FILE")]
+        endorser_key_file: PathBuf,
+        /// Key file of the index key to endorse (owner-private).
+        #[arg(long, value_name = "FILE")]
+        key_file: PathBuf,
+        /// Scope of the record; only `official` exists.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+        /// First Unix second the index key may sign.
+        #[arg(long, value_name = "UNIX_SECONDS")]
+        not_before: u64,
+        /// Unix second from which the index key may no longer sign.
+        #[arg(long, value_name = "UNIX_SECONDS")]
+        not_after: u64,
+        /// Record file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Write a signed revocation list for index keys.
+    ///
+    /// The new list is exactly the `--key-id` values. With `--previous` the
+    /// sequence must exceed the previous one and the list must keep every
+    /// previously revoked id; without it only `--sequence 1` is accepted. At
+    /// most 64 ids.
+    Revoke {
+        /// Key file of the endorsing root (owner-private, 64 hex characters).
+        #[arg(long, value_name = "FILE")]
+        endorser_key_file: PathBuf,
+        /// Sequence of the new document.
+        #[arg(long, value_name = "N")]
+        sequence: u64,
+        /// Key id to revoke; repeatable.
+        #[arg(long = "key-id", value_name = "HEX")]
+        key_ids: Vec<String>,
+        /// Previous revocation document, signed by the same endorser.
+        #[arg(long, value_name = "FILE")]
+        previous: Option<PathBuf>,
+        /// Revocation document to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Write the channel document that names the index endorser root.
+    ///
+    /// The id must be a root of the trust anchor.
+    Channel {
+        /// Trust anchor file.
+        #[arg(long, value_name = "FILE")]
+        anchor: PathBuf,
+        /// Key id of the endorsing root (64 hex characters).
+        #[arg(long, value_name = "HEX")]
+        endorser_key_id: String,
+        /// Channel file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
     },
 }
 
@@ -904,10 +996,75 @@ fn run_catalog(action: CatalogAction) -> Result<(), XtaskError> {
             catalog::anchor_to(&roots, &revoked_key_ids, &output)?;
             println!("catalog anchor ok: {} roots", roots.len());
         }
+        CatalogAction::Keygen { output } => {
+            let key = plugin_index::keygen(&output)?;
+            println!("key_id={}", key.key_id);
+            println!("public_key={}", key.public_key);
+        }
         CatalogAction::PublicKey { key_file } => {
             let (key_id, public_key) = catalog::public_key_of(&key_file)?;
             println!("key_id: {key_id}");
             println!("public_key: {public_key}");
+        }
+    }
+    Ok(())
+}
+
+fn run_index(action: IndexAction) -> Result<(), XtaskError> {
+    match action {
+        IndexAction::Endorse {
+            endorser_key_file,
+            key_file,
+            scope,
+            not_before,
+            not_after,
+            output,
+        } => {
+            let endorsed = plugin_index::endorse(
+                &plugin_index::EndorseArgs {
+                    endorser_key_file,
+                    key_file,
+                    scope,
+                    not_before,
+                    not_after,
+                    output,
+                },
+                catalog::unix_now()?,
+            )?;
+            println!("key_id={}", endorsed.key_id);
+            println!("endorsed_by={}", endorsed.endorsed_by);
+        }
+        IndexAction::Revoke {
+            endorser_key_file,
+            sequence,
+            key_ids,
+            previous,
+            output,
+        } => {
+            let revoked = plugin_index::revoke(&plugin_index::RevokeArgs {
+                endorser_key_file,
+                sequence,
+                key_ids,
+                previous,
+                output,
+            })?;
+            println!(
+                "index revoke ok: sequence={} revoked={}",
+                revoked.sequence, revoked.revoked
+            );
+        }
+        IndexAction::Channel {
+            anchor,
+            endorser_key_id,
+            output,
+        } => {
+            let args = plugin_index::ChannelArgs {
+                anchor,
+                endorser_key_id,
+                output,
+            };
+            plugin_index::channel(&args)?;
+            println!("index channel ok: endorser={}", args.endorser_key_id);
         }
     }
     Ok(())

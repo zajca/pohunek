@@ -73,9 +73,10 @@ Start here:
 - [Debug daemon](runbooks/debug-daemon.md),
   [debug session runtime](runbooks/debug-session-runtime.md),
   [update after release](runbooks/update-after-release.md),
-  [install on macOS](runbooks/install-on-macos.md), and
-  [runtime package recovery](runbooks/runtime-package-recovery.md) are
-  operational runbooks.
+  [install on macOS](runbooks/install-on-macos.md),
+  [runtime package recovery](runbooks/runtime-package-recovery.md), and
+  [plugin index keys](runbooks/plugin-index-keys.md) are operational
+  runbooks.
 - [Trust model](safety/trust-model.md), [secrets](safety/secrets.md), and
   [repo `.pohunek/`](safety/repo-pohunek.md) are safety rules.
 - The [knowledge log](log.md) lists the changes of this bundle per release.
