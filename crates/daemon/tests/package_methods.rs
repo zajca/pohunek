@@ -3601,6 +3601,39 @@ fn git_in(dir: &Path, args: &[&str]) {
     );
 }
 
+/// Runs git in `dir` with `input` on stdin and returns its trimmed stdout,
+/// failing the test on a non-zero exit.
+fn git_stdin(dir: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut child = pohunek_test_support::git::command()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child
+        .stdin
+        .take()
+        .expect("git stdin")
+        .write_all(input.as_bytes())
+        .expect("write git stdin");
+    let output = child.wait_with_output().expect("wait for git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8 git output")
+        .trim_end()
+        .to_owned()
+}
+
 /// A checkout at `parent/name` whose `origin` is `origin` and whose default
 /// branch `origin/HEAD` holds the one commit it has, with `.muse` and
 /// `.agents` tracked. No network is involved: the remote-tracking refs are
@@ -3897,18 +3930,40 @@ async fn only_a_clean_checkout_of_a_trusted_repository_gets_the_trusted_args() {
         &created_argv(&mut local, &servers, &submodule).await
     ));
     // An entry that differs from a declared path only by letter case, in the
-    // remote HEAD's own tree.
+    // remote HEAD's own tree. The commit is built from objects, so a
+    // case-insensitive file system does not fold it into `.muse`.
     let collision = checkout(root, "case-collision", own);
-    std::fs::create_dir_all(collision.join(".MUSE")).expect("create .MUSE");
-    std::fs::write(collision.join(".MUSE/hooks.json"), "{}\n").expect("write hooks");
-    git_in(&collision, &["add", "."]);
-    git_in(&collision, &["commit", "-q", "-m", "pr"]);
+    let blob = git_stdin(&collision, &["hash-object", "-w", "--stdin"], "{}\n");
+    let subtree = git_stdin(
+        &collision,
+        &["mktree"],
+        &format!("100644 blob {blob}\thooks.json\n"),
+    );
+    let head_tree = git_stdin(&collision, &["ls-tree", "HEAD"], "");
+    let tree = git_stdin(
+        &collision,
+        &["mktree"],
+        &format!("{head_tree}\n040000 tree {subtree}\t.MUSE\n"),
+    );
+    let commit = git_stdin(
+        &collision,
+        &["commit-tree", &tree, "-p", "HEAD", "-m", "pr"],
+        "",
+    );
     git_in(
         &collision,
-        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        &["update-ref", "refs/remotes/origin/main", &commit],
     );
     assert!(!carries_trust_arg(
         &created_argv(&mut local, &servers, &collision).await
+    ));
+    // A declared directory whose name on disk differs from the declared path
+    // only by letter case is not the declared path, whether or not the file
+    // system folds the two names.
+    let renamed = checkout(root, "case-renamed", own);
+    std::fs::rename(renamed.join(".muse"), renamed.join(".MUSE")).expect("rename .muse");
+    assert!(!carries_trust_arg(
+        &created_argv(&mut local, &servers, &renamed).await
     ));
     // A symbolic link below a declared path.
     let linked = checkout(root, "symlink", own);

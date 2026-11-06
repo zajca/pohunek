@@ -422,6 +422,55 @@ fn contents_match(git: &Git, facts: &CheckoutFacts<'_>, head: &str) -> Result<bo
         }))
 }
 
+/// How a declared path is named on disk.
+enum NameState {
+    /// Every component exists under exactly the declared name.
+    Exact,
+    /// Some component does not exist under any spelling.
+    Absent,
+    /// Some component exists only under a spelling that differs by ASCII
+    /// letter case, which a case-insensitive file system would open as the
+    /// declared name.
+    OtherCase,
+}
+
+/// Looks up each component of `relative` by its exact name among the entries
+/// of its parent directory, so that a file system that folds letter case
+/// cannot present `.MUSE` as `.muse`.
+fn exact_name_state(cwd: &Path, relative: &str) -> Result<NameState, Failure> {
+    let mut dir = cwd.to_path_buf();
+    for component in relative.split('/') {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(NameState::Absent)
+            }
+            Err(_unreadable) => return Err(Failure::Disk),
+        };
+        let mut folded = false;
+        let mut exact = false;
+        for entry in entries {
+            let entry = entry.map_err(|_unreadable| Failure::Disk)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name == component {
+                exact = true;
+            } else if name.eq_ignore_ascii_case(component) {
+                folded = true;
+            }
+        }
+        if folded {
+            return Ok(NameState::OtherCase);
+        }
+        if !exact {
+            return Ok(NameState::Absent);
+        }
+        dir.push(component);
+    }
+    Ok(NameState::Exact)
+}
+
 /// The bounded walk of the declared paths on disk.
 struct Walk<'a> {
     cwd: &'a Path,
@@ -450,6 +499,13 @@ impl Walk<'_> {
         self.entries += 1;
         if self.entries > MAX_WALKED_ENTRIES {
             return Ok(false);
+        }
+        if depth == 0 {
+            match exact_name_state(self.cwd, relative)? {
+                NameState::Exact => {}
+                NameState::Absent => return Ok(true),
+                NameState::OtherCase => return Ok(false),
+            }
         }
         let metadata = match std::fs::symlink_metadata(self.cwd.join(relative)) {
             Ok(metadata) => metadata,
