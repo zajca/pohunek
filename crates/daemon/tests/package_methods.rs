@@ -4245,6 +4245,93 @@ async fn a_deleted_nested_file_under_a_declared_path_withholds_the_trusted_args(
     servers.stop().await;
 }
 
+/// A clean checkout of `acme/widgets` whose remote `HEAD` holds no
+/// `.muse` and no `.agents`, so no declared path of the trusting runtimes is
+/// tracked.
+fn checkout_without_declared_paths(root: &Path, name: &str) -> PathBuf {
+    let dir = checkout(root, name, "https://github.com/acme/widgets.git");
+    git_in(&dir, &["rm", "-q", "-r", ".muse", ".agents"]);
+    git_in(&dir, &["commit", "-q", "-m", "drop"]);
+    git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    dir
+}
+
+/// Adds an entry named `spelling` below `dir` and reports whether this file
+/// system opens `declared` through it.
+fn add_variant_spelling(dir: &Path, declared: &str, spelling: &str) -> bool {
+    std::fs::create_dir(dir.join(spelling)).expect("create the variant spelling");
+    std::fs::write(dir.join(spelling).join("hooks.json"), "{}\n").expect("write hooks");
+    dir.join(declared).exists()
+}
+
+#[tokio::test]
+async fn a_declared_path_that_the_file_system_opens_under_another_spelling_is_not_trusted() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-spelling",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+
+    // U+017F (long s) folds to `s` under Unicode case folding: the sibling
+    // refuses on every file system, and a folding one would open `.muse`
+    // through it.
+    let long_s = checkout_without_declared_paths(root, "long-s");
+    add_variant_spelling(&long_s, ".muse", ".mu\u{17f}e");
+    announce_remote_source(&servers, Some(remote_snapshot(&long_s)));
+    assert!(!carries_trust_arg(
+        &launched_argv(&mut local, &long_s).await
+    ));
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_declared_non_ascii_path_stored_in_another_normalization_is_not_trusted() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-normalization",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = argv_program(&servers.plugins);
+    let keys = format!(
+        "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\"caf\u{e9}\"]\n"
+    );
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &keys);
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-trusting-nfc",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    let root = servers.plugins.parent().expect("the socket directory");
+
+    // The declared name is NFC; a normalization-insensitive file system
+    // opens the NFD spelling as the same name.
+    let nfd = checkout_without_declared_paths(root, "nfd");
+    let folded = add_variant_spelling(&nfd, "caf\u{e9}", "cafe\u{301}");
+    announce_remote_source(&servers, Some(remote_snapshot(&nfd)));
+    assert_eq!(
+        carries_trust_arg(&launched_argv(&mut local, &nfd).await),
+        !folded,
+        "withheld exactly when the file system opens the NFC name through the NFD one"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,

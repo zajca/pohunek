@@ -18,8 +18,9 @@
 //!    tree of that commit holds there, with the same contents (hashed by git
 //!    in the private repository) and executable bits. Symbolic links,
 //!    submodules, special files, nested `.git` entries, a non-directory
-//!    ancestor and an entry that differs from a path component only by ASCII
-//!    letter case all refuse.
+//!    ancestor and an entry that differs from a path component only by letter
+//!    case all refuse. So does a declared path that the file system resolves
+//!    under another spelling (case or normalization folding).
 //!
 //! The scratch repository lives in a daemon-private directory, never in a
 //! directory a launched session can write. No git command runs against the
@@ -426,49 +427,25 @@ fn contents_match(git: &Git, facts: &CheckoutFacts<'_>, head: &str) -> Result<bo
 enum NameState {
     /// Every component exists under exactly the declared name.
     Exact,
-    /// Some component does not exist under any spelling.
+    /// Nothing on disk resolves to the declared path under any spelling.
     Absent,
-    /// Some component exists only under a spelling that differs by ASCII
-    /// letter case, which a case-insensitive file system would open as the
-    /// declared name.
-    OtherCase,
+    /// A sibling differs from a component only by letter case under Unicode
+    /// case folding, a component is missing under its exact name yet the file
+    /// system still resolves the path (a case-insensitive or
+    /// normalization-insensitive file system opens a variant spelling as the
+    /// declared name), or the lookup exceeded its bounds.
+    Refused,
 }
 
-/// Looks up each component of `relative` by its exact name among the entries
-/// of its parent directory, so that a file system that folds letter case
-/// cannot present `.MUSE` as `.muse`.
-fn exact_name_state(cwd: &Path, relative: &str) -> Result<NameState, Failure> {
-    let mut dir = cwd.to_path_buf();
-    for component in relative.split('/') {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(NameState::Absent)
-            }
-            Err(_unreadable) => return Err(Failure::Disk),
-        };
-        let mut folded = false;
-        let mut exact = false;
-        for entry in entries {
-            let entry = entry.map_err(|_unreadable| Failure::Disk)?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name == component {
-                exact = true;
-            } else if name.eq_ignore_ascii_case(component) {
-                folded = true;
-            }
-        }
-        if folded {
-            return Ok(NameState::OtherCase);
-        }
-        if !exact {
-            return Ok(NameState::Absent);
-        }
-        dir.push(component);
+/// Whether two distinct names are one under Unicode case folding.
+fn folds_together(a: &str, b: &str) -> bool {
+    fn fold(name: &str) -> String {
+        name.chars()
+            .flat_map(char::to_uppercase)
+            .flat_map(char::to_lowercase)
+            .collect()
     }
-    Ok(NameState::Exact)
+    a != b && fold(a) == fold(b)
 }
 
 /// The bounded walk of the declared paths on disk.
@@ -482,6 +459,58 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
+    /// Looks up each component of `relative` by its exact name among the
+    /// entries of its parent directory, so that a file system that folds
+    /// letter case or normalizes names cannot present another spelling as
+    /// the declared one. The entries read count toward the walk bounds and
+    /// the deadline. A path with a component missing under its exact name is
+    /// still resolved once through the file system: only `NotFound` there
+    /// means that nothing answers to the declared name.
+    fn exact_names(&mut self, relative: &str) -> Result<NameState, Failure> {
+        let mut dir = self.cwd.to_path_buf();
+        for component in relative.split('/') {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return self.resolve_absent(relative);
+                }
+                Err(_unreadable) => return Err(Failure::Disk),
+            };
+            let mut exact = false;
+            for entry in entries {
+                if Instant::now() >= self.deadline {
+                    return Err(Failure::Deadline);
+                }
+                self.entries += 1;
+                if self.entries > MAX_WALKED_ENTRIES {
+                    return Ok(NameState::Refused);
+                }
+                let entry = entry.map_err(|_unreadable| Failure::Disk)?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name == component {
+                    exact = true;
+                } else if folds_together(&name, component) {
+                    return Ok(NameState::Refused);
+                }
+            }
+            if !exact {
+                return self.resolve_absent(relative);
+            }
+            dir.push(component);
+        }
+        Ok(NameState::Exact)
+    }
+
+    fn resolve_absent(&self, relative: &str) -> Result<NameState, Failure> {
+        match std::fs::symlink_metadata(self.cwd.join(relative)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(NameState::Absent),
+            Err(_unreadable) => Err(Failure::Disk),
+            Ok(_resolved_under_another_spelling) => Ok(NameState::Refused),
+        }
+    }
+
     /// Appends the regular files below `relative` (relative to `cwd`) to
     /// `files`. `Ok(false)` refuses: a symbolic link, a special file, a `.git`
     /// entry, a name that is not UTF-8, or more than the compared limits. A
@@ -501,10 +530,10 @@ impl Walk<'_> {
             return Ok(false);
         }
         if depth == 0 {
-            match exact_name_state(self.cwd, relative)? {
+            match self.exact_names(relative)? {
                 NameState::Exact => {}
                 NameState::Absent => return Ok(true),
-                NameState::OtherCase => return Ok(false),
+                NameState::Refused => return Ok(false),
             }
         }
         let metadata = match std::fs::symlink_metadata(self.cwd.join(relative)) {
