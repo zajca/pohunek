@@ -3458,7 +3458,7 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
     let script = format!(
         "#!/bin/sh\n\
          cd {dir}\n\
-         /bin/cp /bin/sleep pi-daemon\n\
+         /bin/cp /bin/sh pi-daemon\n\
          wait_for() {{ until [ -e \"$1\" ]; do /bin/sleep 0.02; done; }}\n\
          sh -c 'echo $$ > tree.pid; exec {image} {filter} --ignored --nocapture {dir}/tree.sock {barrier}' </dev/null >/dev/null 2>&1 &\n\
          wait_for tree.pid\n\
@@ -3466,7 +3466,7 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
          wait_for wrapper.pid\n\
          ( /usr/bin/setsid sh -c 'echo $$ > listener.pid; exec {image} {filter} --ignored --nocapture {dir}/escaped.sock {barrier}' </dev/null >/dev/null 2>&1 & )\n\
          wait_for listener.pid\n\
-         /usr/bin/setsid sh -c 'echo $$ > daemon.pid; exec ./pi-daemon 600' </dev/null >/dev/null 2>&1 &\n\
+         /usr/bin/setsid sh -c 'echo $$ > daemon.pid; exec ./pi-daemon -c \"sleep 600; :\"' </dev/null >/dev/null 2>&1 &\n\
          wait_for daemon.pid\n\
          exec /bin/sleep 600\n",
         barrier = barrier.display(),

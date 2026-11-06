@@ -71,8 +71,8 @@ fn end(pid: u32) {
 
 /// Starts a daemon image named for the provider in a session of its own, the
 /// way an agent prewarming a shared host daemon does.
-const PREWARM_DAEMON: &str = "cp /bin/sleep claude-daemon\n\
-    setsid sh -c 'echo $$ > daemon.pid; exec ./claude-daemon 600' &\n\
+const PREWARM_DAEMON: &str = "cp /bin/sh claude-daemon\n\
+    setsid sh -c 'echo $$ > daemon.pid; exec ./claude-daemon -c \"sleep 600; :\"' &\n\
     until [ -e daemon.pid ]; do sleep 0.02; done\n";
 
 #[tokio::test]
@@ -98,8 +98,8 @@ async fn processes_that_stay_or_are_not_the_generations_are_not_reported() {
     // A tool wrapper in a session of its own that is neither named for the
     // provider nor listening; a provider-named image in another session
     // without this generation's marker; a plain background child.
-    let script = "cp /bin/sleep claude-daemon\n\
-        env -u POHUNEK_WORKER_INSTANCE_ID setsid sh -c 'echo $$ > foreign.pid; exec ./claude-daemon 600' &\n\
+    let script = "cp /bin/sh claude-daemon\n\
+        env -u POHUNEK_WORKER_INSTANCE_ID setsid sh -c 'echo $$ > foreign.pid; exec ./claude-daemon -c \"sleep 600; :\"' &\n\
         setsid sh -c 'echo $$ > wrapper.pid; exec sleep 600' &\n\
         sleep 600 &\n\
         until [ -e foreign.pid ] && [ -e wrapper.pid ]; do sleep 0.02; done\n\
