@@ -69,7 +69,7 @@ const SCHEMA_THREE_TEMPLATE: &str = r#"
 
 schema_version = 3
 prefix = "{PREFIX}"
-active_version = "0.40.0"
+active_version = "0.33.1"
 
 [namespace]
 uid = {UID}
