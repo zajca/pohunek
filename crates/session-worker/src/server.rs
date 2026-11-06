@@ -729,6 +729,19 @@ struct State {
     /// Sequence of the last applied prompt-acceptance report of this runtime,
     /// in the hooks' monotonic clock. It is kept in memory only.
     prompt_accepted_sequence: Option<u64>,
+    /// Placement escape check of this runtime; kept in memory only.
+    placement: PlacementState,
+}
+
+/// Placement escape check state of one runtime generation.
+#[derive(Debug, Default)]
+struct PlacementState {
+    /// Set when the daemon armed the check at `Initialize`.
+    armed: Option<crate::placement::Armed>,
+    /// Latest check result.
+    report: Option<protocol::PlacementReport>,
+    /// Whether the escape WARN of this generation was already logged.
+    warned: bool,
 }
 
 impl State {
@@ -751,6 +764,7 @@ impl State {
             subagent_evidence: SubagentEvidence::default(),
             identity_marks: IdentityMarks::default(),
             prompt_accepted_sequence: None,
+            placement: PlacementState::default(),
         }
     }
 }
@@ -1405,6 +1419,7 @@ async fn initialize_request(
         }
     }
 
+    let placement_interval = placement_interval(initialize.placement_check_interval_ms)?;
     let runtime_value = random_value("runtime")
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let worker_instance_id = WorkerInstanceId::new(runtime_value)
@@ -1457,6 +1472,7 @@ async fn initialize_request(
         &initialize.dimensions,
     )
     .await?;
+    arm_placement_check(shared, &pty, &worker_instance_id, placement_interval).await;
     shared.initialized_tx.send_replace(true);
     shared.emit(EventKind::RuntimeStarted {
         worker_instance_id: worker_instance_id.clone(),
@@ -1920,6 +1936,7 @@ async fn stop_request(
             kill_reap,
         } => (pty, grace, kill_reap),
     };
+    run_placement_check(shared).await;
     pty.stop(transaction_id.as_str(), grace, kill_reap)
         .await
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
@@ -2071,6 +2088,114 @@ fn reported_native_reference(
         .transpose()
 }
 
+/// Longest interval between placement escape checks a daemon may ask for.
+const MAX_PLACEMENT_CHECK_INTERVAL: Duration = Duration::from_hours(1);
+
+/// The validated interval of a placement check request, `None` for no check.
+fn placement_interval(millis: Option<u64>) -> Result<Option<Duration>, ControlError> {
+    let Some(millis) = millis else {
+        return Ok(None);
+    };
+    let interval = Duration::from_millis(millis);
+    if interval.is_zero() || interval > MAX_PLACEMENT_CHECK_INTERVAL {
+        return Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "initialize asks for a placement check interval outside its bounds",
+            false,
+        ));
+    }
+    Ok(Some(interval))
+}
+
+/// Arms the placement escape check for the runtime whose PTY child `pty` is
+/// and starts its periodic run every `interval`; `None` arms nothing.
+///
+/// The PTY child's POSIX session is read right away: it is the session every
+/// legitimate descendant stays in, and it must stay known after the child
+/// exits.
+async fn arm_placement_check(
+    shared: &Arc<Shared>,
+    pty: &PtyOwner,
+    worker_instance_id: &WorkerInstanceId,
+    interval: Option<Duration>,
+) {
+    let Some(interval) = interval else {
+        return;
+    };
+    let pty_session = match HostInspector::new().process_session(pty.identity().pid) {
+        Ok(session) => session,
+        Err(error) => {
+            event!(
+                name: "worker.placement.session_unreadable",
+                Level::WARN,
+                error.message = %error,
+                "the PTY child's POSIX session cannot be read; the placement check reports unobservable: {{error.message}}",
+            );
+            None
+        }
+    };
+    shared.state.lock().await.placement.armed = Some(crate::placement::Armed {
+        pty_session,
+        worker_instance_id: worker_instance_id.to_string(),
+        worker_pid: std::process::id(),
+    });
+    let checking = Arc::clone(shared);
+    shared.spawn_task(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = checking.shutdown.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            if checking.state.lock().await.exit.is_some() {
+                return;
+            }
+            run_placement_check(&checking).await;
+        }
+    });
+}
+
+/// Runs one placement escape check for an armed runtime and keeps its result.
+///
+/// The first escape of a generation is logged once; later checks only refresh
+/// the result inspect shows. Nothing is signalled.
+async fn run_placement_check(shared: &Shared) {
+    let (armed, provider) = {
+        let state = shared.state.lock().await;
+        let Some(armed) = state.placement.armed.clone() else {
+            return;
+        };
+        (armed, state.launch_agent_base.clone().unwrap_or_default())
+    };
+    let report = tokio::task::spawn_blocking(move || {
+        let inspector = HostInspector::new();
+        crate::placement::survey(&inspector, &armed, &|pid| {
+            executable_is_named_for(&inspector, pid, &provider).unwrap_or(false)
+        })
+    })
+    .await;
+    let Ok(report) = report else {
+        return;
+    };
+    let mut state = shared.state.lock().await;
+    if report.outcome == protocol::PlacementOutcome::Escaped && !state.placement.warned {
+        state.placement.warned = true;
+        let listed: Vec<String> = report
+            .processes
+            .iter()
+            .map(|process| format!("pid {} ({})", process.pid, process.comm))
+            .collect();
+        event!(
+            name: "worker.placement.escape",
+            Level::WARN,
+            placement.escaped = %listed.join(", "),
+            "placement_escape: processes of this runtime left the PTY session: {{placement.escaped}}",
+        );
+    }
+    state.placement.report = Some(report);
+}
+
 async fn inspect_snapshot(
     shared: &Shared,
     state: &State,
@@ -2171,6 +2296,7 @@ async fn inspect_snapshot(
             .prompt_accepted_sequence
             .filter(|_| version >= protocol::PROMPT_EVIDENCE_VERSION),
         drains_streams_on_terminal_ack: true,
+        placement: state.placement.report.clone(),
     })
 }
 
@@ -2265,6 +2391,7 @@ async fn coordinate_runtime_completion(
             return;
         }
     };
+    run_placement_check(&shared).await;
     let (status, stopped_by_user) = {
         let state = shared.state.lock().await;
         (
@@ -8220,6 +8347,8 @@ mod launch_layout_tests;
 mod tests {
     mod controller_cleanup;
     mod forwarded_identity;
+    #[cfg(target_os = "linux")]
+    mod placement_escape;
     mod prompt_accepted;
 
     use std::time::Duration;
@@ -8354,6 +8483,15 @@ mod tests {
         script: &str,
         config: crate::WorkerConfig,
     ) -> (super::Server, crate::PtyOwner, BarrierDirectory) {
+        launch_claim_fixture_env(script, config, crate::test_support::child_env()).await
+    }
+
+    /// [`launch_claim_fixture_with`] whose PTY child gets exactly `env`.
+    async fn launch_claim_fixture_env(
+        script: &str,
+        config: crate::WorkerConfig,
+        env: Vec<(String, String)>,
+    ) -> (super::Server, crate::PtyOwner, BarrierDirectory) {
         let directory = BarrierDirectory::new();
         let root = directory.path().to_path_buf();
         let server = super::Server::bind(super::ServerArgs {
@@ -8372,7 +8510,7 @@ mod tests {
             crate::Command {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), script.into()],
-                env: crate::test_support::child_env(),
+                env,
                 cwd: root.clone(),
                 cols: 80,
                 rows: 24,
@@ -11436,6 +11574,7 @@ mod tests {
             public_protocol_version: 7,
             hook_schema: None,
             answers_program_status_probe: false,
+            placement_check_interval_ms: None,
             input_policy: protocol::InputPolicy::new(500).expect("input policy"),
         }
     }

@@ -20,6 +20,13 @@ use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::session::{ActiveSupervision, RejectedLinesState};
 use crate::Paths;
 
+/// Name of the check that reports live sessions with a process that left the
+/// PTY's POSIX session as a daemon.
+const PLACEMENT_ESCAPE_CHECK: &str = "placement_escape";
+
+/// Most sessions the placement check names in its detail.
+const MAX_PLACEMENT_SESSIONS_LISTED: usize = 8;
+
 /// Name of the check that reports the metadata-store lines no loader accepts.
 const METADATA_STORE_REJECTED_LINES_CHECK: &str = "metadata_store_rejected_lines";
 
@@ -55,6 +62,7 @@ pub(crate) async fn report(
     overlays: OverlayChecks<'_>,
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
+    placements: &[(protocol::SessionId, protocol::SessionPlacement)],
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
@@ -101,6 +109,7 @@ pub(crate) async fn report(
     checks.push(catalog_trust_check(catalog_trust));
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
+    checks.push(placement_check(placements));
     Ok(bounded_report(checks))
 }
 
@@ -790,6 +799,82 @@ fn invalid_anchor_detail(fault: AnchorFault) -> String {
     format!("{fault}; official packages are refused until the anchor file is fixed and the daemon restarts.")
 }
 
+/// `text` with every control, hidden or separator code point written as its
+/// `\u{...}` escape.
+///
+/// A process name is chosen by the process, and the doctor detail is printed to
+/// a terminal.
+fn inert_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        if pohunek_worker_protocol::is_hidden_or_separator(character) {
+            output.extend(character.escape_unicode());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+/// The `placement_escape` check over the placement results of live sessions.
+///
+/// An escape is a warning, not a failure: the check kills nothing and the
+/// finding may be a tool's own daemon. A session whose host withheld evidence
+/// is named separately so it is never read as clean.
+fn placement_check(
+    placements: &[(protocol::SessionId, protocol::SessionPlacement)],
+) -> DoctorCheck {
+    let named = |outcome: &str| -> Vec<String> {
+        placements
+            .iter()
+            .filter(|(_, placement)| placement.outcome == outcome)
+            .take(MAX_PLACEMENT_SESSIONS_LISTED)
+            .map(|(id, placement)| {
+                if placement.processes.is_empty() {
+                    id.0.clone()
+                } else {
+                    let processes: Vec<String> = placement
+                        .processes
+                        .iter()
+                        .map(|process| format!("{} ({})", process.pid, inert_text(&process.comm)))
+                        .collect();
+                    format!("{} [{}]", id.0, processes.join(", "))
+                }
+            })
+            .collect()
+    };
+    let escaped = named("escaped");
+    if !escaped.is_empty() {
+        return check(
+            PLACEMENT_ESCAPE_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "A process of a live session left its terminal session as a daemon: {}. The agent may have started a shared host daemon; nothing was stopped.",
+                escaped.join("; ")
+            ),
+        );
+    }
+    let unobservable = named("unobservable");
+    if !unobservable.is_empty() {
+        return check(
+            PLACEMENT_ESCAPE_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "The host withheld process evidence, so the placement of these sessions is unverified: {}.",
+                unobservable.join("; ")
+            ),
+        );
+    }
+    check(
+        PLACEMENT_ESCAPE_CHECK,
+        DoctorStatus::Ok,
+        &format!(
+            "{} live session(s) with a placement check report no escaped process.",
+            placements.len()
+        ),
+    )
+}
+
 /// The check that reports the metadata-store lines no loader accepts. It
 /// carries counts and the command that lists them, never a line's text.
 fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
@@ -984,6 +1069,55 @@ mod tests {
         assert!(plain.detail.ends_with("`."), "{}", plain.detail);
     }
 
+    fn placement(outcome: &str, comm: &str) -> (protocol::SessionId, protocol::SessionPlacement) {
+        (
+            protocol::SessionId("s-placement".to_owned()),
+            protocol::SessionPlacement {
+                outcome: outcome.to_owned(),
+                processes: if outcome == "escaped" {
+                    vec![protocol::SessionPlacementProcess {
+                        pid: 4242,
+                        comm: comm.to_owned(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+        )
+    }
+
+    /// The doctor names an escaped process by its pid and name, writes no
+    /// control code point of the name raw, and reports `unobservable` sessions
+    /// as unverified rather than clean.
+    #[test]
+    fn the_placement_check_names_escapes_inertly_and_never_reads_unobservable_as_clean() {
+        let escaped =
+            placement_check(&[placement("escaped", "claude\u{1b}]52;c;AAAA\u{7}\u{1b}[2J")]);
+        assert_eq!(escaped.status, DoctorStatus::Warn);
+        assert!(
+            escaped.detail.contains("4242 (claude"),
+            "{}",
+            escaped.detail
+        );
+        assert!(
+            !escaped.detail.chars().any(char::is_control),
+            "{:?}",
+            escaped.detail
+        );
+        assert!(escaped.detail.contains("\\u{1b}"), "{}", escaped.detail);
+
+        let unverified = placement_check(&[placement("unobservable", "")]);
+        assert_eq!(unverified.status, DoctorStatus::Warn);
+        assert!(
+            unverified.detail.contains("unverified"),
+            "{}",
+            unverified.detail
+        );
+
+        let clean = placement_check(&[placement("clean", "")]);
+        assert_eq!(clean.status, DoctorStatus::Ok);
+    }
+
     fn paths_at(root: &Path) -> Paths {
         Paths {
             runtime_dir: root.join("runtime"),
@@ -1039,6 +1173,7 @@ mod tests {
                 total: 0,
                 may_pin: 0,
             },
+            &[],
         )
         .await
         .expect("doctor report");
@@ -1120,6 +1255,7 @@ mod tests {
                 total: 0,
                 may_pin: 0,
             },
+            &[],
         )
         .await
         .expect("doctor report");

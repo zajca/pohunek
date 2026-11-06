@@ -38,8 +38,8 @@ pub(super) struct LaunchInputs {
     /// The full launch environment, contribution included.
     pub(super) env: LaunchEnv,
     /// Arguments that follow the frozen arguments and precede the native
-    /// session arguments: the contributor's, then the runtime's `[naming]`
-    /// arguments; empty for a runtime with neither.
+    /// session arguments: the contributor's, then the runtime's `[placement]`
+    /// and `[naming]` arguments; empty for a runtime with none of them.
     pub(super) root_args: Vec<String>,
 }
 
@@ -75,12 +75,13 @@ impl SessionRegistry {
             name,
         } = subject;
         let base = self.launch_env(definition, profile_env, agent.clone(), id);
-        let naming_args = naming_args(definition, name, id);
+        let mut declared_args = placement_args(definition, frozen_args);
+        declared_args.extend(naming_args(definition, name, id));
         let Some(contribution) = self.contribution(definition, &base, id, kind, frozen_args)?
         else {
             return Ok(LaunchInputs {
                 env: base,
-                root_args: naming_args,
+                root_args: declared_args,
             });
         };
         let Some(state_root) = self.inner.config.worker_state_root.as_deref() else {
@@ -88,7 +89,7 @@ impl SessionRegistry {
         };
         let placed = place(&contribution, state_root, id)?;
         let mut root_args = placed.root_args;
-        root_args.extend(naming_args);
+        root_args.extend(declared_args);
         Ok(LaunchInputs {
             env: self.launch_env_with(definition, profile_env, &placed.env, agent, id),
             root_args,
@@ -181,6 +182,14 @@ pub(super) fn launch_name(
         Ok(Some(name)) => definition.naming_args(&name).map(|_| Arc::from(name)),
         Ok(None) | Err(_) => None,
     }
+}
+
+/// The `[placement] keep_local_args` of a launch, none when the runtime
+/// declares none or the frozen arguments already hold them.
+fn placement_args(definition: &RuntimeDefinition, frozen_args: &[String]) -> Vec<String> {
+    definition
+        .placement()
+        .map_or_else(Vec::new, |placement| placement.launch_args(frozen_args))
 }
 
 /// The `[naming]` arguments of a launch of `id` under `name`.

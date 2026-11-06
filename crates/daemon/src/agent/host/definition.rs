@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config_home::ConfigHome;
-use super::features::{check_gates, check_requires, FeatureTables};
+use super::features::{check_gates, check_required_keys, check_requires, FeatureTables};
 use super::launch_env::DescriptorLaunchEnv;
 use super::naming::{NamingLaunchArgs, SESSION_NAME_PLACEHOLDER};
+use super::placement::{Placement, RawPlacement};
 use super::transcripts::Transcripts;
 use crate::agent::{
     AssignedReference, ExistenceDecl, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
@@ -155,6 +156,18 @@ pub enum DefinitionError {
         /// The feature that owns the key.
         feature: &'static str,
     },
+    /// `requires` lists a runtime feature whose mandatory descriptor key is
+    /// missing.
+    #[error("runtime feature {feature} requires the descriptor to declare {key}")]
+    FeatureKeyMissing {
+        /// Dotted path of the missing descriptor key.
+        key: &'static str,
+        /// The feature that makes the key mandatory.
+        feature: &'static str,
+    },
+    /// `[placement] mode` names a placement this core cannot deliver.
+    #[error("placement.mode owned_server is not supported by this core")]
+    PlacementModeUnsupported,
 }
 
 impl From<VersionProbeError> for DefinitionError {
@@ -423,6 +436,9 @@ pub struct RuntimeDefinition {
     /// The arguments that hand the session name to the agent, from
     /// `[naming] launch_args`; empty for a runtime that declares none.
     naming: NamingLaunchArgs,
+    /// How the runtime keeps a session out of a shared host daemon, from
+    /// `[placement]`; `None` for a runtime that declares none.
+    placement: Option<Placement>,
     config_home: Option<ConfigHome>,
     /// Where below the config home the agent writes transcripts and which
     /// compiled parser reads them; `None` for a runtime that declares none.
@@ -461,7 +477,7 @@ impl RuntimeDefinition {
         parts: DefinitionParts,
         launch_env: DescriptorLaunchEnv,
     ) -> Result<Self, DefinitionError> {
-        Self::new_declared(parts, launch_env, NamingLaunchArgs::default())
+        Self::new_declared(parts, launch_env, NamingLaunchArgs::default(), None)
     }
 
     /// [`Self::new_with_env`] with the validated `[naming]` arguments the
@@ -474,6 +490,7 @@ impl RuntimeDefinition {
         parts: DefinitionParts,
         launch_env: DescriptorLaunchEnv,
         naming: NamingLaunchArgs,
+        placement: Option<Placement>,
     ) -> Result<Self, DefinitionError> {
         let DefinitionParts {
             runtime_id,
@@ -537,6 +554,7 @@ impl RuntimeDefinition {
                     native: native.as_ref(),
                     launch_env: launch_env.as_slice(),
                     naming: naming.as_slice(),
+                    placement: placement.as_ref().map(PlacementFacts::of),
                 });
                 BindingProvenance::Builtin {
                     package,
@@ -567,6 +585,7 @@ impl RuntimeDefinition {
             integration,
             launch_env,
             naming,
+            placement,
             config_home: None,
             transcripts: None,
             hook_existence: None,
@@ -682,6 +701,7 @@ impl RuntimeDefinition {
             });
         }
         check_gates(&document, features)?;
+        check_required_keys(&document)?;
         let package = PackageIdentity {
             id: PackageId::parse(&raw.id).map_err(|source| DefinitionError::Identifier {
                 field: "id",
@@ -722,6 +742,11 @@ impl RuntimeDefinition {
             .transpose()?;
         let launch_env = raw.validated_launch_env(config_home.as_ref())?;
         let naming = raw.validated_naming()?;
+        let placement = raw
+            .placement
+            .as_ref()
+            .map(RawPlacement::validated)
+            .transpose()?;
         let definition = Self::new_declared(
             DefinitionParts {
                 runtime_id,
@@ -752,13 +777,21 @@ impl RuntimeDefinition {
             },
             launch_env,
             naming,
+            placement,
         )?;
+        validate_placement_handler(&definition)?;
         let definition = match hook_existence {
             Some(existence) => definition.with_hook_existence(existence),
             None => definition,
         };
         let definition = with_declared_startup_grace(definition, raw.input.startup_grace_ms)?;
         with_declared_files(definition, config_home, transcripts)
+    }
+
+    /// The `[placement]` declaration, `None` for a runtime that declares none.
+    #[must_use]
+    pub fn placement(&self) -> Option<&Placement> {
+        self.placement.as_ref()
     }
 
     /// The runtime identity.
@@ -1042,6 +1075,22 @@ fn validated_integration(
     .transpose()
 }
 
+/// Refuses `keep_local_handler` on a runtime whose handler contributes no
+/// launch input: nothing would keep the agent local.
+fn validate_placement_handler(definition: &RuntimeDefinition) -> Result<(), DefinitionError> {
+    let wants_handler = definition
+        .placement
+        .as_ref()
+        .is_some_and(Placement::keeps_local_by_handler);
+    if wants_handler && crate::integration::launch_contributor(definition).is_none() {
+        return Err(DefinitionError::Field {
+            field: "placement.keep_local_handler",
+            reason: "needs an integration handler that contributes launch input",
+        });
+    }
+    Ok(())
+}
+
 /// Checks the fixed launch arguments: each is a valid token and none holds the
 /// `[naming]` placeholder, which only `[naming] launch_args` may carry.
 fn validate_default_args(args: &[String]) -> Result<(), DefinitionError> {
@@ -1186,6 +1235,25 @@ struct DescriptorFacts<'a> {
     /// value persisted sessions record.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     naming: &'a [String],
+    /// Omitted while absent, so a descriptor without `[placement]` hashes to
+    /// the value persisted sessions record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement: Option<PlacementFacts<'a>>,
+}
+
+#[derive(Serialize)]
+struct PlacementFacts<'a> {
+    keep_local_args: &'a [String],
+    keep_local_handler: bool,
+}
+
+impl<'a> PlacementFacts<'a> {
+    fn of(placement: &'a Placement) -> Self {
+        Self {
+            keep_local_args: placement.keep_local_args(),
+            keep_local_handler: placement.keeps_local_by_handler(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1264,6 +1332,8 @@ struct RawDefinition {
     launch_env: Option<BTreeMap<String, String>>,
     #[serde(default)]
     naming: Option<RawNaming>,
+    #[serde(default)]
+    placement: Option<RawPlacement>,
     #[serde(default)]
     config_home: Option<RawConfigHome>,
     #[serde(default)]

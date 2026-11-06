@@ -777,6 +777,7 @@ fn session_minimal() -> SessionInfo {
         worktree_path: None,
         warnings: Vec::new(),
         capability_refusals: None,
+        placement: None,
         output_force_closed: false,
         metadata: BTreeMap::new(),
         created_at: CREATED_AT.to_owned(),
@@ -885,6 +886,7 @@ fn session_full() -> SessionInfo {
             detail: Some("origin unreachable in fixture environment".to_owned()),
         }],
         capability_refusals: None,
+        placement: None,
         output_force_closed: true,
         metadata,
         spawned_by: Some(SpawnedBy {

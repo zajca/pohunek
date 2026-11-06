@@ -1643,6 +1643,46 @@ The Codex handler contributes the single root argument `--no-daemon` (and no
 environment or files), so a Codex session never attaches to a shared managed
 app-server daemon whatever its profile arguments (`crates/daemon/src/integration/provider_handlers.rs`).
 
+### Session placement
+
+A session's agent runs only in processes its worker generation owns: the PTY
+child and its descendants. An agent that prewarms a shared host daemon (a
+managed app-server, a hub) would run later sessions inside the first session's
+tree and environment, and stopping that session would strand the others.
+
+A runtime declares how it avoids that in its descriptor's `[placement]` table
+(runtime feature `placement-v1`). `mode = "in_process"` states that the agent
+stays in the PTY's process tree, by literal `keep_local_args` that the core
+adds to every create, resume and fork launch (never frozen into the resume
+snapshot), by `keep_local_handler = true` when the compiled integration handler
+contributes the launch input (Codex), or by neither when the agent has no
+daemon. `mode = "owned_server"` is refused until a backend that can honour it
+exists. A descriptor that lists `placement-v1` without the table is refused;
+one that does not list the feature is unaffected.
+
+The worker of a runtime that declares `[placement]` runs an escape check at the
+interval `placement_check_interval` of the daemon's session registry
+configuration (30 s by default) and once more before a stop and after the PTY
+root exits. It reads the same-user process table and reports a process that is
+in a POSIX session other than the PTY child's, carries the generation's
+`POHUNEK_WORKER_INSTANCE_ID`, and is named for the provider or holds a listening
+socket. The tests run in that order, so the environment of an unrelated process
+is never read; a process whose facts the host withholds cannot be attributed
+and is not reported, and the check reports `unobservable` only when the PTY
+child's session or the process table cannot be read. The session is identified
+by `getsid` on macOS and `/proc/<pid>/stat` on Linux, a listening socket by
+`libproc` descriptor info on macOS and the `/proc/<pid>/net` socket tables on
+Linux, so the check needs no control group.
+
+The check is report-only. It kills nothing, because the stop and the removal
+sweep already end every marked process and a wrong kill of an owner's daemon
+would cost more than a missed report. The result lives in worker memory:
+`session.inspect` of a live session carries it as `placement`, once per
+generation the worker logs a `placement_escape` WARN, and `daemon.doctor`
+reports a `placement_escape` check. A tool the agent runs that starts its own
+listener in a session of its own (an agent daemon for keys, for example) is
+reported too; the finding names pid and command only.
+
 The Muse Code handler is the first user of this seam
 (`crates/daemon/src/integration/muse/`, removed with #1643): its contribution
 is a per-session managed hooks overlay plus the reporter script, in the state

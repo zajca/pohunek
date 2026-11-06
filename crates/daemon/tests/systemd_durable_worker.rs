@@ -1175,6 +1175,7 @@ impl Fixture {
             public_protocol_version: PROTOCOL_VERSION.get(),
             hook_schema: None,
             answers_program_status_probe: false,
+            placement_check_interval_ms: None,
         }
     }
 
@@ -1250,6 +1251,7 @@ impl Fixture {
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: now.clone(),

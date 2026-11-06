@@ -2872,6 +2872,10 @@ fn render_inspect_human(info: &SessionInfo) -> String {
                 .map_or_else(none, capability_refusals_label),
         ),
         (
+            "placement",
+            info.placement.as_ref().map_or_else(none, placement_label),
+        ),
+        (
             "subagents_running",
             running_subagent_count(info).to_string(),
         ),
@@ -3278,6 +3282,21 @@ fn capability_refusals_label(refusals: &protocol::SessionCapabilityRefusals) -> 
         .join(" ")
 }
 
+/// The `placement` row: the outcome, and `placement_escape` with each escaped
+/// process's pid and command name when a process left the terminal session.
+fn placement_label(placement: &protocol::SessionPlacement) -> String {
+    if placement.outcome != "escaped" {
+        return terminal_text(&placement.outcome);
+    }
+    let processes = placement
+        .processes
+        .iter()
+        .map(|process| format!("{} ({})", process.pid, terminal_text(&process.comm)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("placement_escape: {processes}")
+}
+
 fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
     match kind {
         SessionWarningKind::Fetch => "fetch",
@@ -3334,6 +3353,7 @@ mod tests {
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),

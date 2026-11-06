@@ -495,6 +495,7 @@ impl JournalEvidence {
             active_identity_revision: None,
             prompt_accepted_sequence: None,
             drains_streams_on_terminal_ack: false,
+            placement: None,
         })
     }
 }
@@ -9666,6 +9667,7 @@ while os.getppid() == parent:
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
                 answers_program_status_probe: false,
+                placement_check_interval_ms: None,
             })
             .await
             .expect("initialize worker");
@@ -9761,6 +9763,7 @@ while os.getppid() == parent:
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),
@@ -10094,6 +10097,7 @@ while os.getppid() == parent:
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-v1".to_owned()),
                 answers_program_status_probe: false,
+                placement_check_interval_ms: None,
             })
             .await
             .expect("initialize Hermes worker");
@@ -11138,6 +11142,7 @@ while os.getppid() == parent:
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
                 answers_program_status_probe: false,
+                placement_check_interval_ms: None,
             })
             .await
             .expect("initialize worker");
@@ -11341,6 +11346,7 @@ while os.getppid() == parent:
                 worktree_path: None,
                 warnings: Vec::new(),
                 capability_refusals: None,
+                placement: None,
                 output_force_closed: false,
                 metadata: BTreeMap::new(),
                 created_at: created_at.clone(),
@@ -12313,6 +12319,7 @@ while os.getppid() == parent:
             active_identity_revision: None,
             prompt_accepted_sequence: None,
             drains_streams_on_terminal_ack: false,
+            placement: None,
         }
     }
 
@@ -12872,6 +12879,7 @@ handler = "codex-hook-v1"
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),

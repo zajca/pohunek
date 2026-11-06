@@ -118,6 +118,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "naming-launch-args-v1",
         since: "0.39.0",
     },
+    RuntimeFeature {
+        id: "placement-v1",
+        since: "0.40.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -181,7 +185,18 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
         feature: "naming-launch-args-v1",
         rule: GateRule::Key("naming"),
     },
+    FeatureGate {
+        feature: "placement-v1",
+        rule: GateRule::Key("placement"),
+    },
 ];
+
+/// Descriptor keys a feature makes mandatory once `requires` lists it:
+/// `(feature, dotted key path)`.
+///
+/// A feature listed here is additive until a descriptor opts in by listing it;
+/// from then on the descriptor must declare what the feature governs.
+pub(super) const FEATURE_REQUIRED_KEYS: &[(&str, &str)] = &[("placement-v1", "placement")];
 
 impl FeatureTables<'static> {
     /// The tables a production descriptor parse uses.
@@ -274,6 +289,23 @@ pub(super) fn check_gates(
             key: gate.rule.path(),
             feature: gate.feature,
         }),
+        None => Ok(()),
+    }
+}
+
+/// Checks that every key a required feature makes mandatory is declared.
+///
+/// # Errors
+///
+/// [`DefinitionError::FeatureKeyMissing`] for the first listed feature whose
+/// mandatory key the descriptor lacks.
+pub(super) fn check_required_keys(descriptor: &Table) -> Result<(), DefinitionError> {
+    let requires = declared_requires(descriptor).unwrap_or_default();
+    match FEATURE_REQUIRED_KEYS
+        .iter()
+        .find(|(feature, key)| requires.contains(feature) && lookup(descriptor, key).is_none())
+    {
+        Some((feature, key)) => Err(DefinitionError::FeatureKeyMissing { key, feature }),
         None => Ok(()),
     }
 }

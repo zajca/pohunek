@@ -916,6 +916,7 @@ impl SessionRegistry {
             spawned_by: spawned_by.clone(),
             warnings: warnings.clone(),
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             created_at: created_at.clone(),
             updated_at: created_at.clone(),
@@ -990,6 +991,10 @@ impl SessionRegistry {
         default_detector_config.launch_name.clone_from(&launch_name);
         let hook_schema = self.session_hook_schema(&agent_base, &snapshot.launch_binding);
         let answers_program_status_probe = default_detector_config.answers_program_status_probe();
+        let placement_check = pinned
+            .as_deref()
+            .is_some_and(|definition| definition.placement().is_some())
+            .then_some(self.inner.config.placement_check_interval);
         // Held until this function returns: the entry is installed by then,
         // or the launch failed.
         let _launch_reservation = self.reserve_launch(&id, agent_base.clone(), hook_schema);
@@ -1002,6 +1007,7 @@ impl SessionRegistry {
                 agent_base.clone(),
                 hook_schema,
                 answers_program_status_probe,
+                placement_check,
                 snapshot.native_ref_kind(),
                 command,
                 &transaction_id,
@@ -1081,6 +1087,7 @@ impl SessionRegistry {
             spawned_by,
             warnings,
             capability_refusals: None,
+            placement: None,
             output_force_closed: false,
             created_at,
             updated_at: now,
@@ -1260,6 +1267,7 @@ impl SessionRegistry {
         agent_base: RuntimeRef,
         hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
         answers_program_status_probe: bool,
+        placement_check: Option<std::time::Duration>,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1280,6 +1288,7 @@ impl SessionRegistry {
                 agent_base,
                 hook_schema,
                 answers_program_status_probe,
+                placement_check,
                 reference_kind,
                 command,
                 transaction_id,
@@ -1306,6 +1315,7 @@ impl SessionRegistry {
         agent_base: RuntimeRef,
         hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
         answers_program_status_probe: bool,
+        placement_check: Option<std::time::Duration>,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1376,6 +1386,12 @@ impl SessionRegistry {
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: hook_schema.map(|schema| schema.id.to_owned()),
                 answers_program_status_probe,
+                placement_check_interval_ms: placement_check
+                    .map(|interval| u64::try_from(interval.as_millis()))
+                    .transpose()
+                    .map_err(|error| {
+                        runtime_error("worker_initialize_invalid", error.to_string())
+                    })?,
             })
             .await
             .map_err(super::worker_error_to_protocol)?;

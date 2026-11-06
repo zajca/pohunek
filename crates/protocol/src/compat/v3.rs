@@ -363,6 +363,7 @@ fn session_info(
         object.remove("background");
         object.remove("output_force_closed");
         object.remove("capability_refusals");
+        object.remove("placement");
         object.remove("spawned_by");
         if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
             warnings.retain(|warning| {

@@ -20,6 +20,7 @@ mod launch;
 mod launch_env;
 mod naming;
 mod package;
+mod placement;
 mod registry;
 mod source;
 mod transcripts;
@@ -56,6 +57,7 @@ pub use package::{
     definition_from_archive, descriptor_from_archive, PackageLoad, PackageRejection, PackageSource,
     PackageStore, RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
 };
+pub use placement::{Placement, MAX_KEEP_LOCAL_TOKENS};
 pub use registry::{
     InventoryEntry, RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust,
     RESERVED_RUNTIME_IDS,

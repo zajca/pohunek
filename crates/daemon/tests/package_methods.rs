@@ -129,6 +129,15 @@ async fn spawn_servers_trusting(
     store_content: Option<&str>,
     trust: CatalogTrust,
 ) -> Servers {
+    spawn_servers_configured(tag, store_content, |config| config.catalog_trust = trust).await
+}
+
+/// [`spawn_servers_over`] with `configure` applied to the registry config.
+async fn spawn_servers_configured(
+    tag: &str,
+    store_content: Option<&str>,
+    configure: impl FnOnce(&mut SessionRegistryConfig),
+) -> Servers {
     let socket_dir = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
         .expect("create the socket directory");
     let socket = socket_dir.path().join("daemon.sock");
@@ -154,11 +163,10 @@ async fn spawn_servers_trusting(
         daemon_socket: socket.clone(),
     };
     let store = store_content.map(|content| write_data_store(socket_dir.path(), content));
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         socket_path: Some(socket.clone()),
         store_path: store.clone(),
         plugins_dir: Some(plugins.clone()),
-        catalog_trust: trust,
         agents_dir: Some(agents.clone()),
         host_state_dir: Some(host_state),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
@@ -170,6 +178,7 @@ async fn spawn_servers_trusting(
         ),
         ..support::hermetic_registry_config()
     };
+    configure(&mut config);
     let registry =
         SessionRegistry::new_production(config, Arc::new(SubprocessWorkerLauncher::new()))
             .expect("the production registry opens the plugin root");
@@ -3127,4 +3136,397 @@ async fn the_index_trust_kind_is_served_only_with_a_loaded_channel() {
         assert_eq!(refused, code, "{tag}");
         servers.stop().await;
     }
+}
+
+const PLACEMENT_FEATURE: &str = "\"placement-v1\"";
+
+/// A `[placement]` table with `body` lines.
+fn placement_table(body: &str) -> String {
+    format!("\n[placement]\n{body}\n")
+}
+
+/// The `fixture` descriptor launching `program`, requiring `placement-v1` when
+/// `requires` and followed by `table`.
+fn placement_descriptor(program: &Path, requires: bool, table: &str) -> String {
+    descriptor_requiring(if requires { PLACEMENT_FEATURE } else { "" }, table).replace(
+        "program = \"/bin/sh\"",
+        &format!("program = \"{}\"", program.display()),
+    )
+}
+
+#[tokio::test]
+async fn placement_declarations_install_only_in_their_valid_forms() {
+    let servers = spawn_servers("pkg-placement-forms").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let valid = [
+        ("nothing", placement_table("mode = \"in_process\"")),
+        (
+            "args",
+            placement_table("mode = \"in_process\"\nkeep_local_args = [\"--no-daemon\"]"),
+        ),
+    ];
+    for (name, table) in &valid {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &placement_descriptor(Path::new("/bin/sh"), true, table),
+            true,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{name} is accepted: {error:?}"));
+    }
+
+    // A descriptor that does not list the feature stays valid without a table.
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "additive",
+        &placement_descriptor(Path::new("/bin/sh"), false, ""),
+        true,
+    )
+    .await;
+    result.expect("a descriptor without the feature is untouched");
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn placement_declarations_the_core_cannot_honour_are_refused() {
+    let servers = spawn_servers("pkg-placement-refused").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let refused = [
+        ("listed-without-table", true, String::new()),
+        (
+            "owned-server",
+            true,
+            placement_table("mode = \"owned_server\""),
+        ),
+        (
+            "both-forms",
+            true,
+            placement_table(
+                "mode = \"in_process\"\nkeep_local_args = [\"--a\"]\nkeep_local_handler = true",
+            ),
+        ),
+        (
+            "handler-without-contributor",
+            true,
+            placement_table("mode = \"in_process\"\nkeep_local_handler = true"),
+        ),
+        (
+            "empty-args",
+            true,
+            placement_table("mode = \"in_process\"\nkeep_local_args = []"),
+        ),
+        (
+            "empty-token",
+            true,
+            placement_table("mode = \"in_process\"\nkeep_local_args = [\"\"]"),
+        ),
+        (
+            "control-token",
+            true,
+            placement_table("mode = \"in_process\"\nkeep_local_args = [\"--a\\u0007\"]"),
+        ),
+        (
+            "name-placeholder",
+            true,
+            placement_table("mode = \"in_process\"\nkeep_local_args = [\"{session_name}\"]"),
+        ),
+        (
+            "no-mode",
+            true,
+            placement_table("keep_local_args = [\"--a\"]"),
+        ),
+        (
+            "unknown-key",
+            true,
+            placement_table("mode = \"in_process\"\nsetsid = true"),
+        ),
+    ];
+    for (name, requires, table) in &refused {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &placement_descriptor(Path::new("/bin/sh"), *requires, table),
+            true,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
+
+    // A table without its feature in `requires` is a feature-owned key.
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "unlisted",
+        &placement_descriptor(
+            Path::new("/bin/sh"),
+            false,
+            &placement_table("mode = \"in_process\""),
+        ),
+        true,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("an unlisted feature").code,
+        "runtime_feature_unsupported"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn keep_local_args_follow_each_launch_and_are_not_frozen() {
+    let servers = spawn_servers_over("pkg-placement-args", Some("")).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = argv_program(&servers.plugins);
+    let table = placement_table("mode = \"in_process\"\nkeep_local_args = [\"--keep-local\"]");
+    let document = placement_descriptor(&program, true, &table);
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-placement",
+        &document,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+
+    let created = start_named_session(&mut local, RUNTIME, &cwd, None).await;
+    let argv = printed_argv(&mut local, &created).await;
+    assert_eq!(
+        without_reference(&argv, &["--session-id"]),
+        strings(&["--model", "fast", "--keep-local", "--session-id"])
+    );
+
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
+    let resumed: protocol::SessionResumeResult =
+        call(&mut local, method::SESSION_RESUME, json!(created)).await;
+    let argv = printed_argv(&mut local, &resumed.session.id).await;
+    assert_eq!(
+        without_reference(&argv, &["--session"]),
+        strings(&["--model", "fast", "--keep-local", "--session"])
+    );
+
+    let forked: protocol::SessionForkResult = call(
+        &mut local,
+        method::SESSION_FORK,
+        json!({ "session_id": resumed.session.id, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    let argv = printed_argv(&mut local, &forked.session.id).await;
+    assert_eq!(
+        without_reference(&argv, &["--fork"]),
+        strings(&["--model", "fast", "--keep-local", "--fork"])
+    );
+
+    assert!(
+        !store_text(&servers).contains("--keep-local"),
+        "the persisted resume snapshot holds no keep-local argument"
+    );
+    for id in [forked.session.id, resumed.session.id] {
+        let _: protocol::SessionStopResult =
+            call(&mut local, method::SESSION_STOP, json!(id)).await;
+    }
+    drop(local);
+    servers.stop().await;
+}
+
+/// Filter word that marks a launch of this binary as the listening image.
+#[cfg(target_os = "linux")]
+const LISTENER_IMAGE: &str = "placement_listener_image";
+
+/// The daemon-shaped fixture image: listens on a unix socket and lives while
+/// its barrier directory exists. Started with the socket path and the barrier
+/// path as its last two arguments, only by the escape scenario.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "fixture process image of the placement escape scenario"]
+fn placement_listener_image() {
+    let args: Vec<String> = std::env::args().collect();
+    let [.., socket, barrier] = args.as_slice() else {
+        return;
+    };
+    if !args.iter().any(|argument| argument == LISTENER_IMAGE) {
+        return;
+    }
+    let _listener =
+        std::os::unix::net::UnixListener::bind(socket).expect("listen on the fixture socket");
+    let started = std::time::Instant::now();
+    while Path::new(barrier).is_dir() && started.elapsed() < std::time::Duration::from_secs(300) {
+        // timing-allowed: #1947 the image's own liveness poll; no scenario waits on this sleep, the barrier ends it
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Removes the listener images' barrier and kills the escaped processes when
+/// dropped, so a failing scenario leaves nothing behind.
+#[cfg(target_os = "linux")]
+struct EscapeCleanup {
+    barrier: PathBuf,
+    /// Pids the fixture published, killed on drop; recorded as they appear
+    /// because the scenario directory is gone by the time the guard drops.
+    pids: std::cell::RefCell<Vec<i32>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EscapeCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.barrier);
+        for pid in self.pids.borrow().iter() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+/// The pid a published fixture file holds, recorded for cleanup.
+#[cfg(target_os = "linux")]
+fn published_pid(directory: &Path, name: &str, cleanup: &EscapeCleanup) -> u32 {
+    let pid =
+        pohunek_test_support::wait::poll_until(&format!("the fixture to publish {name}"), || {
+            std::fs::read_to_string(directory.join(name))
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        });
+    cleanup
+        .pids
+        .borrow_mut()
+        .push(i32::try_from(pid).expect("a process id"));
+    pid
+}
+
+/// The session's latest placement check, as `session.inspect` reports it.
+#[cfg(target_os = "linux")]
+async fn placement_of<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+) -> Option<protocol::SessionPlacement>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let info: protocol::SessionInfo = call(framed, method::SESSION_INSPECT, json!(id)).await;
+    info.placement
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_is_not() {
+    let servers = spawn_servers_configured("pkg-placement-escape", Some(""), |config| {
+        config.placement_check_interval = std::time::Duration::from_millis(50);
+    })
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    let directory = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let barrier = directory.join("barrier");
+    std::fs::create_dir(&barrier).expect("create the barrier");
+    let cleanup = EscapeCleanup {
+        barrier: barrier.clone(),
+        pids: std::cell::RefCell::default(),
+    };
+    let image = std::env::current_exe().expect("this test binary");
+    let image = image.display();
+    let dir = directory.display();
+    // In order: a listening image that stays in the tree, a `setsid` wrapper
+    // that neither listens nor is named for the provider, a double-forked
+    // listening image in a session of its own, and a daemon image named for the
+    // provider (the runtime is `pi`) in a session of its own. Each step waits
+    // for the previous process to publish its pid, so the escape is only
+    // reported by a check that already judged the processes that stay.
+    let filter = pohunek_test_support::exact_test_filter(module_path!(), LISTENER_IMAGE);
+    let script = format!(
+        "#!/bin/sh\n\
+         cd {dir}\n\
+         /bin/cp /bin/sh pi-daemon\n\
+         wait_for() {{ until [ -e \"$1\" ]; do /bin/sleep 0.02; done; }}\n\
+         sh -c 'echo $$ > tree.pid; exec {image} {filter} --ignored --nocapture {dir}/tree.sock {barrier}' </dev/null >/dev/null 2>&1 &\n\
+         wait_for tree.pid\n\
+         /usr/bin/setsid sh -c 'echo $$ > wrapper.pid; exec /bin/sleep 600' </dev/null >/dev/null 2>&1 &\n\
+         wait_for wrapper.pid\n\
+         ( /usr/bin/setsid sh -c 'echo $$ > listener.pid; exec {image} {filter} --ignored --nocapture {dir}/escaped.sock {barrier}' </dev/null >/dev/null 2>&1 & )\n\
+         wait_for listener.pid\n\
+         /usr/bin/setsid sh -c 'echo $$ > daemon.pid; exec ./pi-daemon -c \"sleep 600; :\"' </dev/null >/dev/null 2>&1 &\n\
+         wait_for daemon.pid\n\
+         exec /bin/sleep 600\n",
+        barrier = barrier.display(),
+        filter = filter.join(" "),
+    );
+    let program = write_program(&servers.plugins, "agent-escape", &script);
+    let table = placement_table("mode = \"in_process\"");
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-escape",
+        &placement_descriptor(&program, true, &table),
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+
+    let id = start_named_session(&mut local, RUNTIME, &directory, None).await;
+    let tree = published_pid(&directory, "tree.pid", &cleanup);
+    let wrapper = published_pid(&directory, "wrapper.pid", &cleanup);
+    let listener = published_pid(&directory, "listener.pid", &cleanup);
+    let daemon = published_pid(&directory, "daemon.pid", &cleanup);
+
+    let shared = tokio::sync::Mutex::new(&mut local);
+    let shared = &shared;
+    let session = &id;
+    let found = pohunek_test_support::wait::wait_until(
+        "the worker to report both escaped processes",
+        || async move {
+            let mut framed = shared.lock().await;
+            let placement = placement_of(&mut **framed, session).await?;
+            (placement.outcome == "escaped" && placement.processes.len() == 2).then_some(placement)
+        },
+    )
+    .await;
+    let mut reported: Vec<u32> = found.processes.iter().map(|process| process.pid).collect();
+    reported.sort_unstable();
+    let mut expected = vec![listener, daemon];
+    expected.sort_unstable();
+    assert_eq!(
+        reported, expected,
+        "{found:?} (tree {tree}, wrapper {wrapper})"
+    );
+
+    let report: protocol::DaemonDoctorResult =
+        call(&mut local, method::DAEMON_DOCTOR, Value::Null).await;
+    let doctor = report
+        .report
+        .checks
+        .iter()
+        .find(|check| check.name == "placement_escape")
+        .expect("doctor carries the placement check");
+    assert_eq!(doctor.status, protocol::DoctorStatus::Warn);
+    assert!(
+        doctor.detail.contains(&daemon.to_string())
+            && doctor.detail.contains(&listener.to_string()),
+        "{doctor:?}"
+    );
+
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    drop(local);
+    servers.stop().await;
 }

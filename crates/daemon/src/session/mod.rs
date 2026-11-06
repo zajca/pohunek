@@ -94,6 +94,7 @@ mod observation;
 mod package_pins;
 #[cfg(test)]
 mod package_scenarios;
+mod placement;
 mod procwatch;
 #[cfg(test)]
 mod profile_freeze_tests;
@@ -190,6 +191,14 @@ const MAX_ACTIVITY_EVIDENCE_HISTORY: usize = 4_096;
 /// Keeps evidence through the longest public input-wait deadline.
 const ACTIVITY_EVIDENCE_RETENTION: Duration =
     Duration::from_millis(protocol::MAX_SESSION_WAIT_MS as u64);
+/// Cadence of a worker's placement escape check.
+///
+/// Each run reads the whole same-user process table, so it is spaced well
+/// apart; a daemon an agent prewarmed lives far longer than one interval, and
+/// the stop runs the check once more.
+const DEFAULT_PLACEMENT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Longest cadence a worker accepts for its placement escape check.
+const MAX_PLACEMENT_CHECK_INTERVAL: Duration = Duration::from_hours(1);
 /// Final runtime retention while no daemon is present.
 const DEFAULT_WORKER_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
 /// Durable logical-session record schema; every persisted record kind shares the
@@ -410,6 +419,9 @@ pub struct SessionRegistryConfig {
     pub observation_output_bytes: usize,
     /// Maximum bounded wait accepted by `session.output`.
     pub observation_output_wait: Duration,
+    /// Interval between the placement escape checks a worker runs for a
+    /// runtime that declares `[placement]`.
+    pub placement_check_interval: Duration,
     /// Maximum bounded wait accepted by `session.wait`.
     pub session_wait: Duration,
     /// Maximum terminal rows accepted in a screen snapshot.
@@ -639,6 +651,7 @@ impl Default for SessionRegistryConfig {
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
             observation_output_bytes: protocol::MAX_SESSION_OUTPUT_BYTES,
             observation_output_wait: DEFAULT_OBSERVATION_WAIT,
+            placement_check_interval: DEFAULT_PLACEMENT_CHECK_INTERVAL,
             session_wait: DEFAULT_OBSERVATION_WAIT,
             observation_screen_rows: DEFAULT_SCREEN_ROWS,
             observation_screen_cols: DEFAULT_SCREEN_COLS,
@@ -8320,6 +8333,7 @@ fn external_session_info(
         worktree_path: association.worktree_path,
         warnings: Vec::new(),
         capability_refusals: None,
+        placement: None,
         output_force_closed: false,
         metadata: BTreeMap::new(),
         spawned_by: None,
@@ -8541,6 +8555,7 @@ fn create_intent_record(
         spawned_by: spawned_by.cloned(),
         warnings: Vec::new(),
         capability_refusals: None,
+        placement: None,
         output_force_closed: false,
         created_at: created_at.clone(),
         updated_at: created_at,
@@ -9691,6 +9706,8 @@ fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), Pro
         || config.observation_output_bytes > protocol::MAX_SESSION_OUTPUT_BYTES
         || config.observation_output_wait.is_zero()
         || config.observation_output_wait > hard_wait_ceiling
+        || config.placement_check_interval.is_zero()
+        || config.placement_check_interval > MAX_PLACEMENT_CHECK_INTERVAL
         || config.session_wait.is_zero()
         || config.session_wait > hard_wait_ceiling
         || config.observation_screen_rows == 0

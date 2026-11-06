@@ -300,3 +300,34 @@ fn a_refusal_code_with_terminal_control_characters_is_printed_inert() {
     assert!(!table.contains('\u{1b}'), "{table:?}");
     assert!(!text.contains('\u{1b}'), "{text:?}");
 }
+
+#[test]
+fn inspect_shows_the_placement_check_of_a_live_session() {
+    let live = |placement: Value| {
+        let mut live = session("s-1", "running", None);
+        live["placement"] = placement;
+        inspect(vec![live], "s-1")
+    };
+    let row = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("placement"))
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+
+    let escaped = live(json!({
+        "outcome": "escaped",
+        "processes": [{"pid": 4321, "comm": "evil\u{1b}[31mcodex"}],
+    }));
+    let clean = live(json!({"outcome": "clean", "processes": []}));
+    let unverified = live(json!({"outcome": "unobservable", "processes": []}));
+    let unchecked = inspect(vec![session("s-1", "running", None)], "s-1");
+
+    assert!(
+        row(&escaped).ends_with("placement_escape: 4321 (evil\\u{1b}[31mcodex)"),
+        "{escaped}"
+    );
+    assert!(row(&clean).ends_with("clean"), "{clean}");
+    assert!(row(&unverified).ends_with("unobservable"), "{unverified}");
+    assert!(row(&unchecked).ends_with("<none>"), "{unchecked}");
+}

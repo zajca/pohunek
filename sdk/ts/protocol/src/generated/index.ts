@@ -198,6 +198,8 @@ export type { SessionNewResult } from "./SessionNewResult";
 export type { SessionOutputGap } from "./SessionOutputGap";
 export type { SessionOutputParams } from "./SessionOutputParams";
 export type { SessionOutputResult } from "./SessionOutputResult";
+export type { SessionPlacement } from "./SessionPlacement";
+export type { SessionPlacementProcess } from "./SessionPlacementProcess";
 export type { SessionPolicyParams } from "./SessionPolicyParams";
 export type { SessionPolicyResult } from "./SessionPolicyResult";
 export type { SessionReadFormat } from "./SessionReadFormat";

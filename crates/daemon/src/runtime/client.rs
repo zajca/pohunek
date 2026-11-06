@@ -1864,6 +1864,7 @@ mod tests {
             public_protocol_version: protocol::PROTOCOL_VERSION.get(),
             hook_schema: None,
             answers_program_status_probe: false,
+            placement_check_interval_ms: None,
         }
     }
 

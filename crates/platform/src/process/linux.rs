@@ -15,7 +15,7 @@ use rustix::process::{pidfd_open, Pid as NativePid, PidfdFlags};
 
 use super::{
     BootIdentity, ControlGroupPath, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact,
-    ProcessIdentity, ProcessInspector, StartIdentity,
+    ProcessIdentity, ProcessInspector, ProcessSession, StartIdentity,
 };
 
 /// Linux proc filesystem root.
@@ -30,6 +30,8 @@ const ENV_WORKER_ID: &str = "POHUNEK_WORKER_ID";
 const ENV_WORKER_INSTANCE_ID: &str = "POHUNEK_WORKER_INSTANCE_ID";
 /// `/proc/<pid>/stat` process-group field number (`pgrp`).
 const STAT_PGRP_FIELD: usize = 5;
+/// `/proc/<pid>/stat` POSIX-session field number (`session`).
+const STAT_SESSION_FIELD: usize = 6;
 /// `/proc/<pid>/stat` parent-process field number (`ppid`).
 const STAT_PPID_FIELD: usize = 4;
 /// `/proc/<pid>/stat` process-state field number.
@@ -250,6 +252,134 @@ impl ProcessInspector for LinuxInspector {
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
         foreground_process_group(root_pid)
             .map_err(|source| process_error("read_foreground_process_group", source))
+    }
+
+    fn process_session(&self, pid: Pid) -> Result<Option<ProcessSession>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        if !same_user(pid, euid) {
+            return Ok(None);
+        }
+        let stat = match fs::read_to_string(proc_path(pid).join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if is_process_race(&error) => return Ok(None),
+            Err(error) => return Err(process_error("read_process_session", error)),
+        };
+        parse_stat_field::<u64>(&stat, STAT_SESSION_FIELD)
+            .map(|session| Some(ProcessSession::new(session)))
+            .ok_or(Error::InvalidData {
+                operation: "read_process_session",
+            })
+    }
+
+    fn holds_listener(&self, pid: Pid) -> Result<Option<bool>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        if !same_user(pid, euid) {
+            return Ok(None);
+        }
+        holds_listener_at(Path::new(PROC_ROOT), pid)
+    }
+}
+
+/// Socket tables of the process's own network namespace, read through its
+/// `/proc/<pid>/net` view: the file, the column holding the socket inode and
+/// how a listening row is recognised.
+const LISTENER_TABLES: [(&str, usize, ListenerRow); 3] = [
+    ("net/tcp", 9, ListenerRow::TcpState),
+    ("net/tcp6", 9, ListenerRow::TcpState),
+    ("net/unix", 6, ListenerRow::UnixFlags),
+];
+
+/// How a row of a `/proc/net` table marks a listening socket.
+#[derive(Clone, Copy)]
+enum ListenerRow {
+    /// Column 3 is the TCP state; `0A` is `TCP_LISTEN`.
+    TcpState,
+    /// Column 3 holds the socket flags; `__SO_ACCEPTCON` is set on a listening
+    /// stream socket.
+    UnixFlags,
+}
+
+/// Kernel `TCP_LISTEN` state, as `/proc/net/tcp` prints it.
+const TCP_LISTEN_STATE: &str = "0A";
+/// Kernel `__SO_ACCEPTCON` socket flag, as `/proc/net/unix` prints it.
+const SO_ACCEPTCON_FLAG: u32 = 0x1_0000;
+/// Column of the state or flags value in every `/proc/net` socket table.
+const LISTENER_STATE_COLUMN: usize = 3;
+
+/// Whether `pid` holds a socket that is in the listening state.
+///
+/// A descriptor table the kernel withholds is [`Error::Unobservable`], never
+/// "holds none".
+fn holds_listener_at(root: &Path, pid: Pid) -> Result<Option<bool>, Error> {
+    const OPERATION: &str = "read_process_listener";
+    let entries = match fs::read_dir(proc_path_at(root, pid).join("fd")) {
+        Ok(entries) => entries,
+        Err(error) if is_process_race(&error) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(Error::Unobservable {
+                operation: OPERATION,
+            })
+        }
+        Err(error) => return Err(process_error(OPERATION, error)),
+    };
+    let mut inodes = std::collections::BTreeSet::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            inodes.insert(inode.to_owned());
+        }
+    }
+    if inodes.is_empty() {
+        return Ok(Some(false));
+    }
+    for (table, inode_column, row) in LISTENER_TABLES {
+        let text = match fs::read_to_string(proc_path_at(root, pid).join(table)) {
+            Ok(text) => text,
+            // A host without IPv6 has no `net/tcp6`; the other tables still
+            // decide.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if is_process_race(&error) => return Ok(None),
+            Err(error) => return Err(process_error(OPERATION, error)),
+        };
+        if text
+            .lines()
+            .skip(1)
+            .any(|line| row_is_listening(line, inode_column, row, &inodes))
+        {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
+fn row_is_listening(
+    line: &str,
+    inode_column: usize,
+    row: ListenerRow,
+    inodes: &std::collections::BTreeSet<String>,
+) -> bool {
+    let columns: Vec<&str> = line.split_whitespace().collect();
+    let (Some(inode), Some(state)) = (
+        columns.get(inode_column),
+        columns.get(LISTENER_STATE_COLUMN),
+    ) else {
+        return false;
+    };
+    if !inodes.contains(*inode) {
+        return false;
+    }
+    match row {
+        ListenerRow::TcpState => *state == TCP_LISTEN_STATE,
+        ListenerRow::UnixFlags => {
+            u32::from_str_radix(state, 16).is_ok_and(|flags| flags & SO_ACCEPTCON_FLAG != 0)
+        }
     }
 }
 

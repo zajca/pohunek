@@ -106,6 +106,7 @@ MACOS_BUCKETS = {
             "(binary_id(=pohunek-cli) and test(/(^|::)hold$/))",
             "(binary(=launchd) and test(/(^|::)fixture_entry$/))",
             "(binary(=process_lineage) and test(/(^|::)(hold|orphan)$/))",
+            "(binary(=process_placement) and test(=image))",
             "(package(=pohunek-test-support) and test(/(^|::)(umask_probe_test_env|umask_probe_tempdir|hold|write_probe)$/))",
             "(package(=pohunek-session-worker) and test(/(^|::)environment_listing_child$/))",
             "(binary_id(=pohunek-daemon) and test(/(^|::)daemon_(git_under_|git_subprocesses_under_|fetch_under_)/))",
