@@ -1295,9 +1295,10 @@ trusted_checkout_paths = [".muse", ".agents"]
 ```
 
 `trusted_checkout_args` holds 1 to 8 literal tokens without `{session_name}`.
-`trusted_checkout_paths` is required with it: 1 to 16 distinct relative,
+`trusted_checkout_paths` is required with it: 1 to 16 relative,
 normalized `/`-separated paths of at most 256 bytes, with no empty, `.`, `..` or
-`.git` component and no backslash, colon or control character. A violation, one
+`.git` component and no backslash, colon or control character, none equal to or
+inside another (compared per component, ignoring ASCII letter case). A violation, one
 key without the other, or a key without the feature is refused at install
 (`descriptor_invalid`, `runtime_feature_unsupported`; the diagnostic never reflects
 an entry). At `session.new`, `session.resume` and `session.fork` the daemon

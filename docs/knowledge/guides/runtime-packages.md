@@ -312,7 +312,8 @@ placeholder). `trusted_checkout_paths` is required with it and names what the
 runtime loads once it trusts a checkout: 1 to 16 paths, each relative to the
 checkout root, `/`-separated and normalized (no empty, `.`, `..` or `.git`
 component, no leading or trailing `/`, backslash, colon or control character,
-at most 256 bytes), none twice. Either key without the other, or a violation, is
+at most 256 bytes), none equal to or inside another (per component, ignoring
+ASCII letter case). Either key without the other, or a violation, is
 `descriptor_invalid`.
 
 At every create, resume and fork the daemon appends the arguments to the root

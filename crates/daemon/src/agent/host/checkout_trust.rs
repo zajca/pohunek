@@ -54,7 +54,7 @@ impl CheckoutTrust {
     /// [`MAX_CHECKOUT_TRUST_ARGS`], an invalid argument token or one holding
     /// the `{session_name}` placeholder, no path or more than
     /// [`MAX_CHECKOUT_TRUST_PATHS`], a path that is not relative and
-    /// normalized, or a repeated path. A diagnostic
+    /// normalized, or a path equal to or inside another. A diagnostic
     /// never reflects an entry.
     pub fn new(args: Vec<String>, paths: Vec<String>) -> Result<Self, DefinitionError> {
         if args.is_empty() || args.len() > MAX_CHECKOUT_TRUST_ARGS {
@@ -77,8 +77,11 @@ impl CheckoutTrust {
         }
         for (index, path) in paths.iter().enumerate() {
             validate_path(path)?;
-            if paths[..index].contains(path) {
-                return Err(refuse(PATHS_FIELD, "must not repeat a path"));
+            if paths[..index].iter().any(|earlier| overlaps(earlier, path)) {
+                return Err(refuse(
+                    PATHS_FIELD,
+                    "must not repeat a path or hold one inside another",
+                ));
             }
         }
         Ok(Self { args, paths })
@@ -125,6 +128,15 @@ fn validate_path(path: &str) -> Result<(), DefinitionError> {
         ));
     }
     Ok(())
+}
+
+/// Whether one path equals the other or is below it, comparing components
+/// without regard to ASCII letter case, as a case-insensitive file system
+/// would resolve them.
+fn overlaps(a: &str, b: &str) -> bool {
+    a.split('/')
+        .zip(b.split('/'))
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 fn refuse(field: &'static str, reason: &'static str) -> DefinitionError {

@@ -22,11 +22,12 @@
 //!    letter case all refuse.
 //!
 //! The scratch repository lives in a daemon-private directory, never in a
-//! directory a launched session can write. No git command runs against the checkout: its refs, index, objects and
-//! configuration are never read, so a process that can write them cannot
-//! influence the answer. Every git command runs in the private repository
-//! through the bounded runner with a cleared environment, no user or system
-//! configuration, no hooks, no pager and no lazy fetch, and all commands of
+//! directory a launched session can write. No git command runs against the
+//! checkout: its refs, index, objects and configuration are never read, so a
+//! process that can write them cannot influence the answer. Every git command
+//! runs in the private repository through the bounded runner with a cleared
+//! environment, no user or system configuration, no hooks, no pager and no
+//! lazy fetch. The walk of the declared paths on disk and all git commands of
 //! one evaluation share one deadline. The files can still change between the
 //! evaluation and the moment the runtime reads them; a process that can write
 //! the checkout can win that race.
@@ -43,8 +44,7 @@ use tracing::{debug, warn};
 use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 
 /// Longest a single git command of the predicate may run, within the total
-/// deadline. The commands read objects of one checkout or one remote ref, so a
-/// command that takes longer is a stalled filesystem or network.
+/// deadline. A command that takes longer is a stalled filesystem or network.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest one evaluation may take across all its git commands, so a launch
@@ -60,6 +60,10 @@ const GIT_STDOUT_CAP_BYTES: usize = bounded_run::MAX_STDOUT_CAP_BYTES;
 /// Most files below the declared paths the predicate compares; a checkout with
 /// more is not trusted.
 const MAX_COMPARED_FILES: usize = 2048;
+
+/// Most directory entries (files and directories) the walk of the declared
+/// paths visits; a checkout with more is not trusted.
+const MAX_WALKED_ENTRIES: usize = 8192;
 
 /// Deepest directory nesting the predicate walks below a declared path.
 const MAX_COMPARED_DEPTH: usize = 32;
@@ -371,13 +375,26 @@ fn contents_match(git: &Git, facts: &CheckoutFacts<'_>, head: &str) -> Result<bo
         expected.insert(path.to_owned(), (executable, object.to_owned()));
     }
 
-    let mut on_disk: Vec<(String, bool)> = Vec::new();
+    let mut walk = Walk {
+        cwd: facts.cwd,
+        deadline: git.deadline,
+        entries: 0,
+        files: Vec::new(),
+    };
     for path in facts.paths {
-        if !collect_files(facts.cwd, path, 0, &mut on_disk)? {
+        if !walk.collect(path, 0)? {
             return Ok(false);
         }
     }
-    if on_disk.len() != expected.len() {
+    let on_disk = walk.files;
+    // Set equality: no path is seen twice, every on-disk path is expected
+    // (checked with its hash below) and the counts agree.
+    let distinct: std::collections::BTreeSet<&str> =
+        on_disk.iter().map(|(path, _)| path.as_str()).collect();
+    if distinct.len() != on_disk.len()
+        || on_disk.len() != expected.len()
+        || distinct.iter().any(|path| !expected.contains_key(*path))
+    {
         return Ok(false);
     }
     if on_disk.is_empty() {
@@ -405,54 +422,70 @@ fn contents_match(git: &Git, facts: &CheckoutFacts<'_>, head: &str) -> Result<bo
         }))
 }
 
-/// Appends the regular files below `relative` (relative to `cwd`) to `out`
-/// with their executable bit. `Ok(false)` refuses: a symbolic link, a special
-/// file, a `.git` entry, a name that is not UTF-8, or more than the compared
-/// limits. A missing path holds no file.
-fn collect_files(
-    cwd: &Path,
-    relative: &str,
-    depth: usize,
-    out: &mut Vec<(String, bool)>,
-) -> Result<bool, Failure> {
-    use std::os::unix::fs::PermissionsExt as _;
+/// The bounded walk of the declared paths on disk.
+struct Walk<'a> {
+    cwd: &'a Path,
+    deadline: Instant,
+    /// Directory entries visited so far, files and directories alike.
+    entries: usize,
+    /// The regular files found, relative to `cwd`, with their executable bit.
+    files: Vec<(String, bool)>,
+}
 
-    if depth > MAX_COMPARED_DEPTH {
-        return Ok(false);
-    }
-    let metadata = match std::fs::symlink_metadata(cwd.join(relative)) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(_unreadable) => return Err(Failure::Disk),
-    };
-    let kind = metadata.file_type();
-    if kind.is_file() {
-        if out.len() >= MAX_COMPARED_FILES {
+impl Walk<'_> {
+    /// Appends the regular files below `relative` (relative to `cwd`) to
+    /// `files`. `Ok(false)` refuses: a symbolic link, a special file, a `.git`
+    /// entry, a name that is not UTF-8, or more than the compared limits. A
+    /// missing path holds no file. The deadline passing is a
+    /// [`Failure::Deadline`].
+    fn collect(&mut self, relative: &str, depth: usize) -> Result<bool, Failure> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if depth > MAX_COMPARED_DEPTH {
             return Ok(false);
         }
-        out.push((
-            relative.to_owned(),
-            metadata.permissions().mode() & EXECUTE_BITS != 0,
-        ));
-        return Ok(true);
-    }
-    if !kind.is_dir() {
-        return Ok(false);
-    }
-    let entries = std::fs::read_dir(cwd.join(relative)).map_err(|_unreadable| Failure::Disk)?;
-    for entry in entries {
-        let entry = entry.map_err(|_unreadable| Failure::Disk)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        if Instant::now() >= self.deadline {
+            return Err(Failure::Deadline);
+        }
+        self.entries += 1;
+        if self.entries > MAX_WALKED_ENTRIES {
             return Ok(false);
+        }
+        let metadata = match std::fs::symlink_metadata(self.cwd.join(relative)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(_unreadable) => return Err(Failure::Disk),
         };
-        if name.eq_ignore_ascii_case(GIT_SUFFIX) {
+        let kind = metadata.file_type();
+        if kind.is_file() {
+            if self.files.len() >= MAX_COMPARED_FILES {
+                return Ok(false);
+            }
+            self.files.push((
+                relative.to_owned(),
+                metadata.permissions().mode() & EXECUTE_BITS != 0,
+            ));
+            return Ok(true);
+        }
+        if !kind.is_dir() {
             return Ok(false);
         }
-        if !collect_files(cwd, &format!("{relative}/{name}"), depth + 1, out)? {
-            return Ok(false);
+        let entries =
+            std::fs::read_dir(self.cwd.join(relative)).map_err(|_unreadable| Failure::Disk)?;
+        for entry in entries {
+            let entry = entry.map_err(|_unreadable| Failure::Disk)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(false);
+            };
+            if name.eq_ignore_ascii_case(GIT_SUFFIX) {
+                return Ok(false);
+            }
+            if !self.collect(&format!("{relative}/{name}"), depth + 1)? {
+                return Ok(false);
+            }
         }
+        Ok(true)
     }
-    Ok(true)
 }
 
 /// Whether `path` is reached through real directories only: in `head`'s tree

@@ -67,10 +67,10 @@ impl SessionRegistry {
     /// trusted, else empty.
     ///
     /// A runtime that declares none, a host that trusts no repository and
-    /// every error or ambiguity give no arguments. The predicate runs git
-    /// against the checkout, so it runs off the async threads. `project_id`
-    /// names the project record whose stored origin the live origin must
-    /// equal.
+    /// every error or ambiguity give no arguments. The predicate fetches the
+    /// remote `HEAD` into a private repository and reads the declared paths
+    /// on disk, so it runs off the async threads. `project_id` names the
+    /// project record whose stored origin must be a trusted repository.
     pub(super) async fn trusted_checkout_args(
         &self,
         definition: &RuntimeDefinition,

@@ -4143,6 +4143,54 @@ async fn a_git_failure_withholds_the_trusted_args_and_logs_one_line() {
 }
 
 #[tokio::test]
+async fn a_deleted_nested_file_under_a_declared_path_withholds_the_trusted_args() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-nested",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "nested", "https://github.com/acme/widgets.git");
+    let nested = dir.join(".agents/skills/deep");
+    std::fs::create_dir_all(&nested).expect("create nested directories");
+    std::fs::write(dir.join(".agents/skills/s.md"), "skill\n").expect("write skill");
+    std::fs::write(nested.join("t.md"), "deep\n").expect("write deep skill");
+    git_in(&dir, &["add", "."]);
+    git_in(&dir, &["commit", "-q", "-m", "nested"]);
+    git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    assert!(carries_trust_arg(&launched_argv(&mut local, &dir).await));
+
+    // Every file of the remote tree must be on disk: a deletion at any depth
+    // withholds the arguments, and restoring the file trusts the checkout again.
+    for (name, file, content) in [
+        ("top", ".agents/rules.md", "rules\n"),
+        ("middle", ".agents/skills/s.md", "skill\n"),
+        ("deep", ".agents/skills/deep/t.md", "deep\n"),
+    ] {
+        let path = dir.join(file);
+        std::fs::remove_file(&path).expect("remove a declared file");
+        assert!(
+            !carries_trust_arg(&launched_argv(&mut local, &dir).await),
+            "{name}"
+        );
+        std::fs::write(&path, content).expect("restore the file");
+        assert!(
+            carries_trust_arg(&launched_argv(&mut local, &dir).await),
+            "{name} restored"
+        );
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "one table of descriptors walks every refusal against a single daemon"
@@ -4191,6 +4239,30 @@ async fn trusted_checkout_keys_install_only_as_a_valid_declaration() {
             format!(
                 "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [{}]\n",
                 too_many_paths.join(", ")
+            ),
+        ),
+        (
+            "nested-path",
+            format!(
+                "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\".agents\", \".agents/skills\"]\n"
+            ),
+        ),
+        (
+            "nested-path-reversed",
+            format!(
+                "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\".agents/skills\", \".agents\"]\n"
+            ),
+        ),
+        (
+            "nested-path-letter-case",
+            format!(
+                "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\".muse\", \".MUSE/hooks\"]\n"
+            ),
+        ),
+        (
+            "repeated-path-letter-case",
+            format!(
+                "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [\".muse\", \".Muse\"]\n"
             ),
         ),
         (
