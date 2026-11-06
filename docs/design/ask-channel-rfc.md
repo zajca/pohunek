@@ -1,6 +1,6 @@
 # RFC: Ask channel and a Pohunek MCP server for agents
 
-- **Status:** Accepted 2026-11-06 (epic #1982; the owner decisions of round ask-v1 are recorded in
+- **Status:** Accepted 2026-11-06 (epic #1987, design issue #1982; the owner decisions of round ask-v1 are recorded in
   section 12). Design-only: nothing here claims a shipped surface. Implementation is tracked by the
   sub-issues of the epic (section 10).
 - **Date:** 2026-11-06
@@ -78,14 +78,14 @@ Every new runtime repeats the rule work.
    (`docs/architecture.md:2216-2233`). A process can leave its PTY tree with a `setsid` double fork (M2)
    and read other processes' environments (M1). Rights stop a confused or prompt-injected agent that uses
    the sanctioned path. They do not stop a hostile agent until sessions run behind a real boundary
-   (#88 container/VM profiles). slice AC-20 adds the same rights to the public socket for callers whose kernel
+   (#88 container/VM profiles). Slice AC-20 adds the same rights to the public socket for callers whose kernel
    peer sits inside a session's tree, which closes the casual bypass but not the deliberate one.
 4. **MCP, not A2A, for both agent-to-Pohunek control and session-to-session delegation.** Every runtime we
    run is an MCP client; none is a native A2A client or server (section 9.8). Session-to-session tasks are
    Pohunek's own records (sessions and asks) that borrow A2A's state names. An A2A gateway for external
    agents is a later, separate adapter.
 
-**Owner questions: 12, answered 2026-11-06** (section 12). The issue tree is the sub-issues of epic #1982
+**Owner questions: 12, answered 2026-11-06** (section 12). The issue tree is the sub-issues of epic #1987
 (section 10).
 
 ### 0.1 Owner answers applied (round ask-v1)
@@ -123,7 +123,8 @@ defines three things this design must reuse rather than duplicate:
   a rule or the mode may still decide. A routed ask records the provider's real outcome and closes as
   `resolved_elsewhere` when something else decided (4.7). The task RFC records this in its section 8.5 amendment.
 - **"Automatic approval of provider permission prompts on the owner's behalf"** is a non-goal (section 5). The
-  ask channel keeps it: the daemon never answers, the owner does (3.4).
+  ask channel keeps it: the daemon never answers for the owner (3.4); an expiry default (3.1) is the asker's own
+  declared choice applied by the store, not an answer.
 
 ---
 
@@ -198,6 +199,9 @@ defines three things this design must reuse rather than duplicate:
 | `answerers` | Who may answer, from the rights model: `owner` always; `parent` only when granted (section 3.4) | |
 | `revision`, `state`, `outcome` | See 3.3 | |
 
+An `on_expire = default` outcome is the asker's own declared choice, applied by the store when the deadline
+passes; it is not an answer given on the owner's behalf, and it never applies to approvals or secrets.
+
 ### 3.2 Answer kinds
 
 | Kind | Request | Answer | Notes |
@@ -267,7 +271,8 @@ refused, a process that drops them is not. Slice AC-20 replaces the markers with
 **The owner's own shell.** A `shell` runtime session is often the owner's own terminal. Its default
 ceiling is owner-equivalent, so the owner can answer from it; a nested agent started inside that shell
 (`docs/architecture.md:1329-1336`) then shares the shell session's rights. That is a documented limit:
-run agents in their own sessions, not inside a managed shell, when rights matter.
+run agents in their own sessions, not inside a managed shell, when rights matter. The owner-equivalent
+ceiling exists from AC-17 and AC-20 on; between AC-02 and then, the owner answers from outside every session.
 
 ### 3.5 How the answer returns
 
@@ -749,10 +754,11 @@ exposes a Pohunek session to an external agent (or calls one) is a later adapter
 ## 10. Slices in dependency order
 
 Owner answer Q10: questions ship first, permissions (Part B rights) after; VMs (#88) are future scope and
-not part of this work. The ids below are the sub-issues of epic #1982.
+not part of this work. The ids below are the sub-issues of epic #1987 (design issue #1982).
 
 **Milestones.** AC-01 ships in 0.40, AC-02 to AC-07 in 0.42, the secret and further-runtime slices in 0.43,
-and AC-15 with the rights phase (AC-17 to AC-20) in 0.44. The milestone of every slice is recorded on its issue.
+and AC-15 with the rights phase (AC-17 to AC-20) in 0.44. AC-08 lives in `pohunekd/pohunek-companion` and AC-09 in `zajca/pohunek-work`; their milestones are
+recorded on their issues. AC-16 is unscheduled until #1561 lands.
 
 **Phase 1: questions.**
 

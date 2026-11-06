@@ -177,11 +177,12 @@ the polling entirely.
   "headless run" mode.
 - Automatic commit, push, merge, pull-request creation or worktree cleanup.
 - Automatic approval of provider permission prompts on the owner's behalf. The
-  daemon never answers an attention or an ask: the owner does, or a caller
-  that section 11.3 and the answerer table of the
-  [ask channel RFC](ask-channel-rfc.md) (section 3.4) allow. Approvals and
-  secrets are answered by the owner only, and the ask channel adds no
-  daemon-side answerer.
+  daemon never answers an attention on its own. Task attentions keep the
+  answer authority of section 11.3. A routed ask, a `confirm` ask and a
+  `secret` ask of the [ask channel RFC](ask-channel-rfc.md) (section 3.4) are
+  answered by the owner only, and the ask channel adds no daemon-side
+  answerer; an expiry default is the asker's own declared choice applied by
+  the store, never an answer (ask channel RFC, section 3.1).
 - Model or profile routing, experiments and A/B assignment.
 - A hostile-workload sandbox (owned by #88).
 - Replacing `session.wait`, `session.screen` or `session.output`; they remain
@@ -918,9 +919,10 @@ only once waiting is **confirmed**:
   OpenCode `permission.asked` and `form.created`; Claude `Notification` with
   matcher `permission_prompt` or `elicitation_dialog` carrying the same
   `prompt_id`;
-- or by a routed ask held open by a live hook (see Routed asks below): the
-  hook is the waiting point, so the attention exists from the moment the ask
-  opens;
+- or by a routed ask whose hook is still live after
+  `tasks.attention_confirm_ms` (see Routed asks below): the hook is the
+  waiting point, but another hook or rule can still decide while it waits, so
+  a routed ask is a pending decision until then;
 - or, when the provider has no such signal (Codex), by a detection `blocked`
   transition after the pending decision with no tool progress within
   `tasks.attention_confirm_ms`.
@@ -973,14 +975,18 @@ the provider:
   prompt. A running task's routed ask is the source of the task attention;
   `task.answer` on such an attention answers or closes the ask only from a
   caller the answerer table of the ask channel RFC (section 3.4) allows, and
-  every other caller gets a typed refusal, including callers that section 11.3
-  or a relay grant would let answer a keystroke attention. The answer travels
+  every other caller gets a typed refusal. This includes callers that section
+  11.3 would let answer a keystroke attention and relay principals with
+  `allow_delegated_answers`, until open question 3 is decided. The answer travels
   as the hook's output, never as keystrokes. A routed ask is the
   waiting point only while its hook lives: another hook, a permission rule or
   the permission mode may still decide, and the provider's own decision wins.
   When something other than the owner's answer decided (the pending-decision
-  rules above), the ask closes as `resolved_elsewhere`, the owner's answer is
-  not applied, and the attention is marked `resolved_elsewhere` as above. When
+  rules above), the ask closes as `resolved_elsewhere` and the owner's answer
+  is not applied. If the attention was already settled it is marked
+  `resolved_elsewhere` as above; a routed ask that closes before confirmation
+  is discarded like any pending decision and does not count toward
+  `tasks.max_settlement_revisions_per_turn`. When
   the hook exits or times out before an answer, the ask closes as
   `cancelled: hook_timeout`, and the native dialog is the only answer source
   again; the keystroke rules below apply to it.
@@ -3122,6 +3128,11 @@ present, no detection-only settlement for OpenCode, and the share of
    `keepalive_*` keys of `service.toml` (§8.3).
 2. Whether investigation mode should refuse to start when a profile declares
    only `provider_rules` enforcement for an untrusted project.
+3. Who may answer a routed ask over the relay: the relay dark factory RFC
+   (sections 7.3 and 11) lets a share with `allow_delegated_answers` answer
+   provider-addressed attentions, while the ask channel RFC scopes the relay
+   out (its assumption 1). Until decided, only the owner path and a relay
+   attach answer a routed ask.
 
 Resolved elsewhere: relay-path `task.answer` authority and relay delegation
 budget scopes are defined by the relay dark factory RFC (sections 7.3 and

@@ -338,7 +338,7 @@ timeout, ambiguity or missing fact means they are not appended:
    holds there, compared by object id of the file contents (hashed without filters in
    the private repository), with the same executable bits. A symbolic link, a
    submodule, a special file, a nested `.git` entry, an untracked or ignored file, a
-   non-directory ancestor, more than 2048 files, or a tree entry that differs from a path
+   non-directory ancestor, more than 2048 files, a tree entry that differs from a path
    component only by ASCII letter case, an entry on disk that differs from a declared
    component only by letter case (Unicode case folding included, for example `.muſe` next
    to `.muse`), or a declared path that the file system opens under another spelling (case
