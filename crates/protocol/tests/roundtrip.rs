@@ -3164,6 +3164,7 @@ fn m1_observation_errors_are_stable_and_payload_free() {
 fn assistant_materialize_params_json_shape_roundtrips() {
     let params = AssistantMaterializeParams {
         snapshot: r#"{"sessions":[],"projects":[]}"#.to_owned(),
+        request_id: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -3198,6 +3199,7 @@ fn assistant_materialize_result_json_shape_roundtrips() {
                 successor: Some("launcher-v2".to_owned()),
             }),
         }],
+        prompt_contract: "## Safety\n- Be safe.\n".to_owned(),
     };
 
     let value = serde_json::to_value(&result).expect("serialize result");
@@ -3220,7 +3222,8 @@ fn assistant_materialize_result_json_shape_roundtrips() {
                     "version": "0.3.0",
                     "successor": "launcher-v2"
                 }
-            }]
+            }],
+            "prompt_contract": "## Safety\n- Be safe.\n"
         })
     );
 

@@ -10,9 +10,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use pohunek_assistant::launch::{
-    prepare_with_options, AssistantPaths, Intent, LaunchParams, PreparedLaunch,
-};
+use pohunek_assistant::launch::{prepare_with_options, Intent, LaunchParams, PreparedLaunch};
 use pohunek_assistant::{AssistantError, ConnectionOptions, HostConfig};
 use pohunek_client::protocol::{
     self, method, ErrorClass, HostCapabilities, ProtocolError, Request, Response,
@@ -57,12 +55,25 @@ fn capabilities() -> Value {
 /// The `assistant.materialize` result of a daemon whose bundle holds `concepts`
 /// under `content_hash`.
 fn materialize_result(content_hash: &str, concepts: &Value) -> Value {
+    materialize_result_with_contract(content_hash, concepts, PROMPT_CONTRACT)
+}
+
+/// A valid prompt contract: one safety rule and one navigation step.
+const PROMPT_CONTRACT: &str =
+    "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n";
+
+fn materialize_result_with_contract(
+    content_hash: &str,
+    concepts: &Value,
+    prompt_contract: &str,
+) -> Value {
     json!({
         "bundle_path": "/remote/bundle",
         "snapshot_path": "/remote/snapshot.json",
-        "version": knowledge::BUNDLE_VERSION,
+        "version": "1.0.0",
         "content_hash": content_hash,
         "concepts": concepts,
+        "prompt_contract": prompt_contract,
     })
 }
 
@@ -133,23 +144,14 @@ async fn serve_connection(stream: tokio::net::TcpStream, materialize: Value) {
 }
 
 async fn prepare_against(materialize: Value) -> Result<PreparedLaunch, AssistantError> {
-    let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind the fixture host");
     let address: SocketAddr = listener.local_addr().expect("fixture address");
     let server = tokio::spawn(serve(listener, materialize));
 
-    let root = fixture.path();
     let result = prepare_with_options(
         &HostConfig::tcp("newer-host", address),
-        &AssistantPaths {
-            runtime_dir: root.join("runtime"),
-            data_dir: root.join("data"),
-            log_dir: root.join("log"),
-            cache_dir: root.join("cache"),
-            config_dir: root.join("config"),
-        },
         LaunchParams {
             intent: Intent::Help,
             request: None,
@@ -163,7 +165,6 @@ async fn prepare_against(materialize: Value) -> Result<PreparedLaunch, Assistant
             cols: 80,
             rows: 24,
             no_snapshot: true,
-            degraded: false,
             auto_started_daemon: false,
             request_id: None,
         },
@@ -178,27 +179,40 @@ async fn prepare_against(materialize: Value) -> Result<PreparedLaunch, Assistant
 }
 
 #[tokio::test]
-async fn a_concept_type_from_a_newer_daemon_reaches_the_typed_bundle_mismatch() {
-    let result = prepare_against(materialize_result(
-        "a-content-hash-from-a-newer-bundle",
+async fn a_concept_type_from_a_newer_daemon_does_not_fail_the_launch() {
+    let prepared = prepare_against(materialize_result(
+        "sha256:fixture",
         &json!([concept(
             "a_type_from_a_newer_daemon",
             "newer",
             &json!(["help"])
         )]),
     ))
+    .await
+    .expect("the launch prepares past an unknown concept type");
+
+    assert!(prepared.prompt.contains("- newer —"), "{}", prepared.prompt);
+}
+
+#[tokio::test]
+async fn a_daemon_that_sends_no_prompt_contract_is_named_outdated() {
+    let result = prepare_against(materialize_result_with_contract(
+        "sha256:fixture",
+        &json!([]),
+        "",
+    ))
     .await;
 
     let Err(AssistantError::Protocol(error)) = result else {
-        panic!("expected the typed bundle-mismatch refusal, got {result:?}");
+        panic!("expected the typed outdated-daemon refusal, got {result:?}");
     };
-    assert_eq!(error.code, "assistant_bundle_mismatch", "{error:?}");
+    assert_eq!(error.code, "assistant_daemon_outdated", "{error:?}");
 }
 
 #[tokio::test]
 async fn a_concept_intent_from_a_newer_daemon_is_dropped_without_failing_the_launch() {
     let prepared = prepare_against(materialize_result(
-        knowledge::bundle_content_hash(),
+        "sha256:fixture",
         &json!([
             concept(
                 "guide",

@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pohunek_assistant::launch::{
-    prepare_with_options, start_prepared_with_options, AssistantPaths, Intent, LaunchParams,
-    LaunchResult, PreparedLaunch,
+    prepare_with_options, start_prepared_with_options, Intent, LaunchParams, LaunchResult,
+    PreparedLaunch,
 };
 use pohunek_assistant::{AssistantError, ConnectionOptions, HostConfig};
 use pohunek_client::protocol::method;
@@ -243,7 +243,7 @@ async fn serve<S>(
                 }
                 ok(&request, capabilities.clone())
             }
-            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result()),
+            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result(&request)),
             method::SESSION_NEW => {
                 creates
                     .lock()
@@ -314,15 +314,34 @@ fn capabilities(request_id_supported: bool) -> HostCapabilities {
     }
 }
 
-/// The `assistant.materialize` result of a remote daemon holding this build's
-/// knowledge bundle.
-fn materialize_result() -> Value {
+/// The `assistant.materialize` result of the fixture daemon.
+///
+/// Like the daemon, a request id names the snapshot file: a repeat under the id
+/// gets the same path, another id another path.
+fn materialize_result(request: &Request) -> Value {
+    static BUNDLE: std::sync::OnceLock<&'static Path> = std::sync::OnceLock::new();
+    let root = BUNDLE.get_or_init(|| {
+        // Leaked on purpose: the directory must outlive every test of the binary.
+        let root: &'static _ = Box::leak(Box::new(
+            pohunek_test_support::tempdir().expect("create the bundle root"),
+        ));
+        std::fs::write(root.path().join("index.md"), "# index\n").expect("write the index");
+        root.path()
+    });
+    let snapshot = match request.params()["request_id"].as_str() {
+        Some(id) => root.join(format!("snapshot-{id}.json")),
+        None => root.join("snapshot.json"),
+    };
+    if !snapshot.exists() {
+        std::fs::write(&snapshot, "{}").expect("write the snapshot");
+    }
     json!({
-        "bundle_path": "/remote/bundle",
-        "snapshot_path": "/remote/snapshot.json",
-        "version": knowledge::BUNDLE_VERSION,
-        "content_hash": knowledge::bundle_content_hash(),
+        "bundle_path": root,
+        "snapshot_path": snapshot,
+        "version": "1.0.0",
+        "content_hash": "sha256:fixture",
         "concepts": [],
+        "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
     })
 }
 
@@ -372,34 +391,21 @@ fn launch_params(request_id: Option<&str>) -> LaunchParams {
         cols: 80,
         rows: 24,
         no_snapshot: true,
-        degraded: true,
         auto_started_daemon: false,
         request_id: request_id.map(str::to_owned),
     }
 }
 
-/// The launch of a daemon: a remote host needs a target and a materialized
-/// bundle, a local one launches degraded.
+/// The launch of a daemon: a remote host needs a target.
 fn launch_params_for(daemon: &Daemon, request_id: Option<&str>) -> LaunchParams {
     let params = launch_params(request_id);
     if daemon.remote {
         LaunchParams {
             project: Some(REMOTE_PROJECT.to_owned()),
-            degraded: false,
             ..params
         }
     } else {
         params
-    }
-}
-
-fn assistant_paths(fixture_root: &Path) -> AssistantPaths {
-    AssistantPaths {
-        runtime_dir: fixture_root.join("runtime"),
-        data_dir: fixture_root.join("data"),
-        log_dir: fixture_root.join("log"),
-        cache_dir: fixture_root.join("cache"),
-        config_dir: fixture_root.join("config"),
     }
 }
 
@@ -420,18 +426,15 @@ async fn prepare(
     daemon: &Daemon,
     request_id: Option<&str>,
 ) -> Result<PreparedLaunch, AssistantError> {
-    let root = pohunek_test_support::tempdir().expect("create the hermetic assistant root");
-    prepare_in(daemon, root.path(), request_id).await
+    prepare_in(daemon, request_id).await
 }
 
 async fn prepare_in(
     daemon: &Daemon,
-    root: &Path,
     request_id: Option<&str>,
 ) -> Result<PreparedLaunch, AssistantError> {
     prepare_with_options(
         &daemon.host(),
-        &assistant_paths(root),
         launch_params_for(daemon, request_id),
         options(),
     )
@@ -752,15 +755,13 @@ async fn a_generated_key_is_asst_and_128_random_bits_and_differs_per_launch() {
 #[tokio::test]
 async fn a_launch_repeated_under_a_request_id_renders_the_same_opening_prompt() {
     let daemon = Daemon::start(Vec::new(), true);
-    let root = pohunek_test_support::tempdir().expect("create the hermetic assistant root");
-
-    let first = prepare_in(&daemon, root.path(), Some("resume-me"))
+    let first = prepare_in(&daemon, Some("resume-me"))
         .await
         .expect("the launch prepares");
-    let again = prepare_in(&daemon, root.path(), Some("resume-me"))
+    let again = prepare_in(&daemon, Some("resume-me"))
         .await
         .expect("the repeated launch prepares");
-    let other = prepare_in(&daemon, root.path(), Some("resume-me-not"))
+    let other = prepare_in(&daemon, Some("resume-me-not"))
         .await
         .expect("another launch prepares");
 
@@ -887,56 +888,4 @@ async fn a_local_conflict_keeps_the_daemons_own_recovery() {
         "a local rerun replays, so a conflict there gets no remote explanation"
     );
     inhibitor.release().await;
-}
-
-#[tokio::test]
-async fn a_repeated_launch_keeps_the_snapshot_the_first_one_wrote() {
-    let daemon = Daemon::start(Vec::new(), true);
-    let root = pohunek_test_support::tempdir().expect("create the hermetic assistant root");
-
-    let first = prepare_in(&daemon, root.path(), Some("keep-me"))
-        .await
-        .expect("the launch prepares");
-    let snapshot = first.knowledge.snapshot_path.clone();
-    std::fs::write(&snapshot, "the first launch's snapshot").expect("mark the snapshot");
-    prepare_in(&daemon, root.path(), Some("keep-me"))
-        .await
-        .expect("the repeated launch prepares");
-
-    assert_eq!(
-        std::fs::read_to_string(&snapshot).expect("read the snapshot"),
-        "the first launch's snapshot",
-        "a repeat under the id leaves the file a running session reads alone"
-    );
-}
-
-#[tokio::test]
-async fn the_full_local_launch_renders_the_same_prompt_under_a_request_id() {
-    let daemon = Daemon::start(Vec::new(), true);
-    let root = pohunek_test_support::tempdir().expect("create the hermetic assistant root");
-    let prepare_full = || async {
-        let mut params = launch_params(Some("resume-full"));
-        params.degraded = false;
-        prepare_with_options(
-            &daemon.host(),
-            &assistant_paths(root.path()),
-            params,
-            options(),
-        )
-        .await
-        .expect("the full launch prepares")
-    };
-
-    let first = prepare_full().await;
-    let again = prepare_full().await;
-
-    assert_eq!(first.session_params.input, again.session_params.input);
-    assert!(
-        first
-            .session_params
-            .input
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("snapshot")),
-        "the prompt names the snapshot path"
-    );
 }

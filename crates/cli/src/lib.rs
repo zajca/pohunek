@@ -289,9 +289,6 @@ struct AssistantArgs {
     /// metadata and the request.
     #[arg(long)]
     no_snapshot: bool,
-    /// Launch without a readable knowledge bundle (snapshot + source map only).
-    #[arg(long)]
-    degraded: bool,
     /// Do not auto-start the local daemon if it is down.
     #[arg(long)]
     no_start_daemon: bool,
@@ -2752,7 +2749,6 @@ fn resolve_assistant_options(
         json: args.json,
         print_prompt: args.print_prompt,
         no_snapshot: args.no_snapshot,
-        degraded: args.degraded,
         no_start_daemon: args.no_start_daemon,
     })
 }

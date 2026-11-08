@@ -24,9 +24,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pohunek_assistant::launch::{
-    prepare_with_options, AssistantPaths, Intent, LaunchParams, PreparedLaunch,
-};
+use pohunek_assistant::launch::{prepare_with_options, Intent, LaunchParams, PreparedLaunch};
 use pohunek_assistant::{connect_client, AssistantError, ConnectionOptions, HostConfig};
 use pohunek_client::protocol::method;
 use pohunek_client::protocol::{
@@ -150,11 +148,10 @@ fn assert_single_host_inspect(requests: &[Request]) {
         .iter()
         .filter(|r| r.method() != method::HOST_INSPECT)
     {
-        assert_eq!(
-            request.method(),
-            method::DAEMON_HEALTH,
-            "only daemon.health version probes may accompany the capability exchange, \
-             got: {request:?}"
+        assert!(
+            [method::DAEMON_HEALTH, method::ASSISTANT_MATERIALIZE].contains(&request.method()),
+            "only version probes and the materialization may accompany the capability \
+             exchange, got: {request:?}"
         );
     }
 }
@@ -172,74 +169,6 @@ async fn auto_agent_selects_the_pohunek_assistant_runtime_first() {
     .await;
 
     assert_eq!(exchange.selected(), "pohunek-assistant");
-}
-
-/// Set in the child process that prepares a launch under the permissive umask.
-const UMASK_CHILD_VAR: &str = "ASSISTANT_RUNTIME_UMASK_CHILD";
-
-#[test]
-fn a_degraded_preparation_creates_the_runtime_directories_owner_private() {
-    // The umask is process-wide, so a child owns it and this multithreaded test
-    // binary keeps its own; under umask 022 a plain `mkdir` is 0755.
-    let output = std::process::Command::new("/bin/sh")
-        .args(["-c", "umask 022; exec \"$0\" \"$@\""])
-        .arg(std::env::current_exe().expect("test executable"))
-        .args(pohunek_test_support::exact_test_filter(
-            module_path!(),
-            "degraded_preparation_under_a_permissive_umask_child",
-        ))
-        .args(["--nocapture", "--test-threads=1"])
-        .env(UMASK_CHILD_VAR, "1")
-        .output()
-        .expect("run the child under the permissive umask");
-    assert!(
-        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-        "child failed: {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[tokio::test]
-async fn degraded_preparation_under_a_permissive_umask_child() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    if std::env::var_os(UMASK_CHILD_VAR).is_none() {
-        return;
-    }
-    let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
-    let socket_path = fixture.path().join("assistant.sock");
-    let listener = UnixListener::bind(&socket_path).expect("bind the fixture host socket");
-    let capability_json =
-        serde_json::to_value(capabilities(caps(vec![("pohunek-assistant", true)])))
-            .expect("serialize the capability snapshot");
-    let task = spawn_responder(listener, capability_json);
-    // `runtime` stands for `XDG_RUNTIME_DIR/pohunek`, which does not exist yet.
-    let paths = assistant_paths(fixture.path());
-
-    let result = prepare_with_options(
-        &local_host(&socket_path),
-        &paths,
-        launch_params(None),
-        no_origin_options(),
-    )
-    .await;
-    pohunek_test_support::wait::guard("capability responder", task)
-        .await
-        .expect("capability responder task completed");
-
-    result.expect("the degraded preparation succeeds");
-    for directory in [
-        paths.runtime_dir.clone(),
-        paths.runtime_dir.join("assistant"),
-    ] {
-        let mode = std::fs::metadata(&directory)
-            .expect("the runtime directory exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700, "{}", directory.display());
-    }
 }
 
 #[tokio::test]
@@ -584,7 +513,6 @@ async fn prepare_selection(
 
     let result = prepare_with_options(
         &local_host(&socket_path),
-        &assistant_paths(fixture.path()),
         launch_params(requested),
         no_origin_options(),
     )
@@ -626,13 +554,19 @@ async fn reply_to(
             capability_json.clone(),
         )
         .expect("the capability snapshot response is a valid envelope"),
+        method::ASSISTANT_MATERIALIZE => Response::ok(
+            protocol::PROTOCOL_VERSION,
+            request.id(),
+            materialize_result(),
+        )
+        .expect("the materialize response is a valid envelope"),
         _ => Response::err(
             protocol::PROTOCOL_VERSION,
             request.id(),
             ProtocolError::new(
                 ErrorClass::Daemon,
                 "method_not_found",
-                "the selection fixture only serves daemon.health and host.inspect",
+                "the selection fixture only serves daemon.health, host.inspect and assistant.materialize",
                 None,
             ),
         )
@@ -653,30 +587,38 @@ async fn reply_to(
     stream.flush().await.expect("flush the response");
 }
 
+/// The `assistant.materialize` result of the fixture daemon: a bundle
+/// directory that exists for the whole test binary and a valid prompt contract.
+fn materialize_result() -> Value {
+    static BUNDLE: std::sync::OnceLock<&'static Path> = std::sync::OnceLock::new();
+    let root = BUNDLE.get_or_init(|| {
+        // Leaked on purpose: the directory must outlive every test of the binary.
+        let root: &'static _ = Box::leak(Box::new(
+            pohunek_test_support::tempdir().expect("create the bundle root"),
+        ));
+        std::fs::write(root.path().join("index.md"), "# index\n").expect("write the index");
+        std::fs::write(root.path().join("snapshot.json"), "{}").expect("write the snapshot");
+        root.path()
+    });
+    json!({
+        "bundle_path": root,
+        "snapshot_path": root.join("snapshot.json"),
+        "version": "1.0.0",
+        "content_hash": "sha256:fixture",
+        "concepts": [],
+        "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
+    })
+}
+
 /// A local host config for the fixture responder socket.
 fn local_host(socket_path: &Path) -> HostConfig {
     HostConfig::local("test-host", socket_path)
 }
 
-/// Explicit assistant paths in the hermetic fixture root.
-///
-/// Preparation takes no ambient state: every path is passed explicitly, so a
-/// launch never writes outside the fixture even when the process environment
-/// carries real user directories.
-fn assistant_paths(fixture_root: &Path) -> AssistantPaths {
-    AssistantPaths {
-        runtime_dir: fixture_root.join("runtime"),
-        data_dir: fixture_root.join("data"),
-        log_dir: fixture_root.join("log"),
-        cache_dir: fixture_root.join("cache"),
-        config_dir: fixture_root.join("config"),
-    }
-}
-
 /// Selection parameters that need no runtime binaries.
 ///
-/// `no_snapshot` and `degraded` keep preparation to the capability snapshot
-/// exchange plus local materialization, so a scenario exercises the selection
+/// `no_snapshot` keeps preparation to the capability snapshot exchange plus
+/// the materialization answer of the fixture daemon, so a scenario exercises the selection
 /// boundary without an agent runtime on the host.
 fn launch_params(requested: Option<&str>) -> LaunchParams {
     LaunchParams {
@@ -692,7 +634,6 @@ fn launch_params(requested: Option<&str>) -> LaunchParams {
         cols: 80,
         rows: 24,
         no_snapshot: true,
-        degraded: true,
         auto_started_daemon: false,
         request_id: None,
     }
