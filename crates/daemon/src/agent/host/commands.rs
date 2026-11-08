@@ -44,9 +44,17 @@ pub struct PackageDescriptor {
     identity: PackageIdentity,
     runtime: Option<RuntimeDefinition>,
     commands: Vec<CommandInfo>,
+    context_dir: Option<String>,
 }
 
 impl PackageDescriptor {
+    /// The package-relative directory of the files a context package exports;
+    /// `None` for a package that exports a runtime or commands.
+    #[must_use]
+    pub fn context_dir(&self) -> Option<&str> {
+        self.context_dir.as_deref()
+    }
+
     /// The package id and version the descriptor declares.
     #[must_use]
     pub fn identity(&self) -> &PackageIdentity {
@@ -89,6 +97,7 @@ impl PackageDescriptor {
             identity,
             runtime: Some(runtime),
             commands,
+            context_dir: None,
         }
     }
 }
@@ -100,6 +109,8 @@ pub(super) enum Exports {
     Runtime,
     /// Commands only.
     CommandsOnly,
+    /// A directory of files and nothing else.
+    Context,
 }
 
 /// The keys of a command-only descriptor.
@@ -120,6 +131,28 @@ struct RawCommandsDocument {
     /// Validated from the untyped document, next to the manifest.
     #[serde(rename = "commands")]
     _commands: Value,
+}
+
+/// The keys of a context descriptor: the identity, the feature list and the
+/// `[context]` table.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContextDocument {
+    schema: u32,
+    id: String,
+    version: String,
+    runtime_api: u32,
+    /// Checked on the untyped document before this struct is parsed.
+    #[serde(default, rename = "requires")]
+    _requires: Vec<String>,
+    context: RawContext,
+}
+
+/// The `[context]` table.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContext {
+    dir: String,
 }
 
 /// One `[commands.<name>]` table.
@@ -174,6 +207,16 @@ pub(super) fn classify(
         .count();
     if declared == RUNTIME_GROUP.len() {
         return Ok(Exports::Runtime);
+    }
+    if descriptor.contains_key("context") {
+        return if declared == 0 && !descriptor.contains_key("commands") {
+            Ok(Exports::Context)
+        } else {
+            Err(DefinitionError::Field {
+                field: "context",
+                reason: "cannot be combined with a runtime or commands",
+            })
+        };
     }
     if declared != 0 {
         return Err(DefinitionError::Field {
@@ -237,6 +280,74 @@ pub(super) fn parse_commands_only(
         identity,
         runtime: None,
         commands,
+        context_dir: None,
+    })
+}
+
+/// Parses a context descriptor into its identity and file directory.
+///
+/// `lists_under` answers whether the package manifest lists a file below a
+/// directory, so a `dir` that holds nothing is refused at install.
+///
+/// # Errors
+///
+/// [`DefinitionError::Malformed`] when the document does not match the context
+/// schema, the schema and runtime API errors of a runtime descriptor, the gate
+/// errors of [`check_gates`], and [`DefinitionError::Field`] for a `dir` that
+/// is not a normalized package-relative directory holding at least one file.
+pub(super) fn parse_context_only(
+    source: &str,
+    descriptor: &Table,
+    features: &FeatureTables<'_>,
+    lists_under: impl Fn(&str) -> bool,
+) -> Result<PackageDescriptor, DefinitionError> {
+    let raw: RawContextDocument =
+        toml::from_str(source).map_err(|error| malformed_at(source, &error))?;
+    if raw.schema != SUPPORTED_SCHEMA {
+        return Err(DefinitionError::UnsupportedSchema { found: raw.schema });
+    }
+    if raw.runtime_api != SUPPORTED_RUNTIME_API {
+        return Err(DefinitionError::UnsupportedRuntimeApi {
+            found: raw.runtime_api,
+        });
+    }
+    check_gates(descriptor, features)?;
+    let identity = PackageIdentity {
+        id: PackageId::parse(&raw.id).map_err(|source| DefinitionError::Identifier {
+            field: "id",
+            source,
+        })?,
+        version: PackageVersion::parse(&raw.version).map_err(|source| {
+            DefinitionError::Binding {
+                field: "version",
+                source,
+            }
+        })?,
+    };
+    let field = |reason| DefinitionError::Field {
+        field: "context.dir",
+        reason,
+    };
+    let dir = raw.context.dir;
+    if dir.is_empty() || dir.len() > MAX_ARG_BYTES {
+        return Err(field("must be non-empty and within the length limit"));
+    }
+    let normalized = !dir.starts_with('/')
+        && !dir.ends_with('/')
+        && dir
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    if !normalized || dir.chars().any(char::is_control) {
+        return Err(field("must be a normalized package-relative directory"));
+    }
+    if !lists_under(&dir) {
+        return Err(field("must name a directory that holds a package file"));
+    }
+    Ok(PackageDescriptor {
+        identity,
+        runtime: None,
+        commands: Vec::new(),
+        context_dir: Some(dir),
     })
 }
 

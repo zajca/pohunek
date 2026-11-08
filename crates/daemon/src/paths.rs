@@ -81,12 +81,6 @@ impl Paths {
         })
     }
 
-    /// Directory where assistant knowledge bundles are cached.
-    #[must_use]
-    pub fn assistant_bundle_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join(pohunek_paths::KNOWLEDGE_CACHE_SUBDIR)
-    }
-
     /// Runtime directory for assistant material generated for one session or launch.
     #[must_use]
     pub fn assistant_runtime_dir(&self, session_or_launch_id: &str) -> Option<PathBuf> {

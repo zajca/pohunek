@@ -4,11 +4,17 @@
 //! per item, into the opening prompt. Bundle validation and the launch parse
 //! them with the same rules.
 
+use std::fs;
+use std::path::Path;
+
 use thiserror::Error;
 
 /// Bundle-relative path of the file that defines the prompt's safety rules and
 /// navigation steps.
 pub const PROMPT_CONTRACT_PATH: &str = "assistant/system.md";
+
+/// Largest prompt contract file read from a bundle.
+const MAX_CONTRACT_BYTES: u64 = 256 * 1024;
 
 const SAFETY_HEADING: &str = "Safety";
 const NAVIGATION_HEADING: &str = "Navigation";
@@ -145,4 +151,27 @@ fn list_item(line: &str) -> Option<&str> {
         return None;
     }
     line[digits..].strip_prefix(". ")
+}
+
+/// Reads and validates the prompt contract of the bundle directory `root`.
+///
+/// # Errors
+///
+/// Returns a [`PromptContractError`] when the file is missing, larger than the
+/// bound, not UTF-8, or not of the required shape.
+pub fn read_prompt_contract(root: &Path) -> Result<String, PromptContractError> {
+    let path = root.join(PROMPT_CONTRACT_PATH);
+    let whole = |reason: String| PromptContractError { line: None, reason };
+    let length = fs::metadata(&path)
+        .map_err(|error| whole(format!("`{PROMPT_CONTRACT_PATH}` cannot be read: {error}")))?
+        .len();
+    if length > MAX_CONTRACT_BYTES {
+        return Err(whole(format!("`{PROMPT_CONTRACT_PATH}` is too large")));
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| whole(format!("`{PROMPT_CONTRACT_PATH}` cannot be read: {error}")))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| whole(format!("`{PROMPT_CONTRACT_PATH}` is not valid UTF-8")))?;
+    PromptContract::parse(&text)?;
+    Ok(text)
 }

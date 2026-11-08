@@ -11,7 +11,6 @@ name = "knowledge"
 path = "src/lib.rs"
 
 [dependencies]
-include_dir = { workspace = true }
 pohunek-platform = { workspace = true }
 pohunek-protocol = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -22,9 +21,6 @@ thiserror = { workspace = true }
 [features]
 protocol = ["dep:pohunek-protocol"]
 test-util = []
-
-[build-dependencies]
-sha2 = { workspace = true }
 
 [dev-dependencies]
 pohunek-test-support = { workspace = true }

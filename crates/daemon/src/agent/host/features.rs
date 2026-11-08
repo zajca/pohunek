@@ -134,6 +134,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "program-status-gate-v1",
         since: "0.41.0",
     },
+    RuntimeFeature {
+        id: "package-context-v1",
+        since: "0.41.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -188,6 +192,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "package-commands-v1",
         rule: GateRule::Key("commands"),
+    },
+    FeatureGate {
+        feature: "package-context-v1",
+        rule: GateRule::Key("context"),
     },
     FeatureGate {
         feature: "input-refuse-while-blocked-v1",

@@ -117,6 +117,7 @@ The features this core implements:
 | `checkout-trust-args-v1` | 0.40.0 | `[runtime] trusted_checkout_args`, `trusted_checkout_paths` |
 | `integration-cline-hook-v1` | 0.40.0 | `integration.handler = "cline-hook-v1"` |
 | `program-status-gate-v1` | 0.41.0 | detection manifest `[program_status] authority_from` and rule `below_authority` (no descriptor key; the package lists it so an older core refuses it) |
+| `package-context-v1` | 0.41.0 | `[context]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a

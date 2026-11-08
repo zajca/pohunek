@@ -844,6 +844,37 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/assistant_package_missing` error.
+    ///
+    /// Raised by `assistant.materialize` when the assistant context package is
+    /// not installed, not selected or disabled on the daemon host. Code is
+    /// stable: `assistant_package_missing`.
+    #[must_use]
+    pub fn assistant_package_missing(package_id: &str, detail: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "assistant_package_missing",
+            format!("the assistant context package `{package_id}` cannot be used: {detail}"),
+            Some(format!(
+                "install the assistant package on that host with `pohunek plugin install <archive> --sha256 <digest>` (id `{package_id}`; see the plugin-assistant release), then retry"
+            )),
+        )
+    }
+
+    /// The canonical `runtime/assistant_daemon_outdated` error for a daemon that
+    /// answers `assistant.materialize` without the prompt contract.
+    ///
+    /// Code is stable: `assistant_daemon_outdated`.
+    #[must_use]
+    pub fn assistant_daemon_outdated() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "assistant_daemon_outdated",
+            "the daemon answered assistant.materialize without the prompt contract",
+            Some("upgrade the pohunek daemon on that host so it serves the assistant from its context package".to_owned()),
+        )
+    }
+
     /// The canonical `runtime/materialization_failed` error for assistant
     /// bundle extraction or snapshot persistence failures.
     ///

@@ -58,8 +58,8 @@ pub use launch_env::{
 pub use naming::{NamingLaunchArgs, MAX_NAMING_TOKENS, SESSION_NAME_PLACEHOLDER};
 pub(crate) use package::may_serve_reserved;
 pub use package::{
-    definition_from_archive, descriptor_from_archive, PackageLoad, PackageRejection, PackageSource,
-    PackageStore, RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
+    definition_from_archive, descriptor_from_archive, ContextDir, ContextError, PackageLoad,
+    PackageRejection, PackageSource, PackageStore, RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
 };
 pub use placement::{Placement, MAX_KEEP_LOCAL_TOKENS};
 pub use registry::{

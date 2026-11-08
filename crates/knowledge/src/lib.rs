@@ -5,7 +5,6 @@
 pub mod assistant;
 mod index;
 pub mod log;
-mod materializer;
 mod prompt_contract;
 #[cfg(feature = "protocol")]
 mod protocol_conversions;
@@ -14,19 +13,14 @@ mod validation;
 
 #[doc(inline)]
 pub use assistant::{
-    assistant_keyed_launch_id, assistant_launch_id, bundle_content_hash, embedded_bundle,
-    materialized_version_hash, sha256_for_bytes, EmbeddedBundle, BUNDLE_VERSION,
+    assistant_keyed_launch_id, assistant_launch_id, sha256_for_bytes, BUNDLE_VERSION,
 };
 #[doc(inline)]
 pub use index::{bundle_index, BundleIndexError, ConceptMeta};
 #[doc(inline)]
-pub use materializer::{gc, materialize};
-#[cfg(feature = "test-util")]
-#[doc(hidden)]
-#[doc(inline)]
-pub use materializer::{materialize_with_observer, Event};
-#[doc(inline)]
-pub use prompt_contract::{PromptContract, PromptContractError, PROMPT_CONTRACT_PATH};
+pub use prompt_contract::{
+    read_prompt_contract, PromptContract, PromptContractError, PROMPT_CONTRACT_PATH,
+};
 #[doc(inline)]
 pub use schema::{
     Citation, Concept, ConceptType, Deprecation, Intent, SourceKind, CONCEPT_SCHEMA_VERSION,
