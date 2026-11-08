@@ -81,13 +81,6 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    `worker_instance_id`, then use the
    [session runtime runbook](debug-session-runtime.md) for `reconnecting`,
    `lost`, `conflict`, or `incompatible`.
-9. If `pohunek session new` or `session fork` fails with
-   `migration_manifest_missing`, the daemon found legacy resume bindings that
-   no migration manifest imported and refuses to write a first session record
-   that would make them unimportable. Follow the migration section of the
-   [session runtime runbook](debug-session-runtime.md): run
-   `pohunek migration preflight` through the worker-aware installer against
-   the legacy daemon, and the next daemon start imports the manifest.
 
 For durable notification issues:
 

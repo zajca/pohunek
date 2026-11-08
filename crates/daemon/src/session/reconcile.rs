@@ -19,7 +19,6 @@ use protocol::{
     UnconfirmedProcess,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::claim::{same_claim, ClaimKey, ClaimOrigin, PendingRelease};
 use super::conflict_stop::is_conflict_proven_removal;
@@ -50,7 +49,7 @@ use crate::runtime::lifecycle::{
     journal_schema_supported, observation_live, require_supported_journal_schema, Lifecycle,
     UnsupportedJournalSchema, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
 };
-use crate::store::{ActiveAgentOrigin, ResumeBinding, SessionWriteOutcome};
+use crate::store::{ActiveAgentOrigin, ResumeBinding};
 
 // Rust guideline compliant 2026-10-12
 
@@ -96,10 +95,6 @@ pub(super) fn recovery_not_advanced(record: &SessionRecord, worker_id: &str) -> 
 
 /// Maximum worker journal accepted during daemon reconciliation.
 const MAX_WORKER_JOURNAL_BYTES: usize = 1024 * 1024;
-
-/// Inventory reason of a legacy resume binding that startup found with no
-/// logical record and no migration manifest to import it from.
-pub(crate) const MIGRATION_MANIFEST_MISSING: &str = "migration_manifest_missing";
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -1048,15 +1043,8 @@ impl SessionRegistry {
         let Some(store) = self.inner.store.clone() else {
             return Ok(());
         };
-        let (manifest, records, resume_bindings, rejected) = load_durable_state(store).await?;
-        let unmigrated = if manifest == LegacyManifest::Missing && records.is_empty() {
-            unmigrated_legacy_bindings(&resume_bindings)
-        } else {
-            Vec::new()
-        };
-        self.inner
-            .legacy_migration_pending
-            .store(!unmigrated.is_empty(), std::sync::atomic::Ordering::Release);
+        let (records, resume_bindings, rejected) = load_durable_state(Arc::clone(&store)).await?;
+        warn_unimported_legacy_state(&store, &records, &resume_bindings);
         let mut resume_bindings = resume_bindings
             .into_iter()
             .map(|binding| (binding.session_id.clone(), binding))
@@ -1068,7 +1056,6 @@ impl SessionRegistry {
             Err(detail) => (WorkerDiscovery::default(), Some(detail)),
         };
         let mut inventory = std::mem::take(&mut discovered.inventory);
-        inventory.extend(unmigrated);
         let mut journals =
             scan_all_worker_journals(self.inner.config.worker_state_root.clone()).await;
         let stale_journal = |key: &WorkerKey| match &journals {
@@ -6547,23 +6534,6 @@ fn validate_native_reference(kind: SessionRefKind, value: &str) -> Option<String
     Some(reference.value().to_owned())
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyMigrationManifest {
-    schema_version: u32,
-    created_at: String,
-    store_sha256: String,
-    accept_runtime_loss: bool,
-    sessions: Vec<protocol::SessionInfo>,
-    live_session_ids: Vec<String>,
-}
-
-/// Imports a pending migration manifest, then loads every logical record and
-/// resume binding.
-///
-/// # Errors
-///
-/// Returns the typed migration error of [`import_legacy_manifest`], or
-/// `session_reconcile_failed` when the store cannot be loaded.
 /// Why startup worker discovery could not see every runtime.
 #[derive(Clone, Copy)]
 struct DiscoveryFailures<'a> {
@@ -6626,28 +6596,48 @@ fn session_owners(
     TmpdirOwners::Known(owners)
 }
 
-/// What startup reads from the store: the legacy manifest outcome, the
-/// logical sessions, the resume bindings, and the lines no loader accepted.
+/// What startup reads from the store: the logical sessions, the resume
+/// bindings, and the lines no loader accepted.
 type DurableState = (
-    LegacyManifest,
     Vec<SessionRecord>,
     Vec<ResumeBinding>,
     Vec<crate::store::RejectedLine>,
 );
 
+/// Reports resume bindings that have no logical record, and a pending legacy
+/// migration manifest, which no release imports any more.
+///
+/// Such a store was written by the pre-service daemon and never migrated: its
+/// sessions stay invisible. They stay on disk untouched.
+fn warn_unimported_legacy_state(
+    store: &crate::store::Store,
+    records: &[SessionRecord],
+    resume_bindings: &[ResumeBinding],
+) {
+    if records.is_empty() && !resume_bindings.is_empty() {
+        tracing::warn!(
+            name: "reconcile.legacy_bindings.not_imported",
+            legacy_bindings = resume_bindings.len(),
+            "resume bindings exist without logical records and are not imported; they were written by the pre-service daemon, and release v0.40.1 is the last one that migrates them"
+        );
+    }
+    let pending_manifest = store.path().parent().map(|data_dir| {
+        data_dir
+            .join(pohunek_paths::MIGRATIONS_SUBDIR)
+            .join(pohunek_paths::LEGACY_MANIFEST_NAME)
+    });
+    if pending_manifest.is_some_and(|path| path.exists()) {
+        tracing::warn!(
+            name: "reconcile.legacy_manifest.not_imported",
+            "a pending legacy migration manifest exists and is not imported; release v0.40.1 is the last one that imports it"
+        );
+    }
+}
+
 async fn load_durable_state(
     store: Arc<crate::store::Store>,
 ) -> Result<DurableState, ProtocolError> {
-    let import_store = Arc::clone(&store);
-    let manifest = tokio::task::spawn_blocking(move || import_legacy_manifest(&import_store))
-        .await
-        .map_err(|_join_error| {
-            runtime_error(
-                "migration_import_failed",
-                "legacy migration import task panicked",
-            )
-        })??;
-    let (records, resume_bindings, rejected) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         Ok::<_, std::io::Error>((
             store.load_sessions()?,
             store.load_resume()?,
@@ -6665,294 +6655,6 @@ async fn load_durable_state(
         runtime_error(
             "session_reconcile_failed",
             format!("failed to load logical sessions: {error}"),
-        )
-    })?;
-    Ok((manifest, records, resume_bindings, rejected))
-}
-
-/// What startup found at the one-time migration manifest path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LegacyManifest {
-    /// No manifest exists; nothing was imported.
-    Missing,
-    /// A manifest was imported, or archived over an already-migrated store.
-    Processed,
-}
-
-/// Surfaces legacy resume bindings that no migration manifest imported.
-///
-/// Called only when startup found no manifest and no logical record: the
-/// bindings were then written by a legacy daemon whose sessions were never
-/// snapshotted by `pohunek migration preflight`, so nothing can import them
-/// (a binding alone proves neither consent to runtime loss nor the session's
-/// state). They stay on disk untouched, for a later manifest to import, and
-/// each is listed as an orphaned inventory entry with reason
-/// [`MIGRATION_MANIFEST_MISSING`] so the operator sees what is missing. While
-/// any is listed, creating a session fails with the same code
-/// ([`SessionRegistry::ensure_migration_settled`]).
-fn unmigrated_legacy_bindings(bindings: &[ResumeBinding]) -> Vec<RuntimeInventoryEntry> {
-    if bindings.is_empty() {
-        return Vec::new();
-    }
-    tracing::error!(
-        name: "reconcile.migration.manifest_missing",
-        legacy_bindings = bindings.len(),
-        "legacy resume bindings exist without logical records or a migration manifest; session creation is refused until `pohunek migration preflight` runs against the legacy daemon and a restart imports its manifest"
-    );
-    let mut entries = bindings
-        .iter()
-        .map(|binding| RuntimeInventoryEntry {
-            runtime_slot: binding.session_id.clone(),
-            claimed_session_id: Some(binding.session_id.clone()),
-            worker_id: None,
-            worker_instance_id: None,
-            status: RuntimeInventoryStatus::Orphaned,
-            reason: Some(MIGRATION_MANIFEST_MISSING.to_owned()),
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.runtime_slot.cmp(&right.runtime_slot));
-    entries.dedup_by(|left, right| left.runtime_slot == right.runtime_slot);
-    entries
-}
-
-/// Imports the one-time migration manifest `pohunek migration preflight`
-/// wrote against the legacy daemon, then archives it.
-///
-/// # Errors
-///
-/// Returns a typed migration error (`migration_import_failed`,
-/// `migration_store_changed`, `migration_runtime_loss_not_accepted`,
-/// `migration_manifest_mismatch`, `migration_import_stale`) when the manifest
-/// cannot be read, validated, or committed; the store is then left untouched.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one-time migration validation and import remain atomic and auditable together"
-)]
-fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest, ProtocolError> {
-    let Some(data_dir) = store.path().parent() else {
-        return Err(runtime_error(
-            "migration_import_failed",
-            "metadata store has no parent directory",
-        ));
-    };
-    let path = data_dir
-        .join(pohunek_paths::MIGRATIONS_SUBDIR)
-        .join(pohunek_paths::LEGACY_MANIFEST_NAME);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LegacyManifest::Missing)
-        }
-        Err(error) => {
-            return Err(runtime_error(
-                "migration_import_failed",
-                format!("failed to read migration manifest: {error}"),
-            ))
-        }
-    };
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err(runtime_error(
-            "migration_import_failed",
-            "migration manifest exceeds the 16 MiB safety bound",
-        ));
-    }
-    let manifest: LegacyMigrationManifest = serde_json::from_slice(&bytes).map_err(|error| {
-        runtime_error(
-            "migration_import_failed",
-            format!("migration manifest is invalid: {error}"),
-        )
-    })?;
-    if manifest.schema_version != 1 {
-        return Err(runtime_error(
-            "migration_import_failed",
-            format!(
-                "unsupported migration manifest schema {}",
-                manifest.schema_version
-            ),
-        ));
-    }
-    let existing = store.load_sessions().map_err(|error| {
-        runtime_error(
-            "migration_import_failed",
-            format!("failed to inspect logical records before migration: {error}"),
-        )
-    })?;
-    if !existing.is_empty() {
-        archive_imported_manifest(&path, &manifest)?;
-        return Ok(LegacyManifest::Processed);
-    }
-    let store_bytes = match std::fs::read(store.path()) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(runtime_error(
-                "migration_import_failed",
-                format!("failed to fingerprint metadata store: {error}"),
-            ))
-        }
-    };
-    let actual_fingerprint = format!("{:x}", Sha256::digest(store_bytes));
-    // The preflight fingerprints the store as the legacy daemon left it, which
-    // the startup schema migration has already rewritten; the pre-migration
-    // backup proves the current bytes derive from exactly those bytes.
-    if actual_fingerprint != manifest.store_sha256
-        && !store
-            .is_schema_migration_of(&manifest.store_sha256)
-            .map_err(|error| {
-                runtime_error(
-                    "migration_import_failed",
-                    format!("failed to verify the metadata store against its backup: {error}"),
-                )
-            })?
-    {
-        return Err(runtime_error(
-            "migration_store_changed",
-            "metadata store changed after migration preflight; rerun preflight",
-        ));
-    }
-    if !manifest.live_session_ids.is_empty() && !manifest.accept_runtime_loss {
-        return Err(runtime_error(
-            "migration_runtime_loss_not_accepted",
-            format!(
-                "migration would lose live runtimes: {}",
-                manifest.live_session_ids.join(", ")
-            ),
-        ));
-    }
-    let expected_live: std::collections::BTreeSet<&str> = manifest
-        .live_session_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let actual_live: std::collections::BTreeSet<&str> = manifest
-        .sessions
-        .iter()
-        .filter(|session| {
-            matches!(
-                session.state,
-                protocol::SessionState::Starting | protocol::SessionState::Running
-            )
-        })
-        .map(|session| session.id.0.as_str())
-        .collect();
-    if manifest.sessions.iter().any(|session| {
-        session.agent_base.launchable().is_err()
-            || session
-                .active_agent_base
-                .as_ref()
-                .is_some_and(|active| active.launchable().is_err())
-    }) {
-        return Err(runtime_error(
-            "migration_import_failed",
-            "migration manifest contains an unsupported agent kind",
-        ));
-    }
-    if expected_live != actual_live {
-        return Err(runtime_error(
-            "migration_manifest_mismatch",
-            "migration live-session classification does not match its snapshot",
-        ));
-    }
-    let resume = store.load_resume().map_err(|error| {
-        runtime_error(
-            "migration_import_failed",
-            format!("failed to load legacy recovery records: {error}"),
-        )
-    })?;
-    for mut info in manifest.sessions.clone() {
-        let live = actual_live.contains(info.id.0.as_str());
-        let runtime_state = if live {
-            RuntimeState::Lost
-        } else {
-            RuntimeState::Terminal
-        };
-        info.runtime = Some(protocol::SessionRuntime {
-            state: runtime_state,
-            runtime_generation: protocol::RuntimeGeneration::new(1),
-            worker_id: None,
-            worker_instance_id: None,
-            started_at: None,
-            last_connected_at: None,
-            loss_reason: live.then(|| "legacy_runtime_not_transferable".to_owned()),
-            exit: None,
-            loss_cause: None,
-        });
-        let recovery = resume
-            .iter()
-            .find(|binding| binding.session_id == info.id.0)
-            .cloned();
-        let session_id = info.id.0.clone();
-        let outcome = store
-            .record_session(&SessionRecord {
-                schema_version: 1,
-                session_id: info.id.0.clone(),
-                desired_state: if live {
-                    DesiredState::Running
-                } else {
-                    DesiredState::Stopped
-                },
-                transaction: None,
-                info,
-                recovery,
-                active_agent_origin: None,
-                create_request: None,
-                native_identity_ordering: None,
-                runtime: crate::store::RuntimeRecord {
-                    state: runtime_state,
-                    worker_id: None,
-                    worker_instance_id: None,
-                    service_id: None,
-                    generation: None,
-                    executable: None,
-                    reason: live.then(|| "legacy_runtime_not_transferable".to_owned()),
-                },
-            })
-            .map_err(|error| {
-                runtime_error(
-                    "migration_import_failed",
-                    format!("failed to import logical session: {error}"),
-                )
-            })?;
-        match outcome {
-            SessionWriteOutcome::Applied => {}
-            SessionWriteOutcome::AppliedDurabilityUncertain { error } => {
-                tracing::warn!(
-                    session_id,
-                    durability_error = %error,
-                    "legacy session import is visible but directory durability is uncertain"
-                );
-            }
-            SessionWriteOutcome::StaleRuntime => {
-                return Err(runtime_error(
-                    "migration_import_stale",
-                    "legacy session import lost a concurrent runtime commit",
-                ));
-            }
-            SessionWriteOutcome::StaleSnapshot => {
-                return Err(runtime_error(
-                    "migration_import_stale",
-                    "legacy session import lost a concurrent record commit",
-                ));
-            }
-        }
-    }
-    archive_imported_manifest(&path, &manifest)?;
-    Ok(LegacyManifest::Processed)
-}
-
-fn archive_imported_manifest(
-    path: &std::path::Path,
-    manifest: &LegacyMigrationManifest,
-) -> Result<(), ProtocolError> {
-    let created_digest = Sha256::digest(manifest.created_at.as_bytes()).into();
-    let archive = path.with_file_name(pohunek_paths::legacy_manifest_archive_name(
-        &manifest.store_sha256,
-        &created_digest,
-    ));
-    std::fs::rename(path, archive).map_err(|error| {
-        runtime_error(
-            "migration_import_failed",
-            format!("failed to archive imported migration manifest: {error}"),
         )
     })
 }
@@ -7550,7 +7252,6 @@ mod tests {
         SessionInfo, SessionNewParams, SessionReportNativeIdParams, SessionRuntime, SessionState,
         StateSource,
     };
-    use sha2::{Digest, Sha256};
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -7558,9 +7259,9 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::{
-        apply_worker_identities_with, import_legacy_manifest, import_worker_identities,
-        import_worker_subagents, map_worker_subagents, merge_persisted_recovery,
-        validate_worker_identity_process_facts, SessionRegistry,
+        apply_worker_identities_with, import_worker_identities, import_worker_subagents,
+        map_worker_subagents, merge_persisted_recovery, validate_worker_identity_process_facts,
+        SessionRegistry,
     };
     use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
     use crate::catalog_anchor::CatalogTrust;
@@ -12846,532 +12547,6 @@ handler = "codex-hook-v1"
         }
     }
 
-    /// A minimal legacy-manifest session snapshot, as `pohunek migration
-    /// preflight` would have captured it: no runtime yet (the daemon fills
-    /// that in on import) and just enough fields for `import_legacy_manifest`
-    /// to classify and persist it.
-    fn manifest_session_info(id: &str, state: SessionState) -> SessionInfo {
-        let created_at = "2026-07-01T00:00:00Z".to_owned();
-        SessionInfo {
-            spawned_by: None,
-            id: SessionId(id.to_owned()),
-            external: Some(false),
-            name: None,
-            agent: "shell".to_owned(),
-            agent_base: RuntimeRef::shell(),
-            cwd: PathBuf::from("/repo"),
-            cwd_source: Some(CwdSource::Launch),
-            pid: 0,
-            runtime: None,
-            cols: 80,
-            rows: 24,
-            state,
-            state_source: StateSource::Process,
-            activity: None,
-            subagents: Vec::new(),
-            background: None,
-            active_agent: None,
-            active_agent_base: None,
-            active_agent_pid: None,
-            active_agent_session_id: None,
-            active_agent_session_path: None,
-            native_session_id: None,
-            native_session_path: None,
-            native_last_activity_at: None,
-            project_id: None,
-            project_label: None,
-            is_linked_worktree: None,
-            repo: None,
-            branch: None,
-            worktree_path: None,
-            warnings: Vec::new(),
-            capability_refusals: None,
-            placement: None,
-            output_force_closed: false,
-            metadata: BTreeMap::new(),
-            created_at: created_at.clone(),
-            updated_at: created_at,
-            exit_code: None,
-            capabilities: protocol::SessionCapabilities::default(),
-        }
-    }
-
-    /// The sha256 fingerprint `import_legacy_manifest` expects a manifest's
-    /// `store_sha256` to match: the hex digest of the store file's current
-    /// bytes, or of an empty byte string when the store has not been written
-    /// yet. Mirrors the production fingerprinting in `import_legacy_manifest`
-    /// so tests can produce a manifest that passes the freshness check.
-    fn store_fingerprint(store_path: &std::path::Path) -> String {
-        let bytes = std::fs::read(store_path).unwrap_or_default();
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    /// Builds a `durable-session-workers.json` manifest body matching the
-    /// shape `pohunek migration preflight` writes (see
-    /// `crates/cli/src/commands/migration.rs`).
-    fn legacy_manifest_json(
-        store_sha256: &str,
-        accept_runtime_loss: bool,
-        sessions: &[SessionInfo],
-        live_session_ids: &[&str],
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "schema_version": 1,
-            "created_at": "2026-07-01T00:00:00Z",
-            "store_sha256": store_sha256,
-            "accept_runtime_loss": accept_runtime_loss,
-            "sessions": sessions,
-            "live_session_ids": live_session_ids,
-        })
-    }
-
-    /// Writes `manifest` to `<data_dir>/migrations/durable-session-workers.json`,
-    /// the fixed path `import_legacy_manifest` reads at startup.
-    fn write_legacy_manifest(data_dir: &std::path::Path, manifest: &serde_json::Value) -> PathBuf {
-        let migrations_dir = data_dir.join("migrations");
-        std::fs::create_dir_all(&migrations_dir).expect("create migrations dir");
-        let path = migrations_dir.join("durable-session-workers.json");
-        let bytes = serde_json::to_vec_pretty(manifest).expect("serialize legacy manifest");
-        std::fs::write(&path, bytes).expect("write legacy manifest");
-        path
-    }
-
-    #[test]
-    fn import_legacy_manifest_mixed_recoverable_and_unrecoverable() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        // A legacy resume binding for the recoverable terminal session. This
-        // alone does not count as an "existing logical record" (only
-        // `SessionRecord`s do, per `import_legacy_manifest`'s idempotency
-        // check), so import still proceeds; it is attached to the imported
-        // record by matching `session_id`.
-        let recoverable_binding = ResumeBinding {
-            spawned_by: None,
-            session_id: "s-recoverable".to_owned(),
-            name: Some("recoverable".to_owned()),
-            agent: "codex".to_owned(),
-            agent_base: RuntimeRef::codex(),
-            cwd: PathBuf::from("/repo"),
-            cols: 80,
-            rows: 24,
-            native_session_id: None,
-            native_session_path: None,
-            project_id: None,
-            is_linked_worktree: None,
-            metadata: BTreeMap::new(),
-            program: "codex".to_owned(),
-            args: Vec::new(),
-            input_rules: StoredInputRules::default(),
-            native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
-            launch_binding: crate::agent::host::LaunchPin::Unpinned,
-            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
-            profile_revision: None,
-            native_launch_unresolved: false,
-            launch_checkout: None,
-        };
-        store
-            .record_resume(&recoverable_binding)
-            .expect("persist legacy resume binding");
-
-        // Fingerprint the store as it stands right now (resume binding
-        // written, no session records yet), matching what a real preflight
-        // run would have captured.
-        let store_sha256 = store_fingerprint(&store_path);
-        let sessions = vec![
-            manifest_session_info("s-recoverable", SessionState::Done),
-            manifest_session_info("s-unrecoverable", SessionState::Done),
-            manifest_session_info("s-live", SessionState::Running),
-        ];
-        let manifest = legacy_manifest_json(&store_sha256, true, &sessions, &["s-live"]);
-        let manifest_path = write_legacy_manifest(&data_dir, &manifest);
-
-        import_legacy_manifest(&store).expect("import legacy manifest");
-
-        let records = store.load_sessions().expect("load imported sessions");
-        assert_eq!(records.len(), 3);
-        let live = records
-            .iter()
-            .find(|record| record.session_id == "s-live")
-            .expect("live session imported");
-        let recoverable = records
-            .iter()
-            .find(|record| record.session_id == "s-recoverable")
-            .expect("recoverable session imported");
-        let unrecoverable = records
-            .iter()
-            .find(|record| record.session_id == "s-unrecoverable")
-            .expect("unrecoverable session imported");
-
-        assert_eq!(live.desired_state, DesiredState::Running);
-        assert_eq!(live.runtime.state, RuntimeState::Lost);
-        assert_eq!(
-            live.runtime.reason.as_deref(),
-            Some("legacy_runtime_not_transferable")
-        );
-        assert_eq!(
-            live.info
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.loss_reason.as_deref()),
-            Some("legacy_runtime_not_transferable")
-        );
-        assert_eq!(live.recovery, None, "no resume binding matched s-live");
-
-        assert_eq!(recoverable.desired_state, DesiredState::Stopped);
-        assert_eq!(recoverable.runtime.state, RuntimeState::Terminal);
-        assert_eq!(recoverable.runtime.reason, None);
-        assert_eq!(
-            recoverable
-                .recovery
-                .as_ref()
-                .map(|binding| binding.session_id.clone()),
-            Some("s-recoverable".to_owned()),
-            "matching legacy resume binding must be attached as recovery"
-        );
-
-        assert_eq!(unrecoverable.desired_state, DesiredState::Stopped);
-        assert_eq!(unrecoverable.runtime.state, RuntimeState::Terminal);
-        assert_eq!(
-            unrecoverable.recovery, None,
-            "unrecoverable session has no resume binding to attach"
-        );
-
-        assert!(
-            !manifest_path.exists(),
-            "imported manifest must be archived, not left pending"
-        );
-    }
-
-    #[test]
-    fn import_archives_manifest_after_uncertain_post_rename_commit() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-        let fingerprint = store_fingerprint(&store_path);
-        let sessions = vec![manifest_session_info("s-uncertain", SessionState::Done)];
-        let manifest = legacy_manifest_json(&fingerprint, true, &sessions, &[]);
-        let manifest_path = write_legacy_manifest(&data_dir, &manifest);
-        store.fail_next_parent_sync_after_rename();
-
-        import_legacy_manifest(&store).expect("import committed uncertain session");
-
-        assert_eq!(
-            store
-                .load_sessions()
-                .expect("load uncertain import")
-                .first()
-                .map(|record| record.session_id.as_str()),
-            Some("s-uncertain")
-        );
-        assert!(
-            !manifest_path.exists(),
-            "visible committed import may archive its manifest after warning"
-        );
-    }
-
-    #[test]
-    fn import_legacy_manifest_fingerprint_mismatch_fails_closed() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path);
-
-        let sessions = vec![manifest_session_info("s-1", SessionState::Done)];
-        // Well-formed but wrong: 64 hex chars that cannot equal the real
-        // fingerprint of an empty (not-yet-written) store.
-        let bogus_fingerprint = "0".repeat(64);
-        let manifest = legacy_manifest_json(&bogus_fingerprint, false, &sessions, &[]);
-        write_legacy_manifest(&data_dir, &manifest);
-
-        let error =
-            import_legacy_manifest(&store).expect_err("mismatched fingerprint must fail closed");
-        assert_eq!(error.code, "migration_store_changed");
-        assert!(
-            store.load_sessions().expect("load sessions").is_empty(),
-            "store must not be mutated when the fingerprint check fails"
-        );
-    }
-
-    #[test]
-    fn import_legacy_manifest_rejects_a_base_outside_the_runtime_id_grammar() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        let mut session = manifest_session_info("s-historical", SessionState::Done);
-        session.agent_base = RuntimeRef::from_wire("Future Agent");
-        let store_sha256 = store_fingerprint(&store_path);
-        let manifest = legacy_manifest_json(&store_sha256, false, &[session], &[]);
-        write_legacy_manifest(&data_dir, &manifest);
-
-        let error =
-            import_legacy_manifest(&store).expect_err("a historical agent base must fail closed");
-        assert_eq!(error.code, "migration_import_failed");
-        assert!(
-            store.load_sessions().expect("load sessions").is_empty(),
-            "store must not be mutated when the manifest names an unlaunchable base"
-        );
-    }
-
-    #[test]
-    fn import_legacy_manifest_keeps_a_grammar_valid_uninstalled_base() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        let mut session = manifest_session_info("s-acme", SessionState::Done);
-        session.agent_base = RuntimeRef::from_wire("acme");
-        let store_sha256 = store_fingerprint(&store_path);
-        let manifest = legacy_manifest_json(&store_sha256, false, &[session], &[]);
-        write_legacy_manifest(&data_dir, &manifest);
-
-        import_legacy_manifest(&store).expect("a valid but uninstalled runtime id imports");
-        let loaded = store.load_sessions().expect("load sessions");
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].info.agent_base, RuntimeRef::from_wire("acme"));
-    }
-
-    #[test]
-    fn import_legacy_manifest_live_loss_not_accepted_fails_closed() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        let store_sha256 = store_fingerprint(&store_path);
-        let sessions = vec![manifest_session_info("s-live", SessionState::Running)];
-        let manifest = legacy_manifest_json(&store_sha256, false, &sessions, &["s-live"]);
-        write_legacy_manifest(&data_dir, &manifest);
-
-        let error = import_legacy_manifest(&store)
-            .expect_err("unaccepted live-runtime loss must fail closed");
-        assert_eq!(error.code, "migration_runtime_loss_not_accepted");
-        assert!(
-            store.load_sessions().expect("load sessions").is_empty(),
-            "store must not be mutated when runtime loss is not accepted"
-        );
-    }
-
-    #[test]
-    fn import_legacy_manifest_live_classification_mismatch_fails_closed() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        let store_sha256 = store_fingerprint(&store_path);
-        // Models an interrupted or tampered manifest: the snapshot itself
-        // carries a Running session, but `live_session_ids` was not updated
-        // to match, so the two views of "what is live" disagree.
-        let sessions = vec![manifest_session_info("s-running", SessionState::Running)];
-        let manifest = legacy_manifest_json(&store_sha256, true, &sessions, &[]);
-        write_legacy_manifest(&data_dir, &manifest);
-
-        let error = import_legacy_manifest(&store)
-            .expect_err("live-classification mismatch must fail closed");
-        assert_eq!(error.code, "migration_manifest_mismatch");
-        assert!(
-            store.load_sessions().expect("load sessions").is_empty(),
-            "store must not be mutated when live classification disagrees"
-        );
-    }
-
-    #[test]
-    fn import_legacy_manifest_unsupported_schema_fails_closed() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        let manifest = serde_json::json!({
-            "schema_version": 2,
-            "created_at": "2026-07-01T00:00:00Z",
-            "store_sha256": store_fingerprint(&store_path),
-            "accept_runtime_loss": false,
-            "sessions": Vec::<SessionInfo>::new(),
-            "live_session_ids": Vec::<String>::new(),
-        });
-        write_legacy_manifest(&data_dir, &manifest);
-
-        let error = import_legacy_manifest(&store)
-            .expect_err("unsupported schema version must fail closed");
-        assert_eq!(error.code, "migration_import_failed");
-        assert!(
-            store.load_sessions().expect("load sessions").is_empty(),
-            "store must not be mutated when the manifest schema is unsupported"
-        );
-    }
-
-    #[test]
-    fn import_legacy_manifest_already_migrated_is_idempotent() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-
-        let mut existing = identity_record();
-        existing.session_id = "s-existing".to_owned();
-        existing.info.id = SessionId("s-existing".to_owned());
-        store
-            .record_session(&existing)
-            .expect("persist pre-existing logical record");
-
-        // The fingerprint is deliberately wrong: the idempotency short-circuit
-        // must return before the fingerprint (or any other) check runs, so a
-        // stale or tampered manifest cannot even be evaluated once the store
-        // already holds logical records.
-        let bogus_fingerprint = "f".repeat(64);
-        let sessions = vec![manifest_session_info("s-new", SessionState::Done)];
-        let manifest = legacy_manifest_json(&bogus_fingerprint, true, &sessions, &[]);
-        let manifest_path = write_legacy_manifest(&data_dir, &manifest);
-
-        import_legacy_manifest(&store)
-            .expect("import over an already-migrated store must short-circuit cleanly");
-
-        let records = store.load_sessions().expect("load sessions");
-        assert_eq!(
-            records.len(),
-            1,
-            "import must not duplicate or add records once the store is non-empty"
-        );
-        assert_eq!(records[0].session_id, "s-existing");
-        assert!(
-            !manifest_path.exists(),
-            "manifest must be archived, not left pending, even on the idempotent path"
-        );
-        let migrations_dir = data_dir.join("migrations");
-        let archived = std::fs::read_dir(&migrations_dir)
-            .expect("read migrations dir")
-            .filter_map(Result::ok)
-            .any(|entry| {
-                pohunek_paths::is_imported_manifest_archive(&entry.file_name().to_string_lossy())
-            });
-        assert!(
-            archived,
-            "manifest must be archived under its imported-* name"
-        );
-    }
-
-    /// A resume binding as a legacy daemon persisted it for `session_id`.
-    fn legacy_binding(session_id: &str) -> ResumeBinding {
-        ResumeBinding {
-            spawned_by: None,
-            session_id: session_id.to_owned(),
-            name: None,
-            agent: "codex".to_owned(),
-            agent_base: RuntimeRef::codex(),
-            cwd: PathBuf::from("/repo"),
-            cols: 80,
-            rows: 24,
-            native_session_id: Some("native-legacy".to_owned()),
-            native_session_path: None,
-            project_id: None,
-            is_linked_worktree: None,
-            metadata: BTreeMap::new(),
-            program: "codex".to_owned(),
-            args: Vec::new(),
-            input_rules: StoredInputRules::default(),
-            native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
-            launch_binding: crate::agent::host::LaunchPin::Unpinned,
-            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
-            profile_revision: None,
-            native_launch_unresolved: false,
-            launch_checkout: None,
-        }
-    }
-
-    /// Inventory entries naming a legacy binding no manifest imported.
-    async fn unmigrated_entries(registry: &SessionRegistry) -> Vec<String> {
-        registry
-            .runtime_inventory()
-            .await
-            .entries
-            .into_iter()
-            .filter(|entry| {
-                entry.status == RuntimeInventoryStatus::Orphaned
-                    && entry.reason.as_deref() == Some(super::MIGRATION_MANIFEST_MISSING)
-            })
-            .map(|entry| entry.runtime_slot)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn legacy_bindings_without_a_manifest_are_surfaced_and_kept() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store = Store::new(data_dir.join("metadata.jsonl"));
-        for session_id in ["s-legacy-b", "s-legacy-a"] {
-            store
-                .record_resume(&legacy_binding(session_id))
-                .expect("persist legacy resume binding");
-        }
-        let registry = empty_registry(&root, &root.join("runtime/workers"));
-        let mut events = registry.subscribe();
-
-        Box::pin(registry.reconcile_workers())
-            .await
-            .expect("the daemon starts without a manifest");
-
-        assert_eq!(
-            unmigrated_entries(&registry).await,
-            vec!["s-legacy-a".to_owned(), "s-legacy-b".to_owned()]
-        );
-        let mut announced = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            if event.event() == protocol::event::SESSION_RUNTIME_DISCOVERED {
-                announced.push(event);
-            }
-        }
-        assert_eq!(announced.len(), 2, "every unmigrated binding is announced");
-        registry
-            .inspect(&SessionId("s-legacy-a".to_owned()))
-            .await
-            .expect_err("a binding alone never becomes a listed session");
-        assert!(store.load_sessions().expect("load sessions").is_empty());
-        assert_eq!(
-            store.load_resume().expect("load resume bindings").len(),
-            2,
-            "the bindings stay on disk for a later manifest import"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_bindings_are_not_flagged_once_logical_records_exist() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store = Store::new(data_dir.join("metadata.jsonl"));
-        store
-            .record_session(&identity_record())
-            .expect("persist logical record");
-        store
-            .record_resume(&legacy_binding("s-legacy"))
-            .expect("persist resume binding");
-        let registry = empty_registry(&root, &root.join("runtime/workers"));
-
-        Box::pin(registry.reconcile_workers())
-            .await
-            .expect("reconcile");
-
-        assert!(unmigrated_entries(&registry).await.is_empty());
-    }
-
     #[tokio::test]
     async fn a_durable_session_of_an_uninstalled_runtime_stays_listed_and_keeps_its_binding() {
         let root = temp_root();
@@ -13560,88 +12735,6 @@ handler = "codex-hook-v1"
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
         }
-    }
-
-    #[tokio::test]
-    async fn unmigrated_legacy_bindings_refuse_session_creation_until_imported() {
-        let root = temp_root();
-        let data_dir = root.join("data");
-        create_private_dir(&data_dir);
-        let store_path = data_dir.join("metadata.jsonl");
-        let store = Store::new(store_path.clone());
-        store
-            .record_resume(&legacy_binding("s-legacy"))
-            .expect("persist legacy resume binding");
-        let registry = launching_registry(&root, &root.join("runtime/workers"));
-        Box::pin(registry.reconcile_workers())
-            .await
-            .expect("the daemon starts without a manifest");
-        let store_before = std::fs::read(&store_path).expect("read store");
-
-        let refused = registry
-            .create(shell_params(&root))
-            .await
-            .expect_err("creating the first logical record is refused");
-        assert_eq!(refused.code, super::MIGRATION_MANIFEST_MISSING);
-        assert!(
-            refused
-                .recover
-                .as_deref()
-                .is_some_and(|recover| recover.contains("pohunek migration preflight")),
-            "the refusal names the preflight: {refused:?}"
-        );
-        let refused_fork = registry
-            .fork(SessionForkParams {
-                session_id: SessionId("s-legacy".to_owned()),
-                name: None,
-                cwd_mode: ForkCwdMode::default(),
-                cols: 80,
-                rows: 24,
-                accept_profile_change: false,
-            })
-            .await
-            .expect_err("a fork is refused as well");
-        assert_eq!(refused_fork.code, super::MIGRATION_MANIFEST_MISSING);
-        assert_eq!(
-            std::fs::read(&store_path).expect("read store"),
-            store_before,
-            "a refused create writes nothing"
-        );
-        assert!(registry.list().await.is_empty(), "nothing is listed");
-        registry.begin_daemon_shutdown();
-        drop(registry);
-
-        // The preflight snapshots the legacy store, and the next start
-        // imports its manifest.
-        let manifest = legacy_manifest_json(
-            &store_fingerprint(&store_path),
-            true,
-            &[manifest_session_info("s-legacy", SessionState::Done)],
-            &[],
-        );
-        write_legacy_manifest(&data_dir, &manifest);
-        let restarted = launching_registry(&root, &root.join("runtime/workers"));
-        Box::pin(restarted.reconcile_workers())
-            .await
-            .expect("the daemon imports the manifest");
-        assert!(unmigrated_entries(&restarted).await.is_empty());
-        assert!(
-            store
-                .load_sessions()
-                .expect("load sessions")
-                .iter()
-                .any(|record| record.session_id == "s-legacy"),
-            "the legacy session is imported"
-        );
-
-        let created = restarted
-            .create(shell_params(&root))
-            .await
-            .expect("an imported manifest lifts the gate");
-        restarted
-            .stop(&created.id)
-            .await
-            .expect("stop the created session");
     }
 
     /// The WARN lines `logs` holds for `session`.

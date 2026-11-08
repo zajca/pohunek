@@ -194,12 +194,6 @@ enum Commands {
         action: IntegrationAction,
     },
 
-    /// Safely cross the one-time daemon-owned to worker-owned PTY boundary.
-    Migration {
-        #[command(subcommand)]
-        action: MigrationAction,
-    },
-
     /// Set up this machine to run pohunek: the service, the runtime packages,
     /// the integration hooks and the config.
     ///
@@ -1134,24 +1128,6 @@ impl From<HermesUninstallCliOptions> for commands::integration::HermesOptions {
 }
 
 #[derive(Debug, Subcommand)]
-enum MigrationAction {
-    /// Snapshot legacy sessions and refuse replacement while live PTYs exist.
-    Preflight {
-        /// Record informed consent to import live legacy sessions as runtime-lost.
-        #[arg(long)]
-        accept_runtime_loss: bool,
-        /// Dial the legacy daemon on this explicit local socket path instead
-        /// of the default one, as the install wrapper does after moving the
-        /// socket aside as its connect barrier.
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        /// Emit the sanitized migration manifest as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum SetupAction {
     /// Install shell completion in the conventional per-user directory.
     Completions {
@@ -1711,9 +1687,6 @@ impl Commands {
             Commands::Relay { action } => action.wants_json(),
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
-            Commands::Migration { action } => match action {
-                MigrationAction::Preflight { json, .. } => *json,
-            },
             Commands::Service { action } => action.wants_json(),
             Commands::Plugin { action } => action.wants_json(),
             Commands::Store { action } => action.wants_json(),
@@ -1753,7 +1726,6 @@ impl Commands {
             | Commands::Session { .. }
             | Commands::Subscribe { .. }
             | Commands::Integration { .. }
-            | Commands::Migration { .. }
             | Commands::Setup { .. }
             | Commands::Host { .. }
             | Commands::Prompt { .. }
@@ -2654,27 +2626,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Migration { action } => {
-            let paths = Paths::resolve()?;
-            let host = effective_host(&global_host, None);
-            match action {
-                MigrationAction::Preflight {
-                    accept_runtime_loss,
-                    socket,
-                    json,
-                } => {
-                    commands::migration::run_preflight(
-                        &host,
-                        &paths,
-                        socket.as_deref(),
-                        accept_runtime_loss,
-                        json,
-                    )
-                    .await?;
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
         Commands::Setup {
             action,
             yes,
@@ -3089,7 +3040,6 @@ fn command_line_hosts(cli: &Cli) -> Vec<&str> {
         | Commands::Status { .. }
         | Commands::Subscribe { .. }
         | Commands::Integration { .. }
-        | Commands::Migration { .. }
         | Commands::Notifications { .. }
         | Commands::Project { .. }
         | Commands::Assistant { .. } => vec![global],

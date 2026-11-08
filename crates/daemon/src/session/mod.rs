@@ -769,11 +769,6 @@ struct SessionRegistryInner {
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
-    /// Set by startup reconciliation when legacy resume bindings exist with
-    /// no logical record and no migration manifest. The first logical record
-    /// would make a later manifest unimportable, so every path that creates
-    /// one is refused while it holds ([`SessionRegistry::ensure_migration_settled`]).
-    legacy_migration_pending: AtomicBool,
     /// Cancellation signal fired when production daemon shutdown starts.
     ///
     /// Bounded input operations use this token instead of the event-log drain
@@ -2600,7 +2595,6 @@ impl SessionRegistry {
                 activity_evidence_waiters: std::sync::Mutex::new(HashMap::new()),
                 turns,
                 daemon_shutdown_started: AtomicBool::new(false),
-                legacy_migration_pending: AtomicBool::new(false),
                 daemon_shutdown: CancellationToken::new(),
                 daemon_instance_id,
                 config,
@@ -2850,33 +2844,6 @@ impl SessionRegistry {
             "create transactions did not finish within the shutdown drain timeout; startup reconciliation settles them"
         );
         false
-    }
-
-    /// Refuses a lifecycle operation that would write the first logical
-    /// record while unmigrated legacy resume bindings exist.
-    ///
-    /// Startup imports a migration manifest only into a store without logical
-    /// records, so a record written first would archive a later manifest
-    /// unimported and lose those bindings. Startup reconciliation decides the
-    /// gate; a later start that imports the manifest lifts it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `migration_manifest_missing` while the gate holds, before
-    /// anything is written.
-    pub(super) fn ensure_migration_settled(&self) -> Result<(), ProtocolError> {
-        if !self.inner.legacy_migration_pending.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        Err(ProtocolError::new(
-            ErrorClass::Runtime,
-            reconcile::MIGRATION_MANIFEST_MISSING,
-            "legacy resume bindings exist without a migration manifest; creating a session now would lose them",
-            Some(
-                "run `pohunek migration preflight` against the legacy daemon (reinstall the legacy release and rerun the worker-aware installer), then restart this daemon so it imports the manifest"
-                    .to_owned(),
-            ),
-        ))
     }
 
     /// Runs `transaction` detached from the caller and tracked for the
@@ -3382,9 +3349,8 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `migration_manifest_missing` while unmigrated legacy resume
-    /// bindings exist and `daemon_shutting_down` once shutdown started, both
-    /// before anything is written, and otherwise the validation, target, or launch error. A
+    /// Returns `daemon_shutting_down` once shutdown started, before anything is
+    /// written, and otherwise the validation, target, or launch error. A
     /// failed create whose compensation cannot finish stays listed as
     /// `create_compensation_pending` for the supervision retry.
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
@@ -3418,7 +3384,6 @@ impl SessionRegistry {
         mut params: SessionNewParams,
         spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<CreateOutcome, ProtocolError> {
-        self.ensure_migration_settled()?;
         // Taken before the secret values are removed, so the fingerprint covers
         // the slot names and never a value.
         let fingerprint = create_request::request_fingerprint(&params)?;

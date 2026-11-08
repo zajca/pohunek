@@ -1,16 +1,15 @@
 //! Names shared by metadata writers and the service purge.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt::Write as _;
 
-/// Data-root child holding pending and imported legacy manifests.
+/// Data-root child that may hold imported-manifest archives of an earlier release.
 pub const MIGRATIONS_SUBDIR: &str = "migrations";
-/// Pending legacy manifest; purge preserves it.
+/// Name of a pending legacy migration manifest, which no release reads any more.
 pub const LEGACY_MANIFEST_NAME: &str = "durable-session-workers.json";
 const STORE_TEMP_INFIX: &str = ".tmp.";
 const ARCHIVE_PREFIX: &str = "durable-session-workers.imported-";
 const ARCHIVE_SUFFIX: &str = ".json";
-/// Historical archive names retain eight bytes of each SHA-256 digest.
+/// Archive names retain eight bytes of each SHA-256 digest.
 const ARCHIVE_DIGEST_BYTES: usize = 8;
 const ARCHIVE_HEX_CHARS: usize = ARCHIVE_DIGEST_BYTES * 2;
 
@@ -40,24 +39,6 @@ pub fn is_metadata_store_temp(store: &str, name: &str) -> bool {
         && sequence
             .parse::<u64>()
             .is_ok_and(|value| value.to_string() == sequence)
-}
-
-/// Historical imported-manifest name, including already-migrated imports.
-///
-/// Already-migrated stores archive before validating the fingerprint, so its
-/// filtered prefix can contain fewer than sixteen hexadecimal characters.
-#[must_use]
-pub fn legacy_manifest_archive_name(fingerprint: &str, created_digest: &[u8; 32]) -> String {
-    let fingerprint: String = fingerprint
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .take(ARCHIVE_HEX_CHARS)
-        .collect();
-    let mut created = String::with_capacity(ARCHIVE_HEX_CHARS);
-    for byte in &created_digest[..ARCHIVE_DIGEST_BYTES] {
-        let _ = write!(created, "{byte:02x}");
-    }
-    format!("{ARCHIVE_PREFIX}{fingerprint}-{created}{ARCHIVE_SUFFIX}")
 }
 
 /// Whether `name` belongs to the legacy archive producer's exact name grammar.

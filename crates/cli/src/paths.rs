@@ -144,14 +144,6 @@ impl Paths {
             origin_source: OriginSource::Environment,
         })
     }
-
-    /// One-time legacy-to-worker migration manifest.
-    #[must_use]
-    pub(crate) fn worker_migration_manifest(&self) -> PathBuf {
-        self.data_dir
-            .join("migrations")
-            .join("durable-session-workers.json")
-    }
 }
 
 /// The workflow plugin store: its registry root and the parents of the

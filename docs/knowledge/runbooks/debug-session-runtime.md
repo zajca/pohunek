@@ -698,40 +698,16 @@ answers `agent_runtime_unsupported`. Do not diagnose by opening, copying, or edi
 `state.db` or the operator's real `HERMES_HOME`. The compatibility commands use
 their own temporary homes.
 
-For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer runs under
+The archive installer runs under
 `pohunek service lock -- <installer>`, so it refuses before any change while
 another service command holds the transaction lock (`service_transaction_in_progress`) and no such command can
 start during its run. It then refuses before any change whenever
 `pohunek service check --json` fails: an unusable `HOME` or XDG root, an invalid
 prefix, or a prefix, unit, config, state, or runtime directory reached through
 a symlink or not private to the user, each reported with the error code the
-final install or upgrade would fail with. It starts a stopped legacy daemon so
-the migration snapshot is always taken, moves the legacy daemon's control
-socket aside, runs `migration preflight --socket <moved-socket>` there, and
-lists live sessions that lack durable `runtime` metadata to refuse
-replacement. Sessions with a runtime binding are already worker-owned, are
-excluded from this one-time guard, and survive the daemon restart.
-`packaging/install-daemon.sh --accept-runtime-loss` is destructive consent:
-existing legacy PTYs cannot be transferred into workers. Use it only after
-recording the affected ids and accepting that shell and uncaptured agent
-sessions cannot be reconstructed. The same installer refuses to retire an
-older template-unit install while any `pohunek-session@<id>.service` worker
-outside the `inactive` state survives its post-stop re-check; stop those
-sessions first. The flag also gates `pohunek service upgrade` of an installed
-service, whose live-session preflight is described in
+final install or upgrade would fail with. A host with a pre-service
+`pohunekd.service` unit is refused before the lock, naming release v0.40.1 as
+the one to install first. `packaging/install-daemon.sh --accept-runtime-loss`
+gates `pohunek service upgrade` of an installed service, whose live-session
+preflight is described in
 [update after release](update-after-release.md#upgrade-preflight).
-
-A worker-aware daemon started over a legacy store without that preflight (for
-example after replacing the binary by hand) finds legacy resume bindings but no
-logical record and no manifest. It starts anyway and imports nothing: `pohunek
-session list` shows none of those sessions, and `pohunek session runtime-inventory`
-lists each binding as `orphaned` with reason `migration_manifest_missing`
-(the daemon log carries `reconcile.migration.manifest_missing`). The bindings
-stay on disk, and while they are unimported `pohunek session new` and `session
-fork` fail with `migration_manifest_missing` before writing anything, because
-a first logical record would make a later manifest unimportable. To recover
-them, reinstall the legacy release, then rerun the worker-aware installer so
-its `pohunek migration preflight` snapshots them; the worker-aware daemon it
-starts imports the manifest, and session creation works again. Once any
-logical record exists, a later manifest is archived without being imported.

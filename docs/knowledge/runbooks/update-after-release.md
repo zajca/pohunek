@@ -469,19 +469,17 @@ owner, and, for an install that starts over, a daemon job registered without
 `service.toml` (`service_daemon_job_present`) — and fails with the error and
 code that command would fail with. For an upgrade it also runs the
 [upgrade preflight](#upgrade-preflight) and accepts `--accept-runtime-loss`.
-`packaging/install-daemon.sh` runs its whole legacy retirement and the final
-`service install|upgrade` under `pohunek service lock -- <installer>`, and runs
-`service check` before it touches the legacy install.
+`packaging/install-daemon.sh` runs the final `service install|upgrade` under
+`pohunek service lock -- <installer>`, and runs `service check` before it.
 
 `pohunek service uninstall` refuses while sessions are live and lists them.
 `--stop-sessions` stops every session through its worker first; the session
 store, journals, and host identity are kept unless `--purge` is given. Purge
 also removes the store's schema backups, crashed `metadata.jsonl.tmp.<pid>.<sequence>`
-copies, and imported legacy-manifest archives in `migrations/`. It removes only
+copies, and imported legacy-manifest archives an earlier release left in `migrations/`. It removes only
 recognized artifact names; a symlink at a recognized temp or archive name is
 unlinked without following its target. Unrecognized data and migration entries
-are kept and reported (`kept_purge_entries` as byte-escaped display strings in JSON). A pending migration
-manifest is retained. The prefix ownership record is removed after the prefix's version directories and
+are kept and reported (`kept_purge_entries` as byte-escaped display strings in JSON). The prefix ownership record is removed after the prefix's version directories and
 CLI copy (it stays while a version is kept for a worker journal or job of this
 installation). The transaction record (`service-install.json`) is cleared just before
 `service.toml`, which is removed last, so if an uninstall fails partway or is
@@ -533,16 +531,13 @@ with `HOME` an existing directory (`service_environment_invalid`): the daemon
 starts each session worker in `HOME` and refuses to become ready without it,
 even when `--prefix` and every `XDG_*` root are given explicitly.
 
-The first worker-aware release is a destructive compatibility boundary because
-a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions
-finish before installing. The installer moves the legacy daemon's control
-socket aside, runs `migration preflight --socket <moved-socket>` against it,
-and only then stops the daemon and re-checks template workers in every state
-except `inactive`; any surviving worker aborts without removing legacy files.
-`--accept-runtime-loss` is informed consent to lose those existing PTYs and to
-proceed after the post-stop check, not a recovery command. See
-[debug session runtime](debug-session-runtime.md). The same flag is the one
-consent for the service-managed upgrade below; there is no second flag.
+A host that still runs the pre-service install (a `pohunekd.service` unit with
+`pohunek-session@` template workers) is refused by the installer before any
+change, with a message naming release v0.40.1. That release is the last one that
+migrates such a host to the service-managed daemon; install it first, let the
+legacy sessions finish, then run this release's installer.
+`--accept-runtime-loss` is the one consent for the service-managed upgrade below;
+there is no second flag. See [debug session runtime](debug-session-runtime.md).
 
 When the assistant feature is available, its update intent should compare the
 bundle version in the launch snapshot with the installed binary's version and

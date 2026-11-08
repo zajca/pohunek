@@ -14,9 +14,8 @@
 //!   when the registry loads it.
 //!
 //! The mapping is a pure function of the record and of frozen facts about the
-//! releases that wrote it, so the migrated bytes are reproducible (see
-//! `Store::is_schema_migration_of`) and independent of the runtimes the
-//! running daemon ships.
+//! releases that wrote it, so the migrated bytes are reproducible and independent of the runtimes
+//! the running daemon ships.
 
 // Rust guideline compliant 2026-10-12
 
