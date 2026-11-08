@@ -171,7 +171,7 @@ pub fn read_prompt_contract(root: &Path) -> Result<String, PromptContractError> 
     let bytes = fs::read(&path)
         .map_err(|error| whole(format!("`{PROMPT_CONTRACT_PATH}` cannot be read: {error}")))?;
     let text = String::from_utf8(bytes)
-        .map_err(|_| whole(format!("`{PROMPT_CONTRACT_PATH}` is not valid UTF-8")))?;
+        .map_err(|_error| whole(format!("`{PROMPT_CONTRACT_PATH}` is not valid UTF-8")))?;
     PromptContract::parse(&text)?;
     Ok(text)
 }

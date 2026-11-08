@@ -86,9 +86,6 @@ overlay = { workspace = true }
 pohunek-test-support = { workspace = true, features = ["catalog"] }
 # `plugin_daemon.rs` serves the real package lifecycle from an in-process daemon.
 pohunek-daemon = { path = "../daemon" }
-# `host_pin_assistant.rs` answers `assistant.materialize` with the bundle identity
-# the assistant verifies.
-pohunek-knowledge = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
 # `release_upgrade.rs` reads the previous release's archive, whose frame the

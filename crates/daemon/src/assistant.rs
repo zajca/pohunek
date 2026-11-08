@@ -116,10 +116,7 @@ fn write_snapshot(path: &Path, snapshot: &str, keep_existing: bool) -> std::io::
         options.create(true).truncate(true);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(PRIVATE_FILE_MODE);
-    }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, PRIVATE_FILE_MODE);
     match options.open(path) {
         Ok(mut file) => file.write_all(snapshot.as_bytes()),
         Err(error) if keep_existing && error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),

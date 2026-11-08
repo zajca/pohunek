@@ -869,6 +869,40 @@ expose = "peers"              # "local" (default) or "peers"
   `[placement]`, `[config_home]`, `[transcripts]`) next to commands without the runtime group is
   `descriptor_invalid`.
 
+## Declaring a context package
+
+A package can export a directory of files and nothing else. The daemon serves
+the directory to the one feature that names the package; the built-in assistant
+reads its knowledge bundle this way (`pohunek assistant`, package id
+`pohunek.context.assistant`).
+
+```toml
+schema = 1
+id = "pohunek.context.assistant"
+version = "1.0.0"
+runtime_api = 1
+requires = ["package-context-v1"]
+
+[context]
+dir = "bundle"   # package-relative directory that holds the files
+```
+
+- `requires = ["package-context-v1"]` is mandatory, as for commands.
+- `dir` is a normalized package-relative directory (no leading or trailing `/`,
+  no `.` or `..` component) that the manifest lists at least one file below.
+  A descriptor that combines `[context]` with a runtime group or `[commands]`
+  is `package_descriptor_invalid`.
+- The package serves no runtime and declares no command, so it installs by
+  digest (`--sha256`) or `link`, never through the catalog, needs no command
+  opt-in, and never appears among the supported agents.
+- The daemon re-verifies the package root against its archive digest on every
+  use of the files, and uses only the selected, enabled package of the id.
+- For the assistant, `dir` holds `index.md`, `assistant/system.md` (the prompt
+  contract) and the concept files; the daemon answers `assistant.materialize`
+  with the directory, its concept index and the contract text, and
+  `assistant_package_missing` while no package is installed, selected and
+  enabled.
+
 ## Declaring a version probe
 
 A descriptor names the supported release range with `version_probe` in

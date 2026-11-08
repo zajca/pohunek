@@ -73,20 +73,19 @@ Assistant launch and prompt rendering:
 - `crates/prompt/src/lib.rs`
 - `crates/prompt/src/link.rs`
 
-Knowledge bundle build, embed, and materialization:
+Knowledge bundle validation, indexing, and launch ids (the bundle itself ships in the
+assistant context package):
 
-- `crates/knowledge/build.rs` — assembles the embedded bundle and its content hash.
 - `crates/knowledge/src/schema.rs` — concept types and frontmatter fields.
 - `crates/knowledge/src/validation.rs` — bundle validation (frontmatter, ids,
   links, reserved files).
 - `crates/knowledge/src/prompt_contract.rs` — shape of the `## Safety` and
   `## Navigation` sections of `assistant/system.md`, shared by validation and launch.
-- `crates/knowledge/src/index.rs` — the intent-filtered concept index the prompt's
-  table of contents is built from.
+- `crates/knowledge/src/index.rs` — the concept index of a bundle directory the
+  prompt's table of contents is built from.
 - `crates/knowledge/src/protocol_conversions.rs` — concept metadata as it crosses
   the `assistant.materialize` wire.
-- `crates/knowledge/src/materializer.rs` — safe extraction of the embedded bundle.
-- `crates/knowledge/src/assistant.rs` — bundle version, content hash, and launch ids.
+- `crates/knowledge/src/assistant.rs` — launch ids.
 - `docs/knowledge/concepts/host-governance.md`
 
 TypeScript SDK and test relay (the web control center is an external client in
@@ -179,7 +178,7 @@ Release packaging and contributor verification:
 - `crates/knowledge/src/log.rs` — knowledge-log fragments, the files of the
   log.d directory next to `docs/knowledge/log.md`, which the release fold
   removes with its last fragment: the fragment rules, the entry order, the assembled
-  log the embedded bundle (`crates/knowledge/build.rs`) and `docs build` ship,
+  log `docs build` ships,
   and the release fold.
 - `crates/xtask/src/knowledge_log.rs` — `cargo xtask docs log fold|migrate` and
   the `knowledge-log` docs check.

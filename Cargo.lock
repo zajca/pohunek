@@ -1705,7 +1705,6 @@ dependencies = [
  "pohunek-client",
  "pohunek-daemon",
  "pohunek-hostcheck",
- "pohunek-knowledge",
  "pohunek-logging",
  "pohunek-overlay",
  "pohunek-package",
@@ -1832,7 +1831,6 @@ dependencies = [
 name = "pohunek-knowledge"
 version = "0.40.1"
 dependencies = [
- "pohunek-platform",
  "pohunek-protocol",
  "pohunek-test-support",
  "serde",

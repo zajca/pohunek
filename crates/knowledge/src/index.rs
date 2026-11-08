@@ -107,7 +107,7 @@ fn concept_meta_from_file(root: &Path, relative: &Path) -> Result<ConceptMeta, B
     }
     let content = fs::read(&path).map_err(io_error)?;
     let content = std::str::from_utf8(&content)
-        .map_err(|_| BundleIndexError::new(relative, "markdown content is not valid UTF-8"))?;
+        .map_err(|_error| BundleIndexError::new(relative, "markdown content is not valid UTF-8"))?;
     parse_concept_meta(relative, content)
 }
 

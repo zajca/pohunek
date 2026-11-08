@@ -15,7 +15,7 @@ snapshot file, relevant concept list, and source map.
 
 The `## Safety` bullets and `## Navigation` steps below are the single source of
 the launched prompt: `pohunek assistant` renders them verbatim, one line per
-bullet or step, from this file as embedded in the binary. Keep each bullet and
+bullet or step, from this file as the daemon reads it from the assistant context package. Keep each bullet and
 step self-contained, in plain text, with no links that depend on this file's
 location.
 
