@@ -5,7 +5,7 @@
 //!
 //! A runtime declares one strategy in its `[native_reference]` table:
 //!
-//! * `none`: no native recovery; resume and fork are frozen off.
+//! * `none`: no native recovery; resume is frozen off.
 //! * `hook`: the reference arrives only through a validated integration
 //!   report, so a runtime without an integration never becomes resumable.
 //! * `assigned`: core generates the reference before launch and passes it
@@ -140,9 +140,6 @@ pub enum NativeReferenceError {
     /// Strategy `assigned` has no explicit existence declaration.
     #[error("strategy `assigned` requires native_reference.existence")]
     AssignedRequiresExistence,
-    /// `assign_fork = true` was declared next to an unsupported fork.
-    #[error("native_reference.assign_fork requires fork.supported = true")]
-    AssignForkRequiresFork,
     /// A strategy that does not use this field carries it.
     #[error("native_reference.{field} is not accepted by this strategy")]
     UnexpectedField {
@@ -179,41 +176,41 @@ impl ExistenceError {
 
 /// A launch template plus the existence check of an assigned reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "StoredAssignedReference")]
 pub struct AssignedReference {
     launch_args: NativeArgs,
     existence: ReferenceExistence,
-    /// Whether a fork also gets a generated reference of its own, passed with
-    /// `launch_args` after the fork arguments. Absent in a stored spec means
-    /// no: such a fork holds no reference until a report names one.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    assign_fork: bool,
+}
+
+/// Plain stored form of an [`AssignedReference`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAssignedReference {
+    launch_args: NativeArgs,
+    existence: ReferenceExistence,
+    /// Written by an earlier release; read and dropped.
+    #[serde(default)]
+    #[expect(dead_code, reason = "accepted so a record of an earlier release loads")]
+    assign_fork: Option<serde::de::IgnoredAny>,
+}
+
+impl From<StoredAssignedReference> for AssignedReference {
+    fn from(stored: StoredAssignedReference) -> Self {
+        Self {
+            launch_args: stored.launch_args,
+            existence: stored.existence,
+        }
+    }
 }
 
 impl AssignedReference {
-    /// Pairs the launch template with the declared existence check; forks get
-    /// no assigned reference.
+    /// Pairs the launch template with the declared existence check.
     #[must_use]
     pub fn new(launch_args: NativeArgs, existence: ReferenceExistence) -> Self {
         Self {
             launch_args,
             existence,
-            assign_fork: false,
         }
-    }
-
-    /// Also assigns every fork a generated reference of its own, for an agent
-    /// that accepts `launch_args` together with its fork arguments.
-    #[must_use]
-    pub fn with_fork_assignment(mut self) -> Self {
-        self.assign_fork = true;
-        self
-    }
-
-    /// Whether a fork gets a generated reference of its own.
-    #[must_use]
-    pub fn assigns_fork(&self) -> bool {
-        self.assign_fork
     }
 
     /// The argv fragment that passes the generated reference at launch.
@@ -743,7 +740,7 @@ pub enum ReferenceCheckFailure {
 pub enum RefusalPhase {
     /// A first launch (`session.new`): nothing was written yet.
     Launch,
-    /// A resume or fork of a session launched with the declared store.
+    /// A resume of a session launched with the declared store.
     Recovery,
 }
 

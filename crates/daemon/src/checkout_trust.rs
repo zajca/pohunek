@@ -22,7 +22,7 @@
 //!    case all refuse. So does a declared path that the file system resolves
 //!    under another spelling (case or normalization folding).
 //!
-//! A resume or fork evaluates the directory and project the session was created
+//! A resume evaluates the directory and project the session was created
 //! in, not its current ones, and only when it relaunches in that directory
 //! (`SessionRegistry::trusted_relaunch_args`).
 //!

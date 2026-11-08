@@ -150,8 +150,8 @@ fn pi_adapter(dir: &std::path::Path) -> PathBuf {
 /// The agent runs a command loop. `report <id>` sends the real adapter's
 /// session hook for conversation `<id>` and acknowledges it in `acks` once the
 /// worker answered; `nested` starts a child process and records its pid;
-/// `exit` ends the agent. A start without `--session-id` (resume, fork) only
-/// stays alive.
+/// `exit` ends the agent. A start without `--session-id` (resume) only stays
+/// alive.
 struct Rig {
     dir: PathBuf,
     marker: PathBuf,
@@ -576,17 +576,6 @@ impl Rig {
     }
 }
 
-fn fork_params(id: &SessionId) -> SessionForkParams {
-    SessionForkParams {
-        session_id: id.clone(),
-        name: None,
-        cwd_mode: ForkCwdMode::Same,
-        cols: 80,
-        rows: 24,
-        accept_profile_change: false,
-    }
-}
-
 #[tokio::test]
 async fn a_launch_claim_naming_the_assigned_reference_turns_it_reported() {
     let rig = Rig::new(
@@ -651,7 +640,7 @@ async fn a_launch_claim_naming_another_conversation_replaces_the_assigned_refere
 }
 
 #[tokio::test]
-async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resume_and_a_fork() {
+async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_and_a_resume() {
     let mut rig = Rig::new(
         "supersede-clear",
         crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
@@ -722,9 +711,9 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
     )
     .await;
 
-    // Recovery and fork launch from the switched conversation. A reported
-    // reference is the agent's own word, so the declared existence check does
-    // not run for it.
+    // Recovery launches from the switched conversation. A reported reference
+    // is the agent's own word, so the declared existence check does not run
+    // for it.
     rig.exit(&restarted).await;
     restarted.resume(rig.id()).await.expect("native recovery");
     wait_for_file_contains(&rig.marker, "--session\nconversation-cleared\n").await;
@@ -738,20 +727,6 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
         NativeReferenceProvenance::Reported,
     )
     .await;
-    let forked = restarted
-        .fork(fork_params(rig.id()))
-        .await
-        .expect("native fork");
-    wait_for_file_contains(&rig.marker, "--fork\nconversation-cleared\n").await;
-    assert_eq!(
-        rig.launch_argv(2),
-        fast_argv("--fork", "conversation-cleared")
-    );
-    assert_eq!(
-        forked.native_session_id, None,
-        "a fork learns its own reference"
-    );
-    restarted.stop(&forked.id).await.expect("stop the session");
     rig.finish(&restarted).await;
 }
 
@@ -874,7 +849,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
     )
     .await;
 
-    // Recovery and fork use the switched conversation.
+    // Recovery uses the switched conversation.
     rig.exit(&rig.registry).await;
     rig.registry
         .resume(rig.id())
@@ -891,17 +866,6 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         NativeReferenceProvenance::Reported,
     )
     .await;
-    let forked = rig
-        .registry
-        .fork(fork_params(rig.id()))
-        .await
-        .expect("native fork");
-    wait_for_file_contains(&rig.marker, "--fork\nconversation-two\n").await;
-    assert_eq!(rig.launch_argv(2), fast_argv("--fork", "conversation-two"));
-    rig.registry
-        .stop(&forked.id)
-        .await
-        .expect("stop the session");
     rig.finish(&rig.registry).await;
 }
 
@@ -1337,8 +1301,6 @@ enum Step {
     SwitchWhileDown,
     /// The agent exits and is resumed from its latest reference.
     ExitAndResume,
-    /// The latest conversation is forked.
-    Fork,
     /// The agent switches while no daemon runs and exits before the daemon
     /// returns; the ended session is then resumed.
     SwitchDownThenExit,
@@ -1356,7 +1318,7 @@ enum Step {
     ClaimThenPublicThenExit,
 }
 
-const STEPS: [Step; 15] = [
+const STEPS: [Step; 14] = [
     Step::Switch,
     Step::SwitchAfterLease,
     Step::PublicReport,
@@ -1366,7 +1328,6 @@ const STEPS: [Step; 15] = [
     Step::Restart,
     Step::SwitchWhileDown,
     Step::ExitAndResume,
-    Step::Fork,
     Step::SwitchDownThenExit,
     Step::SwitchViaWatcher,
     Step::PublicSequenceZero,
@@ -1400,8 +1361,8 @@ impl Rig {
     async fn restart_with(&mut self, while_down: Option<&str>) -> SessionRegistry {
         let report = self.registry.shutdown().await;
         assert!(report.is_quiescent(), "{report:?}");
-        // Every session of the dead daemon lets go of its worker, forks
-        // included, or a worker would keep serving its former controller.
+        // Every session of the dead daemon lets go of its worker, or a worker
+        // would keep serving its former controller.
         self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
         let entries: Vec<_> = self
             .registry
@@ -1499,8 +1460,8 @@ async fn held_reference(rig: &Rig) -> (Option<String>, Option<String>, bool) {
 
 /// Replays `history` against a fresh session and checks, after every step,
 /// that the session holds the latest accepted conversation, that no write of
-/// its own left a record the next startup rejects, and that resume and fork
-/// launch the latest conversation.
+/// its own left a record the next startup rejects, and that resume launches
+/// the latest conversation.
 #[expect(
     clippy::too_many_lines,
     reason = "one match drives every step kind so the invariants read in one place"
@@ -1668,27 +1629,6 @@ async fn run_history(seed: u64, history: &[Step]) {
                     latest = next;
                 }
             }
-            Step::Fork => {
-                let before = rig.launches();
-                let forked = rig
-                    .registry
-                    .fork(fork_params(rig.id()))
-                    .await
-                    .expect("fork");
-                wait_until("the forked launch", || async {
-                    (rig.launch_argv(before).len() >= LAUNCH_ARGV_LINES).then_some(())
-                })
-                .await;
-                assert_eq!(
-                    rig.launch_argv(before),
-                    fast_argv("--fork", latest.as_str()),
-                    "fork uses the latest reference: {at}"
-                );
-                rig.registry
-                    .stop(&forked.id)
-                    .await
-                    .expect("stop the session");
-            }
         }
         let (memory, durable, conflict) = held_reference(&rig).await;
         assert_eq!(memory.as_deref(), Some(latest.as_str()), "session: {at}");
@@ -1776,20 +1716,14 @@ async fn generated_histories_of_sweep_batch_four_keep_the_latest_conversation() 
 #[tokio::test]
 async fn orderings_found_in_review_hold() {
     use Step::{
-        ClaimThenPublicThenExit, ClaimThenPublicThenImport, ExitAndResume, Fork,
-        LoseProjectionWrites, PublicReport, PublicSequenceZero, ReplayOlderSnapshot, Restart,
-        Switch, SwitchAfterLease, SwitchDownThenExit, SwitchViaWatcher, SwitchWhileDown,
+        ClaimThenPublicThenExit, ClaimThenPublicThenImport, ExitAndResume, LoseProjectionWrites,
+        PublicReport, PublicSequenceZero, ReplayOlderSnapshot, Restart, Switch, SwitchAfterLease,
+        SwitchDownThenExit, SwitchViaWatcher, SwitchWhileDown,
     };
     let histories: [&[Step]; 13] = [
         // A crash after the record write, then a resume, then another crash.
         &[Switch, LoseProjectionWrites, Switch, ExitAndResume, Restart],
-        &[
-            LoseProjectionWrites,
-            PublicReport,
-            ExitAndResume,
-            Restart,
-            Fork,
-        ],
+        &[LoseProjectionWrites, PublicReport, ExitAndResume, Restart],
         // A switch made while the daemon was down, past the lease.
         &[
             Switch,
@@ -1799,7 +1733,7 @@ async fn orderings_found_in_review_hold() {
             ExitAndResume,
         ],
         // A switch before the first report of a recovered generation.
-        &[ExitAndResume, SwitchWhileDown, Restart, Fork],
+        &[ExitAndResume, SwitchWhileDown, Restart],
         &[
             Switch,
             ExitAndResume,
@@ -1815,7 +1749,7 @@ async fn orderings_found_in_review_hold() {
             ReplayOlderSnapshot,
         ],
         // A switch while the daemon is down, then an exit before it returns.
-        &[SwitchDownThenExit, Restart, Fork],
+        &[SwitchDownThenExit, Restart],
         &[Switch, SwitchDownThenExit, SwitchAfterLease, Restart],
         // The watcher imports a switch that only the durable reference carries.
         &[SwitchViaWatcher, SwitchAfterLease, Restart, ExitAndResume],

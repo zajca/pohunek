@@ -33,26 +33,27 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    session or host profile pins the digest; a pinned digest cannot be
    uninstalled (`package_referenced`). `package_retention_uncertain` means a line
    of `metadata.jsonl` that may pin a package cannot be read, so no digest can
-   be proven unpinned; listing and inspection keep working meanwhile. Run
-   `pohunek store rejected list`: it prints each such line with its number,
-   kind, whether it may pin a package, whether it may belong to a live runtime,
-   why it was rejected and its content hash (`pohunek doctor` reports the count
-   as `metadata_store_rejected_lines`). Then run
-   `pohunek store rejected set-aside <content-hash>`: the line moves, with an
-   audit record, into `metadata.rejected.jsonl` next to the store, and the
-   uninstall can be retried. A line that may belong to a session with a live
-   runtime, or a `resume` line whose pin cannot be read, is refused with `store_rejected_line_live`; stop that session, or
-   repeat with `--accept-pin-loss` once nothing depends on its package root.
-   The quarantine file is owner-private and never deleted by the daemon; to put
-   a line back, stop the daemon, append the record's `text` to `metadata.jsonl`
-   and start it. `pohunek service uninstall --purge` keeps and reports it. If
-   `set-aside` fails with `store_quarantine_failed` because the quarantine file
-   reached the store size limit or is not owner-private, stop the daemon, move
-   the file aside as a backup and start it; the next set-aside creates a new one. A
-   daemon that predates these commands has the manual remedy: stop it, move the
-   line out of `metadata.jsonl` into a backup file and start it, because a hand
-   edit while the daemon runs risks a short read and data loss at the next
-   rewrite.
+   be proven unpinned; listing and inspection keep working meanwhile.
+   `pohunek doctor` reports the count of such lines as
+   `metadata_store_rejected_lines`. Recover by hand while the daemon is
+   stopped, because a hand edit while the daemon runs risks a short read and
+   data loss at the next rewrite:
+   1. Stop the daemon (`systemctl --user stop pohunek-<ns>-daemon.service` on
+      Linux; on macOS stop the `io.github.zajca.pohunek.<ns>.daemon` launchd
+      job).
+   2. Open `metadata.jsonl` in the store directory and find the lines the
+      daemon rejected, which its startup WARN logs report. A rejected line
+      stays in the file unchanged.
+   3. Move the line, keeping its text exactly, into `metadata.rejected.jsonl`
+      next to the store (create it owner-private with mode `0600` if it does
+      not exist), and delete it from `metadata.jsonl`. The daemon never reads
+      or deletes `metadata.rejected.jsonl`. A line that may belong to a session
+      with a live runtime, or a `resume` line whose pin cannot be read, may pin
+      a package root: move it only once nothing depends on that package root.
+   4. Start the daemon and retry the uninstall. To put a line back, stop the
+      daemon, append its text to `metadata.jsonl` and start it.
+      `pohunek service uninstall --purge` keeps and reports the quarantine
+      file.
 2. Match each finding (implemented in
    `crates/daemon/src/packages/` and
    `crates/package/src/registry.rs`):
@@ -239,16 +240,16 @@ while the root is modified.
 - `runtime_served_by_package`: the session was launched from a built-in
   runtime, and an official package serves that id, but the package does not
   honor the session's recovery binding (or the record names no package, as in a
-  v0.33.0 record). Resume and fork are refused; start a new session on the
+  v0.33.0 record). Resume is refused; start a new session on the
   package.
 - `runtime_builtin_removed`: the session was launched from the built-in Codex,
   Claude Code or Hermes runtime of an earlier release, which this daemon does
-  not compile in, and no package serves its runtime id. Resume, fork and every
+  not compile in, and no package serves its runtime id. Resume and every
   interaction (input, attach, resize, rename, metadata) are refused; only stop
   and remove work. Install the official package from the release archive (the
   hint names the command): the package then adopts the session, a live session
-  accepts input again, and resume and fork run through the package when it
-  honors the recovery contract. A Hermes fork answers `agent_fork_unsupported`.
+  accepts input again, and resume runs through the package when it
+  honors the recovery contract.
   If the package does not honor the contract, continue in a new session with
   `pohunek session new --agent <runtime>` (`codex`, `claude` or `hermes`).
   Install the Codex or Claude Code package on the earlier release before

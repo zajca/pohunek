@@ -47,10 +47,6 @@ supported = true
 reference_kind = "id"
 args = ["--resume", "{reference}"]
 
-[fork]
-supported = true
-args = ["--resume", "{reference}", "--fork-session"]
-
 # Claude chooses the conversation id itself; the SessionStart hook of the
 # integration reports it. Recovery verifies the transcript file the report
 # names exists before it launches: one project directory below `projects`.

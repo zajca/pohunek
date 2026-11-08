@@ -327,15 +327,6 @@ fn the_resume_command_reaches_the_peer_the_name_first_selected() {
 }
 
 #[test]
-fn the_fork_command_reaches_the_peer_the_name_first_selected() {
-    assert_pinned(
-        "fork",
-        &["fork", SESSION_NAME, "--json"],
-        protocol::method::SESSION_FORK,
-    );
-}
-
-#[test]
 fn the_rm_command_reaches_the_peer_the_name_first_selected() {
     assert_pinned(
         "rm",

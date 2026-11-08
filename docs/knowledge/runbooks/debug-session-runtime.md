@@ -39,7 +39,7 @@ Start with public, non-destructive inspection:
    `pohunek-hooks.jsonl` plus one rotation (at most 2 MiB) is the hook failure
    trace of every session on the host (see below).
 
-A `session.new` or fork that fails before any runtime exists reports one of
+A `session.new` that fails before any runtime exists reports one of
 these codes instead of a runtime state:
 
 - `worker_socket_path_invalid`: the worker socket below the daemon's runtime
@@ -395,24 +395,24 @@ intact, because the daemon cannot tell which conversation the agent last used.
 Resume the newer conversation in a fresh session with
 `<agent> --resume <resolved-id>` or clear the journal discrepancy in the
 session's own generation before retrying; never delete the journal.
-For Claude, `runtime/agent_native_reference_missing` on resume or fork means
+For Claude, `runtime/agent_native_reference_missing` on resume means
 the selected conversation's regular transcript file could not be verified
 under the effective Claude config home. Restore or inspect the transcript tree
-before retrying; the refused operation creates no new worker or fork child.
+before retrying; the refused operation creates no new worker.
 `runtime/agent_native_store_relocated` means the agent would keep its
 conversations outside the store its recovery checks (for Pi: `--session-dir`
 in the profile `args`, a `sessionDir` setting, or a relative
 `PI_CODING_AGENT_SESSION_DIR`); nothing was launched. On `session new`, follow
 the `recover` hint: set the named variable in the profile `[env]` to the
-absolute directory, or remove the argument. On resume or fork the launch had
+absolute directory, or remove the argument. On resume the launch had
 passed the same refusal, so something changed since: a setting appeared, or
 the variable the launch had is gone (a daemon restart without it, an accepted
 profile edit). Undo that change: remove the setting (or make the settings file
 readable JSON again), or restore the variable to the absolute path the session
 was launched with and pass `--accept-profile-change`; pointing the variable at
 a new directory does not find the conversation.
-`daemon/native_store_check_task_panicked` on `session new`, resume or fork
-means the native reference check itself crashed (on resume and fork it covers
+`daemon/native_store_check_task_panicked` on `session new` or resume
+means the native reference check itself crashed (on resume it covers
 the whole check, Claude's transcript check included); nothing was launched,
 and the daemon log has the panic.
 
@@ -462,7 +462,7 @@ and the daemon log has the panic.
   could not complete (no launch spec, for example a deleted profile or a profile
   without native resume; the session carries a `native_recovery` warning) does
   not block adoption: the worker is adopted `live` and `screen`, `input`, and
-  `stop` work; only resume and fork stay unavailable.
+  `stop` work; only resume stays unavailable.
   `pohunek session stop <id>` on a `conflict` stops the supervised job by the
   identity the record names instead of refusing. Before anything is written it
   proves that the journal of the recorded generation names the recorded worker

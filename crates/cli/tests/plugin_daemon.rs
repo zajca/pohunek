@@ -1421,7 +1421,7 @@ async fn update_compares_official_versions_by_precedence_ignoring_build_metadata
 }
 
 #[tokio::test]
-async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_session_with() {
+async fn session_list_names_the_code_resume_refuses_a_damaged_package_session_with() {
     let harness = Harness::start().await;
     let built = harness.archive("1.0.0");
     install_enabled(&harness, &built).await;
@@ -1433,7 +1433,7 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
         .to_owned();
     assert_eq!(
         created["ok"]["capabilities"],
-        serde_json::json!({"resume": true, "fork": true}),
+        serde_json::json!({"resume": true, "fork": false}),
         "{created}"
     );
     assert!(
@@ -1451,9 +1451,6 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
     let resume_code = resumed["err"]["code"]
         .as_str()
         .expect("resume refusal code");
-    let (code, forked) = harness.json(&["session", "fork", &id]).await;
-    assert_eq!(code, 1, "{forked}");
-    let fork_code = forked["err"]["code"].as_str().expect("fork refusal code");
 
     let (code, listed) = harness.json(&["session", "list"]).await;
     assert_eq!(code, 0, "{listed}");
@@ -1471,13 +1468,13 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
     );
     assert_eq!(
         session["capability_refusals"],
-        serde_json::json!({"resume": resume_code, "fork": fork_code}),
+        serde_json::json!({"resume": resume_code}),
         "{session}"
     );
 
     let human = harness.run(&["session", "list"]).await;
     assert_eq!(human.status.code(), Some(0), "{}", stderr_text(&human));
-    let line = format!("refused {id}: resume={resume_code} fork={fork_code}");
+    let line = format!("refused {id}: resume={resume_code}");
     assert!(
         stdout_text(&human)
             .lines()

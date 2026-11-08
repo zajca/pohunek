@@ -14,19 +14,18 @@ use serde_json::json;
 const TASK_CODE_PREFIXES: [&str; 3] = ["task_", "worktree_", "check_"];
 
 /// Codes that exist outside the task layer and must never be reused by it.
-const PRE_TASK_CODES: [&str; 6] = [
+const PRE_TASK_CODES: [&str; 5] = [
     "worktree_branch_in_use",
     "worktree_path_conflict",
     "worktree_store_error",
     "worktree_add_failed",
     "session_waiter_limit_reached",
-    "agent_fork_unsupported",
 ];
 
 /// Exact fixed `msg` and `recover` text of every task-layer error; the public
 /// contract promises both as fixed text, so a reworded constructor must update
 /// this table deliberately.
-const TASK_ERROR_TEXTS: [(&str, &str, Option<&str>); 34] = [
+const TASK_ERROR_TEXTS: [(&str, &str, Option<&str>); 33] = [
     (
         "worktree_users_changed",
         "the expected worktree users differ from the current set",
@@ -183,11 +182,6 @@ const TASK_ERROR_TEXTS: [(&str, &str, Option<&str>); 34] = [
         Some("omit checks and checks_baseline and rely on the executor task's checks"),
     ),
     (
-        "task_fork_unsupported",
-        "the task's agent cannot fork its session",
-        Some("start a new task on the same worktree with worktree_of"),
-    ),
-    (
         "task_investigate_unsupported",
         "the selected profile cannot enforce investigation mode",
         Some("select a profile that can enforce investigation mode"),
@@ -203,7 +197,7 @@ const TASK_ERROR_TEXTS: [(&str, &str, Option<&str>); 34] = [
 type Case = (fn() -> ProtocolError, &'static str, ErrorClass, bool);
 
 /// Every task-layer error constructor with its expected wire identity.
-const TASK_ERRORS: [Case; 34] = [
+const TASK_ERRORS: [Case; 33] = [
     (
         ProtocolError::task_turn_open,
         "task_turn_open",
@@ -387,12 +381,6 @@ const TASK_ERRORS: [Case; 34] = [
     (
         ProtocolError::task_investigate_no_checks,
         "task_investigate_no_checks",
-        ErrorClass::Runtime,
-        true,
-    ),
-    (
-        ProtocolError::task_fork_unsupported,
-        "task_fork_unsupported",
         ErrorClass::Runtime,
         true,
     ),

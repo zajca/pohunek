@@ -62,10 +62,6 @@ tracing = { workspace = true }
 time = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
-# Run identifiers of workflow plugin runs (`pohunek workflow run`).
-ulid = { workspace = true }
-# The bounded per-plugin run log of workflow plugin runs.
-pohunek-logging = { workspace = true }
 
 [lints]
 workspace = true
@@ -101,6 +97,8 @@ ed25519-dalek = { workspace = true }
 # `release_upgrade.rs` reads the previous release's archive, whose frame the
 # current encoder does not reproduce, without the strict canonical reader.
 ruzstd = { workspace = true }
+# `session_process_api.rs` writes daemon log files with the real writer.
+pohunek-logging = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["async-secret-service", "tokio", "crypto-rust"] }

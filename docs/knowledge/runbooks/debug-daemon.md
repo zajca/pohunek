@@ -391,7 +391,7 @@ the store was written in. A store this build cannot use (a newer
 left untouched and the daemon keeps running with notifications unavailable:
 `notification.*` calls answer `notifications_unavailable`, the daemon log says
 "notifications are unavailable", turn signals for `session.wait_turn` still
-work, and idle stop holds every session. Recover by running a build that reads
+work. Recover by running a build that reads
 the store, or by moving the `notifications/` directory aside and restarting the
 daemon; nothing is deleted or rewritten automatically. All three are host-local; `--all-hosts`
 commands perform client-side fan-out rather than reading a shared store.

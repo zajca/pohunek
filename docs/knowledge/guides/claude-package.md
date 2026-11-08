@@ -59,12 +59,12 @@ On a host without the package nothing serves `claude`:
   is not attributed to Claude Code: process recognition and transcript
   observation read the package's `detect.toml` and `[transcripts]` table.
 - A session the built-in Claude of an earlier release launched is refused on
-  resume, fork and every interaction (input, attach, resize, rename, metadata)
+  resume and every interaction (input, attach, resize, rename, metadata)
   with `runtime_builtin_removed`, whose hint names the install; only stop and
   remove still work. With the package installed, the package adopts the session,
-  live or stopped, and resume and fork run through it when it honors the
+  live or stopped, and resume runs through it when it honors the
   session's recovery contract (same native reference kind, hook-reported
-  reference; fork also needs fork support). A session whose contract the package
+  reference). A session whose contract the package
   cannot honor answers `runtime_served_by_package`, and no command rebinds the
   session to another runtime source. `pohunekd upgrade-preflight` reports an adoptable
   session as `adoptable`, and a session that no package adopts as
@@ -125,11 +125,10 @@ enumerated captured frames may read differently.
   are accepted by policy, not verified. Moving `min` is a lock and descriptor change made together after a
   real-Claude run of the new release.
 - Session name: `requires = ["naming-launch-args-v1"]` and `[naming] launch_args
-  = ["--name={session_name}"]`, so a launch, resume or fork of a named session
+  = ["--name={session_name}"]`, so a launch or resume of a named session
   runs `claude … --name=<name>` ([below](#session-name)); a core older than 0.39
   refuses the package.
-- Native reference: `strategy = "hook"`; resume is `claude --resume <id>`; fork
-  is `claude --resume <id> --fork-session`.
+- Native reference: `strategy = "hook"`; resume is `claude --resume <id>`.
 - Integration: handler `claude-hook-v1` with hook schema
   `identity-subagent-v1`. The package names the compiled handler and schema; the
   hook reporter scripts stay core-owned, so the archive carries no asset.
@@ -161,9 +160,9 @@ enumerated captured frames may read differently.
 Every launch of a named pohunek session passes the name as one joined argument,
 `--name=<name>`, so a name that starts with a dash (`--help`) is a value and
 never an option. The arguments follow the descriptor's own and precede the
-resume or fork arguments and the prompt; a session without a name passes none.
+resume arguments and the prompt; a session without a name passes none.
 They are rendered at each launch and never stored, so a resume carries the name
-the session has now and a fork its own name.
+the session has now.
 
 Recorded on Claude Code 2.1.289 (the lock minimum) and 2.1.309 (the lock), real
 binaries from the npm packages in throwaway pohunek sessions (hermetic home,
@@ -206,9 +205,6 @@ loopback Messages stub, dummy key; scenario
 - Resume: the name of the `--name` argument is the one shown. After a
   `session rename` to `beta`, a resume runs `--name=beta --resume <id>` and
   Claude shows `beta`, although the conversation started as `alpha`.
-- Fork: `--name=gamma --resume <id> --fork-session` shows `gamma`, the fork's
-  own name; a fork without a name passes none. Claude adds no fork suffix when
-  the name is given.
 - Collision: a second live session started as `alpha` becomes
   `alpha-<adjective>-<noun>` (for example `alpha-iterative-muffin`), and Claude
   prints `Another live session on this machine goes by "alpha", so this session
@@ -236,12 +232,12 @@ env = { CLAUDE_CODE_FORCE_SYNC_OUTPUT = "1" }
 The inline table is the profile's `[env]` table; add the pair to an `[env]`
 table the profile already has instead of declaring the table twice.
 
-The variable applies to every create, resume and fork of that profile and
+The variable applies to every create and resume of that profile and
 reaches only that profile's Claude. It is undocumented by Anthropic, so a Claude
 Code release may rename or drop it, which turns the fix off without warning.
 Editing a profile's `[env]` makes its existing sessions ask for
 `--accept-profile-change` on the next resume (see [agent
-profiles](../concepts/agent-profiles.md#resuming-and-forking-a-profile-backed-session)).
+profiles](../concepts/agent-profiles.md#resuming-a-profile-backed-session)).
 Whether Claude enables synchronized output by itself when the terminal answers
 a mode 2026 query is not verified here.
 
@@ -309,14 +305,7 @@ captured screen through the package manifest.
   launch process as the reporter, so the conversation id becomes the session's
   native reference and names Claude's transcript file
   (`projects/<folder>/<id>.jsonl`). Unlike Codex there is no nested reporter.
-- Resume starts `claude --resume <id>` and fork starts `claude --resume <id>
-  --fork-session`; both were checked on the process command line of a real run.
-- A fork is a new conversation: Claude fires SessionStart for it (`source:
-  fork`) with the fork's own conversation id. The forked session holds no
-  reference until its launch process reports one, so that id becomes the fork's
-  native reference while the source keeps its own, and resuming the fork starts
-  `claude --resume <fork id>` without `--fork-session`
-  (`a_real_claude_resumes_and_forks_with_the_descriptor_arguments`).
+- Resume starts `claude --resume <id>`; this was checked on the process command line of a real run.
 - A subagent the model starts through the `Task` tool is reported by the
   SubagentStart and SubagentStop hooks (`identity-subagent-v1`) as a Claude
   subagent that runs and then completes.
@@ -376,8 +365,7 @@ captured screen through the package manifest.
 - The `session` action (Claude `SessionStart`) forwards the hook input `source`
   as `session_source` in its identity report only when it is `startup`,
   `resume`, `clear` or `compact`; any other value, or none, omits the key.
-  `fork` is not forwarded: a forked session is a new process and must not clear
-  the snapshot of the session it was forked from. A `SessionStart` from another
+  A `SessionStart` from another
   process clears the snapshot; `startup` and `resume` of the same process clear
   it too, while `clear` and `compact` keep it.
 - The `release` action (Claude `SessionEnd`) forwards the hook input `reason` as
@@ -492,7 +480,7 @@ started through the `claude` launcher symlink is named `claude`; either way the
 command line names `claude` or the image, which the manifest's process matchers
 accept. The worker designates such an image as the launch agent (a resolved
 executable in a `claude/versions/` directory), which `SessionStart` binding
-needs. The real-claude scenarios (SessionStart, resume, fork, UserPromptSubmit,
+needs. The real-claude scenarios (SessionStart, resume, UserPromptSubmit,
 program status) pass against 2.1.309 started from the npm layout
 (`bin/claude.exe`) and from a local copy of the native layout built from the
 locked native binary (`claude/versions/<release>` plus a launcher symlink).
@@ -577,8 +565,8 @@ established by the network namespace, not by Claude's own switches.
   v0.34.2 built-in Claude goldens in `compat/claude/builtin-v0.34/` (as parsed
   definitions, as TOML data, and by feeding both manifests every captured frame,
   title and synthetic dialog; the manifest differences and the frames they
-  reclassify are enumerated, each with what the package reads), checks resume and
-  fork argv, requires the supported range to equal
+  reclassify are enumerated, each with what the package reads), checks resume
+  argv, requires the supported range to equal
   `compat/claude/compatibility-lock.json`, reads the version banner, runs the
   title, screen and process rules, and asserts the `--sha256` install refusal
   above.
@@ -632,7 +620,7 @@ established by the network namespace, not by Claude's own switches.
   gate opens, so the working screen is stable), a reply held mid-stream (it
   must not read idle for longer than two title changes), the SessionStart
   reference and its transcript,
-  resume and fork argv, the subagent hooks (the same subagent must reach
+  resume argv, the subagent hooks (the same subagent must reach
   `completed` while the parent runtime is live), and the approval dialog. The
   subagent tracking of #883 has three more:
   `a_resumed_real_claude_background_agent_keeps_one_row_through_both_runs`
@@ -674,7 +662,7 @@ established by the network namespace, not by Claude's own switches.
   archive with `cargo xtask package build` and runs that file.
 
 Update procedure for a new Claude Code release: install it, rerun the
-real-Claude tests (the SessionStart, resume, fork and UserPromptSubmit scenarios
+real-Claude tests (the SessionStart, resume and UserPromptSubmit scenarios
 on both the npm and the native layout first), recapture the screens and the
 `.program-status` sequences, move the previous captures to `screens/n-1/`
 (deleting the older set), move the lock (release, SHA-256), raise the

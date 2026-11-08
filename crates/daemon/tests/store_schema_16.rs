@@ -4,7 +4,7 @@
 //! The schema-15 fixture is a lost Pi session in the shape the schema-15 daemon
 //! writes: its binding records no launch checkout, which the current schema
 //! reads as none and never backfills from the session's directory. The
-//! schema-16 fixture records the directory and project the session was created
+//! current-schema fixture records the directory and project the session was created
 //! in, and both survive a rewrite of the store.
 
 // Rust guideline compliant 2026-11-06
@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 const SCHEMA_15: &str = include_str!("../src/store/fixtures/schema-15/metadata.jsonl");
-const SCHEMA_16: &str = include_str!("../src/store/fixtures/schema-16/metadata.jsonl");
+const SCHEMA_17: &str = include_str!("../src/store/fixtures/schema-17/metadata.jsonl");
 
 fn fixture_store(root: &std::path::Path, contents: &str) -> Store {
     let path = root.join("metadata.jsonl");
@@ -60,7 +60,7 @@ fn schema_15_sessions_migrate_without_inventing_a_launch_checkout() {
 #[test]
 fn a_recorded_launch_checkout_loads_and_survives_a_rewrite() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let store = fixture_store(root.path(), SCHEMA_16);
+    let store = fixture_store(root.path(), SCHEMA_17);
     let expected = Some(Box::new(LaunchCheckout {
         cwd: PathBuf::from("/fixture"),
         project_id: Some("p-fixture".to_owned()),

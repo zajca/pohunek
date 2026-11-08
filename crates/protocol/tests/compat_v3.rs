@@ -121,11 +121,9 @@ fn method_table() -> Vec<(&'static str, Roundtrip, Roundtrip)> {
         HostGovernanceInspect,
         SessionNew,
         SessionList,
-        SessionRuntimeInventory,
         SessionInspect,
         SessionStop,
         SessionResume,
-        SessionFork,
         SessionRemove,
         SessionRemoveAcceptingUnconfirmed,
         SessionAttach,
@@ -144,8 +142,6 @@ fn method_table() -> Vec<(&'static str, Roundtrip, Roundtrip)> {
         SessionSetMetadata,
         SessionRename,
         SessionDiff,
-        SessionPolicyGet,
-        SessionPolicySet,
         SessionRetentionSweep,
         IntegrationInstall,
         IntegrationStatus,
@@ -455,17 +451,6 @@ fn session_input_prompt_opt_in_is_dropped_for_protocol_3_not_refused() {
             .expect("a request without a wait"),
         waitless
     );
-}
-
-#[test]
-fn session_fork_gains_an_optional_override_that_protocol_3_requests_never_carry() {
-    use protocol::SessionForkParams;
-
-    let golden = json!({"session_id": "s-42", "cols": 80, "rows": 24});
-    let upgraded = request_params(v3(), method::SESSION_FORK, golden.clone()).expect("upgrade");
-    assert_eq!(upgraded, golden);
-    let decoded: SessionForkParams = serde_json::from_value(upgraded).expect("decode");
-    assert!(!decoded.accept_profile_change);
 }
 
 #[test]

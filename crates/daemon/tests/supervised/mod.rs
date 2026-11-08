@@ -52,9 +52,9 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::{bin_exe, worker_binary};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 use protocol::{
-    method, AttachHeader, CwdSource, RuntimeInventoryResult, RuntimeRef, RuntimeState,
-    SessionAttachParams, SessionCapabilities, SessionId, SessionInfo, SessionNewParams,
-    SessionRuntime, SessionState, StateSource,
+    method, AttachHeader, CwdSource, RuntimeRef, RuntimeState, SessionAttachParams,
+    SessionCapabilities, SessionId, SessionInfo, SessionNewParams, SessionRuntime, SessionState,
+    StateSource,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
@@ -498,15 +498,6 @@ impl Installation {
             .expect("list sessions")
     }
 
-    /// Reads the daemon's runtime inventory.
-    pub(crate) async fn inventory(&self) -> RuntimeInventoryResult {
-        self.client()
-            .await
-            .call::<method::SessionRuntimeInventory>(())
-            .await
-            .expect("read the runtime inventory")
-    }
-
     /// Waits until the session's runtime reaches `state`.
     pub(crate) async fn wait_runtime(&self, session_id: &str, state: RuntimeState) -> SessionInfo {
         explained(&format!("{session_id} runtime {state:?}"), || async {
@@ -884,7 +875,6 @@ impl Installation {
                 NativeSessionLaunch::from_templates(
                     SessionRefKind::Id,
                     &["--resume", "{reference}"],
-                    None,
                 )
                 .expect("valid resume template"),
             ),

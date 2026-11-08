@@ -9,7 +9,6 @@ import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   LIFECYCLE_STEP_BOUND_MS,
   RESUME_SWEEP_PASSES,
-  SESSION_FORK_REQUEST_BUDGET_MS,
   SESSION_NEW_REQUEST_BUDGET_MS,
   SESSION_REMOVE_REQUEST_BUDGET_MS,
   SESSION_RESUME_REQUEST_BUDGET_MS,
@@ -38,7 +37,7 @@ const SCENARIO_TIMEOUT_MS = 10_000;
 const fixturePath = join(dirname(fileURLToPath(import.meta.url)), "fixtures/lifecycle-budgets.json");
 
 interface LifecycleCase {
-  readonly method: "session.resume" | "session.fork" | "session.stop" | "session.remove" | "session.remove_accepting_unconfirmed";
+  readonly method: "session.resume" | "session.stop" | "session.remove" | "session.remove_accepting_unconfirmed";
   readonly params: unknown;
   readonly result: unknown;
   readonly kind: ClientErrorKind;
@@ -52,13 +51,6 @@ const LIFECYCLE_CASES: readonly LifecycleCase[] = [
     result: { session: minimalSessionInfo() },
     kind: "sessionResumeOutcomeUnknown",
     code: "session_resume_outcome_unknown",
-  },
-  {
-    method: "session.fork",
-    params: { session_id: "s-target", cwd_mode: "same", cols: 80, rows: 24 },
-    result: minimalSessionInfo(),
-    kind: "sessionForkOutcomeUnknown",
-    code: "session_fork_outcome_unknown",
   },
   {
     method: "session.stop",
@@ -130,7 +122,6 @@ describe("lifecycle response budgets", () => {
       resume_sweep_passes: RESUME_SWEEP_PASSES,
       session_new_request_budget_ms: SESSION_NEW_REQUEST_BUDGET_MS,
       session_resume_request_budget_ms: SESSION_RESUME_REQUEST_BUDGET_MS,
-      session_fork_request_budget_ms: SESSION_FORK_REQUEST_BUDGET_MS,
       session_stop_request_budget_ms: SESSION_STOP_REQUEST_BUDGET_MS,
       worktree_hook_timeout_ms: WORKTREE_HOOK_TIMEOUT_MS,
       session_remove_request_budget_ms: SESSION_REMOVE_REQUEST_BUDGET_MS,
@@ -197,21 +188,6 @@ describe("lifecycle response budgets", () => {
       }
     }, SCENARIO_TIMEOUT_MS);
   }
-
-  test("a retried fork is named as creating a second child in the recover hint", async () => {
-    const daemon = await startLifecycleDaemon(minimalSessionInfo());
-    try {
-      const client = await connect(daemon, { requestTimeoutMs: EXPLICIT_REQUEST_TIMEOUT_MS });
-      await client.call("daemon.health", null);
-      const error = await expectClientError(
-        client.call("session.fork", LIFECYCLE_CASES[1]!.params as never),
-      );
-      expect(error.recoverHint()).toContain("second child");
-      await client.close();
-    } finally {
-      await daemon.close();
-    }
-  }, SCENARIO_TIMEOUT_MS);
 
   test("session.new with the largest input_ack_timeout_ms outlasts the creation budget", async () => {
     const created = {

@@ -798,7 +798,6 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         protocol::method::SESSION_INSPECT => {
             session_for_scenario(SESSION_ID, Some(SESSION_NAME), scenario)
         }
-        protocol::method::SESSION_FORK => session(SESSION_ID, Some(SESSION_NAME)),
         protocol::method::SESSION_SCREEN => json!({
             "session_id": SESSION_ID,
             "worker_id": "worker-fixture-1",
@@ -838,15 +837,6 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         | protocol::method::SESSION_RENAME => {
             json!({"session": session(SESSION_ID, Some(SESSION_NAME))})
         }
-        protocol::method::SESSION_RUNTIME_INVENTORY => json!({
-            "entries": [{
-                "runtime_slot": "slot-fixture-1",
-                "claimed_session_id": SESSION_ID,
-                "worker_id": "worker-fixture-1",
-                "worker_instance_id": "runtime-fixture-1",
-                "status": "managed"
-            }]
-        }),
         protocol::method::SESSION_NEW => {
             let mut result = session(SESSION_ID, Some(SESSION_NAME));
             result["applied_input"] = json!(true);
@@ -1362,10 +1352,6 @@ const PLUGIN_COMMAND_CASES: &[(&[&str], &str)] = &[
         protocol::method::SESSION_INSPECT,
     ),
     (
-        &["session", "fork", SESSION_ID, "--json"],
-        protocol::method::SESSION_FORK,
-    ),
-    (
         &["session", "screen", SESSION_ID, "--json"],
         protocol::method::SESSION_SCREEN,
     ),
@@ -1440,10 +1426,6 @@ const PLUGIN_COMMAND_CASES: &[(&[&str], &str)] = &[
         &["session", "rename", SESSION_ID, "renamed", "--json"],
         protocol::method::SESSION_RENAME,
     ),
-    (
-        &["session", "runtime-inventory", "--json"],
-        protocol::method::SESSION_RUNTIME_INVENTORY,
-    ),
 ];
 
 #[test]
@@ -1457,10 +1439,7 @@ fn plugin_commands_have_binary_level_json_and_wire_parity() {
         assert_typed_session_json(expected_method, &ok);
         let command = requests.last().expect("captured command request");
         assert_eq!(command.method(), *expected_method);
-        if matches!(
-            *expected_method,
-            protocol::method::SESSION_NEW | protocol::method::SESSION_RUNTIME_INVENTORY
-        ) {
+        if matches!(*expected_method, protocol::method::SESSION_NEW) {
             assert_eq!(requests.len(), 1, "command needs no name resolution");
         } else {
             assert_eq!(
@@ -1470,9 +1449,7 @@ fn plugin_commands_have_binary_level_json_and_wire_parity() {
         }
         if !matches!(
             *expected_method,
-            protocol::method::SESSION_NEW
-                | protocol::method::SESSION_LIST
-                | protocol::method::SESSION_RUNTIME_INVENTORY
+            protocol::method::SESSION_NEW | protocol::method::SESSION_LIST
         ) {
             // The canned fixture response names `SESSION_ID` whatever the
             // request carried, so only the captured params show the parsed target.
@@ -1490,7 +1467,6 @@ fn requested_session_id(request: &Request) -> String {
     }
     let session_id = match request.method() {
         protocol::method::SESSION_INSPECT => decode::<protocol::SessionId>(request),
-        protocol::method::SESSION_FORK => decode::<protocol::SessionForkParams>(request).session_id,
         protocol::method::SESSION_SCREEN => decode::<protocol::SessionScreenParams>(request)
             .session_id()
             .clone(),
@@ -1525,9 +1501,7 @@ fn requested_session_id(request: &Request) -> String {
 
 fn assert_typed_session_json(method: &str, ok: &Value) {
     match method {
-        protocol::method::SESSION_NEW
-        | protocol::method::SESSION_INSPECT
-        | protocol::method::SESSION_FORK => {
+        protocol::method::SESSION_NEW | protocol::method::SESSION_INSPECT => {
             let _: protocol::SessionInfo = serde_json::from_value(ok.clone())
                 .unwrap_or_else(|error| panic!("{method} typed JSON: {error}"));
             assert_eq!(ok["runtime"]["runtime_id"], "runtime-fixture-1");
@@ -1586,10 +1560,6 @@ fn assert_typed_session_json(method: &str, ok: &Value) {
             let _: protocol::SessionInputResult =
                 serde_json::from_value(ok.clone()).expect("strict typed session input JSON");
             assert!(ok["runtime"].get("runtime_id").is_none());
-        }
-        protocol::method::SESSION_RUNTIME_INVENTORY => {
-            let _: protocol::RuntimeInventoryResult =
-                serde_json::from_value(ok.clone()).expect("typed runtime inventory JSON");
         }
         method => panic!("unexpected tested method: {method}"),
     }
@@ -2647,22 +2617,6 @@ fn assert_cli_usage_error(args: &[&str], message: &str) {
     assert!(
         !home.socket().exists(),
         "argument validation must not start or contact a daemon"
-    );
-}
-
-#[test]
-fn session_policy_set_requires_a_field_on_the_cli() {
-    assert_cli_usage_error(
-        &["session", "policy", "set"],
-        "required arguments were not provided",
-    );
-}
-
-#[test]
-fn session_policy_set_rejects_conflicting_flags_on_the_cli() {
-    assert_cli_usage_error(
-        &["session", "policy", "set", "--enabled", "--disabled"],
-        "cannot be used with",
     );
 }
 

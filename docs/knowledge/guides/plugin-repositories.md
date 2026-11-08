@@ -2,19 +2,18 @@
 type: Guide
 id: guide/plugin-repositories
 title: Plugin repositories
-description: Where a new runtime package or workflow plugin lives, how its repository and package id are named, the CI and compatibility declaration it carries, how the plugin index admits it, how a core release snapshots the official set, and where its documentation lives.
+description: Where a new runtime package lives, how its repository and package id are named, the CI and compatibility declaration it carries, how the plugin index admits it, how a core release snapshots the official set, and where its documentation lives.
 source_kind: manual
 intents: [setup, update, help]
 ---
 
 # Plugin repositories
 
-A plugin is a runtime package or a workflow plugin. A new plugin is never added
+A plugin is a runtime package. A new plugin is never added
 to the core repository `zajca/pohunek`: it lives in its own repository and
 becomes installable by id through the plugin index. This page is the rule and
 its details. The mechanics of installing a package are in the
-[runtime packages guide](runtime-packages.md) and the
-[workflow plugins guide](workflow-plugins.md).
+[runtime packages guide](runtime-packages.md).
 
 ## What is available when
 
@@ -33,7 +32,7 @@ adds one (`plugin-directories`).
 
 | Tier | Repository | Package id | Created by |
 |---|---|---|---|
-| Official | `pohunekd/plugin-<name>` | `pohunek.runtime.<runtime_id>` or `pohunek.workflow.<name>` | The owner, from `pohunekd/pohunek-plugin-template` |
+| Official | `pohunekd/plugin-<name>` | `pohunek.runtime.<runtime_id>` | The owner, from `pohunekd/pohunek-plugin-template` |
 | Third party | `<owner>/pohunek-plugin-<name>` in the author's account | Outside `pohunek.*`, for example `<owner>.runtime.<id>` | The author, from the template |
 
 Only the owner creates `pohunekd/*` repositories. An agent proposes one in an
@@ -45,20 +44,16 @@ issue and waits for the grant. The `pohunek.` namespace and the
 - An official plugin repository is `pohunekd/plugin-<name>`.
   - `<name>` matches `^[a-z][a-z0-9]*(-[a-z0-9]+)*$` and is 2-32 characters
     long.
-  - For a runtime package, `<name>` is the upstream product's name in
-    kebab-case: `plugin-claude-code`, `plugin-codex`, `plugin-pi`,
-    `plugin-hermes`. For a workflow plugin it is the plugin's function:
-    `plugin-work-queue`.
-  - `<name>` never contains `pohunek`, `plugin`, `runtime` or `workflow`. The
-    kind is recorded in the manifest and in the topics.
+  - `<name>` is the upstream product's name in kebab-case:
+    `plugin-claude-code`, `plugin-codex`, `plugin-pi`, `plugin-hermes`.
+  - `<name>` never contains `pohunek`, `plugin` or `runtime`.
 - One repository holds one plugin and builds one package id. A release is
   tagged `v<package version>` (semver).
-- Package ids are `pohunek.runtime.<runtime_id>` and
-  `pohunek.workflow.<name>`. The runtime id is the `--agent` value and may
+- The package id is `pohunek.runtime.<runtime_id>`. The runtime id is the `--agent` value and may
   differ from `<name>`: `plugin-claude-code` builds `pohunek.runtime.claude`.
   The README's first table maps the repository, the package id, the runtime id
   and the upstream.
-- Topics: `pohunek-plugin`, plus `pohunek-runtime` or `pohunek-workflow`.
+- Topics: `pohunek-plugin` and `pohunek-runtime`.
 - Supporting repositories use the `pohunek-plugin-` prefix:
   `pohunekd/pohunek-plugin-template`, `pohunekd/pohunek-plugin-kit` and
   `pohunekd/pohunek-plugin-index`.
@@ -69,8 +64,7 @@ issue and waits for the grant. The `pohunek.` namespace and the
 
 A plugin repository created from the template holds:
 
-- the descriptor (`runtime.toml` and `detect.toml`) for a runtime package, or
-  `workflow.toml` and its payload for a workflow plugin;
+- the descriptor (`runtime.toml` and `detect.toml`) of the runtime package;
 - the upstream lock for a runtime package, which pins the upstream release the
   package is proven against;
 - a README whose first table maps the repository, the package id, the runtime

@@ -14,7 +14,7 @@
 //!   `subagent_state` events) or flattened into the result itself
 //!   (`session.output`, `session.screen`, `session.read`);
 //! - `SessionRuntime`, the `runtime` object of every `SessionInfo` (nested as
-//!   `session`, flattened into the `session.new` and `session.fork` results, or
+//!   `session`, flattened into the `session.new` result, or
 //!   returned bare by `session.inspect` and `session.list`);
 //! - `RuntimeInventoryEntry`;
 //! - the `session.report_native_id` parameters;
@@ -73,12 +73,8 @@ pub(super) const INTRODUCED_METHODS: &[&str] = &[
     method::PACKAGE_UNINSTALL,
     method::PACKAGE_BIND_PROFILE,
     method::SESSION_WAIT_TURN,
-    method::SESSION_IDLE_STOP_GET,
-    method::SESSION_IDLE_STOP_SET,
     method::HOST_RESOLVE,
     method::COMMAND_RUN,
-    method::STORE_REJECTED_LIST,
-    method::STORE_REJECTED_SET_ASIDE,
 ];
 
 /// Event names protocol 3 defined; every other event is withheld from a
@@ -240,8 +236,8 @@ fn translate_result(
                 }
             }
         }
-        // `session.new` and `session.fork` flatten the session into the result.
-        method::SESSION_INSPECT | method::SESSION_NEW | method::SESSION_FORK => {
+        // `session.new` flattens the session into the result.
+        method::SESSION_INSPECT | method::SESSION_NEW => {
             session_info(&mut result, "result", direction)?;
         }
         method::SESSION_RESUME
@@ -258,13 +254,6 @@ fn translate_result(
         }
         method::SESSION_SCREEN | method::SESSION_READ | method::SESSION_OUTPUT => {
             rename_in(&mut result, "result", direction)?;
-        }
-        method::SESSION_RUNTIME_INVENTORY => {
-            if let Some(Value::Array(entries)) = field(&mut result, "entries") {
-                for entry in entries {
-                    rename_in(entry, "result.entries[]", direction)?;
-                }
-            }
         }
         _ => {}
     }
@@ -460,11 +449,7 @@ mod tests {
                 "{method_name}"
             );
         }
-        for method_name in [
-            method::SESSION_INSPECT,
-            method::SESSION_NEW,
-            method::SESSION_FORK,
-        ] {
+        for method_name in [method::SESSION_INSPECT, method::SESSION_NEW] {
             let bare = result(method_name, session_with_runtime()).expect("adapter");
             assert_eq!(bare["runtime"]["runtime_id"], "w-1", "{method_name}");
         }

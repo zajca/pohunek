@@ -67,10 +67,6 @@ while IFS= read -r line; do
 done
 "#;
 
-/// Real time a scenario waits for a hook process or the worker import that
-/// follows it before it reports a stuck run.
-const HOOK_WAIT: Duration = pohunek_test_support::wait::HANG_GUARD;
-
 /// Debounce window of the default notification policy.
 pub(super) fn debounce() -> Duration {
     Duration::from_secs(u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS))
@@ -192,16 +188,6 @@ impl Fixture {
         Self::assemble(root, sessions, policy)
     }
 
-    /// A daemon that restarted over the same data directory: `sessions` is the
-    /// registry of the new process, which has adopted the live workers.
-    pub(super) fn restarted(
-        &self,
-        sessions: SessionRegistry,
-        policy: Option<NotificationPolicy>,
-    ) -> Self {
-        Self::assemble(Arc::clone(&self.root), sessions, policy)
-    }
-
     fn assemble(
         root: Arc<tempfile::TempDir>,
         sessions: SessionRegistry,
@@ -235,20 +221,6 @@ impl Fixture {
         }
     }
 
-    /// Starts a request on its own task, as a dedicated connection does.
-    pub(super) fn spawn_call(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> JoinHandle<Result<Value, ProtocolError>> {
-        let state = self.state.clone();
-        let method = method.to_owned();
-        tokio::spawn(async move {
-            let request = Request::new("spawned", method, params).expect("request");
-            handle_request(&request, &state).await.into_result()
-        })
-    }
-
     /// Creates a live session through `session.new` and returns its id.
     pub(super) async fn session(&self, tag: &str) -> String {
         let cwd = self.cwd(tag);
@@ -260,120 +232,6 @@ impl Fixture {
             )
             .await);
         created["id"].as_str().expect("session id").to_owned()
-    }
-
-    /// Creates a live session that runs the fake Claude agent and returns its
-    /// id once the agent is ready for hooks.
-    pub(super) async fn hook_session(&self, tag: &str) -> String {
-        let cwd = self.cwd(tag);
-        std::fs::create_dir_all(&cwd).expect("create the session working directory");
-        let created = ok(self
-            .call(
-                method::SESSION_NEW,
-                json!({"agent": HOOK_AGENT, "cwd": cwd, "cols": 80, "rows": 24}),
-            )
-            .await);
-        let id = created["id"].as_str().expect("session id").to_owned();
-        self.wait_screen_line(&id, "fake-agent ready").await;
-        id
-    }
-
-    /// Waits until a screen line of `session` contains `needle`, while real PTY
-    /// output arrives on the paused clock.
-    pub(super) async fn wait_screen_line(&self, session: &str, needle: &str) {
-        let started = std::time::Instant::now();
-        while started.elapsed() < HOOK_WAIT {
-            let screen = ok(self
-                .call(method::SESSION_SCREEN, json!({"session_id": session}))
-                .await);
-            let seen = screen["visible_lines"].as_array().is_some_and(|lines| {
-                lines
-                    .iter()
-                    .any(|line| line.as_str().is_some_and(|line| line.contains(needle)))
-            });
-            if seen {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("no screen line of {session} contains {needle:?}");
-    }
-
-    /// Runs the real Claude state hook `action` in the agent of `session` with
-    /// `payload` on its stdin, and returns once the hook process has exited.
-    pub(super) async fn run_hook(&self, session: &str, action: &str, payload: &Value) {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let input = format!("{}.json", NEXT.fetch_add(1, Ordering::Relaxed));
-        std::fs::write(
-            self.root.path().join(HOOK_INPUTS).join(&input),
-            payload.to_string(),
-        )
-        .expect("write the hook input");
-        ok(self
-            .call(
-                method::SESSION_INPUT,
-                json!({"session_id": session, "text": format!("hook:{action} {input}")}),
-            )
-            .await);
-        self.wait_screen_line(session, &format!("fake-agent ran {action} {input}"))
-            .await;
-    }
-
-    /// Reports the activity of the fake Claude agent of `session`, as its
-    /// managed hook does through the daemon socket the fixture does not serve.
-    pub(super) async fn hook_activity(&self, session: &str, activity: &str) {
-        let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
-        let reported = ok(self
-            .call(
-                method::SESSION_REPORT_AGENT,
-                json!({
-                    "session_id": session,
-                    "source": "pohunek:claude",
-                    "agent": HOOK_AGENT,
-                    "activity": activity,
-                    "pid": info["active_agent_pid"],
-                    "agent_session_id": info["active_agent_session_id"],
-                }),
-            )
-            .await);
-        assert_eq!(reported["recorded"], true, "{activity} report: {reported}");
-    }
-
-    /// Waits until `session` publishes a background snapshot of `count` items
-    /// that the daemon read from the worker's hook-fed snapshot. `count == 0`
-    /// also accepts the agent's identity with no snapshot, which is all a first
-    /// empty listing publishes.
-    pub(super) async fn wait_listed(&self, session: &str, count: usize) {
-        let started = std::time::Instant::now();
-        while started.elapsed() < HOOK_WAIT {
-            let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
-            let items = info["background"]["items"].as_array().map(Vec::len);
-            let seen = items == Some(count)
-                || (count == 0 && info["background"].is_null() && info["active_agent"] == "claude");
-            if seen {
-                return;
-            }
-            // The daemon reads the worker's snapshot on a timer, which only
-            // the virtual clock moves.
-            settle().await;
-            tokio::time::advance(CLOCK_STEP).await;
-        }
-        let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
-        panic!("{session} never published {count} background items: {info}");
-    }
-
-    /// Waits until `session` publishes `count` subagent rows.
-    pub(super) async fn wait_subagent_rows(&self, session: &str, count: usize) {
-        let started = std::time::Instant::now();
-        while started.elapsed() < HOOK_WAIT {
-            let info = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
-            if info["subagents"].as_array().map(Vec::len) == Some(count) {
-                return;
-            }
-            settle().await;
-            tokio::time::advance(CLOCK_STEP).await;
-        }
-        panic!("{session} never published {count} subagent rows");
     }
 
     pub(super) fn cwd(&self, tag: &str) -> PathBuf {

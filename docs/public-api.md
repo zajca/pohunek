@@ -308,8 +308,8 @@ are additive; older daemons return `daemon/method_not_found` for unknown
 methods. Optional fields retain their documented omission behavior. Envelope,
 observation, native-report, capability, and notification-policy objects are
 strict: the daemon rejects unknown fields in them. A client keeps the unknown
-keys of the session capabilities, the session retention policy and the
-notification policy (with its `retention`) it reads, and sends the policies
+keys of the session capabilities and the
+notification policy (with its `retention`) it reads, and sends the notification policy
 back. The per-kind flags of `NotificationPolicy` are a map from
 `NotificationKind` to boolean: the generated `NotificationKindPolicy` TypeScript
 type has an optional key per kind, because a daemon that predates a kind omits
@@ -432,7 +432,7 @@ subscription, and dedicated connections. When both markers identify the target
 as the caller's own origin session, the daemon returns
 `runtime/plugin_self_target_denied` for exactly `session.stop`,
 `session.resume`, `session.remove`, `session.remove_accepting_unconfirmed`,
-`session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
+`session.resize`, `session.set_metadata`, `session.rename`, and
 `session.input`. Read-only methods,
 including observation, remain available. The lifecycle reports
 `session.report_agent`, `session.release_agent`, and `session.report_native_id`
@@ -494,20 +494,18 @@ All params and result type names below refer to structs exported by
 | Method | Params | `ok` result | Notes |
 |---|---|---|---|
 | `daemon.health` | `null` | `{status, daemon_version, protocol_version}` | Liveness and version probe. |
-| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, one `<overlay>_cli` check per configured overlay (`netbird_cli`, `tailscale_cli`) and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtime compiled in (`agent_manifest_embedded_shell`; Codex, Claude Code and Hermes ship only as packages, so no embedded Codex, Claude or Hermes manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn` (the detail of Claude hooks older than integration version 16 adds that a session whose `SessionStart` hook was killed before it reported keeps no native reference until the reinstall); malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `<overlay>_cli` is `ok` with the address the provider reports for this host, `warn` when the provider's state is unavailable or reports no address, and, when the provider CLI is missing or untrusted, `fail` for an overlay that `overlays.toml` lists and `warn` for the NetBird default of an absent file. The daemon also reports one `overlay_<overlay>_listener` check per configured overlay (`overlay_netbird_listener`, `overlay_tailscale_listener`): its detail starts with `port=<n>;` and states the listener address the provider currently reports, which is the provider's state and not proof that the daemon has bound it; `warn` when the provider reports none. A daemon that predates these checks reports none. `metadata_store_rejected_lines` is `ok` when the metadata store holds no line this build cannot load, `warn` with the count (and how many may pin a package) and the command `pohunek store rejected list` otherwise, and `fail` when the store cannot be read; it never carries a line's text. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. `plugin_index_channel`, reported only when the anchor is loaded, is `ok` when the plugin index channel file beside it is loaded, `warn` when there is none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. A check status a newer daemon defines reads as `unknown` on the Rust client and the CLI, ranks like `warn` when checks are merged (never `ok`), and keeps the daemon's other checks visible. |
+| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, one `<overlay>_cli` check per configured overlay (`netbird_cli`, `tailscale_cli`) and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtime compiled in (`agent_manifest_embedded_shell`; Codex, Claude Code and Hermes ship only as packages, so no embedded Codex, Claude or Hermes manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn` (the detail of Claude hooks older than integration version 16 adds that a session whose `SessionStart` hook was killed before it reported keeps no native reference until the reinstall); malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `<overlay>_cli` is `ok` with the address the provider reports for this host, `warn` when the provider's state is unavailable or reports no address, and, when the provider CLI is missing or untrusted, `fail` for an overlay that `overlays.toml` lists and `warn` for the NetBird default of an absent file. The daemon also reports one `overlay_<overlay>_listener` check per configured overlay (`overlay_netbird_listener`, `overlay_tailscale_listener`): its detail starts with `port=<n>;` and states the listener address the provider currently reports, which is the provider's state and not proof that the daemon has bound it; `warn` when the provider reports none. A daemon that predates these checks reports none. `metadata_store_rejected_lines` is `ok` when the metadata store holds no line this build cannot load, `warn` with the count (and how many may pin a package) otherwise, and `fail` when the store cannot be read; it never carries a line's text. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. `plugin_index_channel`, reported only when the anchor is loaded, is `ok` when the plugin index channel file beside it is loaded, `warn` when there is none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. A check status a newer daemon defines reads as `unknown` on the Rust client and the CLI, ranks like `warn` when checks are merged (never `ok`), and keeps the daemon's other checks visible. |
 | `host.inspect` | `HostInspectParams` or `null` | `HostCapabilities` | Capability snapshot for the daemon's host. Presence and path of every agent program are resolved on each call; the version probes behind `runtimes[].version` and `supported` come from a probe cache (see "Version probe"), so a result may be older than the cache lifetime. The inventory is built off the daemon's async runtime. `HostInspectParams.skip_runtime_probes: true` answers only the feature flags, `daemon_version` and `git_available`, with empty `supported_agents` and `runtimes`, and resolves and probes no agent program; a client that only gates a request on a capability flag sends it (the CLI does for `session new --cwd`, `--from-remote` and `--input-ack-timeout-ms`). A daemon that predates the parameters ignores them and answers the full inventory, so such a client must accept a complete answer; a client that sends no parameters always gets the full inventory. The Rust method type keeps `()` parameters (the full inventory) and `Client::host_inspect_with` sends `HostInspectParams`; the TypeScript SDK types the parameters as `HostInspectParams | null`. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
 | `host.resolve` | `HostResolveParams` (`{route}`) | `HostResolution` | Resolves a host route as `--host` accepts it against this daemon's own overlay view: `{target: "local"}` for `local`, the empty route and this machine's own overlay name, or `{target: "remote", address, port, pinned_route, overlay, peer_id?, fqdn?}` for one peer. `pinned_route` (`<overlay>:peer~<id>@<port>`, or `fqdn~` without a peer id) selects the same peer after a name or address change. Same rules and typed errors as `Client::connect` (`host_unknown`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `host_identity_unpinnable`). Served on the local Unix socket only: over the overlay and on a protocol 3 connection it answers `method_not_found`, and a client of this build refuses it against a protocol 3 daemon with `daemon/daemon_protocol_too_old`. |
 | `host.governance.inspect` | `null` | `HostGovernanceStatus` | Owner-safe, read-only snapshot of the daemon's stable host identity and local governance state. Explicit `null` and omitted params both succeed; every non-null JSON value returns `daemon/bad_request`. The method never changes enrollment, ownership, or sessions. On unavailable governance it returns the fixed redacted `daemon/host_governance_unavailable` error; reload or restart the daemon, then retry. A `quarantine` reason a newer daemon defines reads as `unknown` on the Rust client and the CLI; the status cross-check still requires a quarantine reason exactly when the enrollment is quarantined. |
-| `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. With initial `input`, a write the agent does not read for the configured stall bound (`[input] write_stall_timeout_ms`, 3000 ms by default) fails with `session_input_stalled`; part of the input may already have been written, and `session.new` then rolls the session back: the create fails with that error and the session is removed, not left running. With `input` and `input_ack_timeout_ms` (`1..=8000`; without `input`, `bad_request`; outside the range, `session_input_invalid_wait` or `session_wait_limit_exceeded`), the daemon delivers the input like a waited `session.input` and reports `prompt_delivered`: `true` when `working` activity followed the submit within the window (counted from the moment the submit was acknowledged and recorded), `false` when it did not, or when the runtime changed, the session ended or the daemon began shutting down first, or the delivery ended after Enter's send began; the session is kept and `applied_input` stays `true` either way. Delivery that fails before Enter's send began, or with `session_input_stalled`, keeps the rollback above. The agent must not report `blocked`: a blocked agent fails the create like any waited input. Clients check `HostCapabilities.session_new_input_ack_supported` first, because a daemon without it drops the field silently; the Rust and TypeScript clients extend the `session.new` response budget by the window plus `MAX_SESSION_WAIT_MS`; protocol 3 peers refuse the field. Before session, worker, or worktree creation, the program a bare or profile-based launch names must resolve to an executable on the daemon's `PATH`, or the call fails with `agent_binary_missing`; this refusal's message and recover hint name only the program's file name. A bare host-shell session is the exception: it launches the configured shell command, which its launch resolves and reports with the same code. A runtime that declares a version probe (runtime packages that declare one) then requires the isolated, bounded probe to accept that executable; a rejected release, unparseable output, a failing or timed-out probe, or a parser this daemon does not compile in returns `agent_runtime_unsupported`, also before session, worker, or worktree creation; its message names the parsed release and the supported range, or that the output did not parse, and never carries probe output (see "Version probe"). With `project` or `repo` and no `branch`, an optional `cwd` is the directory the session starts in: an absolute path of an existing directory on the daemon's host, inside the project checkout or anywhere else; the session starts with the reference's project association (what a later cwd change does to it is described below). A relative path, a missing path or a path that is not a directory fails with `bad_request` naming the path before anything is created; without `cwd` the session starts in the project checkout. With neither `project` nor `repo`, `cwd` selects the project by detection and, when it is an absolute existing directory, is where the session starts, even below the checkout root; the CLI's own default for a start without `--cwd` is the root of the work tree around its directory. With `branch` the session starts in its worktree, and `cwd` only selects the repository when neither `project` nor `repo` is given. With `branch`, the optional `branch_source: "remote"` takes the branch from `origin` instead of the local branch: the daemon fetches `refs/heads/<branch>` into a private ref and, by how the local branch relates to the fetched commit `R`, creates the branch at `R` (no local branch), uses it (equal), fast-forwards it with a compare-and-swap ref update (behind), uses the local head and adds a `branch_ahead_of_remote` warning naming both commits (ahead), or refuses with `branch_diverged` (diverged: the message names the local, remote and merge-base commits and the local branch is left untouched). `on_diverged: "backup_reset"` instead keeps the local head as `refs/heads/backup/<branch>-<first 12 hex digits of its commit>` and resets the branch to `R`, both in one step that applies neither when the branch moved meanwhile (`worktree_add_failed`, the message states the concurrent move); a taken backup name (a ref at that name, or one above or below it) fails with `backup_ref_exists`, unless the ref already holds the local head, which is then reused; a failed update is classified by the refs it left, so a reset that a concurrent identical request applied first succeeds, and any other position is `worktree_add_failed` naming the backup that holds the old head; any later failure of that request (the worktree add, or a branch that moved again before the checkout) names the backup ref in its message, because the old head is reachable only through it. A branch that would move while another worktree or the main checkout has it checked out, or is in the middle of a rebase or bisect that started on it, or is listed in the `update-refs` of a rebase running in another worktree (`git rebase --update-refs` moves the other branches of its stack when it ends), fails with `worktree_branch_in_use` before any ref changes (the check runs again under the repository's worktree lock before the move, which excludes only the daemon's own concurrent worktree adds). A `branch` that git expands rather than names, such as `@{-1}`, fails with `invalid_branch`. A missing `origin`, or an `origin` without that branch (a tag of the name does not count), fails with `remote_branch_not_found`, and any other failed fetch with `branch_fetch_failed`; neither is a warning, and a refused request leaves no worktree, binding or session. `branch_source` requires `branch`, excludes `base_branch`, and `on_diverged` requires `branch_source: "remote"` (`bad_request`); absent or `"local"` keeps the behavior of an existing local branch described below. The result then carries `worktree_source` `{ref, commit, fast_forwarded_from?, backup_ref?}`: `ref` is `origin/<branch>`, or `refs/heads/<branch>` for an ahead branch whose local head was used. The upstream configuration of the branch is not changed. A daemon that predates the options ignores both and checks out the stale local branch, so a client checks `session_new_branch_source_supported` in `HostCapabilities` before it sends either (the CLI and `pohunek assistant` refuse with `session_new_branch_source_unsupported`); a result without `worktree_source` from a daemon that was not checked means the option was ignored; against a protocol 3 daemon the Rust client and the TypeScript SDK also refuse a request that sets either (any value) with `daemon/daemon_protocol_too_old`. A daemon that honors `cwd` for a project-bound session advertises `session_new_cwd_supported` in `HostCapabilities`; one that does not ignores it, so a client checks the flag before it relies on `cwd` (the CLI requires it for every explicit `--cwd`). The daemon stores the canonical form of the directory, and a session started by reference in a directory outside every repository holds its create-time association (the project; `repo` and `branch` are not part of it) in memory: it keeps it while the observed cwd provably lies outside every repository (`git` reports no repository and no parent holds one; also on return from another repository, whose association it follows meanwhile, and across a stop and resume in the same daemon run), and an observed cwd the daemon cannot classify, such as a missing directory or a `git` that fails, clears it. Every other session, including one started inside a repository and any session after a daemon restart, follows its cwd as `session_updated` always did. A session whose worker socket could never be bound (the published `control.sock` path or the longer staged bind path beside it exceeds the platform `sun_path` limit) fails with configuration-class `worker_socket_path_invalid`, naming the path and the limit, before anything is written or launched; `session.fork` applies the same check. A worker job that ends before accepting connections fails the call with `worker_exited_before_ready` as soon as the service manager shows the job ended, carrying the worker's exit status where the supervisor retains it, instead of waiting for the worker connect deadline (`worker_connect_failed`). A launch whose working directory is no longer a directory (a worktree removed after it was bound) is refused by the worker before the agent spawns, and the call fails with runtime-class `session_cwd_missing`; the create is compensated as below, so no agent runs outside its working directory. A create that fails after binding a worktree is compensated once its runtime is proven ended (checkout and binding, then the durable record); a compensation that cannot finish (for example a checkout locked with `git worktree lock`) still fails the call with its original error, keeps the record, and lists the session as `reconnecting` with reason `create_compensation_pending` while the daemon retries the compensation with the supervision backoff, until the session leaves with `session_removed`. A session launched from a host profile freezes the keyed revision of that profile into its resume binding; when the host cannot read or create its revision key the create fails with `agent_profile_revision_unavailable` before anything is written (a session without a profile needs no key). Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. A session created with initial input into a runtime whose `[input]` table declares `ready = "screen_idle"` writes that input only once the agent's rendered prompt box shows it reads input; the enable of bracketed paste does not count. The wait uses the host's full `input.initial_startup_grace_ms` even when the request omits `extended_input_ready_wait`; a request that sets it waits up to the runtime's longer `[input] startup_grace_ms` when one is declared (the Hermes package declares 30000 ms). The grace is an upper bound: the input is written as soon as readiness shows. If no readiness is observed by the deadline, or the daemon begins shutting down first, nothing is written to the PTY, the call fails with `session_input_not_ready` (runtime class; a deadline names the grace and the session's last observed activity, such as blocked, and a shutdown names the shutdown instead), and the session is removed as for any failed initial-input create (a removal that cannot finish is completed by reconciliation). A runtime whose existence check declares how its agent moves its store refuses a launch that would move it out of reach with `agent_native_store_relocated` before anything is spawned, and with `native_store_check_task_panicked` if that check crashes (see "Native session references"). When the host lists `post-create` in `service.toml` `[hooks] required`, a worktree create whose `post-create` hook fails (a script that exits non-zero, outlives the hook timeout, cannot be spawned or waited on) fails with `hook_required_failed` (runtime class) instead of a `hook` warning. The first failing script ends the hook, so a repository script after a failing host script does not run; the `msg` names the event, the layer (`host` or `repository`), the script and how it ended (exit status, timeout), the scripts that did not run because of it, and the hook's stderr tail as the `hook` warning carries it. When the create had already reset a diverged local branch (`branch_source: remote`), the `msg` also names the backup ref that keeps its previous head. The create is then rolled back like any failed create: no PTY starts, no initial input is injected, `session-start` does not fire, the `pre-remove` and `post-remove` hooks run, and no session record, binding or worktree directory remains; the created branch is kept. A reused worktree runs no `post-create`, so `required` does not apply to it. A required hook that outlasts the client's request timeout ends the call with the outcome-unknown error while the daemon rolls the create back: inspect `session list` before retrying. A client of any protocol version in the window receives the code as an ordinary error code; a previous release's daemon ignores `required` and keeps the warning behaviour. Optional `secret_env` (a map of variable name to string value) fills the secret slots of the launched host profile: the profile's `secret_env = ["NAME", ...]` key declares the names a caller may fill and every declared name is required, so the names come from the host profile and only the values from the request (see "Secret session environment"). A request naming a variable the resolved profile does not declare fails with `secret_env_not_declared`, a launch that leaves a declared name unfilled with `secret_env_missing`, and a malformed map with `secret_env_invalid`, all before anything is created; none of the three quotes a name or a value. Clients check `HostCapabilities.session_new_secret_env_supported` first, because a daemon without it drops the field silently and would start the agent without its credential (the Rust client raises `session_new_secret_env_unsupported` without sending the request; protocol 3 peers refuse the field). Optional `client_request_id` makes the call idempotent: 1 to 128 bytes of `[A-Za-z0-9._:-]`, anything else fails with `bad_request` before anything is written or claimed. The key is scoped to the daemon, not to a caller (the typed caller scope of #223 will qualify it), and is claimed for the whole registry right after the parameters validate, before the agent, its executable or any target is resolved, so two requests that share a key cannot both create and an exact repeat never fails because a profile changed or a binary went missing. The daemon persists the key and a fingerprint of the request on the session's record (`metadata.jsonl`, store schema 14) and never reports either on `SessionInfo`. The fingerprint is `v1:` and the SHA-256 of the typed parameters in a fixed order; it covers every parameter except the key itself, `cols` and `rows` (they come from the caller's terminal, so a retry after a resize repeats the request) and the `secret_env` values (only the sorted slot names are covered, so no digest of a credential is persisted); it is never computed over the received bytes, and `name` is covered as sent, before the daemon trims it. A key whose create settled and whose fingerprint matches returns the session as it is now with `replayed: true`: nothing is created, no hook runs and no input is injected, `applied_input` is `true` when the retry carries `input` (a create that kept its record delivered its input, or it was rolled back), and `worktree_source` and `prompt_delivered` are absent because they are facts of the first response and are not persisted (a client must not read the absence as a failed acknowledgement when `replayed` is set). A key whose fingerprint differs, including the same key with another `agent`, `input` or `metadata`, fails with `session_request_conflict` (runtime class) and creates nothing; a request that differs only in `cols`, `rows` or a `secret_env` value is a replay, so the existing session keeps its original credentials. A key whose create has not settled fails with `session_request_in_progress` (runtime class, `recover`: retry the same request) while the create task runs, which includes the wait for the acknowledgement of an initial input, and while the session's record still carries its create or initial-input marker, as for a `create_compensation_pending` session, or still holds the key without a live session (a removal that has not deleted its record); it clears when the create settles, the compensation finishes or the record is gone. Both errors name the session in `msg` and in `details.session_id`. A create that was rolled back frees the key, so a retry creates; so do `session.remove`, retention and a finished compensation, because the key lives on the record and dies with it. If two records carry one key (a hand-edited store), the key answers `session_request_conflict` naming the older session and the daemon logs a warning. A daemon that does not advertise `HostCapabilities.session_new_request_id_supported` drops the key silently and a retry would create a second session, so the Rust client and the TypeScript SDK check the flag on the connection that carries `session.new` and fail with `daemon/session_new_request_id_unsupported` without sending it; protocol 3 peers refuse the field with `daemon_protocol_too_old`, and a raw client must check the flag itself. |
+| `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. With initial `input`, a write the agent does not read for the configured stall bound (`[input] write_stall_timeout_ms`, 3000 ms by default) fails with `session_input_stalled`; part of the input may already have been written, and `session.new` then rolls the session back: the create fails with that error and the session is removed, not left running. With `input` and `input_ack_timeout_ms` (`1..=8000`; without `input`, `bad_request`; outside the range, `session_input_invalid_wait` or `session_wait_limit_exceeded`), the daemon delivers the input like a waited `session.input` and reports `prompt_delivered`: `true` when `working` activity followed the submit within the window (counted from the moment the submit was acknowledged and recorded), `false` when it did not, or when the runtime changed, the session ended or the daemon began shutting down first, or the delivery ended after Enter's send began; the session is kept and `applied_input` stays `true` either way. Delivery that fails before Enter's send began, or with `session_input_stalled`, keeps the rollback above. The agent must not report `blocked`: a blocked agent fails the create like any waited input. Clients check `HostCapabilities.session_new_input_ack_supported` first, because a daemon without it drops the field silently; the Rust and TypeScript clients extend the `session.new` response budget by the window plus `MAX_SESSION_WAIT_MS`; protocol 3 peers refuse the field. Before session, worker, or worktree creation, the program a bare or profile-based launch names must resolve to an executable on the daemon's `PATH`, or the call fails with `agent_binary_missing`; this refusal's message and recover hint name only the program's file name. A bare host-shell session is the exception: it launches the configured shell command, which its launch resolves and reports with the same code. A runtime that declares a version probe (runtime packages that declare one) then requires the isolated, bounded probe to accept that executable; a rejected release, unparseable output, a failing or timed-out probe, or a parser this daemon does not compile in returns `agent_runtime_unsupported`, also before session, worker, or worktree creation; its message names the parsed release and the supported range, or that the output did not parse, and never carries probe output (see "Version probe"). With `project` or `repo` and no `branch`, an optional `cwd` is the directory the session starts in: an absolute path of an existing directory on the daemon's host, inside the project checkout or anywhere else; the session starts with the reference's project association (what a later cwd change does to it is described below). A relative path, a missing path or a path that is not a directory fails with `bad_request` naming the path before anything is created; without `cwd` the session starts in the project checkout. With neither `project` nor `repo`, `cwd` selects the project by detection and, when it is an absolute existing directory, is where the session starts, even below the checkout root; the CLI's own default for a start without `--cwd` is the root of the work tree around its directory. With `branch` the session starts in its worktree, and `cwd` only selects the repository when neither `project` nor `repo` is given. With `branch`, the optional `branch_source: "remote"` takes the branch from `origin` instead of the local branch: the daemon fetches `refs/heads/<branch>` into a private ref and, by how the local branch relates to the fetched commit `R`, creates the branch at `R` (no local branch), uses it (equal), fast-forwards it with a compare-and-swap ref update (behind), uses the local head and adds a `branch_ahead_of_remote` warning naming both commits (ahead), or refuses with `branch_diverged` (diverged: the message names the local, remote and merge-base commits and the local branch is left untouched). `on_diverged: "backup_reset"` instead keeps the local head as `refs/heads/backup/<branch>-<first 12 hex digits of its commit>` and resets the branch to `R`, both in one step that applies neither when the branch moved meanwhile (`worktree_add_failed`, the message states the concurrent move); a taken backup name (a ref at that name, or one above or below it) fails with `backup_ref_exists`, unless the ref already holds the local head, which is then reused; a failed update is classified by the refs it left, so a reset that a concurrent identical request applied first succeeds, and any other position is `worktree_add_failed` naming the backup that holds the old head; any later failure of that request (the worktree add, or a branch that moved again before the checkout) names the backup ref in its message, because the old head is reachable only through it. A branch that would move while another worktree or the main checkout has it checked out, or is in the middle of a rebase or bisect that started on it, or is listed in the `update-refs` of a rebase running in another worktree (`git rebase --update-refs` moves the other branches of its stack when it ends), fails with `worktree_branch_in_use` before any ref changes (the check runs again under the repository's worktree lock before the move, which excludes only the daemon's own concurrent worktree adds). A `branch` that git expands rather than names, such as `@{-1}`, fails with `invalid_branch`. A missing `origin`, or an `origin` without that branch (a tag of the name does not count), fails with `remote_branch_not_found`, and any other failed fetch with `branch_fetch_failed`; neither is a warning, and a refused request leaves no worktree, binding or session. `branch_source` requires `branch`, excludes `base_branch`, and `on_diverged` requires `branch_source: "remote"` (`bad_request`); absent or `"local"` keeps the behavior of an existing local branch described below. The result then carries `worktree_source` `{ref, commit, fast_forwarded_from?, backup_ref?}`: `ref` is `origin/<branch>`, or `refs/heads/<branch>` for an ahead branch whose local head was used. The upstream configuration of the branch is not changed. A daemon that predates the options ignores both and checks out the stale local branch, so a client checks `session_new_branch_source_supported` in `HostCapabilities` before it sends either (the CLI and `pohunek assistant` refuse with `session_new_branch_source_unsupported`); a result without `worktree_source` from a daemon that was not checked means the option was ignored; against a protocol 3 daemon the Rust client and the TypeScript SDK also refuse a request that sets either (any value) with `daemon/daemon_protocol_too_old`. A daemon that honors `cwd` for a project-bound session advertises `session_new_cwd_supported` in `HostCapabilities`; one that does not ignores it, so a client checks the flag before it relies on `cwd` (the CLI requires it for every explicit `--cwd`). The daemon stores the canonical form of the directory, and a session started by reference in a directory outside every repository holds its create-time association (the project; `repo` and `branch` are not part of it) in memory: it keeps it while the observed cwd provably lies outside every repository (`git` reports no repository and no parent holds one; also on return from another repository, whose association it follows meanwhile, and across a stop and resume in the same daemon run), and an observed cwd the daemon cannot classify, such as a missing directory or a `git` that fails, clears it. Every other session, including one started inside a repository and any session after a daemon restart, follows its cwd as `session_updated` always did. A session whose worker socket could never be bound (the published `control.sock` path or the longer staged bind path beside it exceeds the platform `sun_path` limit) fails with configuration-class `worker_socket_path_invalid`, naming the path and the limit, before anything is written or launched. A worker job that ends before accepting connections fails the call with `worker_exited_before_ready` as soon as the service manager shows the job ended, carrying the worker's exit status where the supervisor retains it, instead of waiting for the worker connect deadline (`worker_connect_failed`). A launch whose working directory is no longer a directory (a worktree removed after it was bound) is refused by the worker before the agent spawns, and the call fails with runtime-class `session_cwd_missing`; the create is compensated as below, so no agent runs outside its working directory. A create that fails after binding a worktree is compensated once its runtime is proven ended (checkout and binding, then the durable record); a compensation that cannot finish (for example a checkout locked with `git worktree lock`) still fails the call with its original error, keeps the record, and lists the session as `reconnecting` with reason `create_compensation_pending` while the daemon retries the compensation with the supervision backoff, until the session leaves with `session_removed`. A session launched from a host profile freezes the keyed revision of that profile into its resume binding; when the host cannot read or create its revision key the create fails with `agent_profile_revision_unavailable` before anything is written (a session without a profile needs no key). Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. A session created with initial input into a runtime whose `[input]` table declares `ready = "screen_idle"` writes that input only once the agent's rendered prompt box shows it reads input; the enable of bracketed paste does not count. The wait uses the host's full `input.initial_startup_grace_ms` even when the request omits `extended_input_ready_wait`; a request that sets it waits up to the runtime's longer `[input] startup_grace_ms` when one is declared (the Hermes package declares 30000 ms). The grace is an upper bound: the input is written as soon as readiness shows. If no readiness is observed by the deadline, or the daemon begins shutting down first, nothing is written to the PTY, the call fails with `session_input_not_ready` (runtime class; a deadline names the grace and the session's last observed activity, such as blocked, and a shutdown names the shutdown instead), and the session is removed as for any failed initial-input create (a removal that cannot finish is completed by reconciliation). A runtime whose existence check declares how its agent moves its store refuses a launch that would move it out of reach with `agent_native_store_relocated` before anything is spawned, and with `native_store_check_task_panicked` if that check crashes (see "Native session references"). When the host lists `post-create` in `service.toml` `[hooks] required`, a worktree create whose `post-create` hook fails (a script that exits non-zero, outlives the hook timeout, cannot be spawned or waited on) fails with `hook_required_failed` (runtime class) instead of a `hook` warning. The first failing script ends the hook, so a repository script after a failing host script does not run; the `msg` names the event, the layer (`host` or `repository`), the script and how it ended (exit status, timeout), the scripts that did not run because of it, and the hook's stderr tail as the `hook` warning carries it. When the create had already reset a diverged local branch (`branch_source: remote`), the `msg` also names the backup ref that keeps its previous head. The create is then rolled back like any failed create: no PTY starts, no initial input is injected, `session-start` does not fire, the `pre-remove` and `post-remove` hooks run, and no session record, binding or worktree directory remains; the created branch is kept. A reused worktree runs no `post-create`, so `required` does not apply to it. A required hook that outlasts the client's request timeout ends the call with the outcome-unknown error while the daemon rolls the create back: inspect `session list` before retrying. A client of any protocol version in the window receives the code as an ordinary error code; a previous release's daemon ignores `required` and keeps the warning behaviour. Optional `secret_env` (a map of variable name to string value) fills the secret slots of the launched host profile: the profile's `secret_env = ["NAME", ...]` key declares the names a caller may fill and every declared name is required, so the names come from the host profile and only the values from the request (see "Secret session environment"). A request naming a variable the resolved profile does not declare fails with `secret_env_not_declared`, a launch that leaves a declared name unfilled with `secret_env_missing`, and a malformed map with `secret_env_invalid`, all before anything is created; none of the three quotes a name or a value. Clients check `HostCapabilities.session_new_secret_env_supported` first, because a daemon without it drops the field silently and would start the agent without its credential (the Rust client raises `session_new_secret_env_unsupported` without sending the request; protocol 3 peers refuse the field). Optional `client_request_id` makes the call idempotent: 1 to 128 bytes of `[A-Za-z0-9._:-]`, anything else fails with `bad_request` before anything is written or claimed. The key is scoped to the daemon, not to a caller (the typed caller scope of #223 will qualify it), and is claimed for the whole registry right after the parameters validate, before the agent, its executable or any target is resolved, so two requests that share a key cannot both create and an exact repeat never fails because a profile changed or a binary went missing. The daemon persists the key and a fingerprint of the request on the session's record (`metadata.jsonl`, store schema 14) and never reports either on `SessionInfo`. The fingerprint is `v1:` and the SHA-256 of the typed parameters in a fixed order; it covers every parameter except the key itself, `cols` and `rows` (they come from the caller's terminal, so a retry after a resize repeats the request) and the `secret_env` values (only the sorted slot names are covered, so no digest of a credential is persisted); it is never computed over the received bytes, and `name` is covered as sent, before the daemon trims it. A key whose create settled and whose fingerprint matches returns the session as it is now with `replayed: true`: nothing is created, no hook runs and no input is injected, `applied_input` is `true` when the retry carries `input` (a create that kept its record delivered its input, or it was rolled back), and `worktree_source` and `prompt_delivered` are absent because they are facts of the first response and are not persisted (a client must not read the absence as a failed acknowledgement when `replayed` is set). A key whose fingerprint differs, including the same key with another `agent`, `input` or `metadata`, fails with `session_request_conflict` (runtime class) and creates nothing; a request that differs only in `cols`, `rows` or a `secret_env` value is a replay, so the existing session keeps its original credentials. A key whose create has not settled fails with `session_request_in_progress` (runtime class, `recover`: retry the same request) while the create task runs, which includes the wait for the acknowledgement of an initial input, and while the session's record still carries its create or initial-input marker, as for a `create_compensation_pending` session, or still holds the key without a live session (a removal that has not deleted its record); it clears when the create settles, the compensation finishes or the record is gone. Both errors name the session in `msg` and in `details.session_id`. A create that was rolled back frees the key, so a retry creates; so do `session.remove`, retention and a finished compensation, because the key lives on the record and dies with it. If two records carry one key (a hand-edited store), the key answers `session_request_conflict` naming the older session and the daemon logs a warning. A daemon that does not advertise `HostCapabilities.session_new_request_id_supported` drops the key silently and a retry would create a second session, so the Rust client and the TypeScript SDK check the flag on the connection that carries `session.new` and fail with `daemon/session_new_request_id_unsupported` without sending it; protocol 3 peers refuse the field with `daemon_protocol_too_old`, and a raw client must check the flag itself. |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. A client that shows one state derives it from `state` and `runtime.state` (a `lost` runtime is `crashed`, proven or not; the Rust `SessionInfo::condition()` and the TypeScript `sessionCondition(info, { listed: true })` give the same answer, and the answer is never sent on the wire); the recovery outlook of a crashed session needs `capabilities.resume` and `capability_refusals.resume`, which only list and inspect responses carry. Metadata filters require the current protocol; a client refuses them against a protocol-3 daemon with `daemon/daemon_protocol_too_old` before sending the request. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`); it ends `stopped` with its root's exit. When a process outside the session's process group keeps the PTY open past the stop deadline, the worker force-closes the PTY output and the stop still succeeds with `SessionInfo.output_force_closed` set, because output written after the close is not retained. Before it records that exit, the worker sweeps every same-user process carrying the runtime's `POHUNEK_WORKER_INSTANCE_ID` marker (`SIGTERM`, then `SIGKILL` after the stop grace) and, while only processes whose environment cannot be read remain, re-reads the process table for up to the stop grace; if it still cannot prove every such process gone, it faults the runtime instead, the stop fails with `worker_operation_failed`, nothing is signalled that it could not attribute, and the session's runtime becomes `lost` (`runtime_lost_cleanup_unconfirmed` when the daemon's own sweep cannot confirm either). A stop whose root exit cannot be observed fails. A `conflict` session is stopped by the identity its record names, only after the recorded generation's journal names the recorded worker and the service manager's job under that generation is that worker's: `session_runtime_conflict` (no recorded generation or worker), `runtime_identity_mismatch` (no journal names the recorded worker, or the job is not that worker's), `runtime_supervision_ambiguous` (journals unreadable, no job holds the still-running worker process, or the ownership-marker sweep cannot confirm every marked process exited), `runtime_supervision_unavailable` (job cannot be inspected). A refusal leaves the record unchanged. A session that already ended, which includes a lost runtime whose end was proven (it presents as `failed`), returns `{stopped: false}`. A `lost` runtime whose end was not proven, a `reconnecting` one and an `incompatible` one are refused with `session_runtime_lost`, `session_runtime_reconnecting`, and `worker_protocol_incompatible`. The call is not cancelled when the client hangs up. The Rust and TypeScript clients wait up to 90 minutes on a dedicated connection and report an elapsed deadline as `session_stop_outcome_unknown`; a repeated stop of a stopped session returns `{stopped: false}`. A worker that leaves the stop unanswered is ended through its service manager once the daemon proved the recorded identity (the proof failures are the `conflict` codes above), and the stop commits `stopped`; a stop behind an exchange the worker did not answer is refused with the retryable `session_runtime_reconnecting` after the daemon closed the connection, and a repeated stop ends the session once the daemon classified the worker. |
 | `session.resume` | `SessionResumeParams` (a bare `SessionId`, or `{session_id, accept_profile_change?}`) | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but starting a new worker generation (a new native service job) with a new runtime id. The previous generation must be proven ended first; two generations of one session are never live at once. A lost runtime with `runtime_lost_cleanup_unconfirmed` requires a fresh, confirmed sweep of the exact runtime its journal names before a new generation is minted. A `runtime_lost` runtime whose loss carries `loss_cause` `user_manager_lost` resumes without that fresh sweep: the daemon discharged an earlier sweep blocked only by unreadable-marker processes because the user manager that held the worker was proven gone. When proving the previous runtime ended, missing or mismatched supervision evidence, or a sweep that still cannot prove the marked processes gone, returns `runtime_supervision_ambiguous` with a recovery hint and leaves the logical session recoverable for a later retry. When same-user processes whose environment cannot be read are the only obstacle, the error `msg` lists them (`pid`, start identity, command name; at most eight, then `and N more`; command names escaped as for `session.remove`) and no environment values are included. The call is not cancelled when the client hangs up, so a client that stopped waiting cannot tell whether the resume still completes: inspect the session before retrying. Before any recovery write or worker launch, recovery resolves the frozen program again and fails with `agent_binary_missing` when it no longer resolves to an executable; a runtime that declares a version probe (Hermes included) then revalidates that executable and returns `agent_runtime_unsupported`, with the same message as `session.new`, when the probe rejects it. Live, reconnecting, conflicting, or incompatible runtimes are rejected; a hook runtime without a native claim returns `native_identity_missing`, and one with a claim that was not verified as its launch process returns `native_identity_unverified`; an unreadable durable record, or absent, unreadable, ambiguous, or worker-id/instance-mismatched native generation evidence returns `native_identity_evidence_unavailable` before launch; a hook runtime whose tested worker journal carries a newer conversation switch that this daemon cannot verify refuses recovery with `native_identity_uncertain` instead of silently resuming the older verified target; other sessions without native metadata return `not_resumable` or `agent_not_resumable`. A Claude conversation id whose transcript cannot be found or verified under the effective Claude config home returns `agent_native_reference_missing` before a worker launches. A session launched from a host profile relaunches only while the profile still has the revision frozen into the session (see "Frozen profile revision" below): an edited profile, or a legacy session that never froze one, returns `agent_profile_changed`; a profile that no longer resolves returns `agent_profile_missing`; a host that cannot read its revision key returns `agent_profile_revision_unavailable`. An adopted built-in session whose profile differs only by the migration pin (`package` and `digest` keys) resumes and forks without the decision. `accept_profile_change: true` is the owner's decision to relaunch under the current profile and freeze its revision; it is accepted on the local control socket only and a remote caller gets `agent_profile_change_local_only` before anything is resolved. The bare id shape stays valid on every protocol version of the window and never accepts a change. Before anything launches, the declared existence check refuses with `agent_native_store_relocated` when the agent's store moved out of reach since the launch, and with `agent_native_reference_missing` when the conversation is not found (`native_store_check_task_panicked` when the check itself crashes). Daemon restart never calls this method automatically. |
-| `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; a source whose native generation evidence cannot be read or matched refuses before launch with `native_identity_evidence_unavailable`, and a newer unverified conversation switch refuses with `native_identity_uncertain`; an assigned reference whose conversation cannot be found returns `agent_native_reference_missing` before anything launches; a runtime that declares `assign_fork` launches the fork under a reference generated for it, returned as the fork's `native_session_id` and resumable at once; Codex- and Hermes-backed sessions return `agent_fork_unsupported`. The fork follows the same frozen-profile rules as `session.resume` (`agent_profile_changed`, `agent_profile_missing`, `agent_profile_revision_unavailable`, local-only `accept_profile_change` in `SessionForkParams`) and freezes the revision it launched under. The program and version-probe checks of `session.resume` apply before anything launches (`agent_binary_missing`, `agent_runtime_unsupported`). The source's existence check runs first, with the same `agent_native_store_relocated`, `agent_native_reference_missing` and `native_store_check_task_panicked` refusals as `session.resume`, and a refused fork creates no child. A successful fork emits `session_created`. The call is not cancelled when the client hangs up; an elapsed client deadline is `session_fork_outcome_unknown` and a retried fork creates a second child, so list sessions first. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. A `reconnecting` or `incompatible` runtime, or a `conflict` whose reason is `runtime_supervision_ambiguous`, is retired through the service manager by the exact worker generation its record names, and every worker the session's journals record for that generation must then be gone, before the record is deleted. A record in one of those states that names no generation, or a `conflict` for any other reason, fails with `session_runtime_conflict`, `session_runtime_reconnecting`, or `worker_protocol_incompatible`; a retirement the service manager cannot complete fails with `runtime_supervision_unavailable`; a still-running worker journaled under another generation fails with `runtime_identity_mismatch`; unreadable session journals or a journaled worker still running after the retirement fail with `runtime_supervision_ambiguous`. The record is kept in every refused case. Every removal then sweeps the processes carrying the session's runtime ownership markers (every runtime its record or a journal of its generation names); a runtime named only by the record is signalled only when its process also carries this session's marker. A missing session marker leaves removal retryable even with `session.remove_accepting_unconfirmed`. A sweep that cannot confirm every marked process exited fails with `runtime_supervision_ambiguous` after the removal intent was recorded, keeping the session listed so a retried removal, or the next daemon start, finishes it. When same-user processes whose environment cannot be read are the only obstacle, the error `msg` lists them (`pid`, start identity, command name; at most eight, then `and N more`) and `recover` tells the operator to inspect and end the ones belonging to the session and retry; no environment values are included. It always refuses on an unconfirmed sweep; `session.remove_accepting_unconfirmed` is the consent variant. Worktree cleanup is best-effort: the result reports `worktrees_removed` for checkouts that are gone and `worktrees_failed` for an owned checkout whose `git worktree remove` failed, whose binding is dropped regardless, so the leftover directory needs manual cleanup. A failing or timed-out worktree `pre-remove` or `post-remove` hook never blocks the removal; the result's optional `warnings` (omitted when empty) carries a `hook` warning that names the event, because the session record is gone once the call returns. This is an explicit operator removal and is deliberately not subject to the retention sweep's unsaved-work hold. The call is not cancelled when the client hangs up; an elapsed client deadline is `session_remove_outcome_unknown`. A worker that stops answering the removal's stop ends it with `worker_operation_failed` and keeps the record; a removal behind a connection the daemon closed after an unanswered exchange fails with the retryable `session_runtime_reconnecting`. |
 | `session.remove_accepting_unconfirmed` | `SessionId` | `SessionRemoveResult` | Removes a session exactly like `session.remove`, except that when the marker sweep of its runtimes is unconfirmed solely because same-user processes with unreadable environments may belong to them, it proceeds instead of refusing with `runtime_supervision_ambiguous`. The daemon never signals those processes; it logs each accepted process at `warn` once the sweep lets the removal proceed, before any cleanup, and lists the set in `accepted_unconfirmed_processes` (`pid`, `start_identity`, optional `command`; the field is omitted when empty). The list is deduplicated and holds the first 64 accepted processes; when more were accepted, `accepted_unconfirmed_total` carries the full count (the field is omitted otherwise, and a reader that does not know it ignores it) and the daemon log names every one. A removal with more than 1024 candidates is refused with a count of at least the candidates found before anything is deleted, because every accepted process is logged. Each `command` is a kernel command name with every character outside ASCII letters, digits, space and `._-+:@/` escaped as `\u{..}` and long names shortened with `...`, so it is safe to print. Consent covers this one call only: nothing stores it, a retried removal needs it again, and the reconciliation finalizer and the retention sweep never have it. Every other unconfirmed reason (a signalled process still running, a sweep error, a missing supervision configuration) and every other refusal of `session.remove` still applies with the same error codes. A process among the accepted ones that does carry the runtime marker keeps running unsupervised after the worktree, logs and record are deleted. A daemon without this method answers `method_not_found`. Its client deadline and outcome-unknown error are those of `session.remove`. |
-| `session.runtime_inventory` | `null` | `RuntimeInventoryResult` | Returns the durable-worker runtime inventory captured at startup reconciliation: one `RuntimeInventoryEntry` per discovered worker with its runtime slot, claimed session id, worker/runtime ids, and classification (`managed`, `orphaned`, `conflict`, `incompatible`, or `identity_mismatch`). Read-only operator diagnostic; it never mutates or kills a worker. A worker `status` a newer daemon defines reads as `unknown` on the Rust client and the CLI. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
@@ -522,13 +520,9 @@ All params and result type names below refer to structs exported by
 | `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. Accepts the optional `retryable_admission` flag described under Retryable admission. |
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hardened public fallback for launch-agent resume metadata. Reports are runtime- and process-bound, ordered, expiring, and provider-matched; ignored reports return `recorded: false`. The caller is attested with its kernel peer credentials before any session state is read: only the session's PTY root itself is admitted, and a caller that fails the attestation (a remote connection, a descendant of the root, another user, or a root whose session uses the `identity-v1` schema) gets the error `native_report_unattested` (see the native-id report attestation rules below the schema section). The owner-private worker claim path is preferred. This is not the nested-agent active identity callback. Accepts the optional `retryable_admission` flag described under Retryable admission. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. The edit is written to the session's durable record before the session shows it, so it survives a daemon restart; a refused write fails with `session_store_failed` and changes nothing. |
-| `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects an over-long name (more than 128 bytes) and a name holding a control, format, line or paragraph separator character (a bidirectional override such as U+202E, a zero-width character), the same character rule as a background-task label, with `bad_request` and the message `session name must not contain control, separator, or format characters`. `session.new` and `session.fork` apply the same rule to their `name`. The rule validates input only: a name persisted before it existed is loaded, listed and served unchanged and is replaced by a rename (or cleared with `name: null`); the store is never rewritten on load. |
+| `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects an over-long name (more than 128 bytes) and a name holding a control, format, line or paragraph separator character (a bidirectional override such as U+202E, a zero-width character), the same character rule as a background-task label, with `bad_request` and the message `session name must not contain control, separator, or format characters`. `session.new` applies the same rule to its `name`. The rule validates input only: a name persisted before it existed is loaded, listed and served unchanged and is replaced by a rename (or cleared with `name: null`); the store is never rewritten on load. |
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. Incomplete git output (a pipe still open 250 ms after git exits, or more than 8 MiB on either captured stream) returns `session_diff_failed` rather than a partial successful diff. See `SessionDiffResult` under Core Payloads for the response size cap and truncation semantics. |
-| `session.policy.get` | `null` | `SessionPolicyResult` | Reads the daemon's session retention policy. Non-null params are `daemon/bad_request`. |
-| `session.policy.set` | `SessionPolicyParams` | `SessionPolicyResult` | Validates, replaces, and persists the session retention policy at `<data_dir>/session-policy.json`. The running sweep task reloads it on its next cycle, so no daemon restart is needed. |
-| `session.idle_stop.get` | `null` | `SessionIdleStopResult` | Reads the host default of the idle-stop duration (`default_after_secs`, absent when none is set) and the smallest duration the host accepts (`min_after_secs`). Non-null params are `daemon/bad_request`. New in the current protocol window: a protocol 3 client or daemon does not define it, and a daemon of the previous release answers `method_not_found`. `host.inspect` advertises it as `session_idle_stop_supported`. See [Idle stop](#idle-stop). |
-| `session.idle_stop.set` | `SessionIdleStopParams` | `SessionIdleStopResult` | Validates, replaces and persists the idle-stop default at `<data_dir>/session-idle-stop.json`. An omitted or `null` `default_after_secs`, and `0`, clear it; a value below `min_after_secs` is `runtime/invalid_session_policy`. It never reads or writes the retention policy, so `session.policy.get` and `session.policy.set` keep their shape. |
-| `session.retention.sweep` | `SessionRetentionParams` or `null` | `SessionRetentionResult` | Runs one retention sweep under the current policy TTLs, or reports the selection when `dry_run` is true. It works whether or not automatic sweeps are enabled, never exceeds the policy's own per-sweep removal cap, and never selects an `external` session or one in `conflict`/`incompatible` runtime state. A matched session whose pohunek-owned worktree has an uncommitted change, an untracked file, commits contained in no other branch/remote/tag, or a state git cannot report is **held**, never removed: it is counted in `held`, excluded from `eligible`, and carries the `hold` reason (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`, `worktree_unknown`) on its candidate. One sweep inspects at most 64 checkouts; a matched session beyond that bound is held as `worktree_unknown` and inspected by the next sweep. `worktrees_cleaned` counts only checkouts confirmed gone from disk; a checkout that survived its removal is reported in `worktrees_failed`. The `pohunek session retention sweep` CLI exits non-zero when `failed` or `worktrees_failed` is above zero. A `reason` or `hold` a newer daemon defines reads as `unknown` on the Rust client and the CLI; an unknown `hold` stays a hold and is never read as `None` (free to remove). |
+| `session.retention.sweep` | `SessionRetentionParams` or `null` | `SessionRetentionResult` | Runs one retention sweep under the stored policy TTLs, or reports the selection when `dry_run` is true. It works whether or not automatic sweeps are enabled, never exceeds the policy's own per-sweep removal cap, and never selects an `external` session or one in `conflict`/`incompatible` runtime state. A matched session whose pohunek-owned worktree has an uncommitted change, an untracked file, commits contained in no other branch/remote/tag, or a state git cannot report is **held**, never removed: it is counted in `held`, excluded from `eligible`, and carries the `hold` reason (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`, `worktree_unknown`) on its candidate. One sweep inspects at most 64 checkouts; a matched session beyond that bound is held as `worktree_unknown` and inspected by the next sweep. `worktrees_cleaned` counts only checkouts confirmed gone from disk; a checkout that survived its removal is reported in `worktrees_failed`. The `pohunek session retention sweep` CLI exits non-zero when `failed` or `worktrees_failed` is above zero. A `reason` or `hold` a newer daemon defines reads as `unknown` on the Rust client and the CLI; an unknown `hold` stays a hold and is never read as `None` (free to remove). |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications into the config home of the selected runtime(s). Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). `profile` selects the config home a host profile launches with and `all_profiles` every distinct home of the runtime (see "Config homes and host profiles"); both are local-only, exclusive, and unknown fields return `bad_request`. With `all_profiles` a home that fails is listed in `failed` (`{agent, home, error}`) while the others still install, and the result is not atomic across homes. Without `all_profiles` every selected home is resolved before the first write, so a home that does not resolve refuses the request with nothing written. Without `agent` on a host where no served runtime has daemon-managed hooks (a clean host: Hermes is CLI-run and the shell has no handler) the request fails with `runtime/integration_no_managed_runtime`, whose hint names the install of each official package with daemon-managed hooks (Codex, Claude Code) that nothing serves and then `pohunek integration install --agent <runtime>`; the Hermes operator plugin is installed by the CLI with its own target flags and is never named. A runtime whose handler installs nothing persistent (Muse) reports an install with an empty `hook_path` and no config paths; its hooks are set up for each launch. |
 | `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. On the Rust client and the CLI an install state or recovery a newer daemon defines reads as `unknown`: never `current`, and the recovery hint is generic (upgrade the client). `null` selects every runtime the daemon serves through a daemon-run hook handler; unknown parameter fields return `bad_request`. `profile` and `all_profiles` select profile config homes (local-only; see "Config homes and host profiles") and label each report with `home`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. For a runtime whose handler installs nothing persistent (Muse), `current` means the config home's settings and the managed hooks file they select build a valid overlay; a managed hooks file named only by a profile `[env]` or the service environment is checked at launch, not here. |
@@ -560,8 +554,6 @@ All params and result type names below refer to structs exported by
 | `package.select` | `PackageSelectParams` | `PackageChangeResult` | Local-only. Selects the installed version bare requests of its package id resolve to. |
 | `package.uninstall` | `PackageUninstallParams` | `PackageUninstallResult` | Local-only. Removes an installed package that no session or host profile pins. |
 | `package.bind_profile` | `PackageBindProfileParams` | `PackageBindProfileResult` | Local-only. Pins a host agent profile to an installed package under the package lifecycle authority, or previews the change with `dry_run`. A `status` a newer daemon defines reads as `unknown` on the Rust client and the CLI and is never treated as `unchanged`: `plugin profile migrate` still asks for consent. |
-| `store.rejected_list` | `null` | `StoreRejectedListResult` | Local-only. Lists the metadata-store lines no loader accepts. See [Rejected Store Lines](#rejected-store-lines). |
-| `store.rejected_set_aside` | `StoreRejectedSetAsideParams` | `StoreRejectedSetAsideResult` | Local-only. Moves the rejected lines with one content hash into the quarantine file. See [Rejected Store Lines](#rejected-store-lines). |
 | `command.run` | `CommandRunParams` | `CommandRunResult` | Runs one command an installed package declared, once, and returns its stdout. Served on the local socket and, for a `peers` command, on remote overlay connections. See [Package Commands](#package-commands). |
 
 `status` exists as a method constant in `crates/protocol` but is not a supported
@@ -573,7 +565,6 @@ daemon method in this API version. It returns `daemon/method_not_found`.
 `session_new_branch_source_supported`,
 `session_new_input_ack_supported`,
 `session_new_secret_env_supported`, `session_new_request_id_supported`,
-`session_idle_stop_supported`,
 `package_install_commands_supported`, `package_install_index_supported`, and `package_bind_profile_expected_supported` independently. Clients must check the relevant
 flag instead of assuming that a reachable daemon or an attach-capable session
 supports every observation method. A daemon that predates `session.wait_turn`
@@ -651,12 +642,9 @@ Shared payloads:
   `identity_mismatch`, `runtime_not_claimable`, `runtime_conflict`. `fault` is
   absent when the root verified and the descriptor loaded.
 - `PackageRuntimeInfo`: `runtime_id`, `display_name`, `program`, `args`,
-  `resumable`, `forkable`, `prompt_argument` and the optional `launch_args`
-  (the arguments appended at a fresh launch to pass the generated reference),
-  `resume_args`, `fork_args`, `fork_launch_args` (the arguments appended after
-  `fork_args` to pass a fork's own generated reference, present only for a
-  runtime that declares `assign_fork`; all templates in which `{reference}`
-  marks the reference slot), `version_probe`, `integration_handler` and `hook_schema` (the
+  `resumable`, `prompt_argument` and the optional `launch_args`
+  (the arguments appended at a fresh launch to pass the generated reference) and
+  `resume_args` (templates in which `{reference}` marks the reference slot), `version_probe`, `integration_handler` and `hook_schema` (the
   core-owned handler and hook schema ids of the descriptor's `[integration]`
   table, absent for a runtime without one). The program, the
   fixed arguments and every template are exactly what the daemon can put in
@@ -693,7 +681,7 @@ Shared payloads:
 | `package.link` | `{directory, dry_run, accept_commands?}` | `{status, package, runtime?, commands?, reloaded}` | Copies the directory into content-addressed storage and installs it disabled and unselected; the daemon never loads the directory itself. `accept_commands` works as for `package.install`. |
 | `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
 | `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. Refused with `package_integration_incompatible` while a retained reference uses a version of the same package whose integration differs; nothing changes. |
-| `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest, and with `package_retention_uncertain` while a `metadata.jsonl` line that may pin a package cannot be read (the line is kept; list it with `store.rejected_list` and move it with `store.rejected_set_aside`). `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
+| `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest, and with `package_retention_uncertain` while a `metadata.jsonl` line that may pin a package cannot be read (the line is kept; `pohunek doctor` reports the rejected lines). `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
 | `package.bind_profile` | `{profile, digest?, expected_previous?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. `expected_previous` is the pin the caller expects the profile to hold now: `"unpinned"` or `{"pinned": {"digest": "sha256:..."}}`. When the profile's current pin differs (a profile with only one of its `package` and `digest` keys holds no pin), the call is refused with `package_profile_pin_changed` before the target is resolved and nothing is written, a dry run included; absent means no condition. Send it only when `host.inspect` reports `package_bind_profile_expected_supported`; an older daemon rejects the unknown parameter. The comparison reads the same file text the write replaces, so a pin made between the caller's read and the write is refused, not overwritten. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. A pin of a version whose integration differs from the selected version of its package, or from another referenced version (a session or another profile's pin; the pin being replaced does not count), is refused with `package_integration_incompatible`, because the pin would be a retained reference that coexists with an incompatible selected version. |
 
 Compatibility-gated selection. An integration handler owns one active asset set
@@ -763,25 +751,22 @@ official package whose `runtime_id` is that alias in `package.list` and
 A session launched from the built-in runtime of an official alias this daemon
 does not compile in (the built-in Codex, Claude Code or Hermes of an earlier
 release, pinned or from a record without a launch binding) while nothing serves
-the alias is refused with `runtime/runtime_builtin_removed` on resume, fork and
+the alias is refused with `runtime/runtime_builtin_removed` on resume and
 every mutation (input, attach, resize, rename, metadata); only stop and remove
 still work. Its recovery hint names the official package install and the
 new-session fallback. Once the official package serves the alias, it adopts a
 session whose launch pin names that package id, live or stopped; the package
-version may differ. The adopted session accepts input again, and resume and fork
-run through the package when it honors the session's recovery contract (the same
-native reference kind, a hook-reported reference, and for fork, fork support in
-both the frozen spec and the package). The relaunched run is pinned to the
+version may differ. The adopted session accepts input again, and resume
+runs through the package when it honors the session's recovery contract (the same
+native reference kind and a hook-reported reference). The relaunched run is pinned to the
 package digest. A session whose contract the package cannot honor, and a
 session record that names no package, are refused with
 `runtime/runtime_served_by_package`, whose recovery hint names the one
 migration (start a new session with `pohunek session new --agent <runtime>`,
 which the official package serves; no command rebinds the session to another
-runtime source), and the stored binding is kept unchanged. A fork of a Hermes
-session answers `agent_fork_unsupported`, because Hermes declares no native fork.
-`session list` and `session inspect` report each of resume and fork as false,
+runtime source), and the stored binding is kept unchanged. `session list` and `session inspect` report resume as false,
 with its refusal code in `capability_refusals`, when the session's recovery
-resolution refuses that operation. A session pinned to a runtime
+resolution refuses it. A session pinned to a runtime
 source the daemon does not serve otherwise (a built-in of a runtime id that is
 not an official alias, a package digest that is not installed) is refused with
 `runtime/runtime_not_installed`. Stop and remove still work. A session the
@@ -856,7 +841,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_identity_installed` | `runtime` | The package id and version are installed from another archive. |
 | `package_identity_conflict` | `runtime` | The digest is installed under another package identity. |
 | `package_referenced` | `runtime` | A session or host profile still pins the digest. |
-| `package_retention_uncertain` | `runtime` | A `metadata.jsonl` line that may pin a package cannot be read, so `package.uninstall` cannot prove the digest unreferenced. The line stays in the store until `store.rejected_set_aside` moves it into the quarantine file. Listing, inspecting and doctor still work; selecting, binding and integration updates judge every installed version while the line stays unreadable. |
+| `package_retention_uncertain` | `runtime` | A `metadata.jsonl` line that may pin a package cannot be read, so `package.uninstall` cannot prove the digest unreferenced. The line stays in the store until it is moved by hand into the quarantine file (see [Rejected Store Lines](#rejected-store-lines)). Listing, inspecting and doctor still work; selecting, binding and integration updates judge every installed version while the line stays unreadable. |
 | `package_root_invalid` | `runtime` | The recorded package root fails verification. |
 | `package_root_intact` | `runtime` | The recorded package root verifies, so it is not removed as modified. |
 | `package_registry_busy` | `daemon` | Another writer holds the package registry. |
@@ -877,35 +862,14 @@ Errors use the error contract below. Every code has fixed message and
 A `metadata.jsonl` line no loader accepts (a record of a newer or damaged
 daemon) is kept in the file through every rewrite, and package gates fail
 closed while a line that may pin a package stays (`package_retention_uncertain`).
-`store.rejected_list` and `store.rejected_set_aside` are the supported way to
-inspect and remove such lines. Both are served on the local control socket only:
-a remote connection is refused with `local_only_method` before a parameter is
-read. A protocol 3 connection gets `method_not_found`, as for every method added
-after protocol 3.
-
-| Method | Params | `ok` result | Notes |
-|---|---|---|---|
-| `store.rejected_list` | `null` | `{lines[], total}` | Each line is `{line, kind?, session_id?, reason, may_pin, may_own_runtime, content_hash}`. `line` is the 1-based position in `metadata.jsonl`; `kind` and `session_id` are the line's own text and, like `reason`, cut to `STORE_REJECTED_TEXT_MAX_BYTES` (128). `may_pin` is true when the readable `kind` is not `worktree` or `project` and the line does not decode as a record, so the pin it may hold cannot be read; a line that decodes but names an agent kind this build does not know has `may_pin` false and its pin counts like a loaded record's. `may_own_runtime` is true for a line whose session state cannot be read, including a line that is not a JSON object, and for a `resume` line whose pin cannot be read (`may_pin`): the session it resumes may be running. `content_hash` is the lowercase hex SHA-256 of the line without its terminator. The raw line is never returned. At most `STORE_REJECTED_LIST_MAX_LINES` (100) lines are returned; `total` counts all of them. |
-| `store.rejected_set_aside` | `{content_hash, accept_pin_loss?}` | `{content_hash, lines[], quarantine_file}` | Moves every rejected line with this hash, in one call, into `metadata.rejected.jsonl` next to the store. `lines` are the numbers the lines had before the move; `quarantine_file` is a file name, not a path. A line with `may_own_runtime` is refused with `store_rejected_line_live` unless `accept_pin_loss` is true, because dropping it drops the package pin that protects a root a live worker may run from. Params are strict: an unknown field is `bad_request`. |
-
-The quarantine file is owner-private (`0600`) JSON lines, written through an
-atomic replace before the store is rewritten without the lines, both under the
-store's write lock; a crash between the two steps leaves the line in both files
-and a repeat appends a second record. Each record is
-`{quarantine_schema, set_aside_at, line, content_hash, kind?, reason, may_pin, may_own_runtime, accepted_pin_loss, text}`;
-`text` is the line exactly as stored. The daemon reads the file only to append
-to it, never interprets or deletes it, and a quarantine file that is not UTF-8,
-not owner-private or over the store size limit fails every later set-aside with
-`store_quarantine_failed`. The other records are rewritten as any store write
-rewrites them: grouped by kind, blank lines dropped, and the lines that stay
-rejected kept as stored after them.
-
-| Code | Class | Meaning |
-|---|---|---|
-| `store_rejected_line_not_found` | `runtime` | No rejected line has the content hash (it may already have been set aside); list again. |
-| `store_rejected_line_live` | `runtime` | The line may own a live runtime and `accept_pin_loss` was not set; nothing changed. |
-| `store_quarantine_failed` | `daemon` | The quarantine file or the store rewrite failed; the store still holds the line. |
-| `store_read_failed` | `daemon` | The store cannot be read or its schema is refused. |
+The protocol has no method that edits the store. The count is reported by the
+`metadata_store_rejected_lines` check of `daemon.doctor`, and the
+[runtime package recovery runbook](knowledge/runbooks/runtime-package-recovery.md)
+describes the manual remedy: with the daemon stopped, move the line, keeping its
+text, into the owner-private quarantine file `metadata.rejected.jsonl` next to
+the store. The daemon never reads, interprets or deletes that file. The other
+records are rewritten as any store write rewrites them: grouped by kind, blank
+lines dropped, and the lines that stay rejected kept as stored after them.
 
 ### Package Commands
 
@@ -1073,13 +1037,13 @@ contents, key material, proposal, nonce, signature, or previous snapshot.
 ### Native reference strategies
 
 A runtime definition declares in `[native_reference]` how core obtains the native
-session reference that resume and fork consume. The table is required.
+session reference that resume consumes. The table is required.
 
-| `strategy` | Reference source | Resume and fork |
-|------------|------------------|-----------------|
+| `strategy` | Reference source | Resume |
+|------------|------------------|--------|
 | `none` | none | frozen off; requires `resume.supported = false` |
 | `hook` | a validated integration report (process-bound, ancestry, sequence and expiry checked) | on once a report arrived; requires a supported resume; may declare `[native_reference.existence]` for an id-kind reference |
-| `assigned` | generated by core and passed to the agent at launch (and at fork with `assign_fork = true`) | on from the first moment; requires a supported resume |
+| `assigned` | generated by core and passed to the agent at launch | on from the first moment; requires a supported resume |
 
 The built-in `shell` declares `none`; the official Codex, Claude Code and
 Hermes packages declare `codex`, `claude` and `hermes` = `hook`.
@@ -1193,7 +1157,7 @@ exactly `0`, `1`, `true` or `false` (case-sensitive, never empty, never
 expanded); a program, path, host, port or credential cannot be a value, and
 widening the set needs a new feature id. A refusal is `descriptor_invalid` and names the field, never a
 name or a value. The pairs are not persisted: each launch (a new session, a
-resume, a fork) reads them from the definition that serves it. A launch applies
+resume) reads them from the definition that serves it. A launch applies
 them first, then the session's private `TMPDIR`, then the host profile's
 `[env]`, the runtime contributor's pairs, the reserved `POHUNEK_*` values, then
 the request's `secret_env` values. A slot that collides with an earlier layer
@@ -1233,7 +1197,7 @@ a placeholder in any other place (first, after `--`, `-`, `--x=y` or a non-flag
 token), text after it, and the placeholder in `runtime.args` are refused at install
 (`descriptor_invalid`, naming the field and never a token). The arguments are
 rendered per launch from the name that launch uses (`session.new` `name`; the
-current name on resume; `session.fork` `name`, not the source's), after the
+current name on resume), after the
 frozen and contributor arguments and before the native reference and prompt
 arguments, and are never persisted: no store or protocol change. No name, or a
 stored name that fails the session-name rule, omits them. A descriptor without
@@ -1258,7 +1222,7 @@ table declares at most one of `keep_local_args` (1 to 8 literal tokens, each at
 most 1024 bytes without control characters and without `{session_name}`) and
 `keep_local_handler = true` (the runtime's integration handler contributes the
 launch input; a handler without one is `descriptor_invalid`). The tokens are
-added to every create, resume and fork launch after the frozen and contributor
+added to every create and resume launch after the frozen and contributor
 arguments and before `[naming]`'s, omitted when the frozen arguments already
 hold all of them, and never persisted. A descriptor that lists `placement-v1`
 without `[placement]` is `descriptor_invalid`; `[placement]` without the feature
@@ -1301,7 +1265,7 @@ normalized `/`-separated paths of at most 256 bytes, with no empty, `.`, `..` or
 inside another (compared per component, ignoring ASCII letter case). A violation, one
 key without the other, or a key without the feature is refused at install
 (`descriptor_invalid`, `runtime_feature_unsupported`; the diagnostic never reflects
-an entry). At `session.new`, `session.resume` and `session.fork` the daemon
+an entry). At `session.new` and `session.resume` the daemon
 appends the arguments after the frozen, contributor and `[naming]` arguments and
 before the native reference and prompt arguments, only when the project's stored
 `origin_url` is a GitHub repository in one of the two exact forms
@@ -1321,12 +1285,11 @@ missing fact withholds the arguments, the git calls and the on-disk walk of one
 evaluation share a 30 second deadline, and a failure logs one `checkout_trust.failed` warning. The arguments are
 evaluated at every launch and never persisted. The directory and project a session was
 created in are persisted (store schema 16, no protocol change): `session.new` evaluates
-the predicate on its launch directory, and `session.resume` and `session.fork` evaluate
+the predicate on its launch directory, and `session.resume` evaluates
 it on that create-time directory and project, never on the session's current ones, and
 append the arguments only when the relaunch directory is byte-equal to the create-time
 directory. A session whose current directory moved (an OSC 7 hint or the focus process)
-therefore relaunches there without the arguments, a fork inherits its source's
-create-time pair, and a session stored before schema 16 has none, so it resumes and forks
+therefore relaunches there without the arguments, and a session stored before schema 16 has none, so it resumes
 without the arguments until it is created again; each withheld relaunch logs one
 `checkout_trust.failed` warning. A run of the arguments in the descriptor's `args` or a
 host profile's `args` is dropped from every launch, so only the predicate adds it. A descriptor
@@ -1362,7 +1325,7 @@ The values travel in the request and reach the agent once, in the worker's
 private `Initialize` message; the daemon does not persist them. They appear in
 no `session.list`, `session.inspect`, event, notification, metadata, journal,
 log or error text, and the typed parameter prints only an entry count. Because
-nothing is kept, `session.resume` and `session.fork` of a session whose profile
+nothing is kept, `session.resume` of a session whose profile
 declares slots fail with `secret_env_missing`, and so does a relay-origin launch
 of such a profile. A slot name is a code-execution decision of the profile owner: declaring an interpreter hook such as `NODE_OPTIONS`, `BASH_ENV` or `GIT_SSH_COMMAND` lets every caller that may start the profile run code. `"secret_env": null` is refused with `secret_env_invalid`; omit the field instead. The agent process holds the values in its environment for its
 lifetime, like a profile `[env]` value: same-user readers of
@@ -1620,7 +1583,7 @@ the old answers. The field is additive and omitted when false. Because
 `session.report_native_id` rejects unknown fields and both daemon generations
 speak protocol 4, the protocol version cannot gate it: a daemon sets
 `POHUNEK_HOOK_ADMISSION_RETRY=1` in the environment of every session it
-launches (new, resumed and forked), and a reporter sends the field only when
+launches (new and resumed), and a reporter sends the field only when
 that is set, so a session launched by an older daemon never sends it. A session
 launched by this daemon keeps the variable if the daemon is later downgraded,
 and the older daemon then rejects its native-id reports with `bad_request`;
@@ -1635,7 +1598,7 @@ No other public wire shape changes.
 **Native-id report attestation.** `session.report_native_id` is attested before any session state is read. The daemon takes the kernel peer of each local Unix connection once, when it is accepted (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` with `LOCAL_PEERPID` on macOS, with the process start identity read at that moment); a remote TCP connection carries no peer. A report is admitted only when all of these hold: the peer is present; its user is the daemon's user; its process id and start identity are the ones the report names; and the peer is still that process when the report is decided, checked again immediately before the native reference is written. The report then goes through the ordinary checks, and only the session's PTY root can pass them. A report that fails the attestation, or any report for a session whose hook schema takes its launch identity only from the worker (`identity-v1`, `FrozenRootEntrypoint`, even from the root itself), returns the error `native_report_unattested` (class `runtime`), and its message names no request value. The recovery hint says to report the native reference through the worker hook socket from the launch process. A report that passes the attestation but fails a later check keeps the existing `recorded: false`. Each refusal writes one `warn` log record, `session.native_report.unattested`, with a `reason` of `no_peer`, `peer_uid`, `peer_not_root`, `peer_identity_changed` or `frozen_root_schema`; the record carries the session id and no request value. Hook processes are children of the agent, so the shipped Claude and Codex hooks' daemon fallback is refused, and the Hermes reporter's fallback is refused by the `identity-v1` rule; a native reference is recorded through the worker hook socket. No protocol version changes.
 
 Rule for runtime packages without an integration handler: such a package gets
-terminal launch and activity detection. It gets resume and fork only when its
+terminal launch and activity detection. It gets resume only when its
 agent CLI accepts a caller-chosen session id and the definition declares
 `strategy = "assigned"`; with `hook` or `none` it is not resumable. A package
 cannot obtain a reference through `session.report_native_id`, because that
@@ -1650,7 +1613,6 @@ below).
 [native_reference]
 strategy = "assigned"
 launch_args = ["--session-id", "{reference}"]   # passed at launch
-assign_fork = true                               # optional; forks get one too
 
 [native_reference.existence]                     # required, explicit
 check = "file"                                   # or "none"
@@ -1674,19 +1636,8 @@ relocating_settings = [                          # optional; refused at launch
   taken from a client or user), appends the rendered `launch_args` after the
   runtime's fixed arguments and before the initial prompt argument, and stores
   the reference in the session and its recovery binding before the agent starts.
-  Resume and fork use the declared `[resume]` / `[fork]` argv with that
+  Resume uses the declared `[resume]` argv with that
   reference; the start flag is never repeated on resume.
-- `assign_fork` (a boolean, default `false`, accepted only with `assigned` and
-  `[fork] supported = true`, otherwise `descriptor_invalid`) gives every fork a
-  reference of its own, for an agent that accepts `launch_args` together with
-  its fork arguments. `session.fork` generates a fresh UUID for the fork and
-  appends the rendered `launch_args` after the rendered `[fork]` args (Pi:
-  `pi --fork <source> --session-id <fork>`); the fork holds that reference with
-  provenance `assigned` from its creation on, so it resumes like a fresh launch
-  and its own existence check guards its recovery. Without `assign_fork` a fork
-  holds no reference until a validated report names one. The flag is frozen
-  into the session's native launch spec, so a session keeps the fork behavior
-  it was launched with.
 - The binding records a provenance: `assigned` for a generated reference,
   `reported` for one a validated report delivered (also the value for records
   written before the field existed). An assigned reference is not identity
@@ -1696,8 +1647,8 @@ relocating_settings = [                          # optional; refused at launch
   the provenance is never stale.
 - An assigned reference goes stale when the user changes conversation inside the
   agent (for example `/clear` or an in-session resume), and it names nothing
-  when the agent never wrote the conversation. Before `session.resume` or
-  `session.fork` launches anything, the declared `existence` check runs against
+  when the agent never wrote the conversation. Before `session.resume`
+  launches anything, the declared `existence` check runs against
   the frozen declaration. `check = "none"` skips verification and relaunches
   from the reference unchecked. `check = "file"` lists directories below the
   config home (the environment variable named by `root_env`, else `root_home` below `HOME`;
@@ -1736,13 +1687,13 @@ relocating_settings = [                          # optional; refused at launch
   an absent file, or a `root` setting below an unresolvable config home, sets
   nothing. Both lists hold one to 8 entries. A first launch (`session.new`) of a
   runtime with native recovery runs this refusal before anything is spawned,
-  and `session.resume` and `session.fork` run it against the session's
+  and `session.resume` runs it against the session's
   arguments and working directory before the existence check; a variable that
   is set to a relative path is refused the same way. The refusal is
   `runtime/agent_native_store_relocated`. At a first launch its `recover` hint
   names the `store_env` variable when one is declared (for a relocating
   argument, which wins over the variable, it says to remove the argument). At
-  resume or fork the launch passed the same refusal, so something changed
+  resume the launch passed the same refusal, so something changed
   since (a setting or argument appeared, or the variable the launch had is
   gone after a daemon restart or an accepted profile edit), and the hint says
   to undo that change: remove the setting or argument, or restore the variable
@@ -1754,16 +1705,13 @@ relocating_settings = [                          # optional; refused at launch
 - A hook runtime may declare the existence check recovery runs on an id-kind
   reference under `[native_reference.existence]` (same shape as the `assigned`
   declaration; a path-kind hook reference cannot carry one). Before
-  `session.resume` or `session.fork` launches, the declared check runs with the
+  `session.resume` launches, the declared check runs with the
   same rules as below. The official Claude Code package declares it: its hook reference is
   checked against a regular transcript file in the `projects` tree below the
   runtime's effective declared config home. An absent or unverifiable file
   returns `runtime/agent_native_reference_missing` without a new worker
-  generation or fork child; a crash of the check returns
+  generation; a crash of the check returns
   `daemon/native_store_check_task_panicked`, also before anything launches.
-- A fork starts a new conversation whose reference core cannot learn without
-  an integration report, so the child holds no reference and is not resumable
-  until its own launch process reports a validated target.
 - A host profile on an `assigned` base inherits the assignment; one that
   restates `[resume]` is rejected with `invalid_profile`, and
   `resumable = false` switches recovery off (no reference is generated).
@@ -1798,17 +1746,14 @@ relocating_settings = [                          # optional; refused at launch
   older than the stored one of its own transport, an expired or overlong
   claim, or a claim from another runtime never replaces a reference, and
   an assigned value never replaces a reported one: relaunches, daemon restarts
-  and rebinding start from the stored reported reference. Resume and fork then
-  launch with the reported reference. The existence check runs only for an
+  and rebinding start from the stored reported reference. Resume then
+  launches with the reported reference. The existence check runs only for an
   `assigned` reference, so a reported one is recovered unchecked, as the agent
   vouched for it. A `hook` runtime uses the same generation, verified launch
   process, provider, frozen kind and sequence checks for the worker's journaled
   native reference, so an in-agent conversation switch can replace its first
   immutable launch claim. A package without an integration cannot send a report, so its
   reference stays `assigned`.
-- A forked session of an assigned reference still shows the frozen
-  `capabilities.resume = true` but holds no reference, so `session.resume`
-  answers `not_resumable` for it.
 - The values in the example are those of the repository's `pi` package
   (`runtime-packages/pi`), verified against a real Pi. Verify any other
   runtime's flag and on-disk layout before declaring them.
@@ -1869,7 +1814,7 @@ existing parsers stay strict, and `AgentRuntime.version` stays an opaque string
 that reports the release as printed (`"1.4.13-R2"`), read by `host.inspect` and
 the launch gate through the same grammar.
 
-Before `session.new`, `session.resume` and `session.fork`, and for the `host.inspect` runtime inventory
+Before `session.new` and `session.resume`, and for the `host.inspect` runtime inventory
 (`version`, `supported`), the daemon resolves the program once, runs it with the
 declared argv, and parses the trimmed first line of its standard output as one
 release (ASCII digits only, no leading zeros, no pre-release or build suffix;
@@ -1906,8 +1851,7 @@ probed again at once; an unchanged program is probed again only after
 under an unchanged script is noticed after at most that lifetime. The probe
 spawns without `pre_exec`, so its cost does not grow with the daemon's memory;
 its output is read from a pipe and a probe that writes more than the 4 KiB cap
-is ended as failed. Launch-time validation (`session.new`, `session.resume`,
-`session.fork`) never reads the cache.
+is ended as failed. Launch-time validation (`session.new`, `session.resume`) never reads the cache.
 
 ### `SessionInfo`
 
@@ -1919,9 +1863,9 @@ Important fields:
   read-only: attach, input, resize, stop, remove, rename, metadata updates, and
   resume return `runtime/session_external_read_only`.
 - `capabilities`: required `SessionCapabilities` object with `resume` and
-  `fork` booleans frozen for the logical session. Both derive from one frozen
-  native-session launch spec (reference kind, resume argv, optional fork argv),
-  so `fork` is `true` only when `resume` is `true`. Clients must use these flags
+  `fork` booleans. `resume` is frozen for the logical session and derives from
+  the frozen native-session launch spec (reference kind, resume argv); `fork` is
+  always `false`. Clients must use these flags
   instead of inferring provider behavior from `agent` or `agent_base`. Records
   that predate the field load both flags as `false`. `session list` and
   `session inspect` report a flag as `false`, even though the frozen value is
@@ -1931,24 +1875,22 @@ Important fields:
   Refusals that depend on the session's current state (a live runtime) or on
   checks of one request (a changed profile, the native reference) come only
   from the operation itself. Host profiles declare the
-  spec in `[resume]` (`reference_kind`, `args`, optional `fork_args`, accepted only on
-  bases whose runtime declares a native fork, such as `claude`); see the
+  spec in `[resume]` (`reference_kind`, `args`); see the
   agent-profiles concept page. The capability object itself is unchanged in
   this release: it stays strict, and the refusal reasons ride in
   `capability_refusals`.
-- `capability_refusals`: optional `{resume?: string, fork?: string}` object on
+- `capability_refusals`: optional `{resume?: string}` object on
   `session list` and `session inspect` responses, present only when the daemon
   cleared a frozen `true` capability. Each value is the error code
-  `session.resume` or `session.fork` returns for that recovery resolution (for example
+  `session.resume` returns for that recovery resolution (for example
   `runtime_served_by_package`, `runtime_builtin_removed`,
-  `runtime_not_installed`, `runtime_incompatible`, `agent_not_resumable` or
-  `agent_fork_unsupported`), derived from the same recovery resolution that
+  `runtime_not_installed`, `runtime_incompatible` or `agent_not_resumable`), derived from the same recovery resolution that
   clears the flag, so for a refusal of that resolution the listing and the
   operation name the same reason. A frozen
   `false` capability carries no reason. Stored records, events and other
   results never carry the field. The object is open: clients ignore operations
   they do not know. Protocol 3 connections never receive it. Human
-  `session list` output adds a `refused <id>: resume=<code> fork=<code>` line,
+  `session list` output adds a `refused <id>: resume=<code>` line,
   and `session inspect` a `capability_refusals` row.
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
@@ -2112,8 +2054,7 @@ Important fields:
   (not passed as a prompt argument); `state = running` alone says neither.
 - `native_session_id` / `native_session_path`: optional agent resume binding.
   These belong to the verified launch agent and follow its accepted conversation
-  switches; nested active-agent reports cannot replace them. A fork reads the
-  source's current target but starts without a recovery reference of its own.
+  switches; nested active-agent reports cannot replace them.
   Hermes resumes only when this valid reference exists, as
   `hermes chat --resume <reference>`; it never infers an ambient Hermes
   session.
@@ -2125,7 +2066,7 @@ Important fields:
   and `session.list` derive it on read without following symlinks. It is absent
   when no native file is verified and never falls back to `updated_at`.
   Human `session.inspect` labels target presence `native_binding`; the
-  authoritative recovery decision is made by `session.resume` or `session.fork`.
+  authoritative recovery decision is made by `session.resume`.
   Human `session.list` shows the target and timestamp in a `recovery` detail
   line for every session with a native binding, using `<unknown>` when no file
   activity is verified.
@@ -2160,9 +2101,9 @@ Important fields:
   warning's `detail` or in the `base_branch_fetch_failed` message; the ordering
   covers one daemon only. `kind` is `native_recovery` for a session whose stored
   native recovery record could not be completed after an upgrade: it cannot
-  resume or fork, `message` says to start a new session and resume the native
+  resume, `message` says to start a new session and resume the native
   conversation, and `detail` carries the stored native reference. `hook` also
-  marks a launch (new, resume or fork) whose agent's installed Claude or Codex
+  marks a launch (new or resume) whose agent's installed Claude or Codex
   hook assets differ from the ones the
   daemon embeds (an older version marker or changed content): `message` names the
   `pohunek integration install --agent <agent>` command (with `--profile` for a
@@ -2191,7 +2132,7 @@ Important fields:
   (such as the native GUI) and the launch scripts to tie a session to a work item — no protocol surface
   is dedicated to it.
 - `spawned_by`: optional `{session_id, daemon_id}`, omitted when absent. When a
-  `session.new` or `session.fork` request carries the request origin pair
+  `session.new` request carries the request origin pair
   (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`), the daemon records that pair
   on the new session. The CLI and the Rust client send the inherited pair
   unless the Rust client selects `OriginSource::Omitted`; the TypeScript SDK
@@ -2199,8 +2140,7 @@ Important fields:
   variables itself. It is not a request parameter: the daemon copies it from the request
   envelope, and a `spawned_by` key in the params is ignored like any unknown
   param key. The record is
-  immutable, survives a daemon restart, a resume and a native recovery, and a
-  fork never inherits the source session's value. A request without an origin
+  immutable, survives a daemon restart, a resume and a native recovery. A request without an origin
   records nothing. `daemon_id` names the daemon instance that launched the
   spawner's runtime: a worker keeps its launch daemon id across daemon restarts,
   so it can be an earlier instance on this host or another host. It is stored
@@ -2216,7 +2156,7 @@ Important fields:
 `provider`, the inventory `agent_base`, the integration `agent` and the
 notification `agent_kind`) are forward-compatible for presentation. An unknown
 string round-trips through Rust and TypeScript clients as a neutral value.
-Agent-targeted mutation, resume and fork resolve the value through the daemon's
+Agent-targeted mutation and resume resolve the value through the daemon's
 runtime registry: a value outside the runtime-id grammar is rejected with
 `runtime/agent_kind_unsupported`, and a grammar-valid id that no enabled runtime
 resolves is rejected with `runtime/runtime_not_installed`. A session's
@@ -2224,16 +2164,16 @@ resolves is rejected with `runtime/runtime_not_installed`. A session's
 session hosts in its foreground) is only checked against the grammar: mutations
 act on the session's own runtime, so a shell session stays interactive while
 the hosted agent's package is missing or uninstalled. Unknown values never
-silently become a supported launch, resume, or fork runtime. A session or
+silently become a supported launch or resume runtime. A session or
 recovery record whose runtime is not installed is kept inert: it stays listed
-with its stored recovery binding, refuses resume, fork, input and every other
+with its stored recovery binding, refuses resume, input and every other
 mutation with `runtime_not_installed` (or `agent_kind_unsupported` for a
 historical label), and resumes again once the runtime is installed. The
 exception is a session launched from the built-in runtime of an official alias
 this daemon does not compile in (the built-in Codex, Claude Code or Hermes of
 an earlier release): it is refused with `runtime/runtime_builtin_removed` while
 no package serves the alias. The official package then adopts the session and
-resume and fork run through it when the recovery contract is honored; otherwise
+resume runs through it when the recovery contract is honored; otherwise
 they are refused with `runtime/runtime_served_by_package`.
 `session.stop` and `session.remove` (also
 `session.remove_accepting_unconfirmed`) are the exceptions: they only release
@@ -2265,7 +2205,7 @@ reveals nothing about profile `[env]` values. A malformed revision is
 Frozen profile revision. A session launched from a host profile freezes the
 profile's keyed revision (the same MAC a relay approval uses) into its resume
 binding when it is created, so the binding names which profile the session ran
-under without storing its `[env]`. `session.resume` and `session.fork` resolve
+under without storing its `[env]`. `session.resume` resolves
 the profile once and use that single resolution for the version probe, the
 native-reference check, the launch and the relaunched session's snapshot. They
 relaunch only while the profile's current revision equals the frozen one:
@@ -2801,83 +2741,6 @@ A protocol 3 connection does not define the method: the daemon answers
 `daemon/daemon_protocol_too_old` before sending it. A protocol 4 daemon of an
 earlier release answers `daemon/method_not_found`.
 
-### Idle Stop
-
-A session stops by itself when it opts in and its agent stays `idle`. The
-opt-in is session metadata, the first key the daemon interprets (`pohunek.` is
-reserved for such keys; other `pohunek.*` keys and every key outside it are
-opaque):
-
-| Key | Value | Meaning |
-| --- | --- | --- |
-| `pohunek.idle_stop_after_secs` | `default` | Stop after the host default of `session.idle_stop.get`; a session is never stopped while no default is set. |
-| | decimal seconds, at least `min_after_secs` | Stop after this idle time, whatever the host default. |
-
-A session without the key is never stopped for idleness. `session.new` and
-`session.set_metadata` refuse any other value (digits only: no sign, space,
-exponent or unit) with `daemon/invalid_idle_stop_after`, before anything
-starts; a refused edit leaves the previous metadata. Only a value being set is
-checked, so a value an older daemon stored unvalidated never blocks an edit of
-another key; such a session is not opted in, and the daemon logs a WARN once.
-
-The idle clock restarts whenever the session's activity value changes
-(`idle -> working -> idle`, `blocked -> idle`); a repeated `idle` report does
-not move it. It lives in memory only: after a daemon restart it starts when the
-session is adopted, so a restart can delay a stop and never advance one. The
-daemon stops the session through the ordinary stop transaction when all of
-these hold at the deadline, re-checked under the lock that marks the session
-as stopping: the session is `running` on a live worker, its activity is
-`idle`, no `agent_blocked` or `approval_required` notification for it is
-`unread` or `read`, and no `session.input`, `session.wait` or
-`session.wait_turn` call waits on it. While the notification store is
-unavailable (`notifications_unavailable`) its attention records are unknown, so
-every session counts as holding one and none is stopped until the daemon runs
-over a usable store. A held session is looked at again after
-a short interval. The worktree is kept and the `session-stop` hook fires.
-The idle clock and the reported activity are memory only: after a daemon restart
-a session is armed again when it reports `idle` again, and its limit counts from
-that report.
-
-Live background work holds the stop. A session whose `SessionInfo.background`
-lists an item of kind `subagent`, `workflow`, `shell`, `monitor` or `mcp_task`
-is not stopped, and `activity` is not changed by it: it keeps its turn meaning
-(`idle` once the turn ends, so `session.input` waits, `session.wait` and
-`session.wait_turn` behave as without background work). A `subagent` item whose
-`SessionInfo.subagents` row with the same id is terminal does not count. Items of
-kind `teammate`, `dream`, `auto_mode_scan`, `memory_import`, `cloud_session` and
-`other` never hold, and a `running` subagent row without a background item never
-holds (Codex lists no background snapshot, so Codex sessions are not held). The
-hold has no age limit and a held session has no deadline. When the last live item
-disappears the idle clock restarts from that moment, so the stop comes a full
-limit later. The rule reads only the published `background` and `subagents`
-fields; there is no protocol change.
-
-Rendering background work: a client shows `background` beside `activity`
-instead of treating a background session as `working`. Only the five kinds above
-hold the idle stop; the CLI's `session list` `BACKGROUND` column lists every
-reported item, teammates and internal kinds included.
-
-The stop is recorded where an operator can find it, without a protocol field:
-an INFO log line `session.idle_stop.stopped` (session id, idle seconds, whether
-the limit came from the session or the host default) and the `session_stopped`
-event in the event log. When the notification policy keeps `system` records, a
-`system` notification for the session carries `reason=idle_stop` and
-`summary=idle_secs=<n>`. The default policy has `system` disabled, and the
-daemon honors that choice: the stop then leaves no notification.
-
-The host default is a record of its own, `<data_dir>/session-idle-stop.json`
-(owner-private, written atomically, `{}` when no default is set; a corrupt or
-unsafe record fails daemon startup like `session-policy.json`). It is not part
-of `SessionRetentionPolicy`, so a client of the previous release reads and
-rewrites the retention policy exactly as before while a default is set.
-
-A protocol 3 connection does not define the methods (`method_not_found`; a
-current client fails with `daemon/daemon_protocol_too_old` before sending). A
-protocol 4 daemon of an earlier release answers `daemon/method_not_found`, and
-`pohunek session policy get` then reports `idle_stop_after: not supported by
-this daemon`; such a daemon treats the metadata key as plain metadata, so the
-session is simply never stopped for idleness.
-
 ### Active-Agent Hook Payloads
 
 Managed PTY children inherit these reserved environment values. The worker
@@ -2939,7 +2802,7 @@ directory fails that check fails with runtime-class `session_tmpdir_unsafe`,
 one whose directory cannot be created, or whose path is not valid UTF-8 and so
 cannot be exported, with `session_tmpdir_failed`, before
 any worker starts. A stop keeps the directory and a resume of the same session
-reuses it (recreating it when it is gone); a fork gets its own. Every removal
+reuses it (recreating it when it is gone). Every removal
 (`session.remove`, retention, a rolled-back create) deletes it with everything
 an agent left in it; a delete that fails is logged with its path and leaves
 the removal itself successful. Daemon startup deletes every entry of its own
@@ -3451,7 +3314,7 @@ startup, `acceptance_scope`: `v1:` and a SHA-256 digest of the facts a durable
 acceptance stays bound to; it is absent for every other verdict and a reader
 treats an absent or unknown scope as not accepted), `stopped_sessions` (the
 same verdicts, plus `already_not_resumable`, for sessions whose runtime has ended
-but that keep native resume or fork; at risk under the same flag), `runtimes` (absent when the release carries no
+but that keep native resume; at risk under the same flag), `runtimes` (absent when the release carries no
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
 plan with `packages`, `profiles`, `integrations` and `refusals`), and
 `unmanaged_workers` (ids of live worker journals the store has no record of; the
@@ -3479,7 +3342,7 @@ never write it, and an unreadable or unsafe file fails with
 journals and the process table only; it never connects to a worker socket. A
 live session whose worker journal names a release before 0.33.1, or no release,
 is `would_not_be_adopted` with code `worker_marker_legacy`. A live session that
-can resume or fork natively and whose launch pin names a runtime source the new
+can resume natively and whose launch pin names a runtime source the new
 binary does not serve (resolved as resume resolves it, against that binary's
 built-in runtimes and the installed packages: a built-in it does not ship, or a
 package digest that is not installed) is `would_lose_recovery` with code
@@ -4108,9 +3971,7 @@ worked on the prompt wait for `working` activity.
 On `SessionStart` (action `session`) the hook's identity report carries the
 hook input `source` as `session_source` only when it is `startup`, `resume`,
 `clear` or `compact`; any other value, or none, omits the key. The worker clears
-the background snapshot only on `startup` and `resume`. `fork` is not forwarded:
-a forked session is a new process and must not clear the snapshot of the session
-it was forked from. On `SessionEnd` (action `release`) the identity release
+the background snapshot only on `startup` and `resume`. On `SessionEnd` (action `release`) the identity release
 carries the hook input `reason` as `release_reason` only when it is `clear`,
 `resume`, `logout`, `prompt_input_exit` or `other`; any other value omits the
 key. The snapshot belongs to the reporting Claude process: any process in the
@@ -4552,7 +4413,7 @@ configuration code.
 
 Protocol v4 emits these runtime codes for provider-neutral agent and
 observation behavior: `agent_kind_unsupported`,
-`agent_fork_unsupported`, `session_terminal_unavailable`,
+`session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
 `session_read_ansi_unavailable`, `session_output_limit_exceeded`,
 `session_wait_limit_exceeded`,
@@ -4563,7 +4424,7 @@ observation behavior: `agent_kind_unsupported`,
 `session_input_not_submitted`, `session_input_timeout`, `session_input_stalled`, `session_input_not_ready`, and the CLI-local `session_input_interrupted`. Daemon startup may additionally return
 `observation_limits_invalid`. `runtime_not_installed` is emitted when a runtime
 id resolves to no enabled runtime: a host profile whose `base` names an
-uninstalled runtime, and resume, fork or mutation of a session whose runtime is
+uninstalled runtime, and resume or mutation of a session whose runtime is
 not installed or no longer matches its recorded launch binding. A bare
 `session.new` agent name that is neither a profile nor an installed runtime
 stays `agent_profile_not_found`. For an official alias nothing serves (`codex`,
@@ -4574,18 +4435,18 @@ installed official package of that alias (`pohunek.runtime.<alias>`) cannot be
 loaded (after a registry rebuild left it out), that unpinned profile's launch is `runtime_incompatible` instead, with
 the recovery `pohunek plugin doctor` and then `pohunek plugin profile migrate
 <name>`; the install is not offered, because the same archive is refused.
-`runtime_builtin_removed` is emitted by resume, fork and mutation of a session
+`runtime_builtin_removed` is emitted by resume and mutation of a session
 launched from the built-in runtime of an official alias this daemon does not
 compile in while no package serves the alias. Once the official package serves
-it, the package adopts the session, and resume and fork answer
-`runtime_served_by_package` only when the recovery contract is not honored
-(fork of a Hermes session: `agent_fork_unsupported`). `runtime_incompatible` is emitted when a
+it, the package adopts the session, and resume answers
+`runtime_served_by_package` only when the recovery contract is not honored.
+`runtime_incompatible` is emitted when a
 runtime package is installed but its root is missing, modified or contradicts
-the session's pin, for fresh launch, resume, fork and integration changes (the
+the session's pin, for fresh launch, resume and integration changes (the
 message names only the runtime id). `agent_profile_revision_stale` and `agent_profile_revision_invalid` are emitted only by the relay-selected launch
 source (see above), which no wire method reaches yet.
-`agent_profile_revision_unavailable` is also emitted by `session.new` for a profile-backed session, and by `session.resume` and `session.fork`, when the host's revision key cannot be read.
-`agent_profile_changed`, `agent_profile_missing` and the daemon-class `agent_profile_change_local_only` are emitted by `session.resume` and `session.fork` (see "Frozen profile revision").
+`agent_profile_revision_unavailable` is also emitted by `session.new` for a profile-backed session, and by `session.resume`, when the host's revision key cannot be read.
+`agent_profile_changed`, `agent_profile_missing` and the daemon-class `agent_profile_change_local_only` are emitted by `session.resume` (see "Frozen profile revision").
 Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.
@@ -4668,7 +4529,7 @@ the Rust SDK's remote path (`ClientError::RemoteProtocol`) prepends
 `ProtocolError` has no data field, so `worktree_in_use` and `task_worktree_busy`
 cannot name the users or the blocking task; the method slice decides where that
 data is carried. Session methods
-raise `worktree_busy`, `task_session_ended`, `task_fork_unsupported`,
+raise `worktree_busy`, `task_session_ended`,
 `worktree_in_use`, `worktree_users_changed` and `task_snapshot_retired` for
 sessions that belong to tasks.
 
@@ -4678,10 +4539,10 @@ sessions that belong to tasks.
 | `task_attention_open` | `runtime` | `task.continue` | The latest turn settled `attention` and was not answered. | yes |
 | `task_agent_busy` | `runtime` | `task.continue` | The agent is still visibly working on an earlier prompt. | yes |
 | `task_worktree_busy` | `runtime` | `task.start`, `task.continue`, `task.answer`, `task.extend` | Another task or a live non-task session occupies the worktree. | yes |
-| `worktree_busy` | `runtime` | `session.input`, attach with terminal control, `session.resume`, `session.fork` (`cwd_mode: "same"`), in-place `session.new` | A task occupies the session's worktree; only observation is admitted. | yes |
+| `worktree_busy` | `runtime` | `session.input`, attach with terminal control, `session.resume`, in-place `session.new` | A task occupies the session's worktree; only observation is admitted. | yes |
 | `task_worktree_unavailable` | `runtime` | `task.start`, `task.continue` | The shared worktree no longer exists. | yes |
 | `task_worktree_mode_conflict` | `runtime` | `task.start` | `worktree_of` combined with `in_place` or `branch`. | yes |
-| `task_session_ended` | `runtime` | `session.resume`, `session.fork`, session recovery | The session belongs to an `ended` task; continue with `task.start { worktree_of }`. | yes |
+| `task_session_ended` | `runtime` | `session.resume`, session recovery | The session belongs to an `ended` task; continue with `task.start { worktree_of }`. | yes |
 | `task_session_unavailable` | `runtime` | `task.continue`, `task.answer` | The task is `ended` or its runtime is not live. | yes |
 | `task_turn_queued` | `runtime` | `task.extend` | The turn is queued behind a re-open window and has no deadline yet. | yes |
 | `task_worktree_via_investigate` | `runtime` | `task.start` | An executor `worktree_of` start named an investigate-mode task. | yes |
@@ -4705,7 +4566,6 @@ sessions that belong to tasks.
 | `task_fingerprint_key_missing` | `runtime` | retried `task.start`, `task.continue`, `task.answer` | The key version a stored fingerprint names is unavailable; nothing is compared or dispatched. | yes |
 | `task_request_conflict` | `runtime` | every idempotent task method | A reused request key with different parameters; nothing is executed. | yes |
 | `task_investigate_no_checks` | `runtime` | `task.start`, `task.continue` | `checks` or `checks_baseline` requested for an investigate-mode task. | yes |
-| `task_fork_unsupported` | `runtime` | `session.fork` | The task's agent cannot fork its native session (OpenCode). | yes |
 | `task_investigate_unsupported` | `runtime` | `task.start` | The profile cannot enforce investigation mode. | yes |
 | `check_cleanup_stuck` | `runtime` | `task.start` with `worktree_of` | A daemon-owned check process scope in the worktree cannot be confirmed empty; the worktree stays occupied. | yes |
 
@@ -4734,7 +4594,7 @@ The daemon then writes these events:
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `session_created` | `{session: SessionInfo}` | A new logical session was created or forked. Daemon reconnection and native recovery use their dedicated runtime events. |
+| `session_created` | `{session: SessionInfo}` | A new logical session was created. Daemon reconnection and native recovery use their dedicated runtime events. |
 | `session_updated` | `{session: SessionInfo}` | Session metadata, active-agent report/release, cwd/worktree/project association, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
@@ -4989,172 +4849,6 @@ The global `--host` flag is accepted and deliberately ignored. The skill is
 embedded locally, so no host is resolved, probed, or connected to, and local
 and remote invocations print the same document.
 
-## Workflow Plugin CLI
-
-`pohunek workflow` is a local CLI lifecycle, not a daemon public method. There
-is no protocol method, event, record or SDK type for workflow plugins: the CLI
-keeps them in its own package registry under `<state>/pohunek/workflow-plugins/`,
-with per-plugin directories `<state>/pohunek/workflow-plugin-state/<id>/` and
-`<config>/pohunek/workflow-plugin-config/<id>/`, and its commands never
-contact a daemon; only the reaction dispatcher (below) reads the local daemon's
-`subscribe` stream.
-Every command that changes the store holds the store lock
-`<state>/pohunek/workflow-plugins/store.lock` for its whole run.
-
-```bash
-pohunek workflow install work.tar.zst --sha256 <digest> --yes --json
-pohunek workflow list --json
-pohunek workflow inspect acme.work --json
-pohunek workflow status acme.work --json
-pohunek workflow enable acme.work --json
-pohunek workflow disable acme.work --json
-pohunek workflow uninstall acme.work --purge --json
-pohunek workflow uninstall acme.work --remove-modified --json
-pohunek workflow run acme.work overview --since 1d
-pohunek workflow run --json acme.work overview --since 1d
-```
-
-`workflow run [--json] <plugin> <action> [<args>...]` passes every argument
-after `<action>` to the action verbatim, including `--json`, `--`, `-h`,
-`--host` and empty strings; pohunek's own options go before `<plugin>`.
-
-Event reactions are a CLI process too, not a protocol surface. A plugin's
-`[reactions.<name>]` table names up to 32 distinct public event names from the
-Events table above, except `attach_opened` and `attach_closed`. The hidden
-`pohunek workflow __dispatch` is the entry point of the dispatcher unit. It
-subscribes to the local daemon's `subscribe` stream with no origin pair, and
-never starts the daemon. A reaction's context is the action context, with
-`invocation.kind = "reaction"` and these fields:
-
-- `event`: `{"event": "<name>", "payload": <the event payload>}`, present
-  when the whole context fits `limits.max_context_bytes`.
-- `event_omitted`: `"too_large"` in place of `event` when it does not fit.
-  `session_id` is then present when the payload names a session: `session_id`
-  or, for session events, `session.id`.
-
-Run records of a reaction carry `kind = "reaction"`. A `dropped` record has
-`outcome = "dropped"`, no `name`, and `dropped`, the number of events one
-overflow episode of a plugin's queue refused. No new event kind, daemon method,
-protocol code or SDK type is added for reactions.
-
-Every `--json` result is one standard CLI process envelope. The `ok` payloads:
-
-- `install`: `{status, plugin, warnings?}`, where `status` is `installed`,
-  `already_installed` or `root_restored`. `warnings` is present when the
-  plugin was recorded but the store could not confirm the change is durable.
-- `list`: `{plugins: [plugin...]}`.
-- `status`: `{plugins: [{id, version, digest, enabled, units: [unit...],
-  units_error?, run_log_error?}]}`, where a unit is `{kind, name, state,
-  state_reason?, last_run, consecutive_failures, backoff_ms?, backoff_error?}`.
-  `kind` is `job` or `service`; `state` is `running`, `stopped`, `failed` or
-  `unknown`; `last_run` is `{ts, outcome, exit_code?, signal?, error_code?}` or
-  `null`; `consecutive_failures` is `null` when it cannot be determined;
-  `backoff_ms` and `backoff_error` are present for services only. `units_error`
-  and `run_log_error` are present when the unit record or the run log cannot be
-  read. The guide's [Status](knowledge/guides/workflow-plugins.md#status)
-  section defines each field.
-- `enable` and `disable`: the updated `plugin`, plus `warnings` from
-  `disable` when it could not list the units of a plugin whose files fail
-  verification and no unit record names any unit, or when no `pohunek service`
-  installation is recorded, no unit is recorded, and the service manager could
-  not be reached to look for leftover units. Each warning says so; a unit left
-  behind refuses every run.
-- `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
-  actions: [{name, argv, args, timeout_ms?, max_output_bytes?}],
-  jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}],
-  reactions?: [{name, events, argv, timeout_ms?}]}`. `argv[0]` is resolved to
-  an absolute path; `args` is `none` or `passthrough`; `jobs`, `services` and
-  `reactions` are present when declared.
-- `run`: the action's stdout, which must be exactly one JSON document (JSON
-  whitespace around it is allowed and dropped), placed as `ok` byte for byte:
-  key order, number spelling and inner whitespace are the action's own. It is
-  printed only when the action exited 0.
-- `uninstall`: `{plugin, purged, purge?, warnings?, state_dir, config_dir}`.
-  `plugin` is `null` when `--purge` removed only the directories of an id that
-  has no record. `purge` is `{state_dir, config_dir}`, each `removed` or
-  `absent`. `warnings` is present when the record was removed but the store
-  could not delete every installed file (the warning names where the residue
-  is) or confirm durability, when a leftover of an earlier purge still
-  cannot be removed (the warning names its location), or for the same unit
-  warnings as `disable`. No warning changes the result.
-
-A `plugin` is `{id, version, digest, enabled, installed_at_unix_seconds}`.
-
-Typed errors use the standard `{class, code, msg, recover?}` shape and never
-contain an argv value, an environment value, manifest text or a byte of an
-action's output. `workflow_action_failed` adds `exit_code` (the action's exit
-code, or 128 plus the signal number) and, when a signal ended the action,
-`signal`. `workflow_installed_disabled` adds `cause`, the code of the failure
-that left the plugin disabled, and its `recover` is that failure's recovery
-followed by the `pohunek workflow enable` step. These fields belong to the
-CLI envelope, not to the protocol's error type:
-
-| Code | Class | Meaning |
-|---|---|---|
-| `workflow_local_only` | `configuration` | A remote `--host` was given; nothing was read or written. |
-| `workflow_archive_invalid` | `configuration` | The archive file is unreadable, too large, or not a canonical package archive. |
-| `workflow_digest_mismatch` | `configuration` | The archive does not have the `--sha256` digest; nothing was installed. |
-| `workflow_descriptor_invalid` | `configuration` | `workflow.toml` is missing, too large, or breaks a manifest rule, or the archive also carries `runtime.toml`. |
-| `consent_required` | `configuration` | `install` ran without `--yes`; nothing was created. |
-| `workflow_plugin_unknown` | `configuration` | No installed plugin has the id. |
-| `workflow_plugin_installed` | `configuration` | Another archive of the id is installed. |
-| `workflow_root_invalid` | `runtime` | The installed files are missing, changed or unreadable; they are left as found. The hint names the recovery for the cause: reinstall or plain `uninstall` for missing files, `uninstall --remove-modified` for changed ones. |
-| `workflow_root_intact` | `runtime` | `uninstall --remove-modified` was given for installed files that verify or are missing; nothing was removed. |
-| `workflow_install_uncertain` | `runtime` | An install's record replacement committed without confirmed durability and could not be read back; the plugin's directories were kept. Check `pohunek workflow list`; installing the same archive again is safe. |
-| `workflow_store_busy` | `runtime` | Another workflow command holds the store lock; nothing was changed. |
-| `workflow_purge_incomplete` | `runtime` | A purge did not finish; the message says whether the plugin was uninstalled, the outcome for each directory, and where remaining data is. |
-| `workflow_dirs_overlap` | `configuration` | The store, state and config locations contain each other; nothing was read or written. |
-| `workflow_store_failed` | `runtime` | The store or a plugin directory cannot be read or changed safely. |
-| `workflow_config_invalid` | `configuration` | `<config>/pohunek/workflow.toml` is unsafe (not an owner-only `0600` regular file in a directory others cannot write), unreadable, not of the knobs schema, or holds an out-of-range value; nothing was run. |
-| `workflow_plugin_disabled` | `configuration` | The plugin is disabled; nothing was run. |
-| `workflow_action_unknown` | `configuration` | The manifest declares no action of the name; nothing was run. |
-| `workflow_action_args_refused` | `configuration` | Arguments after the action name were given to an action declaring `args = "none"`; the message counts them and names no value; nothing was run. |
-| `workflow_origin_incomplete` | `configuration` | Exactly one of `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID` is set; nothing was run. |
-| `workflow_timeout_refused` | `configuration` | The action declares a `timeout_ms` above `limits.action_timeout_max_ms`; nothing was run. |
-| `workflow_context_too_large` | `configuration` | The context JSON is larger than `limits.max_context_bytes`; nothing was run. |
-| `workflow_run_log_failed` | `runtime` | The plugin's run log cannot be opened; nothing was run. |
-| `workflow_spawn_failed` | `runtime` | The action's program is missing or not executable, or its process could not be started. |
-| `workflow_run_failed` | `runtime` | The CLI could not observe the action or read its output; its process group was killed. |
-| `workflow_action_timeout` | `runtime` | The action did not finish before its deadline and its group was stopped. |
-| `workflow_output_limit` | `runtime` | Stdout or stderr passed its cap and the group was stopped; bytes past the cap were not shown. |
-| `workflow_action_interrupted` | `runtime` | The CLI received `SIGINT`, `SIGTERM` or `SIGHUP` and stopped the action's group. |
-| `workflow_action_failed` | `runtime` | `run --json` only: the action exited non-zero or was ended by a signal the CLI did not send; carries `exit_code` and `signal?`; its stdout was not printed. |
-| `workflow_output_incomplete` | `runtime` | `run --json` only: the action exited 0, but a process that left its group still held stdout open, so the capture was never judged. |
-| `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including arrays and objects nested deeper than 126 levels, so the envelope stays within the 127 levels serde_json's default parser accepts), ends inside its document, or has data after it. |
-| `workflow_service_not_installed` | `configuration` | The plugin declares jobs, services or reactions, and no verified `pohunek service` installation (its `service.toml` and `<prefix>/bin/pohunek`) describes this process, or the installation records another pohunek version than this CLI, whose units would run a trampoline this CLI cannot vouch for; the message names both versions and the recovery (`pohunek service install` from this version, or an upgrade to it). `enable` and an enabling `install` change nothing; a `disable` or `uninstall` has already marked the plugin disabled when its recorded installation turns out to be unusable, and the plugin stays installed disabled. `disable` and `uninstall` accept an installation of any version. |
-| `workflow_unit_refused` | `configuration` | A job's `every_s` is below `jobs.min_interval_s` or its `timeout_ms` above `jobs.timeout_max_ms`; nothing was changed or run. |
-| `workflow_units_failed` | `runtime` | The service manager did not install or remove a unit. After a failed enable every unit was removed and the plugin disabled again; after a failed disable the plugin stays disabled; a failed uninstall keeps the plugin installed, disabled. Without a recorded `pohunek service` installation, a disable or uninstall that cannot reach the service manager while units are recorded fails this way and keeps the unit record. An uninstall whose unit record still names units keeps the plugin record too. |
-| `workflow_installed_disabled` | `runtime` | `install --yes` only: the new plugin was recorded, but a step after that failed: reaching the service manager (`cause` `workflow_units_failed`), marking the plugin enabled (`workflow_store_busy` while another workflow command holds the store lock, `workflow_root_invalid`, or `workflow_store_failed`; for a failure that may have written the flag, the plugin is disabled again first), or installing a unit (`workflow_units_failed`). `cause` is that failure's code. When every step was undone the plugin stays installed disabled with no units and the message says so: fix the cause, then run `pohunek workflow enable <id>`. When undoing the failed step failed too (a unit install, or clearing a flag that may have been written), the message says the plugin may remain enabled or keep units: run `pohunek workflow disable <id>` until it succeeds, then `pohunek workflow enable <id>`. Every check that can refuse an enabling install, and the unit lifecycle lock, come before the record is written. |
-| `workflow_unit_stale` | `runtime` | A unit names another archive than the installed one; it was refused and recorded. |
-| `workflow_unit_unknown` | `configuration` | The installed manifest declares no job or service of the unit's name; nothing was run. |
-| `workflow_units_installed` | `configuration` | Only `pohunek service uninstall`: a workflow plugin still has jobs or services recorded, or the reaction dispatcher unit is recorded. The message names each plugin to disable and its `pohunek workflow disable <id>`: the plugins with recorded units, and for the dispatcher each enabled plugin that declares a reaction or fails verification, or every installed plugin when none does; nothing was changed. |
-
-`workflow run` streams the action's stdout and stderr, each up to its cap.
-With `--json` it captures stdout up to the same cap instead, still streams
-stderr, and prints exactly one envelope on stdout. In both modes it exits
-with:
-
-| Exit status | When |
-|---|---|
-| the action's status | The action exited by itself; 128 plus the signal number when a signal it was not sent by the CLI ended it. With `--json` a non-zero status is reported as `workflow_action_failed`. |
-| 124 | `workflow_action_timeout`. |
-| 125 | `workflow_output_limit`. |
-| 128 plus the signal number | `workflow_action_interrupted`. |
-| 1 | Any other workflow error, including every refusal, `workflow_output_incomplete` and `workflow_output_invalid`. |
-
-When several apply, an output stream over its cap wins over a received
-signal, which wins over the deadline; with `--json`, after a zero exit, a cut
-stdout wins over stdout that is not one JSON document. The action's environment, its
-`POHUNEK_PLUGIN_CONTEXT` JSON (schema 1), the content-free run log
-`<state>/pohunek/workflow-plugin-state/<id>/logs/runs.jsonl` and the owner
-knobs `<config>/pohunek/workflow.toml` are specified in
-`docs/knowledge/guides/workflow-plugins.md`, which also holds the manifest and
-trust rules, and the plugin units of jobs and services: each runs the hidden
-`pohunek workflow __exec <id> <digest> job|service <name>`, an entry point
-of the service manager units, not a command to call. Event reactions run
-through the dispatcher unit's hidden `pohunek workflow __dispatch` (see
-"Events" above and the guide's "Event reactions").
-
 ## Hermes Operator Plugin CLI
 
 The Hermes operator plugin is a local CLI lifecycle, not a daemon public method.
@@ -5225,7 +4919,7 @@ the bound flags.
 The plugin never offers raw attach bytes, arbitrary protocol methods, raw argv,
 or force bypasses. It repeats the daemon-authoritative origin denial before a
 subprocess for exactly `session.stop`, `session.resume`, `session.remove`,
-`session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
+`session.resize`, `session.set_metadata`, `session.rename`, and
 `session.input`. The plugin exposes no consent removal, so it has no counterpart for the daemon's denial of `session.remove_accepting_unconfirmed`. Exactly three lifecycle reports may target the origin:
 `session.report_agent`, `session.release_agent`, and
 `session.report_native_id`.
@@ -5306,7 +5000,7 @@ Attach stream rules:
 - Workers negotiated below private worker protocol v3 cannot provide the
   atomic resize-and-snapshot guarantee. The daemon rejects such an attach with
   `runtime/attach_snapshot_unsupported`; restart the session on the upgraded
-  worker or fork it into a new session.
+  worker or start a new session.
 - `session.detach` cancels an active stream by `stream_id`; closing the raw
   socket also ends the attach. If the worker ended the raw stream with a typed
   failure, the first detach call after EOF returns that failure in the optional
@@ -5452,21 +5146,19 @@ Public exports:
   `ClientError::SessionResumeOutcomeUnknown` (`session_resume_outcome_unknown`,
   transport class) instead of `request_timeout`: the daemon does not cancel the
   resume when the client leaves, so inspect the session before retrying.
-  `session_fork`, `session_stop`, `session_remove` and
+  `session_stop`, `session_remove` and
   `session_remove_accepting_unconfirmed` (and their generic `call::<...>`
-  forms) use dedicated connections too. A fork gets 30 minutes (three
-  lifecycle steps: worker connection, worker initialization, the rest), a stop
+  forms) use dedicated connections too. A stop gets
   90 minutes (nine: the worker's stop or a conflicted runtime's job
   retirement, the cleanup sweep of up to three signalling passes, the rest),
   and a remove the stop's 90 minutes plus four hook runs at the daemon's
   5-minute hook timeout (the `pre-remove` and `post-remove` events, each with a
   host and a repository layer), 110 minutes. Each adds 1 second of transport
-  headroom. An elapsed deadline returns `ClientError::SessionForkOutcomeUnknown`
-  (`session_fork_outcome_unknown`; a retried fork creates a second child),
-  `SessionStopOutcomeUnknown` (`session_stop_outcome_unknown`; a repeated stop
+  headroom. An elapsed deadline returns
+  `ClientError::SessionStopOutcomeUnknown` (`session_stop_outcome_unknown`; a repeated stop
   is idempotent) or `SessionRemoveOutcomeUnknown`
   (`session_remove_outcome_unknown`), all transport class. A stop or remove
-  queued behind a resume or fork of the same session waits for that
+  queued behind a resume of the same session waits for that
   operation's lifecycle lock and can exceed any budget; that is an unknown
   outcome too, and the daemon completes the queued call after the client left.
   The daemon bounds its own wait for a worker's stop answer by the stop grace
@@ -5507,9 +5199,9 @@ Public exports:
 - `ClientError`: SDK error enum with `to_protocol_error()` for structured
   rendering. An elapsed response deadline maps to `request_timeout`, distinct
   from connection and daemon-discovery failures; the timed-out mutation may
-  still have completed remotely. A `session_resume`, `session_fork`,
+  still have completed remotely. A `session_resume`,
   `session_stop` or `session_remove` whose deadline elapses is
-  `SessionResumeOutcomeUnknown`, `SessionForkOutcomeUnknown`,
+  `SessionResumeOutcomeUnknown`,
   `SessionStopOutcomeUnknown` or `SessionRemoveOutcomeUnknown` instead; see
   `ClientOptions` above.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
@@ -5823,13 +5515,13 @@ Public exports:
   headroom unless `requestTimeoutMs` is explicitly supplied;
   an explicit value replaces the dedicated budget. A timed-out creation may
   still have completed on the daemon, so inspect sessions before any retry.
-  Typed `session.resume`, `session.fork`, `session.stop`, `session.remove` and
+  Typed `session.resume`, `session.stop`, `session.remove` and
   `session.remove_accepting_unconfirmed` calls also use dedicated connections
   (budgets exported as `SESSION_RESUME_REQUEST_BUDGET_MS`,
-  `SESSION_FORK_REQUEST_BUDGET_MS`, `SESSION_STOP_REQUEST_BUDGET_MS` and
+  `SESSION_STOP_REQUEST_BUDGET_MS` and
   `SESSION_REMOVE_REQUEST_BUDGET_MS`, equal to the Rust client's) and report an
   elapsed deadline as the `ClientError` kinds `sessionResumeOutcomeUnknown`,
-  `sessionForkOutcomeUnknown`, `sessionStopOutcomeUnknown` and
+  `sessionStopOutcomeUnknown` and
   `sessionRemoveOutcomeUnknown` (codes as in the Rust client). A consumer that
   switches exhaustively on `ClientError.kind` must handle the new kinds.
   The typed call opts into the configured host reader grace when it sends

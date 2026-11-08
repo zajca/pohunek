@@ -30,17 +30,6 @@ pub mod service;
 mod target;
 #[cfg(test)]
 mod test_daemon;
-mod workflow;
-
-/// Enables and disables workflow plugins with service manager units against
-/// an explicit service [`Context`](service::Context), such as one whose unit
-/// directory a test chooses.
-pub mod workflow_units {
-    #[doc(inline)]
-    pub use crate::workflow::units::{
-        disable_plugin, enable_plugin, status_plugins, uninstall_plugin, LifecycleError,
-    };
-}
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -137,24 +126,6 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         action: commands::plugin::Action,
-    },
-
-    /// Inspect and repair the daemon's metadata store on this machine.
-    ///
-    /// Purely local: the store holds this user's durable records, so a remote
-    /// `--host` is rejected before anything runs.
-    Store {
-        #[command(subcommand)]
-        action: commands::store::Action,
-    },
-
-    /// Install, inspect, and remove workflow plugins on this machine.
-    ///
-    /// Purely local: workflow plugins live in this user's own store and never
-    /// reach the daemon, so a remote `--host` is rejected before anything runs.
-    Workflow {
-        #[command(subcommand)]
-        action: commands::workflow::Action,
     },
 
     /// Query daemon health over the control socket.
@@ -1312,23 +1283,6 @@ enum SessionAction {
         json: bool,
     },
 
-    /// Fork an agent conversation into a new session.
-    Fork {
-        /// Source session target: `session-id` or `local/session-id`.
-        target: Target,
-        /// Owner-set display name for the forked session.
-        #[arg(long)]
-        name: Option<String>,
-        /// Fork under the session's current host profile although the profile
-        /// changed since the session was launched. Honored by the local daemon
-        /// only.
-        #[arg(long)]
-        accept_profile_change: bool,
-        /// Emit machine-readable JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Remove one session from the daemon, stopping it first if still live.
     Rm {
         /// Session target: `session-id` or `local/session-id`.
@@ -1540,12 +1494,6 @@ enum SessionAction {
         json: bool,
     },
 
-    /// List durable worker runtime endpoints.
-    RuntimeInventory {
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Set or clear a session's display name.
     Rename {
         /// Session target: `session-id` or `local/session-id`.
@@ -1574,75 +1522,10 @@ enum SessionAction {
         json: bool,
     },
 
-    /// Read or update the session retention policy and the idle-stop default.
-    Policy {
-        #[command(subcommand)]
-        action: SessionPolicyAction,
-    },
-
     /// Run session retention maintenance.
     Retention {
         #[command(subcommand)]
         action: SessionRetentionAction,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum SessionPolicyAction {
-    /// Show the session retention policy and the idle-stop default.
-    Get {
-        /// Emit machine-readable JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Update one or more session retention policy fields or the idle-stop
-    /// default.
-    ///
-    /// Unspecified fields keep their current value. The daemon applies the new
-    /// policy on its next sweep; no restart is needed. The idle-stop default is
-    /// kept apart from the retention policy: naming only `--idle-stop-after`
-    /// leaves the retention policy untouched.
-    #[command(group(
-        clap::ArgGroup::new("session_policy_field")
-            .required(true)
-            .multiple(true)
-            .args([
-                "enabled",
-                "disabled",
-                "sweep_interval_secs",
-                "terminal_ttl_secs",
-                "lost_ttl_secs",
-                "max_removals_per_sweep",
-                "idle_stop_after",
-            ])
-    ))]
-    Set {
-        /// Enable automatic retention sweeps.
-        #[arg(long, conflicts_with = "disabled")]
-        enabled: bool,
-        /// Disable automatic retention sweeps.
-        #[arg(long)]
-        disabled: bool,
-        /// Seconds between automatic sweeps.
-        #[arg(long, value_name = "SECONDS")]
-        sweep_interval_secs: Option<u32>,
-        /// Seconds a terminal (stopped/done/failed) session is kept.
-        #[arg(long, value_name = "SECONDS")]
-        terminal_ttl_secs: Option<u32>,
-        /// Seconds a session whose runtime is lost is kept.
-        #[arg(long, value_name = "SECONDS")]
-        lost_ttl_secs: Option<u32>,
-        /// Maximum sessions one sweep may remove.
-        #[arg(long, value_name = "COUNT")]
-        max_removals_per_sweep: Option<u32>,
-        /// Idle seconds after which a session opted in with
-        /// `pohunek.idle_stop_after_secs=default` is stopped; 0 clears it.
-        #[arg(long, value_name = "SECONDS")]
-        idle_stop_after: Option<u32>,
-        /// Emit machine-readable JSON instead of human text.
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -1689,8 +1572,6 @@ impl Commands {
             Commands::Integration { action } => action.wants_json(),
             Commands::Service { action } => action.wants_json(),
             Commands::Plugin { action } => action.wants_json(),
-            Commands::Store { action } => action.wants_json(),
-            Commands::Workflow { action } => action.wants_json(),
             Commands::Setup { action, json, .. } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
@@ -1719,8 +1600,6 @@ impl Commands {
             | Commands::Daemon { .. }
             | Commands::Service { .. }
             | Commands::Plugin { .. }
-            | Commands::Store { .. }
-            | Commands::Workflow { .. }
             | Commands::Health { .. }
             | Commands::Status { .. }
             | Commands::Session { .. }
@@ -1845,7 +1724,6 @@ impl SessionAction {
             | SessionAction::List { json, .. }
             | SessionAction::Inspect { json, .. }
             | SessionAction::Stop { json, .. }
-            | SessionAction::Fork { json, .. }
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
             | SessionAction::Screen { json, .. }
@@ -1856,19 +1734,9 @@ impl SessionAction {
             | SessionAction::Resume { json, .. }
             | SessionAction::Resize { json, .. }
             | SessionAction::Metadata { json, .. }
-            | SessionAction::RuntimeInventory { json }
             | SessionAction::Rename { json, .. }
             | SessionAction::Diff { json, .. } => *json,
-            SessionAction::Policy { action } => action.wants_json(),
             SessionAction::Retention { action } => action.wants_json(),
-        }
-    }
-}
-
-impl SessionPolicyAction {
-    fn wants_json(&self) -> bool {
-        match self {
-            SessionPolicyAction::Get { json } | SessionPolicyAction::Set { json, .. } => *json,
         }
     }
 }
@@ -2024,16 +1892,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             // not ignored.
             commands::plugin::run(action, &global_host).await
         }
-        Commands::Store { action } => {
-            // The metadata store is local-only; the global `--host` is checked
-            // before any connection.
-            commands::store::run(action, &global_host).await
-        }
-        Commands::Workflow { action } => {
-            // The workflow store is local-only; the global `--host` is checked
-            // before any filesystem access.
-            commands::workflow::run(action, &global_host).await
-        }
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;
             let host = effective_host(&global_host, None);
@@ -2142,26 +2000,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     commands::session::ensure_lifecycle_allowed(&host, &paths, &target, "stop")
                         .await?;
                     commands::session::run_stop(&host, &paths, &target, json).await?;
-                }
-                SessionAction::Fork {
-                    target,
-                    name,
-                    accept_profile_change,
-                    json,
-                } => {
-                    let host = effective_host(&global_host, Some(&target));
-                    let host = client::PinnedHost::resolve(&host).await?;
-                    let target =
-                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
-                    commands::session::run_fork(
-                        &host,
-                        &paths,
-                        &target,
-                        name,
-                        accept_profile_change,
-                        json,
-                    )
-                    .await?;
                 }
                 SessionAction::Rm {
                     target,
@@ -2387,10 +2225,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     }
                     commands::session::run_metadata(&host, &paths, &target, metadata, json).await?;
                 }
-                SessionAction::RuntimeInventory { json } => {
-                    let host = effective_host(&global_host, None);
-                    commands::session::run_runtime_inventory(&host, &paths, json).await?;
-                }
                 SessionAction::Rename {
                     target,
                     name,
@@ -2412,39 +2246,6 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_diff(&host, &paths, &target, base, json).await?;
                 }
-                SessionAction::Policy { action } => match action {
-                    SessionPolicyAction::Get { json } => {
-                        let host = effective_host(&global_host, None);
-                        commands::session::run_policy_get(&host, &paths, json).await?;
-                    }
-                    SessionPolicyAction::Set {
-                        enabled,
-                        disabled,
-                        sweep_interval_secs,
-                        terminal_ttl_secs,
-                        lost_ttl_secs,
-                        max_removals_per_sweep,
-                        idle_stop_after,
-                        json,
-                    } => {
-                        let host = effective_host(&global_host, None);
-                        commands::session::run_policy_set(
-                            &host,
-                            &paths,
-                            commands::session::PolicyArgs {
-                                enabled,
-                                disabled,
-                                sweep_interval_secs,
-                                terminal_ttl_secs,
-                                lost_ttl_secs,
-                                max_removals_per_sweep,
-                                idle_stop_after,
-                            },
-                            json,
-                        )
-                        .await?;
-                    }
-                },
                 SessionAction::Retention { action } => match action {
                     SessionRetentionAction::Sweep {
                         dry_run,
@@ -3034,8 +2835,6 @@ fn command_line_hosts(cli: &Cli) -> Vec<&str> {
                 | NotificationsAction::Delete { target, .. },
         } => vec![target.host.as_deref().unwrap_or(global)],
         Commands::Plugin { .. }
-        | Commands::Store { .. }
-        | Commands::Workflow { .. }
         | Commands::Health { .. }
         | Commands::Status { .. }
         | Commands::Subscribe { .. }
@@ -3052,7 +2851,6 @@ fn session_action_hosts<'a>(action: &'a SessionAction, global: &'a str) -> Vec<&
     match action {
         SessionAction::Inspect { target, .. }
         | SessionAction::Stop { target, .. }
-        | SessionAction::Fork { target, .. }
         | SessionAction::Rm { target, .. }
         | SessionAction::Input { target, .. }
         | SessionAction::Screen { target, .. }
@@ -3296,7 +3094,7 @@ mod tests {
     #[test]
     fn consent_flags_default_to_refusal_and_are_opt_in() {
         type Extract = fn(Commands) -> Option<bool>;
-        let rows: [(&str, &[&str], &str, Extract); 5] = [
+        let rows: [(&str, &[&str], &str, Extract); 4] = [
             (
                 "session rm",
                 &["session", "rm", "s-1"],
@@ -3309,21 +3107,6 @@ mod tests {
                                 ..
                             },
                     } => Some(accept_unconfirmed_cleanup),
-                    _ => None,
-                },
-            ),
-            (
-                "session fork",
-                &["session", "fork", "s-1"],
-                "--accept-profile-change",
-                |command| match command {
-                    Commands::Session {
-                        action:
-                            SessionAction::Fork {
-                                accept_profile_change,
-                                ..
-                            },
-                    } => Some(accept_profile_change),
                     _ => None,
                 },
             ),

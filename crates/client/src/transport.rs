@@ -14,13 +14,13 @@ use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
-    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionRemoveResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionStopResult, SessionWaitParams, SessionWaitResult, SessionWaitTurnParams,
-    SessionWaitTurnResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionNewParams,
+    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
+    SessionReadResult, SessionRemoveResult, SessionResizeParams, SessionResizeResult,
+    SessionResumeParams, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
+    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, ENV_DAEMON_ID, ENV_SESSION_ID,
+    MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -65,18 +65,11 @@ const SESSION_RESUME_STEPS: u32 = 1 + (2 * RESUME_SWEEP_PASSES + 1) + 2 + 1;
 /// covers every step at its longest valid daemon bound rather than the
 /// ordinary request timeout.
 pub const SESSION_RESUME_REQUEST_BUDGET_MS: u32 = SESSION_RESUME_STEPS * LIFECYCLE_STEP_BOUND_MS;
-/// Lifecycle steps of a fork: the new worker's connection and initialization
-/// (2), and the rest of the fork, such as the version probe, the native store
-/// check and the registration (1). A fork runs no create hooks.
-const SESSION_FORK_STEPS: u32 = 2 + 1;
-/// A fork waits for bounded worker startup, so its response budget covers
-/// every step at its longest valid daemon bound.
-pub const SESSION_FORK_REQUEST_BUDGET_MS: u32 = SESSION_FORK_STEPS * LIFECYCLE_STEP_BOUND_MS;
 /// Lifecycle steps of a stop (and of the stop a remove performs): the worker's stop, or the retirement
 /// of a conflicted runtime's job (1), the cleanup sweep of a conflicted
 /// runtime (each signalling pass waits a `SIGTERM` grace and a `SIGKILL`
 /// grace, plus one settle window), and the rest of the call (1). A stop
-/// queued behind a resume or fork of the same session waits for that
+/// queued behind a resume of the same session waits for that
 /// operation's lifecycle lock as well; an elapsed budget then reports an
 /// unknown outcome.
 const SESSION_STOP_STEPS: u32 = 1 + (2 * RESUME_SWEEP_PASSES + 1) + 1;
@@ -734,7 +727,7 @@ impl Client {
     /// Send one typed control-method request and decode its success payload.
     ///
     /// This is the public SDK path for normal request/response methods.
-    /// `session.input`, `session.new`, `session.resume`, `session.fork`,
+    /// `session.input`, `session.new`, `session.resume`,
     /// `session.stop`, `session.remove`, `session.remove_accepting_unconfirmed`,
     /// `session.wait`, `session.wait_turn`, and `session.output` take the same
     /// dedicated-connection budgets as their typed helpers. The lower-level
@@ -771,14 +764,6 @@ impl Client {
             let params =
                 serde_json::from_value::<SessionResumeParams>(serde_json::to_value(params)?)?;
             let result = self.session_resume_with(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
-        }
-        if M::NAME == protocol::method::SESSION_FORK {
-            let params =
-                serde_json::from_value::<SessionForkParams>(serde_json::to_value(params)?)?;
-            let result = self.session_fork(params).await?;
             return Ok(protocol::tolerant::from_value(serde_json::to_value(
                 result,
             )?)?);
@@ -1109,24 +1094,6 @@ impl Client {
         .await
     }
 
-    /// Fork one session's native conversation into a new session.
-    ///
-    /// Runs on a dedicated connection whose response budget covers the
-    /// daemon's bounded worker startup; an explicit request timeout overrides
-    /// it. An elapsed deadline returns [`ClientError::SessionForkOutcomeUnknown`]:
-    /// the fork may still complete, and a retried fork creates a second child.
-    pub async fn session_fork(
-        &mut self,
-        params: SessionForkParams,
-    ) -> Result<SessionForkResult, ClientError> {
-        self.call_lifecycle::<protocol::method::SessionFork>(
-            params,
-            SESSION_FORK_REQUEST_BUDGET_MS,
-            |host, timeout| ClientError::SessionForkOutcomeUnknown { host, timeout },
-        )
-        .await
-    }
-
     /// Stop one live session through the typed lifecycle API.
     ///
     /// Runs on a dedicated connection whose response budget covers the
@@ -1221,14 +1188,6 @@ impl Client {
         params: SessionSetMetadataParams,
     ) -> Result<SessionSetMetadataResult, ClientError> {
         self.call::<protocol::method::SessionSetMetadata>(params)
-            .await
-    }
-
-    /// List authenticated and quarantined managed worker runtimes.
-    pub async fn session_runtime_inventory(
-        &mut self,
-    ) -> Result<protocol::RuntimeInventoryResult, ClientError> {
-        self.call::<protocol::method::SessionRuntimeInventory>(())
             .await
     }
 

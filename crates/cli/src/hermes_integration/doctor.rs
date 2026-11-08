@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn access_modes_and_registration_failures_are_checked_at_runtime() {
-        for (mode, expected_tools) in [("read_only", 7), ("manage", 14), ("full", 16)] {
+        for (mode, expected_tools) in [("read_only", 7), ("manage", 13), ("full", 15)] {
             let mut fixture = fixture("access", "enabled", mode);
             let probe = fixture
                 .runner

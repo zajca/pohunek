@@ -37,9 +37,6 @@ supported = true
 reference_kind = "id"
 args = ["--resume", "{reference}"]
 
-[fork]
-supported = false
-
 [native_reference]
 strategy = "hook"
 

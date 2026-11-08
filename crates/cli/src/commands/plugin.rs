@@ -1645,17 +1645,6 @@ fn render_runtime_details(output: &mut String, runtime: &PackageRuntimeInfo) {
         "  arguments: {}",
         template_text(runtime.resume_args.as_deref())
     );
-    let _ = writeln!(output, "Fork:        {}", yes_no(runtime.forkable));
-    let _ = writeln!(
-        output,
-        "  arguments: {}",
-        template_text(runtime.fork_args.as_deref())
-    );
-    let _ = writeln!(
-        output,
-        "  then adds: {}",
-        template_text(runtime.fork_launch_args.as_deref())
-    );
     let _ = writeln!(
         output,
         "First prompt: {}",
@@ -2227,8 +2216,6 @@ mod tests {
                 "{reference}".to_owned(),
             ]),
             resume_args: Some(vec!["--session".to_owned(), "{reference}".to_owned()]),
-            fork_args: None,
-            fork_launch_args: None,
             prompt_argument: true,
             version_probe: Some("probe".to_owned()),
             resumable: true,
@@ -2260,7 +2247,6 @@ mod tests {
             "\"bin/pi\"",
             "[\"--mode\", \"rpc\"]",
             "Resume:      yes",
-            "Fork:        no",
             "Integration: none",
             "Enabled:     yes after install",
             "Selected:    no after install",

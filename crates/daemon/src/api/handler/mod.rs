@@ -19,14 +19,11 @@ mod command;
 mod daemon;
 mod governance;
 mod host;
-#[cfg(test)]
-mod idle_stop_tests;
 mod integration;
 mod notification;
 mod package;
 mod project;
 mod session;
-mod store;
 #[cfg(test)]
 mod turn_completed_projection_tests;
 #[cfg(test)]
@@ -425,13 +422,9 @@ async fn handle_negotiated(
         .expect("deserialized request ids satisfy response validation"),
         method::SESSION_NEW => session::handle_session_new(request, &state.sessions).await,
         method::SESSION_LIST => session::handle_session_list(request, &state.sessions).await,
-        method::SESSION_RUNTIME_INVENTORY => {
-            session::handle_session_runtime_inventory(request, &state.sessions).await
-        }
         method::SESSION_INSPECT => session::handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => session::handle_session_stop(request, &state.sessions).await,
         method::SESSION_RESUME => session::handle_session_resume(request, state).await,
-        method::SESSION_FORK => session::handle_session_fork(request, state).await,
         method::SESSION_REMOVE => session::handle_session_remove(request, &state.sessions).await,
         method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED => {
             session::handle_session_remove_accepting_unconfirmed(request, &state.sessions).await
@@ -444,16 +437,6 @@ async fn handle_negotiated(
         }
         method::SESSION_RENAME => session::handle_session_rename(request, &state.sessions).await,
         method::SESSION_DIFF => session::handle_session_diff(request, &state.sessions).await,
-        method::SESSION_POLICY_GET => session::handle_session_policy_get(request, &state.sessions),
-        method::SESSION_POLICY_SET => {
-            session::handle_session_policy_set(request, &state.sessions).await
-        }
-        method::SESSION_IDLE_STOP_GET => {
-            session::handle_session_idle_stop_get(request, &state.sessions)
-        }
-        method::SESSION_IDLE_STOP_SET => {
-            session::handle_session_idle_stop_set(request, &state.sessions).await
-        }
         method::SESSION_RETENTION_SWEEP => {
             session::handle_session_retention_sweep(request, &state.sessions).await
         }
@@ -511,10 +494,6 @@ async fn handle_negotiated(
         method::PACKAGE_SELECT => package::handle_package_select(request, state).await,
         method::PACKAGE_UNINSTALL => package::handle_package_uninstall(request, state).await,
         method::PACKAGE_BIND_PROFILE => package::handle_package_bind_profile(request, state).await,
-        method::STORE_REJECTED_LIST => store::handle_store_rejected_list(request, state).await,
-        method::STORE_REJECTED_SET_ASIDE => {
-            store::handle_store_rejected_set_aside(request, state).await
-        }
         method::COMMAND_RUN => command::handle_command_run(request, state).await,
         method::HOST_INSPECT => {
             host::handle_host_inspect(request, &state.health, &state.sessions).await
@@ -582,8 +561,7 @@ fn mutation_target(request: &Request) -> Option<&str> {
     );
     let nested = matches!(
         request.method(),
-        method::SESSION_FORK
-            | method::SESSION_RESIZE
+        method::SESSION_RESIZE
             | method::SESSION_SET_METADATA
             | method::SESSION_RENAME
             | method::SESSION_INPUT
@@ -631,9 +609,9 @@ mod tests {
     use pohunek_test_support::process_env::ProcessEnv;
     use protocol::{
         method, AssistantMaterializeParams, AssistantMaterializeResult, DetectionRegionKind,
-        ForkCwdMode, ProtocolError, Request, RuntimeRef, SessionDetectionParams,
-        SessionDetectionResult, SessionForkParams, SessionId, SessionInfo, SessionNewParams,
-        SessionSetMetadataParams, SessionSetMetadataResult, SessionState, StateSource,
+        ProtocolError, Request, RuntimeRef, SessionDetectionParams, SessionDetectionResult,
+        SessionId, SessionInfo, SessionNewParams, SessionSetMetadataParams,
+        SessionSetMetadataResult, SessionState, StateSource,
     };
 
     use super::assistant::run_assistant_materialize_blocking;
@@ -744,10 +722,6 @@ mod tests {
             (
                 method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
                 serde_json::json!(target),
-            ),
-            (
-                method::SESSION_FORK,
-                serde_json::json!({"session_id": target}),
             ),
             (
                 method::SESSION_RESIZE,
@@ -1005,62 +979,6 @@ mod tests {
             result.session.metadata
         );
 
-        sessions.stop(&created.id).await.expect("stop the session");
-    }
-
-    #[tokio::test]
-    async fn session_fork_dispatch_returns_canonical_error_without_child_session() {
-        let sessions = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
-            ..SessionRegistryConfig::default()
-        });
-        let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
-        let created = sessions
-            .create(SessionNewParams {
-                client_request_id: None,
-                agent: "shell".to_owned(),
-                name: None,
-                cwd: Some(cwd.path().to_path_buf()),
-                cols: 80,
-                rows: 24,
-                project: None,
-                repo: None,
-                branch: None,
-                base_branch: None,
-                input: None,
-                extended_input_ready_wait: None,
-                branch_source: None,
-                on_diverged: None,
-                input_ack_timeout_ms: None,
-                metadata: BTreeMap::new(),
-                secret_env: protocol::SessionSecretEnv::default(),
-            })
-            .await
-            .expect("create non-forkable session");
-        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
-        let params = SessionForkParams {
-            session_id: created.id.clone(),
-            name: Some("must-not-exist".to_owned()),
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        };
-        let request = request(
-            "fork-unsupported",
-            method::SESSION_FORK,
-            serde_json::to_value(params).expect("params serialize"),
-        );
-
-        let error = error_value(
-            handle_request(&request, &state).await,
-            "session.fork unsupported",
-        );
-
-        assert_eq!(error, ProtocolError::agent_fork_unsupported());
-        let remaining = sessions.list().await;
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, created.id);
         sessions.stop(&created.id).await.expect("stop the session");
     }
 

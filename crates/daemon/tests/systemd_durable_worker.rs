@@ -171,10 +171,6 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
 
     fixture.start_daemon(&daemon_bin);
     let first = fixture.inspect().await;
-    eprintln!(
-        "initial runtime inventory: {:?}",
-        fixture.runtime_inventory().await
-    );
     let worker_unit_pid = Fixture::main_pid(&fixture.worker_unit);
     let daemon_pid = Fixture::main_pid(&fixture.daemon_unit);
     assert_runtime(
@@ -1211,7 +1207,6 @@ impl Fixture {
             external: Some(false),
             capabilities: SessionCapabilities {
                 resume: true,
-                fork: true,
                 ..Default::default()
             },
             name: Some("systemd durability e2e".to_owned()),
@@ -1294,7 +1289,6 @@ impl Fixture {
                         NativeSessionLaunch::from_templates(
                             pohunek_daemon::agent::SessionRefKind::Id,
                             &["--resume", "{reference}"],
-                            Some(&["--resume", "{reference}", "--fork-session"]),
                         )
                         .expect("valid launch templates"),
                     ),
@@ -1324,16 +1318,6 @@ impl Fixture {
 
     async fn inspect(&self) -> SessionInfo {
         self.inspect_for(&self.session_id).await
-    }
-
-    async fn runtime_inventory(&self) -> protocol::RuntimeInventoryResult {
-        let mut client = Client::connect_local(&self.socket)
-            .await
-            .expect("connect runtime inventory client");
-        client
-            .call::<method::SessionRuntimeInventory>(())
-            .await
-            .expect("inspect runtime inventory")
     }
 
     async fn inspect_for(&self, session_id: &str) -> SessionInfo {

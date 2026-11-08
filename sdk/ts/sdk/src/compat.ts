@@ -247,10 +247,9 @@ export function upgradeResult(version: number, method: string, result: unknown):
         }
       }
       break;
-    // `session.new` and `session.fork` flatten the session into the result.
+    // `session.new` flattens the session into the result.
     case "session.inspect":
     case "session.new":
-    case "session.fork":
       sessionInfo(translated, "result", "toCurrent");
       break;
     case "session.resume":
@@ -268,15 +267,6 @@ export function upgradeResult(version: number, method: string, result: unknown):
     case "session.output":
       renameIn(translated, "result", "toCurrent");
       break;
-    case "session.runtime_inventory": {
-      const entries = field(translated, "entries");
-      if (Array.isArray(entries)) {
-        for (const entry of entries) {
-          renameIn(entry, "result.entries[]", "toCurrent");
-        }
-      }
-      break;
-    }
     default:
       break;
   }

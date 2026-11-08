@@ -359,16 +359,6 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaises(CliError):
                     runner.run(Invocation(("session", "list", "--json")))
 
-    def test_nonzero_json_error_is_typed_before_exit_mapping(self) -> None:
-        runner = CliRunner(policy())
-        output = json.dumps({"protocol": {"minimum": 1, "maximum": 3}, "err": {"code": "agent_fork_unsupported"}}).encode()
-        process = mock.Mock()
-        process.wait.return_value = 1
-        with mock.patch("pohunek.cli.subprocess.Popen", return_value=process), mock.patch.object(runner, "_collect", return_value=(output, b"untrusted stderr")):
-            with self.assertRaisesRegex(CliError, "") as raised:
-                runner.run(Invocation(("session", "fork", "--json")))
-        self.assertEqual(raised.exception.code, "agent_fork_unsupported")
-
     def test_exit_envelope_consistency_and_null_success(self) -> None:
         runner = CliRunner(policy())
         null_ok = json.dumps({"protocol": {"minimum": 1, "maximum": 1}, "ok": None}).encode()
@@ -429,6 +419,16 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("=key", value)
         self.assertNotIn("/home/me/private/file", value)
 
+    def test_nonzero_json_error_is_typed_before_exit_mapping(self) -> None:
+        runner = CliRunner(policy())
+        output = json.dumps({"protocol": {"minimum": 1, "maximum": 3}, "err": {"code": "agent_not_resumable"}}).encode()
+        process = mock.Mock()
+        process.wait.return_value = 1
+        with mock.patch("pohunek.cli.subprocess.Popen", return_value=process), mock.patch.object(runner, "_collect", return_value=(output, b"untrusted stderr")):
+            with self.assertRaisesRegex(CliError, "") as raised:
+                runner.run(Invocation(("session", "resume", "--json")))
+        self.assertEqual(raised.exception.code, "agent_not_resumable")
+
 
 class ToolTests(unittest.TestCase):
     def test_access_mode_registration_and_full_only_tools(self) -> None:
@@ -436,8 +436,8 @@ class ToolTests(unittest.TestCase):
         manage = Tools(policy(mode="manage"), None).handlers()
         full = Tools(policy(mode="full"), None).handlers()
         self.assertEqual(len(read), 7)
-        self.assertEqual(len(manage), 14)
-        self.assertEqual(len(full), 16)
+        self.assertEqual(len(manage), 13)
+        self.assertEqual(len(full), 15)
         self.assertNotIn("pohunek_session_stop", manage)
         self.assertIn("pohunek_session_stop", full)
 
@@ -579,14 +579,13 @@ class ToolTests(unittest.TestCase):
                 self.assertEqual(response["error"]["code"], "plugin_invalid_request")
                 runner.run.assert_not_called()
 
-    def test_all_eight_origin_mutations_are_rejected_before_any_subprocess(self) -> None:
+    def test_all_seven_origin_mutations_are_rejected_before_any_subprocess(self) -> None:
         tools = Tools(policy(), "origin")
         runner = mock.Mock()
         tools._runner = runner
         calls = {
             "pohunek_session_send": {"session": "origin", "input": "x"},
             "pohunek_session_resume": {"session": "origin"},
-            "pohunek_session_fork": {"session": "origin"},
             "pohunek_session_resize": {"session": "origin", "cols": 80, "rows": 24},
             "pohunek_session_rename": {"session": "origin", "name": "new"},
             "pohunek_session_set_metadata": {"session": "origin", "metadata": {"label": "x"}},
@@ -606,15 +605,6 @@ class ToolTests(unittest.TestCase):
         response = json.loads(tools.handlers()["pohunek_session_resume"]({"session": "peer"}))
         self.assertTrue(response["ok"])
         self.assertEqual(runner.run.call_args_list[1].args[0].argv[4], "s-1")
-
-    def test_fork_unsupported_is_data(self) -> None:
-        tools = Tools(policy(), None)
-        runner = mock.Mock()
-        runner.run.side_effect = [[{"id": "s-1"}], CliError("agent_fork_unsupported")]
-        tools._runner = runner
-        response = json.loads(tools.handlers()["pohunek_session_fork"]({"session": "s-1"}))
-        self.assertTrue(response["ok"])
-        self.assertFalse(response["result"]["fork_supported"])
 
     def test_qualified_and_missing_session_are_typed_rejections(self) -> None:
         tools = Tools(policy(), None)
@@ -1204,7 +1194,7 @@ class RegistrationTests(unittest.TestCase):
         context = Context()
         with mock.patch.object(PLUGIN, "load_policy", return_value=policy()), mock.patch("pohunek.tools.Tools.verify_cli"):
             PLUGIN.register(context)
-        self.assertEqual(len(context.tools), 16)
+        self.assertEqual(len(context.tools), 15)
         self.assertTrue(all(item["toolset"] == "pohunek" for item in context.tools))
         self.assertTrue(all(isinstance(item["schema"], dict) and "parameters" in item["schema"] for item in context.tools))
 

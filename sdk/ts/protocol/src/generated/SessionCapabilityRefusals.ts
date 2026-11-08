@@ -4,7 +4,7 @@
  * Typed reasons the session's recovery resolution refuses an operation its
  * frozen [`SessionCapabilities`] allow.
  *
- * Each code is the error code `session.resume` or `session.fork` returns for
+ * Each code is the error code `session.resume` returns for
  * that resolution, derived from the same check that clears the matching
  * capability in a list or inspect response. Refusals that depend on the
  * session's current state or on one request are not listed. Unlike the capability
@@ -16,9 +16,4 @@ export type SessionCapabilityRefusals = {
    * refuses it.
    */
   resume?: string;
-  /**
-   * Error code `session.fork` refuses with when the recovery resolution
-   * refuses it.
-   */
-  fork?: string;
 };

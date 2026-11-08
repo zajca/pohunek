@@ -74,25 +74,6 @@ pub const DATA_AUTHORITY_LOCK_NAME: &str = "data.lock";
 /// It holds the package registry record and the content-addressed package
 /// roots, so it must be an exact `0700` directory owned by the daemon user.
 pub const PLUGINS_SUBDIR: &str = "plugins";
-/// Owner-private workflow plugin store subdirectory under
-/// [`BasePaths::state_dir`].
-///
-/// It holds a package registry of its own, separate from [`PLUGINS_SUBDIR`],
-/// so the daemon never reads a workflow plugin as a runtime package. It must
-/// be an exact `0700` directory owned by the CLI user.
-pub const WORKFLOW_PLUGINS_SUBDIR: &str = "workflow-plugins";
-/// Subdirectory under [`BasePaths::state_dir`] holding one exact-`0700`
-/// state directory per workflow plugin id.
-///
-/// Keyed by plugin id rather than archive digest, so a plugin's state survives
-/// an update; uninstall keeps it unless the owner purges it.
-pub const WORKFLOW_PLUGIN_STATE_SUBDIR: &str = "workflow-plugin-state";
-/// Subdirectory under [`BasePaths::config_dir`] holding one exact-`0700`
-/// config directory per workflow plugin id, kept like the state directory.
-///
-/// Its name differs from [`WORKFLOW_PLUGINS_SUBDIR`], so equal XDG state and
-/// config roots never make the config parent the store root.
-pub const WORKFLOW_PLUGIN_CONFIG_SUBDIR: &str = "workflow-plugin-config";
 
 /// Subdirectory for launchd definitions (below state) and job logs (below logs).
 pub const LAUNCHD_SUBDIR: &str = "launchd";

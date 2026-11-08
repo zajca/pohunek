@@ -158,20 +158,6 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
         native.resume_argv(&reference).expect("resume"),
         ["--session", reference.value()]
     );
-    // A fork gets a reference of its own: `pi --fork <source> --session-id
-    // <fork>` creates the forked conversation under that id.
-    let fork = native.fork_argv(&reference).expect("fork");
-    let fork_reference = fork.reference.expect("the fork is assigned a reference");
-    assert_ne!(fork_reference, reference);
-    assert_eq!(
-        fork.argv,
-        [
-            "--fork",
-            reference.value(),
-            "--session-id",
-            fork_reference.value()
-        ]
-    );
 }
 
 #[test]
@@ -2128,7 +2114,7 @@ async fn launch_and_converse(fixture: &Fixture) -> (String, String, PathBuf) {
     let id = launched["id"].as_str().expect("session id").to_owned();
     assert_eq!(launched["agent_base"], "pi");
     assert_eq!(launched["capabilities"]["resume"], true);
-    assert_eq!(launched["capabilities"]["fork"], true);
+    assert_eq!(launched["capabilities"]["fork"], false);
     let reference = launched["native_session_id"]
         .as_str()
         .expect("the daemon assigned a native reference")
@@ -2202,93 +2188,22 @@ async fn check_resume(fixture: &Fixture, id: &str) {
     assert_eq!(fixture.stub.started(), 1, "resume makes no model request");
 }
 
-/// Forks the live session under a reference the daemon assigns, then stops
-/// and resumes the fork: Pi names the fork's own session file after that
-/// reference, so the existence check finds it and `--session` reopens the
-/// forked conversation without a new model request.
-async fn check_fork(fixture: &Fixture, id: &str, source_reference: &str, source_file: &Path) {
-    let (code, forked) = fixture
-        .harness
-        .json(&["session", "fork", id, "--name", "e2e-fork"])
-        .await;
-    assert_eq!(code, 0, "{forked}");
-    let fork_id = forked["ok"]["id"].as_str().expect("fork id").to_owned();
-    assert_ne!(fork_id, id);
-    let fork_reference = forked["ok"]["native_session_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the daemon assigned the fork a reference: {forked}"))
-        .to_owned();
-    assert_ne!(
-        fork_reference, source_reference,
-        "the fork is a conversation of its own"
-    );
-    assert_eq!(forked["ok"]["capabilities"]["resume"], true, "{forked}");
-    fixture.wait_activity(&fork_id, "idle").await;
-    fixture.wait_screen_line(&fork_id, PROMPT).await;
-
-    // Pi writes the fork's file at once, named and identified by the assigned
-    // reference, with the source conversation as its parent.
-    let files = fixture.session_files();
-    assert_eq!(
-        files.len(),
-        2,
-        "the fork wrote its own session file: {files:?}"
-    );
-    let fork_file = fixture
-        .session_file(&fork_reference)
-        .expect("Pi wrote <timestamp>_<fork reference>.jsonl");
-    assert_ne!(fork_file, source_file);
-    let header = session_header(&fork_file);
-    assert_eq!(header["id"], fork_reference.as_str());
-    assert_eq!(
-        header["parentSession"],
-        source_file.to_str().expect("utf-8 path"),
-        "the fork names the source conversation as its parent"
-    );
-
-    // The fork resumes its own conversation from that file.
-    fixture.stop(&fork_id).await;
-    let (code, resumed) = fixture.harness.json(&["session", "resume", &fork_id]).await;
-    assert_eq!(code, 0, "{resumed}");
-    fixture.wait_activity(&fork_id, "idle").await;
-    let restored = fixture.wait_screen_line(&fork_id, PROMPT).await;
-    assert!(
-        restored
-            .iter()
-            .any(|line| line.contains(model_stub::FIRST_CHUNK)),
-        "the forked turn is on screen after resume: {restored:#?}"
-    );
-    assert_eq!(
-        fixture.session_files().len(),
-        2,
-        "resuming the fork reopens its file instead of starting another"
-    );
-    assert_eq!(
-        fixture.stub.started(),
-        1,
-        "fork and resume make no model request"
-    );
-    fixture.stop(&fork_id).await;
-}
-
 /// Drives a real `pi` through the installed package: launch, detect, input,
-/// stop, resume, fork, resume of the fork and the existence check against
-/// Pi's own session files.
+/// stop, resume and the existence check against Pi's own session files.
 ///
 /// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; the model is a loopback
 /// stub, so no provider, credential or network is involved.
 #[tokio::test]
 #[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
-async fn a_real_pi_session_launches_is_detected_resumes_and_forks() {
+async fn a_real_pi_session_launches_is_detected_and_resumes() {
     require_real_pi();
     let fixture = Fixture::start().await;
     fixture.install().await;
     fixture.write_profile();
 
     check_inventory(&fixture).await;
-    let (id, reference, file) = launch_and_converse(&fixture).await;
+    let (id, _reference, file) = launch_and_converse(&fixture).await;
     check_resume(&fixture, &id).await;
-    check_fork(&fixture, &id, &reference, &file).await;
 
     // The existence check follows Pi's files: without the session file the
     // daemon refuses before launching anything.

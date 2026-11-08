@@ -34,7 +34,6 @@ export const ClientErrorCode = {
   RemoteDaemonUnavailable: "remote_daemon_unavailable",
   RequestTimeout: "request_timeout",
   SessionResumeOutcomeUnknown: "session_resume_outcome_unknown",
-  SessionForkOutcomeUnknown: "session_fork_outcome_unknown",
   SessionStopOutcomeUnknown: "session_stop_outcome_unknown",
   SessionRemoveOutcomeUnknown: "session_remove_outcome_unknown",
   Io: "io_error",
@@ -58,7 +57,6 @@ export type ClientErrorKind =
   | "remoteDaemonUnavailable"
   | "requestTimeout"
   | "sessionResumeOutcomeUnknown"
-  | "sessionForkOutcomeUnknown"
   | "sessionStopOutcomeUnknown"
   | "sessionRemoveOutcomeUnknown"
   | "remoteProtocol"
@@ -420,7 +418,7 @@ export class ClientError extends Error {
 }
 
 /** Lifecycle requests whose elapsed deadline leaves the outcome unknown. */
-export type LifecycleOperation = "resume" | "fork" | "stop" | "remove";
+export type LifecycleOperation = "resume" | "stop" | "remove";
 
 const LIFECYCLE_OUTCOME_UNKNOWN: Record<
   LifecycleOperation,
@@ -431,12 +429,6 @@ const LIFECYCLE_OUTCOME_UNKNOWN: Record<
     code: ClientErrorCode.SessionResumeOutcomeUnknown,
     action: "resume the session",
     recover: "the resume may still complete: run `pohunek session inspect <session>` and read its runtime state before retrying",
-  },
-  fork: {
-    kind: "sessionForkOutcomeUnknown",
-    code: ClientErrorCode.SessionForkOutcomeUnknown,
-    action: "fork the session",
-    recover: "the fork may still complete and a retried fork creates a second child session: run `pohunek session list` and look for the new session before retrying",
   },
   stop: {
     kind: "sessionStopOutcomeUnknown",

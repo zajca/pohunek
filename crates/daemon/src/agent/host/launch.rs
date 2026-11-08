@@ -205,11 +205,11 @@ fn adopted(pin: &LaunchPin, definition: &RuntimeDefinition) -> bool {
     adopts(pin, definition) || adopts_newer(pin, definition)
 }
 
-/// Checks that the package an adopted session resumes or forks from honors the
+/// Checks that the package an adopted session resumes from honors the
 /// launch the session froze.
 ///
 /// The argv is always the frozen one, so only what the frozen spec relies on is
-/// compared: the reference kind and, for a fork, fork support on both sides.
+/// compared: the reference kind and the assignment.
 /// A built-in pin's reference is hook-reported, which an assigned package
 /// strategy cannot honor; an older package version's assigned strategy must be
 /// the one the package serves. A session that is not adopted is not checked
@@ -223,7 +223,6 @@ pub(crate) fn honors_frozen_launch(
     pin: &LaunchPin,
     definition: &RuntimeDefinition,
     frozen: Option<&NativeSessionLaunch>,
-    fork: bool,
 ) -> Result<(), ProtocolError> {
     let same_assignment = |frozen: &NativeSessionLaunch, served: &NativeSessionLaunch| {
         if adopts(pin, definition) {
@@ -237,9 +236,7 @@ pub(crate) fn honors_frozen_launch(
     }
     let honored = match (frozen, definition.native()) {
         (Some(frozen), Some(served)) => {
-            frozen.reference_kind() == served.reference_kind()
-                && same_assignment(frozen, served)
-                && (!fork || (frozen.supports_fork() && served.supports_fork()))
+            frozen.reference_kind() == served.reference_kind() && same_assignment(frozen, served)
         }
         _ => false,
     };
@@ -249,26 +246,6 @@ pub(crate) fn honors_frozen_launch(
         Err(ProtocolError::runtime_served_by_package(
             definition.runtime_id(),
         ))
-    }
-}
-
-/// The launch spec a relaunch of a session frozen with `frozen` runs under.
-///
-/// An adopting package that does not support fork has its fork arguments
-/// removed, so the relaunched session cannot fork through a spec the package
-/// does not honor.
-pub(crate) fn relaunch_launch(
-    frozen: &LaunchPin,
-    definition: &RuntimeDefinition,
-    launch: NativeSessionLaunch,
-) -> NativeSessionLaunch {
-    let package_forks = definition
-        .native()
-        .is_some_and(NativeSessionLaunch::supports_fork);
-    if adopted(frozen, definition) && !package_forks {
-        launch.without_fork()
-    } else {
-        launch
     }
 }
 

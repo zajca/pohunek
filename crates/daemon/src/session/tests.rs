@@ -13,15 +13,15 @@ use time::OffsetDateTime;
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use protocol::{
     method, AgentActivity, CwdSource, DetectionRegionKind, DetectionRegionPreview, ErrorClass,
-    Event, ForkCwdMode, OutputOffset, PackageId, PackageIdentity, PackageVersion,
-    ProcessStartIdentity, ProjectSource, ReportSequence, Request, Response, RuntimeGeneration,
-    RuntimeId, RuntimeRef, RuntimeState, SessionAttachParams, SessionDetectionParams,
-    SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
-    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
-    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    Event, OutputOffset, PackageId, PackageIdentity, PackageVersion, ProcessStartIdentity,
+    ProjectSource, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId, RuntimeRef,
+    RuntimeState, SessionAttachParams, SessionDetectionParams, SessionId, SessionInfo,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionOutputParams, SessionReadFormat,
+    SessionReadParams, SessionReadSource, SessionReleaseAgentParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity,
+    SessionState, SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo,
+    SubagentLifecycle, SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
+    MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::host::fixture::{
@@ -386,7 +386,7 @@ fn old_worker_attach_failure_has_an_actionable_recovery_hint() {
     assert!(error
         .recover
         .as_deref()
-        .is_some_and(|hint| hint.contains("restart") && hint.contains("fork")));
+        .is_some_and(|hint| hint.contains("restart") && hint.contains("new session")));
 }
 
 #[tokio::test]
@@ -1826,13 +1826,9 @@ pub(super) fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, Pat
     (runtime_root, state_root)
 }
 
-fn test_native_launch(kind: SessionRefKind, fork: bool) -> NativeSessionLaunch {
-    NativeSessionLaunch::from_templates(
-        kind,
-        &["--resume", "{reference}"],
-        fork.then_some(&["--resume", "{reference}", "--fork-session"][..]),
-    )
-    .expect("valid test templates")
+fn test_native_launch(kind: SessionRefKind) -> NativeSessionLaunch {
+    NativeSessionLaunch::from_templates(kind, &["--resume", "{reference}"])
+        .expect("valid test templates")
 }
 
 pub(super) fn temp_dir(tag: &str) -> PathBuf {
@@ -12767,7 +12763,7 @@ fn every_launch_announces_the_hook_admission_retry_policy() {
     let mut passed_through = pohunek_worker_protocol::HOOK_RETRY_ENV_NAMES.to_vec();
     passed_through.sort_unstable();
     assert_eq!(announced, passed_through);
-    // New, resumed and forked launches all compose their environment here.
+    // New and resumed launches both compose their environment here.
     for agent in [
         RuntimeRef::shell(),
         RuntimeRef::codex(),
@@ -18853,98 +18849,6 @@ fn resumable_params() -> SessionNewParams {
     }
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
-    let dir = temp_dir("fork-claude-runtime");
-    let claude_home = dir.join("claude-home");
-    let transcripts = claude_home.join("projects/fixture");
-    std::fs::create_dir_all(&transcripts).expect("create Claude transcript store");
-    std::fs::write(transcripts.join("native-live.jsonl"), "{}\n")
-        .expect("write Claude source transcript");
-    let script = dir.join("fork-agent");
-    let marker = dir.join("argv.txt");
-    write_executable(
-        &script,
-        &format!(
-            "#!/bin/sh\n{}sleep 30\n",
-            append_launch_record(&marker, "printf '%s\\n' \"$@\"")
-        ),
-    );
-    let agents_dir = temp_agents_dir_with(
-        "fork-claude",
-        "forkable",
-        &format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
-            script.display(),
-            claude_home.display()
-        ),
-    );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        agents_dir: Some(agents_dir),
-        ..SessionRegistryConfig::default()
-    });
-
-    let created = registry
-        .create(SessionNewParams {
-            agent: "forkable".to_owned(),
-            cwd: Some(dir.clone()),
-            ..params()
-        })
-        .await
-        .expect("create forkable session");
-    assert_eq!(created.state, SessionState::Running);
-    let recorded = registry
-        .report_as_root(native_report!(&registry;
-            session_id: created.id.clone(),
-            agent: "claude".to_owned(),
-            native_session_id: "native-live".to_owned(),
-            transcript_path: None,
-        ))
-        .await;
-    assert!(recorded.recorded);
-
-    let forked = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: Some("forked review".to_owned()),
-            cwd_mode: ForkCwdMode::Same,
-            cols: 100,
-            rows: 30,
-            accept_profile_change: false,
-        })
-        .await
-        .expect("fork live claude session");
-
-    assert_ne!(forked.id, created.id, "fork must mint a fresh pohunek id");
-    assert_eq!(forked.name.as_deref(), Some("forked review"));
-    assert_eq!(forked.cwd, created.cwd);
-    assert_eq!((forked.cols, forked.rows), (100, 30));
-    assert_eq!(forked.native_session_id, None);
-
-    let argv = wait_for_file_contains(&marker, "--fork-session").await;
-    let lines = argv.lines().collect::<Vec<_>>();
-    assert!(
-        lines.windows(6).any(|window| {
-            window
-                == [
-                    "--model",
-                    "sonnet",
-                    "--name=forked review",
-                    "--resume",
-                    "native-live",
-                    "--fork-session",
-                ]
-        }),
-        "fork argv must preserve frozen args, name the fork and append the Claude fork flag: {argv:?}"
-    );
-
-    registry.stop(&created.id).await.expect("stop the session");
-    registry.stop(&forked.id).await.expect("stop the session");
-}
-
 /// Waits until the detector's `osc_title` preview shows `title`.
 async fn wait_for_title_preview(registry: &SessionRegistry, id: &SessionId, title: &str) {
     wait_until(&format!("the title preview {title:?}"), || async {
@@ -19117,75 +19021,7 @@ async fn a_withheld_dash_leading_name_leaves_the_detector_launch_name_unset() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects() {
-    let dir = temp_dir("fork-unsupported-runtime");
-    let codex = dir.join("codex-agent");
-    write_executable(&codex, "#!/bin/sh\nsleep 30\n");
-    let hermes = dir.join("hermes");
-    write_supported_hermes_executable(&hermes, "sleep 30\n");
-    let agents_dir = temp_agents_dir_with(
-        "fork-unsupported",
-        "codex-fork",
-        &format!("base = \"codex\"\nprogram = \"{}\"\n", codex.display()),
-    );
-    fs::write(
-        agents_dir.join("hermes-test.toml"),
-        pin_official_base(&format!(
-            "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
-            hermes.display()
-        )),
-    )
-    .expect("write Hermes profile");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
-        agents_dir: Some(agents_dir),
-        ..SessionRegistryConfig::default()
-    });
-
-    for agent in ["shell", "codex-fork", "hermes-test"] {
-        let created = registry
-            .create(SessionNewParams {
-                agent: agent.to_owned(),
-                cwd: Some(dir.clone()),
-                ..params()
-            })
-            .await
-            .expect(agent);
-        let listed_before = registry.list().await.len();
-
-        let error = registry
-            .fork(SessionForkParams {
-                session_id: created.id.clone(),
-                name: Some("must-not-exist".to_owned()),
-                cwd_mode: ForkCwdMode::Same,
-                cols: 80,
-                rows: 24,
-                accept_profile_change: false,
-            })
-            .await
-            .expect_err(agent);
-
-        assert_eq!(
-            error,
-            protocol::ProtocolError::agent_fork_unsupported(),
-            "{agent}"
-        );
-        let listed = registry.list().await;
-        assert_eq!(listed.len(), listed_before, "{agent}: no child registered");
-        assert!(
-            listed
-                .iter()
-                .all(|session| session.name.as_deref() != Some("must-not-exist")),
-            "{agent}: no child registered"
-        );
-        registry.stop(&created.id).await.expect("stop the session");
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
+async fn non_resumable_claude_profile_has_no_resume() {
     let dir = temp_dir("non-resumable-claude");
     let script = dir.join("claude-agent");
     write_executable(&script, "#!/bin/sh\nsleep 30\n");
@@ -19214,7 +19050,6 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
         .await
         .expect("create non-resumable Claude session");
     assert!(!created.capabilities.resume);
-    assert!(!created.capabilities.fork);
     let worker_instance_id = created
         .runtime
         .as_ref()
@@ -19242,53 +19077,6 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
         .load_resume()
         .expect("load resume bindings")
         .is_empty());
-    registry.stop(&created.id).await.expect("stop the session");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn fork_disable_is_frozen_across_profile_removal() {
-    let dir = temp_dir("fork-disable-frozen-runtime");
-    let script = dir.join("claude-agent");
-    write_executable(&script, "#!/bin/sh\nsleep 30\n");
-    let agents_dir = temp_agents_dir_with(
-        "fork-disable-frozen",
-        "no-fork",
-        &format!(
-            "base = \"claude\"\nprogram = \"{}\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{{reference}}\"]\n",
-            script.display()
-        ),
-    );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        agents_dir: Some(agents_dir.clone()),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry
-        .create(SessionNewParams {
-            agent: "no-fork".to_owned(),
-            cwd: Some(dir),
-            ..params()
-        })
-        .await
-        .expect("create fork-disabled Claude session");
-    std::fs::remove_file(agents_dir.join("no-fork.toml")).expect("remove profile after launch");
-
-    let err = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect_err("frozen fork disable must survive profile removal");
-
-    assert_eq!(err.code, "agent_fork_unsupported");
-    assert_eq!(registry.list().await.len(), 1);
     registry.stop(&created.id).await.expect("stop the session");
 }
 
@@ -19355,7 +19143,6 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
     assert_eq!(persisted[0].native_session_id, None);
     assert_eq!(persisted[0].reference_kind(), Some(SessionRefKind::Path));
     assert!(persisted[0].resumable());
-    assert!(!persisted[0].forkable());
     assert_eq!(persisted[0].program, "/bin/sh");
     assert!(persisted[0].resumable());
 
@@ -19968,7 +19755,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         program: script.display().to_string(),
         args: vec!["chat".to_owned()],
         input_rules: crate::store::StoredInputRules::default(),
-        native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+        native_launch: Some(test_native_launch(SessionRefKind::Id)),
         launch_binding: official_launch_pin(RuntimeId::HERMES),
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         profile_revision: None,
@@ -20119,7 +19906,7 @@ async fn a_hostile_native_id_refuses_recovery_without_launching() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
+async fn pi_shaped_profile_resumes_through_the_frozen_spec() {
     let dir = temp_dir("pi-shaped-session");
     let marker = dir.join("argv.txt");
     let script = dir.join("pi-like");
@@ -20128,7 +19915,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\n{}case \"$1\" in --session|--fork) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            "#!/bin/sh\n{}case \"$1\" in --session) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
             append_launch_record(&marker, "printf '%s\\n' \"$@\""),
             gate_path.display(),
         ),
@@ -20137,7 +19924,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
         "pi-shaped-session",
         "pi-like",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\n[resume]\nreference_kind = \"path\"\nargs = [\"--session\", \"{{reference}}\"]\nfork_args = [\"--fork\", \"{{reference}}\"]\n",
+            "base = \"claude\"\nprogram = \"{}\"\n[resume]\nreference_kind = \"path\"\nargs = [\"--session\", \"{{reference}}\"]\n",
             script.display()
         ),
     );
@@ -20156,7 +19943,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
         })
         .await
         .expect("create Pi-shaped session");
-    assert!(created.capabilities.resume && created.capabilities.fork);
+    assert!(created.capabilities.resume);
     let reference = "/work/with space/$(touch pwned);|.jsonl";
     assert!(
         registry
@@ -20183,24 +19970,6 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
         ["--session", reference]
     );
 
-    let forked = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect("native fork");
-    let argv = wait_for_file_contains(&marker, &format!("--fork\n{reference}\n")).await;
-    assert_eq!(
-        argv.lines().skip(1).collect::<Vec<_>>(),
-        ["--session", reference, "--fork", reference]
-    );
-
-    registry.stop(&forked.id).await.expect("stop the session");
     registry.stop(&created.id).await.expect("stop the session");
 }
 
@@ -20387,7 +20156,7 @@ async fn resume_binding_restores_metadata_from_store() {
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "sleep 30".to_owned()],
             input_rules: crate::store::StoredInputRules::default(),
-            native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+            native_launch: Some(test_native_launch(SessionRefKind::Id)),
             launch_binding: official_launch_pin(RuntimeId::CLAUDE),
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
@@ -25348,7 +25117,7 @@ async fn recoveries_of_different_sessions_are_not_serialized() {
 
 /// A Pi-shaped agent that appends `launch` and its arguments to `marker` on
 /// every start. A start with `--session-id` stays alive until the returned gate
-/// is written; every other start (resume, fork) stays alive for the whole test.
+/// is written; every other start (resume) stays alive for the whole test.
 #[cfg(unix)]
 pub(super) fn assigned_agent_script(
     dir: &std::path::Path,
@@ -25542,7 +25311,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         uuid::Uuid::parse_str(&reference).is_ok(),
         "core generates a UUID"
     );
-    assert!(created.capabilities.resume && created.capabilities.fork);
+    assert!(created.capabilities.resume);
 
     // Persistence: both the durable record and the resume store carry the
     // reference with its provenance, and no process-bound ordering exists.
@@ -25562,161 +25331,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         ["--model", "fast", "--session", reference.as_str()]
     );
 
-    // Fork: the fork template with the source's reference; the child holds no
-    // reference of its own because core cannot learn the forked conversation.
-    let forked = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect("native fork");
-    wait_for_file_contains(&marker, &format!("--fork\n{reference}\n")).await;
-    assert_eq!(
-        recorded_launch(&marker, 2),
-        ["--model", "fast", "--fork", reference.as_str()]
-    );
-    assert_eq!(forked.native_session_id, None);
-    assert!(store
-        .load_resume()
-        .expect("resume store")
-        .iter()
-        .all(|binding| binding.session_id != forked.id.0));
-
-    registry.stop(&forked.id).await.expect("stop the session");
     registry.stop(&created.id).await.expect("stop the session");
-}
-
-/// A Pi-shaped agent that records every start in `marker` and stays alive.
-/// Like Pi, a start with `--fork` writes the forked conversation at once, as
-/// `$PI_SHAPED_HOME/sessions/proj/<stamp>_<id>.jsonl` for the `--session-id`
-/// it was given. The start is recorded after that write, so a recorded fork
-/// start means its conversation exists even if the agent is stopped next.
-#[cfg(unix)]
-fn forking_agent_script(dir: &std::path::Path, marker: &std::path::Path) -> PathBuf {
-    let script = dir.join("pi-forking");
-    write_executable(
-        &script,
-        &format!(
-            "#!/bin/sh\ncase \" $* \" in *\" --fork \"*)\n\
-             previous=\n\
-             for argument in \"$@\"; do\n\
-             if [ \"$previous\" = --session-id ]; then\n\
-             mkdir -p \"$PI_SHAPED_HOME/sessions/proj\"\n\
-             : > \"$PI_SHAPED_HOME/sessions/proj/2026-10-12T10-00-00-000Z_$argument.jsonl\"\n\
-             fi\n\
-             previous=$argument\n\
-             done ;;\n\
-             esac\n{record}exec sleep 30\n",
-            record = append_launch_record(marker, "printf 'launch\\n'; printf '%s\\n' \"$@\""),
-        ),
-    );
-    script
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_fork_of_a_runtime_assigning_forks_resumes_its_own_conversation_after_a_restart() {
-    let dir = temp_dir("assigned-fork");
-    let home = temp_dir("assigned-fork-home");
-    let marker = dir.join("argv.txt");
-    let script = forking_agent_script(&dir, &marker);
-    let store_path = temp_store_path("assigned-fork");
-    // The profile points the runtime's config home at a test directory, so the
-    // existence check and the agent never touch the host's.
-    let agents_dir = temp_agents_dir_with(
-        "assigned-fork",
-        "pi-home",
-        &format!(
-            "base = \"pi\"\n{}program = \"{}\"\n[env]\n{} = \"{}\"\n",
-            crate::agent::host::fixture::pi_shaped_profile_pin(),
-            script.display(),
-            crate::agent::host::fixture::PI_SHAPED_HOME_ENV,
-            home.display()
-        ),
-    );
-    let registry_at = |store_path: &std::path::Path| {
-        SessionRegistry::new_with_runtimes(
-            SessionRegistryConfig {
-                shell_command: hermetic_shell(),
-                stop_grace: Duration::from_millis(50),
-                store_path: Some(store_path.to_path_buf()),
-                agents_dir: Some(agents_dir.clone()),
-                ..SessionRegistryConfig::default()
-            },
-            crate::agent::host::fixture::pi_shaped_forking_host(
-                &script,
-                crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
-            ),
-        )
-    };
-    let registry = registry_at(&store_path);
-
-    let created = registry
-        .create(SessionNewParams {
-            agent: "pi-home".to_owned(),
-            cwd: Some(dir.clone()),
-            ..params()
-        })
-        .await
-        .expect("create a hook-less package session");
-    let source = created
-        .native_session_id
-        .clone()
-        .expect("assigned reference");
-    wait_for_file_contains(&marker, &format!("--session-id\n{source}\n")).await;
-    // The source conversation exists once the agent took a turn.
-    write_conversation(&home, &source);
-
-    // Fork: the fork template with the source's reference, then the launch
-    // template with a reference core generated for the fork.
-    let forked = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect("native fork");
-    let fork = forked
-        .native_session_id
-        .clone()
-        .expect("the fork holds a reference of its own at once");
-    assert_ne!(fork, source, "the fork is a conversation of its own");
-    assert!(
-        uuid::Uuid::parse_str(&fork).is_ok(),
-        "core generates a UUID"
-    );
-    assert!(forked.capabilities.resume && forked.capabilities.fork);
-    wait_for_file_contains(&marker, &format!("--session-id\n{fork}\n")).await;
-    assert_eq!(
-        recorded_launch(&marker, 1),
-        ["--fork", source.as_str(), "--session-id", fork.as_str()]
-    );
-    let store = crate::store::Store::new(store_path.clone());
-    assert_assigned_binding_persisted(&store, &forked.id, &fork);
-
-    // Restart: a new registry over the same store recovers the fork from its
-    // persisted binding, into the fork's conversation and not the source's.
-    registry.stop(&forked.id).await.expect("stop the fork");
-    registry.stop(&created.id).await.expect("stop the source");
-    drop(registry);
-    let restarted = registry_at(&store_path);
-    let resumed = restarted
-        .resume_binding(durable_recovery(&store_path, &forked.id))
-        .await
-        .expect("the fork recovers from its own conversation");
-    wait_for_file_contains(&marker, &format!("--session\n{fork}\n")).await;
-    assert_eq!(recorded_launch(&marker, 2), ["--session", fork.as_str()]);
-    assert_eq!(resumed.native_session_id.as_deref(), Some(fork.as_str()));
-    restarted.stop(&resumed.id).await.expect("stop the session");
 }
 
 /// A Pi-shaped agent that answers `--version` from `version_file` and records
@@ -25766,19 +25381,11 @@ async fn a_probed_package_runtime_is_revalidated_before_every_launch_kind() {
             crate::agent::host::fixture::PI_SHAPED_PROBE,
         ),
     );
-    let fork = |id: &SessionId| SessionForkParams {
-        session_id: id.clone(),
-        name: None,
-        cwd_mode: ForkCwdMode::Same,
-        cols: 80,
-        rows: 24,
-        accept_profile_change: false,
-    };
     let launches = |marker: &std::path::Path| {
         fs::read_to_string(marker).map_or(0, |text| text.matches("launch\n").count())
     };
 
-    // A release inside the range launches and forks.
+    // A release inside the range launches.
     let created = registry
         .create(SessionNewParams {
             agent: "pi".to_owned(),
@@ -25788,21 +25395,10 @@ async fn a_probed_package_runtime_is_revalidated_before_every_launch_kind() {
         .await
         .expect("a release in the range launches");
     wait_for_file_contains(&marker, "--session-id\n").await;
-    let forked = registry
-        .fork(fork(&created.id))
-        .await
-        .expect("a release in the range forks");
-    wait_for_file_contains(&marker, "--fork\n").await;
-    assert_eq!(launches(&marker), 2);
+    assert_eq!(launches(&marker), 1);
 
     // A release outside the range is refused before anything starts.
     fs::write(&version_file, "1.1.0\n").expect("write the newer version");
-    let refused = registry
-        .fork(fork(&created.id))
-        .await
-        .expect_err("fork re-runs the probe");
-    assert_eq!(refused.code, "agent_runtime_unsupported");
-    assert_eq!(launches(&marker), 2, "nothing was launched");
     let refused = registry
         .create(SessionNewParams {
             agent: "pi".to_owned(),
@@ -25823,8 +25419,7 @@ async fn a_probed_package_runtime_is_revalidated_before_every_launch_kind() {
         .await
         .expect_err("resume re-runs the probe");
     assert_eq!(refused.code, "agent_runtime_unsupported");
-    assert_eq!(launches(&marker), 2, "nothing was launched");
-    registry.stop(&forked.id).await.expect("stop the session");
+    assert_eq!(launches(&marker), 1, "nothing was launched");
 }
 
 /// The durable recovery binding of `id`, as a restarted daemon reads it.
@@ -25888,21 +25483,6 @@ async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() 
         ["--session-id", reference.as_str()],
         "a profile launches with its own args and the assigned template"
     );
-
-    // The agent never wrote the conversation: a live fork is refused.
-    let fork = SessionForkParams {
-        session_id: created.id.clone(),
-        name: None,
-        cwd_mode: ForkCwdMode::Same,
-        cols: 80,
-        rows: 24,
-        accept_profile_change: false,
-    };
-    let refused = registry
-        .fork(fork.clone())
-        .await
-        .expect_err("fork needs the conversation");
-    assert_eq!(refused.code, "agent_native_reference_missing");
 
     gate.write_all(b"go\n").expect("release the exit gate");
     registry
@@ -26615,51 +26195,6 @@ async fn a_running_package_session_stays_mutable_when_its_active_agent_is_its_ow
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_fork_holds_the_package_authority_until_its_registration_ends() {
-    let dir = temp_dir("packaged-fork-guard");
-    let marker = dir.join("argv.txt");
-    let (script, _gate) = assigned_agent_script(&dir, &marker);
-    let packaged = PackagedPi::install("packaged-fork-guard-plugins", &script);
-    let registry = packaged.registry(&temp_store_path("packaged-fork-guard"));
-    let created = registry
-        .create(packaged_params(&dir))
-        .await
-        .expect("create a package session");
-    packaged.disable_and_reload(&registry);
-
-    // An uninstall in progress holds the exclusive authority.
-    let exclusive = registry.inner.packages.lifecycle().write().await;
-    let forking = registry.clone();
-    let source = created.id.clone();
-    let mut fork = tokio::spawn(async move {
-        forking
-            .fork(SessionForkParams {
-                session_id: source,
-                name: None,
-                cwd_mode: ForkCwdMode::Same,
-                cols: 80,
-                rows: 24,
-                accept_profile_change: false,
-            })
-            .await
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), &mut fork)
-            .await
-            .is_err(),
-        "a fork waits for the package authority"
-    );
-    drop(exclusive);
-    let forked = fork
-        .await
-        .expect("fork task")
-        .expect("a pinned disabled package still forks");
-    registry.stop(&forked.id).await.expect("stop the session");
-    registry.stop(&created.id).await.expect("stop the session");
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn an_uninstall_survives_the_cancellation_of_its_caller() {
     let dir = temp_dir("packaged-uninstall-cancel");
     let marker = dir.join("argv.txt");
@@ -26841,7 +26376,6 @@ async fn recovery_keeps_an_unchanged_profile_after_its_package_is_disabled() {
             &super::resume::recovery_definition(&registry.inner.profiles, &binding)
                 .expect("the pinned package still resolves"),
             super::ProfileChange::Refuse,
-            false,
         )
         .expect("the unchanged profile still matches its frozen revision");
 
@@ -27170,7 +26704,6 @@ struct MigratedAgentCase {
     frozen_args: &'static [&'static str],
     v0_33_0_fields: serde_json::Value,
     resume_argv: &'static [&'static str],
-    fork_argv: Option<&'static [&'static str]>,
 }
 
 /// Records every argument vector it is launched with and stays alive; answers
@@ -27188,7 +26721,7 @@ fn write_argv_recording_agent(path: &std::path::Path, marker: &std::path::Path) 
 
 #[cfg(unix)]
 #[tokio::test]
-async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
+async fn migrated_legacy_bindings_resume_with_the_native_argv() {
     let cases = [
         MigratedAgentCase {
             agent: "claude",
@@ -27199,7 +26732,6 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
                 "fork_ref_kind": "id", "forkable": true,
             }),
             resume_argv: &["--resume", "native-legacy"],
-            fork_argv: Some(&["--resume", "native-legacy", "--fork-session"]),
         },
         MigratedAgentCase {
             agent: "codex",
@@ -27208,7 +26740,6 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
                 "resume_mode": "subcommand", "ref_kind": "id", "resumable": true,
             }),
             resume_argv: &["--no-daemon", "resume", "native-legacy"],
-            fork_argv: None,
         },
         MigratedAgentCase {
             agent: "hermes",
@@ -27217,7 +26748,6 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
                 "resume_mode": "flag", "ref_kind": "id", "resumable": true,
             }),
             resume_argv: &["--resume", "native-legacy"],
-            fork_argv: None,
         },
     ];
     // v0.33.0 froze the flat fields; v0.33.1 dropped them without a spec.
@@ -27228,7 +26758,7 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
     }
 }
 
-/// The registry a migrated binding resumes and forks through. A migrated
+/// The registry a migrated binding resumes through. A migrated
 /// binding is unpinned, so it resumes only through a built-in runtime: the
 /// registry serves Codex and Claude as built-ins ([`compiled_in_host`]), as
 /// the daemon that wrote the binding did. The Claude case clears the recovery
@@ -27263,8 +26793,9 @@ fn migrated_agent_registry(
     )
 }
 
-/// Migrates one generation's store line for `case`, then resumes and forks the
-/// binding and checks the exact argv the agent is launched with.#[cfg(unix)]
+/// Migrates one generation's store line for `case`, then resumes the binding
+/// and checks the exact argv the agent is launched with.
+#[cfg(unix)]
 async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase) {
     let tag = format!("migrated-{generation}-{}", case.agent);
     let dir = temp_dir(&tag);
@@ -27320,43 +26851,6 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
         "{tag}: resume argv"
     );
 
-    let fork = registry
-        .fork(SessionForkParams {
-            session_id: resumed.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await;
-    match case.fork_argv {
-        Some(fork_argv) => {
-            let forked = fork.unwrap_or_else(|error| panic!("{tag}: fork failed: {error:?}"));
-            let expected_fork = case
-                .frozen_args
-                .iter()
-                .chain(fork_argv)
-                .copied()
-                .collect::<Vec<_>>();
-            let total = expected_resume.len() + expected_fork.len();
-            let launched = wait_for_line_count(&marker, total).await;
-            assert_eq!(
-                launched
-                    .lines()
-                    .skip(expected_resume.len())
-                    .collect::<Vec<_>>(),
-                expected_fork,
-                "{tag}: fork argv"
-            );
-            registry.stop(&forked.id).await.expect("stop the session");
-        }
-        None => assert_eq!(
-            fork.expect_err("the built-in spec has no fork").code,
-            "agent_fork_unsupported",
-            "{tag}"
-        ),
-    }
     registry.stop(&resumed.id).await.expect("stop the session");
 }
 
@@ -28150,58 +27644,6 @@ async fn a_launch_over_outdated_hook_assets_carries_a_hook_warning() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_fork_over_outdated_hook_assets_carries_a_hook_warning() {
-    let claude_dir = temp_dir("outdated-fork-claude");
-    // The fork preflight verifies the conversation in the registry's config
-    // home, beside the hooks this test installs.
-    write_claude_transcript(&claude_dir, "native-fork");
-    let dir = temp_dir("outdated-fork-runtime");
-    let script = dir.join("fork-agent");
-    write_executable(&script, "#!/bin/sh\nsleep 30\n");
-    let agents_dir = temp_agents_dir_with(
-        "outdated-fork",
-        "forkable",
-        &format!("base = \"claude\"\nprogram = \"{}\"\n", script.display()),
-    );
-    let registry = claude_home_registry(&claude_dir, agents_dir, None);
-    install_claude_hooks(&registry);
-    let created = create_in(&registry, "forkable", &dir)
-        .await
-        .expect("create");
-    let recorded = registry
-        .report_as_root(native_report!(&registry;
-            session_id: created.id.clone(),
-            agent: "claude".to_owned(),
-            native_session_id: "native-fork".to_owned(),
-            transcript_path: None,
-        ))
-        .await;
-    assert!(recorded.recorded);
-    let fork = || {
-        registry.fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-    };
-
-    let current = fork().await.expect("fork over current hooks");
-    assert!(!warns_of_outdated_hooks(&current));
-
-    drift_claude_state_hook(&claude_dir);
-    let outdated = fork().await.expect("fork over outdated hooks");
-    assert!(
-        warns_of_outdated_hooks(&outdated),
-        "{:?}",
-        outdated.warnings
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
     let claude_dir = temp_dir("outdated-resume-claude");
     let marker = temp_dir("outdated-resume-marker").join("argv.txt");
@@ -28306,57 +27748,6 @@ fn install_shadowing_profile_hooks(registry: &SessionRegistry) {
 /// transcript must exist in the profile home before a recovery preflight.
 #[cfg(unix)]
 const SHADOW_NATIVE_REFERENCE: &str = "native-shadow";
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_fork_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
-    let default_dir = temp_dir("shadow-fork-default");
-    let profile_dir = temp_dir("shadow-fork-profile");
-    // The fork preflight verifies the conversation in the profile home the
-    // shadowing profile declares.
-    write_claude_transcript(&profile_dir, SHADOW_NATIVE_REFERENCE);
-    let dir = temp_dir("shadow-fork-runtime");
-    let script = dir.join("fork-agent");
-    write_executable(&script, "#!/bin/sh\nsleep 30\n");
-    let registry =
-        shadowing_profile_registry("shadow-fork", &default_dir, &profile_dir, &script, None);
-    install_shadowing_profile_hooks(&registry);
-    let created = create_in(&registry, "claude", &dir).await.expect("create");
-    let recorded = registry
-        .report_as_root(native_report!(&registry;
-            session_id: created.id.clone(),
-            agent: "claude".to_owned(),
-            native_session_id: SHADOW_NATIVE_REFERENCE.to_owned(),
-            transcript_path: None,
-        ))
-        .await;
-    assert!(recorded.recorded);
-    drift_claude_state_hook(&profile_dir);
-
-    let forked = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect("fork");
-    let warning = forked
-        .warnings
-        .iter()
-        .find(|warning| warning.kind == protocol::SessionWarningKind::Hook)
-        .expect("the profile home's outdated hooks are flagged");
-    assert!(
-        warning
-            .message
-            .contains("pohunek integration install --agent claude --profile claude"),
-        "{}",
-        warning.message
-    );
-}
 
 #[cfg(unix)]
 #[tokio::test]

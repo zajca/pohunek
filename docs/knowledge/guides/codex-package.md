@@ -55,12 +55,12 @@ On a host without the package nothing serves `codex`:
   not attributed to Codex: process recognition and transcript observation read
   the package's `detect.toml` and `[transcripts]` table.
 - A session the built-in Codex of an earlier release launched is refused on
-  resume, fork and every interaction (input, attach, resize, rename, metadata)
+  resume and every interaction (input, attach, resize, rename, metadata)
   with `runtime_builtin_removed`, whose hint names the install; only stop and
   remove still work. With the package installed, the package adopts the session,
-  live or stopped, and resume and fork run through it when it honors the
+  live or stopped, and resume runs through it when it honors the
   session's recovery contract (same native reference kind, hook-reported
-  reference; fork also needs fork support). A session whose contract the package
+  reference). A session whose contract the package
   cannot honor answers `runtime_served_by_package`, and no command rebinds the
   session to another runtime source. `pohunekd upgrade-preflight` reports an adoptable
   session as `adoptable`, and a session that no package adopts as
@@ -96,7 +96,7 @@ copies of that descriptor and its detection manifest in
   independently of pohunek and a refused launch breaks every Codex session.
   Releases above 0.164.0 are accepted by policy, not verified.
 - Launch arguments: `args = []`; the `codex-hook-v1` handler adds `--no-daemon`
-  to every launch as per-launch input (create, resume and fork), after the
+  to every launch as per-launch input (create and resume), after the
   frozen arguments and before the native resume arguments, so a relaunch runs
   `codex <frozen args> --no-daemon resume <id>`. A frozen argument list that
   already holds `--no-daemon` gets no second copy. Every Codex release in the
@@ -114,8 +114,7 @@ copies of that descriptor and its detection manifest in
   wrapper that treats the first argument as its own (`/bin/sh -c ...`) receives
   the flag in that position, so the wrapper has to pass it on to `codex`. Needs a core release; the descriptor carries no
   argument.
-- Native reference: `strategy = "hook"`; resume is `codex resume <id>`; fork is
-  unsupported.
+- Native reference: `strategy = "hook"`; resume is `codex resume <id>`.
 - Integration: handler `codex-hook-v1` with hook schema `identity-subagent-v1`.
   The package names the compiled handler and schema; the hook reporter scripts
   stay core-owned, so the archive carries no asset.

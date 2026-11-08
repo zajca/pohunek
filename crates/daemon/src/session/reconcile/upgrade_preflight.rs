@@ -92,8 +92,8 @@ use crate::runtime::lifecycle::IDENTITY_MISMATCH;
 use crate::runtime::LaunchEnvironment;
 use crate::session::native_repair::repair_native_recovery;
 use crate::session::resume::{
-    binding_native_launch, binding_program, check_recovery_reference, recovery_contract,
-    recovery_definition, reference_existence, session_ref_from_binding,
+    binding_native_launch, binding_program, check_recovery_reference, recovery_definition,
+    reference_existence, session_ref_from_binding,
 };
 use crate::session::resume::{recovery_profile_in, ProfileChange};
 use crate::session::{plan_official_runtimes, EnsureInputs, OfficialPlan, PlannedProfile};
@@ -867,7 +867,7 @@ fn judge_stopped_candidate(
     }
     candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return match facts.recovery {
             RecoveryOutcome::Lost | RecoveryOutcome::NeedsRegistry => {
                 recovery_loss(facts, candidate, judging)
@@ -1133,20 +1133,18 @@ const STORE_SCHEMA_V034: u32 = 5;
 fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return None;
     }
     // judge_pin and judge_launch refuse a definition, profile or base
     // environment that does not resolve before this check is reached, so the
     // lookups below succeed for every session that gets here.
-    let fork = !capabilities.resume;
     let definition = recovery_definition(judging.profiles, binding).ok()?;
     let profile = recovery_profile_in(
         judging.profiles,
         binding,
         Some(&definition),
         ProfileChange::Refuse,
-        fork,
     )
     .ok()?;
     let base = judging.base_env.as_ref().ok()?;
@@ -2099,57 +2097,47 @@ fn recovery_loss(
 /// environment that profile gives the agent; a runtime without one is only
 /// checked for an executable.
 ///
-/// Only a session that resumes or forks reaches it. A profile refusal carries
+/// Only a session that resumes reaches it. A profile refusal carries
 /// resume's own code, and so does a probe refusal, so the verdict names the
 /// refusal resume would return.
 fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return None;
     }
     let definition = recovery_definition(judging.profiles, binding);
-    let mut profile_env = None;
-    for (fork, required) in [(false, capabilities.resume), (true, capabilities.fork)] {
-        if !required {
-            continue;
+    let profile_env = match recovery_profile_in(
+        judging.profiles,
+        binding,
+        definition.as_ref().ok(),
+        ProfileChange::Refuse,
+    ) {
+        Ok(profile) => profile.env,
+        Err(error) if error.code == protocol::SECRET_ENV_MISSING_CODE => {
+            // The profile's secret slots refuse every relaunch on the running
+            // release too, so the upgrade loses no recovery.
+            return Some((
+                Verdict::AlreadyNotResumable,
+                error.code.clone(),
+                "resume refuses the session's host profile because it declares secret \
+                 variables a relaunch cannot fill, on the running release too"
+                    .to_owned(),
+            ));
         }
-        match recovery_profile_in(
-            judging.profiles,
-            binding,
-            definition.as_ref().ok(),
-            ProfileChange::Refuse,
-            fork,
-        ) {
-            Ok(profile) => {
-                profile_env.get_or_insert(profile.env);
-            }
-            Err(error) if error.code == protocol::SECRET_ENV_MISSING_CODE => {
-                // The profile's secret slots refuse every relaunch on the running
-                // release too, so the upgrade loses no recovery.
-                return Some((
-                    Verdict::AlreadyNotResumable,
-                    error.code.clone(),
-                    "resume refuses the session's host profile because it declares secret \
-                     variables a relaunch cannot fill, on the running release too"
-                        .to_owned(),
-                ));
-            }
-            Err(error) => {
-                return Some((
-                    Verdict::WouldLoseRecovery,
-                    error.code.clone(),
-                    format!(
-                        "resume refuses the session's host profile ({}: {}), so the session \
-                         cannot resume natively; restore the profile it was launched from, or \
-                         upgrade with --accept-runtime-loss",
-                        error.code, error.msg
-                    ),
-                ));
-            }
+        Err(error) => {
+            return Some((
+                Verdict::WouldLoseRecovery,
+                error.code.clone(),
+                format!(
+                    "resume refuses the session's host profile ({}: {}), so the session \
+                     cannot resume natively; restore the profile it was launched from, or \
+                     upgrade with --accept-runtime-loss",
+                    error.code, error.msg
+                ),
+            ));
         }
-    }
-    let profile_env = profile_env.unwrap_or_default();
+    };
     let definition = definition.ok()?;
     // Resume builds the base environment for every relaunch and validates the
     // frozen executable for every relaunch; only a declared version probe reads
@@ -2268,15 +2256,11 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
 fn judge_pin(candidate: &SessionRecord, profiles: &ProfileRegistry) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return None;
     }
-    let error = match recovery_definition(profiles, binding) {
-        Err(error) => error,
-        Ok(definition) if capabilities.fork => {
-            recovery_contract(binding, &definition, true).err()?
-        }
-        Ok(_) => return None,
+    let Err(error) = recovery_definition(profiles, binding) else {
+        return None;
     };
     let runtime = binding.agent_base.as_wire();
     Some((

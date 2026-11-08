@@ -1260,6 +1260,15 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
         // The placement feature exists only in the package descriptor.
         table.remove("requires");
         table.remove("placement");
+        // The frozen built-in descriptor declares fork data the package
+        // does not carry.
+        table.remove("fork");
+        if let Some(reference) = table
+            .get_mut("native_reference")
+            .and_then(toml::Value::as_table_mut)
+        {
+            reference.remove("assign_fork");
+        }
         table
     };
     let golden_descriptor: toml::Table = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR)

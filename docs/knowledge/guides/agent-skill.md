@@ -326,7 +326,7 @@ files are never listed even though removing the worktree deletes them too.
 
 ## Destructive operations
 
-`session stop`, `session rm`, and `session fork` change or destroy session
+`session stop` and `session rm` change or destroy session
 state. Use them only on explicit user intent, and confirm the exact target with
 `session inspect` immediately before acting:
 
@@ -334,10 +334,9 @@ state. Use them only on explicit user intent, and confirm the exact target with
 pohunek session stop <target> --json
 pohunek session diff <target> --json
 pohunek session rm <target> --json
-pohunek session fork <target> --name <fork-name> --json
 ```
 
-`session stop`, `session rm` and `session fork` can take longer than 5 seconds; they
+`session stop` and `session rm` can take longer than 5 seconds; they
 print a waiting notice on stderr (never with `--json`) and return the daemon's
 result.
 

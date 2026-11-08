@@ -34,28 +34,10 @@ const JSON_EXCEPTION_MARKER: &str = "The commands without `--json` are";
 
 /// Command paths that exist in the clap tree and are intentionally absent from
 /// [`CLI_REFERENCE`]. Each entry needs a reason.
-const UNDOCUMENTED_LEAVES: [(&str, &str); 2] = [
-    (
-        "workflow __exec",
-        "hidden: the service manager unit entry point of a plugin job",
-    ),
-    (
-        "workflow __dispatch",
-        "hidden: the service manager unit entry point of the reaction dispatcher",
-    ),
-];
+const UNDOCUMENTED_LEAVES: [(&str, &str); 0] = [];
 
 /// Leaves that accept no `--json` for a reason the reference does not list.
-const JSON_EXEMPT_LEAVES: [(&str, &str); 2] = [
-    (
-        "workflow __exec",
-        "hidden: the service manager unit entry point of a plugin job",
-    ),
-    (
-        "workflow __dispatch",
-        "hidden: the service manager unit entry point of the reaction dispatcher",
-    ),
-];
+const JSON_EXEMPT_LEAVES: [(&str, &str); 0] = [];
 
 /// Lines at the top of a page searched for a `Status:` marker.
 const STATUS_SCAN_LINES: usize = 30;

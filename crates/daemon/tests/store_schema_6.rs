@@ -8,11 +8,11 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 /// A schema-5 resume binding of a Pi package session: its frozen spec assigns
-/// the launch reference and declares no fork assignment.
+/// the launch reference.
 const SCHEMA_5: &str = include_str!("../src/store/fixtures/schema-5/metadata.jsonl");
 
 #[test]
-fn a_schema_5_assigned_binding_migrates_and_still_forks_without_a_reference_of_its_own() {
+fn a_schema_5_assigned_binding_migrates_and_still_resumes_with_its_assigned_launch() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
     let path = root.path().join("metadata.jsonl");
     std::fs::OpenOptions::new()
@@ -37,10 +37,8 @@ fn a_schema_5_assigned_binding_migrates_and_still_forks_without_a_reference_of_i
     let line: serde_json::Value = serde_json::from_str(stored.trim()).expect("stored JSON");
     assert_eq!(line["schema_version"], STORE_SCHEMA_VERSION);
     assert!(
-        line["native_launch"]["assigned"]
-            .get("assign_fork")
-            .is_none(),
-        "the migration grants no fork assignment"
+        line["native_launch"]["assigned"].is_object(),
+        "the migrated launch keeps its assigned reference"
     );
 
     let bindings = store.load_resume().expect("load migrated binding");
@@ -49,10 +47,13 @@ fn a_schema_5_assigned_binding_migrates_and_still_forks_without_a_reference_of_i
         .native_launch
         .as_ref()
         .expect("frozen native launch");
-    let assigned = launch.assigned().expect("the launch reference is assigned");
-    assert!(!assigned.assigns_fork());
+    assert!(
+        launch.assigned().is_some(),
+        "the launch reference is assigned"
+    );
     let source = SessionRef::id("0197aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee").expect("reference");
-    let fork = launch.fork_argv(&source).expect("the session still forks");
-    assert_eq!(fork.argv, ["--fork", source.value()]);
-    assert_eq!(fork.reference, None, "its fork holds no assigned reference");
+    let resume = launch
+        .resume_argv(&source)
+        .expect("the session still resumes");
+    assert_eq!(resume, ["--session", source.value()]);
 }

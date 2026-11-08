@@ -922,7 +922,7 @@ fn an_unreadable_store_line_that_may_pin_widens_the_set_the_plan_judges() {
         assert!(
             report.refusals[0]
                 .detail
-                .contains("pohunek store rejected list"),
+                .contains("runtime-package-recovery.md"),
             "the refusal names the command: {}",
             report.refusals[0].detail
         );

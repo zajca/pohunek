@@ -594,7 +594,7 @@ fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_run
     );
     render_sessions(
         text,
-        ("stopped", "with native resume or fork"),
+        ("stopped", "with native resume"),
         &preflight.stopped_sessions,
         accepted_runtime_loss,
     );
@@ -1700,7 +1700,7 @@ mod tests {
         assert!(text.contains("catalog  current\n"), "{text}");
         assert!(text.contains("sessions   1 live, 1 adoptable\n"), "{text}");
         assert!(
-            text.contains("stopped    2 with native resume or fork, 0 adoptable, 2 at risk\n"),
+            text.contains("stopped    2 with native resume, 0 adoptable, 2 at risk\n"),
             "{text}"
         );
         assert!(
@@ -1750,7 +1750,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "stopped    3 with native resume or fork, 1 adoptable, 1 at risk, 1 already not resumable before the upgrade\n"
+                "stopped    3 with native resume, 1 adoptable, 1 at risk, 1 already not resumable before the upgrade\n"
             ),
             "{text}"
         );

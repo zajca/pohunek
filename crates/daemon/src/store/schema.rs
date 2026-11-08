@@ -35,7 +35,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 16;
+pub const STORE_SCHEMA_VERSION: u32 = 17;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -113,6 +113,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 15,
         apply: migrate_v15_to_v16,
+    },
+    Migration {
+        from: 16,
+        apply: migrate_v16_to_v17,
     },
 ];
 
@@ -234,6 +238,14 @@ fn migrate_v14_to_v15(_record: &mut Map<String, Value>) {}
 /// session's current directory, which may have moved. Such a session resumes
 /// and forks without the trusted arguments.
 fn migrate_v15_to_v16(_record: &mut Map<String, Value>) {}
+
+/// Schema 16 to 17: a native launch spec records no fork arguments
+/// (`fork_args`) and an assigned reference no fork assignment (`assign_fork`).
+///
+/// A record that still carries the keys is read with them ignored and written
+/// without them. A stored `info.capabilities.fork` loads as `false`. No record
+/// needs rewriting.
+fn migrate_v16_to_v17(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

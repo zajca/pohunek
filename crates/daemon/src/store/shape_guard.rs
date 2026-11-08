@@ -78,6 +78,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (14, include_str!("fixtures/shape/schema-14.txt")),
     (15, include_str!("fixtures/shape/schema-15.txt")),
     (16, include_str!("fixtures/shape/schema-16.txt")),
+    (17, include_str!("fixtures/shape/schema-17.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -109,11 +110,9 @@ fn resume_builtin_json() -> Value {
         "native_launch": {
             "reference_kind": "id",
             "resume_args": [{"literal": "--resume"}, "reference"],
-            "fork_args": [{"literal": "--fork"}, "reference"],
             "assigned": {
                 "launch_args": [{"literal": "--session-id"}, "reference"],
-                "existence": {"check": "none"},
-                "assign_fork": true
+                "existence": {"check": "none"}
             }
         },
         "launch_binding": {
@@ -743,7 +742,6 @@ fn persisted_enums() -> Vec<EnumEntry> {
     );
     for relative in [
         "native_launch.resume_args[]",
-        "native_launch.fork_args[]",
         "native_launch.assigned.launch_args[]",
     ] {
         add(under(RESUME_ROOTS, relative), native_arg_values());
@@ -792,7 +790,6 @@ const RESUME_FREE: &[&str] = &[
     "program",
     "args[]",
     "native_launch.resume_args[].literal",
-    "native_launch.fork_args[].literal",
     "native_launch.assigned.launch_args[].literal",
     "native_launch.assigned.existence.root_env",
     "native_launch.assigned.existence.root_home",

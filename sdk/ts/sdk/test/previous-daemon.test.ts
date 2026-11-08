@@ -523,7 +523,6 @@ describe("client against a daemon of the previous release", () => {
     const client = await connect(daemon);
     const methods = [
       "session.resume",
-      "session.fork",
       "session.stop",
       "session.remove",
       "session.remove_accepting_unconfirmed",

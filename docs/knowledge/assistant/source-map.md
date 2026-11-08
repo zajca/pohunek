@@ -56,7 +56,6 @@ Current CLI and command surface:
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/standalone_discovery.rs`
 - `crates/cli/tests/session_process_api.rs`
-- `crates/cli/tests/session_idle_stop.rs` — `session policy` idle-stop default against a real daemon.
 - `crates/cli/tests/session_wait_turn.rs` — `session wait` turn mode against a real daemon.
 
 Assistant launch and prompt rendering:
@@ -506,15 +505,14 @@ Daemon, sessions, integrations, and project state:
 - `crates/platform/src/process/`
 - `crates/platform/src/peer/`
 - `crates/platform/src/supervisor/mod.rs` — `Supervisor`, `DaemonSupervisor`,
-  `PluginUnits`, `JobDefinition`, `PluginUnitDefinition`, and the typed
+  `JobDefinition`, and the typed
   supervision errors.
 - `crates/platform/src/supervisor/namespace.rs` — installation namespace,
-  launchd labels, systemd unit names, and workflow plugin unit names.
+  launchd labels and systemd unit names.
 - `crates/platform/src/supervisor/launchd/` — launchd backend (`/bin/launchctl`
-  status table, plist rendering, worker and daemon agents, and workflow plugin
-  unit LaunchAgents).
+  status table, plist rendering, worker and daemon agents).
 - `crates/platform/src/supervisor/systemd.rs` — systemd transient-unit backend,
-  the daemon unit/slice installer, and the workflow plugin unit installer.
+  and the daemon unit/slice installer.
 - `crates/platform/src/shell_env/` — executable search-path policy: bounded
   login-shell discovery, path validation, and executable resolution (see
   `docs/knowledge/guides/environment-resolution.md`).
@@ -572,9 +570,6 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/api/handler/session.rs`
 - `crates/daemon/src/session/mod.rs`
 - `crates/daemon/src/session/observation.rs`
-- `crates/daemon/src/session/idle_stop.rs` — idle stop of sessions opted in with
-  `pohunek.idle_stop_after_secs`: the host default record, the deadline task and
-  the guarded stop.
 - `crates/daemon/src/session/turn_wait.rs` — `session.wait_turn`: edge-triggered
   selection, `targets_ended`, `cursor_reset`, per-target progress.
 - `crates/daemon/src/session/turn_events.rs` — the in-memory turn-event journal,
@@ -589,7 +584,7 @@ Daemon, sessions, integrations, and project state:
   worker socket.
 - `crates/daemon/src/session/native_repair.rs`
 - `crates/daemon/src/session/target.rs`
-- `crates/daemon/src/session/resume.rs` — resume and fork, the frozen profile revision check and the `ProfileChange` decision.
+- `crates/daemon/src/session/resume.rs` — resume, the frozen profile revision check and the `ProfileChange` decision.
 - `crates/daemon/src/session/procwatch.rs`
 - `crates/daemon/src/runtime/`
 - `crates/daemon/src/runtime/lifecycle.rs` — worker generation lifecycle
@@ -684,24 +679,6 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
-- `crates/cli/src/commands/workflow.rs` — `pohunek workflow list|inspect|install|enable|disable|uninstall|run` and the hidden `__exec`, the consent review, the `--json` payloads and the `run` exit statuses.
-- `crates/cli/src/workflow/mod.rs` — workflow error codes, classes and recovery hints.
-- `crates/cli/src/workflow/manifest.rs` — the strict `workflow.toml` schema, size cap and argv rules.
-- `crates/cli/src/workflow/store.rs` — the workflow registry root, per-plugin state and config directories, install, uninstall and purge, and the per-plugin unit records of jobs and services.
-- `crates/cli/src/workflow/runner.rs` — `workflow run`: refusals, the child's argv, cwd and exact environment, the context JSON, deadline, output caps, signal handling, outcome precedence, and the `--json` stdout capture and its single-document check.
-- `crates/cli/src/workflow/config.rs` — the owner knobs `<config>/pohunek/workflow.toml`: tables, defaults, ranges and the file safety rule.
-- `crates/cli/src/workflow/runlog.rs` — the per-plugin `logs/runs.jsonl` record and its outcomes.
-- `crates/cli/src/workflow/status.rs` — `workflow status`: native state, last run, consecutive failures and service backoff of each recorded unit.
-- `crates/cli/src/workflow/units.rs` — job and service units: the service installation they need, their definitions, and enable, disable and uninstall against the user service manager.
-- `crates/cli/src/workflow/supervised.rs` — the `__exec` trampoline every unit runs: refusals, the run lock, the wall-clock job schedule, the service backoff and stop handling.
-- `crates/cli/src/workflow/dispatch.rs` — the event reaction dispatcher (`__dispatch`): the daemon `subscribe` stream with backoff reconnects, per-plugin bounded queues with `dropped` accounting, one worker per plugin and the stop handling.
-- `crates/paths/src/lib.rs` — `WORKFLOW_PLUGINS_SUBDIR`, `WORKFLOW_PLUGIN_STATE_SUBDIR` and `WORKFLOW_PLUGIN_CONFIG_SUBDIR`.
-- `crates/cli/tests/workflow_store.rs` — consent, digest, hostile-manifest, tampered-root, local-only and lifecycle scenarios through the real binary.
-- `crates/cli/tests/workflow_run.rs` — `workflow run` scenarios through the real binary: exact environment and origin pair (with a real `pohunekd` session), refusals, deadline, output cap, interruption, slow output consumer, redaction, context and owner knobs.
-- `crates/cli/tests/workflow_reactions.rs` — event reactions against the real systemd user manager and a real `pohunekd`: the context and origin-free environment, queue drops with delivery after overflow, an oversized event's omission, a wedged reaction that delays neither session commands nor a daemon restart, and the dispatcher unit following the reacting plugins.
-- `crates/cli/tests/workflow_run_json.rs` — `workflow run --json` and verbatim-argument scenarios through the real binary: byte-exact `ok`, invalid, failed, cut and capped output as single error envelopes, refusals as envelopes, and every argument after the action reaching it unchanged.
-- `crates/cli/tests/support/workflow_scenarios.rs` — job and service scenarios against the real service manager (`workflow_systemd.rs`, `workflow_launchd.rs`): enable and disable, overlap, timeout, service backoff, failure isolation, stale units, the supervised environment and clean stops.
-- `docs/knowledge/guides/workflow-plugins.md`
 - `docs/knowledge/guides/plugin-repositories.md` — the rule that new plugins live in their own repositories, naming, required CI, index admission and the release snapshot; the guard is `check_plugin_directories` in `crates/xtask/src/doc_drift.rs`.
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.
 - `docs/architecture.md` — "Runtime Packages and Trust": the package classes and the same-UID owner trust boundary.
@@ -710,7 +687,7 @@ Runtime package archive format:
 - `docs/knowledge/guides/claude-package.md`
 - `docs/knowledge/guides/hermes-package.md`
 - `runtime-packages/README.md` — layout convention of the official package sources.
-- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference for launches and forks, existence check with the session-dir variable and the refused flag and settings, version probe).
+- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference for launches, existence check with the session-dir variable and the refused flag and settings, version probe).
 - `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
 - `compat/pi/compatibility-lock.json` — pinned Pi release, supported range and Node requirement.
 - `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies; `overlays/` holds the dialog, login and selector screens.
@@ -723,7 +700,7 @@ Runtime package archive format:
 - `compat/codex/builtin-v0.34/` — golden copies of the built-in Codex descriptor and detection manifest of release 0.34.2.
 - `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `codex`, its integration and an unpinned `base = "codex"` profile refused with the install hint until the package is installed), and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
-- `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume and fork argv, `semver-line-v1` version probe).
+- `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume argv, `semver-line-v1` version probe).
 - `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the v0.34.2 built-in one plus the #613 rules (running-turn title and footer, wrapped selection forms, first-run and trust dialogs, the `done <time>` completed-turn line, the npm `claude.exe` process); the daemon compiles no Claude in, so this package is the only source of `claude`.
 - `compat/claude/compatibility-lock.json` — pinned Claude Code release, native binary SHA-256 and supported range.
 - `compat/claude/screens/` — screens and terminal titles captured from a real Claude Code that the manifest test classifies.
@@ -823,7 +800,7 @@ Hermes operator plugin and managed lifecycle:
 - `crates/cli/src/hermes_integration/policy.rs`
 - `crates/cli/src/hermes_integration/lifecycle.rs`
 - `crates/cli/src/hermes_integration/runner.rs`
-- `crates/cli/src/process/bounded.rs` — the bounded child lifecycle the Hermes runner and `workflow run` spawn through: own process group, inherited descriptors closed, deadline kill (with a `SIGTERM` grace for workflow runs), and capped output, buffered or streamed to a sink.
+- `crates/cli/src/process/bounded.rs` — the bounded child lifecycle the Hermes runner spawns through: own process group, inherited descriptors closed, deadline kill, and capped output, buffered or streamed to a sink.
 - `crates/cli/src/hermes_integration/assets.rs`
 - `crates/cli/src/hermes_integration/doctor.rs`
 - `crates/cli/src/hermes_integration/skill.rs`
@@ -860,8 +837,6 @@ Protocol contracts and transport:
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/decimal.rs`
 - `crates/protocol/src/limits.rs`
-- `crates/protocol/src/idle_stop.rs` — `session.idle_stop.get/set` types and the
-  `pohunek.idle_stop_after_secs` metadata value.
 - `crates/protocol/src/turn_wait.rs` — `session.wait_turn` params, result,
   cursor, and progress wire types.
 - `crates/protocol/src/lib.rs`

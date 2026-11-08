@@ -237,10 +237,6 @@ fn session_turn_progress_bases() -> Vec<Value> {
     vec![turn_progress_document()]
 }
 
-fn session_policy_result_bases() -> Vec<Value> {
-    vec![json!({"retention": protocol::SessionRetentionPolicy::default()})]
-}
-
 fn notification_policy_document() -> Value {
     json!({
         "attention_dedupe_window_secs": 90,
@@ -399,13 +395,6 @@ const ROWS: &[Row] = &[
         WIRE_ONLY
     ),
     row!(
-        SessionPolicyResult,
-        Relax,
-        [],
-        Probe::Documents(session_policy_result_bases),
-        WIRE_ONLY
-    ),
-    row!(
         NotificationPolicyResult,
         Relax,
         [],
@@ -525,7 +514,6 @@ const ROWS: &[Row] = &[
     ),
     // Strict: client params.
     row!(CommandRunParams, Strict, PARAMS_STRICT),
-    row!(SessionIdleStopParams, Strict, PARAMS_STRICT),
     row!(IntegrationInstallParams, Strict, PARAMS_STRICT),
     row!(IntegrationStatusParams, Strict, PARAMS_STRICT),
     row!(IntegrationUninstallParams, Strict, PARAMS_STRICT),
@@ -576,8 +564,6 @@ const ROWS: &[Row] = &[
         Probe::Key(empty_document),
         PARAMS_STRICT
     ),
-    row!(SessionPolicyParams, Strict, PARAMS_STRICT),
-    row!(StoreRejectedSetAsideParams, Strict, PARAMS_STRICT),
     // Lenient: every other param, result and event type.
     row!(AgentStateEvent, Lenient, LENIENT_EVENT),
     row!(AssistantMaterializeParams, Lenient, LENIENT_PARAMS),
@@ -629,7 +615,6 @@ const ROWS: &[Row] = &[
     row!(ProjectShowParams, Lenient, LENIENT_PARAMS),
     row!(ProjectShowResult, Lenient, LENIENT_RESULT),
     row!(RuntimeInventoryEvent, Lenient, LENIENT_EVENT),
-    row!(RuntimeInventoryResult, Lenient, LENIENT_RESULT),
     row!(SessionAttachParams, Lenient, LENIENT_PARAMS),
     row!(SessionAttachResult, Lenient, LENIENT_RESULT),
     row!(SessionDetachParams, Lenient, LENIENT_PARAMS),
@@ -637,9 +622,6 @@ const ROWS: &[Row] = &[
     row!(SessionDiffParams, Lenient, LENIENT_PARAMS),
     row!(SessionDiffResult, Lenient, LENIENT_RESULT),
     row!(SessionEvent, Lenient, LENIENT_EVENT),
-    row!(SessionForkParams, Lenient, LENIENT_PARAMS),
-    row!(SessionForkResult, Lenient, LENIENT_RESULT),
-    row!(SessionIdleStopResult, Lenient, LENIENT_RESULT),
     row!(SessionInputParams, Lenient, LENIENT_PARAMS),
     row!(SessionInputResult, Lenient, LENIENT_RESULT),
     row!(SessionListParams, Lenient, LENIENT_PARAMS),
@@ -662,8 +644,6 @@ const ROWS: &[Row] = &[
     row!(SessionSetMetadataParams, Lenient, LENIENT_PARAMS),
     row!(SessionSetMetadataResult, Lenient, LENIENT_RESULT),
     row!(SessionStopResult, Lenient, LENIENT_RESULT),
-    row!(StoreRejectedListResult, Lenient, LENIENT_RESULT),
-    row!(StoreRejectedSetAsideResult, Lenient, LENIENT_RESULT),
     row!(SubagentStateEvent, Lenient, LENIENT_EVENT),
     row!(WorktreeRemoveParams, Lenient, LENIENT_PARAMS),
     row!(WorktreeRemoveResult, Lenient, LENIENT_RESULT),

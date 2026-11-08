@@ -64,7 +64,6 @@ import type {
   ProjectRenameParams,
   ProjectShowParams,
   ProjectShowResult,
-  RuntimeInventoryResult,
   SessionAttachParams,
   SessionAttachResult,
   SessionDetachParams,
@@ -73,11 +72,7 @@ import type {
   SessionDetectionResult,
   SessionDiffParams,
   SessionDiffResult,
-  SessionForkParams,
-  SessionForkResult,
   SessionId,
-  SessionIdleStopParams,
-  SessionIdleStopResult,
   SessionInfo,
   SessionInputParams,
   SessionInputResult,
@@ -86,8 +81,6 @@ import type {
   SessionNewResult,
   SessionOutputParams,
   SessionOutputResult,
-  SessionPolicyParams,
-  SessionPolicyResult,
   SessionReadParams,
   SessionReadResult,
   SessionReleaseAgentParams,
@@ -114,9 +107,6 @@ import type {
   SessionWaitResult,
   SessionWaitTurnParams,
   SessionWaitTurnResult,
-  StoreRejectedListResult,
-  StoreRejectedSetAsideParams,
-  StoreRejectedSetAsideResult,
   WorktreeRemoveParams,
   WorktreeRemoveResult,
 } from "./index";
@@ -162,16 +152,11 @@ export interface Methods {
   "session.detach": { params: SessionDetachParams; output: SessionDetachResult };
   "session.detection": { params: SessionDetectionParams; output: SessionDetectionResult };
   "session.diff": { params: SessionDiffParams; output: SessionDiffResult };
-  "session.fork": { params: SessionForkParams; output: SessionForkResult };
-  "session.idle_stop.get": { params: null; output: SessionIdleStopResult };
-  "session.idle_stop.set": { params: SessionIdleStopParams; output: SessionIdleStopResult };
   "session.input": { params: SessionInputParams; output: SessionInputResult };
   "session.inspect": { params: SessionId; output: SessionInfo };
   "session.list": { params: SessionListParams; output: SessionInfo[] };
   "session.new": { params: SessionNewParams; output: SessionNewResult };
   "session.output": { params: SessionOutputParams; output: SessionOutputResult };
-  "session.policy.get": { params: null; output: SessionPolicyResult };
-  "session.policy.set": { params: SessionPolicyParams; output: SessionPolicyResult };
   "session.read": { params: SessionReadParams; output: SessionReadResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
@@ -182,14 +167,11 @@ export interface Methods {
   "session.resize": { params: SessionResizeParams; output: SessionResizeResult };
   "session.resume": { params: SessionResumeParams; output: SessionResumeResult };
   "session.retention.sweep": { params: SessionRetentionParams; output: SessionRetentionResult };
-  "session.runtime_inventory": { params: null; output: RuntimeInventoryResult };
   "session.screen": { params: SessionScreenParams; output: SessionScreenResult };
   "session.set_metadata": { params: SessionSetMetadataParams; output: SessionSetMetadataResult };
   "session.stop": { params: SessionId; output: SessionStopResult };
   "session.wait": { params: SessionWaitParams; output: SessionWaitResult };
   "session.wait_turn": { params: SessionWaitTurnParams; output: SessionWaitTurnResult };
-  "store.rejected_list": { params: null; output: StoreRejectedListResult };
-  "store.rejected_set_aside": { params: StoreRejectedSetAsideParams; output: StoreRejectedSetAsideResult };
   "subscribe": { params: null; output: JsonValue };
   "worktree.remove": { params: WorktreeRemoveParams; output: WorktreeRemoveResult };
 }
@@ -236,16 +218,11 @@ export const METHOD_NAMES = [
   "session.detach",
   "session.detection",
   "session.diff",
-  "session.fork",
-  "session.idle_stop.get",
-  "session.idle_stop.set",
   "session.input",
   "session.inspect",
   "session.list",
   "session.new",
   "session.output",
-  "session.policy.get",
-  "session.policy.set",
   "session.read",
   "session.release_agent",
   "session.remove",
@@ -256,14 +233,11 @@ export const METHOD_NAMES = [
   "session.resize",
   "session.resume",
   "session.retention.sweep",
-  "session.runtime_inventory",
   "session.screen",
   "session.set_metadata",
   "session.stop",
   "session.wait",
   "session.wait_turn",
-  "store.rejected_list",
-  "store.rejected_set_aside",
   "subscribe",
   "worktree.remove",
 ] as const satisfies readonly (keyof Methods)[];

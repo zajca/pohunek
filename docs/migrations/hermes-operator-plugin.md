@@ -26,7 +26,7 @@ from its compiled copy (`provenance` `source=embedded`).
    `local` for a canary.
 5. Run `pohunek integration doctor --agent hermes` for the same explicit target,
    then validate a managed Hermes session's native identity, screen, output,
-   wait, and native resume. Hermes native fork remains unsupported.
+   wait, and native resume.
 6. Expand to other profiles/hosts only after the canary succeeds. Remote
    execution remains direct over NetBird, never SSH; `full` and `*` remain
    explicit opt-ins.

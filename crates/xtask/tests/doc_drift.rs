@@ -179,7 +179,6 @@ fn examples_in_every_documented_form_are_accepted() {
         "`pohunek session new --name \"explain --removed behavior\"`",
         "`pohunek service status && pohunek health`",
         "`pohunek health --json | jq .`",
-        "`pohunek workflow run --json acme.work overview --since 1d`",
         "`pohunek session input s-01J -- --literal`",
         "`pohunek integration ... --agent hermes`",
         "`pohunek assistant diagnose this problem`",
@@ -231,7 +230,7 @@ fn each_drifted_example_fails_the_command_check() {
         ),
         (
             "a removed flag before passthrough arguments",
-            "`pohunek workflow run --removed acme.work overview`",
+            "`pohunek session input --removed s-01J hello`",
         ),
         (
             "a stale alternative",

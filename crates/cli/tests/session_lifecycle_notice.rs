@@ -1,5 +1,4 @@
-//! Binary-level scenario for the waiting notice of `session fork`, `stop` and
-//! `rm`.
+//! Binary-level scenario for the waiting notice of `session stop` and `rm`.
 //!
 //! The built CLI runs against a fixture daemon that holds the reply to the
 //! lifecycle request. A plain run prints a waiting notice to stderr once it has
@@ -42,26 +41,6 @@ fn scenarios() -> Vec<Scenario> {
             result: json!({"stopped": true}),
             notice: "waiting for the daemon to stop s-42",
             human_stdout: "session s-42: stopped=true",
-        },
-        Scenario {
-            arguments: &["session", "fork", "s-42"],
-            method: protocol::method::SESSION_FORK,
-            result: json!({
-                "id": "s-43",
-                "agent": "shell",
-                "agent_base": "shell",
-                "capabilities": {"fork": true, "resume": true},
-                "cwd": "/workspace/pohunek",
-                "pid": 42424,
-                "state": "running",
-                "state_source": "process",
-                "cols": 80,
-                "rows": 24,
-                "created_at": "2026-07-08T00:00:00Z",
-                "updated_at": "2026-07-08T00:01:00Z",
-            }),
-            notice: "waiting for the daemon to fork s-42",
-            human_stdout: "session s-43 forked",
         },
         Scenario {
             arguments: &["session", "rm", "s-42"],

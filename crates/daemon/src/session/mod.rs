@@ -17,13 +17,13 @@ use pohunek_worker_protocol::LaunchProcess;
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundStateEvent,
     CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
-    RuntimeInventoryEntry, RuntimeInventoryResult, RuntimeRef, RuntimeState, SessionAttachParams,
-    SessionEvent, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionNativeRecoveredEvent,
-    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
+    RuntimeInventoryEntry, RuntimeRef, RuntimeState, SessionAttachParams, SessionEvent, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -38,10 +38,9 @@ use ulid::Ulid;
 
 use crate::agent::host::{self, InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
-    agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
-    resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchEnv, LaunchOpts,
-    NativeReferenceProvenance, NativeSessionLaunch, ProfileRegistry, ResolvedAgent, SessionRef,
-    SessionRefKind, ValidatedLaunchProgram,
+    agent_not_resumable, build_pty_command, resume_pty_command_from_launch, InputRules,
+    LaunchCommand, LaunchEnv, LaunchOpts, NativeReferenceProvenance, NativeSessionLaunch,
+    ProfileRegistry, ResolvedAgent, SessionRef, SessionRefKind, ValidatedLaunchProgram,
 };
 use crate::catalog_anchor::CatalogTrust;
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
@@ -112,7 +111,6 @@ use forward::Forwarded;
 pub use native_attestation::ControlPeer;
 pub use reconcile::upgrade_preflight;
 pub(crate) use rejected_lines::RejectedLinesState;
-mod idle_stop;
 mod resume;
 mod retention;
 mod settle;
@@ -130,7 +128,6 @@ pub use crate::packages::ensure::{
 pub use crate::packages::HostTrustAnchor;
 pub use attach::{RedeemedAttach, RedeemedRuntime};
 pub use background::ShutdownReport;
-pub use idle_stop::{spawn_idle_stop, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
 pub use retention::{spawn_session_retention, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
@@ -533,16 +530,6 @@ pub struct SessionRegistryConfig {
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
     pub retention_policy_path: Option<PathBuf>,
-    /// Durable idle-stop default (`<data_dir>/session-idle-stop.json`). `None`
-    /// keeps the default in memory only.
-    pub idle_stop_policy_path: Option<PathBuf>,
-    /// Shortest idle time accepted for the idle-stop default and for a session's
-    /// own `pohunek.idle_stop_after_secs`. Defaults to
-    /// [`idle_stop::DEFAULT_IDLE_STOP_MIN_SECS`].
-    pub idle_stop_min_secs: u32,
-    /// How long the idle-stop task waits before it looks again at a session whose
-    /// stop was held back. Defaults to [`idle_stop::DEFAULT_IDLE_STOP_RECHECK`].
-    pub idle_stop_recheck: Duration,
     /// Directory containing bounded structured logs. When set, removing a
     /// stopped session also removes its owner-private worker log family.
     pub log_dir: Option<PathBuf>,
@@ -689,9 +676,6 @@ impl Default for SessionRegistryConfig {
             inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
             worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
             retention_policy_path: None,
-            idle_stop_policy_path: None,
-            idle_stop_min_secs: idle_stop::DEFAULT_IDLE_STOP_MIN_SECS,
-            idle_stop_recheck: idle_stop::DEFAULT_IDLE_STOP_RECHECK,
             log_dir: None,
             config_dir: None,
             agents_dir: None,
@@ -863,8 +847,6 @@ struct SessionRegistryInner {
     external: ExternalSessions,
     /// Automatic session retention policy and its sweep serialization point.
     retention: retention::RetentionState,
-    /// Host default of the idle stop and the wake-up of its task.
-    idle_stop: idle_stop::IdleStopState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
     /// Rendezvous the next waited input write meets at its send boundary.
@@ -881,11 +863,11 @@ struct SessionRegistryInner {
     /// Holds the next create once its target is bound, before its launch.
     #[cfg(test)]
     bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
-    /// Holds the next resume or fork once its profile is resolved and verified,
+    /// Holds the next resume once its profile is resolved and verified,
     /// before it launches.
     #[cfg(test)]
     recovery_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
-    /// Holds the next resume or fork once its recovery definition is resolved,
+    /// Holds the next resume once its recovery definition is resolved,
     /// before it plans the relaunch.
     #[cfg(test)]
     definition_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1108,17 +1090,6 @@ struct SessionEntry {
     /// outside every repository starts with. Held in memory only, so a session
     /// adopted after a daemon restart has none.
     reference_launch: Option<Box<CwdAssociation>>,
-    /// When `info.activity` last took its current value on the daemon clock.
-    ///
-    /// Memory only: an entry built by adoption starts the clock when it is
-    /// built, so a restart delays an idle stop and never advances it.
-    activity_since: Instant,
-    /// When live background work last ended, on the daemon clock.
-    ///
-    /// Memory only. The idle clock of [`idle_stop`] starts at the later of this
-    /// and [`Self::activity_since`], so a hold that ends without a new turn
-    /// still grants a full idle limit.
-    background_quiet_since: Option<Instant>,
     /// Daemon instance holding the create's undelivered initial input; the
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
@@ -1126,6 +1097,14 @@ struct SessionEntry {
     /// The idempotency key and fingerprint of the creating `session.new`,
     /// written to every record of the session and never reported to clients.
     create_request: Option<Box<CreateRequest>>,
+}
+
+/// Discovery inventory as the session tests read it.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RuntimeInventorySnapshot {
+    /// Authenticated endpoints and quarantined discovery failures.
+    pub(crate) entries: Vec<RuntimeInventoryEntry>,
 }
 
 /// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
@@ -1144,12 +1123,8 @@ impl SessionEntry {
         }
     }
 
-    /// Sets the activity and restarts [`Self::activity_since`] when the value
-    /// differs from the current one.
+    /// Sets the published activity.
     fn set_activity(&mut self, activity: AgentActivity) {
-        if self.info.activity != Some(activity) {
-            self.activity_since = crate::time::now();
-        }
         self.info.activity = Some(activity);
     }
 
@@ -1964,9 +1939,11 @@ impl SessionRegistry {
         markers.daemon_id.as_deref() == Some(origin_daemon_id) || markers.daemon_id.is_none()
     }
 
-    /// Returns the latest fail-closed durable-worker discovery inventory.
-    pub async fn runtime_inventory(&self) -> RuntimeInventoryResult {
-        RuntimeInventoryResult {
+    /// The latest fail-closed durable-worker discovery inventory, for tests
+    /// that assert what discovery quarantined.
+    #[cfg(test)]
+    pub(crate) async fn runtime_inventory(&self) -> RuntimeInventorySnapshot {
+        RuntimeInventorySnapshot {
             entries: self.inner.runtime_inventory.lock().await.clone(),
         }
     }
@@ -2582,7 +2559,6 @@ impl SessionRegistry {
             .with_revision_state_dir(config.host_state_dir.clone());
         let probe_cache = crate::capabilities::ProbeCache::new(config.inventory_probe);
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
-        let idle_stop = idle_stop::IdleStopState::new(config.idle_stop_policy_path.clone());
         let daemon_instance_id = generate_daemon_instance_id();
         let turns = TurnEvents::new(daemon_instance_id.clone(), config.turn_event_capacity);
         let packages = Arc::new(crate::packages::PackageAuthority::new(
@@ -2640,7 +2616,6 @@ impl SessionRegistry {
                 procwatch_seq: AtomicU64::new(current_time_millis()),
                 external: external.clone(),
                 retention,
-                idle_stop,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -3404,7 +3379,6 @@ impl SessionRegistry {
         // only in the launch carrier and never reach a record, hook or event.
         let secret_env = std::mem::take(&mut params.secret_env);
         validate_new_params(&params)?;
-        idle_stop::validate_opt_in(&params.metadata, self.inner.config.idle_stop_min_secs)?;
         let id = Self::allocate_session_id();
         // Claimed before agent resolution and the executable probe, so an exact
         // replay never fails because a profile changed or a binary went missing.
@@ -4267,7 +4241,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Parks a resume or fork after its recovery definition resolved, before
+    /// Parks a resume after its recovery definition resolved, before
     /// the relaunch is planned, when a test armed the hold.
     #[cfg(test)]
     async fn hold_definition(&self) {
@@ -4283,7 +4257,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Parks a resume or fork after its profile resolved when a test armed the
+    /// Parks a resume after its profile resolved when a test armed the
     /// hold.
     #[cfg(test)]
     async fn hold_recovery(&self, id: &SessionId) {
@@ -4670,7 +4644,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Record an agent's native session id for resume or fork recovery.
+    /// Record an agent's native session id for resume recovery.
     ///
     /// Called from the `session.report_native_id` handler when a `SessionStart`
     /// hook fires. Validates the native id, updates the in-memory session info
@@ -5104,7 +5078,6 @@ impl SessionRegistry {
             false,
         );
         entry.set_activity(activity);
-        self.wake_idle_stop();
         entry.info.state_source = StateSource::Report;
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
     }
@@ -6012,13 +5985,6 @@ impl SessionRegistry {
         merge: BTreeMap<String, Option<String>>,
     ) -> Result<SessionSetMetadataResult, ProtocolError> {
         self.ensure_not_external(id).await?;
-        // Only a value being set is checked, so a value an older daemon stored
-        // without validation never blocks an edit of another key.
-        let patch: BTreeMap<String, String> = merge
-            .iter()
-            .filter_map(|(key, value)| Some((key.clone(), value.clone()?)))
-            .collect();
-        idle_stop::validate_opt_in(&patch, self.inner.config.idle_stop_min_secs)?;
         // `persist_lock` is held from the merge through the store write to the
         // in-memory edit, and the sessions lock is held across them, so an
         // unconditional record writer cannot interleave and write the previous
@@ -6056,7 +6022,6 @@ impl SessionRegistry {
             self.persist_resume_binding(id).await;
         }
 
-        self.wake_idle_stop();
         self.emit(event::SESSION_UPDATED, &info);
         Ok(SessionSetMetadataResult { session: info })
     }
@@ -7487,7 +7452,6 @@ impl SessionRegistry {
         self.set_unpersisted(&id.0, None);
         self.inner.turns.observe_state(id, info.state);
         sessions.insert(id.clone(), candidate);
-        self.wake_idle_stop();
         RuntimeTransitionOutcome::Applied(Box::new(info))
     }
 
@@ -7535,7 +7499,6 @@ impl SessionRegistry {
             }
             sessions.insert(id.clone(), entry)
         };
-        self.wake_idle_stop();
         if let Some(replaced) = replaced {
             replaced.cancel_runtime_watchers();
         }
@@ -7707,7 +7670,6 @@ impl SessionRegistry {
                 // The process watch paused for the stop and waits for this
                 // wakeup; the permit is kept when it is mid-scan.
                 entry.procwatch_rescan.request();
-                self.wake_idle_stop();
             }
         }
     }
@@ -7770,7 +7732,6 @@ impl SessionRegistry {
             entry.stop_transaction_id = None;
             entry.desired_state = previous_desired_state;
             entry.procwatch_rescan.request();
-            self.wake_idle_stop();
         }
     }
 
@@ -8563,9 +8524,6 @@ fn create_intent_record(
         external: Some(false),
         capabilities: protocol::SessionCapabilities {
             resume: native.is_some(),
-            fork: native
-                .as_ref()
-                .is_some_and(NativeSessionLaunch::supports_fork),
             ..protocol::SessionCapabilities::default()
         },
         name: validate_session_name(params.name.as_deref())?,
@@ -9579,8 +9537,7 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
             "attach_snapshot_unsupported",
             unsupported.to_string(),
             Some(
-                "restart the session on the upgraded worker, or fork it into a new session"
-                    .to_owned(),
+                "restart the session on the upgraded worker, or start a new session".to_owned(),
             ),
         ),
         WorkerError::Rejected {

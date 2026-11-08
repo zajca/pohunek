@@ -92,7 +92,7 @@ TOOLS = [
     "pohunek_hosts", "pohunek_sessions", "pohunek_session_get",
     "pohunek_session_screen", "pohunek_session_output", "pohunek_session_wait",
     "pohunek_session_diff", "pohunek_session_start", "pohunek_session_send",
-    "pohunek_session_resume", "pohunek_session_fork", "pohunek_session_resize",
+    "pohunek_session_resume", "pohunek_session_resize",
     "pohunek_session_rename", "pohunek_session_set_metadata",
     "pohunek_session_stop", "pohunek_session_remove",
 ]
@@ -233,7 +233,7 @@ READ = (
 )
 MANAGE = (
     "pohunek_session_start", "pohunek_session_send", "pohunek_session_resume",
-    "pohunek_session_fork", "pohunek_session_resize", "pohunek_session_rename",
+    "pohunek_session_resize", "pohunek_session_rename",
     "pohunek_session_set_metadata",
 )
 FULL = ("pohunek_session_stop", "pohunek_session_remove")
@@ -1944,7 +1944,7 @@ mod tests {
             probe.failure_phase, probe.failure_errno
         );
         assert!(probe.tools_ok);
-        assert_eq!(probe.tool_count, 16);
+        assert_eq!(probe.tool_count, 15);
         assert!(probe.skill_ok);
         assert_eq!(probe.skill_count, 1);
         assert!(probe.hooks_ok);

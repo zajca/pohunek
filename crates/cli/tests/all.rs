@@ -108,8 +108,6 @@ mod session_background;
 mod session_background_work;
 #[path = "session_condition.rs"]
 mod session_condition;
-#[path = "session_idle_stop.rs"]
-mod session_idle_stop;
 #[path = "session_lifecycle_notice.rs"]
 mod session_lifecycle_notice;
 #[path = "session_metadata_filters.rs"]
@@ -134,17 +132,3 @@ mod setup_host;
 mod setup_host_native;
 #[path = "standalone_discovery.rs"]
 mod standalone_discovery;
-#[path = "store_cli.rs"]
-mod store_cli;
-#[path = "workflow_launchd.rs"]
-mod workflow_launchd;
-#[path = "workflow_reactions.rs"]
-mod workflow_reactions;
-#[path = "workflow_run.rs"]
-mod workflow_run;
-#[path = "workflow_run_json.rs"]
-mod workflow_run_json;
-#[path = "workflow_store.rs"]
-mod workflow_store;
-#[path = "workflow_systemd.rs"]
-mod workflow_systemd;

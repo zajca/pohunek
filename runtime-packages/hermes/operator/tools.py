@@ -29,11 +29,11 @@ _READ = (
 )
 _MANAGE = (
     "pohunek_session_start", "pohunek_session_send", "pohunek_session_resume",
-    "pohunek_session_fork", "pohunek_session_resize", "pohunek_session_rename",
+    "pohunek_session_resize", "pohunek_session_rename",
     "pohunek_session_set_metadata",
 )
 _FULL = ("pohunek_session_stop", "pohunek_session_remove")
-_ORIGIN_MUTATIONS = frozenset(("stop", "resume", "remove", "fork", "resize", "set_metadata", "rename", "input"))
+_ORIGIN_MUTATIONS = frozenset(("stop", "resume", "remove", "resize", "set_metadata", "rename", "input"))
 
 
 _STRING_SCHEMA = {"type": "string"}
@@ -61,7 +61,6 @@ TOOL_SCHEMAS = {
     "pohunek_session_start": _schema("Start a session with a host-inventory agent profile and structured project or worktree selection.", {"host": _STRING_SCHEMA, "agent_profile": _STRING_SCHEMA, "name": _STRING_SCHEMA, "project": {"oneOf": [{"type": "object", "properties": {"id": _STRING_SCHEMA}, "required": ["id"], "additionalProperties": False}, {"type": "object", "properties": {"label": _STRING_SCHEMA}, "required": ["label"], "additionalProperties": False}]}, "worktree": {"type": "object", "properties": {"project": {"oneOf": [{"type": "object", "properties": {"id": _STRING_SCHEMA}, "required": ["id"], "additionalProperties": False}, {"type": "object", "properties": {"label": _STRING_SCHEMA}, "required": ["label"], "additionalProperties": False}]}, "branch": _STRING_SCHEMA, "base_branch": _STRING_SCHEMA}, "required": ["project"], "additionalProperties": False}, "cols": _INTEGER_SCHEMA, "rows": _INTEGER_SCHEMA, "initial_input": _STRING_SCHEMA}, ["agent_profile"]),
     "pohunek_session_send": _schema("Send bounded terminal input through stdin.", {**_HOST_SESSION_PROPERTIES, "input": _STRING_SCHEMA}, ["session", "input"]),
     "pohunek_session_resume": _schema("Resume a session with a valid native reference.", _HOST_SESSION_PROPERTIES, ["session"]),
-    "pohunek_session_fork": _schema("Fork a session when its adapter supports native fork.", {**_HOST_SESSION_PROPERTIES, "name": _STRING_SCHEMA}, ["session"]),
     "pohunek_session_resize": _schema("Resize a managed terminal.", {**_HOST_SESSION_PROPERTIES, "cols": _INTEGER_SCHEMA, "rows": _INTEGER_SCHEMA}, ["session", "cols", "rows"]),
     "pohunek_session_rename": _schema("Set one logical session display name.", {**_HOST_SESSION_PROPERTIES, "name": _STRING_SCHEMA}, ["session", "name"]),
     "pohunek_session_set_metadata": _schema("Set or clear fixed public metadata fields.", {**_HOST_SESSION_PROPERTIES, "metadata": {"type": "object", "properties": {key: {"type": ["string", "null"]} for key in _METADATA_KEYS}, "additionalProperties": False}}, ["session", "metadata"]),
@@ -80,7 +79,7 @@ _METHOD_TO_TOOL = {
     "hosts": "pohunek_hosts", "sessions": "pohunek_sessions", "session_get": "pohunek_session_get",
     "screen": "pohunek_session_screen", "output": "pohunek_session_output", "wait": "pohunek_session_wait",
     "diff": "pohunek_session_diff", "start": "pohunek_session_start", "send": "pohunek_session_send",
-    "resume": "pohunek_session_resume", "fork": "pohunek_session_fork", "resize": "pohunek_session_resize",
+    "resume": "pohunek_session_resume", "resize": "pohunek_session_resize",
     "rename": "pohunek_session_rename", "set_metadata": "pohunek_session_set_metadata",
     "stop": "pohunek_session_stop", "remove": "pohunek_session_remove",
 }
@@ -117,7 +116,6 @@ class Tools:
                 "pohunek_session_start": self._handle(self.start),
                 "pohunek_session_send": self._handle(self.send),
                 "pohunek_session_resume": self._handle(self.resume),
-                "pohunek_session_fork": self._handle(self.fork),
                 "pohunek_session_resize": self._handle(self.resize),
                 "pohunek_session_rename": self._handle(self.rename),
                 "pohunek_session_set_metadata": self._handle(self.set_metadata),
@@ -295,18 +293,6 @@ class Tools:
     def resume(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._mutation_target(args, "resume")
         return self._runner.run(Invocation(("--host", host, "session", "resume", target, "--json")))
-
-    def fork(self, args: dict[str, Any], **kwargs: Any) -> Any:
-        host, target = self._mutation_target(args, "fork")
-        argv = ["--host", host, "session", "fork", target, "--json"]
-        if "name" in args:
-            argv.extend(("--name", _string(args["name"], "name", _MAX_NAME_CHARS)))
-        try:
-            return self._runner.run(Invocation(tuple(argv)))
-        except CliError as error:
-            if error.code == "agent_fork_unsupported":
-                return {"fork_supported": False, "error": {"code": error.code}}
-            raise
 
     def resize(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._mutation_target(args, "resize")

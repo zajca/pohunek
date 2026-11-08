@@ -58,8 +58,7 @@ For each host after that one-time transition:
    shows `pohunek.runtime.hermes` enabled and selected; see Preconditions),
    then launch one managed Hermes canary. Verify its reported native identity,
    continuation identity replacement after `pre_llm_call`, rendered screen,
-   incremental output, bounded wait, and native resume. Hermes fork must return
-   typed unsupported data rather than creating a child.
+   incremental output, bounded wait, and native resume.
 6. Add a named remote host only after verifying direct NetBird reachability.
    Use `full` only where stop/remove delegation is intended. A wildcard
    allowlist requires the explicit installer confirmation; it never triggers
@@ -78,7 +77,7 @@ destructive delegation explicit, and rely on the daemon for normal session and
 worktree preconditions.
 
 The plugin rejects the origin session for exactly `session.stop`,
-`session.resume`, `session.remove`, `session.fork`, `session.resize`,
+`session.resume`, `session.remove`, `session.resize`,
 `session.set_metadata`, `session.rename`, and `session.input` before it launches
 the CLI. The daemon repeats that authoritative denial and also denies `session.remove_accepting_unconfirmed`, which the plugin never offers. Only
 `session.report_agent`, `session.release_agent`, and

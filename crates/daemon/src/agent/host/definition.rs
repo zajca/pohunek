@@ -1,10 +1,10 @@
 //! Validated, immutable agent runtime definitions.
 //!
 //! A [`RuntimeDefinition`] is everything the daemon needs to launch, frame
-//! input for, resume, fork and observe one agent runtime, held as data. It is
+//! input for, resume and observe one agent runtime, held as data. It is
 //! built either from the `runtime.toml` shape ([`RuntimeDefinition::from_toml`])
 //! or from explicit [`DefinitionParts`], and both paths run the same
-//! validation. The `[resume]` and `[fork]` tables share the typed
+//! validation. The `[resume]` table shares the typed
 //! [`NativeSessionLaunch`] template rules with host profiles, so a reference
 //! slot is always one whole argv token.
 
@@ -118,7 +118,7 @@ pub enum DefinitionError {
     /// Runtime id, program kind and origin contradict each other.
     #[error("{0}")]
     Invariant(DefinitionInvariant),
-    /// A resume or fork template is invalid.
+    /// A resume template is invalid.
     #[error("{field}: {source}")]
     Native {
         /// Field that failed.
@@ -401,7 +401,7 @@ pub struct DefinitionParts {
     pub submit_delay_configurable: bool,
     /// Activity detection manifest.
     pub manifest: Arc<Manifest>,
-    /// Native resume and fork launch, or `None` for an explicitly
+    /// Native resume launch, or `None` for an explicitly
     /// non-resumable runtime.
     pub native: Option<NativeSessionLaunch>,
     /// Whether the initial prompt is passed as a trailing launch argument.
@@ -669,7 +669,7 @@ impl RuntimeDefinition {
     ///
     /// Returns a [`DefinitionError`] for a malformed or oversized document, an
     /// unsupported `schema` or `runtime_api`, an unknown field, an invalid
-    /// resume or fork template, a manifest the resolver rejects, or a
+    /// resume template, a manifest the resolver rejects, or a
     /// `[transcripts]` table with an unknown parser, an unsafe directory or
     /// no `[config_home]` next to it.
     pub fn from_toml(
@@ -858,7 +858,7 @@ impl RuntimeDefinition {
         &self.manifest
     }
 
-    /// Native resume and fork launch; `None` means explicitly non-resumable.
+    /// Native resume launch; `None` means explicitly non-resumable.
     #[must_use]
     pub fn native(&self) -> Option<&NativeSessionLaunch> {
         self.native.as_ref()
@@ -1175,7 +1175,7 @@ fn submit_delay_millis(delay: Duration) -> Result<u64, DefinitionError> {
     u64::try_from(delay.as_millis()).map_err(|_error| INVALID)
 }
 
-/// Bounds the token count and size of the resume, fork and assigned launch
+/// Bounds the token count and size of the resume and assigned launch
 /// templates, and checks that an assigned reference is an id.
 fn validate_native(native: &NativeSessionLaunch) -> Result<(), DefinitionError> {
     if native.assigned().is_some() && native.reference_kind() != SessionRefKind::Id {
@@ -1185,7 +1185,6 @@ fn validate_native(native: &NativeSessionLaunch) -> Result<(), DefinitionError> 
     }
     let templates = [
         ("resume.args", Some(native.resume_args())),
-        ("fork.args", native.fork_args()),
         (
             "native_reference.launch_args",
             native.assigned().map(AssignedReference::launch_args),
@@ -1222,7 +1221,7 @@ fn text_policy_name(policy: InputTextPolicy) -> &'static str {
 /// The structural launch fields a descriptor digest covers.
 ///
 /// The set is deliberately limited to what changes how a session launches,
-/// frames input, and resumes or forks. Display text, the detection manifest,
+/// frames input, and resumes. Display text, the detection manifest,
 /// the input readiness, the version-probe parser and the integration handler
 /// are excluded: they do not alter a launch, and the digest never claims to
 /// authenticate package contents.
@@ -1352,7 +1351,10 @@ struct RawDefinition {
     runtime: RawRuntime,
     input: RawInput,
     resume: RawResume,
-    fork: RawFork,
+    /// `[fork]` of a descriptor written by an earlier release; read, warned
+    /// about and dropped.
+    #[serde(default)]
+    fork: Option<serde::de::IgnoredAny>,
     native_reference: RawNativeReference,
     #[serde(default)]
     integration: Option<RawIntegration>,
@@ -1541,14 +1543,6 @@ struct RawResume {
     args: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawFork {
-    supported: bool,
-    #[serde(default)]
-    args: Option<Vec<String>>,
-}
-
 /// Strategy names accepted in `[native_reference]`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1565,10 +1559,10 @@ struct RawNativeReference {
     /// Argv that passes the generated reference at launch; `assigned` only.
     #[serde(default)]
     launch_args: Option<Vec<String>>,
-    /// Whether a fork also gets a generated reference, passed with
-    /// `launch_args` after the fork arguments; `assigned` only.
+    /// `assign_fork` of a descriptor written by an earlier release; read,
+    /// warned about and dropped.
     #[serde(default)]
-    assign_fork: Option<bool>,
+    assign_fork: Option<serde::de::IgnoredAny>,
     /// How recovery confirms the conversation exists; `assigned` always, or
     /// `hook` with an id-kind reference.
     #[serde(default)]
@@ -1647,7 +1641,7 @@ impl RawTranscripts {
 }
 
 impl RawDefinition {
-    /// Resolves `[resume]`, `[fork]` and `[native_reference]` into the native
+    /// Resolves `[resume]` and `[native_reference]` into the native
     /// launch spec plus the hook existence check, or `None` for a runtime that
     /// does not recover natively.
     ///
@@ -1657,17 +1651,16 @@ impl RawDefinition {
     fn native_and_existence(
         &self,
     ) -> Result<(Option<NativeSessionLaunch>, Option<ReferenceExistence>), DefinitionError> {
-        let native = self.resume_and_fork()?;
+        let native = self.resume_launch()?;
         self.apply_strategy(native)
     }
 
-    /// Applies the declared `[native_reference]` strategy to the resume and
-    /// fork launch the other tables describe.
+    /// Applies the declared `[native_reference]` strategy to the resume launch
+    /// the other table describes.
     ///
     /// `none` freezes recovery off, so it must sit next to `resume.supported =
     /// false`; `hook` and `assigned` both need a supported resume; only
-    /// `assigned` carries a launch template and `assign_fork` (which needs a
-    /// supported fork), and only `assigned`, or `hook` with an id-kind
+    /// `assigned` carries a launch template, and only `assigned`, or `hook` with an id-kind
     /// reference, carries an explicit existence check.
     fn apply_strategy(
         &self,
@@ -1679,11 +1672,6 @@ impl RawDefinition {
             if declaration.launch_args.is_some() {
                 return Err(invalid(NativeReferenceError::UnexpectedField {
                     field: "launch_args",
-                }));
-            }
-            if declaration.assign_fork.is_some() {
-                return Err(invalid(NativeReferenceError::UnexpectedField {
-                    field: "assign_fork",
                 }));
             }
             Ok(())
@@ -1740,43 +1728,32 @@ impl RawDefinition {
                 let existence = existence
                     .into_assigned()
                     .map_err(|source| invalid(NativeReferenceError::Existence(source)))?;
-                let mut assigned = AssignedReference::new(launch_args, existence);
-                if declaration.assign_fork == Some(true) {
-                    if !native.supports_fork() {
-                        return Err(invalid(NativeReferenceError::AssignForkRequiresFork));
-                    }
-                    assigned = assigned.with_fork_assignment();
-                }
-                let native = native
-                    .with_assigned(assigned)
-                    .map_err(|source| match source {
-                        NativeLaunchError::AssignedForkRequiresFork => {
-                            invalid(NativeReferenceError::AssignForkRequiresFork)
-                        }
-                        _ => invalid(NativeReferenceError::AssignedRequiresIdReference),
-                    })?;
+                let assigned = AssignedReference::new(launch_args, existence);
+                let native = native.with_assigned(assigned).map_err(|_source| {
+                    invalid(NativeReferenceError::AssignedRequiresIdReference)
+                })?;
                 Ok((Some(native), None))
             }
         }
     }
 
-    /// Resolves `[resume]` and `[fork]` into one native launch spec.
+    /// Resolves `[resume]` into the native launch spec.
     ///
-    /// A fork is expressible only alongside the resume that declares the
-    /// reference kind, and each `supported = false` table must be empty so a
-    /// leftover argv cannot be mistaken for an active one.
-    fn resume_and_fork(&self) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+    /// `supported = false` must leave the table empty so a leftover argv cannot
+    /// be mistaken for an active one. A `[fork]` table or `assign_fork` key of
+    /// an earlier release is ignored with a warning.
+    fn resume_launch(&self) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+        if self.fork.is_some() || self.native_reference.assign_fork.is_some() {
+            tracing::warn!(
+                runtime = %self.id,
+                "ignoring fork data in the runtime descriptor; session fork is not supported"
+            );
+        }
         if !self.resume.supported {
             if self.resume.reference_kind.is_some() || self.resume.args.is_some() {
                 return Err(DefinitionError::Field {
                     field: "resume",
                     reason: "supported = false cannot carry reference_kind or args",
-                });
-            }
-            if self.fork.supported || self.fork.args.is_some() {
-                return Err(DefinitionError::Field {
-                    field: "fork",
-                    reason: "a fork requires a supported resume",
                 });
             }
             return Ok(None);
@@ -1794,27 +1771,7 @@ impl RawDefinition {
                 reason: "is required when resume is supported",
             })
             .and_then(|tokens| template("resume.args", tokens))?;
-        let fork_args = match (self.fork.supported, self.fork.args.as_deref()) {
-            (true, Some(tokens)) => Some(template("fork.args", tokens)?),
-            (true, None) => {
-                return Err(DefinitionError::Field {
-                    field: "fork.args",
-                    reason: "is required when fork is supported",
-                })
-            }
-            (false, None) => None,
-            (false, Some(_)) => {
-                return Err(DefinitionError::Field {
-                    field: "fork",
-                    reason: "supported = false cannot carry args",
-                })
-            }
-        };
-        Ok(Some(NativeSessionLaunch::new(
-            reference_kind,
-            resume_args,
-            fork_args,
-        )))
+        Ok(Some(NativeSessionLaunch::new(reference_kind, resume_args)))
     }
 }
 

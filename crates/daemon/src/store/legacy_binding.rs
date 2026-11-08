@@ -3,7 +3,7 @@
 //! Two generations of bindings predate `native_launch`:
 //!
 //! - v0.33.0 froze the recovery as flat fields (`resume_mode`, `ref_kind`,
-//!   `resumable`, `fork_*`). They map one to one onto a launch spec, so the
+//!   `resumable`, `fork_*`). The resume fields map one to one onto a launch spec, so the
 //!   translation needs nothing but the record.
 //! - v0.33.1 dropped those fields without writing a `native_launch`, leaving a
 //!   binding with a native reference, a snapshot program and no launch spec.
@@ -40,16 +40,6 @@ const LEGACY_KEYS: [&str; 7] = [
     "forkable",
 ];
 
-/// The literal arguments v0.33.0 appended to the resume operation of a binding
-/// it forked natively.
-///
-/// A historical store-format fact: v0.33.0 knew one fork mode
-/// (`ForkMode::ClaudeSession`), which appended `CLAUDE_FORK_SESSION_ARG` in
-/// `crates/daemon/src/agent/mod.rs` at tag `v0.33.0`. It must never follow a
-/// current runtime descriptor, because a stored fork means what the release
-/// that wrote it launched.
-const V0_33_0_FORK_EXTENSION: [&str; 1] = ["--fork-session"];
-
 /// The runtimes compiled into v0.33.1 and the native launch each recovered
 /// with.
 ///
@@ -69,7 +59,6 @@ const V0_33_RUNTIMES: [FrozenRuntime; 4] = [
         launch: Some(FrozenLaunch {
             reference_kind: SessionRefKind::Id,
             resume: &["resume", REFERENCE_PLACEHOLDER],
-            fork: None,
         }),
     },
     FrozenRuntime {
@@ -77,7 +66,6 @@ const V0_33_RUNTIMES: [FrozenRuntime; 4] = [
         launch: Some(FrozenLaunch {
             reference_kind: SessionRefKind::Id,
             resume: &["--resume", REFERENCE_PLACEHOLDER],
-            fork: Some(&["--resume", REFERENCE_PLACEHOLDER, "--fork-session"]),
         }),
     },
     FrozenRuntime {
@@ -85,7 +73,6 @@ const V0_33_RUNTIMES: [FrozenRuntime; 4] = [
         launch: Some(FrozenLaunch {
             reference_kind: SessionRefKind::Id,
             resume: &["--resume", REFERENCE_PLACEHOLDER],
-            fork: None,
         }),
     },
 ];
@@ -102,7 +89,6 @@ struct FrozenRuntime {
 struct FrozenLaunch {
     reference_kind: SessionRefKind,
     resume: &'static [&'static str],
-    fork: Option<&'static [&'static str]>,
 }
 
 /// What the mapping did to one binding.
@@ -165,12 +151,11 @@ fn migrate_session(record: &mut Map<String, Value>) -> RecoveryOutcome {
     };
     let outcome = migrate_binding(recovery);
     let recovery_outcome = RecoveryOutcome::from(&outcome);
-    let Outcome::Mapped(launch) = outcome else {
+    let Outcome::Mapped(_) = outcome else {
         return recovery_outcome;
     };
     let capabilities = SessionCapabilities {
         resume: true,
-        fork: launch.supports_fork(),
         ..SessionCapabilities::default()
     };
     if let (Some(Value::Object(info)), Ok(capabilities)) =
@@ -229,7 +214,7 @@ enum Legacy {
 /// Translates the flat v0.33.0 fields with the rules that version applied when
 /// it relaunched: a binding with a snapshot program that was not `resumable`
 /// does not recover, otherwise the frozen mode and reference kind are the
-/// resume operation, and a fork needs its own complete, matching fields.
+/// resume operation; the fork fields are dropped.
 fn legacy_launch(binding: &Map<String, Value>) -> Legacy {
     let has_program = text(binding, "program").is_some_and(|program| !program.is_empty());
     if !flag(binding, "resumable") && has_program {
@@ -239,26 +224,9 @@ fn legacy_launch(binding: &Map<String, Value>) -> Legacy {
         let mode = ResumeMode::parse(text(binding, "resume_mode")?)?;
         let kind = reference_kind(text(binding, "ref_kind")?)?;
         let resume = mode.template().map(str::to_owned);
-        let fork = legacy_fork(binding, kind);
-        NativeSessionLaunch::from_templates(kind, &resume, fork.as_deref()).ok()
+        NativeSessionLaunch::from_templates(kind, &resume).ok()
     };
     spec().map_or(Legacy::Unmappable, Legacy::Spec)
-}
-
-/// The fork operation of the flat fields: the frozen resume mode followed by
-/// [`V0_33_0_FORK_EXTENSION`].
-fn legacy_fork(binding: &Map<String, Value>, kind: SessionRefKind) -> Option<Vec<String>> {
-    if !flag(binding, "forkable") || text(binding, "fork_mode").is_none() {
-        return None;
-    }
-    let mode = ResumeMode::parse(text(binding, "fork_resume_mode")?)?;
-    // A spec has one reference kind for both operations.
-    if reference_kind(text(binding, "fork_ref_kind")?)? != kind {
-        return None;
-    }
-    let mut fork = mode.template().map(str::to_owned).to_vec();
-    fork.extend(V0_33_0_FORK_EXTENSION.map(str::to_owned));
-    Some(fork)
 }
 
 /// How v0.33.0 shaped a resume argv.
@@ -347,7 +315,7 @@ fn v0_33_native_launch(id: &str) -> FrozenSpec {
     let Some(launch) = &runtime.launch else {
         return FrozenSpec::NoNativeRecovery;
     };
-    NativeSessionLaunch::from_templates(launch.reference_kind, launch.resume, launch.fork)
+    NativeSessionLaunch::from_templates(launch.reference_kind, launch.resume)
         .map_or(FrozenSpec::NotCompiledIn, FrozenSpec::Spec)
 }
 

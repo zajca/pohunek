@@ -15,11 +15,10 @@ use std::time::Duration;
 
 use pohunek_terminal::{step, Compositor, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 use protocol::{
-    event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
-    SessionInfo, SessionNewParams, SessionNewResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionResizeParams, SessionState, TerminalDimensions, ENV_DAEMON_ID,
-    ENV_SESSION_ID, ENV_WORKER_ID,
+    event, method, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    SessionDetachResult, SessionId, SessionInfo, SessionNewParams, SessionNewResult,
+    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionResizeParams,
+    SessionState, TerminalDimensions, ENV_DAEMON_ID, ENV_SESSION_ID, ENV_WORKER_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -342,7 +341,6 @@ enum MenuTaskAction {
     Kill,
     Remove,
     NewSession,
-    Fork,
     Rename,
 }
 
@@ -352,7 +350,6 @@ impl MenuTaskAction {
             Self::Kill => "kill",
             Self::Remove => "remove",
             Self::NewSession => "new_session",
-            Self::Fork => "fork",
             Self::Rename => "rename",
         }
     }
@@ -899,17 +896,6 @@ fn build_menu_rename_request(target: &Target, name: &str) -> Result<Request, Cli
             name: Some(name.to_owned()),
         },
     )
-}
-
-fn menu_fork_params(target: &Target, cols: u16, rows: u16) -> SessionForkParams {
-    SessionForkParams {
-        session_id: SessionId(target.session_id.clone()),
-        name: None,
-        cwd_mode: ForkCwdMode::Same,
-        cols,
-        rows,
-        accept_profile_change: false,
-    }
 }
 
 /// Builds the dialog header rows: session identity first, live state last.
@@ -2199,17 +2185,6 @@ fn handle_menu_effects(effects: Vec<MenuEffect>, ctx: MenuEffectContext<'_>) {
                     ));
                 }
             }
-            MenuEffect::RunFork => {
-                if let (None, Some(modal)) = (menu_task.as_ref(), modal) {
-                    let (rows, cols) = modal.compositor.grid_size();
-                    *menu_task = Some(spawn_menu_task(
-                        generation,
-                        MenuTaskAction::Fork,
-                        control,
-                        MenuTaskArgs::Fork { cols, rows },
-                    ));
-                }
-            }
             MenuEffect::RunRename(name) => {
                 if menu_task.is_none() {
                     *menu_task = Some(spawn_menu_task(
@@ -2324,15 +2299,6 @@ fn log_abandoned_menu_task_result(target: &Target, result: &MenuTaskResult) {
                 "abandoned attach menu task created a session"
             );
         }
-        Ok(MenuOutcome::Forked { id }) => {
-            tracing::info!(
-                session_id = %target.session_id,
-                action = result.action.as_str(),
-                generation = result.generation,
-                created_session_id = %id,
-                "abandoned attach menu task forked a session"
-            );
-        }
         Ok(MenuOutcome::Renamed { name }) => {
             tracing::info!(
                 session_id = %target.session_id,
@@ -2427,17 +2393,6 @@ async fn send_menu_rename(
     Ok(protocol::tolerant::from_value(value)?)
 }
 
-async fn send_menu_fork(
-    client: &mut Client,
-    target: &Target,
-    cols: u16,
-    rows: u16,
-) -> Result<SessionForkResult, CliError> {
-    client
-        .call::<method::SessionFork>(menu_fork_params(target, cols, rows))
-        .await
-}
-
 fn spawn_menu_task(
     generation: u64,
     action: MenuTaskAction,
@@ -2473,14 +2428,6 @@ fn spawn_menu_task(
                     id: created.session.id.0,
                 })
             }
-            MenuTaskArgs::Fork { cols, rows } => {
-                let forked = send_menu_fork(&mut client, &control.target, cols, rows)
-                    .await
-                    .map_err(|err| err.to_string())?;
-                Ok(MenuOutcome::Forked {
-                    id: forked.session.id.0,
-                })
-            }
             MenuTaskArgs::Rename { name } => {
                 let renamed = send_menu_rename(&mut client, &control.target, name)
                     .await
@@ -2503,7 +2450,6 @@ enum MenuTaskArgs {
     Kill,
     Remove,
     NewSession { cols: u16, rows: u16 },
-    Fork { cols: u16, rows: u16 },
     Rename { name: String },
 }
 
@@ -4308,7 +4254,7 @@ mod tests {
     #[tokio::test]
     async fn closed_menu_task_failure_keeps_modal_closed_and_clears_task() {
         let generation = FIRST_MENU_GENERATION;
-        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Fork));
+        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Rename));
         let mut menu_state = Some(MenuState::Closed);
         let mut modal = None;
         let mut terminal = None;
@@ -4318,8 +4264,8 @@ mod tests {
         let end = handle_menu_task_result(
             Some(MenuTaskResult {
                 generation,
-                action: MenuTaskAction::Fork,
-                outcome: Err("fork failed".to_owned()),
+                action: MenuTaskAction::Rename,
+                outcome: Err("rename failed".to_owned()),
             }),
             &target,
             &mut menu_task,
@@ -4405,7 +4351,7 @@ mod tests {
     #[tokio::test]
     async fn menu_task_result_surfaces_when_modal_is_open_but_not_busy() {
         let generation = FIRST_MENU_GENERATION;
-        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Fork));
+        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Rename));
         let mut menu_state = Some(MenuState::open_root());
         let mut modal = None;
         let mut terminal = None;
@@ -4415,9 +4361,9 @@ mod tests {
         let end = handle_menu_task_result(
             Some(MenuTaskResult {
                 generation,
-                action: MenuTaskAction::Fork,
-                outcome: Ok(MenuOutcome::Forked {
-                    id: "s-forked".to_owned(),
+                action: MenuTaskAction::Rename,
+                outcome: Ok(MenuOutcome::Renamed {
+                    name: Some("renamed".to_owned()),
                 }),
             }),
             &target,
@@ -4434,7 +4380,7 @@ mod tests {
         assert_eq!(
             menu_state,
             Some(MenuState::Result {
-                message: "Forked session created: s-forked".to_owned()
+                message: "Session renamed: renamed".to_owned()
             })
         );
         assert!(
@@ -4476,28 +4422,14 @@ mod tests {
         );
     }
 
-    /// Daemon-side duration of a menu fork, stop or remove, above the 5 s
-    /// default response timeout of a shared connection.
+    /// Daemon-side duration of a menu stop or remove, above the 5 s default
+    /// response timeout of a shared connection.
     const SLOW_MENU_ACTION: Duration = Duration::from_secs(6);
 
     #[tokio::test(start_paused = true)]
-    async fn menu_fork_stop_and_remove_wait_on_a_dedicated_budget() {
+    async fn menu_stop_and_remove_wait_on_a_dedicated_budget() {
         use pohunek_test_support::time::AutoAdvanceInhibitor;
 
-        let session_info = json!({
-            "id": "s-forked",
-            "agent": "codex",
-            "agent_base": "codex",
-            "capabilities": {"fork": true, "resume": true},
-            "cwd": "/workspace/pohunek",
-            "pid": 42424,
-            "state": "running",
-            "state_source": "process",
-            "cols": 100,
-            "rows": 30,
-            "created_at": "2026-07-08T00:00:00Z",
-            "updated_at": "2026-07-08T00:01:00Z",
-        });
         let removed = json!({
             "removed": true,
             "stopped": true,
@@ -4505,18 +4437,6 @@ mod tests {
             "worktrees_failed": 2
         });
         let cases = [
-            (
-                MenuTaskAction::Fork,
-                MenuTaskArgs::Fork {
-                    cols: 100,
-                    rows: 30,
-                },
-                method::SESSION_FORK,
-                session_info,
-                MenuOutcome::Forked {
-                    id: "s-forked".to_owned(),
-                },
-            ),
             (
                 MenuTaskAction::Kill,
                 MenuTaskArgs::Kill,
@@ -4555,23 +4475,6 @@ mod tests {
             assert_eq!(outcome, Ok(expected_outcome), "{expected_method}");
         }
         inhibitor.release().await;
-    }
-
-    #[test]
-    fn menu_fork_params_send_session_id_size_and_same_cwd_mode() {
-        let target: Target = "host-a/s-42".parse().expect("target");
-
-        let params = menu_fork_params(&target, 100, 30);
-
-        assert_eq!(
-            serde_json::to_value(&params).expect("serialize params"),
-            json!({
-                "session_id": "s-42",
-                "cwd_mode": "same",
-                "cols": 100,
-                "rows": 30
-            })
-        );
     }
 
     #[tokio::test]

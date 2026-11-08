@@ -290,7 +290,6 @@ def assert_origin_denials(plugin: Any, policy: Any, session_id: str) -> None:
     calls = {
         "pohunek_session_send": {"session": session_id, "input": "x"},
         "pohunek_session_resume": {"session": session_id},
-        "pohunek_session_fork": {"session": session_id},
         "pohunek_session_resize": {"session": session_id, "cols": 80, "rows": 24},
         "pohunek_session_rename": {"session": session_id, "name": "blocked"},
         "pohunek_session_set_metadata": {"session": session_id, "metadata": {"label": "blocked"}},
@@ -556,9 +555,6 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "runtime_generation": hermes_generation, "max_bytes": 4096,
     })
     old_cursor = require_output_shape(hermes_output, hermes_id, hermes_runtime, hermes_generation)
-    forked = invoke(handlers, "pohunek_session_fork", {"session": hermes_id})
-    if forked != {"fork_supported": False, "error": {"code": "agent_fork_unsupported"}}:
-        raise FixtureError("Hermes fork was not returned as structured unsupported data")
     invoke(handlers, "pohunek_session_send", {
         "session": hermes_id, "input": _HERMES_EXIT_INPUT,
     })
@@ -588,10 +584,9 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "ok": True,
         "logical_id_present": True,
         "worker_instance_id_present": True,
-        "tools_exercised": 16,
-        "origin_denials": 8,
+        "tools_exercised": 15,
+        "origin_denials": 7,
         "hermes_resume": True,
-        "hermes_fork_unsupported": True,
         "output_gap_recovered": True,
         "remote_loopback": True,
     }

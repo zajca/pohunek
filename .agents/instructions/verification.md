@@ -75,9 +75,7 @@ The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/cli/tests/setup_host_native.rs`,
 `crates/cli/tests/setup_host.rs`,
 `crates/daemon/tests/supervised_lifecycle.rs`,
-`crates/cli/tests/service_upgrade.rs`,
-`crates/cli/tests/workflow_systemd.rs`,
-`crates/cli/tests/workflow_reactions.rs`) have their real-systemd scenarios
+`crates/cli/tests/service_upgrade.rs`) have their real-systemd scenarios
 `#[ignore]`d on Linux, and those need
 `POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
 `real systemd supervision` runs all nine with `--ignored --test-threads 1`

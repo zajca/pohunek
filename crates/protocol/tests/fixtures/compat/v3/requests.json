@@ -56,10 +56,6 @@
       }
     },
     {
-      "method": "session.runtime_inventory",
-      "params": null
-    },
-    {
       "method": "session.inspect",
       "params": "s-42"
     },
@@ -70,16 +66,6 @@
     {
       "method": "session.resume",
       "params": "s-42"
-    },
-    {
-      "method": "session.fork",
-      "params": {
-        "cols": 100,
-        "cwd_mode": "same",
-        "name": "forked review",
-        "rows": 30,
-        "session_id": "s-42"
-      }
     },
     {
       "method": "session.remove",
@@ -254,22 +240,6 @@
       "params": {
         "base": "main",
         "session_id": "s-42"
-      }
-    },
-    {
-      "method": "session.policy.get",
-      "params": null
-    },
-    {
-      "method": "session.policy.set",
-      "params": {
-        "retention": {
-          "enabled": true,
-          "lost_ttl_secs": 3600,
-          "max_removals_per_sweep": 25,
-          "sweep_interval_secs": 600,
-          "terminal_ttl_secs": 86400
-        }
       }
     },
     {

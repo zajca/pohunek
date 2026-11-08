@@ -16,7 +16,7 @@
 //! untouched — `serde` never denies an unknown key and the reader's rules
 //! still hold — but its next whole-store rewrite drops the foreign snapshot:
 //! v0.33.0 has no `native_launch` or `launch_binding`, and v0.33.1 has no
-//! resume or fork relaunch modes. The validation therefore also refuses any
+//! resume relaunch modes. The validation therefore also refuses any
 //! recovery binding whose relaunch snapshot the selected reader would
 //! silently rewrite away, including the snapshot nested in a session record;
 //! a binding in the selected reader's own spellings still passes.

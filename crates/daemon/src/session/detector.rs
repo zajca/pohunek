@@ -441,7 +441,6 @@ impl SessionRegistry {
                 true,
             );
             entry.set_activity(transition.activity);
-            self.wake_idle_stop();
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
             let evidence = record_activity_evidence(

@@ -6,7 +6,7 @@
 //! The Unix socket serves the whole lifecycle; every package method is refused
 //! on the remote connection before it reads a parameter or touches the disk.
 //! The same servers, over a registry that owns a metadata store, serve the
-//! `store.rejected_*` methods and the package gates that depend on them.
+//! package gates that depend on rejected store lines.
 
 // Rust guideline compliant 2026-10-12
 
@@ -304,36 +304,6 @@ where
         .into_result()
         .unwrap_or_else(|error| panic!("{method} failed: {error}"));
     serde_json::from_value(value).unwrap_or_else(|error| panic!("{method} result: {error}"))
-}
-
-/// The `store_rejected_line_live` message names a `resume` line only for the
-/// fixture's unreadable-pin `resume` line, not for a possible session record.
-async fn assert_live_refusal_names_its_line_kind<S>(
-    local: &mut Framed<S, LinesCodec>,
-    fixture: &RejectedFixture,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let resume_refusal = refused(
-        local,
-        method::STORE_REJECTED_SET_ASIDE,
-        json!({ "content_hash": sha256_hex(&fixture.resume) }),
-    )
-    .await;
-    assert!(
-        resume_refusal.msg.contains("`resume` line"),
-        "{resume_refusal:?}"
-    );
-    let session_refusal = refused(
-        local,
-        method::STORE_REJECTED_SET_ASIDE,
-        json!({ "content_hash": sha256_hex(&fixture.live) }),
-    )
-    .await;
-    assert!(
-        !session_refusal.msg.contains("`resume` line"),
-        "{session_refusal:?}"
-    );
 }
 
 /// The wire error code of a refused call.
@@ -2026,8 +1996,13 @@ where
     .await
 }
 
+fn store_text(servers: &Servers) -> String {
+    std::fs::read_to_string(servers.store.as_ref().expect("the registry owns a store"))
+        .expect("read the metadata store")
+}
+
 #[tokio::test]
-async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_overrides_them() {
+async fn launch_env_pairs_reach_new_and_resumed_sessions_and_a_profile_overrides_them() {
     let servers = spawn_servers("pkg-launch-env-session").await;
     let mut local = connect_unix(&servers.socket).await;
     let cwd = servers
@@ -2071,19 +2046,8 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
     let resumed: protocol::SessionResumeResult =
         call(&mut local, method::SESSION_RESUME, json!(id)).await;
     wait_for_text(&mut local, &resumed.session.id, "LAUNCH_ENV_PAIR=<1>").await;
-
-    // A fork is launched the same way.
-    let forked: protocol::SessionForkResult = call(
-        &mut local,
-        method::SESSION_FORK,
-        json!({ "session_id": resumed.session.id, "cols": 80, "rows": 24 }),
-    )
-    .await;
-    wait_for_text(&mut local, &forked.session.id, "LAUNCH_ENV_PAIR=<1>").await;
-    for stopped in [&resumed.session.id, &forked.session.id] {
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(stopped)).await;
-    }
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
 
     // A host profile's `[env]` entry of the same name wins.
     let overridden = start_session(&mut local, "overridden", &cwd).await;
@@ -2097,80 +2061,49 @@ async fn launch_env_pairs_reach_new_resumed_and_forked_sessions_and_a_profile_ov
 }
 
 #[tokio::test]
-async fn a_fork_assignment_installs_only_next_to_an_assigned_fork_and_is_shown_for_review() {
-    let servers = spawn_servers("pkg-assign-fork").await;
+async fn a_descriptor_with_or_without_fork_data_installs_and_shows_no_fork() {
+    let servers = spawn_servers("pkg-fork-data").await;
     let mut local = connect_unix(&servers.socket).await;
     let plain = descriptor("/bin/sh");
     let launch_args = "launch_args = [\"--session-id\", \"{reference}\"]\n";
     let fork = "[fork]\nsupported = true\nargs = [\"--fork\", \"{reference}\"]\n";
-    let assigned = format!("strategy = \"assigned\"\n{launch_args}");
-    assert!(plain.contains(fork) && plain.contains(&assigned));
-    let assign_fork = |value: &str| {
-        plain.replace(
-            launch_args,
-            &format!("{launch_args}assign_fork = {value}\n"),
-        )
-    };
-    let assigning = assign_fork("true");
-    let without_fork = |document: &str| document.replace(fork, "[fork]\nsupported = false\n");
-    let hook = |line: &str| plain.replace(&assigned, &format!("strategy = \"hook\"\n{line}"));
-    // Each refused descriptor next to the same descriptor without the
-    // offending `assign_fork`, which a dry run accepts.
-    let refused = [
-        (
-            "without-fork",
-            without_fork(&assigning),
-            without_fork(&plain),
-        ),
-        ("hook-strategy", hook("assign_fork = false\n"), hook("")),
-        ("not-a-boolean", assign_fork("\"yes\""), plain.clone()),
-    ];
-    for (name, document, control) in &refused {
-        let (_digest, result) =
+    assert!(plain.contains(fork) && plain.contains(launch_args));
+    // A descriptor of an earlier release: a `[fork]` table next to an
+    // `assign_fork` key.
+    let legacy = plain.replace(launch_args, &format!("{launch_args}assign_fork = true\n"));
+    // A descriptor of this release: no fork data at all.
+    let current = plain
+        .replace(fork, "")
+        .replace("version = \"1.0.0\"", "version = \"1.0.1\"");
+    assert!(!current.contains("[fork]"));
+    for (name, document) in [("legacy-fork", &legacy), ("current-no-fork", &current)] {
+        let (digest, installed) =
             install_descriptor(&mut local, &servers.plugins, name, document, false).await;
-        let error = result.expect_err(name);
-        assert_eq!(error.code, "package_descriptor_invalid", "{name}");
-        let (_digest, result) =
-            install_descriptor(&mut local, &servers.plugins, name, control, true).await;
-        result.unwrap_or_else(|error| panic!("{name} without assign_fork is valid: {error:?}"));
+        installed.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
+        let inspected: PackageInspectResult = call(
+            &mut local,
+            method::PACKAGE_INSPECT,
+            json!({ "digest": digest }),
+        )
+        .await;
+        let runtime = inspected.runtime.expect("descriptor");
+        assert_eq!(
+            runtime.launch_args,
+            Some(vec!["--session-id".to_owned(), "{reference}".to_owned()]),
+            "{name}"
+        );
+        assert!(runtime.resumable, "{name}");
+        let wire = serde_json::to_value(&runtime).expect("serialize the runtime info");
+        assert_eq!(wire["forkable"], false, "{name}: forkable is always false");
+        for field in ["fork_args", "fork_launch_args"] {
+            assert!(wire.get(field).is_none(), "{name}: {field} is not shown");
+        }
     }
-    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
-    assert!(
-        listed.packages.is_empty(),
-        "a refused descriptor or a dry run records nothing"
-    );
-
-    // Review shows what a fork appends after its own arguments.
-    let (digest, installed) = install_descriptor(
-        &mut local,
-        &servers.plugins,
-        "assign-fork",
-        &assigning,
-        false,
-    )
-    .await;
-    installed.expect("a fork assignment next to an assigned fork installs");
-    let inspected: PackageInspectResult = call(
-        &mut local,
-        method::PACKAGE_INSPECT,
-        json!({ "digest": digest }),
-    )
-    .await;
-    let runtime = inspected.runtime.expect("descriptor");
-    let tokens = |tokens: &[&str]| Some(tokens.iter().map(|token| (*token).to_owned()).collect());
-    assert_eq!(runtime.fork_args, tokens(&["--fork", "{reference}"]));
-    assert_eq!(
-        runtime.fork_launch_args,
-        tokens(&["--session-id", "{reference}"])
-    );
-    assert_eq!(runtime.launch_args, runtime.fork_launch_args);
 
     drop(local);
     servers.stop().await;
 }
 
-/// A host profile slot equal to a `[launch_env]` name of its runtime cannot be
-/// filled by a request: the pair is the runtime's behaviour flag, not a secret.
 #[tokio::test]
 async fn a_secret_slot_naming_a_launch_env_pair_is_refused_at_session_new() {
     const SECRET: &str = "SENTINEL_LAUNCH_ENV_SLOT_6f1e";
@@ -2229,264 +2162,8 @@ fn rejected_line(kind: &str) -> String {
     .to_string()
 }
 
-/// A current-schema session line that no loader accepts, with `runtime`.
-fn rejected_session_line(session_id: &str, runtime: Value) -> String {
-    let mut line = json!({
-        "kind": "session",
-        "schema_version": pohunek_daemon::store::STORE_SCHEMA_VERSION,
-        "session_id": session_id,
-        "desired_state": "suspended"
-    });
-    if !runtime.is_null() {
-        line["runtime"] = runtime;
-    }
-    line.to_string()
-}
-
-/// Lowercase hex SHA-256 of `text`.
-fn sha256_hex(text: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-    format!("{:x}", Sha256::digest(text.as_bytes()))
-}
-
-fn quarantine_records(servers: &Servers) -> Vec<Value> {
-    let path = servers
-        .store
-        .as_ref()
-        .expect("the registry owns a store")
-        .with_file_name("metadata.rejected.jsonl");
-    std::fs::read_to_string(path)
-        .expect("read the quarantine file")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("a quarantine record"))
-        .collect()
-}
-
-fn store_text(servers: &Servers) -> String {
-    std::fs::read_to_string(servers.store.as_ref().expect("the registry owns a store"))
-        .expect("read the metadata store")
-}
-
-/// The rejected lines of the scenarios below, numbered as the store holds them
-/// (a blank line sits at 2, a duplicate of the resume line at 7).
-struct RejectedFixture {
-    project: String,
-    resume: String,
-    live: String,
-    ended: String,
-    corrupt: String,
-    content: String,
-}
-
-impl RejectedFixture {
-    fn new() -> Self {
-        let project = rejected_line("project");
-        let resume = rejected_line("resume");
-        let live = rejected_session_line("s-live", Value::Null);
-        let ended = rejected_session_line("s-ended", json!({ "state": "terminal" }));
-        let corrupt = "{not json".to_owned();
-        let content = format!("{project}\n\n{resume}\n{live}\n{ended}\n{corrupt}\n{resume}\n");
-        Self {
-            project,
-            resume,
-            live,
-            ended,
-            corrupt,
-            content,
-        }
-    }
-}
-
-async fn set_aside(
-    local: &mut Framed<UnixStream, LinesCodec>,
-    text: &str,
-    accept_pin_loss: bool,
-) -> protocol::StoreRejectedSetAsideResult {
-    call(
-        local,
-        method::STORE_REJECTED_SET_ASIDE,
-        json!({ "content_hash": sha256_hex(text), "accept_pin_loss": accept_pin_loss }),
-    )
-    .await
-}
-
 #[tokio::test]
-async fn the_rejected_line_methods_are_local_only_and_list_every_line() {
-    let fixture = RejectedFixture::new();
-    let servers = spawn_servers_over("store-rejected-list", Some(&fixture.content)).await;
-    let mut local = connect_unix(&servers.socket).await;
-    let mut remote = connect_tcp(servers.addr).await;
-
-    for (name, params) in [
-        (method::STORE_REJECTED_LIST, Value::Null),
-        (
-            method::STORE_REJECTED_SET_ASIDE,
-            json!({ "content_hash": sha256_hex(&fixture.project) }),
-        ),
-    ] {
-        assert_eq!(
-            refusal(&mut remote, name, params).await,
-            LOCAL_ONLY,
-            "{name}"
-        );
-    }
-    assert_eq!(
-        store_text(&servers),
-        fixture.content,
-        "the remote calls changed nothing"
-    );
-
-    let listed: protocol::StoreRejectedListResult =
-        call(&mut local, method::STORE_REJECTED_LIST, Value::Null).await;
-    assert_eq!(listed.total, 6);
-    let summary: Vec<_> = listed
-        .lines
-        .iter()
-        .map(|line| {
-            (
-                line.line,
-                line.kind.as_deref(),
-                line.may_pin,
-                line.may_own_runtime,
-                line.content_hash.clone(),
-            )
-        })
-        .collect();
-    let expected = [
-        (
-            1,
-            Some("project"),
-            false,
-            false,
-            sha256_hex(&fixture.project),
-        ),
-        (3, Some("resume"), true, true, sha256_hex(&fixture.resume)),
-        (4, Some("session"), true, true, sha256_hex(&fixture.live)),
-        (5, Some("session"), true, false, sha256_hex(&fixture.ended)),
-        (6, None, true, true, sha256_hex(&fixture.corrupt)),
-        (7, Some("resume"), true, true, sha256_hex(&fixture.resume)),
-    ];
-    assert_eq!(summary, expected);
-    assert!(
-        listed.lines.iter().all(|line| !line.reason.is_empty()),
-        "every line names why it is rejected"
-    );
-
-    assert_eq!(
-        refusal(
-            &mut local,
-            method::STORE_REJECTED_SET_ASIDE,
-            json!({ "content_hash": sha256_hex(&fixture.live) })
-        )
-        .await,
-        "store_rejected_line_live"
-    );
-    assert_eq!(
-        refusal(
-            &mut local,
-            method::STORE_REJECTED_SET_ASIDE,
-            json!({ "content_hash": sha256_hex(&fixture.resume) })
-        )
-        .await,
-        "store_rejected_line_live",
-        "a resume line whose pin cannot be read needs the same consent"
-    );
-    assert_live_refusal_names_its_line_kind(&mut local, &fixture).await;
-    assert_eq!(
-        refusal(
-            &mut local,
-            method::STORE_REJECTED_SET_ASIDE,
-            json!({ "content_hash": "0".repeat(64) })
-        )
-        .await,
-        "store_rejected_line_not_found"
-    );
-    assert_eq!(
-        store_text(&servers),
-        fixture.content,
-        "a refusal changes nothing"
-    );
-    assert!(
-        !quarantine_path(&servers).exists(),
-        "a refusal writes no quarantine file"
-    );
-
-    drop(remote);
-    drop(local);
-    servers.stop().await;
-}
-
-fn quarantine_path(servers: &Servers) -> PathBuf {
-    servers
-        .store
-        .as_ref()
-        .expect("the registry owns a store")
-        .with_file_name("metadata.rejected.jsonl")
-}
-
-#[tokio::test]
-async fn setting_lines_aside_moves_them_into_an_audited_owner_private_quarantine_file() {
-    let fixture = RejectedFixture::new();
-    let servers = spawn_servers_over("store-rejected-move", Some(&fixture.content)).await;
-    let mut local = connect_unix(&servers.socket).await;
-
-    let moved = set_aside(&mut local, &fixture.project, false).await;
-    assert_eq!(moved.lines, [1]);
-    assert_eq!(moved.quarantine_file, "metadata.rejected.jsonl");
-    // The first rewrite dropped the blank line, so the numbers moved up.
-    let duplicate = set_aside(&mut local, &fixture.resume, true).await;
-    assert_eq!(duplicate.lines, [1, 5], "identical lines move together");
-    let ended = set_aside(&mut local, &fixture.ended, false).await;
-    assert_eq!(ended.lines, [2]);
-    let accepted = set_aside(&mut local, &fixture.live, true).await;
-    assert_eq!(accepted.lines, [1], "the number is the one before the move");
-    assert_eq!(
-        store_text(&servers),
-        format!("{}\n", fixture.corrupt),
-        "the store keeps only the line nobody set aside"
-    );
-
-    let records = quarantine_records(&servers);
-    let audited: Vec<_> = records
-        .iter()
-        .map(|record| {
-            (
-                record["line"].as_u64().expect("line"),
-                record["text"].as_str().expect("text").to_owned(),
-                record["accepted_pin_loss"].as_bool().expect("flag"),
-            )
-        })
-        .collect();
-    assert_eq!(
-        audited,
-        [
-            (1, fixture.project.clone(), false),
-            (1, fixture.resume.clone(), true),
-            (5, fixture.resume.clone(), true),
-            (2, fixture.ended.clone(), false),
-            (1, fixture.live.clone(), true),
-        ]
-    );
-    assert!(records
-        .iter()
-        .all(|record| record["quarantine_schema"] == 1 && record["set_aside_at"].is_string()));
-    let mode = std::fs::metadata(quarantine_path(&servers))
-        .expect("quarantine metadata")
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600, "the quarantine file is owner-private");
-
-    let after: protocol::StoreRejectedListResult =
-        call(&mut local, method::STORE_REJECTED_LIST, Value::Null).await;
-    assert_eq!(after.total, 1);
-    assert_eq!(after.lines[0].line, 1);
-
-    drop(local);
-    servers.stop().await;
-}
-
-#[tokio::test]
-async fn a_removal_refused_for_an_unreadable_line_proceeds_once_the_line_is_set_aside() {
+async fn a_removal_refused_for_an_unreadable_line_keeps_the_package() {
     let unreadable = rejected_line("resume");
     let servers = spawn_servers_over("store-uninstall", Some(&format!("{unreadable}\n"))).await;
     let mut local = connect_unix(&servers.socket).await;
@@ -2508,24 +2185,10 @@ async fn a_removal_refused_for_an_unreadable_line_proceeds_once_the_line_is_set_
     let uninstall = json!({ "digest": digest, "remove_modified": false });
 
     assert_eq!(
-        refusal(&mut local, method::PACKAGE_UNINSTALL, uninstall.clone()).await,
+        refusal(&mut local, method::PACKAGE_UNINSTALL, uninstall).await,
         "package_retention_uncertain",
         "a line that may pin the package keeps it installed"
     );
-    let listed: protocol::StoreRejectedListResult =
-        call(&mut local, method::STORE_REJECTED_LIST, Value::Null).await;
-    assert_eq!(listed.total, 1);
-    assert!(listed.lines[0].may_pin);
-
-    let _: protocol::StoreRejectedSetAsideResult = call(
-        &mut local,
-        method::STORE_REJECTED_SET_ASIDE,
-        json!({ "content_hash": listed.lines[0].content_hash, "accept_pin_loss": true }),
-    )
-    .await;
-    let removed: PackageUninstallResult =
-        call(&mut local, method::PACKAGE_UNINSTALL, uninstall).await;
-    assert!(removed.reloaded);
 
     drop(local);
     servers.stop().await;
@@ -2675,30 +2338,6 @@ async fn naming_args_follow_the_name_each_launch_uses() {
         strings(&["--model", "fast", "--name=Beta", "--session"])
     );
 
-    // A fork carries its own name, never the source's, and none without one.
-    for (fork_name, expected) in [
-        (
-            Some("Gamma"),
-            strings(&["--model", "fast", "--name=Gamma", "--fork"]),
-        ),
-        (None, strings(&["--model", "fast", "--fork"])),
-    ] {
-        let forked: protocol::SessionForkResult = call(
-            &mut local,
-            method::SESSION_FORK,
-            json!({ "session_id": resumed.session.id, "name": fork_name, "cols": 80, "rows": 24 }),
-        )
-        .await;
-        let argv = printed_argv(&mut local, &forked.session.id).await;
-        assert_eq!(
-            without_reference(&argv, &["--fork"]),
-            expected,
-            "{fork_name:?}"
-        );
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(forked.session.id)).await;
-    }
-
     // The persisted resume snapshot never holds a naming token.
     let store = store_text(&servers);
     assert!(store.contains("Beta"), "the record holds the current name");
@@ -2795,8 +2434,8 @@ async fn assert_pair_creates(
 /// The pair form `["--name", "{session_name}"]` hands the name over as a
 /// separate element, after the contributor arguments and before the native
 /// reference; a name with interior spaces stays one element, a dash-leading
-/// name is withheld with its flag at create, resume and fork, and a resume
-/// carries the name the record holds now.
+/// name is withheld with its flag at create and resume, and a resume carries
+/// the name the record holds now.
 #[tokio::test]
 async fn pair_naming_args_follow_the_name_each_launch_uses() {
     let servers = spawn_servers_over("pkg-naming-pair", Some("")).await;
@@ -2858,41 +2497,6 @@ async fn pair_naming_args_follow_the_name_each_launch_uses() {
             call(&mut local, method::SESSION_STOP, json!(named)).await;
     }
 
-    // A fork carries its own name, and none without one or with a dash.
-    let _: protocol::SessionRenameResult = call(
-        &mut local,
-        method::SESSION_RENAME,
-        json!({ "session_id": named, "name": "Source" }),
-    )
-    .await;
-    let resumed: protocol::SessionResumeResult =
-        call(&mut local, method::SESSION_RESUME, json!(named)).await;
-    for (fork_name, expected) in [
-        (
-            Some("Delta"),
-            strings(&["--model", "fast", "--name", "Delta", "--fork"]),
-        ),
-        (None, strings(&["--model", "fast", "--fork"])),
-        (Some("-d"), strings(&["--model", "fast", "--fork"])),
-    ] {
-        let forked: protocol::SessionForkResult = call(
-            &mut local,
-            method::SESSION_FORK,
-            json!({ "session_id": resumed.session.id, "name": fork_name, "cols": 80, "rows": 24 }),
-        )
-        .await;
-        let argv = printed_argv(&mut local, &forked.session.id).await;
-        assert_eq!(
-            without_reference(&argv, &["--fork"]),
-            expected,
-            "{fork_name:?}"
-        );
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(forked.session.id)).await;
-    }
-
-    let _: protocol::SessionStopResult =
-        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
     drop(local);
     servers.stop().await;
 }
@@ -3366,26 +2970,12 @@ async fn keep_local_args_follow_each_launch_and_are_not_frozen() {
         strings(&["--model", "fast", "--keep-local", "--session"])
     );
 
-    let forked: protocol::SessionForkResult = call(
-        &mut local,
-        method::SESSION_FORK,
-        json!({ "session_id": resumed.session.id, "cols": 80, "rows": 24 }),
-    )
-    .await;
-    let argv = printed_argv(&mut local, &forked.session.id).await;
-    assert_eq!(
-        without_reference(&argv, &["--fork"]),
-        strings(&["--model", "fast", "--keep-local", "--fork"])
-    );
-
     assert!(
         !store_text(&servers).contains("--keep-local"),
         "the persisted resume snapshot holds no keep-local argument"
     );
-    for id in [forked.session.id, resumed.session.id] {
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(id)).await;
-    }
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
     drop(local);
     servers.stop().await;
 }
@@ -4071,7 +3661,7 @@ async fn only_a_clean_checkout_of_a_trusted_repository_gets_the_trusted_args() {
 }
 
 #[tokio::test]
-async fn resume_and_fork_evaluate_the_trust_again() {
+async fn resume_evaluates_the_trust_again() {
     let servers = spawn_servers_trusting_repositories(
         "pkg-trust-relaunch",
         Some(""),
@@ -4100,20 +3690,8 @@ async fn resume_and_fork_evaluate_the_trust_again() {
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
 
-    // A fork of the same session is not trusted either.
-    let forked: protocol::SessionForkResult = call(
-        &mut local,
-        method::SESSION_FORK,
-        json!({ "session_id": resumed.session.id, "name": null, "cols": 80, "rows": 24 }),
-    )
-    .await;
-    let argv = printed_argv(&mut local, &forked.session.id).await;
-    assert!(!carries_trust_arg(&argv), "{argv:?}");
-    let _: protocol::SessionStopResult =
-        call(&mut local, method::SESSION_STOP, json!(forked.session.id)).await;
-
-    // Restoring the file makes the next resume and fork trusted again; the
-    // arguments are never part of the persisted snapshot.
+    // Restoring the file makes the next resume trusted again; the arguments
+    // are never part of the persisted snapshot.
     std::fs::write(&hooks, "{}\n").expect("restore hooks");
     let resumed: protocol::SessionResumeResult =
         call(&mut local, method::SESSION_RESUME, json!(created)).await;
@@ -4122,26 +3700,13 @@ async fn resume_and_fork_evaluate_the_trust_again() {
         without_reference(&argv, &["--session"]),
         strings(&["--model", "fast", TRUST_ARG, "--session"])
     );
-    let forked: protocol::SessionForkResult = call(
-        &mut local,
-        method::SESSION_FORK,
-        json!({ "session_id": resumed.session.id, "name": null, "cols": 80, "rows": 24 }),
-    )
-    .await;
-    let argv = printed_argv(&mut local, &forked.session.id).await;
-    assert_eq!(
-        without_reference(&argv, &["--fork"]),
-        strings(&["--model", "fast", TRUST_ARG, "--fork"])
-    );
     assert!(
         !store_text(&servers).contains(TRUST_ARG),
         "the store holds no trusted argument"
     );
 
-    for id in [forked.session.id, resumed.session.id] {
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(id)).await;
-    }
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
     drop(local);
     servers.stop().await;
 }
@@ -4883,29 +4448,12 @@ async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
     servers.stop().await;
 }
 
-/// The fork of the running session `id`, with the id of the fork.
-async fn fork_of<S>(
-    framed: &mut Framed<S, LinesCodec>,
-    id: &protocol::SessionId,
-) -> protocol::SessionId
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let forked: protocol::SessionForkResult = call(
-        framed,
-        method::SESSION_FORK,
-        json!({ "session_id": id, "name": null, "cols": 80, "rows": 24 }),
-    )
-    .await;
-    forked.session.id
-}
-
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "one session walks fork, restart and a store without the launch checkout"
+    reason = "one session walks a move, a restart and a store without the launch checkout"
 )]
-async fn a_fork_inherits_the_launch_checkout_and_a_store_without_one_withholds_the_args() {
+async fn a_resumed_session_keeps_its_launch_checkout_across_a_restart_and_a_migration() {
     let _ = captured_log();
     let base = pohunek_test_support::tempdir().expect("checkout root");
     let own = "https://github.com/acme/widgets.git";
@@ -4915,55 +4463,38 @@ async fn a_fork_inherits_the_launch_checkout_and_a_store_without_one_withholds_t
         config.trusted_repositories = host_trusting(&["acme/widgets"]);
     };
     let program = drifting_program(&base.path().join("plugins"));
-    let servers = spawn_servers_configured("pkg-trust-fork", Some(""), trusting).await;
+    let servers = spawn_servers_configured("pkg-trust-resume", Some(""), trusting).await;
     let mut local = connect_unix(&servers.socket).await;
     install_drifting_runtime(&servers, &mut local, &program).await;
     announce_remote_source(&servers, Some(remote_snapshot(&anchor)));
     register_project(&mut local, &second).await;
 
-    // Row 8: a fork of an unmoved session gets the arguments, records the
-    // source's launch checkout, and its own resume gets them too.
+    // A session created in the anchor gets the arguments.
     let created = start_named_session(&mut local, RUNTIME, &anchor, None).await;
     assert_eq!(
         trust_arg_count(&printed_argv(&mut local, &created).await),
         1
     );
-    let fork = fork_of(&mut local, &created).await;
-    assert_eq!(trust_arg_count(&printed_argv(&mut local, &fork).await), 1);
-    let store = store_text(&servers);
-    assert_eq!(
-        recorded_launch_checkout(&store, &fork),
-        recorded_launch_checkout(&store, &created)
-    );
-    assert_eq!(trust_arg_count(&resumed_argv(&mut local, &fork).await), 1);
-    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(fork)).await;
 
-    // Row 9: a fork of a moved session launches in the moved directory without
-    // the arguments, and neither does the resume of that fork.
+    // A session moved out of the anchor resumes in the moved directory without
+    // the arguments, and the record keeps the anchor as its launch checkout.
     drift(&mut local, &created, "osc", &second).await;
-    let moved_fork = fork_of(&mut local, &created).await;
     assert_eq!(
-        trust_arg_count(&printed_argv(&mut local, &moved_fork).await),
-        0
-    );
-    assert_eq!(
-        trust_arg_count(&resumed_argv(&mut local, &moved_fork).await),
+        trust_arg_count(&resumed_argv(&mut local, &created).await),
         0
     );
     let store = store_text(&servers);
     assert_eq!(
-        recorded_launch_checkout(&store, &moved_fork).expect("the fork records a launch checkout")
+        recorded_launch_checkout(&store, &created).expect("the session records a launch checkout")
             ["cwd"],
         json!(anchor)
     );
 
-    // Row 10: after a daemon restart the stored launch checkout still lets the
+    // After a daemon restart the stored launch checkout still lets the
     // unmoved session resume with the arguments.
     drift(&mut local, &created, "osc", &anchor).await;
-    for id in [&created, &moved_fork] {
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(id)).await;
-    }
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
     let store = store_text(&servers);
     drop(local);
     servers.stop().await;
@@ -4986,9 +4517,9 @@ async fn a_fork_inherits_the_launch_checkout_and_a_store_without_one_withholds_t
     drop(local);
     servers.stop().await;
 
-    // Row 11: the same store as an older daemon wrote it, without any launch
+    // The same store as an older daemon wrote it, without any launch
     // checkout, migrates to the current schema and keeps launching, with no
-    // arguments and one failure per resume and per fork.
+    // arguments and one failure per resume.
     let older: Vec<String> = store
         .lines()
         .map(|line| match serde_json::from_str::<Value>(line) {
@@ -5035,13 +4566,8 @@ async fn a_fork_inherits_the_launch_checkout_and_a_store_without_one_withholds_t
     let argv = printed_argv(&mut local, &resumed.session.id).await;
     assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
     assert_eq!(failure_lines(&anchor), before + 1);
-    let fork = fork_of(&mut local, &created).await;
-    assert_eq!(trust_arg_count(&printed_argv(&mut local, &fork).await), 0);
-    assert_eq!(failure_lines(&anchor), before + 2);
-    for id in [&fork, &created] {
-        let _: protocol::SessionStopResult =
-            call(&mut local, method::SESSION_STOP, json!(id)).await;
-    }
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(created)).await;
     drop(local);
     servers.stop().await;
 }

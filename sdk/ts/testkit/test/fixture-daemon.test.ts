@@ -466,20 +466,6 @@ describe("@pohunek/testkit fixture daemon", () => {
       await client.call("session.stop", hermes.id);
       await client.call("session.resume", hermes.id);
 
-      const sessionIdsBeforeFork = (await client.call("session.list", {})).map((session) => session.id);
-      const forkError = await expectClientError(client.call("session.fork", {
-        session_id: hermes.id,
-        cwd_mode: "same",
-        cols: TEST_COLS,
-        rows: TEST_ROWS,
-      }));
-      expect(forkError.toProtocolError()).toEqual({
-        class: "runtime",
-        code: "agent_fork_unsupported",
-        msg: "the selected agent does not support fork",
-      });
-      expect((await client.call("session.list", {})).map((session) => session.id)).toEqual(sessionIdsBeforeFork);
-
       const missingReference = await client.call("session.new", {
         agent: "hermes",
         cols: TEST_COLS,
@@ -661,12 +647,6 @@ describe("@pohunek/testkit fixture daemon", () => {
         (): Promise<unknown> => client.call("session.stop", futureSession.id),
         (): Promise<unknown> => client.call("session.resume", futureSession.id),
         (): Promise<unknown> => client.call("session.remove", futureSession.id),
-        (): Promise<unknown> => client.call("session.fork", {
-          session_id: futureSession.id,
-          cwd_mode: "same",
-          cols: RESIZED_COLS,
-          rows: RESIZED_ROWS,
-        }),
         (): Promise<unknown> => client.call("session.resize", {
           session_id: futureSession.id,
           cols: RESIZED_COLS,
@@ -1161,8 +1141,6 @@ describe("@pohunek/testkit fixture daemon", () => {
       const created = await client.call("session.new", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
       expect((await client.call("session.rename", { session_id: created.id, name: "Renamed" })).session.name).toBe("Renamed");
       expect((await client.call("session.set_metadata", { session_id: created.id, metadata: { issue: "ABC-1" } })).session.metadata).toEqual({ issue: "ABC-1" });
-      const fork = await client.call("session.fork", { session_id: created.id, cwd_mode: "same", cols: RESIZED_COLS, rows: RESIZED_ROWS });
-      expect(fork.cols).toBe(RESIZED_COLS);
       await client.call("session.stop", created.id);
       expect((await client.call("session.resume", created.id)).session.state).toBe("running");
       expect(await client.call("session.remove", created.id)).toEqual({ removed: true, stopped: true, worktrees_removed: 0, worktrees_failed: 0 });

@@ -8,7 +8,7 @@
 //! refuses the descriptor at install.
 //!
 //! A descriptor exports a runtime (`[runtime]`, `[input]`, `[resume]`,
-//! `[fork]`, `[native_reference]`, all or none), commands, or both, and at
+//! `[native_reference]`, all or none), commands, or both, and at
 //! least one of the two. A package that exports commands only serves no
 //! runtime: it is never launchable as a session.
 
@@ -36,7 +36,7 @@ pub const MAX_PACKAGE_COMMANDS: usize = 16;
 
 /// Top-level tables that make up the runtime export, declared together or not
 /// at all.
-const RUNTIME_GROUP: [&str; 5] = ["runtime", "input", "resume", "fork", "native_reference"];
+const RUNTIME_GROUP: [&str; 4] = ["runtime", "input", "resume", "native_reference"];
 
 /// What a package descriptor exports.
 #[derive(Debug, Clone)]
@@ -178,7 +178,8 @@ pub(super) fn classify(
     if declared != 0 {
         return Err(DefinitionError::Field {
             field: "runtime",
-            reason: "runtime, input, resume, fork and native_reference are declared together or not at all",
+            reason:
+                "runtime, input, resume and native_reference are declared together or not at all",
         });
     }
     if descriptor.contains_key("commands") {

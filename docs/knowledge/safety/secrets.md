@@ -28,7 +28,7 @@ A `session.new` `secret_env` map is a second secret-bearing carrier. The
 protocol type prints only an entry count and reports a malformed entry with
 fixed text; the daemon takes the values out of the request before any record,
 hook or event is built, and sends them once to the worker in `Initialize`
-alongside the profile environment. They are not persisted, so a resume or fork of
+alongside the profile environment. They are not persisted, so a resume of
 a profile that declares `secret_env` slots is refused with `secret_env_missing`.
 The slot names come from the host profile, never from the wire.
 

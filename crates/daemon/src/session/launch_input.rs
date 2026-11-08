@@ -27,7 +27,7 @@ use crate::store::ResumeBinding;
 /// otherwise run with and the session name it uses.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LaunchSubject<'a> {
-    /// Create, resume or fork.
+    /// Create or resume.
     pub(super) kind: LaunchKind,
     /// The arguments the launch would otherwise run with; they are only read.
     pub(super) frozen_args: &'a [String],

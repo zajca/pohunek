@@ -310,8 +310,6 @@ SYSTEMD_SUITE_FILES = (
     ("pohunek-cli", "crates/cli/tests/setup_host.rs"),
     ("pohunek-daemon", "crates/daemon/tests/supervised_lifecycle.rs"),
     ("pohunek-cli", "crates/cli/tests/service_upgrade.rs"),
-    ("pohunek-cli", "crates/cli/tests/workflow_systemd.rs"),
-    ("pohunek-cli", "crates/cli/tests/workflow_reactions.rs"),
 )
 SYSTEMD_SUITES = word_list(file for _, file in SYSTEMD_SUITE_FILES)
 # Packages whose integration test files are modules of one `all` test binary.
@@ -340,8 +338,7 @@ LAUNCHD_SUITE_FILES = (
     ("pohunek-daemon", ("crates/daemon/tests/supervised_lifecycle.rs",)),
     ("pohunek-cli", ("crates/cli/tests/service_launchd.rs",
                      "crates/cli/tests/service_upgrade.rs",
-                     "crates/cli/tests/setup_host_native.rs",
-                     "crates/cli/tests/workflow_launchd.rs")),
+                     "crates/cli/tests/setup_host_native.rs")),
 )
 LAUNCHD_SUITES = word_list(
     file for _, files in LAUNCHD_SUITE_FILES for file in files

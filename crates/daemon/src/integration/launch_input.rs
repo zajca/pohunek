@@ -70,8 +70,6 @@ pub enum LaunchKind {
     Create,
     /// A relaunch of a stopped session.
     Resume,
-    /// A new session forked from an existing one.
-    Fork,
 }
 
 /// What a contributor may read about the launch it contributes to.
@@ -79,7 +77,7 @@ pub enum LaunchKind {
 pub struct LaunchInputContext<'a> {
     /// The session being launched.
     pub session_id: &'a SessionId,
-    /// Create, resume or fork.
+    /// Create or resume.
     pub kind: LaunchKind,
     /// The config home the runtime's descriptor declares, resolved against the
     /// environment the launched agent sees; `None` when the descriptor

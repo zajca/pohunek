@@ -14,7 +14,7 @@
 //! tree, in one of three ways:
 //!
 //! - `keep_local_args`: literal arguments, validated like `[runtime] args`,
-//!   that the core adds to every create, resume and fork launch. They are
+//!   that the core adds to every create and resume launch. They are
 //!   never part of the frozen resume snapshot, and a launch whose frozen
 //!   arguments already hold all of them gets no second copy.
 //! - `keep_local_handler = true`: the runtime's compiled integration handler

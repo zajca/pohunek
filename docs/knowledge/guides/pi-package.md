@@ -2,7 +2,7 @@
 type: Guide
 id: guide/pi-package
 title: Pi runtime package
-description: Install and operate the official Pi coding agent runtime package (Pi 1.x from 1.0.0, verified on 1.4.0 with the 1.0.2 screens kept as the previous release), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume and fork work, where sessions may live, and what fails closed.
+description: Install and operate the official Pi coding agent runtime package (Pi 1.x from 1.0.0, verified on 1.4.0 with the 1.0.2 screens kept as the previous release), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume works, where sessions may live, and what fails closed.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -93,13 +93,11 @@ reserved, so either way of installing serves it.
   blocker is on screen, as it can forge screen text today.
 - Session name: `[naming] launch_args = ["--name", "{session_name}"]` (package
   1.1.0, `requires = ["naming-launch-args-v1"]`), so a named pohunek session
-  runs `pi --name <name>` at launch, resume and fork. See [Session name](#session-name).
-- Native reference: `strategy = "assigned"` with `assign_fork = true`. The
+  runs `pi --name <name>` at launch and resume. See [Session name](#session-name).
+- Native reference: `strategy = "assigned"`. The
   daemon generates a UUID, starts `pi --session-id <id>` (Pi creates the
-  conversation with that id), resumes with `pi --session <id>`, and forks with
-  `pi --fork <id> --session-id <fork id>` under a second UUID it generates for
-  the fork. No integration hook is involved.
-- Existence check: before resume or fork the daemon looks for a regular file
+  conversation with that id), and resumes with `pi --session <id>`. No integration hook is involved.
+- Existence check: before resume the daemon looks for a regular file
   named `*_<id>.jsonl` in a project directory below
   `$PI_CODING_AGENT_DIR/sessions/` (default `~/.pi/agent/sessions/`). Pi writes
   `sessions/--<cwd with / as ->--/<ISO time with : and . as ->_<id>.jsonl`, and
@@ -119,7 +117,7 @@ reserved, so either way of installing serves it.
   `PI_CODING_AGENT_SESSION_DIR`: setting it in the profile `[env]` to the
   directory the setting names satisfies both Pi and the check, because Pi
   follows the variable over the setting; the flag wins over the variable, so
-  its hint says to remove it. Resume and fork run the same refusal against the
+  its hint says to remove it. Resume runs the same refusal against the
   session's arguments and working directory first. The launch passed that
   refusal, so a refusal there means something changed since: a `sessionDir`
   setting appeared, or the variable the launch had is gone (a daemon restarted
@@ -202,7 +200,7 @@ uses the long flag in the pair form of `[naming]`
 `--name=<name>` is not a name for Pi: it falls into the generic `--` branch of the
 parser and is handed to extensions as an unknown flag, so it would be ignored
 without an error. The package needs a 0.39 core and is package version 1.1.0; a session
-pinned to 1.0.5 or earlier resumes and forks without the name until it is
+pinned to 1.0.5 or earlier resumes without the name until it is
 adopted.
 
 What was checked, from the source of the npm tarballs of Pi 1.0.0 (the lock
@@ -214,7 +212,7 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
   line 78, 1.4.0 line 79), including a value that starts with `@` or holds
   spaces; the bundled entry point (`dist/bundle/chunks/*.js`, the file `bin.pi`
   runs) has the identical branch. The flag exists at 1.0.0, the minimum the
-  version probe enforces on create, resume and fork, so the value cannot fall
+  version probe enforces on create and resume, so the value cannot fall
   through to the prompt.
 - A name is never one of Pi's own scans: `main.js` reads `args.includes("--offline")`
   before the parser (1.0.0 line 452, 1.4.0 line 455), and the other pre-parse
@@ -225,10 +223,8 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
 - Pi trims the value, exits 1 on an empty one and appends a `session_info` entry
   to the conversation on every launch (`main.js`, `appendSessionInfo`). Nothing is
   written before the conversation has a message, so the
-  existence check's premise holds; after that each named launch (create, resume
-  or fork) adds one `session_info` line to the session file. A fork copies the
-  source's entries, so a fork without a pohunek name shows the source's Pi
-  name; a fork with one appends its own, and Pi reads the latest.
+  existence check's premise holds; after that each named launch (create or resume)
+  adds one `session_info` line to the session file.
 - Where Pi shows the name: the footer line `<cwd> [(branch)] • <name>`, the
   terminal title `π - <name> - <cwd basename>` and the message of the OSC 7501
   program-status report (Pi 1.1.0 and later, base64-encoded; pohunek keeps only
@@ -247,16 +243,6 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
 - A session that never received a model reply has no session file; `resume` is
   refused with `agent_native_reference_missing` before any worker starts, as is
   a resume after the file was deleted.
-- A forked session holds its own assigned reference from the start: Pi writes
-  the fork's file `<ISO time>_<fork id>.jsonl` at once (its header names the
-  source file as `parentSession`), before any model turn, so the fork resumes
-  with `pi --session <fork id>` after a stop or a daemon restart. Pi refuses a
-  fork id that already names a session; the daemon generates a fresh UUID for
-  every fork. Package version 1.0.1 and later declare this; a host with 1.0.0
-  installed gets it with `pohunek plugin update pohunek.runtime.pi <archive>`
-  (installed beside 1.0.0 and selected). A session launched from 1.0.0, or from
-  a profile still pinned to its digest, keeps the spec it was launched with, so
-  its forks hold no reference and are not resumable.
 - Package version 1.1.0 adds the session name (`pi --name <name>`); a session
   launched from 1.0.5 or earlier keeps its pinned definition and carries no name
   argument until it is relaunched on the new version.
@@ -271,8 +257,7 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
   `PI_CODING_AGENT_SESSION_DIR` (absolute) in the host profile's `[env]`, or
   set `PI_CODING_AGENT_DIR` to move the whole agent directory; do not pass
   `--session-dir` in profile `args`.
-- A stopped session moves to a newer official Pi package version on resume or
-  fork when three things hold. The newer version keeps the session's native
+- A stopped session moves to a newer official Pi package version on resume when three things hold. The newer version keeps the session's native
   reference check and its `--session-id` assignment. A session launched from a
   profile also needs the profile to pin the newer version
   (`pohunek plugin profile migrate <name> --yes`; `service upgrade` repins a Pi
@@ -304,7 +289,7 @@ minimum) and 1.4.0 (the lock; its tarball integrity equals
   existence check and the session-dir refusals on Pi's real file layouts.
 - The same file holds `#[ignore]`d tests that drive a real `pi` through an
   installed package: launch, idle and working detection, input, stop, resume,
-  fork, stop and resume of the fork, adoption of a live session and resume of a
+  adoption of a live session and resume of a
   stopped one by a daemon that restarted (only the first turn reaches the
   stub), refusal without a session file, an
   extension dialog and the project trust prompt read `blocked`, a session kept

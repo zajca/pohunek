@@ -17,17 +17,16 @@ use base64::Engine as _;
 #[cfg(test)]
 use protocol::Request;
 use protocol::{
-    method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
-    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionForkParams,
-    SessionId, SessionIdleStopParams, SessionIdleStopResult, SessionInfo, SessionInputParams,
+    method, AgentActivity, CwdSource, OutputOffset, RuntimeGeneration, SessionDetectionParams,
+    SessionDetectionResult, SessionDiffParams, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputParams, SessionPolicyParams, SessionReadFormat, SessionReadParams,
-    SessionReadResult, SessionReadSource, SessionRemoveResult, SessionRenameParams,
-    SessionResizeParams, SessionResumeParams, SessionRetentionParams, SessionRetentionPolicy,
-    SessionRetentionResult, SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams,
-    SessionState, SessionStopResult, SessionTurnCursor, SessionTurnEventKind, SessionTurnProgress,
-    SessionWaitParams, SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult,
-    SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
+    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
+    SessionResumeParams, SessionRetentionParams, SessionRetentionResult, SessionRuntimeIdentity,
+    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
+    SessionTurnCursor, SessionTurnEventKind, SessionTurnProgress, SessionWaitParams,
+    SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult, SessionWarningKind,
+    StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_TURN_MS,
 };
 
@@ -38,20 +37,10 @@ use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{is_local_host, Target};
 
-/// How long a resume, fork, stop or remove runs before the CLI tells the
+/// How long a resume, stop or remove runs before the CLI tells the
 /// operator it is still waiting for the daemon (the ordinary request timeout
 /// of other commands).
 const LIFECYCLE_PROGRESS_NOTICE_AFTER: Duration = Duration::from_secs(5);
-
-/// Default fork PTY width when the command is not launched from an attach view.
-///
-/// Matches `session new`'s CLI default so non-interactive fork callers get the
-/// same baseline terminal geometry unless a richer surface supplies live size.
-const DEFAULT_FORK_COLS: u16 = 80;
-/// Default fork PTY height when the command is not launched from an attach view.
-///
-/// Matches `session new`'s CLI default; attach and other interactive clients send live size.
-const DEFAULT_FORK_ROWS: u16 = 24;
 
 /// Default observation page balances useful output with compact CLI responses.
 pub(crate) const DEFAULT_OUTPUT_BYTES: u32 = 16 * 1024;
@@ -990,52 +979,6 @@ pub(crate) async fn run_stop(
     Ok(())
 }
 
-/// Fork a session's native agent conversation into a new session.
-///
-/// # Errors
-///
-/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
-/// resolved, the daemon rejects the fork, or the payload does not match the
-/// contract.
-pub(crate) async fn run_fork(
-    host: &PinnedHost,
-    paths: &Paths,
-    target: &Target,
-    name: Option<String>,
-    accept_profile_change: bool,
-    json: bool,
-) -> Result<(), CliError> {
-    let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
-    let forked = with_wait_notice(
-        sdk.session_fork(fork_params(
-            target,
-            name,
-            accept_profile_change,
-            DEFAULT_FORK_COLS,
-            DEFAULT_FORK_ROWS,
-        )),
-        json,
-        || {
-            format!(
-                "waiting for the daemon to fork {}: it starts the new session's worker first",
-                target.session_id
-            )
-        },
-    )
-    .await?;
-    let info = &forked.session;
-
-    if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_FORK, info)?
-        );
-    } else {
-        print!("{}", render_fork_human(info));
-    }
-    Ok(())
-}
-
 /// Run `session rm` against the daemon for `host`.
 ///
 /// Removal evicts the session from the daemon's registry, stopping it first if
@@ -1686,23 +1629,6 @@ pub(crate) async fn run_metadata(
     Ok(())
 }
 
-pub(crate) async fn run_runtime_inventory(
-    host: &str,
-    paths: &Paths,
-    json: bool,
-) -> Result<(), CliError> {
-    let client = Client::connect(host, paths).await?;
-    let result = client.into_sdk().session_runtime_inventory().await?;
-    if json {
-        print!("{}", crate::commands::render_json(&result)?);
-    } else {
-        for entry in result.entries {
-            println!("{}\t{:?}", entry.runtime_slot, entry.status);
-        }
-    }
-    Ok(())
-}
-
 /// Set (`Some`) or clear (`None`) a session's display name on the target host.
 pub(crate) async fn run_rename(
     host: &PinnedHost,
@@ -1765,141 +1691,6 @@ pub(crate) async fn run_diff(
     Ok(())
 }
 
-/// Fields accepted by `session policy set`.
-///
-/// Every field is optional so an update is a read-modify-write of exactly the
-/// fields the operator named.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PolicyArgs {
-    /// Enable automatic retention sweeps.
-    pub(crate) enabled: bool,
-    /// Disable automatic retention sweeps.
-    pub(crate) disabled: bool,
-    /// Seconds between automatic sweeps.
-    pub(crate) sweep_interval_secs: Option<u32>,
-    /// Seconds a terminal session is kept.
-    pub(crate) terminal_ttl_secs: Option<u32>,
-    /// Seconds a session whose runtime is lost is kept.
-    pub(crate) lost_ttl_secs: Option<u32>,
-    /// Maximum sessions one sweep may remove.
-    pub(crate) max_removals_per_sweep: Option<u32>,
-    /// Idle-stop default in seconds; 0 clears it.
-    pub(crate) idle_stop_after: Option<u32>,
-}
-
-impl PolicyArgs {
-    /// Whether any field of the retention policy is named.
-    fn names_retention(self) -> bool {
-        self.enabled
-            || self.disabled
-            || self.sweep_interval_secs.is_some()
-            || self.terminal_ttl_secs.is_some()
-            || self.lost_ttl_secs.is_some()
-            || self.max_removals_per_sweep.is_some()
-    }
-}
-
-/// What `session policy get` and `set` print: the retention policy as the
-/// daemon holds it and, from a daemon that serves it, the idle-stop default.
-#[derive(Debug, serde::Serialize)]
-struct PolicyOutput {
-    retention: SessionRetentionPolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    idle_stop: Option<SessionIdleStopResult>,
-}
-
-/// Whether a daemon answered that it does not serve the idle-stop methods: a
-/// daemon of the previous release answers `method_not_found`, and a protocol 3
-/// daemon is refused before anything is sent.
-fn idle_stop_unsupported(error: &CliError) -> bool {
-    match error {
-        CliError::Protocol(source) => source.code == "method_not_found",
-        CliError::Client(pohunek_client::ClientError::DaemonProtocolTooOld { .. }) => true,
-        CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
-            source.code == "method_not_found"
-        }
-        _ => false,
-    }
-}
-
-/// Recovery hint for a daemon that does not know the idle-stop default;
-/// `connected` is the version the daemon reported, when it answered `daemon.health`.
-///
-/// The upgrade target is this CLI's own release, which serves the methods it
-/// calls. A daemon whose version is not older than the CLI's (an unreleased
-/// build) is told to upgrade to a release that includes the default instead,
-/// because naming the version it already runs would contradict the hint.
-fn idle_stop_upgrade_hint(connected: Option<&str>) -> String {
-    let daemon = connected.map_or_else(
-        || "the connected daemon".to_owned(),
-        |version| format!("the connected daemon (version {version})"),
-    );
-    let cli = env!("CARGO_PKG_VERSION");
-    let older = connected
-        .and_then(|version| semver::Version::parse(version).ok())
-        .zip(semver::Version::parse(cli).ok())
-        .is_none_or(|(daemon, cli)| daemon < cli);
-    let target = if older {
-        format!("this CLI's release ({cli})")
-    } else {
-        "a release that includes it".to_owned()
-    };
-    format!(
-        "{daemon} predates --idle-stop-after; upgrade the daemon to {target} and retry. Nothing was changed"
-    )
-}
-
-/// Adds an upgrade hint naming the connected daemon's version to a
-/// `method_not_found` answer for the idle-stop default. Errors relayed from a
-/// remote daemon keep their host.
-async fn missing_idle_stop_method_hint(client: &mut Client, error: CliError) -> CliError {
-    let is_missing = |source: &protocol::ProtocolError| source.code == "method_not_found";
-    let missing = match &error {
-        CliError::Protocol(source) => is_missing(source),
-        CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
-            is_missing(source)
-        }
-        _ => false,
-    };
-    if !missing {
-        return error;
-    }
-    let connected = client
-        .call::<method::DaemonHealth>(())
-        .await
-        .ok()
-        .map(|health| health.daemon_version);
-    let hint = idle_stop_upgrade_hint(connected.as_deref());
-    let add_hint = |mut source: protocol::ProtocolError| {
-        source.recover = Some(hint.clone());
-        source
-    };
-    match error {
-        CliError::Protocol(source) => CliError::Protocol(add_hint(source)),
-        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
-            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
-                host,
-                source: add_hint(source),
-            })
-        }
-        other => other,
-    }
-}
-
-/// Reads the idle-stop default, or `None` from a daemon that does not serve it.
-async fn read_idle_stop(client: &mut Client) -> Result<Option<SessionIdleStopResult>, CliError> {
-    match client.call::<method::SessionIdleStopGet>(()).await {
-        Ok(result) => Ok(Some(result)),
-        Err(error) => {
-            if idle_stop_unsupported(&error) {
-                Ok(None)
-            } else {
-                Err(error)
-            }
-        }
-    }
-}
-
 /// Arguments accepted by `session retention sweep`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SweepArgs {
@@ -1909,147 +1700,6 @@ pub(crate) struct SweepArgs {
     pub(crate) apply: bool,
     /// Maximum sessions to remove.
     pub(crate) limit: Option<u32>,
-}
-
-/// Run `session policy get` against the daemon for `host`.
-///
-/// # Errors
-///
-/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
-/// resolved, the daemon rejects the request, or the payload does not match the
-/// contract.
-pub(crate) async fn run_policy_get(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
-    let result = client.call::<method::SessionPolicyGet>(()).await?;
-    let idle_stop = read_idle_stop(&mut client).await?;
-    print_policy(host, result.retention, idle_stop, true, json)
-}
-
-fn print_policy(
-    host: &str,
-    retention: SessionRetentionPolicy,
-    idle_stop: Option<SessionIdleStopResult>,
-    report_idle_stop: bool,
-    json: bool,
-) -> Result<(), CliError> {
-    if json {
-        print!(
-            "{}",
-            crate::commands::render_json(&PolicyOutput {
-                retention,
-                idle_stop
-            })?
-        );
-    } else {
-        print!(
-            "{}",
-            render_policy_human(host, &retention, idle_stop.as_ref(), report_idle_stop)
-        );
-    }
-    Ok(())
-}
-
-/// Run `session policy set` against the daemon for `host`.
-///
-/// The idle-stop default is only touched when `--idle-stop-after` is named. The
-/// daemon's support and minimum are read and the value is checked first, then
-/// the retention fields are written, then the default, so a refusal of either
-/// changes nothing. A daemon that refuses the default after the retention
-/// policy was written says which half landed. The current retention policy is
-/// read first so unnamed fields keep their value, which also means the daemon
-/// validates exactly the policy it will store.
-///
-/// # Errors
-///
-/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
-/// resolved, the daemon rejects the policy, or the payload does not match the
-/// contract.
-pub(crate) async fn run_policy_set(
-    host: &str,
-    paths: &Paths,
-    args: PolicyArgs,
-    json: bool,
-) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
-    if let Some(secs) = args.idle_stop_after {
-        let served = match client.call::<method::SessionIdleStopGet>(()).await {
-            Ok(served) => served,
-            Err(error) => return Err(missing_idle_stop_method_hint(&mut client, error).await),
-        };
-        if secs != 0 && secs < served.min_after_secs {
-            return Err(CliError::Protocol(protocol::ProtocolError::new(
-                protocol::ErrorClass::Daemon,
-                "invalid_session_policy",
-                format!(
-                    "--idle-stop-after must be 0 or at least {} seconds",
-                    served.min_after_secs
-                ),
-                None,
-            )));
-        }
-    }
-    let current = client.call::<method::SessionPolicyGet>(()).await?.retention;
-    let retention_written = args.names_retention();
-    let retention = if retention_written {
-        client
-            .call::<method::SessionPolicySet>(SessionPolicyParams {
-                retention: apply_policy_args(current, args),
-            })
-            .await?
-            .retention
-    } else {
-        current
-    };
-    let idle_stop = match args.idle_stop_after {
-        Some(secs) => Some(
-            match client
-                .call::<method::SessionIdleStopSet>(SessionIdleStopParams {
-                    default_after_secs: Some(secs),
-                })
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let error = missing_idle_stop_method_hint(&mut client, error).await;
-                    return Err(if retention_written {
-                        note_retention_landed(error)
-                    } else {
-                        error
-                    });
-                }
-            },
-        ),
-        None => None,
-    };
-    print_policy(
-        host,
-        retention,
-        idle_stop,
-        args.idle_stop_after.is_some(),
-        json,
-    )
-}
-
-/// Says in `error` that the retention policy was written before the failure.
-fn note_retention_landed(error: CliError) -> CliError {
-    const LANDED: &str = "the retention policy was updated, but the idle-stop default was not";
-    let note = |mut source: protocol::ProtocolError| {
-        source.msg = format!("{LANDED}: {}", source.msg);
-        source
-    };
-    match error {
-        CliError::Protocol(source) => CliError::Protocol(note(source)),
-        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
-            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
-                host,
-                source: note(source),
-            })
-        }
-        other => {
-            eprintln!("{LANDED}");
-            other
-        }
-    }
 }
 
 /// Run `session retention sweep` against the daemon for `host`.
@@ -2091,29 +1741,6 @@ fn sweep_succeeded(result: &SessionRetentionResult) -> bool {
     result.failed == 0 && result.worktrees_failed == 0
 }
 
-/// Returns `current` with the fields named by `args` replaced.
-fn apply_policy_args(current: SessionRetentionPolicy, args: PolicyArgs) -> SessionRetentionPolicy {
-    let enabled = if args.enabled {
-        true
-    } else if args.disabled {
-        false
-    } else {
-        current.enabled
-    };
-    SessionRetentionPolicy {
-        enabled,
-        sweep_interval_secs: args
-            .sweep_interval_secs
-            .unwrap_or(current.sweep_interval_secs),
-        terminal_ttl_secs: args.terminal_ttl_secs.unwrap_or(current.terminal_ttl_secs),
-        lost_ttl_secs: args.lost_ttl_secs.unwrap_or(current.lost_ttl_secs),
-        max_removals_per_sweep: args
-            .max_removals_per_sweep
-            .unwrap_or(current.max_removals_per_sweep),
-        unknown_fields: current.unknown_fields,
-    }
-}
-
 /// Builds the sweep params. `--apply` is the absence of `--dry-run`; clap
 /// requires exactly one of the two so the destructive mode is never implicit.
 fn sweep_params(args: SweepArgs) -> SessionRetentionParams {
@@ -2121,52 +1748,6 @@ fn sweep_params(args: SweepArgs) -> SessionRetentionParams {
         dry_run: args.dry_run || !args.apply,
         limit: args.limit,
     }
-}
-
-fn render_policy_human(
-    host: &str,
-    policy: &SessionRetentionPolicy,
-    idle_stop: Option<&SessionIdleStopResult>,
-    report_idle_stop: bool,
-) -> String {
-    let mut output = format!("host {host} session retention policy\n");
-    let _ = writeln!(
-        output,
-        "  automatic sweeps: {}",
-        if policy.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    let _ = writeln!(
-        output,
-        "  sweep_interval_secs: {}",
-        policy.sweep_interval_secs
-    );
-    let _ = writeln!(output, "  terminal_ttl_secs: {}", policy.terminal_ttl_secs);
-    let _ = writeln!(output, "  lost_ttl_secs: {}", policy.lost_ttl_secs);
-    let _ = writeln!(
-        output,
-        "  max_removals_per_sweep: {}",
-        policy.max_removals_per_sweep
-    );
-    match idle_stop {
-        None if !report_idle_stop => {}
-        Some(idle) => {
-            let _ = writeln!(
-                output,
-                "  idle_stop_after: {} (minimum {} seconds)",
-                idle.default_after_secs
-                    .map_or_else(|| "not set".to_owned(), |secs| format!("{secs} seconds")),
-                idle.min_after_secs
-            );
-        }
-        None => {
-            let _ = writeln!(output, "  idle_stop_after: not supported by this daemon");
-        }
-    }
-    output
 }
 
 fn render_sweep_human(host: &str, result: &SessionRetentionResult) -> String {
@@ -2404,39 +1985,8 @@ fn missing_consent_method_hint(error: CliError) -> CliError {
     }
 }
 
-fn fork_params(
-    target: &Target,
-    name: Option<String>,
-    accept_profile_change: bool,
-    cols: u16,
-    rows: u16,
-) -> SessionForkParams {
-    SessionForkParams {
-        session_id: SessionId(target.session_id.clone()),
-        name,
-        cwd_mode: ForkCwdMode::Same,
-        cols,
-        rows,
-        accept_profile_change,
-    }
-}
-
 fn resume_params(target: &Target, accept_profile_change: bool) -> SessionResumeParams {
     SessionResumeParams::new(SessionId(target.session_id.clone()), accept_profile_change)
-}
-
-#[cfg(test)]
-fn build_fork_request(
-    target: &Target,
-    name: Option<String>,
-    accept_profile_change: bool,
-    cols: u16,
-    rows: u16,
-) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_FORK,
-        &fork_params(target, name, accept_profile_change, cols, rows),
-    )
 }
 
 fn input_params(
@@ -2534,14 +2084,6 @@ fn render_new_human(
     }
     write_warnings(&mut output, &info.warnings);
     output
-}
-
-fn render_fork_human(info: &SessionInfo) -> String {
-    format!(
-        "session {} forked (state: {})\n",
-        info.id.0,
-        state_label(info.state)
-    )
 }
 
 fn render_list_human(sessions: &[SessionInfo]) -> String {
@@ -3310,9 +2852,9 @@ fn state_source_label(source: StateSource) -> &'static str {
 }
 
 /// The operations a session's recovery resolution refuses, with the error code
-/// each returns for it, as `resume=<code> fork=<code>`.
+/// each returns for it, as `resume=<code>`.
 fn capability_refusals_label(refusals: &protocol::SessionCapabilityRefusals) -> String {
-    [("resume", &refusals.resume), ("fork", &refusals.fork)]
+    [("resume", &refusals.resume)]
         .into_iter()
         .filter_map(|(operation, code)| {
             code.as_ref()
@@ -4407,13 +3949,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn renders_fork_result_with_new_session_id() {
-        let output = render_fork_human(&running_session("s-99"));
-
-        assert_eq!(output, "session s-99 forked (state: running)\n");
-    }
-
     #[tokio::test]
     async fn run_remove_calls_the_consenting_method_only_with_explicit_consent() {
         for (accept_unconfirmed_cleanup, expected_method) in [
@@ -4478,7 +4013,7 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), CliError>> + Send + 'a>,
         >;
-        let commands: [(&str, u32, &str, Command); 3] = [
+        let commands: [(&str, u32, &str, Command); 2] = [
             (
                 "stop",
                 pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS,
@@ -4487,16 +4022,6 @@ mod tests {
                     Box::pin(
                         async move { run_stop(&PinnedHost::local(), paths, target, json).await },
                     )
-                },
-            ),
-            (
-                "fork",
-                pohunek_client::SESSION_FORK_REQUEST_BUDGET_MS,
-                "session_fork_outcome_unknown",
-                |paths, target, json| {
-                    Box::pin(async move {
-                        run_fork(&PinnedHost::local(), paths, target, None, false, json).await
-                    })
                 },
             ),
             (
@@ -4667,38 +4192,6 @@ mod tests {
         assert_eq!(
             value["ok"]["accepted_unconfirmed_processes"],
             serde_json::json!([{"pid": 4242, "start_identity": "99", "command": "gpg-agent"}])
-        );
-    }
-
-    #[test]
-    fn build_fork_request_carries_the_profile_override_only_when_asked() {
-        let target: Target = "host-a/s-42".parse().expect("target");
-
-        let request = build_fork_request(&target, Some("forked review".to_owned()), false, 100, 30)
-            .expect("build fork request");
-        assert_request(
-            &request,
-            method::SESSION_FORK,
-            serde_json::json!({
-                "session_id": "s-42",
-                "name": "forked review",
-                "cwd_mode": "same",
-                "cols": 100,
-                "rows": 30
-            }),
-        );
-
-        let request = build_fork_request(&target, None, true, 100, 30).expect("build fork request");
-        assert_request(
-            &request,
-            method::SESSION_FORK,
-            serde_json::json!({
-                "session_id": "s-42",
-                "cwd_mode": "same",
-                "cols": 100,
-                "rows": 30,
-                "accept_profile_change": true
-            }),
         );
     }
 

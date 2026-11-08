@@ -44,8 +44,7 @@ the [github-workflow skill](../github-workflow/SKILL.md) for issue handling.
 
 ## Contribute a plugin
 
-A plugin is not contributed to this repository. To write a runtime package or
-a workflow plugin:
+A plugin is not contributed to this repository. To write a runtime package:
 
 1. Create a repository in your own account from the template
    `pohunekd/pohunek-plugin-template` and name it `pohunek-plugin-<name>`.

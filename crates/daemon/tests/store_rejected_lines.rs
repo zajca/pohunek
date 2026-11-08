@@ -456,9 +456,10 @@ fn setting_a_line_aside_keeps_every_other_record_and_a_failed_quarantine_keeps_t
 }
 
 #[tokio::test]
-async fn the_daemon_doctor_reports_rejected_lines_and_names_the_command() {
+async fn the_daemon_doctor_reports_rejected_lines_and_clears_once_they_are_set_aside() {
     let env = TestEnv::new().expect("create short test environment");
-    let layout = Layout::new(&env, &format!("{}\n", rejected_session_line()));
+    let line = rejected_session_line();
+    let layout = Layout::new(&env, &format!("{line}\n"));
     let mut daemon = daemon_command(&env, &layout)
         .stderr(Stdio::null())
         .spawn()
@@ -484,27 +485,40 @@ async fn the_daemon_doctor_reports_rejected_lines_and_names_the_command() {
     );
     assert_eq!(warned.status, protocol::DoctorStatus::Warn);
     assert!(
-        warned.detail.contains("pohunek store rejected list"),
-        "the check names the command: {}",
-        warned.detail
-    );
-    assert!(
         !warned.detail.contains("s-from-a-newer-daemon"),
         "the check carries counts, never a line"
     );
+    drop(client);
 
-    let listed = client
-        .call::<protocol::method::StoreRejectedList>(())
-        .await
-        .expect("list");
-    assert_eq!(listed.total, 1);
-    client
-        .call::<protocol::method::StoreRejectedSetAside>(protocol::StoreRejectedSetAsideParams {
-            content_hash: listed.lines[0].content_hash.clone(),
-            accept_pin_loss: true,
-        })
-        .await
+    daemon.kill().await.expect("stop daemon");
+    let _ = daemon.wait().await;
+
+    // The line is set aside through the store boundary while no daemon holds the store.
+    let content_hash = {
+        use sha2::{Digest as _, Sha256};
+        format!("{:x}", Sha256::digest(line.as_bytes()))
+    };
+    let store = Store::new(layout.store.clone());
+    assert_eq!(
+        store.rejected_lines().expect("list rejected lines").len(),
+        1
+    );
+    store
+        .set_aside_rejected(&content_hash, true)
         .expect("set the line aside");
+    assert!(
+        layout.store.with_file_name(QUARANTINE_NAME).exists(),
+        "the line is in the quarantine file"
+    );
+
+    let mut daemon = daemon_command(&env, &layout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("respawn daemon");
+    wait_until_ready(&mut daemon, &layout.socket()).await;
+    let mut client = pohunek_client::Client::connect_local(&layout.socket())
+        .await
+        .expect("connect to the restarted daemon");
     let settled = check(
         client
             .call::<protocol::method::DaemonDoctor>(())
@@ -512,10 +526,6 @@ async fn the_daemon_doctor_reports_rejected_lines_and_names_the_command() {
             .expect("doctor"),
     );
     assert_eq!(settled.status, protocol::DoctorStatus::Ok);
-    assert!(
-        layout.store.with_file_name(QUARANTINE_NAME).exists(),
-        "the line is in the quarantine file"
-    );
 
     daemon.kill().await.expect("stop daemon");
     let _ = daemon.wait().await;

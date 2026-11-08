@@ -320,8 +320,7 @@ impl SessionRegistry {
 ///
 /// The first sweep runs immediately so an upgraded daemon cleans stale
 /// records without waiting a full interval. Both the enable flag and the
-/// interval are re-read from the current policy every cycle, so a policy
-/// change takes effect on the next sweep without a restart. The task is a
+/// interval come from the policy the registry holds at each cycle. The task is a
 /// driver of `tasks`: daemon shutdown cancels it and waits for an in-flight
 /// sweep.
 #[expect(
