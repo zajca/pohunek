@@ -714,7 +714,9 @@ prefix, or a prefix, unit, config, state, or runtime directory reached through
 a symlink or not private to the user, each reported with the error code the
 final install or upgrade would fail with. A host with a pre-service
 `pohunekd.service` unit is refused before the lock, naming release v0.40.1 as
-the one to install first. `packaging/install-daemon.sh --accept-runtime-loss`
+the one to install first, as is a pending
+`migrations/durable-session-workers.json` manifest, which only v0.40.1 imports.
+`packaging/install-daemon.sh --accept-runtime-loss`
 gates `pohunek service upgrade` of an installed service, whose live-session
 preflight is described in
 [update after release](update-after-release.md#upgrade-preflight).

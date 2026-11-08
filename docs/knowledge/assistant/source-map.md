@@ -373,8 +373,8 @@ Release packaging and contributor verification:
 - `docs/install.md` — manual install: release archives, login service, upgrades, quick start, and installing the official runtime packages from a release daemon archive with its signed catalog.
 - `docs/development.md` — workspace layout, gates, fast loops, release pipeline.
 - `packaging/install-daemon.sh` — release-archive wrapper that re-executes
-  itself under `pohunek service lock`, refuses a legacy template-unit install
-  (naming release v0.40.1), runs `pohunek service check` for every check the
+  itself under `pohunek service lock`, refuses a legacy template-unit install or a
+  pending migration manifest (naming release v0.40.1), runs `pohunek service check` for every check the
   final install or upgrade makes, then runs `pohunek service install|upgrade`:
   `install` while `pohunek service status --json` reports a pending install
   transaction or no `service.toml` exists, `upgrade` otherwise. Before any of

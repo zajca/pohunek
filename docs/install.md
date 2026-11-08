@@ -171,7 +171,9 @@ new daemon would refuse to start with. See the
 A host that still runs the pre-service install (a `pohunekd.service` unit with
 `pohunek-session@` template workers) is refused by the installer before
 anything changes: install release v0.40.1 first, which migrates it to the
-service-managed daemon, then run this release's installer. The whole run holds
+service-managed daemon, then run this release's installer. A pending
+`migrations/durable-session-workers.json` manifest, which only v0.40.1 imports,
+is refused the same way. The whole run holds
 the service transaction lock (`pohunek service lock`), and `pohunek service
 check` first confirms that the final install or upgrade would accept `HOME`,
 the XDG roots, the prefix, and every directory it writes. See the

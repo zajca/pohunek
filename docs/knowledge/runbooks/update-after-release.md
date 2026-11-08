@@ -535,7 +535,9 @@ A host that still runs the pre-service install (a `pohunekd.service` unit with
 `pohunek-session@` template workers) is refused by the installer before any
 change, with a message naming release v0.40.1. That release is the last one that
 migrates such a host to the service-managed daemon; install it first, let the
-legacy sessions finish, then run this release's installer.
+legacy sessions finish, then run this release's installer. A pending
+`migrations/durable-session-workers.json` manifest, which only v0.40.1 imports,
+is refused the same way.
 `--accept-runtime-loss` is the one consent for the service-managed upgrade below;
 there is no second flag. See [debug session runtime](debug-session-runtime.md).
 
