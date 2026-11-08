@@ -158,12 +158,27 @@ fn a_gate_open_claude_reads_every_capture_with_its_record_and_every_dialog_from_
 }
 
 #[test]
-fn a_gate_open_claude_screen_without_a_record_reads_nothing_for_working_and_idle() {
-    for name in ["idle", "working_early", "working_stream", "idle_after_turn"] {
+fn a_gate_open_claude_without_a_held_record_reads_the_screen_as_before() {
+    // The rules marked `below_authority` are skipped only while a record is
+    // held; before the first record, and after a clear or a lag resync, the
+    // screen keeps deciding so the activity never goes stale.
+    for (name, meant) in [
+        ("idle", AgentActivity::Idle),
+        ("working_early", AgentActivity::Working),
+        ("working_stream", AgentActivity::Working),
+        ("idle_after_turn", AgentActivity::Idle),
+    ] {
         let mut harness = Harness::new("claude", CLAUDE_GATE_OPEN, InputReadiness::ScreenIdle);
         harness.feed(&captured("claude", "", name));
-        assert_eq!(harness.activity(), None, "{name}");
+        assert_eq!(harness.activity(), Some(meant), "{name}");
     }
+
+    let mut harness = Harness::new("claude", CLAUDE_GATE_OPEN, InputReadiness::ScreenIdle);
+    harness.feed(&captured("claude", "", "working_early"));
+    harness.feed(b"\x1b]7501;state=working:app=claude-code\x1b\\");
+    harness.feed(b"\x1b]7501;state=clear\x1b\\");
+    harness.feed(&captured("claude", "", "idle_after_turn"));
+    assert_eq!(harness.activity(), Some(AgentActivity::Idle));
 }
 
 #[test]

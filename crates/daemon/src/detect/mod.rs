@@ -520,7 +520,7 @@ impl Detector {
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
         let mut osc_events = self.osc.advance_with_offsets(bytes);
-        let had_osc_events = !osc_events.is_empty();
+        let mut applied_osc_evidence = false;
         // Without the opt-in a 7501 report is no event, so the screen is fed in
         // the same segments as for any other output.
         if self
@@ -550,6 +550,7 @@ impl Detector {
         for (item, end) in osc_events {
             self.feed_screen_segment(&bytes[consumed..end], &mut latch);
             if self.apply_osc_event(item, &mut latch.osc_changes) {
+                applied_osc_evidence = true;
                 self.sight_full_context();
                 self.latch_at_osc_point(&mut latch);
             }
@@ -571,7 +572,7 @@ impl Detector {
         };
         let hit = self.activity_evidence(freshness);
         let has_structured_evidence = hit.is_some();
-        if has_structured_evidence || had_osc_events {
+        if has_structured_evidence || applied_osc_evidence {
             self.last_evidence_at = Some(now);
         }
 
@@ -833,7 +834,7 @@ impl Detector {
             let screen_hit = self.manifest_evidence(
                 ContextFreshness::all(),
                 self.program_status.is_some(),
-                self.authority_gate().open,
+                self.authority_gate().open && self.program_status.is_some(),
             );
             if let Some(hit) = &screen_hit {
                 self.sight_visible_blocker(hit);
@@ -1067,7 +1068,7 @@ impl Detector {
             self.manifest_evidence(
                 freshness,
                 self.program_status.is_some(),
-                self.authority_gate().open,
+                self.authority_gate().open && self.program_status.is_some(),
             ),
         )
     }
@@ -1181,7 +1182,7 @@ impl ChunkLatch {
                 freshness,
                 RecordGate {
                     held: self.program_status.is_some(),
-                    authority_open: self.authority_open,
+                    authority_open: self.authority_open && self.program_status.is_some(),
                 },
             ),
         );

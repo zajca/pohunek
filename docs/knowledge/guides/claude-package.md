@@ -422,7 +422,9 @@ detection is screen-and-title only.
   an `id=` and are ignored by the detector.
 - From the gate, the working and idle screen rules (`live_status_spinner`,
   `live_turn_footer`, `live_prompt_box`, `completed_turn_status`) are marked
-  `below_authority` and no longer decide the activity; the records do. The
+  `below_authority`: from the gate, while a record is held, they do not decide
+  the activity and the record does; with no record held (before the first one,
+  after a clear) they apply as before. The
   dialog and blocked rules, the title rules and every rule for a release below
   the gate are unchanged, and the prompt box still decides input readiness.
 - A visible dialog on the screen always wins over a record that is not

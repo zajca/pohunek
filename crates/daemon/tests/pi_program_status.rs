@@ -726,20 +726,11 @@ async fn a_held_pi_record_outlives_screen_changes_until_pi_clears_it() {
     wait_screen(&fixture, &created.id, "Working", false).await;
     assert_eq!(fixture.activity(&created.id).await, Some(WORKING));
 
-    // The clear drops the record. The open gate retires the screen rules for
-    // working and idle, so the screen does not read the idle prompt back.
+    // The clear drops the record, and the screen speaks again.
     command(&fixture, b'l');
-    wait_until("the record to be dropped", || async {
-        let status = fixture
-            .registry
-            .detection(&created.id)
-            .await
-            .expect("session.detection")
-            .status
-            .expect("the daemon reports the detection status");
-        (!status.record_present).then_some(())
-    })
-    .await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
     fixture
         .registry
         .stop(&created.id)

@@ -64,7 +64,7 @@ reserved, so either way of installing serves it.
   Node installation is probed with that Node; every other variable is isolated.
 - Program status: the manifest declares `[program_status] app = "pi"` with
   `answer_probe = true` and `authority_from = "1.1.0"`; the `working_rule` and
-  `idle_editor_rule` screen rules are `below_authority`, so from the gate the
+  `idle_editor_rule` screen rules are `below_authority`, so from the gate, while a record is held, the
   records decide working and idle. Pi 1.1.0 and later print an OSC 7501 probe at start and
   report `working`, `done`, `idle`, `error`, `blocked` (kind `permission`,
   `question` or `auth`) and `clear` only after the terminal answers; the session

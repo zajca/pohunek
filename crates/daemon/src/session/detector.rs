@@ -285,10 +285,11 @@ impl SessionRegistry {
                 (
                     entry.detector_preview.clone(),
                     entry.detector_config.borrow().generation,
+                    entry.probe_answered,
                 )
             })
         };
-        let Some((preview, minimum_config_generation)) = managed else {
+        let Some((preview, minimum_config_generation, probe_answered)) = managed else {
             if self.inner.external.contains_id(id).await {
                 return Err(protocol::ProtocolError::session_has_no_managed_terminal());
             }
@@ -311,7 +312,8 @@ impl SessionRegistry {
                 .get(id)
                 .and_then(|entry| entry.info.activity.map(|_| entry.info.state_source))
         };
-        let status = snapshot.status.into_protocol(state_source);
+        let mut status = snapshot.status.into_protocol(state_source);
+        status.probe_answered = probe_answered;
         let previews = snapshot.previews;
 
         // The program-status preview stays off the wire while
@@ -402,17 +404,6 @@ impl SessionRegistry {
                 .active_agent
                 .as_ref()
                 .is_some_and(|report| report.activity_reported)
-            {
-                return;
-            }
-
-            // A hook that spoke for this generation outranks screen text and
-            // process activity; OSC evidence still applies.
-            if entry.hook_spoke
-                && matches!(
-                    transition.source,
-                    protocol::StateSource::Screen | protocol::StateSource::Process
-                )
             {
                 return;
             }

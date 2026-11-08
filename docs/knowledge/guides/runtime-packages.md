@@ -994,8 +994,8 @@ screen decides. Without the key the records are authoritative for every
 release.
 
 A rule may set `below_authority = true` (only with `authority_from`): it serves
-releases below the gate and is skipped for activity once the gate is open, so
-the records decide working and idle there. Dialog and blocked rules never set
+releases below the gate and is skipped for activity while the gate is open and a record is held, so
+the record decides working and idle there; with no record held the rule applies as without the gate. Dialog and blocked rules never set
 it. Input readiness still evaluates the rule, so a prompt box that releases the
 first input keeps doing so.
 

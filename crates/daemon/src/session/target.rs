@@ -1138,7 +1138,7 @@ impl SessionRegistry {
             default_detector_config,
             launch_name,
             runtime_version,
-            hook_spoke: false,
+            probe_answered: answers_program_status_probe,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),

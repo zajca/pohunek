@@ -1059,10 +1059,9 @@ struct SessionEntry {
     /// The release the launch of this runtime generation probed; `None` for an
     /// unprobed program or a session re-attached after a daemon restart.
     runtime_version: Option<package::version_probe::ProbeVersion>,
-    /// Whether a hook or provider report has set this generation's activity.
-    /// Once set, the detector's screen and process transitions are not applied;
-    /// its OSC transitions still are.
-    hook_spoke: bool,
+    /// Whether the session worker answers the program's OSC 7501 probe, as set
+    /// when the generation launched.
+    probe_answered: bool,
     /// Definition of the session's launch pin, fixed when this daemon
     /// launched or adopted the session: the verified installed package, or the
     /// built-in runtime of the same package identity. A session launched by
@@ -1742,7 +1741,6 @@ fn clear_entry_agent(entry: &mut SessionEntry) {
     entry.last_agent_report = None;
     entry.observed_agents.clear();
     entry.bound_reporter = None;
-    entry.hook_spoke = false;
 }
 
 /// Applies the session presentation of a `Lost` classification to `info`.
@@ -5106,7 +5104,6 @@ impl SessionRegistry {
             false,
         );
         entry.set_activity(activity);
-        entry.hook_spoke = true;
         self.wake_idle_stop();
         entry.info.state_source = StateSource::Report;
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
@@ -9378,7 +9375,6 @@ fn clear_active_agent(
         .is_some_and(|active| active.activity_reported);
     entry.last_agent_report = Some(tombstone);
     entry.active_agent = None;
-    entry.hook_spoke = false;
     entry.info.active_agent = None;
     entry.info.active_agent_base = None;
     entry.info.active_agent_pid = None;
@@ -9425,15 +9421,19 @@ fn send_detector_config(entry: &SessionEntry, mut config: DetectorConfig) {
     config.runtime_version = own_runtime.then_some(entry.runtime_version).flatten();
     config.gate_waived = program_status_app(&config).is_some() && !own_runtime;
     let gate = config.authority_gate();
-    tracing::info!(
+    if program_status_app(&config).is_some() {
+        tracing::info!(
         target: "session.program_status.gate",
+        session = %entry.info.id.0,
+        runtime = %entry.info.agent_base,
         runtime_version = ?gate.runtime_version.map(|version| version.to_string()),
         authority_from = ?gate.authority_from.map(|version| version.to_string()),
         gate_open = gate.open,
         reason = gate.reason.as_str(),
         answer_probe = config.answers_program_status_probe(),
         "program-status authority gate reconfigured"
-    );
+        );
+    }
     let generation = entry
         .detector_config
         .borrow()
