@@ -23,7 +23,7 @@ pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
     ProcessMatchers, ProgramStatusConfig,
 };
-pub use osc::{OscEvidence, OscParser};
+pub use osc::{OscEvidence, OscParser, ProgressReport, ProgressState};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
 use pohunek_terminal::{ProgramState, ProgramStatusRecord, ProgramStatusReport};
@@ -589,11 +589,14 @@ impl Detector {
                 self.title_seq = self.strict_seq;
                 true
             }
-            OscEvidence::Progress(progress) => {
+            OscEvidence::Progress(report) => {
+                let progress = report.region_text();
                 changes.progress |= self.latest_progress.as_deref() != Some(progress.as_str());
                 self.latest_progress = Some(progress);
                 true
             }
+            // A plain notice is not state evidence.
+            OscEvidence::Notice(_) => false,
             OscEvidence::Cwd(path) => {
                 self.latest_cwd_hint = Some(path);
                 false
@@ -1592,18 +1595,6 @@ mod tests {
     }
 
     #[test]
-    fn osc_progress_action_required_emits_blocked_progress_transition() {
-        let started_at = instant();
-        let mut detector = Detector::new(3, 80, started_at, config());
-
-        assert_eq!(
-            detector.feed(started_at, b"\x1b]9;action required\x07"),
-            vec![transition(AgentActivity::Blocked, StateSource::OscProgress)]
-        );
-        assert_eq!(detector.latest_progress(), Some("action required"));
-    }
-
-    #[test]
     fn non_empty_control_bytes_without_visible_text_emit_working_process_transition() {
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config());
@@ -1989,13 +1980,13 @@ mod tests {
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config());
 
-        let transitions = detector.feed(started_at, b"\x1b]2;working\x07\x1b]9;progress\x07");
+        let transitions = detector.feed(started_at, b"\x1b]2;working\x07\x1b]9;4;1;50\x07");
         assert_eq!(
             transitions,
             vec![transition(AgentActivity::Working, StateSource::OscTitle)]
         );
         assert_eq!(detector.latest_title(), Some("working"));
-        assert_eq!(detector.latest_progress(), Some("progress"));
+        assert_eq!(detector.latest_progress(), Some("4;1"));
 
         detector.resync_after_lag();
 

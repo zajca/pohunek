@@ -25,13 +25,6 @@ region = "osc_title"
 any = [{ contains = "blocked" }, { contains = "action required" }]
 
 [[rules]]
-id = "osc_progress_blocked"
-state = "blocked"
-priority = 300
-region = "osc_progress"
-any = [{ contains = "blocked" }, { contains = "action required" }]
-
-[[rules]]
 id = "screen_blocked"
 state = "blocked"
 priority = 300
@@ -47,12 +40,16 @@ priority = 200
 region = "osc_title"
 any = [{ contains = "idle" }, { contains = "ready" }]
 
+# OSC 9;4 progress reaches the `osc_progress` region as the normalised text
+# `4;<state>`: state 0 removes the indicator (idle) and state 3 is
+# indeterminate progress (working). Plain OSC 9 notification text never
+# reaches this region. States 1, 2 and 4 map to no activity.
 [[rules]]
 id = "osc_progress_idle"
 state = "idle"
 priority = 200
 region = "osc_progress"
-any = [{ contains = "idle" }, { contains = "ready" }]
+regex = ['^4;0$']
 
 [[rules]]
 id = "screen_idle"
@@ -75,7 +72,7 @@ id = "osc_progress_working"
 state = "working"
 priority = 100
 region = "osc_progress"
-any = [{ contains = "working" }, { contains = "running" }, { contains = "progress" }]
+regex = ['^4;3$']
 
 [[rules]]
 id = "screen_working"

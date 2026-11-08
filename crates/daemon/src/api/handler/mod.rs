@@ -1124,8 +1124,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 DetectionRegionKind::OscTitle,
-                DetectionRegionKind::OscProgress,
                 DetectionRegionKind::WholeRecent,
+                DetectionRegionKind::OscProgress,
             ]
         );
         sessions.stop(&created.id).await.expect("stop the session");

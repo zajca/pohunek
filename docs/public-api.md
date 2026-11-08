@@ -2101,8 +2101,9 @@ Important fields:
 - `state`: `starting`, `running`, `stopped`, `done`, or `failed`. `failed`
   also presents a runtime that was lost with an observed end (see `runtime`).
 - `state_source`: `osc_title`, `osc_progress`, `screen`, `process`, or
-  `report`. `osc_progress` is an OSC status report of the program: OSC 9
-  progress or an OSC 7501 program-status record.
+  `report`. `osc_progress` is an OSC status report of the program: an OSC 9;4
+  progress report or an OSC 7501 program-status record. A plain OSC 9
+  notification text is not progress.
 - `activity`: optional `working`, `blocked`, or `idle`. `idle` means the agent shows its
   prompt and is ready for input; a startup or confirmation dialog (folder trust,
   login, permission) reads `blocked`. Readiness for a first input is a separate
