@@ -16,7 +16,9 @@ pub enum OscEvidence {
     Title(String),
     /// A well-formed `OSC 9 ; 4 ; <state> [; <percent>]` progress report.
     Progress(ProgressReport),
-    /// A plain `OSC 9 ; <text>` desktop notification. It is not progress.
+    /// A desktop notification: a plain `OSC 9 ; <text>`, an `OSC 777 ; notify`
+    /// or a complete `OSC 99` title or body. Its title and body are joined by
+    /// a newline. It is not progress.
     Notice(String),
     Cwd(String),
     /// A parsed OSC 7501 program-status report, never a probe.
@@ -105,6 +107,54 @@ fn classify_osc9(payload: &[u8]) -> Option<OscEvidence> {
         return None;
     }
     Some(OscEvidence::Progress(ProgressReport { state, percent }))
+}
+
+/// The `OSC 777` extension that carries a notification.
+const OSC777_NOTIFY: &[u8] = b"notify";
+
+/// `OSC 777 ; notify ; <title> ; <body>`. Any other `777` extension is
+/// ignored.
+fn classify_osc777(payload: &[u8]) -> Option<OscEvidence> {
+    let mut parts = payload.splitn(3, |&byte| byte == b';');
+    if parts.next()? != OSC777_NOTIFY {
+        return None;
+    }
+    let title = parts.next().unwrap_or_default();
+    let body = parts.next().unwrap_or_default();
+    Some(OscEvidence::Notice(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(title),
+        String::from_utf8_lossy(body)
+    )))
+}
+
+/// `OSC 99 ; <metadata> ; <payload>` of the kitty notification protocol.
+///
+/// Only a complete, unencoded `title` or `body` payload is a notice: a chunked
+/// notification (`d=0`), a base64 payload (`e=1`), a query, a close and any
+/// other payload type are ignored.
+fn classify_osc99(payload: &[u8]) -> Option<OscEvidence> {
+    let split = payload.iter().position(|&byte| byte == b';')?;
+    let (metadata, text) = (&payload[..split], &payload[split + 1..]);
+    let mut payload_type: &[u8] = b"title";
+    for pair in metadata.split(|&byte| byte == b':') {
+        let Some(eq) = pair.iter().position(|&byte| byte == b'=') else {
+            continue;
+        };
+        let (key, value) = (&pair[..eq], &pair[eq + 1..]);
+        match key {
+            b"d" if value == b"0" => return None,
+            b"e" if value != b"0" => return None,
+            b"p" => payload_type = value,
+            _ => {}
+        }
+    }
+    if payload_type != b"title" && payload_type != b"body" {
+        return None;
+    }
+    Some(OscEvidence::Notice(
+        String::from_utf8_lossy(text).into_owned(),
+    ))
 }
 
 fn parse_percent(digits: &[u8]) -> Option<u8> {
@@ -296,8 +346,10 @@ impl OscParser {
     }
 
     fn is_supported_command(&self) -> bool {
-        matches!(self.command.as_slice(), b"0" | b"2" | b"7" | b"9")
-            || self.command == PROGRAM_STATUS
+        matches!(
+            self.command.as_slice(),
+            b"0" | b"2" | b"7" | b"9" | b"99" | b"777"
+        ) || self.command == PROGRAM_STATUS
     }
 
     fn finish_osc(&mut self, offset: usize, evidence: &mut Vec<(OscEvidence, usize)>) {
@@ -305,6 +357,8 @@ impl OscParser {
             b"0" | b"2" => Some(OscEvidence::Title(self.payload_string())),
             b"7" => self.cwd_payload().map(OscEvidence::Cwd),
             b"9" => classify_osc9(&self.payload),
+            b"777" => classify_osc777(&self.payload),
+            b"99" => classify_osc99(&self.payload),
             command if command == PROGRAM_STATUS => parse_program_status(&self.payload)
                 .filter(|report| *report != ProgramStatusReport::Probe)
                 .map(OscEvidence::ProgramStatus),

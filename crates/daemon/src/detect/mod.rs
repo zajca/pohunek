@@ -422,6 +422,8 @@ pub struct Detector {
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
+    /// An approval notice arrived since the last [`Self::take_approval_notice`].
+    approval_notice: bool,
     /// When the latest evidence (an OSC event or a manifest match) was applied.
     last_evidence_at: Option<Instant>,
     /// The latest root OSC 7501 record of the active manifest's app. Held until
@@ -474,6 +476,7 @@ impl Detector {
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
+            approval_notice: false,
             last_evidence_at: None,
             program_status: None,
             process_activity: ProcessActivityScanner::default(),
@@ -769,8 +772,12 @@ impl Detector {
                 self.latest_progress = Some(progress);
                 true
             }
-            // A plain notice is not state evidence.
-            OscEvidence::Notice(_) => false,
+            // A notice is not state evidence; an approval notice is held for
+            // the attention fallback.
+            OscEvidence::Notice(text) => {
+                self.approval_notice |= is_approval_notice(&text);
+                false
+            }
             OscEvidence::Cwd(path) => {
                 self.latest_cwd_hint = Some(path);
                 false
@@ -968,6 +975,12 @@ impl Detector {
             self.runtime_version,
             self.gate_waived,
         )
+    }
+
+    /// Takes whether an approval notice (`OSC 9`, `OSC 777 ; notify` or
+    /// `OSC 99`) arrived since the last call.
+    pub fn take_approval_notice(&mut self) -> bool {
+        std::mem::take(&mut self.approval_notice)
     }
 
     /// Takes the latest OSC 7 cwd hint, if one has arrived.
@@ -1275,6 +1288,19 @@ fn match_context_for(
 struct Arrivals {
     title: u64,
     screen: u64,
+}
+
+/// The text an agent's approval notice starts with.
+const APPROVAL_NOTICE_PREFIX: &str = "approval requested";
+
+/// Whether a notice is an approval request: its title or body starts with
+/// the approval text, ASCII case-insensitively.
+fn is_approval_notice(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.get(..APPROVAL_NOTICE_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(APPROVAL_NOTICE_PREFIX))
+    })
 }
 
 /// What the program-status layer tells a manifest match.
