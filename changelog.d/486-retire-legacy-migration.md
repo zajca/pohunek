@@ -1,0 +1,4 @@
+---
+kind: removed
+---
+The one-time migration from the pre-service install (a `pohunekd.service` unit with `pohunek-session@` template workers) is no longer shipped: `pohunek migration preflight`, the installer's legacy retirement, and the daemon's import of a migration manifest (with its `migration_manifest_missing` gate on session creation) are gone. `packaging/install-daemon.sh` now refuses a host that still has a `pohunekd.service` unit before anything changes and names release v0.40.1, the last release that migrates it, as the one to install first; a pending `migrations/durable-session-workers.json` manifest is refused the same way. `--accept-runtime-loss` stays for `pohunek service upgrade`, `service check` and `service refresh-path` on a service-managed host. Imported-manifest archives that an earlier release left in `migrations/` are still removed by `service uninstall --purge`.

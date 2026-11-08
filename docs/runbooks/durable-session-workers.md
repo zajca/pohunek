@@ -347,6 +347,5 @@ upgrade. Already-running workers continue executing their own versioned binary. 
 operator workflow; never restart its worker merely to pick up an update.
 
 The first worker-aware release is a separate boundary from the normal N/N-1
-window. Follow
-[the migration guide](../migrations/durable-session-workers.md) before replacing
-a legacy daemon.
+window. A host still on the legacy daemon-owned PTYs installs release v0.40.1
+first, the last release that migrates it.

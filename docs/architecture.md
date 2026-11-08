@@ -1017,13 +1017,6 @@ Startup order in `crates/daemon/src/main.rs`:
 same classification and migration in memory only, with no lock, backup or
 write, for the upgrade preflight (see "Upgrade window").
 
-A pending legacy migration manifest (`pohunek migration preflight`) is
-validated against the original store bytes: the importer accepts a store whose
-SHA-256 equals the manifest fingerprint, or a store that is exactly the schema
-migration of the `.pre-schema-<old>` backup whose SHA-256 equals it. A store
-edited before or after the schema migration is still refused with
-`migration_store_changed`.
-
 A store written by a newer daemon, or older than every kept step, is refused
 with a typed `StoreSchemaError`; the daemon exits at startup and the store is
 not touched. An interrupted service upgrade never automatically downgrades over a store

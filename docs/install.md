@@ -163,18 +163,13 @@ list; it never overrides a plan the release cannot apply
 new daemon would refuse to start with. See the
 [update runbook](knowledge/runbooks/update-after-release.md).
 
-The first upgrade from a legacy daemon-owned PTY release refuses live sessions
-by default because those open PTYs cannot be transferred. Let them finish; use
-`--accept-runtime-loss` only after reviewing the affected ids and knowingly
-accepting the destructive boundary. An install that still runs the older
-`pohunek-session@` template workers is retired only after the wrapper has
-closed new connections to the legacy daemon, run the migration preflight, and
-re-checked every not-inactive worker state after the daemon stopped; any
-detected worker aborts the installer without removing legacy files. The whole
-run holds the service transaction lock (`pohunek service lock`), and
-`pohunek service check` first confirms that the final install or upgrade would
-accept `HOME`, the XDG roots, the prefix, and every directory it writes. See the
-[migration guide](migrations/durable-session-workers.md) and
+A host that still runs the pre-service install (a `pohunekd.service` unit with
+`pohunek-session@` template workers) is refused by the installer before
+anything changes: install release v0.40.1 first, which migrates it to the
+service-managed daemon, then run this release's installer. The whole run holds
+the service transaction lock (`pohunek service lock`), and `pohunek service
+check` first confirms that the final install or upgrade would accept `HOME`,
+the XDG roots, the prefix, and every directory it writes. See the
 [operations runbook](runbooks/durable-session-workers.md).
 
 Or build from source (Rust 1.96+):

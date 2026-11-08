@@ -841,8 +841,7 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `migration_manifest_missing` while unmigrated legacy resume
-    /// bindings exist, before anything is written, `agent_profile_changed` or
+    /// Returns `agent_profile_changed` or
     /// `agent_profile_missing` when the profile no longer matches the source,
     /// `native_identity_evidence_unavailable` when the source's durable record
     /// or exact worker generation cannot be read and matched,
@@ -873,7 +872,6 @@ impl SessionRegistry {
         params: SessionForkParams,
         spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<SessionInfo, ProtocolError> {
-        self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
         // Held from resolving the pin until the detached registration has
         // persisted the fork's record, so the pinned package cannot be
