@@ -774,6 +774,24 @@ fn a_pre_service_install_is_refused_naming_the_bridge_release() {
 }
 
 #[test]
+fn a_pending_migration_manifest_is_refused_naming_the_bridge_release() {
+    let fixture = Fixture::new();
+    let data_home = fixture.base().join("data");
+    let manifest = data_home.join("pohunek/migrations/durable-session-workers.json");
+    write(&manifest, "{}\n");
+    let output = fixture.run(
+        &[],
+        &[("XDG_DATA_HOME", data_home.to_str().expect("utf-8"))],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pending migration manifest"), "{stderr}");
+    assert!(stderr.contains("install release v0.40.1 first"), "{stderr}");
+    assert!(fixture.pohunek_calls().is_empty(), "no pohunek call ran");
+    assert!(manifest.exists(), "the manifest stays");
+}
+
+#[test]
 fn a_stray_legacy_unit_on_macos_is_named_for_removal() {
     let fixture = Fixture::new();
     fixture.fake_host("Darwin", "arm64");

@@ -94,6 +94,19 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     exit 1
 fi
 
+# The v0.40.1 migration removes the units before its final install, so a run
+# that stopped there leaves its manifest unimported. Release v0.40.1 imports it
+# while no session record exists; once a record is written the sessions are
+# lost, so this release is refused while the manifest is pending.
+legacy_manifest="${XDG_DATA_HOME:-"$HOME/.local/share"}/pohunek/migrations/durable-session-workers.json"
+if [ -e "$legacy_manifest" ]; then
+    echo "$legacy_manifest is a pending migration manifest of a pre-service install;" >&2
+    echo "nothing was changed" >&2
+    echo "install release v0.40.1 first (its daemon imports the manifest)," >&2
+    echo "then re-run $0 from this release" >&2
+    exit 1
+fi
+
 # Everything below runs under the transaction lock. `pohunek service lock`
 # refuses with `service_transaction_in_progress` while another `pohunek
 # service` command holds it, before this script runs again; nothing was

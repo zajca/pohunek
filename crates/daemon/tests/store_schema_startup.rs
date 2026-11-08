@@ -171,3 +171,55 @@ async fn an_older_store_is_migrated_with_a_backup_before_the_daemon_serves() {
     daemon.kill().await.expect("stop daemon");
     let _ = daemon.wait().await;
 }
+
+/// A schema-1 store written by the pre-service daemon: resume bindings and no
+/// logical record.
+fn resume_only_store() -> String {
+    let mut store = String::new();
+    for line in V0_33_0_STORE
+        .lines()
+        .filter(|line| !line.contains("\"kind\":\"session\""))
+    {
+        store.push_str(line);
+        store.push('\n');
+    }
+    store
+}
+
+#[tokio::test]
+async fn a_pending_legacy_manifest_and_record_less_bindings_are_left_untouched() {
+    let env = TestEnv::new().expect("create short test environment");
+    let layout = Layout::new(&env, &resume_only_store());
+    let manifest = layout
+        .store
+        .parent()
+        .expect("data dir")
+        .join(pohunek_paths::MIGRATIONS_SUBDIR)
+        .join(pohunek_paths::LEGACY_MANIFEST_NAME);
+    fs::create_dir_all(manifest.parent().expect("migrations dir")).expect("create migrations dir");
+    fs::write(&manifest, b"{\"schema_version\":1}\n").expect("write manifest");
+
+    let mut daemon = daemon_command(&env, &layout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    wait_until_ready(&mut daemon, &layout.socket()).await;
+
+    assert_eq!(
+        fs::read(&manifest).expect("manifest stays"),
+        b"{\"schema_version\":1}\n",
+        "the pending manifest is neither imported nor archived"
+    );
+    let store = fs::read_to_string(&layout.store).expect("read store");
+    assert!(
+        store.contains("\"s-fixture-resume\""),
+        "the record-less binding stays on disk: {store}"
+    );
+    assert!(
+        !store.contains("\"kind\":\"session\""),
+        "no logical record is invented from the manifest: {store}"
+    );
+
+    daemon.kill().await.expect("stop daemon");
+    let _ = daemon.wait().await;
+}
