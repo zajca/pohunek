@@ -420,6 +420,11 @@ detection is screen-and-title only.
   reported as `state_source = osc_progress`; a visible dialog over a `blocked`
   record is reported as `screen`. Records of background agents carry
   an `id=` and are ignored by the detector.
+- From the gate, the working and idle screen rules (`live_status_spinner`,
+  `live_turn_footer`, `live_prompt_box`, `completed_turn_status`) are marked
+  `below_authority` and no longer decide the activity; the records do. The
+  dialog and blocked rules, the title rules and every rule for a release below
+  the gate are unchanged, and the prompt box still decides input readiness.
 - A visible dialog on the screen always wins over a record that is not
   `blocked`: the folder trust, theme, login, API-key and permission dialogs stay
   blocked, whatever a (forged or stale) record says. The API-key dialog is read

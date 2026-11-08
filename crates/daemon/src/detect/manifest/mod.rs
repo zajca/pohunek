@@ -83,6 +83,17 @@ impl Manifest {
                 });
             }
         }
+        if program_status
+            .as_ref()
+            .and_then(ProgramStatusConfig::authority_from)
+            .is_none()
+        {
+            if let Some(rule) = rules.iter().find(|rule| rule.below_authority) {
+                return Err(ManifestError::BelowAuthorityWithoutGate {
+                    rule_id: rule.id.clone(),
+                });
+            }
+        }
         let process = raw
             .process
             .map(|raw_process| compile_process_matchers(raw_process, &mut budget))
@@ -118,6 +129,9 @@ impl Manifest {
 
         for rule in &self.rules {
             if rule.overrides_program_status && !context.program_status_held {
+                continue;
+            }
+            if rule.below_authority && context.authority_open {
                 continue;
             }
 
@@ -415,6 +429,9 @@ pub struct MatchContext {
     /// only then; without one they are skipped, so the screen reads as it
     /// would without the override.
     program_status_held: bool,
+    /// The program-status gate is open: rules marked `below_authority` serve
+    /// releases below the gate only and are skipped.
+    authority_open: bool,
 }
 
 impl MatchContext {
@@ -429,6 +446,13 @@ impl MatchContext {
     #[must_use]
     pub fn with_program_status_held(mut self, held: bool) -> Self {
         self.program_status_held = held;
+        self
+    }
+
+    /// Marks the release gate as open, which skips the `below_authority` rules.
+    #[must_use]
+    pub fn with_authority_open(mut self, open: bool) -> Self {
+        self.authority_open = open;
         self
     }
 

@@ -25,7 +25,10 @@ cmdline = [
 # Claude Code reports its root state as OSC 7501 records once the session
 # worker answers its `ESC ] 7501 ; ? ST` probe. The records are authoritative
 # from `authority_from`; below it, or for an unprobed release, the worker does
-# not answer the probe and the title and screen rules decide. The record outranks stale
+# not answer the probe and the title and screen rules decide. The working and
+# idle screen rules marked `below_authority` serve those releases only and are
+# skipped once the gate is open; the prompt-box rule still decides input
+# readiness. The record outranks stale
 # screen evidence; a visible dialog still wins (see the program-status layer in
 # docs/architecture.md). Background agents report as `id=` records, which are
 # ignored.
@@ -62,6 +65,7 @@ regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 id = "live_status_spinner"
 state = "working"
 priority = 960
+below_authority = true
 region = "whole_recent"
 line_regex = ['^[·✢✳✶✻✽*] (?:[\p{L}\x27’-]+…|\S[^…]*… \((?:[0-9]+[smh]\b.*|[0-9]*[smh]?…))$']
 not = { any = [
@@ -79,6 +83,7 @@ not = { any = [
 id = "live_turn_footer"
 state = "working"
 priority = 960
+below_authority = true
 region = "after_last_horizontal_rule"
 contains = ["esc to interrupt"]
 not = { any = [
@@ -165,6 +170,7 @@ regex = [
 id = "live_prompt_box"
 state = "idle"
 priority = 950
+below_authority = true
 region = "prompt_box_body"
 line_regex = ['^\s*❯']
 not = { any = [
@@ -183,6 +189,7 @@ not = { any = [
 id = "completed_turn_status"
 state = "idle"
 priority = 955
+below_authority = true
 region = "last_non_empty_above_prompt_box"
 line_regex = ['^[·✢✳✶✻✽*] \S.* for [0-9]+(?:\.[0-9]+)?s(?: · done [^·]+)?$']
 

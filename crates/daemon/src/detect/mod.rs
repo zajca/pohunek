@@ -491,6 +491,7 @@ impl Detector {
             self.latch_gate_open(),
             recent_before.clone(),
             self.program_status.clone(),
+            self.authority_gate().open,
         );
         let mut consumed = 0;
         for (item, end) in osc_events {
@@ -769,8 +770,11 @@ impl Detector {
         // A pending candidate needs repeated observations to confirm, so it
         // keeps evaluating even over unchanged context.
         if self.context_dirty || self.needs_visible_recheck || self.state.has_pending() {
-            let screen_hit =
-                self.manifest_evidence(ContextFreshness::all(), self.program_status.is_some());
+            let screen_hit = self.manifest_evidence(
+                ContextFreshness::all(),
+                self.program_status.is_some(),
+                self.authority_gate().open,
+            );
             if let Some(hit) = &screen_hit {
                 self.sight_visible_blocker(hit);
             }
@@ -801,7 +805,7 @@ impl Detector {
         // clear alone, or the idle title cached from before the blocker, can
         // never release the latched prompt.
         let idle_hit = || {
-            self.manifest_evidence(ContextFreshness::all(), false)
+            self.manifest_evidence(ContextFreshness::all(), false, false)
                 .filter(|hit| hit.evidence.activity == AgentActivity::Idle)
         };
         let screen_idle =
@@ -900,7 +904,7 @@ impl Detector {
         if !self.initial_input_pending || self.input_readiness != InputReadiness::ManifestIdle {
             return;
         }
-        if let Some(hit) = self.manifest_evidence(ContextFreshness::all(), false) {
+        if let Some(hit) = self.manifest_evidence(ContextFreshness::all(), false, false) {
             self.sight_visible_blocker(&hit);
         }
     }
@@ -971,7 +975,11 @@ impl Detector {
         };
         overlay_program_status(
             self.program_status.as_ref(),
-            self.manifest_evidence(freshness, self.program_status.is_some()),
+            self.manifest_evidence(
+                freshness,
+                self.program_status.is_some(),
+                self.authority_gate().open,
+            ),
         )
     }
 
@@ -979,6 +987,7 @@ impl Detector {
         &self,
         freshness: ContextFreshness,
         program_status_held: bool,
+        authority_open: bool,
     ) -> Option<ManifestEvidenceHit> {
         self.manifest.as_ref().and_then(|manifest| {
             manifest_hit(
@@ -992,6 +1001,7 @@ impl Detector {
                 },
                 freshness,
                 program_status_held,
+                authority_open,
             )
         })
     }
@@ -1020,12 +1030,20 @@ struct ChunkLatch {
     drew: bool,
     evaluations: usize,
     sighted: Option<ActivityEvidence>,
+    /// The program-status gate is open, so `below_authority` rules are skipped.
+    authority_open: bool,
 }
 
 impl ChunkLatch {
-    fn new(open: bool, recent_before: String, program_status: Option<ProgramStatusRecord>) -> Self {
+    fn new(
+        open: bool,
+        recent_before: String,
+        program_status: Option<ProgramStatusRecord>,
+        authority_open: bool,
+    ) -> Self {
         Self {
             open,
+            authority_open,
             program_status,
             recent_before,
             osc_changes: OscChanges::default(),
@@ -1071,6 +1089,7 @@ impl ChunkLatch {
                 Arrivals::default(),
                 freshness,
                 self.program_status.is_some(),
+                self.authority_open,
             ),
         );
         if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
@@ -1182,7 +1201,8 @@ struct Arrivals {
 /// shared counterpart of [`Detector::manifest_evidence`], for the same
 /// borrow-split reason as [`match_context_for`]. `program_status_held`
 /// enables the rules that override a record; readiness passes `false`, so a
-/// record never releases a prompt.
+/// record never releases a prompt. `authority_open` skips the `below_authority`
+/// rules; readiness passes `false`, so those rules still release a prompt.
 fn manifest_hit(
     manifest: &Manifest,
     screen: &ScreenTracker,
@@ -1191,9 +1211,11 @@ fn manifest_hit(
     arrivals: Arrivals,
     freshness: ContextFreshness,
     program_status_held: bool,
+    authority_open: bool,
 ) -> Option<ManifestEvidenceHit> {
     let context = match_context_for(manifest, screen, latest_title, latest_progress, freshness)
-        .with_program_status_held(program_status_held);
+        .with_program_status_held(program_status_held)
+        .with_authority_open(authority_open);
     let matched = manifest.match_context(&context)?;
     let source = manifest_source(&matched.region);
     if matched.activity == AgentActivity::Blocked
@@ -1271,6 +1293,7 @@ impl ReadinessObserver<'_> {
                     screen: *self.screen_seq,
                 },
                 ContextFreshness::all(),
+                false,
                 false,
             )
         });

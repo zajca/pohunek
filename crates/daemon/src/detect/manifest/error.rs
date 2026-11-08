@@ -39,6 +39,8 @@ pub enum ManifestError {
     InvalidProgramStatusApp { app: String },
     #[error("[program_status] authority_from {value:?} is not a MAJOR.MINOR.PATCH version")]
     InvalidProgramStatusAuthority { value: String },
+    #[error("rule {rule_id:?} sets below_authority without [program_status] authority_from")]
+    BelowAuthorityWithoutGate { rule_id: String },
     #[error("rule {rule_id:?} sets overrides_program_status without a [program_status] table")]
     OverrideWithoutProgramStatus { rule_id: String },
 }

@@ -1735,6 +1735,7 @@ fn clear_entry_agent(entry: &mut SessionEntry) {
     entry.last_agent_report = None;
     entry.observed_agents.clear();
     entry.bound_reporter = None;
+    entry.hook_spoke = false;
 }
 
 /// Applies the session presentation of a `Lost` classification to `info`.
@@ -9370,6 +9371,7 @@ fn clear_active_agent(
         .is_some_and(|active| active.activity_reported);
     entry.last_agent_report = Some(tombstone);
     entry.active_agent = None;
+    entry.hook_spoke = false;
     entry.info.active_agent = None;
     entry.info.active_agent_base = None;
     entry.info.active_agent_pid = None;

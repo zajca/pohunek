@@ -48,6 +48,7 @@ pub(super) struct Rule {
     pub(super) region: ManifestRegion,
     pub(super) visible_blocker: bool,
     pub(super) overrides_program_status: bool,
+    pub(super) below_authority: bool,
     pub(super) gate: Gate,
 }
 
@@ -70,6 +71,7 @@ impl Rule {
             gates,
             visible_blocker,
             overrides_program_status,
+            below_authority,
         } = raw;
 
         let activity = parse_activity(&id, state)?;
@@ -95,6 +97,7 @@ impl Rule {
             region: parsed_region,
             visible_blocker: visible_blocker.unwrap_or(false),
             overrides_program_status: overrides_program_status.unwrap_or(false),
+            below_authority: below_authority.unwrap_or(false),
             gate,
         })
     }
@@ -424,6 +427,7 @@ pub(super) struct RawRule {
     gates: Option<RawGate>,
     visible_blocker: Option<bool>,
     overrides_program_status: Option<bool>,
+    below_authority: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

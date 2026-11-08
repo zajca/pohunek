@@ -992,6 +992,12 @@ release unknown, the worker answers no probe, records are ignored and the
 screen decides. Without the key the records are authoritative for every
 release.
 
+A rule may set `below_authority = true` (only with `authority_from`): it serves
+releases below the gate and is skipped for activity once the gate is open, so
+the records decide working and idle there. Dialog and blocked rules never set
+it. Input readiness still evaluates the rule, so a prompt box that releases the
+first input keeps doing so.
+
 `app` names the program whose root records the detector holds; records of any
 other app, records without an app and records of children (an `id=` pair) are
 ignored. `answer_probe = true` makes the session worker answer the program's
