@@ -60,6 +60,9 @@ fn plain_source(runtime: &str) -> String {
     table.remove("program_status");
     if let Some(rules) = table.get_mut("rules").and_then(toml::Value::as_array_mut) {
         rules.retain(|rule| rule.get("overrides_program_status").is_none());
+        for rule in rules.iter_mut().filter_map(toml::Value::as_table_mut) {
+            rule.remove("below_authority");
+        }
     }
     table.to_string()
 }

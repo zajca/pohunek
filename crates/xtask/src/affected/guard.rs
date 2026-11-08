@@ -210,11 +210,6 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "the generic shell manifest and the shipped Claude manifest, read through helpers that take the path",
     ),
     (
-        "crates/daemon/tests/osc_notice_attention.rs",
-        &["crates/daemon/src/detect/manifests"],
-        "the generic shell manifest, read through a helper that takes the path",
-    ),
-    (
         "crates/daemon/tests/program_status_gate.rs",
         &[
             "runtime-packages/claude",

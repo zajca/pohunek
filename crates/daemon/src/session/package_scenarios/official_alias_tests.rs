@@ -4048,7 +4048,11 @@ async fn an_observed_nested_agent_in_a_record_without_an_origin_is_restored_as_o
         .runtimes()
         .resolve_id(&RuntimeId::parse(RuntimeId::CODEX).expect("runtime id"))
         .expect("the package serves codex");
-    let observed_config = detector_debug(&crate::detect::DetectorConfig::for_definition(&codex));
+    // A nested agent of another runtime keeps its records authoritative.
+    let observed_config = detector_debug(&crate::detect::DetectorConfig {
+        gate_waived: true,
+        ..crate::detect::DetectorConfig::for_definition(&codex)
+    });
     let profile_config = crate::session::detector_config_for_resolved_agent(
         &adopted
             .registry
