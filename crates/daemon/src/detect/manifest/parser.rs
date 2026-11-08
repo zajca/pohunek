@@ -398,6 +398,7 @@ pub(super) struct RawManifest {
 pub(super) struct RawProgramStatus {
     pub(super) app: String,
     pub(super) answer_probe: Option<bool>,
+    pub(super) authority_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

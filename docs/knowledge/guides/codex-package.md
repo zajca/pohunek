@@ -137,7 +137,9 @@ copies of that descriptor and its detection manifest in
   marker (`press enter to confirm or esc to cancel`, `enter to submit answer`,
   `enter to submit all`) and the weaker `[y/n]`-style prompts
   anywhere in the recent screen.
-- Program status: the manifest declares `[program_status] app = "codex"`.
+- Program status: the manifest declares `[program_status] app = "codex"` with
+  `authority_from = "0.163.0"` (the supported minimum, 0.164.0, is always at or
+  above it).
   Codex 0.163.0 and later write OSC 7501 root records
   (`state=idle|working|blocked|done|error`, `app=codex`, `kind` with
   `blocked`) whenever stdout is a terminal, so the package never answers a

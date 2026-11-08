@@ -4233,6 +4233,8 @@ impl SessionRegistry {
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
             launch_name,
+            runtime_version: None,
+            hook_spoke: false,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -4573,6 +4575,8 @@ impl SessionRegistry {
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
             launch_name: None,
+            runtime_version: None,
+            hook_spoke: false,
             pinned: self
                 .inner
                 .profiles

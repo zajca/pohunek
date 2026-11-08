@@ -394,6 +394,17 @@ impl SessionRegistry {
                 return;
             }
 
+            // A hook that spoke for this generation outranks screen text and
+            // process activity; OSC evidence still applies.
+            if entry.hook_spoke
+                && matches!(
+                    transition.source,
+                    protocol::StateSource::Screen | protocol::StateSource::Process
+                )
+            {
+                return;
+            }
+
             // A restated activity is neither a new revision nor an event. A
             // waiter still gets it as evidence newer than its boundary. The
             // waiter is looked up under the session lock: a wait registers
@@ -487,6 +498,8 @@ mod tests {
     async fn preview_applies_an_accepted_pending_configuration_first() {
         let initial = DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
             manifest: Some(Arc::new(
@@ -505,6 +518,8 @@ mod tests {
         };
         let updated = DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
             manifest: Some(Arc::new(
@@ -631,6 +646,8 @@ mod tests {
 
             let config = DetectorConfig {
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
                 input_readiness: crate::agent::host::InputReadiness::default(),
                 detection: DetectionConfig {
                     recheck_after: TEST_RECHECK_AFTER,

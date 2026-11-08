@@ -163,7 +163,7 @@ done
 
 /// The shipped Claude manifest with its `[program_status]` table replaced by one
 /// that sets `answer_probe` as the scenario needs.
-fn opted_in_manifest(answer_probe: bool) -> String {
+fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String {
     let mut in_table = false;
     let shipped =
         std::fs::read_to_string(workspace_root().join("runtime-packages/claude/detect.toml"))
@@ -182,7 +182,10 @@ fn opted_in_manifest(answer_probe: bool) -> String {
                 source.push('\n');
                 source
             });
-    format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n")
+    let gate = authority_from
+        .map(|version| format!("authority_from = \"{version}\"\n"))
+        .unwrap_or_default();
+    format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n{gate}")
 }
 
 /// One worker-backed registry with the stand-in agent installed as a profile.
@@ -194,6 +197,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new(answer_probe: bool) -> Self {
+        Self::gated(answer_probe, None).await
+    }
+
+    /// A fixture whose manifest declares `authority_from`.
+    async fn gated(answer_probe: bool, authority_from: Option<&str>) -> Self {
         let env = TestEnv::new().expect("create the test environment");
         let scratch = env.cwd().join("scratch");
         std::fs::create_dir(&scratch).expect("create the scratch directory");
@@ -201,7 +209,7 @@ impl Fixture {
         std::fs::create_dir_all(agents.join("manifests")).expect("create the agents directory");
         std::fs::write(
             agents.join("manifests/fake.toml"),
-            opted_in_manifest(answer_probe),
+            opted_in_manifest(answer_probe, authority_from),
         )
         .expect("write the override manifest");
         let program = env.root().join("fake-agent");
@@ -686,4 +694,66 @@ fn agent_states(
         }
     }
     states
+}
+
+#[tokio::test]
+async fn a_release_below_authority_from_is_screen_only_and_gets_no_probe_answer() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    // The stand-in reports the locked Claude release, far below the gate.
+    let fixture = Fixture::gated(true, Some("99.0.0")).await;
+    let created = fixture.start("fake-silent").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    fixture
+        .registry
+        .input(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "g".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("type a key");
+    let typed = wait_until("the agent to record its first input bytes", || async {
+        read_trimmed(&fixture.scratch_file("typed.hex"))
+    })
+    .await;
+    assert!(
+        !typed.starts_with(&REPLY_HEX[..4]),
+        "the closed gate writes no probe reply: {typed}"
+    );
+    assert_eq!(
+        fixture.activity(&created.id).await,
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "a working record below the gate is ignored"
+    );
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+#[tokio::test]
+async fn a_release_at_or_above_authority_from_answers_the_probe_and_reads_records() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::gated(true, Some("0.0.1")).await;
+    let created = fixture.start("fake-reply-stdin").await;
+    let reply = wait_until("the agent to record the worker's reply", || async {
+        read_trimmed(&fixture.scratch_file("reply.hex"))
+    })
+    .await;
+    assert_eq!(reply, REPLY_HEX);
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }

@@ -405,16 +405,20 @@ captured screen through the package manifest.
 
 ## Program status (OSC 7501)
 
-Claude Code 2.1.309 reports its root state as OSC 7501 records
+Claude Code 2.1.309 and newer report their root state as OSC 7501 records
 (`ESC ] 7501 ; state=<state>:app=claude-code ST`) once the terminal answers the
 probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in with
-`[program_status] app = "claude-code"`, `answer_probe = true`, so the session
-worker answers the probe of a Claude session (and only of a session whose
-manifest opts in) and the daemon holds the latest root record.
+`[program_status] app = "claude-code"`, `answer_probe = true`,
+`authority_from = "2.1.309"`: the session worker answers the probe, and the
+daemon holds the root record, only when the `claude --version` the session's
+launch probed is at or above the gate. Below it (Claude 2.1.289 and older) or
+with the release unknown the worker answers no probe, a record is ignored and
+detection is screen-and-title only.
 
 - Mapping: `working` reads working, `blocked` (`kind=permission` or
   `question`) reads blocked, `done`, `idle` and `error` read idle. All are
-  reported as `state_source = osc_progress`. Records of background agents carry
+  reported as `state_source = osc_progress`; a visible dialog over a `blocked`
+  record is reported as `screen`. Records of background agents carry
   an `id=` and are ignored by the detector.
 - A visible dialog on the screen always wins over a record that is not
   `blocked`: the folder trust, theme, login, API-key and permission dialogs stay

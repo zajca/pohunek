@@ -216,6 +216,8 @@ fn detector_launched_as(
         now,
         DetectorConfig {
             launch_name: launch_name.map(Arc::from),
+            runtime_version: None,
+            gate_waived: true,
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
                 confirmations: 1,
@@ -1027,6 +1029,7 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
         toml::Value::Table(toml::Table::from_iter([
             ("app".to_owned(), "claude-code".into()),
             ("answer_probe".to_owned(), true.into()),
+            ("authority_from".to_owned(), "2.1.309".into()),
         ]))
     );
     assert_eq!(
@@ -1263,6 +1266,8 @@ fn without_a_record_every_captured_screen_reads_as_without_the_opt_in() {
                 started,
                 DetectorConfig {
                     launch_name: None,
+                    runtime_version: None,
+                    gate_waived: true,
                     detection: DetectionConfig {
                         recheck_after: Duration::from_millis(100),
                         confirmations: 1,

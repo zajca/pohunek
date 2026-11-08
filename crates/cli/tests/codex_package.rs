@@ -653,6 +653,8 @@ fn detector_for(manifest: &Arc<Manifest>, now: Instant, columns: u16) -> Detecto
         now,
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: true,
             input_readiness: pohunek_daemon::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
@@ -1123,6 +1125,8 @@ fn the_startup_update_prompt_rule_blocks_the_measured_popup_and_outranks_a_stale
     let definition = installed_definition();
     let config = DetectorConfig {
         launch_name: None,
+        runtime_version: None,
+        gate_waived: true,
         input_readiness: InputReadiness::default(),
         detection: DetectionConfig {
             recheck_after: Duration::from_millis(100),
@@ -1604,6 +1608,8 @@ fn manifest_idle_keeps_the_popup_hold_across_implicit_scroll() {
 fn manifest_idle_probe_config(definition: &RuntimeDefinition) -> DetectorConfig {
     DetectorConfig {
         launch_name: None,
+        runtime_version: None,
+        gate_waived: true,
         input_readiness: InputReadiness::ManifestIdle,
         detection: latch_detection_config(),
         manifest: Some(Arc::clone(definition.manifest())),
@@ -1751,6 +1757,8 @@ fn manifest_idle_releases_on_fresh_screen_idle_evidence() {
     let columns = DEFAULT_COLUMNS;
     let config = DetectorConfig {
         launch_name: None,
+        runtime_version: None,
+        gate_waived: true,
         input_readiness: InputReadiness::ManifestIdle,
         detection: latch_detection_config(),
         manifest: Some(Arc::new(

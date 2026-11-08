@@ -634,6 +634,8 @@ fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: 
         now,
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: true,
             input_readiness: pohunek_daemon::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),

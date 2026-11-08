@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::procwatch::ProcessFact;
+use package::version_probe::ProbeVersion;
 use protocol::AgentActivity;
 use regex::Regex;
 
@@ -225,6 +226,9 @@ pub struct ProgramStatusConfig {
     app: String,
     /// Whether the session worker answers the runtime's 7501 probe.
     answer_probe: bool,
+    /// The first runtime release whose records are authoritative. Absent: the
+    /// records are authoritative for every release.
+    authority_from: Option<ProbeVersion>,
 }
 
 impl ProgramStatusConfig {
@@ -233,10 +237,24 @@ impl ProgramStatusConfig {
         if !valid {
             return Err(ManifestError::InvalidProgramStatusApp { app: raw.app });
         }
+        let authority_from = raw
+            .authority_from
+            .map(|value| {
+                ProbeVersion::parse(&value)
+                    .ok_or(ManifestError::InvalidProgramStatusAuthority { value })
+            })
+            .transpose()?;
         Ok(Self {
             app: raw.app,
             answer_probe: raw.answer_probe.unwrap_or(false),
+            authority_from,
         })
+    }
+
+    /// The first release whose records are authoritative, when declared.
+    #[must_use]
+    pub fn authority_from(&self) -> Option<ProbeVersion> {
+        self.authority_from
     }
 
     /// The `app` name of the runtime's root records.

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
     ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestError,
+    ProgramStatusConfig,
 };
 use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
@@ -73,13 +74,20 @@ fn fast_detection() -> DetectionConfig {
     }
 }
 
+/// A config whose runtime release sits exactly at the manifest's
+/// `authority_from`, so the records are authoritative; a manifest without the
+/// key is authoritative for every release.
 fn config(manifest: &str, readiness: InputReadiness) -> DetectorConfig {
+    let manifest = Manifest::parse_str(manifest).expect("the manifest parses");
+    let runtime_version = manifest
+        .program_status()
+        .and_then(ProgramStatusConfig::authority_from);
     DetectorConfig {
         launch_name: None,
+        runtime_version,
+        gate_waived: false,
         detection: fast_detection(),
-        manifest: Some(Arc::new(
-            Manifest::parse_str(manifest).expect("the manifest parses"),
-        )),
+        manifest: Some(Arc::new(manifest)),
         input_readiness: readiness,
     }
 }

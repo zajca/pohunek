@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use package::version_probe::ProbeVersion;
 use pohunek_platform::shell_env;
 use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
@@ -70,7 +71,12 @@ pub(crate) fn host_login_shell() -> String {
 /// The private path invariant lets the session launch path consume the exact
 /// executable that was probed without consulting `PATH` a second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedLaunchProgram(PathBuf);
+pub(crate) struct ValidatedLaunchProgram {
+    path: PathBuf,
+    /// The release the launch probe read from this exact executable; `None`
+    /// for a program without a version probe.
+    version: Option<ProbeVersion>,
+}
 
 impl ValidatedLaunchProgram {
     /// Resolve one configured program and canonicalize its first executable match.
@@ -82,16 +88,31 @@ impl ValidatedLaunchProgram {
     fn resolve_with_path(program: &str, path: Option<&OsStr>) -> Option<Self> {
         let candidate = resolve_program(program, path)?;
         let canonical = candidate.canonicalize().ok()?;
-        (canonical.is_absolute() && canonical.to_str().is_some()).then_some(Self(canonical))
+        (canonical.is_absolute() && canonical.to_str().is_some()).then_some(Self {
+            path: canonical,
+            version: None,
+        })
     }
 
     /// The absolute canonical path used for both probing and launch.
     pub(crate) fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// Records the release the launch probe read from this executable.
+    #[must_use]
+    pub(crate) fn with_version(mut self, version: ProbeVersion) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    /// The release the launch probe read, when the program is probed.
+    pub(crate) fn version(&self) -> Option<ProbeVersion> {
+        self.version
     }
 
     fn as_launch_str(&self) -> &str {
-        self.0
+        self.path
             .to_str()
             .expect("validated launch paths have a UTF-8 representation")
     }
@@ -129,6 +150,9 @@ pub struct LaunchCommand {
     pub cols: u16,
     /// Initial terminal height in rows.
     pub rows: u16,
+    /// The release the launch probe read from the program, when it has a
+    /// version probe.
+    pub runtime_version: Option<ProbeVersion>,
 }
 
 /// Input framing rules for programmatic prompt injection.
@@ -409,6 +433,10 @@ pub fn build_pty_command(
         cwd: opts.cwd.clone(),
         cols: opts.cols,
         rows: opts.rows,
+        runtime_version: opts
+            .validated_program
+            .as_ref()
+            .and_then(ValidatedLaunchProgram::version),
     })
 }
 

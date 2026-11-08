@@ -46,6 +46,8 @@ impl Harness {
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
         let config = DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             detection: detection(),
             manifest: Some(Arc::new(Manifest::parse_str(&source).expect("manifest"))),
             input_readiness: InputReadiness::ScreenIdle,

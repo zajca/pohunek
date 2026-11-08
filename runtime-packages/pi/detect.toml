@@ -83,6 +83,7 @@
 [program_status]
 app = "pi"
 answer_probe = true
+authority_from = "1.1.0"
 
 [process]
 # Pi retitles its process to `pi` shortly after start (kernel name and argv),

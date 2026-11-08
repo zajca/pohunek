@@ -4205,6 +4205,7 @@ fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> La
         cwd: crate::test_support::thread_scoped_dir("pohunek-cwd-"),
         cols: 80,
         rows: 24,
+        runtime_version: None,
     }
 }
 

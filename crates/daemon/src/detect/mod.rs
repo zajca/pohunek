@@ -26,6 +26,7 @@ pub use manifest::{
 pub use osc::{OscEvidence, OscParser, ProgressReport, ProgressState};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
+use package::version_probe::ProbeVersion;
 use pohunek_terminal::{ProgramState, ProgramStatusRecord, ProgramStatusReport};
 pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 
@@ -66,17 +67,122 @@ pub struct DetectorConfig {
     /// through it: the title is owner text, so the title region is withheld
     /// from manifest evaluation (see [`launch_name_echo`]).
     pub launch_name: Option<Arc<str>>,
+    /// The release the launch of this runtime generation probed, for the
+    /// session's own runtime; `None` when unprobed or not the own runtime.
+    /// It decides whether the manifest's program-status records are
+    /// authoritative (see [`AuthorityGate`]).
+    pub runtime_version: Option<ProbeVersion>,
+    /// Set for an agent of another runtime than the session's own, such as a
+    /// Codex started below a shell: its release is not probed by any launch, so
+    /// its manifest's `authority_from` is not applied and its records stay
+    /// authoritative.
+    pub gate_waived: bool,
+}
+
+/// Why a program-status authority gate is open or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateReason {
+    /// The manifest declares no `[program_status]` table or no `authority_from`.
+    NotDeclared,
+    /// The runtime release is at or above `authority_from`.
+    AtOrAbove,
+    /// The runtime release is below `authority_from`.
+    Below,
+    /// `authority_from` is declared but the release is unknown.
+    VersionUnknown,
+}
+
+impl GateReason {
+    /// The stable name used in logs and detection output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "not_declared",
+            Self::AtOrAbove => "at_or_above",
+            Self::Below => "below",
+            Self::VersionUnknown => "version_unknown",
+        }
+    }
+}
+
+/// The version gate of a manifest's OSC 7501 records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityGate {
+    /// Whether the manifest declares `authority_from`.
+    pub declared: bool,
+    /// Whether the release is known and at or above `authority_from`.
+    pub open: bool,
+    pub reason: GateReason,
+    pub runtime_version: Option<ProbeVersion>,
+    pub authority_from: Option<ProbeVersion>,
+}
+
+impl AuthorityGate {
+    /// Evaluates the gate of `manifest` for a runtime at `runtime_version`.
+    #[must_use]
+    pub fn evaluate(
+        manifest: Option<&Manifest>,
+        runtime_version: Option<ProbeVersion>,
+        gate_waived: bool,
+    ) -> Self {
+        let authority_from = manifest
+            .and_then(Manifest::program_status)
+            .and_then(ProgramStatusConfig::authority_from)
+            .filter(|_| !gate_waived);
+        let (open, reason) = match (authority_from, runtime_version) {
+            (None, _) => (false, GateReason::NotDeclared),
+            (Some(_), None) => (false, GateReason::VersionUnknown),
+            (Some(from), Some(version)) if version >= from => (true, GateReason::AtOrAbove),
+            (Some(_), Some(_)) => (false, GateReason::Below),
+        };
+        Self {
+            declared: authority_from.is_some(),
+            open,
+            reason,
+            runtime_version,
+            authority_from,
+        }
+    }
+
+    /// Whether the manifest's records are authoritative: it opts in and the
+    /// gate is either undeclared or open.
+    #[must_use]
+    pub fn records_authoritative(&self, manifest: Option<&Manifest>) -> bool {
+        manifest.is_some_and(|manifest| manifest.program_status().is_some())
+            && (!self.declared || self.open)
+    }
 }
 
 impl DetectorConfig {
+    /// Sets the probed release of the session's own runtime.
+    #[must_use]
+    pub fn with_runtime_version(mut self, runtime_version: Option<ProbeVersion>) -> Self {
+        self.runtime_version = runtime_version;
+        self
+    }
+
+    /// The authority gate of this configuration.
+    #[must_use]
+    pub fn authority_gate(&self) -> AuthorityGate {
+        AuthorityGate::evaluate(
+            self.manifest.as_deref(),
+            self.runtime_version,
+            self.gate_waived,
+        )
+    }
+
     /// Whether the session worker answers the runtime's OSC 7501 probe: the
-    /// manifest opts in with `[program_status] answer_probe = true`.
+    /// manifest opts in with `[program_status] answer_probe = true` and its
+    /// records are authoritative for the probed release.
     #[must_use]
     pub fn answers_program_status_probe(&self) -> bool {
         self.manifest
             .as_ref()
             .and_then(|manifest| manifest.program_status())
             .is_some_and(ProgramStatusConfig::answer_probe)
+            && self
+                .authority_gate()
+                .records_authoritative(self.manifest.as_deref())
     }
 
     /// Production detector config using the embedded generic shell manifest.
@@ -87,6 +193,8 @@ impl DetectorConfig {
             manifest: Some(Arc::clone(shared_generic_shell_manifest())),
             input_readiness: InputReadiness::default(),
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
         }
     }
 
@@ -120,6 +228,8 @@ impl DetectorConfig {
                     .for_manifest(&manifest),
                 manifest: Some(Arc::new(manifest)),
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
             },
             None => host.definition_for_pin(base, pin).map_or_else(
                 |_unresolved| Self::generic_shell(),
@@ -144,6 +254,8 @@ impl DetectorConfig {
                 input_readiness: definition
                     .map_or_else(InputReadiness::default, RuntimeDefinition::input_readiness),
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
             },
             (None, Some(definition)) => Self::for_definition(definition),
             (None, None) => Self::generic_shell(),
@@ -159,6 +271,8 @@ impl DetectorConfig {
             manifest: Some(Arc::clone(definition.manifest())),
             input_readiness: definition.input_readiness(),
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
         }
     }
 
@@ -179,6 +293,8 @@ impl DetectorConfig {
                 input_readiness: readiness_of(host.resolve_ref(base)).for_manifest(&manifest),
                 manifest: Some(Arc::new(manifest)),
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
             },
             None => Self::for_agent(host, base),
         }
@@ -254,6 +370,8 @@ pub struct Detector {
     manifest: Option<Arc<Manifest>>,
     input_readiness: InputReadiness,
     launch_name: Option<Arc<str>>,
+    runtime_version: Option<ProbeVersion>,
+    gate_waived: bool,
     initial_input_pending: bool,
     latest_title: Option<String>,
     latest_progress: Option<String>,
@@ -302,6 +420,8 @@ impl Detector {
             manifest: config.manifest,
             input_readiness: config.input_readiness,
             launch_name: config.launch_name,
+            runtime_version: config.runtime_version,
+            gate_waived: config.gate_waived,
             initial_input_pending: true,
             latest_title: None,
             latest_progress: None,
@@ -619,6 +739,12 @@ impl Detector {
         else {
             return false;
         };
+        if !self
+            .authority_gate()
+            .records_authoritative(self.manifest.as_deref())
+        {
+            return false;
+        }
         match report {
             ProgramStatusReport::Record(record)
                 if record.app.as_deref() == Some(program_status.app()) =>
@@ -705,6 +831,8 @@ impl Detector {
         self.manifest = config.manifest;
         self.input_readiness = config.input_readiness;
         self.launch_name = config.launch_name;
+        self.runtime_version = config.runtime_version;
+        self.gate_waived = config.gate_waived;
         if self.latch_eligible() {
             self.screen.resume_observation();
         } else if !self.initial_input_pending {
@@ -750,6 +878,16 @@ impl Detector {
     #[must_use]
     pub fn latest_progress(&self) -> Option<&str> {
         self.latest_progress.as_deref()
+    }
+
+    /// The authority gate of the active manifest for this runtime release.
+    #[must_use]
+    pub fn authority_gate(&self) -> AuthorityGate {
+        AuthorityGate::evaluate(
+            self.manifest.as_deref(),
+            self.runtime_version,
+            self.gate_waived,
+        )
     }
 
     /// Takes the latest OSC 7 cwd hint, if one has arrived.
@@ -1149,9 +1287,10 @@ const PROGRAM_STATUS_REGION: &str = "program_status";
 
 /// Arbitrates the screen winner with the held program-status record.
 ///
-/// A `blocked` record always wins. Otherwise a visible blocker, or a winner
-/// whose rule overrides the record, stays the screen result; any other screen
-/// result yields to the record: `working` reads working, and `done`, `idle`
+/// A visible blocker wins over every record and reports the screen as its
+/// source; a `blocked` record without one reports the record. Otherwise a
+/// winner whose rule overrides the record stays the screen result; any other
+/// screen result yields to the record: `working` reads working, and `done`, `idle`
 /// and `error` read idle. With no record the screen winner is returned as is.
 /// The record is included whatever the chunk's freshness: it is a state, not
 /// an event.
@@ -1172,7 +1311,15 @@ fn overlay_program_status(
         arrival: 0,
     };
     match record.state {
-        ProgramState::Blocked(_) => Some(from_record(AgentActivity::Blocked, true)),
+        // A visible dialog is the more specific evidence of the same state, so
+        // the screen is the reported source when both say blocked.
+        ProgramState::Blocked(_) => Some(
+            screen
+                .filter(|hit| {
+                    hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker
+                })
+                .unwrap_or_else(|| from_record(AgentActivity::Blocked, true)),
+        ),
         state => {
             if let Some(hit) = screen.filter(|hit| {
                 (hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker)
@@ -1374,6 +1521,8 @@ mod tests {
     fn config() -> DetectorConfig {
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
@@ -1389,6 +1538,8 @@ mod tests {
     fn debounce_config() -> DetectorConfig {
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),

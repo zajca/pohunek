@@ -23,13 +23,16 @@ cmdline = [
 ]
 
 # Claude Code reports its root state as OSC 7501 records once the session
-# worker answers its `ESC ] 7501 ; ? ST` probe. The record outranks stale
+# worker answers its `ESC ] 7501 ; ? ST` probe. The records are authoritative
+# from `authority_from`; below it, or for an unprobed release, the worker does
+# not answer the probe and the title and screen rules decide. The record outranks stale
 # screen evidence; a visible dialog still wins (see the program-status layer in
 # docs/architecture.md). Background agents report as `id=` records, which are
 # ignored.
 [program_status]
 app = "claude-code"
 answer_probe = true
+authority_from = "2.1.309"
 
 # Claude Code 2.1.289 leads its title with `◐`/`◑`, alternating every 960 ms
 # while a turn runs, and with `✳` while it waits. 2.1.309 sets the plain title

@@ -1056,6 +1056,13 @@ struct SessionEntry {
     /// carried by every detector configuration the session runs. A rename does
     /// not relaunch, so the agent keeps the name it was launched with.
     launch_name: Option<Arc<str>>,
+    /// The release the launch of this runtime generation probed; `None` for an
+    /// unprobed program or a session re-attached after a daemon restart.
+    runtime_version: Option<package::version_probe::ProbeVersion>,
+    /// Whether a hook or provider report has set this generation's activity.
+    /// Once set, the detector's screen and process transitions are not applied;
+    /// its OSC transitions still are.
+    hook_spoke: bool,
     /// Definition of the session's launch pin, fixed when this daemon
     /// launched or adopted the session: the verified installed package, or the
     /// built-in runtime of the same package identity. A session launched by
@@ -5091,6 +5098,7 @@ impl SessionRegistry {
             false,
         );
         entry.set_activity(activity);
+        entry.hook_spoke = true;
         self.wake_idle_stop();
         entry.info.state_source = StateSource::Report;
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
@@ -9390,8 +9398,33 @@ fn active_agent_origin(entry: &SessionEntry) -> Option<ActiveAgentOrigin> {
     )
 }
 
+/// The program-status app a configuration's manifest opts in with.
+fn program_status_app(config: &DetectorConfig) -> Option<&str> {
+    config
+        .manifest
+        .as_deref()
+        .and_then(crate::detect::Manifest::program_status)
+        .map(crate::detect::ProgramStatusConfig::app)
+}
+
 fn send_detector_config(entry: &SessionEntry, mut config: DetectorConfig) {
     config.launch_name.clone_from(&entry.launch_name);
+    // Only the session's own runtime carries the version its launch probed; a
+    // nested agent of another runtime has none, and its gate is waived.
+    let own_runtime = program_status_app(&config)
+        .is_some_and(|app| program_status_app(&entry.default_detector_config) == Some(app));
+    config.runtime_version = own_runtime.then_some(entry.runtime_version).flatten();
+    config.gate_waived = program_status_app(&config).is_some() && !own_runtime;
+    let gate = config.authority_gate();
+    tracing::info!(
+        target: "session.program_status.gate",
+        runtime_version = ?gate.runtime_version.map(|version| version.to_string()),
+        authority_from = ?gate.authority_from.map(|version| version.to_string()),
+        gate_open = gate.open,
+        reason = gate.reason.as_str(),
+        answer_probe = config.answers_program_status_probe(),
+        "program-status authority gate reconfigured"
+    );
     let generation = entry
         .detector_config
         .borrow()
