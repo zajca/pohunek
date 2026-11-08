@@ -10,3 +10,4 @@ naming-launch-args-v1 0.39.0
 placement-v1 0.40.0
 checkout-trust-args-v1 0.40.0
 integration-cline-hook-v1 0.40.0
+program-status-gate-v1 0.41.0

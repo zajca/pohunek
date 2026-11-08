@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.6.0";
+const PACKAGE_VERSION: &str = "1.7.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
