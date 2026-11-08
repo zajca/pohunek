@@ -405,6 +405,10 @@ pub fn identify_definition(
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent latches of one detector's state"
+)]
 pub struct Detector {
     osc: OscParser,
     screen: ScreenTracker,
@@ -1072,8 +1076,10 @@ impl Detector {
                     screen: self.screen_seq,
                 },
                 freshness,
-                program_status_held,
-                authority_open,
+                RecordGate {
+                    held: program_status_held,
+                    authority_open,
+                },
             )
         })
     }
@@ -1160,8 +1166,10 @@ impl ChunkLatch {
                 latest_progress,
                 Arrivals::default(),
                 freshness,
-                self.program_status.is_some(),
-                self.authority_open,
+                RecordGate {
+                    held: self.program_status.is_some(),
+                    authority_open: self.authority_open,
+                },
             ),
         );
         if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
@@ -1269,6 +1277,15 @@ struct Arrivals {
     screen: u64,
 }
 
+/// What the program-status layer tells a manifest match.
+#[derive(Debug, Default, Clone, Copy)]
+struct RecordGate {
+    /// A record is held, which enables the rules that override it.
+    held: bool,
+    /// The release gate is open, which skips the `below_authority` rules.
+    authority_open: bool,
+}
+
 /// The winning manifest evidence over explicit context pieces: the pure,
 /// shared counterpart of [`Detector::manifest_evidence`], for the same
 /// borrow-split reason as [`match_context_for`]. `program_status_held`
@@ -1282,12 +1299,11 @@ fn manifest_hit(
     latest_progress: Option<&str>,
     arrivals: Arrivals,
     freshness: ContextFreshness,
-    program_status_held: bool,
-    authority_open: bool,
+    gate: RecordGate,
 ) -> Option<ManifestEvidenceHit> {
     let context = match_context_for(manifest, screen, latest_title, latest_progress, freshness)
-        .with_program_status_held(program_status_held)
-        .with_authority_open(authority_open);
+        .with_program_status_held(gate.held)
+        .with_authority_open(gate.authority_open);
     let matched = manifest.match_context(&context)?;
     let source = manifest_source(&matched.region);
     if matched.activity == AgentActivity::Blocked
@@ -1365,8 +1381,7 @@ impl ReadinessObserver<'_> {
                     screen: *self.screen_seq,
                 },
                 ContextFreshness::all(),
-                false,
-                false,
+                RecordGate::default(),
             )
         });
         if hit.is_some_and(|hit| {

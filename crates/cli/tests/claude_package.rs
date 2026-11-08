@@ -1048,7 +1048,6 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
 
     // `below_authority` marks rules the open release gate retires; the golden
     // has no gate, so the comparison reads the rules without that key.
-    let mut package = package;
     for rule in package["rules"].as_array_mut().expect("package rules") {
         rule.as_table_mut()
             .expect("a rule table")

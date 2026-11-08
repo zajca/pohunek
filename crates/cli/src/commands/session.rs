@@ -1265,18 +1265,18 @@ fn render_detection_status(status: &protocol::DetectionStatus) -> String {
         .as_deref()
         .map_or_else(|| "absent".to_owned(), |state| format!("present ({state})"));
     let gate = &status.gate;
-    let mut gate_line = format!(
-        "{} ({}",
-        if gate.open { "open" } else { "closed" },
-        gate.reason.as_str()
-    );
+    let mut details = vec![gate.reason.as_str().to_owned()];
     if let Some(version) = &gate.runtime_version {
-        gate_line.push_str(&format!(", runtime {version}"));
+        details.push(format!("runtime {version}"));
     }
     if let Some(from) = &gate.authority_from {
-        gate_line.push_str(&format!(", authority_from {from}"));
+        details.push(format!("authority_from {from}"));
     }
-    gate_line.push(')');
+    let gate_line = format!(
+        "{} ({})",
+        if gate.open { "open" } else { "closed" },
+        details.join(", ")
+    );
     let probe = match (status.probe_answered, gate.declared && !gate.open) {
         (true, _) => "answered",
         (false, true) => "unanswered, screen only",

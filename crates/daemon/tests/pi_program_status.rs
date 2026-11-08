@@ -77,7 +77,19 @@ const UNFRAMED_SCREEN: &str = "overlays/unframed_fork_other_project_w100.txt";
 /// A supported Pi release below the package's `authority_from`.
 const OLD_RELEASE: &str = "1.0.0";
 
+fn write_executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("write the stand-in agent");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in agent executable");
+}
+
 fn agent_script(version: &str) -> String {
+    let (idle, working, own_confirm, unframed) = (
+        IDLE_SCREEN,
+        WORKING_SCREEN,
+        OWN_CONFIRM_SCREEN,
+        UNFRAMED_SCREEN,
+    );
     format!(
         r#"#!/bin/sh
 {version}
@@ -128,12 +140,7 @@ while :; do
     else pending=$pending$c; fi
   fi
 done
-"#,
-        version = version,
-        idle = IDLE_SCREEN,
-        working = WORKING_SCREEN,
-        own_confirm = OWN_CONFIRM_SCREEN,
-        unframed = UNFRAMED_SCREEN,
+"#
     )
 }
 
@@ -192,6 +199,10 @@ struct Fixture {
 }
 
 impl Fixture {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture builds the registry, the stand-in programs and every profile"
+    )]
     async fn new() -> Self {
         let env = TestEnv::new().expect("create the test environment");
         let scratch = env.cwd().join("scratch");
@@ -199,25 +210,19 @@ impl Fixture {
         let agents = env.root().join("agents");
         std::fs::create_dir_all(&agents).expect("create the agents directory");
         let program = env.root().join("fake-agent");
-        std::fs::write(
+        write_executable(
             &program,
-            agent_script(&official_runtimes::sh_version_answer("pi")),
-        )
-        .expect("write the stand-in agent");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stand-in agent executable");
-        // A Pi release below the program-status gate (`authority_from`) that
-        // the package still supports.
+            &agent_script(&official_runtimes::sh_version_answer("pi")),
+        );
+        // A Pi release below the package's `authority_from` that the package
+        // still supports.
         let old_program = env.root().join("fake-agent-old");
-        std::fs::write(
+        write_executable(
             &old_program,
-            agent_script(&format!(
+            &agent_script(&format!(
                 "if [ \"$1\" = --version ]; then printf '%s\\n' '{OLD_RELEASE}'; exit 0; fi\n"
             )),
-        )
-        .expect("write the old stand-in agent");
-        std::fs::set_permissions(&old_program, std::fs::Permissions::from_mode(0o755))
-            .expect("make the old stand-in agent executable");
+        );
         let screens = workspace_root().join("compat/pi/screens");
         for (name, mode, source) in [
             ("fake-reply-stdin", "reply", "stdin"),

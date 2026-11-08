@@ -23,7 +23,7 @@ pub enum OscEvidence {
     ProgramStatus(ProgramStatusReport),
 }
 
-/// The ConEmu progress state of an `OSC 9 ; 4` report.
+/// The `ConEmu` progress state of an `OSC 9 ; 4` report.
 ///
 /// State 4 (`Warning`) is parsed but no manifest maps it to an activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,7 @@ impl ProgressReport {
     }
 }
 
-/// The ConEmu OSC 9 subcommand that carries progress.
+/// The `ConEmu` OSC 9 subcommand that carries progress.
 const PROGRESS_SUBCOMMAND: &str = "4";
 const MAX_PROGRESS_PERCENT: u8 = 100;
 
