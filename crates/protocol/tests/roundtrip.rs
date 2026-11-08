@@ -2293,6 +2293,67 @@ fn observation_method_names_and_limits_are_stable() {
 }
 
 #[test]
+fn session_detection_status_has_exact_wire_shape_and_an_older_result_decodes() {
+    use protocol::{AuthorityGate, AuthorityGateReason, DetectionStatus, StateSource};
+
+    let status = DetectionStatus {
+        state_source: Some(StateSource::OscProgress),
+        probe_answered: true,
+        record_present: true,
+        record_state: Some("working".to_owned()),
+        gate: AuthorityGate {
+            declared: true,
+            open: true,
+            reason: AuthorityGateReason::AtOrAbove,
+            runtime_version: Some("2.1.309".to_owned()),
+            authority_from: Some("2.1.309".to_owned()),
+        },
+        last_evidence_age_ms: Some(120),
+    };
+    let result = SessionDetectionResult {
+        session_id: SessionId("s-42".to_owned()),
+        supported_regions: Vec::new(),
+        previews: Vec::new(),
+        status: Some(status),
+    };
+    let expected = json!({
+        "session_id": "s-42",
+        "supported_regions": [],
+        "previews": [],
+        "status": {
+            "state_source": "osc_progress",
+            "probe_answered": true,
+            "record_present": true,
+            "record_state": "working",
+            "gate": {
+                "declared": true,
+                "open": true,
+                "reason": "at_or_above",
+                "runtime_version": "2.1.309",
+                "authority_from": "2.1.309"
+            },
+            "last_evidence_age_ms": 120
+        }
+    });
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize detection result"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionDetectionResult>(expected).expect("parse"),
+        result
+    );
+    // A daemon that predates the field sends none.
+    let older = serde_json::from_value::<SessionDetectionResult>(json!({
+        "session_id": "s-42",
+        "supported_regions": [],
+        "previews": []
+    }))
+    .expect("an older result decodes");
+    assert_eq!(older.status, None);
+}
+
+#[test]
 fn session_detection_contract_has_exact_wire_shape() {
     let params = SessionDetectionParams::new(SessionId("s-42".to_owned()));
     assert_eq!(
@@ -2307,6 +2368,7 @@ fn session_detection_contract_has_exact_wire_shape() {
             region: "top_non_empty_lines(8)".to_owned(),
             text: "Do you trust the contents of this directory?".to_owned(),
         }],
+        status: None,
     };
     let expected = json!({
         "session_id": "s-42",

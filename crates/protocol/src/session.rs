@@ -1144,6 +1144,95 @@ pub struct SessionDetectionResult {
     pub supported_regions: Vec<DetectionRegionKind>,
     /// Regions required by the active manifest, in manifest order.
     pub previews: Vec<DetectionRegionPreview>,
+    /// Which source decided the activity and why. Absent from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub status: Option<DetectionStatus>,
+}
+
+/// The evidence behind a session's activity, returned by `session.detection`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DetectionStatus.ts"))]
+pub struct DetectionStatus {
+    /// The source of the session's current activity, as in `session.info`.
+    pub state_source: Option<StateSource>,
+    /// Whether the session worker answers the program's OSC 7501 probe.
+    pub probe_answered: bool,
+    /// Whether an authoritative OSC 7501 root record is held.
+    pub record_present: bool,
+    /// The held record's state, such as `working` or `blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub record_state: Option<String>,
+    /// The release gate of the program-status records.
+    pub gate: AuthorityGate,
+    /// Milliseconds since the detector last applied evidence; absent before
+    /// any evidence arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub last_evidence_age_ms: Option<u64>,
+}
+
+/// The release gate of a runtime's OSC 7501 records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AuthorityGate.ts"))]
+pub struct AuthorityGate {
+    /// Whether the manifest declares an `authority_from` release.
+    pub declared: bool,
+    /// Whether the runtime release is known and at or above it.
+    pub open: bool,
+    pub reason: AuthorityGateReason,
+    /// The release the session's launch probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime_version: Option<String>,
+    /// The first release whose records are authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub authority_from: Option<String>,
+}
+
+/// Why an [`AuthorityGate`] is open or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AuthorityGateReason.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum AuthorityGateReason {
+    /// The manifest declares no `authority_from`; its records, if any, are
+    /// authoritative for every release.
+    NotDeclared,
+    /// The release is at or above `authority_from`.
+    AtOrAbove,
+    /// The release is below `authority_from`.
+    Below,
+    /// `authority_from` is declared but the release is unknown.
+    VersionUnknown,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(AuthorityGateReason);
+
+impl AuthorityGateReason {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "not_declared",
+            Self::AtOrAbove => "at_or_above",
+            Self::Below => "below",
+            Self::VersionUnknown => "version_unknown",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Text source selected for `session.read`.

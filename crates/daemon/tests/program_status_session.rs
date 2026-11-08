@@ -36,7 +36,6 @@ use protocol::{
 /// `session.detection` as a client that predates the program-status region
 /// kind decodes it: a strict closed set of kinds.
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LegacyDetection {
     #[serde(rename = "session_id")]
     _session_id: String,
@@ -170,6 +169,11 @@ fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String
             .expect("read the shipped Claude manifest")
             .lines()
             .filter(|line| {
+                // A manifest without `authority_from` has no gate to retire
+                // rules under.
+                if authority_from.is_none() && line.trim() == "below_authority = true" {
+                    return false;
+                }
                 if line.trim() == "[program_status]" {
                     in_table = true;
                 } else if in_table && line.trim().is_empty() {
@@ -729,6 +733,19 @@ async fn a_release_below_authority_from_is_screen_only_and_gets_no_probe_answer(
         Some((AgentActivity::Idle, StateSource::Screen)),
         "a working record below the gate is ignored"
     );
+    let status = fixture
+        .registry
+        .detection(&created.id)
+        .await
+        .expect("session.detection")
+        .status
+        .expect("the daemon reports the detection status");
+    assert_eq!(status.state_source, Some(StateSource::Screen));
+    assert!(!status.probe_answered);
+    assert!(!status.record_present);
+    assert!(status.gate.declared && !status.gate.open);
+    assert_eq!(status.gate.reason, protocol::AuthorityGateReason::Below);
+    assert_eq!(status.gate.authority_from.as_deref(), Some("99.0.0"));
     fixture
         .registry
         .stop(&created.id)
@@ -751,6 +768,21 @@ async fn a_release_at_or_above_authority_from_answers_the_probe_and_reads_record
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
         .await;
+    let status = fixture
+        .registry
+        .detection(&created.id)
+        .await
+        .expect("session.detection")
+        .status
+        .expect("the daemon reports the detection status");
+    assert_eq!(status.state_source, Some(StateSource::OscProgress));
+    assert!(status.probe_answered);
+    assert!(status.record_present);
+    assert!(status.gate.declared && status.gate.open);
+    assert_eq!(status.gate.reason, protocol::AuthorityGateReason::AtOrAbove);
+    assert_eq!(status.gate.authority_from.as_deref(), Some("0.0.1"));
+    assert!(status.gate.runtime_version.is_some());
+    assert!(status.last_evidence_age_ms.is_some());
     fixture
         .registry
         .stop(&created.id)

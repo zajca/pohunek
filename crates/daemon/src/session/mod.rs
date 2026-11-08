@@ -1211,7 +1211,14 @@ struct DetectorConfigUpdate {
 #[derive(Debug)]
 struct DetectionPreviewRequest {
     minimum_config_generation: u64,
-    reply: oneshot::Sender<Result<Vec<protocol::DetectionRegionPreview>, protocol::ProtocolError>>,
+    reply: oneshot::Sender<Result<DetectionSnapshot, protocol::ProtocolError>>,
+}
+
+/// What the detector task answers a `session.detection` request with.
+#[derive(Debug)]
+struct DetectionSnapshot {
+    previews: Vec<protocol::DetectionRegionPreview>,
+    status: crate::detect::DetectorStatus,
 }
 
 struct DetectorInputs {

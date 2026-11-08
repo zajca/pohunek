@@ -12971,7 +12971,17 @@ async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
     drop(sessions);
     tokio::spawn(async move {
         let request = preview_rx.recv().await.expect("preview request");
-        request.reply.send(Ok(previews)).expect("preview reply");
+        let status = crate::detect::Detector::new(
+            3,
+            80,
+            std::time::Instant::now(),
+            crate::detect::DetectorConfig::default(),
+        )
+        .status(std::time::Instant::now());
+        request
+            .reply
+            .send(Ok(super::DetectionSnapshot { previews, status }))
+            .expect("preview reply");
     });
     let request = Request::new(
         "x".repeat(MAX_REQUEST_ID_BYTES),

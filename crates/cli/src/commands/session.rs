@@ -1239,6 +1239,9 @@ pub(crate) async fn run_read(
 
 fn render_detection_human(result: &SessionDetectionResult) -> String {
     let mut rendered = String::new();
+    if let Some(status) = &result.status {
+        rendered.push_str(&render_detection_status(status));
+    }
     for preview in &result.previews {
         rendered.push_str("--- ");
         rendered.push_str(&preview.region);
@@ -1251,6 +1254,40 @@ fn render_detection_human(result: &SessionDetectionResult) -> String {
         }
     }
     rendered
+}
+
+/// The evidence header of `session detection`: the deciding source, the
+/// program-status record, the release gate and the evidence age.
+fn render_detection_status(status: &protocol::DetectionStatus) -> String {
+    let source = status.state_source.map_or("none", state_source_label);
+    let record = status
+        .record_state
+        .as_deref()
+        .map_or_else(|| "absent".to_owned(), |state| format!("present ({state})"));
+    let gate = &status.gate;
+    let mut gate_line = format!(
+        "{} ({}",
+        if gate.open { "open" } else { "closed" },
+        gate.reason.as_str()
+    );
+    if let Some(version) = &gate.runtime_version {
+        gate_line.push_str(&format!(", runtime {version}"));
+    }
+    if let Some(from) = &gate.authority_from {
+        gate_line.push_str(&format!(", authority_from {from}"));
+    }
+    gate_line.push(')');
+    let probe = match (status.probe_answered, gate.declared && !gate.open) {
+        (true, _) => "answered",
+        (false, true) => "unanswered, screen only",
+        (false, false) => "unanswered",
+    };
+    let age = status
+        .last_evidence_age_ms
+        .map_or_else(|| "none".to_owned(), |ms| format!("{ms} ms ago"));
+    format!(
+        "state_source: {source}\nprogram status: {record}\ngate: {gate_line}\nprobe: {probe}\nlast evidence: {age}\n"
+    )
 }
 
 fn render_read_text(result: &SessionReadResult) -> String {
@@ -4694,6 +4731,7 @@ mod tests {
                     text: String::new(),
                 },
             ],
+            status: None,
         };
 
         assert_eq!(

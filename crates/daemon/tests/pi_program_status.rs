@@ -74,7 +74,10 @@ const UNFRAMED_SCREEN: &str = "overlays/unframed_fork_other_project_w100.txt";
 /// turn that reports working until the FIFO yields a byte and then done, and
 /// `l` the clear record. In the `old` mode the screens change and no record is
 /// written.
-fn agent_script() -> String {
+/// A supported Pi release below the package's `authority_from`.
+const OLD_RELEASE: &str = "1.0.0";
+
+fn agent_script(version: &str) -> String {
     format!(
         r#"#!/bin/sh
 {version}
@@ -126,7 +129,7 @@ while :; do
   fi
 done
 "#,
-        version = official_runtimes::sh_version_answer("pi"),
+        version = version,
         idle = IDLE_SCREEN,
         working = WORKING_SCREEN,
         own_confirm = OWN_CONFIRM_SCREEN,
@@ -196,9 +199,25 @@ impl Fixture {
         let agents = env.root().join("agents");
         std::fs::create_dir_all(&agents).expect("create the agents directory");
         let program = env.root().join("fake-agent");
-        std::fs::write(&program, agent_script()).expect("write the stand-in agent");
+        std::fs::write(
+            &program,
+            agent_script(&official_runtimes::sh_version_answer("pi")),
+        )
+        .expect("write the stand-in agent");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in agent executable");
+        // A Pi release below the program-status gate (`authority_from`) that
+        // the package still supports.
+        let old_program = env.root().join("fake-agent-old");
+        std::fs::write(
+            &old_program,
+            agent_script(&format!(
+                "if [ \"$1\" = --version ]; then printf '%s\\n' '{OLD_RELEASE}'; exit 0; fi\n"
+            )),
+        )
+        .expect("write the old stand-in agent");
+        std::fs::set_permissions(&old_program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the old stand-in agent executable");
         let screens = workspace_root().join("compat/pi/screens");
         for (name, mode, source) in [
             ("fake-reply-stdin", "reply", "stdin"),
@@ -208,6 +227,11 @@ impl Fixture {
         ] {
             // The nested stand-in runs under a shell session, whose manifest
             // has no `[program_status]` table.
+            let program = if mode == "old" {
+                &old_program
+            } else {
+                &program
+            };
             let (base, pin) = if mode == "nested" {
                 ("shell", String::new())
             } else {
@@ -697,10 +721,20 @@ async fn a_held_pi_record_outlives_screen_changes_until_pi_clears_it() {
     wait_screen(&fixture, &created.id, "Working", false).await;
     assert_eq!(fixture.activity(&created.id).await, Some(WORKING));
 
+    // The clear drops the record. The open gate retires the screen rules for
+    // working and idle, so the screen does not read the idle prompt back.
     command(&fixture, b'l');
-    fixture
-        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
-        .await;
+    wait_until("the record to be dropped", || async {
+        let status = fixture
+            .registry
+            .detection(&created.id)
+            .await
+            .expect("session.detection")
+            .status
+            .expect("the daemon reports the detection status");
+        (!status.record_present).then_some(())
+    })
+    .await;
     fixture
         .registry
         .stop(&created.id)

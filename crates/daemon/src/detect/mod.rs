@@ -105,6 +105,48 @@ impl GateReason {
     }
 }
 
+/// The evidence state of a detector, as `session.detection` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectorStatus {
+    /// Whether the session worker answers the program's 7501 probe.
+    pub probe_answered: bool,
+    /// The state of the held authoritative record, when one is held.
+    pub record_state: Option<String>,
+    pub gate: AuthorityGate,
+    /// Time since the latest applied evidence.
+    pub last_evidence_age: Option<std::time::Duration>,
+}
+
+impl DetectorStatus {
+    /// The wire form; `state_source` is the session's, which the detector
+    /// does not own.
+    #[must_use]
+    pub fn into_protocol(self, state_source: Option<StateSource>) -> protocol::DetectionStatus {
+        let reason = match self.gate.reason {
+            GateReason::NotDeclared => protocol::AuthorityGateReason::NotDeclared,
+            GateReason::AtOrAbove => protocol::AuthorityGateReason::AtOrAbove,
+            GateReason::Below => protocol::AuthorityGateReason::Below,
+            GateReason::VersionUnknown => protocol::AuthorityGateReason::VersionUnknown,
+        };
+        protocol::DetectionStatus {
+            state_source,
+            probe_answered: self.probe_answered,
+            record_present: self.record_state.is_some(),
+            record_state: self.record_state,
+            gate: protocol::AuthorityGate {
+                declared: self.gate.declared,
+                open: self.gate.open,
+                reason,
+                runtime_version: self.gate.runtime_version.map(|version| version.to_string()),
+                authority_from: self.gate.authority_from.map(|version| version.to_string()),
+            },
+            last_evidence_age_ms: self
+                .last_evidence_age
+                .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
 /// The version gate of a manifest's OSC 7501 records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorityGate {
@@ -376,6 +418,8 @@ pub struct Detector {
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
+    /// When the latest evidence (an OSC event or a manifest match) was applied.
+    last_evidence_at: Option<Instant>,
     /// The latest root OSC 7501 record of the active manifest's app. Held until
     /// a `clear`, a reconfigure or a lag resync; it carries no expiry because
     /// programs report on change only.
@@ -426,6 +470,7 @@ impl Detector {
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
+            last_evidence_at: None,
             program_status: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
@@ -468,6 +513,7 @@ impl Detector {
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
         let mut osc_events = self.osc.advance_with_offsets(bytes);
+        let had_osc_events = !osc_events.is_empty();
         // Without the opt-in a 7501 report is no event, so the screen is fed in
         // the same segments as for any other output.
         if self
@@ -518,6 +564,9 @@ impl Detector {
         };
         let hit = self.activity_evidence(freshness);
         let has_structured_evidence = hit.is_some();
+        if has_structured_evidence || had_osc_events {
+            self.last_evidence_at = Some(now);
+        }
 
         let mut transitions = Vec::new();
         // Only a chunk that ends idle latches: transcript text drawn ahead of a
@@ -882,6 +931,29 @@ impl Detector {
     #[must_use]
     pub fn latest_progress(&self) -> Option<&str> {
         self.latest_progress.as_deref()
+    }
+
+    /// What the detector holds about its evidence, for `session.detection`.
+    #[must_use]
+    pub fn status(&self, now: Instant) -> DetectorStatus {
+        let gate = self.authority_gate();
+        let answers_probe = self
+            .manifest
+            .as_deref()
+            .and_then(Manifest::program_status)
+            .is_some_and(ProgramStatusConfig::answer_probe)
+            && gate.records_authoritative(self.manifest.as_deref());
+        DetectorStatus {
+            probe_answered: answers_probe,
+            record_state: self
+                .program_status
+                .as_ref()
+                .map(|record| record.state.as_str().to_owned()),
+            gate,
+            last_evidence_age: self
+                .last_evidence_at
+                .map(|at| now.saturating_duration_since(at)),
+        }
     }
 
     /// The authority gate of the active manifest for this runtime release.
