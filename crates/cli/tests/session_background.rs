@@ -18,13 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use futures::{SinkExt, StreamExt};
 use pohunek_client::Client;
-use pohunek_test_support::wait::{guard, wait_until};
+use pohunek_test_support::wait::wait_until;
 use protocol::{method, Request};
 use serde_json::{json, Value};
-use tokio::net::UnixStream;
-use tokio_util::codec::{Framed, LinesCodec};
 
 #[path = "../../daemon/tests/support/official_runtimes.rs"]
 mod official_runtimes;
@@ -76,9 +73,6 @@ fn forget_stored_background(root: &Path, id: &str) {
 
 /// Event name of the marker a collector appends when its stream ends.
 const STREAM_ENDED: &str = "stream_ended";
-
-/// Protocol version of the withholding client, the previous public version.
-const PREVIOUS_VERSION: u32 = 3;
 
 /// The fake agent. It runs the installed state hook as its direct child for
 /// each `hook:<action>:<fixture>` line, feeding it the named fixture file, and
@@ -614,38 +608,6 @@ async fn ending_the_agent_clears_the_background_and_publishes_null() {
         held["runtime"]["runtime_generation"]
     );
     harness.stop().await;
-}
-
-/// Connects a protocol 3 client to the daemon socket.
-async fn connect_previous(socket: &Path) -> Framed<UnixStream, LinesCodec> {
-    wait_until("the daemon socket to accept a connection", || async {
-        UnixStream::connect(socket)
-            .await
-            .ok()
-            .map(|stream| Framed::new(stream, LinesCodec::new()))
-    })
-    .await
-}
-
-/// A hand-built protocol 3 request line.
-fn previous_request(id: &str, method: &str, params: &Value) -> String {
-    json!({
-        "v": {"minimum": PREVIOUS_VERSION, "maximum": PREVIOUS_VERSION},
-        "id": id,
-        "method": method,
-        "params": params,
-    })
-    .to_string()
-}
-
-/// Sends one line and reads the reply line, which must come back as JSON.
-async fn exchange(client: &mut Framed<UnixStream, LinesCodec>, line: &str) -> Value {
-    client.send(line.to_owned()).await.expect("send a request");
-    let reply = guard("a protocol 3 response", client.next())
-        .await
-        .expect("a response line")
-        .expect("line framing");
-    serde_json::from_str(&reply).expect("the daemon writes JSON lines")
 }
 
 /// Every worker journal under `dir`, parsed.

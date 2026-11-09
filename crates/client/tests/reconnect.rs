@@ -19,10 +19,6 @@ use tokio::net::{UnixListener, UnixStream};
 /// Response timeout of the scenarios; the clock is paused, so it is virtual.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(20);
 
-/// Package digest whose request depends on the protocol version, so a fresh
-/// connection probes the daemon before sending it.
-const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
 struct Fixture {
     listener: UnixListener,
     path: std::path::PathBuf,
