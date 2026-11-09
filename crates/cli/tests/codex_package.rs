@@ -3298,8 +3298,13 @@ async fn a_real_codex_approval_prompt_is_blocked_by_title_and_screen() {
         ])
         .await;
     assert_eq!(code, 0, "{sent}");
+    // The title and the program-status record of one prompt arrive separately;
+    // whichever comes first names the source.
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "osc_progress", "{blocked}");
+    assert!(
+        ["osc_title", "osc_progress"].contains(&blocked["state_source"].as_str().unwrap_or("")),
+        "{blocked}"
+    );
     let rows = fixture
         .wait_screen_line(&id, "Would you like to run the following command?")
         .await;

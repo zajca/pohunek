@@ -128,8 +128,12 @@ if [ "$mode" = screen ]; then
   done
 fi
 if [ "$mode" = reply ]; then emit idle; fi
-if [ "$mode" = silent ]; then
+if [ "$mode" = silent ] || [ "$mode" = recording ]; then
   head -c 2 | od -An -v -tx1 | tr -d ' \n' > "$dir/typed.hex"
+  if [ "$mode" = recording ]; then
+    emit working
+    printf 'SYNC\r\n'
+  fi
   exec sleep 600
 fi
 exec 3<> "$dir/cmd"
@@ -224,6 +228,7 @@ impl Fixture {
             ("fake-reply-stdin", "reply", "stdin"),
             ("fake-reply-fifo", "reply", "fifo"),
             ("fake-silent", "silent", "stdin"),
+            ("fake-recording", "recording", "stdin"),
             ("fake-screen", "screen", "fifo"),
         ] {
             std::fs::write(
@@ -707,7 +712,7 @@ async fn a_release_below_authority_from_is_screen_only_and_gets_no_probe_answer(
     }
     // The stand-in reports the locked Claude release, far below the gate.
     let fixture = Fixture::gated(true, Some("99.0.0")).await;
-    let created = fixture.start("fake-silent").await;
+    let created = fixture.start("fake-recording").await;
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
         .await;
@@ -728,6 +733,17 @@ async fn a_release_below_authority_from_is_screen_only_and_gets_no_probe_answer(
         !typed.starts_with(&REPLY_HEX[..4]),
         "the closed gate writes no probe reply: {typed}"
     );
+    // The detector answers `session.detection` from its own screen, so once the
+    // marker shows there it has consumed the chunk with the working record.
+    wait_until("the detector to see the marker line", || async {
+        let detection = fixture.registry.detection(&created.id).await.ok()?;
+        detection
+            .previews
+            .iter()
+            .any(|preview| preview.text.contains("SYNC"))
+            .then_some(())
+    })
+    .await;
     assert_eq!(
         fixture.activity(&created.id).await,
         Some((AgentActivity::Idle, StateSource::Screen)),

@@ -1245,9 +1245,10 @@ the screen rules stay the fallback.
   session's own (a Codex started below a shell) is not gated. Each gate
   evaluation is logged as `session.program_status.gate`.
 - **Evidence order.** From strongest to weakest: a visible dialog; the
-  authoritative 7501 root record; OSC 9;4 progress and titles; a hook report
-  that carries the activity (while it is current the detector's transitions are
-  not applied); screen text; process activity; unknown.
+  authoritative 7501 root record; OSC 9;4 progress and titles; screen text;
+  process activity; unknown. A hook or `session report-agent` report that
+  carries the activity sits above all detector evidence: while it is current
+  no detector transition, record included, is applied.
 - **Arbitration.** One fixed rule combines the held record with the screen
   winner of today's evaluation, in `feed`, in `tick` and at every working-latch
   point. The record is always included, whatever the chunk's freshness: it is a

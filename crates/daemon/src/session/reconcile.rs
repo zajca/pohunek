@@ -4185,14 +4185,10 @@ impl SessionRegistry {
         let launch_name =
             super::launch_input::launch_name(pinned.as_deref(), record.info.name.as_deref());
         default_detector_config.launch_name.clone_from(&launch_name);
-        // The release is not stored. The oldest release the pinned definition
-        // supports is the one safe lower bound: a gate at or below it is open,
-        // a higher one stays closed until the session is launched again.
-        let runtime_version = pinned
-            .as_deref()
-            .and_then(|definition| definition.version_probe_policy())
-            .map(package::version_probe::VersionProbePolicy::min);
-        default_detector_config.runtime_version = runtime_version;
+        // The release is not stored: a reattached session has an unknown
+        // release, so a runtime that declares `authority_from` reads the screen
+        // until the session is launched again.
+        let runtime_version = None;
         let probe_answered_at_reattach = default_detector_config.answers_program_status_probe();
         let mut restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())

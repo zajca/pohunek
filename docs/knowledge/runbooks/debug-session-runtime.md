@@ -638,7 +638,13 @@ Use `session detection` when activity classification is surprising. Its
 `previews` shows the exact current text supplied to each region required by the
 active manifest. A terminal title that only repeats the session name the launch
 gave the agent shows here as the agent set it, but the manifest does not
-evaluate it. Empty text is meaningful: for example,
+evaluate it. The `status` object (printed first by the human output) names
+what decided the activity: `state_source`, whether a program-status record is
+held, the release gate (`open` or `closed` with its reason, the runtime release
+and `authority_from`), whether the worker answered the probe (`unanswered,
+screen only` when the gate is declared and closed) and the age of the last
+applied evidence. A closed gate with an unknown release is the state of a
+session reattached after a daemon restart. Empty text is meaningful: for example,
 `last_non_empty_above_prompt_box` is empty without a complete prompt box. The
 preview waits for accepted agent/configuration changes before rendering.
 `session_detection_response_too_large` means the complete diagnostic would

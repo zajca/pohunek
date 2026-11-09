@@ -228,6 +228,18 @@ fn a_blocked_record_without_a_dialog_reports_the_record() {
 }
 
 #[test]
+fn a_blocked_title_and_a_blocked_record_report_the_record() {
+    let mut harness = Harness::codex(Some("0.164.0"));
+    harness.feed(&captured("codex", "", "idle"));
+    harness.feed(b"\x1b]0;Action Required\x07");
+    harness.feed(&record("codex", "blocked"));
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Blocked, StateSource::OscProgress))
+    );
+}
+
+#[test]
 fn a_codex_0_164_record_beats_a_stale_idle_title() {
     let mut harness = Harness::codex(Some("0.164.0"));
     harness.feed(&captured("codex", "", "idle"));

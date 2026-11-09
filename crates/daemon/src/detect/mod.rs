@@ -572,7 +572,10 @@ impl Detector {
         };
         let hit = self.activity_evidence(freshness);
         let has_structured_evidence = hit.is_some();
-        if has_structured_evidence || applied_osc_evidence {
+        // Output that changes no region and applies no event restates the
+        // held evidence, so it does not refresh its age.
+        let region_changed = freshness.screen || freshness.osc_title || freshness.osc_progress;
+        if applied_osc_evidence || (has_structured_evidence && region_changed) {
             self.last_evidence_at = Some(now);
         }
 
@@ -1424,8 +1427,9 @@ const PROGRAM_STATUS_REGION: &str = "program_status";
 
 /// Arbitrates the screen winner with the held program-status record.
 ///
-/// A visible blocker wins over every record and reports the screen as its
-/// source; a `blocked` record without one reports the record. Otherwise a
+/// A visible blocker wins over every record. Over a `blocked` record only a
+/// screen dialog is the reported source; a title blocker or no blocker reports
+/// the record. Otherwise a
 /// winner whose rule overrides the record stays the screen result; any other
 /// screen result yields to the record: `working` reads working, and `done`, `idle`
 /// and `error` read idle. With no record the screen winner is returned as is.
@@ -1448,12 +1452,15 @@ fn overlay_program_status(
         arrival: 0,
     };
     match record.state {
-        // A visible dialog is the more specific evidence of the same state, so
-        // the screen is the reported source when both say blocked.
+        // A dialog on the screen is the more specific evidence of the same
+        // state, so the screen is the reported source when both say blocked; a
+        // title blocker is not a dialog and the record stays the source.
         ProgramState::Blocked(_) => Some(
             screen
                 .filter(|hit| {
-                    hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker
+                    hit.evidence.activity == AgentActivity::Blocked
+                        && hit.visible_blocker
+                        && hit.evidence.source == StateSource::Screen
                 })
                 .unwrap_or_else(|| from_record(AgentActivity::Blocked, true)),
         ),
