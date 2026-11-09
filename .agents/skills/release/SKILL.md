@@ -130,9 +130,11 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
 
    Verify the attestation (`gh attestation verify <archive> --repo
    pohunekd/plugin-assistant`), then append the archive's sha256 to the core release
-   notes: fetch the body first (`gh release view "vX.Y.Z" --json body --jq .body >
-   FILE`), add the digest line, and `gh release edit "vX.Y.Z" --notes-file FILE`,
-   so the folded changelog stays. The notes are where
+   notes of `zajca/pohunek` (these commands run in the plugin clone, so each names
+   the repository): fetch the body first (`gh release view "vX.Y.Z" --repo
+   zajca/pohunek --json body --jq .body > FILE`), add the digest line, and
+   `gh release edit "vX.Y.Z" --repo zajca/pohunek --notes-file FILE`, so the
+   folded changelog stays. The notes are where
    `docs/install.md` ("Install the assistant package") sends operators for the
    digest. Without this release, `pohunek assistant` answers
    `assistant_package_missing` on every host.
