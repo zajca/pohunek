@@ -10,9 +10,9 @@
 //! daemon when needed.
 //!
 //! Knowledge delivery is pull-by-file: the launch never inlines bundle bodies
-//! into the prompt. For local launches the bundle is materialized in-process;
-//! for remote launches the host daemon materializes its own version-matched
-//! bundle via `assistant.materialize`.
+//! into the prompt. Every launch, local or remote, asks the daemon of the target
+//! host for the bundle of its assistant context package via
+//! `assistant.materialize`.
 
 pub(crate) mod bootstrap;
 

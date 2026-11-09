@@ -25,6 +25,7 @@ use protocol::{
     Request as ProtocolRequest, Response, ASSISTANT_CONTEXT_PACKAGE_ID,
 };
 use serde_json::{json, Value};
+use sha2::Digest as _;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -467,36 +468,71 @@ async fn a_package_whose_files_were_modified_after_install_is_refused() {
 }
 
 #[tokio::test]
-async fn a_bundle_cache_left_by_an_earlier_release_is_not_a_fallback() {
+async fn files_left_by_an_earlier_release_are_never_served() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
-    let servers = spawn_servers("asst-stale-cache").await;
-    let stale = servers
-        .socket
-        .parent()
-        .expect("socket directory")
-        .join("xdg-cache/pohunek/knowledge/0.0.1");
-    std::fs::create_dir_all(stale.join("assistant")).expect("create the stale bundle");
-    std::fs::write(stale.join("index.md"), "# stale\n").expect("write the stale index");
-    std::fs::write(stale.join("assistant/system.md"), CONTRACT).expect("write the stale contract");
+    let servers = spawn_servers("asst-earlier-release").await;
+    let root = servers.socket.parent().expect("socket directory");
+    // The earlier release cached its bundle under `knowledge/<version>-<hash>`.
+    let earlier_name = format!("{}-{}", env!("CARGO_PKG_VERSION"), "0".repeat(64));
+    let cache = root.join("xdg-cache/pohunek/knowledge").join(earlier_name);
+    std::fs::create_dir_all(cache.join("assistant")).expect("create the earlier bundle");
+    std::fs::write(cache.join("index.md"), "# earlier\n").expect("write the earlier index");
+    std::fs::write(cache.join("assistant/system.md"), CONTRACT)
+        .expect("write the earlier contract");
     let mut client = connect(&servers.socket).await;
 
     let error = materialize(&mut client, json!({ "snapshot": "{}" }))
         .await
-        .expect_err("a stale bundle cache is ignored");
+        .expect_err("the earlier bundle cache is not a fallback");
     assert_eq!(error.code, "assistant_package_missing", "{error:?}");
 
     install(&mut client, &servers.plugins, &bundle_entries(CONTRACT))
         .await
         .expect("install");
-    let served = materialize(&mut client, json!({ "snapshot": "{}" }))
-        .await
-        .expect("the installed package is used");
+    let probe = materialize(
+        &mut client,
+        json!({ "snapshot": "{}", "request_id": "probe" }),
+    )
+    .await
+    .expect("the installed package is used");
     assert!(
-        !served.bundle_path.contains("xdg-cache"),
-        "the bundle comes from the package, not the old cache: {}",
-        served.bundle_path
+        !probe.bundle_path.contains("xdg-cache"),
+        "the bundle comes from the package: {}",
+        probe.bundle_path
+    );
+
+    // The earlier release named a keyed launch directory
+    // `launch-<version>-<hash>-request-<digest>` and left its snapshot behind.
+    let launches = Path::new(&probe.snapshot_path)
+        .parent()
+        .and_then(Path::parent)
+        .expect("the assistant runtime directory");
+    let digest = format!("{:x}", sha2::Sha256::digest(b"r-earlier"));
+    let earlier_launch = launches.join(format!(
+        "launch-{}-{}-request-{digest}",
+        env!("CARGO_PKG_VERSION"),
+        "0".repeat(64)
+    ));
+    std::fs::create_dir_all(&earlier_launch).expect("create the earlier launch directory");
+    std::fs::write(earlier_launch.join("snapshot.json"), "earlier").expect("write the snapshot");
+
+    let launch = materialize(
+        &mut client,
+        json!({ "snapshot": "current", "request_id": "r-earlier" }),
+    )
+    .await
+    .expect("a launch under the same request id");
+
+    assert!(
+        !Path::new(&launch.snapshot_path).starts_with(&earlier_launch),
+        "{}",
+        launch.snapshot_path
+    );
+    assert_eq!(
+        std::fs::read_to_string(&launch.snapshot_path).expect("read the snapshot"),
+        "current"
     );
     servers.stop().await;
 }

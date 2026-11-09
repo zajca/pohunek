@@ -419,15 +419,24 @@ digest, never through the catalog:
 
 ```bash
 pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
-pohunek plugin select pohunek.context.assistant
 ```
 
-Until that repository publishes its first release there is no archive to
-install, and `pohunek assistant` answers `assistant_package_missing` with the
-step to take. After a core upgrade, install the package version whose release
-notes name your core version; `pohunek plugin list` shows the installed version,
-and a package that was disabled, left unselected or modified is refused the same
-way (`pohunek plugin doctor` names the cause). The
+The first install selects the package. Until that repository publishes its first
+release there is no archive to install, and `pohunek assistant` answers
+`assistant_package_missing` with the step to take.
+
+After a core upgrade, move to the package version whose release notes name your
+core version with `plugin update`, which installs the new version next to the old
+one and selects it (a plain `plugin install` keeps the old version selected):
+
+```bash
+pohunek plugin update pohunek.context.assistant ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
+```
+
+`pohunek plugin list` shows the installed versions and which one is selected;
+`pohunek plugin select pohunek.context.assistant --digest <digest>` switches
+between installed versions. A package that was disabled, left unselected or
+modified is refused (`pohunek plugin doctor` names the cause). The
 [runtime packages guide](knowledge/guides/runtime-packages.md#declaring-a-context-package)
 describes the package format.
 

@@ -58,7 +58,7 @@ pub async fn materialize_assistant(
             ContextError::NotSelected => (
                 "it is installed but not selected".to_owned(),
                 format!(
-                    "select it with `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID}` (see `pohunek plugin list`), then retry"
+                    "select it with `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID} --digest <digest>` (`pohunek plugin list` shows the digests), then retry"
                 ),
             ),
             ContextError::Disabled => (

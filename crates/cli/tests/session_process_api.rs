@@ -854,10 +854,10 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
 }
 
-/// The bundle of the repository: a real directory with a readable `index.md`,
-/// which is all a local launch checks before it starts the agent.
+/// A real directory with a readable `index.md`, which is all a local launch
+/// checks before it starts the agent.
 fn bundle_root() -> PathBuf {
-    pohunek_test_support::manifest_dir().join("../../docs/knowledge")
+    pohunek_test_support::manifest_dir().join("tests/fixtures/assistant-bundle")
 }
 
 /// The `assistant.materialize` result of the fixture daemon: a bundle

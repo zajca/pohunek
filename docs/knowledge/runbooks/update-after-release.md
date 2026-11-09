@@ -541,10 +541,11 @@ is refused the same way.
 `--accept-runtime-loss` is the one consent for the service-managed upgrade below;
 there is no second flag. See [debug session runtime](debug-session-runtime.md).
 
-After a core upgrade, install the assistant context package version that matches
-it (`pohunek plugin install <archive> --sha256 <digest>`, then `pohunek plugin
-select pohunek.context.assistant`; see `docs/install.md`, "Install the assistant package", and the
-[context package guide](../guides/runtime-packages.md#declaring-a-context-package)).
+After a core upgrade, move the assistant context package to the version that
+matches it: `pohunek plugin update pohunek.context.assistant <archive> --sha256
+<digest>` installs and selects it (a plain `plugin install` leaves the old version
+selected); see `docs/install.md`, "Install the assistant package", and the
+[context package guide](../guides/runtime-packages.md#declaring-a-context-package).
 When the assistant feature is available, its update intent should compare the
 snapshot's `pohunek_version` and the package version in the prompt with the
 installed binary's version and check behavior against that binary before recommending edits.

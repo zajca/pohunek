@@ -5,8 +5,8 @@
 //! consumer reads the fragments through this module:
 //!
 //! - [`assemble`] places the unreleased entries at the top of `log.md`, as
-//!   `## Unreleased (...)` sections. The embedded bundle and `docs build`
-//!   ship that assembled log, so readers see unreleased changes in place.
+//!   `## Unreleased (...)` sections. `docs build` ships that assembled
+//!   log, so readers see unreleased changes in place.
 //! - [`fold`] writes the entries under a release heading; `scripts/release`
 //!   runs it and removes the fragments in the release commit.
 //! - [`check_log`] refuses a committed `log.md` that carries an unreleased
@@ -22,8 +22,7 @@
 //! of one date by their file's issue number, then by file name, so the order
 //! never depends on the directory listing.
 //!
-//! The module depends on `std` only, because the crate's build script includes
-//! it to assemble the embedded bundle.
+//! The module depends on `std` only.
 
 // Rust guideline compliant 2026-10-14
 

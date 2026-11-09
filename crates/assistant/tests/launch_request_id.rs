@@ -243,7 +243,7 @@ async fn serve<S>(
                 }
                 ok(&request, capabilities.clone())
             }
-            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result()),
+            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result(&request)),
             method::SESSION_NEW => {
                 creates
                     .lock()
@@ -321,12 +321,19 @@ fn bundle_root() -> PathBuf {
 }
 
 /// The `assistant.materialize` result of the fixture daemon.
-fn materialize_result() -> Value {
+///
+/// The package version carries the request id the daemon received, so a prompt
+/// shows which id reached `assistant.materialize`.
+fn materialize_result(request: &Request) -> Value {
     let root = bundle_root();
+    let version = match request.params()["request_id"].as_str() {
+        Some(id) => format!("1.0.0+{id}"),
+        None => "1.0.0".to_owned(),
+    };
     json!({
         "bundle_path": root,
         "snapshot_path": root.join("index.md"),
-        "version": "1.0.0",
+        "version": version,
         "content_hash": "sha256:fixture",
         "concepts": [],
         "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
@@ -749,10 +756,17 @@ async fn a_launch_repeated_under_a_request_id_renders_the_same_opening_prompt() 
     let again = prepare_in(&daemon, Some("resume-me"))
         .await
         .expect("the repeated launch prepares");
+    let other = prepare_in(&daemon, Some("resume-me-not"))
+        .await
+        .expect("another launch prepares");
 
     assert_eq!(
         first.session_params.input, again.session_params.input,
         "the same request id gives the daemon the same request"
+    );
+    assert_ne!(
+        first.session_params.input, other.session_params.input,
+        "another request id reaches assistant.materialize"
     );
 }
 
