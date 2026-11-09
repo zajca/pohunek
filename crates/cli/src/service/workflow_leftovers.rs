@@ -38,7 +38,16 @@ fn leftover_units(directory: &Path, namespace: &str) -> Result<Vec<String>, Erro
     let launchd = format!("io.github.zajca.pohunek.{namespace}.wf.");
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // A directory that does not exist, or whose parent is not a directory,
+        // holds no units; the environment checks name such a path.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(Vec::new())
+        }
         Err(source) => {
             return Err(Error::Io {
                 operation: "read the unit directory",
