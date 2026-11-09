@@ -138,7 +138,14 @@ live workers keep running from their versioned directory. Agents receive only
 an allowlisted base environment (`[environment] allowlist` in `service.toml`)
 rather than the daemon's whole environment. `pohunek service uninstall` refuses
 while sessions are live unless `--stop-sessions` is given, and keeps durable
-metadata unless `--purge` is given.
+metadata unless `--purge` is given. `pohunek service check`, `upgrade` and
+`uninstall` also refuse with `service_workflow_units_installed` while units of the
+removed workflow plugin feature remain in the unit directory (systemd
+`pohunek-<namespace>-wf-*.service` and `.timer`, launchd
+`io.github.zajca.pohunek.<namespace>.wf.*.plist`); the error names each one. Stop
+and delete them (`systemctl --user disable --now <unit>` and
+`systemctl --user daemon-reload`, or `launchctl bootout gui/$(id -u)/<label>`),
+then retry.
 
 `pohunek service upgrade` first runs a read-only preflight with the new
 binaries. It judges every live session and every stopped session that keeps

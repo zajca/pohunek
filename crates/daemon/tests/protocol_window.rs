@@ -860,6 +860,44 @@ async fn an_inherited_origin_guards_a_protocol_3_mutation() {
     daemon.stop().await;
 }
 
+/// Methods no version of the window serves any more.
+const REMOVED_METHODS: &[&str] = &[
+    "session.fork",
+    "session.runtime_inventory",
+    "session.policy.get",
+    "session.policy.set",
+    "session.idle_stop.get",
+    "session.idle_stop.set",
+    "store.rejected_list",
+    "store.rejected_set_aside",
+];
+
+#[tokio::test]
+async fn removed_methods_are_unknown_on_every_version_of_the_window() {
+    let daemon = Daemon::start("window-removed").await;
+    let mut previous = daemon.connect().await;
+    let mut current = daemon.connect().await;
+    for name in REMOVED_METHODS {
+        let response = exchange(
+            &mut previous,
+            &previous_request("removed-previous", name, json!({})),
+        )
+        .await;
+        assert_eq!(response["v"], PREVIOUS_VERSION, "{name}: {response}");
+        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
+
+        let request = Request::new("removed-current", *name, json!({})).expect("valid request");
+        let response = exchange(
+            &mut current,
+            &serde_json::to_value(&request).expect("serialize request"),
+        )
+        .await;
+        assert_eq!(response["v"], PROTOCOL_VERSION.get(), "{name}: {response}");
+        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
+    }
+    daemon.stop().await;
+}
+
 #[tokio::test]
 async fn methods_added_after_the_previous_version_are_unknown_to_it() {
     let daemon = Daemon::start("window-introduced").await;

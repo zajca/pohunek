@@ -3272,7 +3272,8 @@ async fn the_acceptance_scope_does_not_depend_on_the_volatile_fields_startup_rew
 
 /// The scope of the frozen v1 encoding for the literal facts of
 /// [`ScopedFacts::baseline`] as a stopped session. A change to this digest is
-/// a change to the cross-release scope contract and needs a new scheme name.
+/// a change to the cross-release scope contract and needs a new scheme name,
+/// unless it can only make an acceptance fail closed (`project.md`).
 const GOLDEN_STOPPED_SCOPE_V1: &str =
     "v1:0b9a099942dec811bb7f4a07936c6345a29762615cf44948831ffe97e02fb137";
 

@@ -2076,10 +2076,21 @@ async fn a_descriptor_with_or_without_fork_data_installs_and_shows_no_fork() {
         .replace(fork, "")
         .replace("version = \"1.0.0\"", "version = \"1.0.1\"");
     assert!(!current.contains("[fork]"));
-    for (name, document) in [("legacy-fork", &legacy), ("current-no-fork", &current)] {
+    for (name, document, warns) in [
+        ("legacy-fork", &legacy, true),
+        ("current-no-fork", &current, false),
+    ] {
+        let captured = captured_logs();
+        let before = captured.text().len();
         let (digest, installed) =
             install_descriptor(&mut local, &servers.plugins, name, document, false).await;
         installed.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
+        let logged = captured.text().split_off(before);
+        assert_eq!(
+            logged.contains("ignoring fork data in the runtime descriptor"),
+            warns,
+            "{name}: {logged}"
+        );
         let inspected: PackageInspectResult = call(
             &mut local,
             method::PACKAGE_INSPECT,
@@ -4619,26 +4630,51 @@ async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_not
     servers.stop().await;
 }
 
-#[tokio::test]
-async fn the_removed_methods_answer_method_not_found() {
-    let servers = spawn_servers("removed-methods").await;
-    let mut local = connect_unix(&servers.socket).await;
-    for method in [
-        "session.fork",
-        "session.runtime_inventory",
-        "session.policy.get",
-        "session.policy.set",
-        "session.idle_stop.get",
-        "session.idle_stop.set",
-        "store.rejected_list",
-        "store.rejected_set_aside",
-    ] {
-        assert_eq!(
-            refusal(&mut local, method, json!({})).await,
-            "method_not_found",
-            "{method}"
-        );
+/// The lines a log subscriber captured.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log capture lock")).into_owned()
     }
-    drop(local);
-    servers.stop().await;
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut *self.0.lock().expect("log capture lock"), buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The process-wide capture of the daemon's logs. The daemon parses a
+/// descriptor on a blocking thread, so a thread-local subscriber would miss
+/// it; every test of this binary runs in a process of its own under nextest.
+fn captured_logs() -> Captured {
+    static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+    CAPTURED
+        .get_or_init(|| {
+            let captured = Captured::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(captured.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            )
+            .expect("no other global subscriber in this process");
+            captured
+        })
+        .clone()
 }

@@ -111,7 +111,7 @@ pub const REPORT_VERSION: u32 = 1;
 /// - the agent base, the launch pin (including the package or descriptor
 ///   digest), and digests of the native session id and path, so no raw
 ///   reference leaves the daemon;
-/// - whether the session can resume and fork.
+/// - whether the session can resume.
 ///
 /// It leaves out everything startup rewrites (runtime state and reason,
 /// transactions, identity ordering, process ids), the human `detail` and
@@ -131,7 +131,7 @@ pub const ACCEPTANCE_SCOPE_V1: &str = "v1";
 
 /// The session is adopted with its native recovery intact.
 pub const CODE_ADOPTABLE: &str = "adoptable";
-/// The stopped session resumes and forks through a newer version of the
+/// The stopped session resumes through a newer version of the
 /// official package it was launched from, which adopts it; the detail names
 /// both versions.
 pub const CODE_ADOPTABLE_BY_NEWER_PACKAGE: &str = "adoptable_by_newer_package";
@@ -196,7 +196,7 @@ pub const CODE_RECOVERY_UNREPAIRABLE: &str = "native_recovery_unrepairable";
 /// The session's launch pin names a runtime source the new daemon does not
 /// serve: a built-in runtime it does not ship or an official package serves
 /// in its place, or a package digest that is not installed. The worker is
-/// adopted, but resume and fork are refused, because no other source stands
+/// adopted, but resume is refused, because no other source stands
 /// in for the pinned one. While the session's runtime resolves nowhere (a
 /// built-in it does not ship and no package serves, or a runtime that is not
 /// installed), every interaction with the session is refused too, whether or
@@ -329,9 +329,9 @@ pub struct PreflightReport {
     pub store: StoreReport,
     /// Every live session, ordered by id.
     pub sessions: Vec<SessionVerdict>,
-    /// Sessions whose runtime has ended and that keep native resume or fork,
-    /// ordered by id. Each verdict says whether the session still resumes or
-    /// forks through the runtime source the new daemon serves.
+    /// Sessions whose runtime has ended and that keep native resume,
+    /// ordered by id. Each verdict says whether the session still resumes
+    /// through the runtime source the new daemon serves.
     #[serde(default)]
     pub stopped_sessions: Vec<SessionVerdict>,
     /// Sessions whose worker journal is live but which the store has no

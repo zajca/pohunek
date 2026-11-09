@@ -38,8 +38,8 @@
 //!
 //! The resume binding additionally carries the **structural relaunch snapshot**
 //! (Part C, C.4): `program`, `args`, `input_rules`, `native_launch` (the typed
-//! native-session launch spec: reference kind plus resume and optional fork argv
-//! with one reference slot each), and `agent_base`. These are the non-secret
+//! native-session launch spec: reference kind plus the resume argv
+//! with one reference slot), and `agent_base`. These are the non-secret
 //! fields needed to relaunch-and-resume a host-profile session with exactly its
 //! launch-time shape after a daemon restart. The profile's **`env` is deliberately NOT among them** —
 //! it may hold secrets, so it is re-resolved by agent name at resume, never
@@ -99,8 +99,7 @@ const BODY_CAPACITY_SLACK: usize = 4096;
 
 /// The launch directory and project a session was created with.
 ///
-/// Recorded once at create and never refreshed by a cwd change or a resume; a
-/// fork copies its source's. The trusted-checkout predicate evaluates this pair,
+/// Recorded once at create and never refreshed by a cwd change or a resume. The trusted-checkout predicate evaluates this pair,
 /// not the session's current directory, which terminal output and the focus
 /// process can move.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +112,7 @@ pub struct LaunchCheckout {
     pub project_id: Option<String>,
 }
 
-/// One session's native resume and fork recovery binding.
+/// One session's native resume recovery binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResumeBinding {
     /// The pohunek session id (stable across restart).
@@ -135,10 +134,10 @@ pub struct ResumeBinding {
     pub cols: u16,
     /// Terminal height at capture time.
     pub rows: u16,
-    /// Captured native session id used to build resume or fork argv.
+    /// Captured native session id used to build resume argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
-    /// Captured native session path, for agents that resume or fork from a path.
+    /// Captured native session path, for agents that resume from a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_path: Option<String>,
     /// Project this session belongs to ([`ProjectRecord::id`]), captured here so a
@@ -177,7 +176,7 @@ pub struct ResumeBinding {
     #[serde(default)]
     pub input_rules: StoredInputRules,
     /// Structural relaunch snapshot (C.4): the native-session launch spec, frozen
-    /// at creation so a profile's `[resume]` override drives the relaunch and fork
+    /// at creation so a profile's `[resume]` override drives the relaunch
     /// argv and decides which validation guard the captured reference passes.
     /// `None` for a session without native recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,7 +193,7 @@ pub struct ResumeBinding {
     pub native_reference_provenance: NativeReferenceProvenance,
     /// The keyed revision of the host profile the session was launched from,
     /// frozen when it was created or when the owner accepted a profile change.
-    /// Resume and fork relaunch under the profile only while its current
+    /// Resume relaunches under the profile only while its current
     /// revision matches. Absent for a session without a profile and for a
     /// binding written before revisions were frozen. A keyed MAC, so it reveals
     /// nothing about the profile's `[env]` values.

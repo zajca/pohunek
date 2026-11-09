@@ -1295,7 +1295,7 @@ because such a session may still be recoverable with `session resume`.
 The file is a JSON object with the keys `enabled` (boolean), `sweep_interval_secs`,
 `terminal_ttl_secs`, `lost_ttl_secs` and `max_removals_per_sweep` (positive
 integers, each at or above the minimum the daemon enforces; the cap must be
-greater than zero), written with owner-only permissions. Unknown keys, a value
+greater than zero). The file has mode `0600` in a `0700` directory (`chmod 600`; any other mode stops the daemon at startup). The minimums are 60 for `sweep_interval_secs` and 3600 for `terminal_ttl_secs` and `lost_ttl_secs`. Unknown keys, a value
 below a minimum or a file that is not valid JSON make the daemon refuse to
 start, naming the file.
 

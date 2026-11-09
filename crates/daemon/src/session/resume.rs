@@ -46,8 +46,8 @@ pub(super) struct ResumeSnapshot {
     pub(super) program: String,
     /// Launch args (the profile's `args`; empty for a bare base kind).
     pub(super) args: Vec<String>,
-    /// Resolved native-session launch spec; `None` ⇒ this session neither resumes
-    /// nor forks natively.
+    /// Resolved native-session launch spec; `None` ⇒ this session does not resume
+    /// natively.
     pub(super) native: Option<NativeSessionLaunch>,
     /// The runtime identity this launch shape was frozen with.
     pub(super) launch_binding: host::LaunchPin,
@@ -59,7 +59,7 @@ pub(super) struct ResumeSnapshot {
     pub(super) profile_revision: Option<ProfileRevision>,
     /// The directory and project the session was created with; the trusted
     /// checkout arguments are evaluated on this pair. Set once at create,
-    /// carried unchanged by every resume and copied by a fork.
+    /// carried unchanged by every resume.
     pub(super) launch_checkout: Option<Box<LaunchCheckout>>,
 }
 
@@ -90,7 +90,7 @@ impl ResumeSnapshot {
         }
     }
 
-    /// Return the native reference kind required by resume or fork.
+    /// Return the native reference kind required by resume.
     pub(super) fn native_ref_kind(&self) -> Option<SessionRefKind> {
         self.native
             .as_ref()
@@ -125,7 +125,7 @@ impl ProfileChange {
     }
 }
 
-/// The host profile a resume or fork relaunches under, resolved once.
+/// The host profile a resume relaunches under, resolved once.
 pub(super) struct RecoveryProfile {
     /// Profile `[env]`, secret-bearing.
     pub(super) env: LaunchEnv,
@@ -147,7 +147,7 @@ impl RecoveryProfile {
     }
 }
 
-/// Everything a resume or fork launches with, resolved once and consumed by
+/// Everything a resume launches with, resolved once and consumed by
 /// verification, launch and the relaunched snapshot.
 pub(super) struct RelaunchPlan {
     definition: Arc<RuntimeDefinition>,
@@ -328,7 +328,7 @@ impl SessionRegistry {
     }
 
     /// Adds verified native-reference last activity to public response copies,
-    /// and clears the resume and fork capabilities of each listed session whose
+    /// and clears the resume capabilities of each listed session whose
     /// recovery resolution refuses them, naming the refusal codes, so a
     /// response never advertises an operation that resolution refuses. Refusals
     /// that depend on the session's state or on one request are left to the
@@ -442,7 +442,7 @@ impl SessionRegistry {
                     return None;
                 }
                 entry.snapshot.native_ref_kind()?;
-                // Resume/fork recovery becomes actionable once the agent reports
+                // Resume recovery becomes actionable once the agent reports
                 // the native reference required by either frozen capability.
                 if entry.info.native_session_id.is_none()
                     && entry.info.native_session_path.is_none()
@@ -520,7 +520,7 @@ impl SessionRegistry {
         // Held from resolving the pin until the detached registration has
         // persisted the resumed record, so an adopting package cannot be
         // uninstalled in between: the built-in pin does not count as a
-        // reference to it. Taken before the lifecycle guard, as `fork` does.
+        // reference to it. Taken before the lifecycle guard.
         let package_authority = self.inner.packages.hold_launch().await;
         let guard = self.lock_lifecycle(id).await;
         let (binding, definition, registration, record) = {
@@ -925,7 +925,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Resolves everything a resume or fork of `binding` launches with, once:
+    /// Resolves everything a resume of `binding` launches with, once:
     /// the profile, the native reference, the program and the version probe.
     ///
     /// # Errors
@@ -1508,7 +1508,7 @@ fn repinned_profile_matches_in(
 }
 
 /// Resolves the host profile `binding` was launched from and checks it against
-/// the revision frozen into the binding, as a resume or a fork of `binding`
+/// the revision frozen into the binding, as a resume of `binding`
 /// does. Resume and the upgrade preflight both run this one check.
 ///
 /// `definition` is the [`recovery_definition`] the operation resolved; the
@@ -1624,7 +1624,7 @@ pub(super) fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefin
 /// launch.
 ///
 /// A newer version adopts the session only when it honors everything the
-/// frozen launch supports (resume, and fork when the frozen spec forks), and,
+/// frozen launch supports (resume), and,
 /// for a session launched from a host profile, only when that profile now pins
 /// the newer version: a profile still pinned to the frozen digest keeps the
 /// session on it. Otherwise the session resolves its exact digest, as it would
@@ -1747,7 +1747,7 @@ pub(super) fn recovery_definition_memo(
 }
 
 /// Whether the newer package version `adopter` may serve `binding`'s relaunch:
-/// it honors the frozen resume, and the frozen fork when there is one, and a
+/// it honors the frozen resume, and a
 /// host profile the session was launched from pins `adopter`.
 fn newer_adoption_holds(
     profiles: &ProfileRegistry,

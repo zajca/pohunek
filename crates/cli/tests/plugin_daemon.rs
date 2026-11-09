@@ -133,6 +133,7 @@ args = ["--fork", "{{reference}}"]
 [native_reference]
 strategy = "assigned"
 launch_args = ["--session-id", "{{reference}}"]
+assign_fork = true
 
 [native_reference.existence]
 check = "none"
@@ -1522,4 +1523,38 @@ async fn the_removed_commands_are_unknown_and_a_leftover_workflow_store_does_not
     let (code, listed) = restarted.json(&["session", "list"]).await;
     assert_eq!(code, 0, "{listed}");
     restarted.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_of_a_descriptor_with_fork_data_lists_without_fork_and_resumes() {
+    let harness = Harness::start().await;
+    let built = harness.archive("1.0.0");
+    install_enabled(&harness, &built).await;
+    let (code, created) = launch(&harness, RUNTIME).await;
+    assert_eq!(code, 0, "{created}");
+    let id = created["ok"]["id"]
+        .as_str()
+        .expect("created session id")
+        .to_owned();
+
+    let (code, listed) = harness.json(&["session", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    let session = listed["ok"]
+        .as_array()
+        .expect("session list array")
+        .iter()
+        .find(|session| session["id"] == id.as_str())
+        .expect("the session is listed")
+        .clone();
+    assert_eq!(
+        session["capabilities"],
+        serde_json::json!({"resume": true, "fork": false}),
+        "{session}"
+    );
+
+    let (code, stopped) = harness.json(&["session", "stop", &id]).await;
+    assert_eq!(code, 0, "{stopped}");
+    let (code, resumed) = harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 0, "{resumed}");
+    harness.stop().await;
 }
