@@ -991,6 +991,20 @@ impl SessionRegistry {
             manifest_override,
         );
         default_detector_config.launch_name.clone_from(&launch_name);
+        let runtime_version = command.runtime_version;
+        default_detector_config.runtime_version = runtime_version;
+        let gate = default_detector_config.authority_gate();
+        tracing::info!(
+            target: "session.program_status.gate",
+            session = %id.0,
+            runtime = %agent_base,
+            runtime_version = ?gate.runtime_version.map(|version| version.to_string()),
+            authority_from = ?gate.authority_from.map(|version| version.to_string()),
+            gate_open = gate.open,
+            reason = gate.reason.as_str(),
+            answer_probe = default_detector_config.answers_program_status_probe(),
+            "program-status authority gate evaluated"
+        );
         let hook_schema = self.session_hook_schema(&agent_base, &snapshot.launch_binding);
         let answers_program_status_probe = default_detector_config.answers_program_status_probe();
         let placement_check = pinned
@@ -1123,6 +1137,8 @@ impl SessionRegistry {
             initial_input_done: initial_input_done.clone(),
             default_detector_config,
             launch_name,
+            runtime_version,
+            probe_answered: answers_program_status_probe,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),

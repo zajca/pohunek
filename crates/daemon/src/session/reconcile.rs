@@ -4185,9 +4185,22 @@ impl SessionRegistry {
         let launch_name =
             super::launch_input::launch_name(pinned.as_deref(), record.info.name.as_deref());
         default_detector_config.launch_name.clone_from(&launch_name);
+        // The release is not stored: a reattached session has an unknown
+        // release, so a runtime that declares `authority_from` reads the screen
+        // until the session is launched again.
+        let runtime_version = None;
+        let probe_answered_at_reattach = default_detector_config.answers_program_status_probe();
         let mut restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())
             .unwrap_or_else(|| default_detector_config.clone());
+        if super::program_status_app(&restored_detector_config)
+            == super::program_status_app(&default_detector_config)
+        {
+            restored_detector_config.runtime_version = runtime_version;
+        } else {
+            restored_detector_config.gate_waived =
+                super::program_status_app(&restored_detector_config).is_some();
+        }
         restored_detector_config
             .launch_name
             .clone_from(&launch_name);
@@ -4233,6 +4246,8 @@ impl SessionRegistry {
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
             launch_name,
+            runtime_version,
+            probe_answered: probe_answered_at_reattach,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -4573,6 +4588,8 @@ impl SessionRegistry {
             initial_input_done: cancelled_initial_input(),
             default_detector_config,
             launch_name: None,
+            runtime_version: None,
+            probe_answered: false,
             pinned: self
                 .inner
                 .profiles

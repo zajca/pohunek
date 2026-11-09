@@ -124,6 +124,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/work"),
             cols: 80,
             rows: 24,
+            runtime_version: None,
         };
         assert_redacted(&format!("{command:?}"));
         assert_redacted(&format!("{command:#?}"));

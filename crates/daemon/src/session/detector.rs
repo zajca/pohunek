@@ -121,7 +121,10 @@ fn reply_to_preview(
         apply_detector_config(detector, tick, applied_generation, update);
     }
 
-    let _ = request.reply.send(Ok(detector.region_previews()));
+    let _ = request.reply.send(Ok(super::DetectionSnapshot {
+        previews: detector.region_previews(),
+        status: detector.status(crate::time::now()),
+    }));
 }
 
 impl SessionRegistry {
@@ -282,10 +285,11 @@ impl SessionRegistry {
                 (
                     entry.detector_preview.clone(),
                     entry.detector_config.borrow().generation,
+                    entry.probe_answered,
                 )
             })
         };
-        let Some((preview, minimum_config_generation)) = managed else {
+        let Some((preview, minimum_config_generation, probe_answered)) = managed else {
             if self.inner.external.contains_id(id).await {
                 return Err(protocol::ProtocolError::session_has_no_managed_terminal());
             }
@@ -299,9 +303,18 @@ impl SessionRegistry {
             })
             .await
             .map_err(|_send_error| protocol::ProtocolError::session_terminal_unavailable())?;
-        let previews = response
+        let snapshot = response
             .await
             .map_err(|_receive_error| protocol::ProtocolError::session_terminal_unavailable())??;
+        let state_source = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .get(id)
+                .and_then(|entry| entry.info.activity.map(|_| entry.info.state_source))
+        };
+        let mut status = snapshot.status.into_protocol(state_source);
+        status.probe_answered = probe_answered;
+        let previews = snapshot.previews;
 
         // The program-status preview stays off the wire while
         // `DetectionRegionKind` is a strict enum, so a client that predates the
@@ -317,6 +330,7 @@ impl SessionRegistry {
                 .filter(|kind| *kind != protocol::DetectionRegionKind::ProgramStatus)
                 .collect(),
             previews,
+            status: Some(status),
         })
     }
 
@@ -487,6 +501,8 @@ mod tests {
     async fn preview_applies_an_accepted_pending_configuration_first() {
         let initial = DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
             manifest: Some(Arc::new(
@@ -505,6 +521,8 @@ mod tests {
         };
         let updated = DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
             manifest: Some(Arc::new(
@@ -550,7 +568,8 @@ mod tests {
         let previews = response
             .await
             .expect("detector replies")
-            .expect("preview succeeds");
+            .expect("preview succeeds")
+            .previews;
         assert_eq!(applied_generation, 1);
         assert_eq!(previews.len(), 1);
         assert_eq!(previews[0].kind, DetectionRegionKind::BottomLines);
@@ -631,6 +650,8 @@ mod tests {
 
             let config = DetectorConfig {
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
                 input_readiness: crate::agent::host::InputReadiness::default(),
                 detection: DetectionConfig {
                     recheck_after: TEST_RECHECK_AFTER,

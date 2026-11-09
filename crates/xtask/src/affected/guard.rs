@@ -205,6 +205,31 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "shipped manifests and captured screens of the Claude, Codex and Pi packages, read through helpers that take the path",
     ),
     (
+        "crates/daemon/tests/osc_progress_detector.rs",
+        &["crates/daemon/src/detect/manifests", "runtime-packages/claude"],
+        "the generic shell manifest and the shipped Claude manifest, read through helpers that take the path",
+    ),
+    (
+        "crates/daemon/tests/program_status_gate.rs",
+        &[
+            "runtime-packages/claude",
+            "runtime-packages/codex",
+            "compat/claude",
+            "compat/codex",
+        ],
+        "shipped manifests and captured screens of the Claude and Codex packages, read through helpers that take the path",
+    ),
+    (
+        "crates/daemon/tests/program_status_screen_retirement.rs",
+        &[
+            "runtime-packages/claude",
+            "runtime-packages/codex",
+            "compat/claude",
+            "compat/codex",
+        ],
+        "shipped manifests, captured screens and record sequences of the Claude and Codex packages, read through helpers that take the path",
+    ),
+    (
         "crates/cli/tests/codex_package.rs",
         &["runtime-packages/codex", "compat/codex"],
         "goldens and TOML files of the Codex package, read through helpers that take the path",

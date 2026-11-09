@@ -967,6 +967,83 @@ fn a_retention_hold_and_reason_from_a_newer_daemon_show_unknown_and_never_free_t
 }
 
 #[test]
+fn session_detection_names_a_closed_gate_and_the_unanswered_probe() {
+    let detection = run_against_scripted_daemon(
+        &["session", "detection", "s-1"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_DETECTION,
+                json!({
+                    "session_id": "s-1",
+                    "supported_regions": ["osc_title"],
+                    "previews": [],
+                    "status": {
+                        "state_source": "screen",
+                        "probe_answered": false,
+                        "record_present": false,
+                        "gate": {
+                            "declared": true,
+                            "open": false,
+                            "reason": "below",
+                            "authority_from": "2.1.309",
+                            "runtime_version": "2.1.289",
+                        },
+                        "last_evidence_age_ms": 1500,
+                    },
+                }),
+            ),
+        ]),
+    );
+    assert_eq!(detection.status.code(), Some(0), "{detection:?}");
+    let text = String::from_utf8_lossy(&detection.stdout);
+    for line in [
+        "state_source: screen",
+        "program status: absent",
+        "gate: closed (below, runtime 2.1.289, authority_from 2.1.309)",
+        "probe: unanswered, screen only",
+        "last evidence: 1500 ms ago",
+    ] {
+        assert!(text.contains(line), "{line:?} missing from:\n{text}");
+    }
+}
+
+#[test]
+fn session_detection_does_not_claim_a_probe_state_for_an_unknown_release() {
+    let detection = run_against_scripted_daemon(
+        &["session", "detection", "s-1"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_DETECTION,
+                json!({
+                    "session_id": "s-1",
+                    "supported_regions": ["osc_title"],
+                    "previews": [],
+                    "status": {
+                        "state_source": "screen",
+                        "probe_answered": false,
+                        "record_present": false,
+                        "gate": {
+                            "declared": true,
+                            "open": false,
+                            "reason": "version_unknown",
+                            "authority_from": "2.1.309",
+                        },
+                    },
+                }),
+            ),
+        ]),
+    );
+    assert_eq!(detection.status.code(), Some(0), "{detection:?}");
+    let text = String::from_utf8_lossy(&detection.stdout);
+    assert!(
+        text.contains("probe: not reported (release unknown), screen only"),
+        "{text}"
+    );
+}
+
+#[test]
 fn detection_regions_and_inventory_status_from_a_newer_daemon_are_dropped_or_shown_unknown() {
     let detection = run_against_scripted_daemon(
         &["session", "detection", "s-1", "--json"],

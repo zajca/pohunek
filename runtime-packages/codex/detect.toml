@@ -37,6 +37,7 @@
 
 [program_status]
 app = "codex"
+authority_from = "0.163.0"
 
 [process]
 comm = ["^codex$"]

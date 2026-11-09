@@ -116,6 +116,7 @@ The features this core implements:
 | `placement-v1` | 0.40.0 | `[placement]` |
 | `checkout-trust-args-v1` | 0.40.0 | `[runtime] trusted_checkout_args`, `trusted_checkout_paths` |
 | `integration-cline-hook-v1` | 0.40.0 | `integration.handler = "cline-hook-v1"` |
+| `program-status-gate-v1` | 0.41.0 | detection manifest `[program_status] authority_from` and rule `below_authority` (no descriptor key; the package lists it so an older core refuses it) |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -983,7 +984,20 @@ A detection manifest opts in to OSC 7501 program-status evidence with a table:
 [program_status]
 app = "my-agent"      # 1-32 characters of [A-Za-z0-9_.+-]
 answer_probe = true   # optional, default false
+authority_from = "1.2.0"   # optional MAJOR.MINOR.PATCH
 ```
+
+`authority_from` makes the records authoritative only for a runtime release at
+or above it, as probed by the launch's `version_probe`; below it, or with the
+release unknown, the worker answers no probe, records are ignored and the
+screen decides. Without the key the records are authoritative for every
+release.
+
+A rule may set `below_authority = true` (only with `authority_from`): it serves
+releases below the gate and is skipped for activity while the gate is open and a record is held, so
+the record decides working and idle there; with no record held the rule applies as without the gate. Dialog and blocked rules never set
+it. Input readiness still evaluates the rule, so a prompt box that releases the
+first input keeps doing so.
 
 `app` names the program whose root records the detector holds; records of any
 other app, records without an app and records of children (an `id=` pair) are

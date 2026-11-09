@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.6.0";
+const PACKAGE_VERSION: &str = "1.7.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -653,6 +653,8 @@ fn detector_for(manifest: &Arc<Manifest>, now: Instant, columns: u16) -> Detecto
         now,
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: true,
             input_readiness: pohunek_daemon::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
@@ -1123,6 +1125,8 @@ fn the_startup_update_prompt_rule_blocks_the_measured_popup_and_outranks_a_stale
     let definition = installed_definition();
     let config = DetectorConfig {
         launch_name: None,
+        runtime_version: None,
+        gate_waived: true,
         input_readiness: InputReadiness::default(),
         detection: DetectionConfig {
             recheck_after: Duration::from_millis(100),
@@ -1604,6 +1608,8 @@ fn manifest_idle_keeps_the_popup_hold_across_implicit_scroll() {
 fn manifest_idle_probe_config(definition: &RuntimeDefinition) -> DetectorConfig {
     DetectorConfig {
         launch_name: None,
+        runtime_version: None,
+        gate_waived: true,
         input_readiness: InputReadiness::ManifestIdle,
         detection: latch_detection_config(),
         manifest: Some(Arc::clone(definition.manifest())),
@@ -1751,6 +1757,8 @@ fn manifest_idle_releases_on_fresh_screen_idle_evidence() {
     let columns = DEFAULT_COLUMNS;
     let config = DetectorConfig {
         launch_name: None,
+        runtime_version: None,
+        gate_waived: true,
         input_readiness: InputReadiness::ManifestIdle,
         detection: latch_detection_config(),
         manifest: Some(Arc::new(
@@ -3290,8 +3298,13 @@ async fn a_real_codex_approval_prompt_is_blocked_by_title_and_screen() {
         ])
         .await;
     assert_eq!(code, 0, "{sent}");
+    // The title and the program-status record of one prompt arrive separately;
+    // whichever comes first names the source.
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "osc_progress", "{blocked}");
+    assert!(
+        ["osc_title", "osc_progress"].contains(&blocked["state_source"].as_str().unwrap_or("")),
+        "{blocked}"
+    );
     let rows = fixture
         .wait_screen_line(&id, "Would you like to run the following command?")
         .await;

@@ -14,10 +14,157 @@ const HEX_ALPHA_OFFSET: u8 = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscEvidence {
     Title(String),
-    Progress(String),
+    /// A well-formed `OSC 9 ; 4 ; <state> [; <percent>]` progress report.
+    Progress(ProgressReport),
+    /// A desktop notification: a plain `OSC 9 ; <text>`, an `OSC 777 ; notify`
+    /// or a complete `OSC 99` title or body. Its title and body are joined by
+    /// a newline. It is not progress.
+    Notice(String),
     Cwd(String),
     /// A parsed OSC 7501 program-status report, never a probe.
     ProgramStatus(ProgramStatusReport),
+}
+
+/// The `ConEmu` progress state of an `OSC 9 ; 4` report.
+///
+/// State 4 (`Warning`) is parsed but no manifest maps it to an activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressState {
+    /// State 0: the progress indicator is removed.
+    Remove,
+    /// State 1: determinate progress.
+    Normal,
+    /// State 2: an error.
+    Error,
+    /// State 3: indeterminate progress.
+    Indeterminate,
+    /// State 4: a warning.
+    Warning,
+}
+
+impl ProgressState {
+    fn from_digit(digit: &[u8]) -> Option<Self> {
+        match digit {
+            b"0" => Some(Self::Remove),
+            b"1" => Some(Self::Normal),
+            b"2" => Some(Self::Error),
+            b"3" => Some(Self::Indeterminate),
+            b"4" => Some(Self::Warning),
+            _ => None,
+        }
+    }
+
+    fn digit(self) -> u8 {
+        match self {
+            Self::Remove => 0,
+            Self::Normal => 1,
+            Self::Error => 2,
+            Self::Indeterminate => 3,
+            Self::Warning => 4,
+        }
+    }
+}
+
+/// A typed OSC 9;4 progress report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    /// The reported percentage, 0 to 100, when the sequence carries one.
+    pub percent: Option<u8>,
+}
+
+impl ProgressReport {
+    /// The text manifests match in the `osc_progress` region: `4;<state>`.
+    ///
+    /// The percentage is left out so a rule such as `^4;0` keys on the state
+    /// alone and a moving percentage is not a region change.
+    #[must_use]
+    pub fn region_text(&self) -> String {
+        format!("{PROGRESS_SUBCOMMAND};{}", self.state.digit())
+    }
+}
+
+/// The `ConEmu` OSC 9 subcommand that carries progress.
+const PROGRESS_SUBCOMMAND: &str = "4";
+const MAX_PROGRESS_PERCENT: u8 = 100;
+
+/// Classifies an OSC 9 payload. `None` is a malformed `4` subcommand, which is
+/// neither progress nor a notice.
+fn classify_osc9(payload: &[u8]) -> Option<OscEvidence> {
+    let mut parts = payload.split(|&byte| byte == b';');
+    let head = parts.next().unwrap_or_default();
+    if head != PROGRESS_SUBCOMMAND.as_bytes() {
+        return Some(OscEvidence::Notice(
+            String::from_utf8_lossy(payload).into_owned(),
+        ));
+    }
+    let state = ProgressState::from_digit(parts.next()?)?;
+    let percent = match parts.next() {
+        None | Some(b"") => None,
+        Some(digits) => Some(parse_percent(digits)?),
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(OscEvidence::Progress(ProgressReport { state, percent }))
+}
+
+/// The `OSC 777` extension that carries a notification.
+const OSC777_NOTIFY: &[u8] = b"notify";
+
+/// `OSC 777 ; notify ; <title> ; <body>`. Any other `777` extension is
+/// ignored.
+fn classify_osc777(payload: &[u8]) -> Option<OscEvidence> {
+    let mut parts = payload.splitn(3, |&byte| byte == b';');
+    if parts.next()? != OSC777_NOTIFY {
+        return None;
+    }
+    let title = parts.next().unwrap_or_default();
+    let body = parts.next().unwrap_or_default();
+    Some(OscEvidence::Notice(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(title),
+        String::from_utf8_lossy(body)
+    )))
+}
+
+/// `OSC 99 ; <metadata> ; <payload>` of the kitty notification protocol.
+///
+/// Only a complete, unencoded `title` or `body` payload is a notice: a chunked
+/// notification (`d=0`), a base64 payload (`e=1`), a query, a close and any
+/// other payload type are ignored.
+fn classify_osc99(payload: &[u8]) -> Option<OscEvidence> {
+    let split = payload.iter().position(|&byte| byte == b';')?;
+    let (metadata, text) = (&payload[..split], &payload[split + 1..]);
+    let mut payload_type: &[u8] = b"title";
+    for pair in metadata.split(|&byte| byte == b':') {
+        let Some(eq) = pair.iter().position(|&byte| byte == b'=') else {
+            continue;
+        };
+        let (key, value) = (&pair[..eq], &pair[eq + 1..]);
+        match key {
+            b"d" if value == b"0" => return None,
+            b"e" if value != b"0" => return None,
+            b"p" => payload_type = value,
+            _ => {}
+        }
+    }
+    if payload_type != b"title" && payload_type != b"body" {
+        return None;
+    }
+    Some(OscEvidence::Notice(
+        String::from_utf8_lossy(text).into_owned(),
+    ))
+}
+
+fn parse_percent(digits: &[u8]) -> Option<u8> {
+    if digits.is_empty() || digits.len() > 3 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let value: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    u8::try_from(value)
+        .ok()
+        .filter(|percent| *percent <= MAX_PROGRESS_PERCENT)
 }
 
 #[derive(Debug, Default)]
@@ -199,15 +346,19 @@ impl OscParser {
     }
 
     fn is_supported_command(&self) -> bool {
-        matches!(self.command.as_slice(), b"0" | b"2" | b"7" | b"9")
-            || self.command == PROGRAM_STATUS
+        matches!(
+            self.command.as_slice(),
+            b"0" | b"2" | b"7" | b"9" | b"99" | b"777"
+        ) || self.command == PROGRAM_STATUS
     }
 
     fn finish_osc(&mut self, offset: usize, evidence: &mut Vec<(OscEvidence, usize)>) {
         let item = match self.command.as_slice() {
             b"0" | b"2" => Some(OscEvidence::Title(self.payload_string())),
             b"7" => self.cwd_payload().map(OscEvidence::Cwd),
-            b"9" => Some(OscEvidence::Progress(self.payload_string())),
+            b"9" => classify_osc9(&self.payload),
+            b"777" => classify_osc777(&self.payload),
+            b"99" => classify_osc99(&self.payload),
             command if command == PROGRAM_STATUS => parse_program_status(&self.payload)
                 .filter(|report| *report != ProgramStatusReport::Probe)
                 .map(OscEvidence::ProgramStatus),
@@ -307,17 +458,6 @@ mod tests {
         assert_eq!(
             parser.advance(b"\\"),
             vec![OscEvidence::Title("editor".to_string())]
-        );
-    }
-
-    #[test]
-    fn parses_osc_9_progress_fragmented_and_bel_terminated() {
-        let mut parser = OscParser::new();
-
-        assert!(parser.advance(b"\x1b]9;pro").is_empty());
-        assert_eq!(
-            parser.advance(b"gress=42\x07"),
-            vec![OscEvidence::Progress("progress=42".to_string())]
         );
     }
 

@@ -130,6 +130,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "integration-cline-hook-v1",
         since: "0.40.0",
     },
+    RuntimeFeature {
+        id: "program-status-gate-v1",
+        since: "0.41.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].

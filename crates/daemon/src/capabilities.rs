@@ -655,7 +655,7 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
     match outcome {
         ProbeOutcome::Output(output) => policy
             .check_output(&output)
-            .map(|_version| Some(program))
+            .map(|version| Some(program.with_version(version)))
             .map_err(LaunchValidationFailure::Refused),
         ProbeOutcome::TimedOut if shortened_budget => Err(LaunchValidationFailure::ProbeTimedOut),
         ProbeOutcome::TimedOut | ProbeOutcome::Failed | ProbeOutcome::Unavailable => {

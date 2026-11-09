@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.3.0";
+const PACKAGE_VERSION: &str = "1.4.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -216,6 +216,8 @@ fn detector_launched_as(
         now,
         DetectorConfig {
             launch_name: launch_name.map(Arc::from),
+            runtime_version: None,
+            gate_waived: true,
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
                 confirmations: 1,
@@ -936,8 +938,8 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     assert_eq!(placement["mode"].as_str(), Some("in_process"));
     assert_eq!(
         package["requires"].as_array().map(Vec::len),
-        Some(2),
-        "the descriptor requires exactly the naming and placement features"
+        Some(3),
+        "the descriptor requires exactly the naming, placement and program-status gate features"
     );
     package.remove("requires");
     // `ready` is the one key the package declares that v0.34.2 does not: the
@@ -1027,6 +1029,7 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
         toml::Value::Table(toml::Table::from_iter([
             ("app".to_owned(), "claude-code".into()),
             ("answer_probe".to_owned(), true.into()),
+            ("authority_from".to_owned(), "2.1.309".into()),
         ]))
     );
     assert_eq!(
@@ -1043,6 +1046,13 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
         ["cmdline", "comm"]
     );
 
+    // `below_authority` marks rules the open release gate retires; the golden
+    // has no gate, so the comparison reads the rules without that key.
+    for rule in package["rules"].as_array_mut().expect("package rules") {
+        rule.as_table_mut()
+            .expect("a rule table")
+            .remove("below_authority");
+    }
     let golden_rules = golden["rules"].as_array().expect("golden rules");
     let package_rules = package["rules"].as_array().expect("package rules");
     let mut expected_ids: Vec<&str> = golden_rules.iter().map(rule_id).collect();
@@ -1250,6 +1260,11 @@ fn without_a_record_every_captured_screen_reads_as_without_the_opt_in() {
     let with = installed_definition();
     let mut table = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     assert!(table.remove("program_status").is_some());
+    for rule in table["rules"].as_array_mut().expect("rules") {
+        rule.as_table_mut()
+            .expect("a rule table")
+            .remove("below_authority");
+    }
     let without = Manifest::parse_str(&toml::to_string(&table).expect("the manifest serializes"))
         .expect("the manifest without the opt-in parses");
     let mut compared = 0_usize;
@@ -1263,6 +1278,8 @@ fn without_a_record_every_captured_screen_reads_as_without_the_opt_in() {
                 started,
                 DetectorConfig {
                     launch_name: None,
+                    runtime_version: None,
+                    gate_waived: true,
                     detection: DetectionConfig {
                         recheck_after: Duration::from_millis(100),
                         confirmations: 1,

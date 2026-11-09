@@ -63,7 +63,9 @@ reserved, so either way of installing serves it.
   environment overridden by the profile's `PATH`), so a profile that selects a
   Node installation is probed with that Node; every other variable is isolated.
 - Program status: the manifest declares `[program_status] app = "pi"` with
-  `answer_probe = true`. Pi 1.1.0 and later print an OSC 7501 probe at start and
+  `answer_probe = true` and `authority_from = "1.1.0"`; the `working_rule` and
+  `idle_editor_rule` screen rules are `below_authority`, so from the gate, while a record is held, the
+  records decide working and idle. Pi 1.1.0 and later print an OSC 7501 probe at start and
   report `working`, `done`, `idle`, `error`, `blocked` (kind `permission`,
   `question` or `auth`) and `clear` only after the terminal answers; the session
   worker answers each probe once, so a Pi launched by pohunek reports, and its

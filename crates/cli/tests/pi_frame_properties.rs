@@ -359,6 +359,8 @@ fn detector(manifest: &Arc<Manifest>, columns: u16) -> Detector {
         now,
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: true,
             input_readiness: pohunek_daemon::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),

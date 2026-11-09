@@ -23,9 +23,10 @@ pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
     ProcessMatchers, ProgramStatusConfig,
 };
-pub use osc::{OscEvidence, OscParser};
+pub use osc::{OscEvidence, OscParser, ProgressReport, ProgressState};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
+use package::version_probe::ProbeVersion;
 use pohunek_terminal::{ProgramState, ProgramStatusRecord, ProgramStatusReport};
 pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 
@@ -66,17 +67,164 @@ pub struct DetectorConfig {
     /// through it: the title is owner text, so the title region is withheld
     /// from manifest evaluation (see [`launch_name_echo`]).
     pub launch_name: Option<Arc<str>>,
+    /// The release the launch of this runtime generation probed, for the
+    /// session's own runtime; `None` when unprobed or not the own runtime.
+    /// It decides whether the manifest's program-status records are
+    /// authoritative (see [`AuthorityGate`]).
+    pub runtime_version: Option<ProbeVersion>,
+    /// Set for an agent of another runtime than the session's own, such as a
+    /// Codex started below a shell: its release is not probed by any launch, so
+    /// its manifest's `authority_from` is not applied and its records stay
+    /// authoritative.
+    pub gate_waived: bool,
+}
+
+/// Why a program-status authority gate is open or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateReason {
+    /// The manifest declares no `[program_status]` table or no `authority_from`.
+    NotDeclared,
+    /// The runtime release is at or above `authority_from`.
+    AtOrAbove,
+    /// The runtime release is below `authority_from`.
+    Below,
+    /// `authority_from` is declared but the release is unknown.
+    VersionUnknown,
+}
+
+impl GateReason {
+    /// The stable name used in logs and detection output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "not_declared",
+            Self::AtOrAbove => "at_or_above",
+            Self::Below => "below",
+            Self::VersionUnknown => "version_unknown",
+        }
+    }
+}
+
+/// The evidence state of a detector, as `session.detection` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectorStatus {
+    /// Whether the session worker answers the program's 7501 probe.
+    pub probe_answered: bool,
+    /// The state of the held authoritative record, when one is held.
+    pub record_state: Option<String>,
+    pub gate: AuthorityGate,
+    /// Time since the latest applied evidence.
+    pub last_evidence_age: Option<std::time::Duration>,
+}
+
+impl DetectorStatus {
+    /// The wire form; `state_source` is the session's, which the detector
+    /// does not own.
+    #[must_use]
+    pub fn into_protocol(self, state_source: Option<StateSource>) -> protocol::DetectionStatus {
+        let reason = match self.gate.reason {
+            GateReason::NotDeclared => protocol::AuthorityGateReason::NotDeclared,
+            GateReason::AtOrAbove => protocol::AuthorityGateReason::AtOrAbove,
+            GateReason::Below => protocol::AuthorityGateReason::Below,
+            GateReason::VersionUnknown => protocol::AuthorityGateReason::VersionUnknown,
+        };
+        protocol::DetectionStatus {
+            state_source,
+            probe_answered: self.probe_answered,
+            record_present: self.record_state.is_some(),
+            record_state: self.record_state,
+            gate: protocol::AuthorityGate {
+                declared: self.gate.declared,
+                open: self.gate.open,
+                reason,
+                runtime_version: self.gate.runtime_version.map(|version| version.to_string()),
+                authority_from: self.gate.authority_from.map(|version| version.to_string()),
+            },
+            last_evidence_age_ms: self
+                .last_evidence_age
+                .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+/// The version gate of a manifest's OSC 7501 records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityGate {
+    /// Whether the manifest declares `authority_from`.
+    pub declared: bool,
+    /// Whether the release is known and at or above `authority_from`.
+    pub open: bool,
+    pub reason: GateReason,
+    pub runtime_version: Option<ProbeVersion>,
+    pub authority_from: Option<ProbeVersion>,
+}
+
+impl AuthorityGate {
+    /// Evaluates the gate of `manifest` for a runtime at `runtime_version`.
+    #[must_use]
+    pub fn evaluate(
+        manifest: Option<&Manifest>,
+        runtime_version: Option<ProbeVersion>,
+        gate_waived: bool,
+    ) -> Self {
+        let authority_from = manifest
+            .and_then(Manifest::program_status)
+            .and_then(ProgramStatusConfig::authority_from)
+            .filter(|_| !gate_waived);
+        let (open, reason) = match (authority_from, runtime_version) {
+            (None, _) => (false, GateReason::NotDeclared),
+            (Some(_), None) => (false, GateReason::VersionUnknown),
+            (Some(from), Some(version)) if version >= from => (true, GateReason::AtOrAbove),
+            (Some(_), Some(_)) => (false, GateReason::Below),
+        };
+        Self {
+            declared: authority_from.is_some(),
+            open,
+            reason,
+            runtime_version,
+            authority_from,
+        }
+    }
+
+    /// Whether the manifest's records are authoritative: it opts in and the
+    /// gate is either undeclared or open.
+    #[must_use]
+    pub fn records_authoritative(&self, manifest: Option<&Manifest>) -> bool {
+        manifest.is_some_and(|manifest| manifest.program_status().is_some())
+            && (!self.declared || self.open)
+    }
 }
 
 impl DetectorConfig {
+    /// Sets the probed release of the session's own runtime.
+    #[must_use]
+    pub fn with_runtime_version(mut self, runtime_version: Option<ProbeVersion>) -> Self {
+        self.runtime_version = runtime_version;
+        self
+    }
+
+    /// The authority gate of this configuration.
+    #[must_use]
+    pub fn authority_gate(&self) -> AuthorityGate {
+        AuthorityGate::evaluate(
+            self.manifest.as_deref(),
+            self.runtime_version,
+            self.gate_waived,
+        )
+    }
+
     /// Whether the session worker answers the runtime's OSC 7501 probe: the
-    /// manifest opts in with `[program_status] answer_probe = true`.
+    /// manifest opts in with `[program_status] answer_probe = true` and its
+    /// records are authoritative for the probed release.
     #[must_use]
     pub fn answers_program_status_probe(&self) -> bool {
         self.manifest
             .as_ref()
             .and_then(|manifest| manifest.program_status())
             .is_some_and(ProgramStatusConfig::answer_probe)
+            && self
+                .authority_gate()
+                .records_authoritative(self.manifest.as_deref())
     }
 
     /// Production detector config using the embedded generic shell manifest.
@@ -87,6 +235,8 @@ impl DetectorConfig {
             manifest: Some(Arc::clone(shared_generic_shell_manifest())),
             input_readiness: InputReadiness::default(),
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
         }
     }
 
@@ -120,6 +270,8 @@ impl DetectorConfig {
                     .for_manifest(&manifest),
                 manifest: Some(Arc::new(manifest)),
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
             },
             None => host.definition_for_pin(base, pin).map_or_else(
                 |_unresolved| Self::generic_shell(),
@@ -144,6 +296,8 @@ impl DetectorConfig {
                 input_readiness: definition
                     .map_or_else(InputReadiness::default, RuntimeDefinition::input_readiness),
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
             },
             (None, Some(definition)) => Self::for_definition(definition),
             (None, None) => Self::generic_shell(),
@@ -159,6 +313,8 @@ impl DetectorConfig {
             manifest: Some(Arc::clone(definition.manifest())),
             input_readiness: definition.input_readiness(),
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
         }
     }
 
@@ -179,6 +335,8 @@ impl DetectorConfig {
                 input_readiness: readiness_of(host.resolve_ref(base)).for_manifest(&manifest),
                 manifest: Some(Arc::new(manifest)),
                 launch_name: None,
+                runtime_version: None,
+                gate_waived: false,
             },
             None => Self::for_agent(host, base),
         }
@@ -247,6 +405,10 @@ pub fn identify_definition(
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent latches of one detector's state"
+)]
 pub struct Detector {
     osc: OscParser,
     screen: ScreenTracker,
@@ -254,10 +416,16 @@ pub struct Detector {
     manifest: Option<Arc<Manifest>>,
     input_readiness: InputReadiness,
     launch_name: Option<Arc<str>>,
+    runtime_version: Option<ProbeVersion>,
+    gate_waived: bool,
     initial_input_pending: bool,
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
+    /// An approval notice arrived since the last [`Self::take_approval_notice`].
+    approval_notice: bool,
+    /// When the latest evidence (an OSC event or a manifest match) was applied.
+    last_evidence_at: Option<Instant>,
     /// The latest root OSC 7501 record of the active manifest's app. Held until
     /// a `clear`, a reconfigure or a lag resync; it carries no expiry because
     /// programs report on change only.
@@ -302,10 +470,14 @@ impl Detector {
             manifest: config.manifest,
             input_readiness: config.input_readiness,
             launch_name: config.launch_name,
+            runtime_version: config.runtime_version,
+            gate_waived: config.gate_waived,
             initial_input_pending: true,
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
+            approval_notice: false,
+            last_evidence_at: None,
             program_status: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
@@ -348,6 +520,7 @@ impl Detector {
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
         let mut osc_events = self.osc.advance_with_offsets(bytes);
+        let mut applied_osc_evidence = false;
         // Without the opt-in a 7501 report is no event, so the screen is fed in
         // the same segments as for any other output.
         if self
@@ -371,11 +544,13 @@ impl Detector {
             self.latch_gate_open(),
             recent_before.clone(),
             self.program_status.clone(),
+            self.authority_gate().open,
         );
         let mut consumed = 0;
         for (item, end) in osc_events {
             self.feed_screen_segment(&bytes[consumed..end], &mut latch);
             if self.apply_osc_event(item, &mut latch.osc_changes) {
+                applied_osc_evidence = true;
                 self.sight_full_context();
                 self.latch_at_osc_point(&mut latch);
             }
@@ -397,6 +572,12 @@ impl Detector {
         };
         let hit = self.activity_evidence(freshness);
         let has_structured_evidence = hit.is_some();
+        // Output that changes no region and applies no event restates the
+        // held evidence, so it does not refresh its age.
+        let region_changed = freshness.screen || freshness.osc_title || freshness.osc_progress;
+        if applied_osc_evidence || (has_structured_evidence && region_changed) {
+            self.last_evidence_at = Some(now);
+        }
 
         let mut transitions = Vec::new();
         // Only a chunk that ends idle latches: transcript text drawn ahead of a
@@ -589,10 +770,17 @@ impl Detector {
                 self.title_seq = self.strict_seq;
                 true
             }
-            OscEvidence::Progress(progress) => {
+            OscEvidence::Progress(report) => {
+                let progress = report.region_text();
                 changes.progress |= self.latest_progress.as_deref() != Some(progress.as_str());
                 self.latest_progress = Some(progress);
                 true
+            }
+            // A notice is not state evidence; an approval notice is held for
+            // the attention fallback.
+            OscEvidence::Notice(text) => {
+                self.approval_notice |= is_approval_notice(&text);
+                false
             }
             OscEvidence::Cwd(path) => {
                 self.latest_cwd_hint = Some(path);
@@ -616,6 +804,12 @@ impl Detector {
         else {
             return false;
         };
+        if !self
+            .authority_gate()
+            .records_authoritative(self.manifest.as_deref())
+        {
+            return false;
+        }
         match report {
             ProgramStatusReport::Record(record)
                 if record.app.as_deref() == Some(program_status.app()) =>
@@ -640,8 +834,11 @@ impl Detector {
         // A pending candidate needs repeated observations to confirm, so it
         // keeps evaluating even over unchanged context.
         if self.context_dirty || self.needs_visible_recheck || self.state.has_pending() {
-            let screen_hit =
-                self.manifest_evidence(ContextFreshness::all(), self.program_status.is_some());
+            let screen_hit = self.manifest_evidence(
+                ContextFreshness::all(),
+                self.program_status.is_some(),
+                self.authority_gate().open && self.program_status.is_some(),
+            );
             if let Some(hit) = &screen_hit {
                 self.sight_visible_blocker(hit);
             }
@@ -672,7 +869,7 @@ impl Detector {
         // clear alone, or the idle title cached from before the blocker, can
         // never release the latched prompt.
         let idle_hit = || {
-            self.manifest_evidence(ContextFreshness::all(), false)
+            self.manifest_evidence(ContextFreshness::all(), false, false)
                 .filter(|hit| hit.evidence.activity == AgentActivity::Idle)
         };
         let screen_idle =
@@ -702,6 +899,8 @@ impl Detector {
         self.manifest = config.manifest;
         self.input_readiness = config.input_readiness;
         self.launch_name = config.launch_name;
+        self.runtime_version = config.runtime_version;
+        self.gate_waived = config.gate_waived;
         if self.latch_eligible() {
             self.screen.resume_observation();
         } else if !self.initial_input_pending {
@@ -749,6 +948,45 @@ impl Detector {
         self.latest_progress.as_deref()
     }
 
+    /// What the detector holds about its evidence, for `session.detection`.
+    #[must_use]
+    pub fn status(&self, now: Instant) -> DetectorStatus {
+        let gate = self.authority_gate();
+        let answers_probe = self
+            .manifest
+            .as_deref()
+            .and_then(Manifest::program_status)
+            .is_some_and(ProgramStatusConfig::answer_probe)
+            && gate.records_authoritative(self.manifest.as_deref());
+        DetectorStatus {
+            probe_answered: answers_probe,
+            record_state: self
+                .program_status
+                .as_ref()
+                .map(|record| record.state.as_str().to_owned()),
+            gate,
+            last_evidence_age: self
+                .last_evidence_at
+                .map(|at| now.saturating_duration_since(at)),
+        }
+    }
+
+    /// The authority gate of the active manifest for this runtime release.
+    #[must_use]
+    pub fn authority_gate(&self) -> AuthorityGate {
+        AuthorityGate::evaluate(
+            self.manifest.as_deref(),
+            self.runtime_version,
+            self.gate_waived,
+        )
+    }
+
+    /// Takes whether an approval notice (`OSC 9`, `OSC 777 ; notify` or
+    /// `OSC 99`) arrived since the last call.
+    pub fn take_approval_notice(&mut self) -> bool {
+        std::mem::take(&mut self.approval_notice)
+    }
+
     /// Takes the latest OSC 7 cwd hint, if one has arrived.
     pub fn take_cwd_hint(&mut self) -> Option<String> {
         self.latest_cwd_hint.take()
@@ -759,7 +997,7 @@ impl Detector {
         if !self.initial_input_pending || self.input_readiness != InputReadiness::ManifestIdle {
             return;
         }
-        if let Some(hit) = self.manifest_evidence(ContextFreshness::all(), false) {
+        if let Some(hit) = self.manifest_evidence(ContextFreshness::all(), false, false) {
             self.sight_visible_blocker(&hit);
         }
     }
@@ -830,7 +1068,11 @@ impl Detector {
         };
         overlay_program_status(
             self.program_status.as_ref(),
-            self.manifest_evidence(freshness, self.program_status.is_some()),
+            self.manifest_evidence(
+                freshness,
+                self.program_status.is_some(),
+                self.authority_gate().open && self.program_status.is_some(),
+            ),
         )
     }
 
@@ -838,6 +1080,7 @@ impl Detector {
         &self,
         freshness: ContextFreshness,
         program_status_held: bool,
+        authority_open: bool,
     ) -> Option<ManifestEvidenceHit> {
         self.manifest.as_ref().and_then(|manifest| {
             manifest_hit(
@@ -850,7 +1093,10 @@ impl Detector {
                     screen: self.screen_seq,
                 },
                 freshness,
-                program_status_held,
+                RecordGate {
+                    held: program_status_held,
+                    authority_open,
+                },
             )
         })
     }
@@ -879,12 +1125,20 @@ struct ChunkLatch {
     drew: bool,
     evaluations: usize,
     sighted: Option<ActivityEvidence>,
+    /// The program-status gate is open, so `below_authority` rules are skipped.
+    authority_open: bool,
 }
 
 impl ChunkLatch {
-    fn new(open: bool, recent_before: String, program_status: Option<ProgramStatusRecord>) -> Self {
+    fn new(
+        open: bool,
+        recent_before: String,
+        program_status: Option<ProgramStatusRecord>,
+        authority_open: bool,
+    ) -> Self {
         Self {
             open,
+            authority_open,
             program_status,
             recent_before,
             osc_changes: OscChanges::default(),
@@ -929,7 +1183,10 @@ impl ChunkLatch {
                 latest_progress,
                 Arrivals::default(),
                 freshness,
-                self.program_status.is_some(),
+                RecordGate {
+                    held: self.program_status.is_some(),
+                    authority_open: self.authority_open && self.program_status.is_some(),
+                },
             ),
         );
         if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
@@ -1037,11 +1294,34 @@ struct Arrivals {
     screen: u64,
 }
 
+/// The text an agent's approval notice starts with.
+const APPROVAL_NOTICE_PREFIX: &str = "approval requested";
+
+/// Whether a notice is an approval request: its title or body starts with
+/// the approval text, ASCII case-insensitively.
+fn is_approval_notice(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.get(..APPROVAL_NOTICE_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(APPROVAL_NOTICE_PREFIX))
+    })
+}
+
+/// What the program-status layer tells a manifest match.
+#[derive(Debug, Default, Clone, Copy)]
+struct RecordGate {
+    /// A record is held, which enables the rules that override it.
+    held: bool,
+    /// The release gate is open, which skips the `below_authority` rules.
+    authority_open: bool,
+}
+
 /// The winning manifest evidence over explicit context pieces: the pure,
 /// shared counterpart of [`Detector::manifest_evidence`], for the same
 /// borrow-split reason as [`match_context_for`]. `program_status_held`
 /// enables the rules that override a record; readiness passes `false`, so a
-/// record never releases a prompt.
+/// record never releases a prompt. `authority_open` skips the `below_authority`
+/// rules; readiness passes `false`, so those rules still release a prompt.
 fn manifest_hit(
     manifest: &Manifest,
     screen: &ScreenTracker,
@@ -1049,10 +1329,11 @@ fn manifest_hit(
     latest_progress: Option<&str>,
     arrivals: Arrivals,
     freshness: ContextFreshness,
-    program_status_held: bool,
+    gate: RecordGate,
 ) -> Option<ManifestEvidenceHit> {
     let context = match_context_for(manifest, screen, latest_title, latest_progress, freshness)
-        .with_program_status_held(program_status_held);
+        .with_program_status_held(gate.held)
+        .with_authority_open(gate.authority_open);
     let matched = manifest.match_context(&context)?;
     let source = manifest_source(&matched.region);
     if matched.activity == AgentActivity::Blocked
@@ -1130,7 +1411,7 @@ impl ReadinessObserver<'_> {
                     screen: *self.screen_seq,
                 },
                 ContextFreshness::all(),
-                false,
+                RecordGate::default(),
             )
         });
         if hit.is_some_and(|hit| {
@@ -1146,9 +1427,11 @@ const PROGRAM_STATUS_REGION: &str = "program_status";
 
 /// Arbitrates the screen winner with the held program-status record.
 ///
-/// A `blocked` record always wins. Otherwise a visible blocker, or a winner
-/// whose rule overrides the record, stays the screen result; any other screen
-/// result yields to the record: `working` reads working, and `done`, `idle`
+/// A visible blocker wins over every record. Over a `blocked` record only a
+/// screen dialog is the reported source; a title blocker or no blocker reports
+/// the record. Otherwise a
+/// winner whose rule overrides the record stays the screen result; any other
+/// screen result yields to the record: `working` reads working, and `done`, `idle`
 /// and `error` read idle. With no record the screen winner is returned as is.
 /// The record is included whatever the chunk's freshness: it is a state, not
 /// an event.
@@ -1169,7 +1452,18 @@ fn overlay_program_status(
         arrival: 0,
     };
     match record.state {
-        ProgramState::Blocked(_) => Some(from_record(AgentActivity::Blocked, true)),
+        // A dialog on the screen is the more specific evidence of the same
+        // state, so the screen is the reported source when both say blocked; a
+        // title blocker is not a dialog and the record stays the source.
+        ProgramState::Blocked(_) => Some(
+            screen
+                .filter(|hit| {
+                    hit.evidence.activity == AgentActivity::Blocked
+                        && hit.visible_blocker
+                        && hit.evidence.source == StateSource::Screen
+                })
+                .unwrap_or_else(|| from_record(AgentActivity::Blocked, true)),
+        ),
         state => {
             if let Some(hit) = screen.filter(|hit| {
                 (hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker)
@@ -1371,6 +1665,8 @@ mod tests {
     fn config() -> DetectorConfig {
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
@@ -1386,6 +1682,8 @@ mod tests {
     fn debounce_config() -> DetectorConfig {
         DetectorConfig {
             launch_name: None,
+            runtime_version: None,
+            gate_waived: false,
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
@@ -1589,18 +1887,6 @@ mod tests {
         detector.resync_after_lag();
 
         assert_eq!(detector.take_cwd_hint(), None);
-    }
-
-    #[test]
-    fn osc_progress_action_required_emits_blocked_progress_transition() {
-        let started_at = instant();
-        let mut detector = Detector::new(3, 80, started_at, config());
-
-        assert_eq!(
-            detector.feed(started_at, b"\x1b]9;action required\x07"),
-            vec![transition(AgentActivity::Blocked, StateSource::OscProgress)]
-        );
-        assert_eq!(detector.latest_progress(), Some("action required"));
     }
 
     #[test]
@@ -1989,13 +2275,13 @@ mod tests {
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config());
 
-        let transitions = detector.feed(started_at, b"\x1b]2;working\x07\x1b]9;progress\x07");
+        let transitions = detector.feed(started_at, b"\x1b]2;working\x07\x1b]9;4;1;50\x07");
         assert_eq!(
             transitions,
             vec![transition(AgentActivity::Working, StateSource::OscTitle)]
         );
         assert_eq!(detector.latest_title(), Some("working"));
-        assert_eq!(detector.latest_progress(), Some("progress"));
+        assert_eq!(detector.latest_progress(), Some("4;1"));
 
         detector.resync_after_lag();
 

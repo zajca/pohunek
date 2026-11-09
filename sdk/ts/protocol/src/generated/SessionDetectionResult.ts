@@ -2,6 +2,7 @@
 
 import type { DetectionRegionKind } from "./DetectionRegionKind";
 import type { DetectionRegionPreview } from "./DetectionRegionPreview";
+import type { DetectionStatus } from "./DetectionStatus";
 import type { SessionId } from "./SessionId";
 
 /**
@@ -21,4 +22,9 @@ export type SessionDetectionResult = {
    * Regions required by the active manifest, in manifest order.
    */
   previews: Array<DetectionRegionPreview>;
+  /**
+   * Which source decided the activity and why. Absent from a daemon that
+   * predates the field.
+   */
+  status?: DetectionStatus;
 };
