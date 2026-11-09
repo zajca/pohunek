@@ -200,7 +200,7 @@ impl Fixture {
         std::fs::write(self.cwd(tag).join(trigger), b"").expect("ask the agent for a notice");
         // Yields instead of sleeping: the scenarios hold a paused clock, on
         // which a sleep would not end.
-        guard("the notice marker is on screen", async {
+        Box::pin(guard("the notice marker is on screen", async {
             loop {
                 let screen = ok(self
                     .call(method::SESSION_SCREEN, json!({"session_id": session}))
@@ -214,7 +214,7 @@ impl Fixture {
                 }
                 tokio::task::yield_now().await;
             }
-        })
+        }))
         .await;
     }
 
@@ -390,7 +390,7 @@ pub(super) async fn pause_clock() -> AutoAdvanceInhibitor {
 /// The step yields to the scheduler instead of sleeping, so a debounce window
 /// passes in virtual time and the wait costs no real time.
 pub(super) async fn surfaced_inbox(fixture: &Fixture) -> Vec<Value> {
-    guard("a record to surface", async {
+    Box::pin(guard("a record to surface", async {
         loop {
             tokio::time::advance(CLOCK_STEP).await;
             settle().await;
@@ -399,7 +399,7 @@ pub(super) async fn surfaced_inbox(fixture: &Fixture) -> Vec<Value> {
                 return inbox;
             }
         }
-    })
+    }))
     .await
 }
 
@@ -1333,7 +1333,7 @@ async fn an_approval_notice_creates_one_approval_record_and_nothing_else() {
     let _inhibitor = pause_clock().await;
 
     Box::pin(fixture.emit_notice(&session, "notice", "notice", "noticed")).await;
-    let records = surfaced_inbox(&fixture).await;
+    let records = Box::pin(surfaced_inbox(&fixture)).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["kind"], "approval_required");
     assert_eq!(records[0]["dedupe_key"], format!("attention:{session}"));
@@ -1395,7 +1395,7 @@ async fn a_notice_and_a_hook_approval_for_one_moment_are_one_record() {
         )
         .await);
     assert_eq!(approval["created"], true);
-    let records = surfaced_inbox(&fixture).await;
+    let records = Box::pin(surfaced_inbox(&fixture)).await;
     tokio::time::advance(debounce() + FLUSH_SLACK).await;
     settle().await;
     assert_eq!(records.len(), 1, "{records:?}");
@@ -1432,7 +1432,7 @@ async fn a_session_that_stops_while_blocked_resolves_its_attention_record() {
     let _inhibitor = pause_clock().await;
 
     fixture.activity(&session, "blocked").await;
-    let records = surfaced_inbox(&fixture).await;
+    let records = Box::pin(surfaced_inbox(&fixture)).await;
     assert_eq!(records[0]["kind"], "agent_blocked");
     assert_eq!(records[0]["status"], "unread");
 
