@@ -2080,12 +2080,12 @@ async fn a_descriptor_with_or_without_fork_data_installs_and_shows_no_fork() {
         ("legacy-fork", &legacy, true),
         ("current-no-fork", &current, false),
     ] {
-        let captured = captured_logs();
-        let before = captured.text().len();
+        let captured = captured_log();
+        let before = captured_text(captured).len();
         let (digest, installed) =
             install_descriptor(&mut local, &servers.plugins, name, document, false).await;
         installed.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
-        let logged = captured.text().split_off(before);
+        let logged = captured_text(captured).split_off(before);
         assert_eq!(
             logged.contains("ignoring fork data in the runtime descriptor"),
             warns,
@@ -3780,6 +3780,10 @@ fn captured_log() -> &'static CapturedLog {
     })
 }
 
+fn captured_text(log: &CapturedLog) -> String {
+    String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned()
+}
+
 #[tokio::test]
 async fn a_git_failure_withholds_the_trusted_args_and_logs_one_line() {
     let captured = captured_log();
@@ -4628,53 +4632,4 @@ async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_not
         call(&mut local, method::SESSION_STOP, json!(created)).await;
     drop(local);
     servers.stop().await;
-}
-
-/// The lines a log subscriber captured.
-#[derive(Clone, Default)]
-struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("log capture lock")).into_owned()
-    }
-}
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        std::io::Write::write(&mut *self.0.lock().expect("log capture lock"), buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// The process-wide capture of the daemon's logs. The daemon parses a
-/// descriptor on a blocking thread, so a thread-local subscriber would miss
-/// it; every test of this binary runs in a process of its own under nextest.
-fn captured_logs() -> Captured {
-    static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
-    CAPTURED
-        .get_or_init(|| {
-            let captured = Captured::default();
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::fmt()
-                    .with_writer(captured.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::DEBUG)
-                    .finish(),
-            )
-            .expect("no other global subscriber in this process");
-            captured
-        })
-        .clone()
 }
