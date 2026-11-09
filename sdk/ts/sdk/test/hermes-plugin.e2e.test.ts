@@ -311,10 +311,9 @@ async function runHermesPluginScenario(
   expect(result.ok).toBe(true);
   expect(result.logical_id_present).toBe(true);
   expect(result.worker_instance_id_present).toBe(true);
-  expect(result.tools_exercised).toBe(16);
-  expect(result.origin_denials).toBe(8);
+  expect(result.tools_exercised).toBe(15);
+  expect(result.origin_denials).toBe(7);
   expect(result.hermes_resume).toBe(true);
-  expect(result.hermes_fork_unsupported).toBe(true);
   expect(result.output_gap_recovered).toBe(true);
   expect(result.remote_loopback).toBe(true);
   const identityEvents = (await readFile(daemon.identityTrace, "utf8"))
@@ -515,7 +514,6 @@ interface FixtureResult {
   readonly tools_exercised: number;
   readonly origin_denials: number;
   readonly hermes_resume: boolean;
-  readonly hermes_fork_unsupported: boolean;
   readonly output_gap_recovered: boolean;
   readonly remote_loopback: boolean;
 }
@@ -548,7 +546,6 @@ function parseFixtureResult(stdout: string): FixtureResult {
     || typeof parsed["tools_exercised"] !== "number"
     || typeof parsed["origin_denials"] !== "number"
     || typeof parsed["hermes_resume"] !== "boolean"
-    || typeof parsed["hermes_fork_unsupported"] !== "boolean"
     || typeof parsed["output_gap_recovered"] !== "boolean"
     || typeof parsed["remote_loopback"] !== "boolean"
   ) {
@@ -561,7 +558,6 @@ function parseFixtureResult(stdout: string): FixtureResult {
     tools_exercised: parsed["tools_exercised"],
     origin_denials: parsed["origin_denials"],
     hermes_resume: parsed["hermes_resume"],
-    hermes_fork_unsupported: parsed["hermes_fork_unsupported"],
     output_gap_recovered: parsed["output_gap_recovered"],
     remote_loopback: parsed["remote_loopback"],
   };

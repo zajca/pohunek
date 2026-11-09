@@ -343,7 +343,9 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureError("out-of-window policy was accepted")
     tools.verify_cli()
     handlers = tools.handlers()
-    if len(handlers) != 16:
+    # The previous release's plugin also registers `pohunek_session_fork`.
+    expected_tools = 16 if args.identity_key == "runtime_id" else 15
+    if len(handlers) != expected_tools:
         raise FixtureError("full policy did not register the complete tool surface")
 
     hosts = invoke(handlers, "pohunek_hosts", {})
