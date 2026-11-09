@@ -242,6 +242,17 @@ impl SessionRegistry {
                             )
                                         .await;
                                 }
+                                if detector.take_approval_notice()
+                                    && detector.status(crate::time::now()).record_state.is_none()
+                                {
+                                    registry
+                                        .record_approval_notice(
+                                            &id,
+                                            &runtime,
+                                            applied_config_generation,
+                                        )
+                                        .await;
+                                }
                                 if let Some(path) = detector.take_cwd_hint() {
                                     registry
                                         .record_cwd_hint_scoped(&id, path, Some(&runtime))
@@ -339,14 +350,62 @@ impl SessionRegistry {
         self.record_activity_scoped(id, None, transition).await;
     }
 
-    /// Feeds one detector transition, as the detector task does.
-    #[cfg(test)]
-    pub(crate) async fn feed_detector_activity(&self, id: &SessionId, activity: AgentActivity) {
-        let transition = ActivityTransition {
-            activity,
-            source: protocol::StateSource::Process,
+    /// Binds where approval notices on session terminals become attention.
+    /// Later calls leave the first binding in place.
+    pub fn bind_approval_notice_sink(&self, sink: crate::notifications::ApprovalNoticeSink) {
+        let _ = self.inner.approval_notice_sink.set(sink);
+    }
+
+    /// Notes that a provider hook spoke for `id` in the runtime generation it
+    /// runs now.
+    pub(crate) async fn note_hook_spoke(&self, id: &SessionId) {
+        if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
+            entry.hook_spoke = Some(super::HookSpoke {
+                generation: entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.runtime_generation),
+            });
+        }
+    }
+
+    /// Turns an approval notice the detector held into attention.
+    ///
+    /// A notice is a fallback source: it is dropped when a hook already spoke
+    /// in the current runtime generation, and the detector drops it before this
+    /// call while it holds an authoritative program-status record. It never
+    /// changes the session's activity.
+    pub(super) async fn record_approval_notice(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        config_generation: u64,
+    ) {
+        let Some(sink) = self.inner.approval_notice_sink.get() else {
+            return;
         };
-        self.record_activity(id, transition).await;
+        let sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get(id) else {
+            return;
+        };
+        if !expected.matches(entry)
+            || config_generation < entry.detector_config.borrow().generation
+            || entry.stopping
+            || is_terminal(entry.info.state)
+        {
+            return;
+        }
+        let generation = entry
+            .info
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.runtime_generation);
+        if entry.hook_spoke == Some(super::HookSpoke { generation }) {
+            debug!(session_id = %id.0, "approval notice ignored: a hook already spoke");
+            return;
+        }
+        sink.approval_required(id);
     }
 
     pub(super) async fn record_detector_activity(

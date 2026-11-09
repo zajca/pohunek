@@ -26,7 +26,7 @@ use tokio::process::Child;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 
-use plugin_harness::{stderr_text, Harness};
+use plugin_harness::Harness;
 
 /// Session the filtered watchers follow.
 const WATCHED_SESSION: &str = "s-01J00000000000000000000001";
@@ -132,24 +132,6 @@ fn json_lines(lines: &[String]) -> Vec<Value> {
         .collect()
 }
 
-/// Enables `turn_completed` records for every producer without an override;
-/// the default policy disables them.
-async fn enable_turn_completed(harness: &Harness) {
-    let (code, policy) = harness
-        .json(&[
-            "notifications",
-            "policy",
-            "set",
-            "--provider",
-            "default",
-            "--kind",
-            "turn_completed",
-            "--enabled",
-        ])
-        .await;
-    assert_eq!(code, 0, "{policy}");
-}
-
 /// Creates matching readiness records until every watcher has printed a line,
 /// so each one is subscribed before the scenario events, and returns their ids.
 ///
@@ -166,7 +148,7 @@ async fn subscribe_all(harness: &Harness, watchers: &[&Watcher]) -> BTreeSet<Str
             let id = create(
                 harness,
                 WATCHED_SESSION,
-                NotificationKind::TurnCompleted,
+                NotificationKind::ApprovalRequired,
                 &title,
             )
             .await;
@@ -183,12 +165,10 @@ async fn subscribe_all(harness: &Harness, watchers: &[&Watcher]) -> BTreeSet<Str
 
 /// Events the filtered watchers must drop.
 struct Dropped {
-    /// A `turn_completed` record of [`OTHER_SESSION`].
+    /// An `approval_required` record of [`OTHER_SESSION`].
     other_session: String,
-    /// An `error` record of [`WATCHED_SESSION`].
+    /// An `agent_blocked` record of [`WATCHED_SESSION`].
     other_kind: String,
-    /// A printed finish, then acknowledged and deleted.
-    acknowledged: String,
 }
 
 /// Asserts the unfiltered control stream carries every dropped event, in the
@@ -203,19 +183,9 @@ fn assert_control_saw(control: &Watcher, dropped: &Dropped) {
             "control missed the create of {id}"
         );
     }
-    assert!(events.iter().any(|line| {
-        line["event"] == "notification_updated"
-            && line["record"]["id"] == dropped.acknowledged.as_str()
-            && line["record"]["status"] == "acknowledged"
-    }));
-    assert!(events.contains(&serde_json::json!({
-        "host_id": LOCAL_HOST,
-        "event": "notification_deleted",
-        "notification_id": dropped.acknowledged,
-    })));
 }
 
-/// Asserts the JSON watcher printed only created, unread `turn_completed`
+/// Asserts the JSON watcher printed only created, unread `approval_required`
 /// records of [`WATCHED_SESSION`] from `allowed`, including `fence`.
 fn assert_filtered_json(watcher: &Watcher, allowed: &BTreeSet<String>, fence: &str) {
     let mut printed = BTreeSet::new();
@@ -223,7 +193,7 @@ fn assert_filtered_json(watcher: &Watcher, allowed: &BTreeSet<String>, fence: &s
         assert_eq!(line["host_id"], LOCAL_HOST, "{line}");
         assert_eq!(line["event"], "notification_created", "{line}");
         assert_eq!(line["record"]["session_id"], WATCHED_SESSION, "{line}");
-        assert_eq!(line["record"]["kind"], "turn_completed", "{line}");
+        assert_eq!(line["record"]["kind"], "approval_required", "{line}");
         assert_eq!(line["record"]["status"], "unread", "{line}");
         printed.insert(line["record"]["id"].as_str().expect("id").to_owned());
     }
@@ -248,13 +218,11 @@ fn assert_filtered_human(watcher: &Watcher, allowed: &BTreeSet<String>, fence: &
     assert!(lines.iter().any(|line| line.contains(fence)), "{lines:?}");
 }
 
-/// A session-scoped finish filter prints only new unread `turn_completed`
-/// records of that session: not another session's, not another kind, not the
-/// update that acknowledges an earlier finish, and not a delete.
+/// A session-scoped attention filter prints only new unread `approval_required`
+/// records of that session: not another session's and not another kind.
 #[tokio::test]
-async fn filtered_watch_prints_only_new_unread_turns_of_one_session() {
+async fn filtered_watch_prints_only_new_unread_approvals_of_one_session() {
     let harness = Harness::start_with_notifications().await;
-    enable_turn_completed(&harness).await;
 
     let filtered_json = Watcher::spawn(
         &harness,
@@ -262,7 +230,7 @@ async fn filtered_watch_prints_only_new_unread_turns_of_one_session() {
             "--session",
             WATCHED_SESSION,
             "--kind",
-            "turn_completed",
+            "approval_required",
             "--status",
             "unread",
             "--json",
@@ -274,7 +242,7 @@ async fn filtered_watch_prints_only_new_unread_turns_of_one_session() {
             "--session",
             WATCHED_SESSION,
             "--kind",
-            "turn_completed",
+            "approval_required",
             "--unread",
         ],
     );
@@ -282,41 +250,28 @@ async fn filtered_watch_prints_only_new_unread_turns_of_one_session() {
     let watchers = [&filtered_json, &filtered_human, &control];
     let readiness = subscribe_all(&harness, &watchers).await;
 
-    // A finish the filtered JSON watcher already printed; acknowledging it must
-    // not read as a new finish.
-    let acknowledged = json_lines(&filtered_json.lines())[0]["record"]["id"]
-        .as_str()
-        .expect("printed record id")
-        .to_owned();
     let dropped = Dropped {
         other_session: create(
             &harness,
             OTHER_SESSION,
-            NotificationKind::TurnCompleted,
+            NotificationKind::ApprovalRequired,
             "other-session",
         )
         .await,
         other_kind: create(
             &harness,
             WATCHED_SESSION,
-            NotificationKind::Error,
+            NotificationKind::AgentBlocked,
             "other-kind",
         )
         .await,
-        acknowledged,
     };
-    for action in ["ack", "delete"] {
-        let output = harness
-            .run(&["notifications", action, &dropped.acknowledged])
-            .await;
-        assert!(output.status.success(), "{}", stderr_text(&output));
-    }
     // The stream is ordered: once a watcher prints the fence, it has handled
     // every earlier event.
     let fence = create(
         &harness,
         WATCHED_SESSION,
-        NotificationKind::TurnCompleted,
+        NotificationKind::ApprovalRequired,
         "fence",
     )
     .await;

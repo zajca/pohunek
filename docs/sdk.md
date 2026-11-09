@@ -147,7 +147,7 @@ still returns per-session progress, so the caller can tell "still working" from
 // TypeScript — one bounded wait; pass `result.cursor` as `after` next time.
 const result = await client.sessionWaitTurn({
   session_ids: ["s-41"],
-  until: ["turn_completed", "agent_blocked", "approval_required", "exited"],
+  until: ["turn_completed", "turn_error", "agent_blocked", "approval_required", "exited"],
   timeout_ms: 300_000,
 });
 console.log(result.reason, result.event, result.progress);

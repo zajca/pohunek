@@ -81,14 +81,6 @@ function install(extra: Partial<PackageInstallParams> = {}): PackageInstallParam
   return { archive_path: ARCHIVE, trust: { kind: "explicit_digest", digest: `sha256:${"0".repeat(64)}` }, enable: true, select: true, dry_run: false, ...extra };
 }
 
-function healthStep(): ScriptStep {
-  return keepOpen((line) => okResponseLine(requestIdFromLine(line), {
-    status: "ok",
-    daemon_version: "0.0.0-test",
-    protocol_version: PROTOCOL_VERSION,
-  }));
-}
-
 describe("accept_commands opt-in", () => {
   test("a daemon without the flag is refused before package.install is sent", async () => {
     const daemon = await start([inspectStep({})]);
@@ -123,12 +115,12 @@ describe("accept_commands opt-in", () => {
 
   test("a declined consent is left off the wire without a capability check", async () => {
     for (const extra of [{}, { accept_commands: false }]) {
-      const daemon = await start([healthStep(), installedStep()]);
+      const daemon = await start([installedStep()]);
       const client = await connect(daemon);
       await client.call("package.install", install(extra));
-      const seen = await methods(daemon, 2);
-      expect(seen.map((request) => request["method"])).toEqual(["daemon.health", "package.install"]);
-      expect("accept_commands" in (seen[1]?.["params"] as Record<string, unknown>)).toBe(false);
+      const seen = await methods(daemon, 1);
+      expect(seen.map((request) => request["method"])).toEqual(["package.install"]);
+      expect("accept_commands" in (seen[0]?.["params"] as Record<string, unknown>)).toBe(false);
       await daemon.expectNoRequest(SETTLE_MS);
     }
   });

@@ -1,11 +1,10 @@
-//! Integration test: a real daemon serves the previous public protocol version.
+//! Integration test: a real daemon serves exactly the current public protocol
+//! version.
 //!
 //! A worker-backed daemon is bound on a Unix socket and driven with raw JSON
-//! lines of protocol 3 (release v0.33.0): hand-built lines for the shape
-//! checks and the lines recorded from the v0.33.0 CLI, TypeScript SDK, Hermes
-//! plugin and managed hooks (`tests/fixtures/compat/v3/consumers/`). Responses
-//! and events must come back stamped and shaped as protocol 3, while a current
-//! client on the same daemon keeps the current shape.
+//! lines. The window holds protocol 5 only, so a client that announces an
+//! earlier version is refused at the negotiation boundary, and the notification
+//! methods protocol 5 removed answer `method_not_found`.
 
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
@@ -21,7 +20,7 @@ use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::{AttentionCoordinator, NotificationService};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
-use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::session::SessionRegistry;
 use pohunek_daemon::shutdown::DaemonShutdown;
 use pohunek_test_support::wait::{self, wait_until};
 use pohunek_test_support::worker_binary;
@@ -31,65 +30,21 @@ use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
 
-/// Protocol version of the recorded fixtures and of the hand-built lines.
-const PREVIOUS_VERSION: u32 = 3;
-
-/// Session id the recorded consumer requests address.
-const FIXTURE_SESSION_ID: &str = "ses_0123456789abcdef";
-/// Worker instance id the recorded consumer requests address.
-const FIXTURE_WORKER_INSTANCE_ID: &str = "rt-0123456789abcdef";
-
-/// `max_bytes` of the hand-built `session.output` requests; the parameter is required.
-const OUTPUT_MAX_BYTES: u32 = 4096;
-
-/// Error codes that mean the daemon could not read the request's shape.
-const SHAPE_ERROR_CODES: &[&str] = &["bad_request", "version_mismatch", "method_not_found"];
-
-/// Refusal a replayed native-id report from a hook that is not the PTY root receives.
-const UNATTESTED_CODE: &str = "native_report_unattested";
-
-/// Consumer recordings: (file name, contents).
-const CONSUMER_FIXTURES: &[(&str, &str)] = &[
-    (
-        "cli.json",
-        include_str!("fixtures/compat/v3/consumers/cli.json"),
-    ),
-    (
-        "ts_sdk.json",
-        include_str!("fixtures/compat/v3/consumers/ts_sdk.json"),
-    ),
-    (
-        "hermes_plugin.json",
-        include_str!("fixtures/compat/v3/consumers/hermes_plugin.json"),
-    ),
-    (
-        "managed_hook.json",
-        include_str!("fixtures/compat/v3/consumers/managed_hook.json"),
-    ),
-];
-
-/// Methods whose recorded public-fallback requests carry an integer `seq`.
-///
-/// Release v0.33.0 itself rejects that spelling (`ReportSequence` reads a
-/// decimal string), so the adapter must leave the rejection as it was.
-const INTEGER_SEQ_REJECTIONS: &[&str] =
-    &[method::SESSION_REPORT_AGENT, method::SESSION_RELEASE_AGENT];
-
-/// Methods whose recorded requests must succeed against a live session.
-const MUST_SUCCEED: &[&str] = &[
-    method::DAEMON_HEALTH,
-    method::HOST_INSPECT,
-    method::SESSION_NEW,
-    method::SESSION_LIST,
-    method::SESSION_INSPECT,
-    method::SESSION_SCREEN,
-    method::SESSION_READ,
-    method::SESSION_OUTPUT,
-    method::SESSION_WAIT,
-    method::SESSION_RESIZE,
-    method::SESSION_RENAME,
-    method::SESSION_SET_METADATA,
-    method::NOTIFICATION_LIST,
+/// Methods no version of the window serves any more.
+const REMOVED_METHODS: &[&str] = &[
+    "session.fork",
+    "session.runtime_inventory",
+    "session.policy.get",
+    "session.policy.set",
+    "session.idle_stop.get",
+    "session.idle_stop.set",
+    "store.rejected_list",
+    "store.rejected_set_aside",
+    "notification.update",
+    "notification.delete",
+    "notification.policy.get",
+    "notification.policy.set",
+    "notification.retention.prune",
 ];
 
 type Client = Framed<UnixStream, LinesCodec>;
@@ -97,7 +52,7 @@ type Client = Framed<UnixStream, LinesCodec>;
 /// A unique socket path inside a dedicated per-test directory.
 struct TestSocket {
     path: PathBuf,
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
 }
 
 impl TestSocket {
@@ -107,12 +62,8 @@ impl TestSocket {
         std::fs::create_dir(dir.path().join("work")).expect("create the session working directory");
         Self {
             path: dir.path().join("daemon.sock"),
-            dir,
+            _dir: dir,
         }
-    }
-
-    fn work_dir(&self) -> PathBuf {
-        self.dir.path().join("work")
     }
 }
 
@@ -129,26 +80,16 @@ struct Daemon {
     socket: TestSocket,
     shutdown: oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
-    /// This daemon process instance's opaque controller id, the value an
-    /// inherited origin pair uses to identify its own daemon.
-    instance_id: String,
 }
 
 impl Daemon {
     async fn start(tag: &str) -> Self {
-        Self::start_with(tag, |_config, _dir| {}).await
-    }
-
-    /// Starts a daemon whose registry configuration `tweak` adjusts; it receives
-    /// the test's socket directory, which it may use for its own files.
-    async fn start_with(tag: &str, tweak: impl FnOnce(&mut SessionRegistryConfig, &Path)) -> Self {
         let socket = TestSocket::new(tag);
-        let (shutdown, handle, daemon_instance_id) = spawn_server(&socket, tweak).await;
+        let (shutdown, handle, _daemon_instance_id) = spawn_server(&socket).await;
         Self {
             socket,
             shutdown,
             handle,
-            instance_id: daemon_instance_id,
         }
     }
 
@@ -162,11 +103,7 @@ impl Daemon {
     }
 }
 
-/// Spawns the control server over a registry backed by a real worker binary.
-async fn spawn_server(
-    socket: &Path,
-    tweak: impl FnOnce(&mut SessionRegistryConfig, &Path),
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>, String) {
+async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>, String) {
     // Short, because the worker nests its control socket below it.
     let worker_home_dir =
         pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
@@ -189,10 +126,6 @@ async fn spawn_server(
             .supervision(worker_binary())
             .with_environment_source(support::hermetic_environment_source()),
     );
-    tweak(
-        &mut config,
-        socket.parent().expect("test socket has an isolated parent"),
-    );
     let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
         Arc::new(SubprocessWorkerLauncher::new()),
@@ -210,19 +143,6 @@ async fn spawn_server(
     );
     let notifications = NotificationService::open(&state_root.join("notification-data"))
         .expect("notification service opens");
-    let mut policy = pohunek_daemon::notifications::default_policy();
-    policy.enabled = protocol::NotificationKindPolicy::from_flags([
-        (protocol::NotificationKind::AgentBlocked, true),
-        (protocol::NotificationKind::ApprovalRequired, true),
-        (protocol::NotificationKind::TurnCompleted, true),
-        (protocol::NotificationKind::SessionFinished, true),
-        (protocol::NotificationKind::Error, true),
-        (protocol::NotificationKind::System, true),
-    ]);
-    policy.providers.clear();
-    notifications
-        .set_policy(policy)
-        .expect("enable every notification kind");
     // Session-scoped notifications (approval, turn) are debounced by the coordinator.
     let (attention, _attention_task) =
         AttentionCoordinator::spawn(&DaemonShutdown::default(), notifications.clone(), &registry);
@@ -284,401 +204,57 @@ async fn next_line(client: &mut Client) -> Value {
     serde_json::from_str(&reply).expect("the daemon writes JSON lines")
 }
 
-/// A hand-built request line of the previous protocol version.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "test helper takes the json! literal by value to keep call sites terse"
-)]
-fn previous_request(id: &str, method: &str, params: Value) -> Value {
+/// A request line announcing exactly `version`.
+fn request_at(version: u32, id: &str, method: &str, params: &Value) -> Value {
     json!({
-        "v": {"minimum": PREVIOUS_VERSION, "maximum": PREVIOUS_VERSION},
+        "v": {"minimum": version, "maximum": version},
         "id": id,
         "method": method,
         "params": params,
     })
 }
 
-/// A hand-built request line of the previous protocol version that carries an
-/// inherited origin pair.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "test helper takes the json! literal by value to keep call sites terse"
-)]
-fn previous_origin_request(
-    id: &str,
-    method: &str,
-    params: Value,
-    origin_session: &str,
-    origin_daemon: &str,
-) -> Value {
-    json!({
-        "v": {"minimum": PREVIOUS_VERSION, "maximum": PREVIOUS_VERSION},
-        "id": id,
-        "method": method,
-        "params": params,
-        "origin_session_id": origin_session,
-        "origin_daemon_id": origin_daemon,
-    })
-}
-
-/// The success payload of a response stamped with the previous version.
-fn previous_ok(response: &Value) -> &Value {
-    assert_eq!(response["v"], PREVIOUS_VERSION, "{response}");
-    assert!(response.get("err").is_none(), "{response}");
-    &response["ok"]
-}
-
-fn contains_key(value: &Value, wanted: &str) -> bool {
-    match value {
-        Value::Object(object) => {
-            object.contains_key(wanted) || object.values().any(|inner| contains_key(inner, wanted))
-        }
-        Value::Array(items) => items.iter().any(|inner| contains_key(inner, wanted)),
-        _ => false,
-    }
-}
-
-/// Asserts that no protocol 4 spelling of the worker instance key leaks.
-fn assert_previous_spelling(value: &Value) {
-    for key in ["worker_instance_id", "previous_worker_instance_id"] {
-        assert!(!contains_key(value, key), "`{key}` leaked into {value}");
-    }
-}
-
-/// Replaces recorded placeholder values with the live session's identity.
-fn substitute(value: &Value, live: &LiveSession, work_dir: &Path) -> Value {
-    match value {
-        Value::String(text) if text == FIXTURE_SESSION_ID => json!(live.session_id),
-        Value::String(text) if text == FIXTURE_WORKER_INSTANCE_ID => json!(live.worker_instance_id),
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, inner)| {
-                    // The recorded launch directories are host paths; a session
-                    // launched by a replayed request starts in the test's own.
-                    let replaced = match key.as_str() {
-                        "runtime_generation" => json!(live.runtime_generation),
-                        "cwd" => json!(work_dir),
-                        _ => substitute(inner, live, work_dir),
-                    };
-                    (key.clone(), replaced)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|inner| substitute(inner, live, work_dir))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-struct LiveSession {
-    session_id: String,
-    worker_instance_id: String,
-    runtime_generation: String,
-}
-
-/// Creates a shell session as a protocol 3 client and reads its identity back
-/// in the protocol 3 spelling.
-async fn create_previous_session(client: &mut Client, daemon: &Daemon) -> (LiveSession, Value) {
-    let response = exchange(
-        client,
-        &previous_request(
-            "new-1",
-            method::SESSION_NEW,
-            json!({"agent": "shell", "cwd": daemon.socket.work_dir(), "cols": 80, "rows": 24}),
-        ),
-    )
-    .await;
-    let session = previous_ok(&response).clone();
-    assert_previous_spelling(&session);
-    let runtime = &session["runtime"];
-    let live = LiveSession {
-        session_id: session["id"].as_str().expect("session id").to_owned(),
-        worker_instance_id: runtime["runtime_id"]
-            .as_str()
-            .expect("a protocol 3 session carries `runtime.runtime_id`")
-            .to_owned(),
-        runtime_generation: runtime["runtime_generation"]
-            .as_str()
-            .expect("runtime generation")
-            .to_owned(),
-    };
-    (live, session)
-}
-
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one linear scenario shares a single worker-backed session"
-)]
-async fn previous_version_client_drives_a_worker_backed_session_in_the_previous_shape() {
-    let daemon = Daemon::start("window-shape").await;
-    let mut client = daemon.connect().await;
-
-    let health = exchange(
-        &mut client,
-        &previous_request("health-1", method::DAEMON_HEALTH, Value::Null),
-    )
-    .await;
-    assert_eq!(
-        previous_ok(&health)["protocol_version"],
-        PREVIOUS_VERSION,
-        "the handshake of a protocol 3 SDK compares this field with its own version"
-    );
-
-    let (live, created) = create_previous_session(&mut client, &daemon).await;
-    assert_eq!(created["agent"], "shell");
-
-    let listed = exchange(
-        &mut client,
-        &previous_request("list-1", method::SESSION_LIST, json!({})),
-    )
-    .await;
-    let listed = previous_ok(&listed);
-    assert_previous_spelling(listed);
-    let entry = listed
-        .as_array()
-        .expect("session list")
-        .iter()
-        .find(|session| session["id"] == live.session_id)
-        .expect("the created session is listed");
-    assert_eq!(entry["runtime"]["runtime_id"], live.worker_instance_id);
-
-    let inspected = exchange(
-        &mut client,
-        &previous_request("inspect-1", method::SESSION_INSPECT, json!(live.session_id)),
-    )
-    .await;
-    // A real protocol 3 SDK correlates a response to its request by id; the
-    // daemon must echo it through the adapter untouched.
-    assert_eq!(inspected["id"], "inspect-1", "{inspected}");
-    assert_eq!(
-        previous_ok(&inspected)["runtime"]["runtime_id"],
-        live.worker_instance_id
-    );
-
-    for (id, name, params) in [
-        (
-            "screen-1",
-            method::SESSION_SCREEN,
-            json!({"session_id": live.session_id}),
-        ),
-        (
-            "read-1",
-            method::SESSION_READ,
-            json!({"session_id": live.session_id}),
-        ),
-        (
-            "output-1",
-            method::SESSION_OUTPUT,
-            json!({"session_id": live.session_id, "max_bytes": OUTPUT_MAX_BYTES}),
-        ),
-    ] {
-        let response = exchange(&mut client, &previous_request(id, name, params)).await;
-        let result = previous_ok(&response);
-        assert_eq!(result["runtime_id"], live.worker_instance_id, "{name}");
-        assert_eq!(
-            result["runtime_generation"], live.runtime_generation,
-            "{name}"
-        );
-        assert_previous_spelling(result);
-    }
-
-    let continued = exchange(
-        &mut client,
-        &previous_request(
-            "output-2",
-            method::SESSION_OUTPUT,
-            json!({
-                "session_id": live.session_id,
-                "runtime": {
-                    "runtime_id": live.worker_instance_id,
-                    "runtime_generation": live.runtime_generation,
-                },
-                "after_offset": "0",
-                "max_bytes": OUTPUT_MAX_BYTES,
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(
-        previous_ok(&continued)["runtime_id"],
-        live.worker_instance_id,
-        "a protocol 3 runtime cursor is accepted and answered in the same spelling"
-    );
-
-    let replaced = exchange(
-        &mut client,
-        &previous_request(
-            "wait-1",
-            method::SESSION_WAIT,
-            json!({
-                "session_id": live.session_id,
-                "runtime": {"runtime_id": "another-worker-instance", "runtime_generation": "1"},
-                "timeout_ms": 1000,
-            }),
-        ),
-    )
-    .await;
-    let waited = previous_ok(&replaced);
-    assert_eq!(waited["reason"], "runtime_changed");
-    assert_eq!(
-        waited["session"]["runtime"]["runtime_id"],
-        live.worker_instance_id
-    );
-    assert_previous_spelling(waited);
-
-    let current_spelling = exchange(
-        &mut client,
-        &previous_request(
-            "output-3",
-            method::SESSION_OUTPUT,
-            json!({
-                "session_id": live.session_id,
-                "runtime": {
-                    "worker_instance_id": live.worker_instance_id,
-                    "runtime_generation": live.runtime_generation,
-                },
-                "max_bytes": OUTPUT_MAX_BYTES,
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(current_spelling["v"], PREVIOUS_VERSION);
-    assert_eq!(
-        current_spelling["err"]["code"], "bad_request",
-        "the protocol 4 spelling is not part of a protocol 3 request: {current_spelling}"
-    );
-
-    // A previous-version request without a runtime succeeded above. A value
-    // with the wrong shape must reach the daemon's typed request validation
-    // and be rejected without taking down the connection.
-    let malformed_runtime = exchange(
-        &mut client,
-        &previous_request(
-            "output-bad-runtime",
-            method::SESSION_OUTPUT,
-            json!({
-                "session_id": live.session_id,
-                "runtime": "w-1",
-                "max_bytes": OUTPUT_MAX_BYTES,
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(malformed_runtime["v"], PREVIOUS_VERSION);
-    assert_eq!(malformed_runtime["err"]["code"], "bad_request");
-
-    let stopped = exchange(
-        &mut client,
-        &previous_request("stop-1", method::SESSION_STOP, json!(live.session_id)),
-    )
-    .await;
-    assert_eq!(previous_ok(&stopped)["stopped"], true);
-
-    daemon.stop().await;
-}
-
-#[tokio::test]
-async fn a_current_client_on_the_same_daemon_keeps_the_current_shape() {
+async fn the_current_version_is_served_and_stamped() {
     let daemon = Daemon::start("window-current").await;
-    let mut previous = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut previous, &daemon).await;
-
-    let mut current = daemon.connect().await;
-    let request = Request::new(
-        "inspect-current",
-        method::SESSION_INSPECT,
-        json!(live.session_id),
-    )
-    .expect("valid request");
-    let response = exchange(
-        &mut current,
-        &serde_json::to_value(&request).expect("serialize request"),
-    )
-    .await;
-    assert_eq!(response["v"], PROTOCOL_VERSION.get());
-    assert_eq!(
-        response["ok"]["runtime"]["worker_instance_id"],
-        live.worker_instance_id
-    );
-    assert!(!contains_key(&response, "runtime_id"), "{response}");
-
-    daemon.stop().await;
-}
-
-#[tokio::test]
-async fn subscribers_of_both_versions_each_receive_their_own_event_shape() {
-    let daemon = Daemon::start("window-events").await;
-    let mut previous_events = daemon.connect().await;
-    let ack = exchange(
-        &mut previous_events,
-        &previous_request("subscribe-previous", method::SUBSCRIBE, Value::Null),
-    )
-    .await;
-    assert_eq!(ack["v"], PREVIOUS_VERSION);
-    let mut current_events = daemon.connect().await;
-    let request =
-        Request::new("subscribe-current", method::SUBSCRIBE, Value::Null).expect("valid request");
-    let ack = exchange(
-        &mut current_events,
-        &serde_json::to_value(&request).expect("serialize request"),
-    )
-    .await;
-    assert_eq!(ack["v"], PROTOCOL_VERSION.get());
-
-    let mut driver = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut driver, &daemon).await;
-
-    let previous_event = next_event_with_runtime(&mut previous_events).await;
-    assert_eq!(previous_event["v"], PREVIOUS_VERSION);
-    assert_eq!(
-        previous_event["session"]["runtime"]["runtime_id"],
-        live.worker_instance_id
-    );
-    assert_previous_spelling(&previous_event);
-
-    let current_event = next_event_with_runtime(&mut current_events).await;
-    assert_eq!(current_event["v"], PROTOCOL_VERSION.get());
-    assert_eq!(
-        current_event["session"]["runtime"]["worker_instance_id"],
-        live.worker_instance_id
-    );
-    assert!(
-        !contains_key(&current_event, "runtime_id"),
-        "{current_event}"
-    );
-
-    daemon.stop().await;
-}
-
-/// Reads events until one carries a session with a worker runtime.
-async fn next_event_with_runtime(subscriber: &mut Client) -> Value {
-    wait::guard("an event whose session carries a runtime", async {
-        loop {
-            let event = next_line(subscriber).await;
-            if event["session"]["runtime"].is_object() {
-                return event;
-            }
-        }
-    })
-    .await
-}
-
-#[tokio::test]
-async fn invalid_input_on_a_previous_version_connection_is_answered_in_that_version() {
-    let daemon = Daemon::start("window-invalid").await;
     let mut client = daemon.connect().await;
     let health = exchange(
         &mut client,
-        &previous_request("health-1", method::DAEMON_HEALTH, Value::Null),
+        &request_at(
+            PROTOCOL_VERSION.get(),
+            "health",
+            method::DAEMON_HEALTH,
+            &Value::Null,
+        ),
     )
     .await;
-    assert_eq!(previous_ok(&health)["protocol_version"], PREVIOUS_VERSION);
+    assert_eq!(health["v"], PROTOCOL_VERSION.get(), "{health}");
+    assert_eq!(
+        health["ok"]["protocol_version"],
+        PROTOCOL_VERSION.get(),
+        "{health}"
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_version_outside_the_window_is_refused_and_invalid_input_is_a_bad_request() {
+    let daemon = Daemon::start("window-outside").await;
+    let mut client = daemon.connect().await;
+
+    // The window is the current version alone: the previous protocol and one
+    // beyond the current are both refused at the negotiation boundary.
+    assert_eq!(MIN_PROTOCOL_VERSION, PROTOCOL_VERSION);
+    for (id, outside) in [
+        ("previous", PROTOCOL_VERSION.get() - 1),
+        ("below-window", PROTOCOL_VERSION.get() - 2),
+        ("above-window", PROTOCOL_VERSION.get() + 1),
+    ] {
+        let line = request_at(outside, id, method::DAEMON_HEALTH, &Value::Null);
+        let reply = exchange(&mut client, &line).await;
+        assert_eq!(reply["id"], id, "{line}: {reply}");
+        assert_eq!(reply["err"]["code"], "version_mismatch", "{line}: {reply}");
+    }
 
     for line in ["", "not json", "{\"v\":1}"] {
         client
@@ -686,206 +262,16 @@ async fn invalid_input_on_a_previous_version_connection_is_answered_in_that_vers
             .await
             .expect("send invalid input");
         let reply = next_line(&mut client).await;
-        assert_eq!(reply["v"], PREVIOUS_VERSION, "{line:?}: {reply}");
         assert_eq!(reply["err"]["code"], "bad_request", "{line:?}: {reply}");
     }
-
-    // A well-formed envelope advertising a version outside the supported
-    // window is refused at the negotiation boundary; the adapter never runs.
-    for (id, outside) in [
-        ("below-window", PREVIOUS_VERSION - 1),
-        ("above-window", PREVIOUS_VERSION + 3),
-    ] {
-        let line = json!({
-            "v": {"minimum": outside, "maximum": outside},
-            "id": id,
-            "method": method::DAEMON_HEALTH,
-            "params": serde_json::Value::Null,
-        });
-        let reply = exchange(&mut client, &line).await;
-        assert_eq!(reply["v"], PREVIOUS_VERSION, "{line}: {reply}");
-        assert_eq!(reply["id"], id, "{line}: {reply}");
-        assert_eq!(reply["err"]["code"], "version_mismatch", "{line}: {reply}");
-    }
-
-    // Before anything is negotiated the daemon's current version is stamped.
-    let mut fresh = daemon.connect().await;
-    fresh
-        .send("not json".to_owned())
-        .await
-        .expect("send invalid input");
-    let reply = next_line(&mut fresh).await;
-    assert_eq!(reply["v"], PROTOCOL_VERSION.get(), "{reply}");
     daemon.stop().await;
 }
 
-/// A well-formed protocol 3 request whose handler fails: the daemon's typed
-/// error reaches the protocol 3 client untranslated, stamped and correlated in
-/// the negotiated version. This is the boundary evidence for the
-/// downgrade-response typed-error pass-through: only success payloads are
-/// translated.
 #[tokio::test]
-async fn a_typed_error_on_a_previous_version_connection_is_answered_in_that_version() {
-    let daemon = Daemon::start("window-typed-error").await;
-    let mut client = daemon.connect().await;
-    let health = exchange(
-        &mut client,
-        &previous_request("health-1", method::DAEMON_HEALTH, Value::Null),
-    )
-    .await;
-    assert_eq!(previous_ok(&health)["protocol_version"], PREVIOUS_VERSION);
-
-    let response = exchange(
-        &mut client,
-        &previous_request(
-            "inspect-missing",
-            method::SESSION_INSPECT,
-            json!("ses_missing"),
-        ),
-    )
-    .await;
-    assert_eq!(response["v"], PREVIOUS_VERSION, "{response}");
-    assert_eq!(response["id"], "inspect-missing", "{response}");
-    assert_eq!(response["err"]["code"], "session_not_found", "{response}");
-    assert!(response.get("ok").is_none(), "{response}");
-
-    daemon.stop().await;
-}
-
-/// A failing required `post-create` hook is answered to a protocol 3 client as
-/// a protocol 3 error that carries the code this release added.
-#[tokio::test]
-async fn a_required_hook_failure_is_answered_in_the_previous_version() {
-    let repo = pohunek_test_support::env::TestEnv::new().expect("create the repository");
-    let git = |args: &[&str]| {
-        let out = repo.git_command().args(args).output().expect("run git");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    };
-    git(&["-c", "init.defaultBranch=main", "init", "-q"]);
-    git(&["config", "user.email", "test@example.com"]);
-    git(&["config", "user.name", "Test"]);
-    git(&["config", "commit.gpgsign", "false"]);
-    std::fs::write(repo.cwd().join("README.md"), "init\n").expect("write README");
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-
-    let daemon = Daemon::start_with("window-required-hook", |config, dir| {
-        let hooks = dir.join("config/hooks");
-        std::fs::create_dir_all(&hooks).expect("create the host hook directory");
-        let hook = hooks.join("post-create");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write the hook");
-        std::fs::create_dir(dir.join("worktrees")).expect("create the worktree root");
-        config.config_dir = Some(dir.join("config"));
-        config.worktree_root = Some(dir.join("worktrees"));
-        config.store_path = Some(dir.join("metadata.jsonl"));
-        config.hook_required = vec![pohunek_service_config::RequiredHook::PostCreate];
-    })
-    .await;
-    let mut client = daemon.connect().await;
-
-    let response = exchange(
-        &mut client,
-        &previous_request(
-            "new-required-hook",
-            method::SESSION_NEW,
-            json!({
-                "agent": "shell",
-                "repo": repo.cwd(),
-                "branch": "b",
-                "cols": 80,
-                "rows": 24,
-            }),
-        ),
-    )
-    .await;
-
-    assert_eq!(response["v"], PREVIOUS_VERSION, "{response}");
-    assert_eq!(response["id"], "new-required-hook", "{response}");
-    assert_eq!(
-        response["err"]["code"], "hook_required_failed",
-        "{response}"
-    );
-    assert_eq!(response["err"]["class"], "runtime", "{response}");
-    assert!(response.get("ok").is_none(), "{response}");
-    daemon.stop().await;
-}
-
-/// The origin markers survive the request upgrade path and are acted on: a
-/// protocol 3 request carrying its own session's origin pair is denied by the
-/// same-origin guard, while the same method with a different origin pairing
-/// proceeds — both answered in protocol 3.
-#[tokio::test]
-async fn an_inherited_origin_guards_a_protocol_3_mutation() {
-    let daemon = Daemon::start("window-origin").await;
-    let mut client = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut client, &daemon).await;
-
-    let rename = json!({"session_id": live.session_id, "name": "renamed"});
-    let denied = exchange(
-        &mut client,
-        &previous_origin_request(
-            "origin-same",
-            method::SESSION_RENAME,
-            rename.clone(),
-            &live.session_id,
-            &daemon.instance_id,
-        ),
-    )
-    .await;
-    assert_eq!(denied["v"], PREVIOUS_VERSION, "{denied}");
-    assert_eq!(denied["id"], "origin-same", "{denied}");
-    assert_eq!(
-        denied["err"]["code"], "plugin_self_target_denied",
-        "{denied}"
-    );
-
-    // The same method pairing the markers with a different origin session is
-    // an inherited origin targeting the live session from elsewhere: the guard
-    // lets it through and the rename succeeds.
-    let control = exchange(
-        &mut client,
-        &previous_origin_request(
-            "origin-other",
-            method::SESSION_RENAME,
-            rename,
-            "s-other-origin",
-            &daemon.instance_id,
-        ),
-    )
-    .await;
-    assert_eq!(control["v"], PREVIOUS_VERSION, "{control}");
-    assert_eq!(control["id"], "origin-other", "{control}");
-    assert!(control.get("ok").is_some(), "{control}");
-
-    daemon.stop().await;
-}
-
-/// Methods no version of the window serves any more.
-const REMOVED_METHODS: &[&str] = &[
-    "session.fork",
-    "session.runtime_inventory",
-    "session.policy.get",
-    "session.policy.set",
-    "session.idle_stop.get",
-    "session.idle_stop.set",
-    "store.rejected_list",
-    "store.rejected_set_aside",
-];
-
-#[tokio::test]
-async fn removed_methods_are_unknown_on_every_version_of_the_window() {
+async fn removed_methods_are_unknown() {
     let daemon = Daemon::start("window-removed").await;
-    let mut previous = daemon.connect().await;
     let mut current = daemon.connect().await;
     for name in REMOVED_METHODS {
-        let response = exchange(
-            &mut previous,
-            &previous_request("removed-previous", name, json!({})),
-        )
-        .await;
-        assert_eq!(response["v"], PREVIOUS_VERSION, "{name}: {response}");
-        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
-
         let request = Request::new("removed-current", *name, json!({})).expect("valid request");
         let response = exchange(
             &mut current,
@@ -899,687 +285,42 @@ async fn removed_methods_are_unknown_on_every_version_of_the_window() {
 }
 
 #[tokio::test]
-async fn methods_added_after_the_previous_version_are_unknown_to_it() {
-    let daemon = Daemon::start("window-introduced").await;
-    let mut previous = daemon.connect().await;
-    for name in protocol::compat::introduced_methods(MIN_PROTOCOL_VERSION) {
-        let response = exchange(
-            &mut previous,
-            &previous_request("introduced-1", name, json!({})),
-        )
-        .await;
-        assert_eq!(response["v"], PREVIOUS_VERSION, "{name}: {response}");
-        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
-        assert!(response.get("ok").is_none(), "{name}: {response}");
-    }
-
-    // The same method is served on a current connection.
-    let mut current = daemon.connect().await;
-    let request =
-        Request::new("package-list", method::PACKAGE_LIST, json!({})).expect("valid request");
-    let response = exchange(
-        &mut current,
-        &serde_json::to_value(&request).expect("serialize request"),
-    )
-    .await;
-    assert_eq!(response["v"], PROTOCOL_VERSION.get());
-    assert_ne!(response["err"]["code"], "method_not_found", "{response}");
-    daemon.stop().await;
-}
-
-#[tokio::test]
-async fn recorded_previous_release_consumer_requests_are_accepted() {
-    let daemon = Daemon::start("window-consumers").await;
-    let mut driver = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut driver, &daemon).await;
-    let work_dir = daemon.socket.work_dir();
-
-    let mut accepted = 0;
-    let mut stops = Vec::new();
-    for (file, raw) in CONSUMER_FIXTURES {
-        let document: Value = serde_json::from_str(raw).expect("consumer fixture is JSON");
-        assert_eq!(document["release"], "v0.33.0", "{file}");
-        for recorded in document["requests"].as_array().expect("recorded requests") {
-            let label = recorded["label"].as_str().expect("label");
-            let sent = substitute(&recorded["line"], &live, &work_dir);
-            let name = sent["method"].as_str().expect("method").to_owned();
-            if name == method::SESSION_STOP {
-                stops.push((format!("{file}: {label}"), sent));
-                continue;
-            }
-            if sent["v"].is_u64() {
-                // The recorded notify hooks send a bare integer `v`, a legacy
-                // envelope no protocol 2 or later daemon reads.
-                let response = exchange(&mut driver, &sent).await;
-                assert_eq!(response["err"]["code"], "bad_request", "{file}: {label}");
-                continue;
-            }
-            let mut client = daemon.connect().await;
-            let response = exchange(&mut client, &sent).await;
-            assert_accepted(file, label, &name, &sent, &response);
-            accepted += 1;
-        }
-    }
-    assert!(
-        accepted >= 40,
-        "only {accepted} recorded requests were replayed"
-    );
-
-    for (label, sent) in stops {
-        let mut client = daemon.connect().await;
-        let response = exchange(&mut client, &sent).await;
-        assert_accepted("stop", &label, method::SESSION_STOP, &sent, &response);
-    }
-    daemon.stop().await;
-}
-
-/// A recorded request is accepted when it is answered in protocol 3 and is not
-/// refused for its shape; the listed methods must also succeed. The response
-/// correlates to the request by id, so the envelope adapter keeps it.
-fn assert_accepted(file: &str, label: &str, name: &str, sent: &Value, response: &Value) {
-    let context = format!("{file}: {label}: {response}");
-    assert_eq!(response["v"], PREVIOUS_VERSION, "{context}");
-    assert_eq!(response["id"], sent["id"], "{context}");
-    assert_previous_spelling(response);
-    if let Some(error) = response.get("err") {
-        let code = error["code"].as_str().expect("error code");
-        let message = error["msg"].as_str().expect("error message");
-        let integer_seq = INTEGER_SEQ_REJECTIONS.contains(&name)
-            && message.contains("invalid type: integer")
-            && message.contains("expected a string");
-        assert!(
-            integer_seq || !SHAPE_ERROR_CODES.contains(&code),
-            "the daemon refused the shape: {context}"
-        );
-        // A replayed native-id report comes from a hook that is not the session's
-        // PTY root, so the daemon answers its typed attestation refusal.
-        if name == method::SESSION_REPORT_NATIVE_ID {
-            assert_eq!(code, UNATTESTED_CODE, "{context}");
-        }
-    }
-    if MUST_SUCCEED.contains(&name) {
-        assert!(response.get("ok").is_some(), "{context}");
-    }
-}
-
-/// A socket the hooks dial that relays every request to the real daemon and
-/// records each (request, response) exchange.
-struct RecordingRelay {
-    path: PathBuf,
-    exchanges: Arc<std::sync::Mutex<Vec<(Value, Value)>>>,
-}
-
-impl RecordingRelay {
-    fn start(daemon: &Daemon) -> Self {
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-
-        let path = daemon.socket.dir.path().join("relay.sock");
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind relay socket");
-        let upstream = daemon.socket.path.clone();
-        let exchanges = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&exchanges);
-        tokio::spawn(async move {
-            while let Ok((stream, _addr)) = listener.accept().await {
-                let (upstream, recorded) = (upstream.clone(), Arc::clone(&recorded));
-                tokio::spawn(async move {
-                    let (read, mut write) = stream.into_split();
-                    let mut request = String::new();
-                    if BufReader::new(read).read_line(&mut request).await.is_err() {
-                        return;
-                    }
-                    let Ok(mut client) = connect_once(&upstream).await else {
-                        return;
-                    };
-                    let reply = exchange(
-                        &mut client,
-                        &serde_json::from_str(&request).expect("request JSON"),
-                    )
-                    .await;
-                    recorded.lock().expect("relay lock").push((
-                        serde_json::from_str(&request).expect("request JSON"),
-                        reply.clone(),
-                    ));
-                    let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
-                });
-            }
-        });
-        Self { path, exchanges }
-    }
-
-    fn exchanges(&self) -> Vec<(Value, Value)> {
-        self.exchanges.lock().expect("relay lock").clone()
-    }
-}
-
-async fn connect_once(socket: &Path) -> std::io::Result<Client> {
-    UnixStream::connect(socket)
-        .await
-        .map(|stream| Framed::new(stream, LinesCodec::new()))
-}
-
-/// Runs one real managed hook asset with the launch environment of a session
-/// that baked `version` as `POHUNEK_PROTOCOL_VERSION` and returns its exit status.
-async fn run_prebump_hook(
-    relay: &RecordingRelay,
-    live: &LiveSession,
-    version: u32,
-    agent: &str,
-    script: &str,
-    args: &[&str],
-    stdin: &Value,
-) -> std::process::ExitStatus {
-    use tokio::io::AsyncWriteExt as _;
-
-    // The scripts ship as templates; the recorded rendering is byte-identical
-    // to what the handler installs.
-    let asset = pohunek_test_support::manifest_dir()
-        .join("src/integration/reporter_golden")
-        .join(format!("{agent}-{script}"));
-    let mut command = tokio::process::Command::new("/bin/sh");
-    command
-        .arg(&asset)
-        .args(args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
-        .env("TMPDIR", relay.path.parent().expect("relay dir"))
-        .env("POHUNEK_ENV", "1")
-        .env("POHUNEK_SOCKET_PATH", &relay.path)
-        .env("POHUNEK_PROTOCOL_VERSION", version.to_string())
-        .env("POHUNEK_SESSION_ID", &live.session_id)
-        .env("POHUNEK_WORKER_INSTANCE_ID", &live.worker_instance_id)
-        .stdin(std::process::Stdio::piped());
-    let mut child = command.spawn().expect("spawn managed hook");
-    let mut pipe = child.stdin.take().expect("hook stdin");
-    pipe.write_all(stdin.to_string().as_bytes())
-        .await
-        .expect("write hook input");
-    drop(pipe);
-    wait::guard("the managed hook to exit", child.wait())
-        .await
-        .expect("hook exit status")
-}
-
-/// Protocol version of the current release.
-const CURRENT_VERSION: u32 = PROTOCOL_VERSION.get();
-
-/// Asserts the exchange was stamped and answered in `version` and succeeded.
-fn assert_hook_exchange(version: u32, request: &Value, reply: &Value) {
-    let context = format!("{request} => {reply}");
-    assert_eq!(
-        request["v"],
-        json!({"minimum": version, "maximum": version}),
-        "{context}"
-    );
-    assert_eq!(reply["v"], version, "{context}");
-    assert!(reply.get("ok").is_some(), "{context}");
-    assert_previous_spelling_if(version, reply);
-}
-
-fn assert_previous_spelling_if(version: u32, reply: &Value) {
-    if version == PREVIOUS_VERSION {
-        assert_previous_spelling(reply);
-    }
-}
-
-#[tokio::test]
-async fn prebump_state_hooks_report_through_the_daemon_socket() {
-    let daemon = Daemon::start("prebump-state").await;
-    let relay = RecordingRelay::start(&daemon);
-    let mut driver = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut driver, &daemon).await;
-    let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
-
-    for agent in ["claude", "codex"] {
-        let mut outcomes = Vec::new();
-        for version in [PREVIOUS_VERSION, CURRENT_VERSION] {
-            let before = relay.exchanges().len();
-            // Only the Claude state hook has a release action.
-            let actions: &[&str] = if agent == "claude" {
-                &["session", "release"]
-            } else {
-                &["session"]
-            };
-            for action in actions.iter().copied() {
-                let status = run_prebump_hook(
-                    &relay,
-                    &live,
-                    version,
-                    agent,
-                    "pohunek-agent-state.sh",
-                    &[action],
-                    &input,
-                )
-                .await;
-                assert!(status.success(), "{agent} {action} v{version}");
-            }
-            let exchanges = relay.exchanges().split_off(before);
-            let methods: Vec<_> = exchanges
-                .iter()
-                .map(|(request, _)| request["method"].as_str().expect("method").to_owned())
-                .collect();
-            let mut expected = vec![
-                method::SESSION_REPORT_AGENT,
-                method::SESSION_REPORT_NATIVE_ID,
-            ];
-            if agent == "claude" {
-                expected.push(method::SESSION_RELEASE_AGENT);
-            }
-            assert_eq!(methods, expected, "{agent} v{version}");
-            for (request, reply) in &exchanges {
-                assert_hook_exchange(version, request, reply);
-            }
-            // The hook runs as a child of this test process and reports its
-            // parent as the agent, and the relay that forwards it is this same
-            // process. The attestation therefore passes, and the existing process
-            // check answers `recorded: false`: the session's PTY root is a
-            // different process.
-            assert_eq!(
-                exchanges[1].1["ok"]["recorded"],
-                json!(false),
-                "{agent} v{version}: {}",
-                exchanges[1].1
-            );
-            let native = &exchanges[1].0["params"];
-            let key = if version == PREVIOUS_VERSION {
-                "runtime_id"
-            } else {
-                "worker_instance_id"
-            };
-            assert_eq!(
-                native[key],
-                json!(live.worker_instance_id),
-                "{agent} v{version}"
-            );
-            outcomes.push(
-                exchanges
-                    .iter()
-                    .map(|(_, reply)| reply["ok"].clone())
-                    .collect::<Vec<_>>(),
-            );
-        }
-        assert_eq!(
-            outcomes[0], outcomes[1],
-            "{agent}: a version 3 session is served the same outcomes as a current one"
-        );
-    }
-    daemon.stop().await;
-}
-
-/// The public fallback of both managed state hooks names the agent process
-/// by its start identity and orders the report on the monotonic clock the
-/// worker path uses, so the daemon can forward it as a bound claim.
-#[tokio::test]
-async fn the_state_hook_fallbacks_send_the_bound_process_and_the_monotonic_sequence() {
-    use pohunek_platform::process::ProcessInspector as _;
-
-    let daemon = Daemon::start("hook-bound-fields").await;
-    let relay = RecordingRelay::start(&daemon);
-    let mut driver = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut driver, &daemon).await;
-    let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
-    // The hook runs as a child of this process and reports its parent.
-    let own = pohunek_platform::process::HostInspector::new()
-        .identity(std::process::id())
-        .expect("inspect own process")
-        .expect("own process exists");
-
-    for agent in ["claude", "codex"] {
-        let actions: &[&str] = if agent == "claude" {
-            &["session", "release"]
-        } else {
-            &["session"]
-        };
-        let before = relay.exchanges().len();
-        for action in actions.iter().copied() {
-            let status = run_prebump_hook(
-                &relay,
-                &live,
-                CURRENT_VERSION,
-                agent,
-                "pohunek-agent-state.sh",
-                &[action],
-                &input,
-            )
-            .await;
-            assert!(status.success(), "{agent} {action}");
-        }
-        let exchanges = relay.exchanges().split_off(before);
-        let public: Vec<_> = exchanges
-            .iter()
-            .map(|(request, _)| request)
-            .filter(|request| {
-                [method::SESSION_REPORT_AGENT, method::SESSION_RELEASE_AGENT]
-                    .contains(&request["method"].as_str().expect("method"))
-            })
-            .collect();
-        assert_eq!(public.len(), actions.len(), "{agent}");
-        for request in public {
-            let params = &request["params"];
-            let context = format!("{agent}: {request}");
-            assert_eq!(
-                params["pid_start_identity"],
-                json!(own.start_identity.get().to_string()),
-                "{context}"
-            );
-            assert_eq!(params["pid"], json!(std::process::id()), "{context}");
-            let monotonic: u64 = params["monotonic_sequence"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{context}"))
-                .parse()
-                .unwrap_or_else(|_| panic!("{context}"));
-            assert!(monotonic > 0, "{context}");
-            // The wall-clock `seq` stays as it was: it orders the memory path.
-            assert!(params.get("seq").is_some(), "{context}");
-        }
-    }
-    daemon.stop().await;
-}
-
-/// User metadata keys are free-form values: both adapters leave them untouched
-/// even when a user entry is named exactly like the key the two versions spell
-/// differently (`runtime_id`, `previous_runtime_id`, `worker_instance_id`). A
-/// protocol 3 write must reach the store verbatim, a current read must return
-/// it verbatim, a current write must patch it verbatim, and a protocol 3
-/// read-back must return it verbatim in the downgraded result. The response
-/// here carries a user `worker_instance_id` entry, so the suite's blanket
-/// `assert_previous_spelling` would be wrong and is not used.
-#[tokio::test]
-async fn metadata_user_keys_named_like_worker_identity_are_never_rewritten() {
-    let daemon = Daemon::start("window-metadata").await;
-    let mut previous = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut previous, &daemon).await;
-
-    // A protocol 3 client writes user entries named like the renamed keys: the
-    // request upgrade must not walk the metadata map.
-    let user = json!({
-        "owner": "gui",
-        "previous_runtime_id": "user-previous",
-        "runtime_id": "user-runtime",
-    });
-    let response = exchange(
-        &mut previous,
-        &previous_request(
-            "meta-previous-write",
-            method::SESSION_SET_METADATA,
-            json!({"session_id": live.session_id, "metadata": user.clone()}),
-        ),
-    )
-    .await;
-    let returned = previous_ok(&response)["session"].clone();
-    assert_eq!(returned["metadata"], user, "{response}");
-    assert_eq!(returned["runtime"]["runtime_id"], live.worker_instance_id);
-    assert_previous_spelling(&returned);
-
-    // The stored metadata is the user's own: a current reader sees the same
-    // entries verbatim, so the upgrade did not rewrite the user's keys.
-    let mut current = daemon.connect().await;
-    let read = Request::new(
-        "meta-current-read",
-        method::SESSION_INSPECT,
-        json!(live.session_id),
-    )
-    .expect("valid request");
-    let response = exchange(
-        &mut current,
-        &serde_json::to_value(&read).expect("serialize request"),
-    )
-    .await;
-    assert_eq!(response["v"], PROTOCOL_VERSION.get(), "{response}");
-    assert_eq!(response["ok"]["metadata"], user, "{response}");
-    assert_eq!(
-        response["ok"]["runtime"]["worker_instance_id"],
-        live.worker_instance_id
-    );
-
-    // A current client adds a user entry that itself resembles the current
-    // spelling of the worker identity.
-    let write = Request::new(
-        "meta-current-write",
-        method::SESSION_SET_METADATA,
-        json!({"session_id": live.session_id, "metadata": {"worker_instance_id": "user-worker"}}),
-    )
-    .expect("valid request");
-    let response = exchange(
-        &mut current,
-        &serde_json::to_value(&write).expect("serialize request"),
-    )
-    .await;
-    let mut patched = user.clone();
-    patched["worker_instance_id"] = json!("user-worker");
-    assert_eq!(response["ok"]["session"]["metadata"], patched, "{response}");
-
-    // The protocol 3 read-back: the result downgrade must not walk the
-    // metadata map either — both `runtime_id` spellings of the user entries
-    // survive, and the user `worker_instance_id` entry is not renamed or used
-    // to rewrite the carrier.
-    let read_back = exchange(
-        &mut previous,
-        &previous_request(
-            "meta-previous-read",
-            method::SESSION_INSPECT,
-            json!(live.session_id),
-        ),
-    )
-    .await;
-    let returned = previous_ok(&read_back).clone();
-    assert_eq!(returned["metadata"], patched, "{read_back}");
-    assert_eq!(returned["runtime"]["runtime_id"], live.worker_instance_id);
-
-    daemon.stop().await;
-}
-
-#[tokio::test]
-async fn prebump_notify_hooks_create_notifications_through_the_daemon_socket() {
-    let daemon = Daemon::start("prebump-notify").await;
-    let relay = RecordingRelay::start(&daemon);
-    let mut driver = daemon.connect().await;
-    let (live, _) = create_previous_session(&mut driver, &daemon).await;
-
-    let cases: [(&str, &[&str]); 4] = [
-        ("claude", &["notification", "auth_success"]),
-        ("claude", &["stop"]),
-        ("codex", &["permission_request"]),
-        ("codex", &["stop"]),
-    ];
-    for (agent, args) in cases {
-        let before = relay.exchanges().len();
-        let status = run_prebump_hook(
-            &relay,
-            &live,
-            PREVIOUS_VERSION,
-            agent,
-            "pohunek-agent-notify.sh",
-            args,
-            &json!({"hook_event_id": "evt-1"}),
-        )
-        .await;
-        assert!(status.success(), "{agent} {args:?}");
-        let exchanges = relay.exchanges().split_off(before);
-        assert_eq!(exchanges.len(), 1, "{agent} {args:?}: {exchanges:?}");
-        let (request, reply) = &exchanges[0];
-        assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
-        assert_hook_exchange(PREVIOUS_VERSION, request, reply);
-        assert_eq!(
-            reply["ok"]["created"],
-            json!(true),
-            "{agent} {args:?}: {reply}"
-        );
-        assert_eq!(reply["ok"]["record"]["session_id"], json!(live.session_id));
-        assert_eq!(reply["ok"]["record"]["agent_kind"], json!(agent));
-    }
-    daemon.stop().await;
-}
-
-/// A `runtime` object of observation params, with a key the daemon does not
-/// know when `with_unknown_key` is set.
-fn nested_runtime(with_unknown_key: bool) -> Value {
-    let mut runtime = json!({"worker_instance_id": "runtime-1", "runtime_generation": "1"});
-    if with_unknown_key {
-        runtime["key_from_a_newer_client"] = json!(1);
-    }
-    runtime
-}
-
-/// Params with a key the daemon does not know stay refused: tolerance of
-/// unknown keys applies to what a client decodes, never to what the daemon
-/// decodes.
-#[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one table of every strict params type, each row sending its own refused request"
-)]
-async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
-    let daemon = Daemon::start("window-params-unknown-key").await;
+async fn the_kept_notification_methods_keep_their_shape() {
+    let daemon = Daemon::start("window-kept").await;
     let mut client = daemon.connect().await;
+    let create = Request::new(
+        "create",
+        method::NOTIFICATION_CREATE,
+        json!({
+            "source": {
+                "provider": "scenario-tool",
+                "provider_event": "PermissionRequest",
+                "host_local_source_id": "scenario-1"
+            },
+            "kind": "approval_required",
+            "severity": "action_required",
+            "title": "Approval required",
+            "body": "A tool waits for approval."
+        }),
+    )
+    .expect("valid request");
+    let created = exchange(
+        &mut client,
+        &serde_json::to_value(&create).expect("serialize request"),
+    )
+    .await;
+    assert_eq!(created["ok"]["created"], true, "{created}");
+    assert_eq!(created["ok"]["record"]["kind"], "approval_required");
 
-    for (id, method_name, params) in [
-        (
-            "read-extra",
-            method::SESSION_READ,
-            json!({"session_id": "s-1", "key_from_a_newer_client": 1}),
-        ),
-        (
-            "output-runtime-extra",
-            method::SESSION_OUTPUT,
-            json!({
-                "session_id": "s-1",
-                "runtime": nested_runtime(true),
-                "after_offset": "0",
-                "max_bytes": 4096,
-            }),
-        ),
-        (
-            "wait-runtime-extra",
-            method::SESSION_WAIT,
-            json!({
-                "session_id": "s-1",
-                "runtime": nested_runtime(true),
-                "states": ["running"],
-                "timeout_ms": 1000,
-            }),
-        ),
-        (
-            "notification-policy-extra",
-            method::NOTIFICATION_POLICY_SET,
-            json!({"policy": {
-                "attention_dedupe_window_secs": 90,
-                "enabled": {
-                    "agent_blocked": true, "approval_required": true,
-                    "turn_completed": true, "session_finished": true,
-                    "error": true, "system": true,
-                },
-                "key_from_a_newer_client": 1,
-            }}),
-        ),
-        (
-            "notification-kind-extra",
-            method::NOTIFICATION_POLICY_SET,
-            json!({"policy": {
-                "attention_dedupe_window_secs": 90,
-                "enabled": {
-                    "agent_blocked": true, "approval_required": true,
-                    "turn_completed": true, "session_finished": true,
-                    "error": true, "system": true,
-                    "a_kind_from_a_newer_client": true,
-                },
-            }}),
-        ),
-        (
-            "notification-provider-kind-extra",
-            method::NOTIFICATION_POLICY_SET,
-            json!({"policy": {
-                "attention_dedupe_window_secs": 90,
-                "enabled": {
-                    "agent_blocked": true, "approval_required": true,
-                    "turn_completed": true, "session_finished": true,
-                    "error": true, "system": true,
-                },
-                "providers": {"codex": {"a_kind_from_a_newer_client": true}},
-            }}),
-        ),
-        (
-            "notification-retention-extra",
-            method::NOTIFICATION_POLICY_SET,
-            json!({"policy": {
-                "attention_dedupe_window_secs": 90,
-                "enabled": {
-                    "agent_blocked": true, "approval_required": true,
-                    "turn_completed": true, "session_finished": true,
-                    "error": true, "system": true,
-                },
-                "retention": {
-                    "sweep_interval_secs": 60, "info_ttl_secs": 1,
-                    "warning_ttl_secs": 1, "resolved_attention_ttl_secs": 1,
-                    "resolved_error_ttl_secs": 1, "archived_ttl_secs": 1,
-                    "compaction_min_actions": 1,
-                    "key_from_a_newer_client": 1,
-                },
-            }}),
-        ),
-        (
-            "command-extra",
-            method::COMMAND_RUN,
-            json!({
-                "package": "acme.fleet-state",
-                "command": "host-state",
-                "key_from_a_newer_client": 1,
-            }),
-        ),
-    ] {
-        let request = Request::new(id, method_name, params).expect("valid request");
-        let response = exchange(
-            &mut client,
-            &serde_json::to_value(&request).expect("serialize request"),
-        )
-        .await;
-        assert_eq!(
-            response["err"]["code"], "bad_request",
-            "{method_name}: {response}"
-        );
-        assert!(
-            response["err"]["msg"]
-                .as_str()
-                .is_some_and(|msg| msg.contains("unknown field")),
-            "{method_name}: {response}"
-        );
-    }
-
-    // The same params without the extra key pass decoding: whatever the daemon
-    // answers is not a params refusal.
-    for (id, method_name, params) in [
-        (
-            "output-runtime-control",
-            method::SESSION_OUTPUT,
-            json!({
-                "session_id": "s-1",
-                "runtime": nested_runtime(false),
-                "after_offset": "0",
-                "max_bytes": 4096,
-            }),
-        ),
-        (
-            "wait-runtime-control",
-            method::SESSION_WAIT,
-            json!({
-                "session_id": "s-1",
-                "runtime": nested_runtime(false),
-                "states": ["running"],
-                "timeout_ms": 1000,
-            }),
-        ),
-    ] {
-        let request = Request::new(id, method_name, params).expect("valid request");
-        let response = exchange(
-            &mut client,
-            &serde_json::to_value(&request).expect("serialize request"),
-        )
-        .await;
-        assert!(
-            !response["err"]["msg"]
-                .as_str()
-                .is_some_and(|msg| msg.contains("invalid params")),
-            "{method_name}: {response}"
-        );
-    }
+    let list = Request::new("list", method::NOTIFICATION_LIST, json!({})).expect("valid request");
+    let listed = exchange(
+        &mut client,
+        &serde_json::to_value(&list).expect("serialize request"),
+    )
+    .await;
+    assert_eq!(
+        listed["ok"]["notifications"][0]["id"], created["ok"]["record"]["id"],
+        "{listed}"
+    );
     daemon.stop().await;
 }

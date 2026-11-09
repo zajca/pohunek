@@ -378,7 +378,11 @@ mod tests {
             .expect("load")
             .is_none());
         let mut wrong_protocol = snapshot(18722, now, Vec::new());
-        wrong_protocol.protocol = protocol::CURRENT_PROTOCOL_VERSIONS;
+        let earlier =
+            protocol::ProtocolVersion::new(protocol::CLIENT_PROTOCOL_VERSIONS.minimum().get() - 1)
+                .expect("nonzero version");
+        wrong_protocol.protocol =
+            protocol::ProtocolVersionRange::new(earlier, earlier).expect("ordered range");
         store_atomic(&dir, &wrong_protocol).expect("store");
         assert!(load_fresh(&dir, &routes(TEST_PORT))
             .expect("load")

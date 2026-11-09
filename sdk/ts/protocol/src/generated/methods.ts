@@ -25,16 +25,8 @@ import type {
   JsonValue,
   NotificationCreateParams,
   NotificationCreateResult,
-  NotificationDeleteParams,
-  NotificationDeleteResult,
   NotificationListParams,
   NotificationListResult,
-  NotificationPolicyParams,
-  NotificationPolicyResult,
-  NotificationRetentionParams,
-  NotificationRetentionResult,
-  NotificationUpdateParams,
-  NotificationUpdateResult,
   PackageBindProfileParams,
   PackageBindProfileResult,
   PackageChangeResult,
@@ -125,12 +117,7 @@ export interface Methods {
   "integration.status": { params: IntegrationStatusParams; output: IntegrationStatusResult };
   "integration.uninstall": { params: IntegrationUninstallParams; output: IntegrationUninstallResult };
   "notification.create": { params: NotificationCreateParams; output: NotificationCreateResult };
-  "notification.delete": { params: NotificationDeleteParams; output: NotificationDeleteResult };
   "notification.list": { params: NotificationListParams; output: NotificationListResult };
-  "notification.policy.get": { params: null; output: NotificationPolicyResult };
-  "notification.policy.set": { params: NotificationPolicyParams; output: NotificationPolicyResult };
-  "notification.retention.prune": { params: NotificationRetentionParams; output: NotificationRetentionResult };
-  "notification.update": { params: NotificationUpdateParams; output: NotificationUpdateResult };
   "package.bind_profile": { params: PackageBindProfileParams; output: PackageBindProfileResult };
   "package.doctor": { params: PackageDoctorParams; output: PackageDoctorResult };
   "package.inspect": { params: PackageInspectParams; output: PackageInspectResult };
@@ -191,12 +178,7 @@ export const METHOD_NAMES = [
   "integration.status",
   "integration.uninstall",
   "notification.create",
-  "notification.delete",
   "notification.list",
-  "notification.policy.get",
-  "notification.policy.set",
-  "notification.retention.prune",
-  "notification.update",
   "package.bind_profile",
   "package.doctor",
   "package.inspect",

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::notifications::DEFAULT_ATTENTION_DEBOUNCE_SECS;
+use pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS;
 use protocol::{
     AgentActivity, NotificationId, SessionId, SessionState, SessionTurnCursor, SessionTurnEventKind,
 };
@@ -119,9 +119,6 @@ struct TurnRecord {
     state: TurnState,
     /// Whether the turn took the session's input evidence when it opened.
     holds_input: bool,
-    /// When the turn's record reached the inbox.
-    inbox_reported_at: Option<Instant>,
-    inbox_reported: bool,
     signal_reported: bool,
 }
 
@@ -163,8 +160,6 @@ impl TurnTable {
                 ended_metadata: None,
                 state: TurnState::Open,
                 holds_input: false,
-                inbox_reported_at: None,
-                inbox_reported: false,
                 signal_reported: false,
             },
         );
@@ -310,30 +305,17 @@ struct TurnChange {
 /// A turn as the report of its end reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnSnapshot {
-    /// Unix nanoseconds of the first transition into `working`, when observed.
-    pub(crate) started_nanos: Option<u64>,
-    /// Monotonic length from that transition to the turn leaving `working`.
-    pub(crate) length: Option<Duration>,
-    /// The session's metadata when the turn left `working`.
-    pub(crate) metadata: BTreeMap<String, String>,
-    pub(crate) inbox_reported: bool,
+    /// Whether the turn's end was already recorded as a turn event.
     pub(crate) signal_reported: bool,
 }
 
 impl TurnRecord {
     fn reported(&self) -> bool {
-        self.inbox_reported || self.signal_reported
+        self.signal_reported
     }
 
     fn snapshot(&self) -> TurnSnapshot {
         TurnSnapshot {
-            started_nanos: self.started_nanos,
-            length: self
-                .started
-                .zip(self.ended)
-                .map(|(started, ended)| ended - started),
-            metadata: self.ended_metadata.clone().unwrap_or_default(),
-            inbox_reported: self.inbox_reported,
             signal_reported: self.signal_reported,
         }
     }
@@ -573,24 +555,9 @@ impl TurnProgress {
         }
     }
 
-    /// Whether the record of the newest turn reached the inbox within
-    /// `within`.
-    fn recently_reported(&self, within: Duration) -> bool {
-        let mut table = self.table();
-        table.newest_mut().is_some_and(|(_, record)| {
-            record
-                .inbox_reported_at
-                .is_some_and(|reported| reported.elapsed() <= within)
-        })
-    }
-
     /// Records what the flush of turn `id` delivered.
-    pub(crate) fn mark_reported(&self, id: TurnId, inbox: bool, signal: bool) {
+    pub(crate) fn mark_reported(&self, id: TurnId, signal: bool) {
         if let Some(record) = self.table().records.get_mut(&id) {
-            if inbox && !record.inbox_reported {
-                record.inbox_reported_at = Some(Instant::now());
-            }
-            record.inbox_reported |= inbox;
             record.signal_reported |= signal;
         }
     }
@@ -658,9 +625,6 @@ struct Inner {
     flap_window_ms: Arc<AtomicU64>,
     /// Unix nanoseconds that replace the system clock for turn starts, or 0.
     wall_clock_pin: AtomicU64,
-    /// How often a held provider report was evaluated again while its turn
-    /// still worked.
-    held_rechecks: AtomicU64,
     /// Turns that went idle, for the notification projector: `(session, turn)`.
     edges: mpsc::UnboundedSender<TurnEdge>,
     edge_receiver: Mutex<Option<mpsc::UnboundedReceiver<TurnEdge>>>,
@@ -697,10 +661,9 @@ impl TurnEvents {
             inner: Arc::new(Inner {
                 epoch,
                 capacity: capacity.max(1),
-                held_rechecks: AtomicU64::new(0),
                 wall_clock_pin: AtomicU64::new(0),
                 flap_window_ms: Arc::new(AtomicU64::new(
-                    u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS) * 1000,
+                    DEFAULT_NOTIFICATION_SETTINGS.attention_debounce_secs * 1000,
                 )),
                 edges,
                 edge_receiver: Mutex::new(Some(edge_receiver)),
@@ -781,13 +744,6 @@ impl TurnEvents {
         self.existing_progress(session_id)?.attach_report(owner)
     }
 
-    /// Whether the session's newest turn reached the inbox within `within`:
-    /// a provider report that names no turn then repeats it.
-    pub(crate) fn recently_reported(&self, session_id: &SessionId, within: Duration) -> bool {
-        self.existing_progress(session_id)
-            .is_some_and(|progress| progress.recently_reported(within))
-    }
-
     /// What a flush does with the report of turn `id`.
     pub(crate) fn settle(
         &self,
@@ -802,21 +758,10 @@ impl TurnEvents {
     }
 
     /// Records what the flush of a turn delivered.
-    pub(crate) fn mark_reported(
-        &self,
-        session_id: &SessionId,
-        id: TurnId,
-        inbox: bool,
-        signal: bool,
-    ) {
+    pub(crate) fn mark_reported(&self, session_id: &SessionId, id: TurnId, signal: bool) {
         if let Some(progress) = self.existing_progress(session_id) {
-            progress.mark_reported(id, inbox, signal);
+            progress.mark_reported(id, signal);
         }
-    }
-
-    /// Counts one more evaluation of a held provider report.
-    pub(crate) fn note_held_recheck(&self) {
-        self.inner.held_rechecks.fetch_add(1, Ordering::Relaxed);
     }
 
     fn wall_nanos(&self) -> u64 {
@@ -830,12 +775,6 @@ impl TurnEvents {
     #[cfg(test)]
     pub(crate) fn pin_wall_clock(&self, nanos: u64) {
         self.inner.wall_clock_pin.store(nanos, Ordering::Relaxed);
-    }
-
-    /// How often held provider reports were evaluated again.
-    #[cfg(test)]
-    pub(crate) fn held_rechecks(&self) -> u64 {
-        self.inner.held_rechecks.load(Ordering::Relaxed)
     }
 
     /// Records one turn event now and wakes every waiter.

@@ -5661,14 +5661,6 @@ PY
         super::validate_pohunek_envelope(&status_step(), &current, CONTROLLED_PACKAGE_DIGEST)
             .expect("current install");
 
-        let mut narrowed = status_envelope(&serde_json::json!({}));
-        narrowed["protocol"]["minimum"] = protocol::PROTOCOL_VERSION.get().into();
-        let narrowed: super::PohunekEnvelope = serde_json::from_value(narrowed).expect("parse");
-        let error =
-            super::validate_pohunek_envelope(&status_step(), &narrowed, CONTROLLED_PACKAGE_DIGEST)
-                .expect_err("the CLI must advertise its complete supported window");
-        assert!(error.to_string().contains("invalid envelope"), "{error}");
-
         let outdated: super::PohunekEnvelope =
             serde_json::from_value(status_envelope(&serde_json::json!({"outdated": true})))
                 .expect("parse");

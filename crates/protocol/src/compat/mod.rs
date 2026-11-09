@@ -1,15 +1,13 @@
-//! Edge adapters between the current public protocol and the previous version.
+//! Edge adapters between the current public protocol and an older version.
 //!
-//! The window is [`crate::SUPPORTED_PROTOCOL_VERSIONS`], the previous version
-//! and the current one. Core types describe only the current wire shape; each
-//! older version in the window has one adapter module (`v3` today) that
-//! translates in both directions. A daemon translates a previous-version
-//! peer's requests up to the current shape and its own results and events down
+//! The window is [`crate::SUPPORTED_PROTOCOL_VERSIONS`]. Core types describe only
+//! the current wire shape; an older version in the window has one adapter module
+//! that translates in both directions. A daemon translates an older peer's
+//! requests up to the current shape and its own results and events down
 //! ([`upgrade_request`], [`downgrade_response`], [`downgrade_event`]). A client
-//! of this build talking to a previous-version daemon does the inverse
-//! ([`downgrade_request`], [`upgrade_result`], [`upgrade_event`]). The
-//! negotiated version is fixed per connection, so a connection is adapted for
-//! its whole life.
+//! talking to an older daemon does the inverse ([`downgrade_request`],
+//! [`upgrade_result`], [`upgrade_event`]). The negotiated version is fixed per
+//! connection, so a connection is adapted for its whole life.
 //!
 //! Adapters translate shape only: key renames and moved fields, plus dropping
 //! values the older version cannot decode (events and enum values it never
@@ -21,25 +19,16 @@
 //! next [`crate::PROTOCOL_VERSION`] bump the oldest adapter is deleted in the
 //! same change and an adapter for the version being left behind is added.
 //!
-//! The functions here are the only entry points. Both directions share one
-//! adapter per version, so the sites that carry a renamed key exist once.
+//! The window holds the current version only since protocol 5 removed the
+//! notification update, delete, policy and retention methods, so no adapter
+//! exists and every older version fails with [`CompatError::UnsupportedVersion`].
+//! The entry points stay so the next window brings its adapter without touching
+//! the callers.
 //!
-//! Observable behavior is asserted at supported boundaries only: the frozen
-//! v0.33.0 recordings and their strict typed decode in
-//! `crates/protocol/tests/compat_v3.rs`, the real client in
-//! `crates/client/tests/previous_daemon.rs`, and the real daemon in
-//! `crates/daemon/tests/protocol_window.rs`. Branches no real exchange can
-//! reach carry no helper tests: negotiation refuses a request version outside
-//! the supported window and the client refuses a peer-response version outside
-//! its selected version before any adapter runs, the daemon publishes events
-//! without correlation ids, and envelope coordinates that have no wire-observable
-//! effect (origin marker survival) are exercised by a wire scenario of that
-//! daemon (`protocol_window.rs`), which acts on them through the same-origin
-//! guard.
+//! Observable behavior is asserted at supported boundaries only: the real
+//! daemon in `crates/daemon/tests/protocol_window.rs`.
 
 // Rust guideline compliant 2026-10-09
-
-mod v3;
 
 use serde_json::Value;
 use thiserror::Error;
@@ -98,10 +87,8 @@ pub enum CompatError {
 /// [`CompatError::MethodNotDefined`]). The list goes away with its adapter.
 #[must_use]
 pub fn introduced_methods(version: ProtocolVersion) -> &'static [&'static str] {
-    match adapter(version) {
-        Ok(Adapter::V3) => v3::INTRODUCED_METHODS,
-        _ => &[],
-    }
+    let _ = version;
+    &[]
 }
 
 /// Lists the keys `version` spelled differently, as `(older, current)`.
@@ -110,10 +97,8 @@ pub fn introduced_methods(version: ProtocolVersion) -> &'static [&'static str] {
 /// TypeScript SDK) generate their key mapping from this table.
 #[must_use]
 pub fn renamed_keys(version: ProtocolVersion) -> &'static [(&'static str, &'static str)] {
-    match adapter(version) {
-        Ok(Adapter::V3) => v3::RENAMED_KEYS,
-        _ => &[],
-    }
+    let _ = version;
+    &[]
 }
 
 /// Translates request parameters of `version` into the current shape.
@@ -128,12 +113,11 @@ pub fn renamed_keys(version: ProtocolVersion) -> &'static [(&'static str, &'stat
 /// the current shape that `version` does not define.
 pub fn request_params(
     version: ProtocolVersion,
-    method: &str,
+    _method: &str,
     params: Value,
 ) -> Result<Value, CompatError> {
     match adapter(version)? {
         Adapter::Current => Ok(params),
-        Adapter::V3 => v3::request_params(method, params),
     }
 }
 
@@ -147,10 +131,13 @@ pub fn request_params(
 /// Returns [`CompatError::UnsupportedVersion`] when `version` is outside the
 /// window, or [`CompatError::Conflict`] when `result` already carries a key of
 /// the older shape that the translation would write.
-pub fn result(version: ProtocolVersion, method: &str, result: Value) -> Result<Value, CompatError> {
+pub fn result(
+    version: ProtocolVersion,
+    _method: &str,
+    result: Value,
+) -> Result<Value, CompatError> {
     match adapter(version)? {
         Adapter::Current => Ok(result),
-        Adapter::V3 => v3::result(method, result),
     }
 }
 
@@ -166,12 +153,11 @@ pub fn result(version: ProtocolVersion, method: &str, result: Value) -> Result<V
 /// the older shape that the translation would write.
 pub fn event_payload(
     version: ProtocolVersion,
-    name: &str,
+    _name: &str,
     payload: Value,
 ) -> Result<Option<Value>, CompatError> {
     match adapter(version)? {
         Adapter::Current => Ok(Some(payload)),
-        Adapter::V3 => v3::event_payload(name, payload),
     }
 }
 
@@ -248,12 +234,11 @@ pub fn downgrade_event(
 /// of the older shape that the translation would write.
 pub fn downgrade_request_params(
     version: ProtocolVersion,
-    method: &str,
+    _method: &str,
     params: Value,
 ) -> Result<Value, CompatError> {
     match adapter(version)? {
         Adapter::Current => Ok(params),
-        Adapter::V3 => v3::downgrade_request_params(method, params),
     }
 }
 
@@ -270,12 +255,11 @@ pub fn downgrade_request_params(
 /// of the current shape that `version` does not define.
 pub fn upgrade_result(
     version: ProtocolVersion,
-    method: &str,
+    _method: &str,
     result: Value,
 ) -> Result<Value, CompatError> {
     match adapter(version)? {
         Adapter::Current => Ok(result),
-        Adapter::V3 => v3::upgrade_result(method, result),
     }
 }
 
@@ -288,12 +272,11 @@ pub fn upgrade_result(
 /// the current shape that `version` does not define.
 pub fn upgrade_event_payload(
     version: ProtocolVersion,
-    name: &str,
+    _name: &str,
     payload: Value,
 ) -> Result<Value, CompatError> {
     match adapter(version)? {
         Adapter::Current => Ok(payload),
-        Adapter::V3 => v3::upgrade_event_payload(name, payload),
     }
 }
 
@@ -357,15 +340,11 @@ pub fn request_is_version_independent(method: &str, params: &Value) -> bool {
 /// Adapter selected for a negotiated version.
 enum Adapter {
     Current,
-    V3,
 }
 
 fn adapter(version: ProtocolVersion) -> Result<Adapter, CompatError> {
     if version == PROTOCOL_VERSION {
         return Ok(Adapter::Current);
     }
-    match version.get() {
-        v3::VERSION => Ok(Adapter::V3),
-        _ => Err(CompatError::UnsupportedVersion(version)),
-    }
+    Err(CompatError::UnsupportedVersion(version))
 }

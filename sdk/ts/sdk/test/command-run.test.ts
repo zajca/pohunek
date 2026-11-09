@@ -187,17 +187,7 @@ describe("runCommand against the fixture daemon", () => {
 
 describe("runCommand against a mock daemon", () => {
   async function mock(step: ScriptStep): Promise<{ daemon: MockDaemon; client: Client }> {
-    // The version probe precedes the request and must leave the connection open.
-    const probe: ScriptStep = {
-      kind: "gate",
-      ready: Promise.resolve(),
-      line: (line) => okResponseLine(requestIdFromLine(line), {
-        status: "ok",
-        daemon_version: "0.0.0-test",
-        protocol_version: PROTOCOL_VERSION,
-      }),
-    };
-    const daemon = await startTcpDaemon([probe, step]);
+    const daemon = await startTcpDaemon([step]);
     open.push(daemon);
     if (daemon.endpoint.kind !== "tcp") {
       throw new Error("the mock daemon needs a TCP endpoint");
@@ -233,7 +223,6 @@ describe("runCommand against a mock daemon", () => {
       }),
     });
     await client.runCommand({ package: PACKAGE, command: COMMAND, max_output_bytes: 1024 });
-    expect((JSON.parse(await daemon.nextRequest()) as { method: string }).method).toBe("daemon.health");
     const request = JSON.parse(await daemon.nextRequest()) as { method: string; params: unknown };
     expect(request.method).toBe("command.run");
     expect(request.params).toEqual({ package: PACKAGE, command: COMMAND, max_output_bytes: 1024 });
@@ -258,7 +247,6 @@ describe("runCommand against a mock daemon", () => {
       }),
     });
     const daemon = await startTcpDaemon([
-      health(Promise.resolve()),
       {
         kind: "gate",
         ready: commandHeld,

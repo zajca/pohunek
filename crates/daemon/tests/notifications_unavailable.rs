@@ -26,10 +26,7 @@ use tokio::net::UnixStream;
 
 const DATA_APP_DIR: &str = "pohunek";
 
-/// A policy the daemon accepts.
-const VALID_POLICY: &str = r#"{"attention_dedupe_window_secs":300,"enabled":{"agent_blocked":true,"approval_required":true,"turn_completed":true,"session_finished":true,"error":true,"system":true},"retention":{"sweep_interval_secs":60,"info_ttl_secs":1,"warning_ttl_secs":1,"resolved_attention_ttl_secs":1,"resolved_error_ttl_secs":1,"archived_ttl_secs":1,"compaction_min_actions":1}}"#;
-
-const NOTIFICATION_FILES: [&str; 3] = ["notifications.jsonl", "policy.json", "format.json"];
+const NOTIFICATION_FILES: [&str; 2] = ["notifications.jsonl", "format.json"];
 
 struct Layout {
     runtime: PathBuf,
@@ -153,8 +150,8 @@ fn unavailable_code(error: &ClientError) -> &str {
 /// A named set of files (name, bytes) that make the store unavailable.
 type UnavailableCase = (&'static str, Vec<(&'static str, &'static [u8])>);
 
-/// A store written in a newer format, a damaged format marker, an action this
-/// build cannot decode and a policy key it rejects.
+/// A store written in a newer format, a damaged format marker and an action this
+/// build cannot decode.
 fn unavailable_cases() -> Vec<UnavailableCase> {
     vec![
         (
@@ -179,45 +176,6 @@ fn unavailable_cases() -> Vec<UnavailableCase> {
         (
             "marker that is not text",
             vec![("format.json", b"\xff\xfe")],
-        ),
-        (
-            "policy that parses but is invalid",
-            vec![(
-                "policy.json",
-                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"approval_required\":true,\"turn_completed\":true,\"session_finished\":true,\"error\":true,\"system\":true},\"retention\":{\"sweep_interval_secs\":0,\"info_ttl_secs\":1,\"warning_ttl_secs\":1,\"resolved_attention_ttl_secs\":1,\"resolved_error_ttl_secs\":1,\"archived_ttl_secs\":1,\"compaction_min_actions\":1}}\n",
-            )],
-        ),
-        (
-            "rejected policy key",
-            vec![("policy.json", b"{\"a_key_from_a_newer_daemon\":1}\n")],
-        ),
-        (
-            "valid policy with a key this build does not know",
-            vec![(
-                "policy.json",
-                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"approval_required\":true,\"turn_completed\":true,\"session_finished\":true,\"error\":true,\"system\":true},\"a_key_from_a_newer_daemon\":1}\n",
-            )],
-        ),
-        (
-            "valid policy with a retention key this build does not know",
-            vec![(
-                "policy.json",
-                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"approval_required\":true,\"turn_completed\":true,\"session_finished\":true,\"error\":true,\"system\":true},\"retention\":{\"sweep_interval_secs\":60,\"info_ttl_secs\":1,\"warning_ttl_secs\":1,\"resolved_attention_ttl_secs\":1,\"resolved_error_ttl_secs\":1,\"archived_ttl_secs\":1,\"compaction_min_actions\":1,\"a_key_from_a_newer_daemon\":1}}\n",
-            )],
-        ),
-        (
-            "valid policy with a kind this build does not know",
-            vec![(
-                "policy.json",
-                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true,\"a_kind_from_a_newer_daemon\":true}}\n",
-            )],
-        ),
-        (
-            "valid policy with a provider override of a kind this build does not know",
-            vec![(
-                "policy.json",
-                b"{\"attention_dedupe_window_secs\":300,\"enabled\":{\"agent_blocked\":true},\"providers\":{\"codex\":{\"a_kind_from_a_newer_daemon\":false}}}\n",
-            )],
         ),
     ]
 }
@@ -252,61 +210,6 @@ async fn assert_notification_calls_refused(client: &mut pohunek_client::Client, 
         .expect_err("a debounced create is refused before it is minted");
     assert_eq!(
         unavailable_code(&created),
-        "notifications_unavailable",
-        "{case}"
-    );
-    let policy = client
-        .call::<method::NotificationPolicyGet>(())
-        .await
-        .expect_err("the policy is not served from defaults");
-    assert_eq!(
-        unavailable_code(&policy),
-        "notifications_unavailable",
-        "{case}"
-    );
-    let updated = client
-        .call::<method::NotificationUpdate>(protocol::NotificationUpdateParams {
-            id: protocol::NotificationId("n-1".to_owned()),
-            status: protocol::NotificationStatus::Read,
-        })
-        .await
-        .expect_err("updating needs the store");
-    assert_eq!(
-        unavailable_code(&updated),
-        "notifications_unavailable",
-        "{case}"
-    );
-    let deleted = client
-        .call::<method::NotificationDelete>(protocol::NotificationDeleteParams {
-            id: protocol::NotificationId("n-1".to_owned()),
-        })
-        .await
-        .expect_err("deleting needs the store");
-    assert_eq!(
-        unavailable_code(&deleted),
-        "notifications_unavailable",
-        "{case}"
-    );
-    let policy_set = client
-        .call::<method::NotificationPolicySet>(protocol::NotificationPolicyParams {
-            policy: serde_json::from_str(VALID_POLICY).expect("a valid policy"),
-        })
-        .await
-        .expect_err("writing the policy needs the store");
-    assert_eq!(
-        unavailable_code(&policy_set),
-        "notifications_unavailable",
-        "{case}"
-    );
-    let pruned =
-        client
-            .call::<method::NotificationRetentionPrune>(
-                protocol::NotificationRetentionParams::default(),
-            )
-            .await
-            .expect_err("pruning needs the store");
-    assert_eq!(
-        unavailable_code(&pruned),
         "notifications_unavailable",
         "{case}"
     );
@@ -386,7 +289,7 @@ async fn a_healthy_store_writes_the_format_marker_and_stays_available() {
         .expect("the format marker is written");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&marker).expect("marker json"),
-        serde_json::json!({"format_version": 2})
+        serde_json::json!({"format_version": 3})
     );
 }
 
@@ -395,7 +298,7 @@ async fn a_healthy_store_writes_the_format_marker_and_stays_available() {
 /// ranks by its provider name, so a projector report inside the dedupe window
 /// does not displace it.
 #[tokio::test]
-async fn a_format_1_store_opens_keeps_its_ranking_and_moves_to_format_2() {
+async fn a_format_1_store_opens_keeps_its_ranking_and_moves_to_format_3() {
     let env = TestEnv::new().expect("create short test environment");
     let created_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -456,6 +359,6 @@ async fn a_format_1_store_opens_keeps_its_ranking_and_moves_to_format_2() {
         .expect("the format marker is kept");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&marker).expect("marker json"),
-        serde_json::json!({"format_version": 2})
+        serde_json::json!({"format_version": 3})
     );
 }

@@ -19,10 +19,6 @@ use tokio::net::{UnixListener, UnixStream};
 /// Response timeout of the scenarios; the clock is paused, so it is virtual.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(20);
 
-/// Package digest whose request depends on the protocol version, so a fresh
-/// connection probes the daemon before sending it.
-const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
 struct Fixture {
     listener: UnixListener,
     path: std::path::PathBuf,
@@ -270,54 +266,5 @@ async fn a_failed_reopen_is_typed_and_the_next_call_tries_again() {
     connection.reply(&seen, json!({"call": 3})).await;
     let (_client, result) = call.await.expect("the call task joins");
     assert_eq!(result.expect("the next call succeeds"), json!({"call": 3}));
-    inhibitor.release().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_reopened_connection_learns_the_daemon_version_again() {
-    let inhibitor = AutoAdvanceInhibitor::new();
-    let fixture = Fixture::start();
-    let client = fixture.connect().await;
-    let mut first_connection = fixture.accept().await;
-    let uninstall = |id: &str| {
-        Request::new(
-            id,
-            protocol::method::PACKAGE_UNINSTALL,
-            json!({"digest": DIGEST}),
-        )
-        .expect("valid uninstall request")
-    };
-    // The first connection selects the current version, then the request is
-    // never answered.
-    let call = spawn_request(client, uninstall("req-version-1"));
-    let probe = first_connection.read_request().await;
-    assert_eq!(probe.method(), protocol::method::DAEMON_HEALTH);
-    first_connection
-        .reply(
-            &probe,
-            json!({
-                "status": "ok",
-                "daemon_version": "test",
-                "protocol_version": protocol::PROTOCOL_VERSION.get(),
-            }),
-        )
-        .await;
-    assert_eq!(
-        first_connection.read_request().await.method(),
-        protocol::method::PACKAGE_UNINSTALL
-    );
-    let mut client = time_out(call).await;
-
-    let call = tokio::spawn(async move {
-        let result = client.request(&uninstall("req-version-2")).await;
-        (client, result)
-    });
-    let mut second_connection = fixture.accept().await;
-    // Nothing selected on the old connection is inherited: the new one probes.
-    let probe = second_connection.read_request().await;
-    assert_eq!(probe.method(), protocol::method::DAEMON_HEALTH);
-    drop(second_connection);
-    let (_client, result) = call.await.expect("the call task joins");
-    assert!(result.is_err(), "{result:?}");
     inhibitor.release().await;
 }

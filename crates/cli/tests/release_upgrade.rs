@@ -261,16 +261,10 @@ const LIVE_NAME: &str = "upgrade-fake";
 /// as the current native conversation for a verified launch process.
 const NATIVE_AFTER: &str = "native-after-upgrade";
 
-/// Hook event ids of the notifications the test waits for; each carries a
-/// distinct one so the test can tell which phase delivered it. The fake agent
-/// also sends one at its first launch (`evt-before-upgrade`); the previous
-/// release's own notification hook is not accepted by its own daemon, so that
-/// one is not observable and not asserted.
+/// Hook event id the fake agent sends after the upgrade; the agent also sends
+/// one at each launch. The error hook of the agent surfaces as a `turn_error`
+/// turn event, which the test waits for.
 const EVENT_AFTER_UPGRADE: &str = "evt-after-upgrade";
-/// Prefix of the hook event id a resumed launch sends; the fake agent appends
-/// its process id, because the daemon merges notifications by event id across
-/// sessions.
-const EVENT_AFTER_RESUME: &str = "evt-after-resume-";
 
 /// Environment a child CLI receives; nothing else is inherited, so no
 /// `POHUNEK_*` input of this test reaches the daemon or the CLIs.
@@ -635,52 +629,87 @@ fn wait_native_id(cli: &Cli, id: &str, expected: &str) {
     );
 }
 
-/// The number of notifications of session `id` that mention `event`.
-fn notification_count(cli: &Cli, id: &str, event: &str) -> usize {
-    let list = cli.json(&["notifications", "list", "--session", id, "--json"]);
-    list["notifications"].as_array().map_or(0, |records| {
-        records
-            .iter()
-            .filter(|record| record.to_string().contains(event))
-            .count()
-    })
+/// Cursor of the turn events of session `id` at this moment; a wait that
+/// passes it ends only on a later event.
+fn turn_cursor(cli: &Cli, id: &str) -> String {
+    let waited = cli.json(&["session", "wait", id, "--timeout", "1s", "--json"]);
+    waited["cursor"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no turn cursor in {waited}"))
+        .to_owned()
 }
 
-/// Waits until session `id` has more than `known` notifications that mention
-/// `event`.
-fn wait_new_notification(cli: &Cli, id: &str, event: &str, known: usize) {
+/// Waits until session `id` records a `turn_error` event after `cursor`, the
+/// way an error hook of the agent surfaces.
+fn wait_turn_error(cli: &Cli, id: &str, cursor: &str) {
     poll_until(
-        &format!("a new notification {event} of {id} via {}", cli.label),
+        &format!("a turn_error event of {id} via {}", cli.label),
         || {
-            let list = cli
-                .try_json(&["notifications", "list", "--session", id, "--json"])
+            let waited = cli
+                .try_json(&[
+                    "session",
+                    "wait",
+                    id,
+                    "--until",
+                    "turn_error",
+                    "--after",
+                    cursor,
+                    "--timeout",
+                    "5s",
+                    "--json",
+                ])
                 .ok()?;
-            (list
-                .get("notifications")?
-                .as_array()?
-                .iter()
-                .filter(|record| record.to_string().contains(event))
-                .count()
-                > known)
-                .then_some(())
+            (waited["reason"] == "event" && waited["event"]["kind"] == "turn_error").then_some(())
         },
     );
 }
 
-/// Waits until a notification of the session mentions the hook event id.
-fn wait_notification(cli: &Cli, id: &str, event: &str) {
-    poll_until(
-        &format!("notification {event} of {id} via {}", cli.label),
-        || {
-            let list = cli
-                .try_json(&["notifications", "list", "--session", id, "--json"])
-                .ok()?;
-            list.get("notifications")?
-                .as_array()?
-                .iter()
-                .any(|record| record.to_string().contains(event))
-                .then_some(())
-        },
+/// Asserts that session `id` records no `turn_error` event after `cursor`
+/// within a wait longer than the attention debounce window an admitted report
+/// waits out.
+fn assert_no_turn_error(cli: &Cli, id: &str, cursor: &str) {
+    let waited = cli.json(&[
+        "session",
+        "wait",
+        id,
+        "--until",
+        "turn_error",
+        "--after",
+        cursor,
+        "--timeout",
+        "10s",
+        "--json",
+    ]);
+    assert_eq!(
+        waited["reason"], "timeout",
+        "a refused hook report must not surface as a turn event: {waited}"
+    );
+}
+
+/// Asserts that a call of the previous release's CLI is refused with a
+/// protocol version mismatch: this build's daemon serves protocol 5 only.
+fn assert_refused_as_version_mismatch(cli: &Cli, args: &[&str]) {
+    let refusal = cli
+        .try_json(args)
+        .expect_err("the previous release's client must be refused");
+    assert!(
+        refusal.contains("version_mismatch"),
+        "`pohunek {}` is not refused as a version mismatch: {refusal}",
+        args.join(" ")
+    );
+}
+
+/// Asserts that the inbox of session `id` holds no `error` record: turn
+/// reports are signals, not stored notifications.
+fn assert_no_error_record(cli: &Cli, id: &str) {
+    let list = cli.json(&["notifications", "list", "--session", id, "--json"]);
+    let records = list["notifications"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        records.iter().all(|record| record["kind"] != "error"),
+        "an error report must not be stored: {list}"
     );
 }
 
@@ -2341,10 +2370,10 @@ impl Upgrade {
         );
     }
 
-    /// `screen` and `input` reach the adopted worker through the new daemon,
-    /// and the previous release's hooks, running in the previous release's
-    /// worker, still reach the new daemon. The hook event at the end is sent
-    /// through the hooks the upgrade reinstalled.
+    /// `screen` and `input` reach the adopted worker through the new daemon.
+    /// The adopted worker still runs the previous release's hooks, which
+    /// announce protocol 4, so this build's daemon refuses their report until
+    /// the session relaunches.
     fn assert_session_works(&self) {
         let (head, id) = (&self.head, &self.id);
         wait_screen(head, id, "fake-agent ready");
@@ -2354,27 +2383,33 @@ impl Upgrade {
         input(head, id, &format!("report:{NATIVE_AFTER}"));
         wait_active_agent_id(head, id, NATIVE_AFTER);
         wait_native_id(head, id, NATIVE_AFTER);
+        let cursor = turn_cursor(head, id);
         input(head, id, &format!("stopfail:{EVENT_AFTER_UPGRADE}"));
-        wait_notification(head, id, EVENT_AFTER_UPGRADE);
+        wait_screen(
+            head,
+            id,
+            &format!("fake-agent notified {EVENT_AFTER_UPGRADE}"),
+        );
+        assert_no_turn_error(head, id, &cursor);
     }
 
-    /// A client of the previous release talks to the new daemon: reads and a
-    /// write, within the protocol window.
-    fn assert_previous_client(&self, after: &Runtime) {
+    /// A client of the previous release gets a clear protocol refusal on
+    /// reads and writes alike: the window is protocol 5 only.
+    fn assert_previous_client_refused(&self) {
         let (previous, id) = (&self.previous, &self.id);
-        let listed = previous.json(&["session", "list", "--json"]);
-        assert!(
-            listed.to_string().contains(id),
-            "previous client lost {id}: {listed}"
+        assert_refused_as_version_mismatch(previous, &["session", "list", "--json"]);
+        assert_refused_as_version_mismatch(previous, &["session", "inspect", id, "--json"]);
+        assert_refused_as_version_mismatch(previous, &["health", "--json"]);
+        assert_refused_as_version_mismatch(
+            previous,
+            &[
+                "session",
+                "input",
+                id,
+                "echo:input-from-previous-client",
+                "--json",
+            ],
         );
-        assert_eq!(
-            runtime(&previous.json(&["session", "inspect", id, "--json"])).as_ref(),
-            Some(after)
-        );
-        previous.json(&["health", "--json"]);
-        wait_notification(previous, id, EVENT_AFTER_UPGRADE);
-        input(previous, id, "echo:input-from-previous-client");
-        wait_screen(previous, id, "fake-agent ack input-from-previous-client");
     }
 
     /// Resumes session `id` with a plain `session resume`, which must succeed:
@@ -2385,15 +2420,15 @@ impl Upgrade {
     /// package its profile names.
     fn resume(&self, id: &str, name: &str, native: &str, stopped: &Runtime) -> Runtime {
         let launched = self.run.launches().len();
-        let notified = notification_count(&self.head, id, EVENT_AFTER_RESUME);
+        let cursor = turn_cursor(&self.head, id);
         self.head.json(&["session", "resume", id, "--json"]);
-        self.assert_relaunched(id, name, native, stopped, launched, notified)
+        self.assert_relaunched(id, name, native, stopped, launched, &cursor)
     }
 
-    /// Checks a relaunch of session `id` after `launched` launches and
-    /// `notified` resume notifications: a new generation of this build's
-    /// worker, launched with `--name=<name> --resume <native>`, whose hooks deliver a new
-    /// resume notification and whose store pin is the package its profile names.
+    /// Checks a relaunch of session `id` after `launched` launches and the turn
+    /// `cursor`: a new generation of this build's worker, launched with
+    /// `--name=<name> --resume <native>`, whose hooks deliver a new turn error
+    /// and whose store pin is the package its profile names.
     fn assert_relaunched(
         &self,
         id: &str,
@@ -2401,7 +2436,7 @@ impl Upgrade {
         native: &str,
         stopped: &Runtime,
         launched: usize,
-        notified: usize,
+        cursor: &str,
     ) -> Runtime {
         let head = &self.head;
         let resumed = wait_live(head, id);
@@ -2428,7 +2463,8 @@ impl Upgrade {
         });
         assert_eq!(status["active_version"], self.head_version.as_str());
         wait_native_id(head, id, native);
-        wait_new_notification(head, id, EVENT_AFTER_RESUME, notified);
+        wait_turn_error(head, id, cursor);
+        assert_no_error_record(head, id);
         assert_store_pin(
             &self.run,
             id,
@@ -2483,33 +2519,22 @@ impl Upgrade {
         self.assert_package_served(CODEX_PACKAGE_ID, self.profile_digest(CODEX_PACKAGE_ID));
     }
 
-    /// The published client's request deadline bounds a silent-reader create.
-    fn assert_previous_client_creates_with_input(&self) {
+    /// The previous release's client cannot create a session either.
+    fn assert_previous_client_cannot_create(&self) {
         let cwd = self.run.home.display().to_string();
-        let created = self.previous.json(&[
-            "session",
-            "new",
-            "--agent",
-            SILENT_PROFILE,
-            "--cwd",
-            &cwd,
-            "--input",
-            "echo:input-from-previous-create",
-            "--json",
-        ]);
-        let id = created
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("previous client did not receive a session id: {created}"));
-        wait_screen(
+        assert_refused_as_version_mismatch(
             &self.previous,
-            id,
-            "silent-agent ack echo:input-from-previous-create",
-        );
-        let removed = self.head.json(&["session", "rm", id, "--json"]);
-        assert_eq!(
-            removed["removed"], true,
-            "compat session was not removed: {removed}"
+            &[
+                "session",
+                "new",
+                "--agent",
+                SILENT_PROFILE,
+                "--cwd",
+                &cwd,
+                "--input",
+                "echo:input-from-previous-create",
+                "--json",
+            ],
         );
     }
 }
@@ -2554,11 +2579,11 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.resize_live_on_previous();
     upgrade.upgrade();
     upgrade.assert_downgrade_guard();
-    let after = upgrade.assert_adopted(&before.live, before.daemon);
+    upgrade.assert_adopted(&before.live, before.daemon);
     upgrade.assert_resize_applied_by_adopted_worker();
     upgrade.assert_session_works();
     upgrade.assert_head_links_a_package_of_its_format();
-    upgrade.assert_previous_client(&after);
+    upgrade.assert_previous_client_refused();
 
     // The stopped session resumes with a plain resume onto the package its
     // profile names; a second stop and plain resume succeed.
@@ -2581,7 +2606,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.resume(&upgrade.id, LIVE_NAME, NATIVE_AFTER, &stopped);
 
     upgrade.assert_new_sessions_launch_through_packages();
-    upgrade.assert_previous_client_creates_with_input();
+    upgrade.assert_previous_client_cannot_create();
     upgrade.head.json(&[
         "service",
         "uninstall",
@@ -2592,8 +2617,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
 }
 
 /// Real `--json` documents captured from the v0.33.1 and this build's CLIs
-/// (`tests/fixtures/release_upgrade`) and the recorded v0.33.0 protocol 3
-/// results.
+/// (`tests/fixtures/release_upgrade`).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2606,20 +2630,6 @@ mod tests {
     const HEAD_NOTIFICATIONS: &str =
         include_str!("fixtures/release_upgrade/head-notifications-list.json");
     const HEAD_ERROR: &str = include_str!("fixtures/release_upgrade/head-error.json");
-    const V3_RESULTS: &str = include_str!("../../protocol/tests/fixtures/compat/v3/results.json");
-
-    /// The recorded v0.33.0 result of `method`.
-    fn v3_result(method: &str) -> Value {
-        let recording: Value = serde_json::from_str(V3_RESULTS).expect("parse the v3 recording");
-        assert_eq!(recording["release"], "v0.33.0");
-        recording["entries"]
-            .as_array()
-            .expect("entries")
-            .iter()
-            .find(|entry| entry["method"] == method)
-            .unwrap_or_else(|| panic!("no recorded {method}"))["result"]
-            .clone()
-    }
 
     #[test]
     fn envelopes_of_both_releases_yield_their_payload() {
@@ -2688,16 +2698,6 @@ mod tests {
     }
 
     #[test]
-    fn the_v0_33_0_spelling_of_the_runtime_is_normalized() {
-        let recorded = v3_result("session.inspect");
-        assert!(recorded["runtime"].get("runtime_id").is_some());
-        assert!(recorded["runtime"].get("worker_instance_id").is_none());
-        let runtime = runtime(&recorded).expect("v0.33.0 runtime");
-        assert_eq!(runtime.worker_instance_id, "runtime-42");
-        assert_eq!(runtime.generation, 3);
-    }
-
-    #[test]
     fn matching_spellings_at_once_are_normalized() {
         let info = serde_json::json!({"runtime": {
             "state": "live", "runtime_generation": "1",
@@ -2717,19 +2717,5 @@ mod tests {
             "state": "live", "runtime_generation": "1",
             "worker_instance_id": "a", "runtime_id": "b"}});
         let _ = runtime(&info);
-    }
-
-    /// The other payload fields the assertions read keep their spelling in the
-    /// v0.33.0 recordings.
-    #[test]
-    fn the_other_fields_have_one_spelling_in_both_releases() {
-        let inspect = v3_result("session.inspect");
-        assert!(inspect.get("native_session_id").is_some());
-        assert!(inspect.get("active_agent_session_id").is_some());
-        assert!(v3_result("session.screen")["visible_lines"].is_array());
-        assert!(v3_result("session.input")["accepted"].is_boolean());
-        assert!(v3_result("session.stop")["stopped"].is_boolean());
-        assert!(v3_result("notification.list")["notifications"].is_array());
-        assert!(v3_result("daemon.health").get("status").is_some());
     }
 }

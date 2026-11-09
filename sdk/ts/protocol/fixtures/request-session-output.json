@@ -12,7 +12,7 @@
     "wait_ms": 1000
   },
   "v": {
-    "maximum": 4,
-    "minimum": 3
+    "maximum": 5,
+    "minimum": 5
   }
 }

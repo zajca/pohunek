@@ -3,7 +3,7 @@ import { PROTOCOL_VERSION, type HostCapabilities, type SessionNewParams } from "
 import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import { createFixtureRootSync, startFixtureDaemon, type FixtureDaemonHandle } from "@pohunek/testkit";
 import { rmSync } from "node:fs";
-import { Client, ClientError, CompatError, type ControlChannel, type Transport, connectLocal, connectTcp, downgradeRequestParams } from "@pohunek/sdk";
+import { Client, ClientError, type ControlChannel, type Transport, connectLocal, connectTcp } from "@pohunek/sdk";
 import {
   errResponseLine,
   minimalSessionInfo,
@@ -338,35 +338,6 @@ describe("session.new secret_env over a relayed transport with a poisoned connec
     expect((await rejection(client.subscribe(request).then(() => undefined))).kind)
       .toBe("sessionNewSecretEnvRelayRefused");
     expect(controls).toBe(1);
-  });
-});
-
-describe("session.new secret_env against the previous protocol", () => {
-  test("a protocol 3 daemon gets the distinct refusal and no session.new", async () => {
-    const daemon = track(await startTcpDaemon([{
-      kind: "gate",
-      ready: Promise.resolve(),
-      line: (line) => JSON.stringify({
-        v: 3,
-        id: requestIdFromLine(line),
-        ok: { daemon_version: "0.37.0", protocol_version: 3, supported_agents: [], runtimes: [], git_available: true },
-      }),
-    }]));
-    const client = await connect(daemon);
-    const error = await rejection(client.call("session.new", newParams()));
-    expect(error.kind).toBe("sessionNewSecretEnvUnsupported");
-    expect(error.code).toBe("session_new_secret_env_unsupported");
-    expect((await methodsSeen(daemon, 1)).map((request) => request["method"])).toEqual(["host.inspect"]);
-    await daemon.expectNoRequest(SETTLE_MS);
-    await client.close();
-  });
-
-  test("the version adapter refuses the field instead of dropping it", () => {
-    expect(() => downgradeRequestParams(3, "session.new", newParams())).toThrow(CompatError);
-    const plain = { agent: "codex", cols: 80, rows: 24 };
-    expect(downgradeRequestParams(3, "session.new", plain)).toEqual(plain);
-    const emptied = { ...plain, secret_env: {} };
-    expect(downgradeRequestParams(3, "session.new", emptied)).toEqual(emptied);
   });
 });
 

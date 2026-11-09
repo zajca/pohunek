@@ -29,9 +29,6 @@ const HERMES_OPERATOR_PAYLOAD = join(REPO_ROOT, "runtime-packages", "hermes", "o
 const HERMES_PLUGIN_FIXTURE = join(TEST_DIR, "fixtures", "hermes-plugin-e2e.py");
 const IDENTITY_DELAY_TRACE_NAME = "identity-delay-trace.log";
 const IDENTITY_DELAY_ENV = "LC_POHUNEK_TEST_IDENTITY_DELAY_TRACE";
-// Frozen plugin assets from v0.33.0; policy.json records that release's schema and v3 range.
-const PREVIOUS_HERMES_ASSETS = join(TEST_DIR, "fixtures", "hermes-v0.33.0");
-const PREVIOUS_HERMES_POLICY = join(PREVIOUS_HERMES_ASSETS, "policy.json");
 // The daemon serves `hermes` only from the official Hermes package. The scenarios install
 // the archive built from `runtime-packages/hermes` through a throwaway signed catalog whose
 // trust anchor sits beside a private copy of the daemon (`cargo xtask hermes
@@ -140,30 +137,6 @@ pluginDaemonTest(
   PLUGIN_E2E_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
 );
 
-pluginDaemonTest(
-  "v0.33.0 Hermes policy and plugin tools survive the protocol window",
-  async () => {
-    const prerequisites = await pluginPrerequisites();
-    await withTimeout(
-      startPluginDaemon(prerequisites).then((started) => withResource(
-        started,
-        async (daemon) => {
-          try {
-            await runHermesPluginScenario(daemon, true);
-          } catch (error: unknown) {
-            throw addDaemonContext(error, daemon);
-          }
-        },
-        (daemon) => daemon.stop(),
-        "previous Hermes plugin e2e and daemon teardown both failed",
-      )),
-      PLUGIN_E2E_TIMEOUT_MS,
-      `previous Hermes plugin e2e did not finish within ${PLUGIN_E2E_TIMEOUT_MS}ms`,
-    );
-  },
-  PLUGIN_E2E_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
-);
-
 /** Assembles the current plugin the fixture loads as `<root>/current-hermes-assets/pohunek/`. */
 async function assembleCurrentHermesAssets(root: string): Promise<string> {
   const assets = join(root, "current-hermes-assets");
@@ -173,120 +146,31 @@ async function assembleCurrentHermesAssets(root: string): Promise<string> {
   return assets;
 }
 
-async function runHermesPluginScenario(
-  daemon: PluginDaemonHarness,
-  previousRelease = false,
-): Promise<void> {
+async function runHermesPluginScenario(daemon: PluginDaemonHarness): Promise<void> {
   await waitForRemoteListener(daemon.remoteCapture);
   const projectId = await createPluginProject(daemon, daemon.cliWrapper);
   const policyPath = join(daemon.tempRoot, "hermes-plugin-policy.json");
-  const policy = previousRelease
-    ? JSON.parse(await readFile(PREVIOUS_HERMES_POLICY, "utf8")) as Record<string, unknown>
-    : {
-      schema_version: 1,
-      pohunek_cli: daemon.cliWrapper,
-      protocol_min: PROTOCOL_VERSION,
-      protocol_max: PROTOCOL_VERSION,
-      access_mode: "full",
-      allowed_hosts: [LOCAL_HOST, REMOTE_HOST],
-      tool_timeout_ms: 8_000,
-      request_timeout_ms: 5_000,
-      max_output_bytes: 262_144,
-      max_screen_bytes: 65_536,
-      max_concurrency: 1,
-    };
-  if (previousRelease) {
-    expect(policy["pohunek_cli"]).toBe("__CLI_PATH__");
-    policy["pohunek_cli"] = daemon.cliWrapper;
-  }
+  const policy = {
+    schema_version: 1,
+    pohunek_cli: daemon.cliWrapper,
+    protocol_min: PROTOCOL_VERSION,
+    protocol_max: PROTOCOL_VERSION,
+    access_mode: "full",
+    allowed_hosts: [LOCAL_HOST, REMOTE_HOST],
+    tool_timeout_ms: 8_000,
+    request_timeout_ms: 5_000,
+    max_output_bytes: 262_144,
+    max_screen_bytes: 65_536,
+    max_concurrency: 1,
+  };
   await writeFile(policyPath, JSON.stringify(policy), { mode: 0o600 });
-
-  if (previousRelease) {
-    for (const version of [2, 5]) {
-      const incompatiblePolicyPath = join(daemon.tempRoot, `hermes-policy-v${version}.json`);
-      await writeFile(
-        incompatiblePolicyPath,
-        JSON.stringify({ ...policy, protocol_min: version, protocol_max: version }),
-        { mode: 0o600 },
-      );
-      const incompatible = await runProgram(
-        daemon.pythonBin,
-        [
-          HERMES_PLUGIN_FIXTURE,
-          "--assets-dir", PREVIOUS_HERMES_ASSETS,
-          "--policy", incompatiblePolicyPath,
-          "--project-id", projectId,
-          "--remote-host", REMOTE_HOST,
-          "--identity-key", "runtime_id",
-          "--expect-incompatible",
-        ],
-        pluginFixtureEnvironment(daemon.env),
-        daemon.tempRoot,
-        PROGRAM_TIMEOUT_MS,
-      );
-      expect(incompatible.code).toBe(0);
-      expect(JSON.parse(incompatible.stdout)).toEqual({ ok: true, incompatible: true });
-    }
-
-    const malformedPolicyPath = join(daemon.tempRoot, "hermes-policy-malformed.json");
-    const malformedPolicy: Record<string, unknown> = { ...policy };
-    delete malformedPolicy["protocol_min"];
-    await writeFile(malformedPolicyPath, JSON.stringify(malformedPolicy), { mode: 0o600 });
-    const invalidPolicy = await runProgram(
-      daemon.pythonBin,
-      [
-        HERMES_PLUGIN_FIXTURE,
-        "--assets-dir", PREVIOUS_HERMES_ASSETS,
-        "--policy", malformedPolicyPath,
-        "--project-id", projectId,
-        "--remote-host", REMOTE_HOST,
-        "--identity-key", "runtime_id",
-        "--expect-invalid-policy",
-      ],
-      pluginFixtureEnvironment(daemon.env),
-      daemon.tempRoot,
-      PROGRAM_TIMEOUT_MS,
-    );
-    expect(invalidPolicy.code).toBe(0);
-    expect(JSON.parse(invalidPolicy.stdout)).toEqual({ ok: true, invalid_policy: true });
-
-    const malformedCli = join(daemon.tempRoot, "malformed-cli-envelope");
-    await writeFile(
-      malformedCli,
-      "#!/bin/sh\nprintf '%s\\n' '{\"cli_version\":\"0.33.1\",\"protocol\":{\"minimum\":\"3\",\"maximum\":4},\"ok\":{}}'\n",
-      { mode: 0o700 },
-    );
-    const invalidEnvelopePolicyPath = join(daemon.tempRoot, "hermes-policy-invalid-envelope.json");
-    await writeFile(
-      invalidEnvelopePolicyPath,
-      JSON.stringify({ ...policy, pohunek_cli: malformedCli }),
-      { mode: 0o600 },
-    );
-    const invalidEnvelope = await runProgram(
-      daemon.pythonBin,
-      [
-        HERMES_PLUGIN_FIXTURE,
-        "--assets-dir", PREVIOUS_HERMES_ASSETS,
-        "--policy", invalidEnvelopePolicyPath,
-        "--project-id", projectId,
-        "--remote-host", REMOTE_HOST,
-        "--identity-key", "runtime_id",
-        "--expect-invalid-envelope",
-      ],
-      pluginFixtureEnvironment(daemon.env),
-      daemon.tempRoot,
-      PROGRAM_TIMEOUT_MS,
-    );
-    expect(invalidEnvelope.code).toBe(0);
-    expect(JSON.parse(invalidEnvelope.stdout)).toEqual({ ok: true, invalid_envelope: true });
-  }
 
   const fixture = await runProgram(
     daemon.pythonBin,
     [
       HERMES_PLUGIN_FIXTURE,
       "--assets-dir",
-      previousRelease ? PREVIOUS_HERMES_ASSETS : await assembleCurrentHermesAssets(daemon.tempRoot),
+      await assembleCurrentHermesAssets(daemon.tempRoot),
       "--policy",
       policyPath,
       "--project-id",
@@ -294,7 +178,7 @@ async function runHermesPluginScenario(
       "--remote-host",
       REMOTE_HOST,
       "--identity-key",
-      previousRelease ? "runtime_id" : "worker_instance_id",
+      "worker_instance_id",
     ],
     pluginFixtureEnvironment(daemon.env),
     daemon.tempRoot,

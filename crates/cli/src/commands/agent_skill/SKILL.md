@@ -141,12 +141,12 @@ periodically during long watches.
 
 To follow specific sessions, prefer the turn wait of the next section, which
 is driven by a cursor and loses nothing between two calls. For a filtered
-stream of inbox records instead, `notifications watch` takes `--session`,
-`--kind`, and `--unread`; it carries only the records the notification policy
-keeps (the default policy keeps no `turn_completed` records):
+stream of attention records instead, `notifications watch` takes `--session`,
+`--kind` (`agent_blocked` or `approval_required`), and `--unread`; the inbox
+holds attention only, never a finished turn:
 
 ```sh
-pohunek notifications watch --session <session-id> --kind turn_completed --unread --json
+pohunek notifications watch --session <session-id> --kind agent_blocked --unread --json
 ```
 
 ## Sending prompts and waiting
@@ -238,15 +238,15 @@ no target activity arrived, so inspect the session instead of resending.
 A manager that starts sessions and follows them waits for turn events, not for
 a predicate. `session wait` without legacy flags is a turn wait: it returns
 when one of its targets records an event newer than `--after` — the agent
-finished its turn (`turn_completed`), is blocked on the owner
-(`agent_blocked`), waits for an approval (`approval_required`), or the session
-ended (`exited`) — or when `--timeout` elapses. The wait is edge-triggered on
+finished its turn (`turn_completed`), ended a turn in an error
+(`turn_error`), is blocked on the owner (`agent_blocked`), waits for an
+approval (`approval_required`), or the session ended (`exited`) — or when `--timeout` elapses. The wait is edge-triggered on
 when the daemon records an event: an event recorded before the cursor is never
 returned, and an event recorded between two chained waits is returned by the
 second.
 
 The cursor orders recording, not the agent's own timeline. `turn_completed`,
-`agent_blocked`, and `approval_required` are recorded only when the attention
+`turn_error`, `agent_blocked`, and `approval_required` are recorded only when the attention
 debounce window (`attention_debounce_secs`, 5 seconds by default) after the
 agent's report ends; `exited` is recorded at once. A pending `turn_completed`
 is dropped when the daemon sees the session start working inside that window
@@ -266,7 +266,7 @@ with `--after` returns it as if the new prompt had finished. Follow this loop:
    first) or `targets_ended`.
 2. Send the input.
 3. Wait with `--after <cursor>`, naming every kind (or omitting `--until`,
-   which selects all four), with a timeout you choose.
+   which selects every kind), with a timeout you choose.
 4. Branch on `reason`, then wait again with the returned `cursor`. After a
    `turn_completed`, that returned cursor is the one to chain the next prompt
    from.
@@ -274,7 +274,7 @@ with `--after` returns it as if the new prompt had finished. Follow this loop:
 ```sh
 pohunek session wait <target> --timeout 1ms --json
 pohunek session input <coding-agent-target> --stdin --json
-pohunek session wait <target> <other-target> --until turn_completed,agent_blocked,approval_required,exited --after <cursor> --timeout 5m --json
+pohunek session wait <target> <other-target> --until turn_completed,turn_error,agent_blocked,approval_required,exited --after <cursor> --timeout 5m --json
 ```
 
 A `turn_completed` that arrives implausibly soon after the input (before the
@@ -300,9 +300,9 @@ error, so run one wait per host. Read `ok.reason`:
 - `targets_ended`: every target is terminal and nothing newer is pending; stop
   waiting on them.
 
-`turn_completed`, `agent_blocked`, and `approval_required` arrive after the
-attention debounce (5 seconds by default), `exited` at once, and all of them are
-recorded even when the notification policy keeps no inbox record for them. A `--timeout` above the daemon ceiling fails with
+`turn_completed`, `turn_error`, `agent_blocked`, and `approval_required` arrive after the
+attention debounce (5 seconds by default) and `exited` at once. A turn end is a
+wait event only: it creates no notification record. A `--timeout` above the daemon ceiling fails with
 `session_wait_limit_exceeded`; omitting it uses the daemon default. Never mix
 `--until`, `--after`, or `--timeout` with the legacy flags above (`--state`,
 `--activity`, `--after-terminal-watermark`, `--timeout-ms`): that is a usage

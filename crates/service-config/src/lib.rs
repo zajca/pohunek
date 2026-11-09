@@ -110,6 +110,10 @@
 //! omits the table while every key equals its default, so a previous release
 //! still reads the file unless the operator set a key.
 //!
+//! `[notifications]` sets the attention debounce, the dedupe window and the
+//! lifetime of resolved records; see [`DEFAULT_NOTIFICATION_SETTINGS`]. The table
+//! and each key are optional and a value equal to its default is not written.
+//!
 //! `[worker_journals]` bounds how long the daemon keeps the journal directory of
 //! a session that no longer exists; see [`DEFAULT_WORKER_JOURNAL_MAX_AGE`]. The
 //! table and its `max_age_days` key are optional, a file that lacks them means
@@ -341,6 +345,37 @@ pub const DEFAULT_EVENT_RETENTION: EventRetention = EventRetention {
 /// keeps the evidence longer; lowering it frees the disk sooner but narrows the
 /// forensic window.
 pub const DEFAULT_WORKER_JOURNAL_MAX_AGE: Duration = Duration::from_secs(7 * SECONDS_PER_DAY);
+
+/// Notification timings used when `[notifications]` names none.
+///
+/// Five seconds of debounce swallow the transient prompts an agent answers
+/// itself without delaying a genuine wait; a two-minute dedupe window merges the
+/// reports several producers make of one attention moment; resolved records
+/// are kept for 14 days, the same horizon as the event journal.
+pub const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = NotificationSettings {
+    attention_debounce_secs: 5,
+    attention_dedupe_window_secs: 120,
+    record_ttl_secs: 14 * SECONDS_PER_DAY,
+    record_sweep_interval_secs: 3_600,
+};
+
+/// Largest accepted `notifications.attention_debounce_secs`.
+pub const MAX_ATTENTION_DEBOUNCE_SECS: u64 = 300;
+
+/// Largest accepted `notifications.attention_dedupe_window_secs`.
+pub const MAX_ATTENTION_DEDUPE_WINDOW_SECS: u64 = 3_600;
+
+/// Largest accepted `notifications.record_ttl_secs`.
+pub const MAX_NOTIFICATION_RECORD_TTL_SECS: u64 = 365 * SECONDS_PER_DAY;
+
+/// Smallest accepted `notifications.record_sweep_interval_secs`.
+pub const MIN_NOTIFICATION_SWEEP_INTERVAL_SECS: u64 = 1;
+
+/// Largest accepted `notifications.record_sweep_interval_secs`.
+pub const MAX_NOTIFICATION_SWEEP_INTERVAL_SECS: u64 = SECONDS_PER_DAY;
+
+/// Smallest accepted `notifications.record_ttl_secs`.
+pub const MIN_NOTIFICATION_RECORD_TTL_SECS: u64 = 60;
 
 /// Smallest accepted `worker_journals.max_age_days`.
 pub const MIN_WORKER_JOURNAL_AGE_DAYS: u64 = 1;
@@ -943,6 +978,24 @@ pub struct EventRetention {
     pub max_age: Duration,
 }
 
+/// Notification timings recorded in `[notifications]`.
+///
+/// [`ServiceConfig::new`] keeps `attention_debounce_secs` within
+/// `1..=`[`MAX_ATTENTION_DEBOUNCE_SECS`], `attention_dedupe_window_secs` within
+/// `1..=`[`MAX_ATTENTION_DEDUPE_WINDOW_SECS`] and `record_ttl_secs` within
+/// [`MIN_NOTIFICATION_RECORD_TTL_SECS`]`..=`[`MAX_NOTIFICATION_RECORD_TTL_SECS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NotificationSettings {
+    /// Seconds an attention state or turn end is held before it may surface.
+    pub attention_debounce_secs: u64,
+    /// Seconds within which reports of one attention moment merge.
+    pub attention_dedupe_window_secs: u64,
+    /// Seconds after which a resolved attention record is removed.
+    pub record_ttl_secs: u64,
+    /// Seconds between two retention sweeps.
+    pub record_sweep_interval_secs: u64,
+}
+
 /// A key or table of `service.toml` that this version does not know.
 ///
 /// The value never enters this type, so no warning built from it can leak a
@@ -1130,6 +1183,8 @@ pub struct ConfigSpec {
     /// at daemon start; a whole number of days within
     /// [`MIN_WORKER_JOURNAL_AGE_DAYS`]`..=`[`MAX_WORKER_JOURNAL_AGE_DAYS`].
     pub worker_journal_max_age: Duration,
+    /// Debounce, dedupe window and record lifetime of the notification inbox.
+    pub notifications: NotificationSettings,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -1158,6 +1213,7 @@ pub struct ServiceConfig {
     event_retention: EventRetention,
     inventory_probe: InventoryProbe,
     worker_journal_max_age: Duration,
+    notifications: NotificationSettings,
     open_files: u64,
     unknown: UnknownKeys,
 }
@@ -1239,9 +1295,8 @@ impl ServiceConfig {
         }
         validate_required_hooks(&spec.hook_required)?;
         let trusted_repositories = parse_trusted_repositories(&spec.trusted_repositories)?;
-        validate_event_retention(spec.event_retention)?;
         validate_inventory_probe(spec.inventory_probe)?;
-        validate_worker_journal_max_age(spec.worker_journal_max_age)?;
+        validate_retention(&spec)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -1270,6 +1325,7 @@ impl ServiceConfig {
             event_retention: spec.event_retention,
             inventory_probe: spec.inventory_probe,
             worker_journal_max_age: spec.worker_journal_max_age,
+            notifications: spec.notifications,
             open_files: spec.open_files,
             unknown: UnknownKeys::default(),
         })
@@ -1478,6 +1534,7 @@ impl ServiceConfig {
             },
             inventory: RawInventory::from(self.inventory_probe),
             worker_journals: RawWorkerJournals::from(self.worker_journal_max_age),
+            notifications: RawNotifications::from(self.notifications),
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -1515,6 +1572,7 @@ impl ServiceConfig {
             event_retention: self.event_retention,
             inventory_probe: self.inventory_probe,
             worker_journal_max_age: self.worker_journal_max_age,
+            notifications: self.notifications,
             open_files: self.open_files,
         }
     }
@@ -1693,6 +1751,12 @@ impl ServiceConfig {
         self.worker_journal_max_age
     }
 
+    /// Debounce, dedupe window and record lifetime of the notification inbox.
+    #[must_use]
+    pub fn notifications(&self) -> NotificationSettings {
+        self.notifications
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -1766,6 +1830,8 @@ struct RawConfig {
     inventory: RawInventory,
     #[serde(default, skip_serializing_if = "RawWorkerJournals::is_default")]
     worker_journals: RawWorkerJournals,
+    #[serde(default, skip_serializing_if = "RawNotifications::is_default")]
+    notifications: RawNotifications,
     limits: RawLimits,
 }
 
@@ -2195,6 +2261,119 @@ fn is_default_worker_journal_max_age_days(value: &u64) -> bool {
     *value == default_worker_journal_max_age_days()
 }
 
+/// The optional `[notifications]` table: each key is optional and omitted while
+/// it equals its default.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the keys name the unit of each setting"
+)]
+struct RawNotifications {
+    #[serde(
+        default = "default_attention_debounce_secs",
+        skip_serializing_if = "is_default_attention_debounce_secs"
+    )]
+    attention_debounce_secs: u64,
+    #[serde(
+        default = "default_attention_dedupe_window_secs",
+        skip_serializing_if = "is_default_attention_dedupe_window_secs"
+    )]
+    attention_dedupe_window_secs: u64,
+    #[serde(
+        default = "default_record_ttl_secs",
+        skip_serializing_if = "is_default_record_ttl_secs"
+    )]
+    record_ttl_secs: u64,
+    #[serde(
+        default = "default_record_sweep_interval_secs",
+        skip_serializing_if = "is_default_record_sweep_interval_secs"
+    )]
+    record_sweep_interval_secs: u64,
+}
+
+impl RawNotifications {
+    /// Whether every key equals its default, so the whole table is omitted.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A value of every key that is not its default, used only to derive the
+    /// set of known keys.
+    fn known_keys_sample() -> Self {
+        Self {
+            attention_debounce_secs: default_attention_debounce_secs() + 1,
+            attention_dedupe_window_secs: default_attention_dedupe_window_secs() + 1,
+            record_ttl_secs: default_record_ttl_secs() + 1,
+            record_sweep_interval_secs: default_record_sweep_interval_secs() + 1,
+        }
+    }
+}
+
+impl Default for RawNotifications {
+    fn default() -> Self {
+        Self::from(DEFAULT_NOTIFICATION_SETTINGS)
+    }
+}
+
+impl From<NotificationSettings> for RawNotifications {
+    fn from(settings: NotificationSettings) -> Self {
+        Self {
+            attention_debounce_secs: settings.attention_debounce_secs,
+            attention_dedupe_window_secs: settings.attention_dedupe_window_secs,
+            record_ttl_secs: settings.record_ttl_secs,
+            record_sweep_interval_secs: settings.record_sweep_interval_secs,
+        }
+    }
+}
+
+fn default_attention_debounce_secs() -> u64 {
+    DEFAULT_NOTIFICATION_SETTINGS.attention_debounce_secs
+}
+
+fn default_attention_dedupe_window_secs() -> u64 {
+    DEFAULT_NOTIFICATION_SETTINGS.attention_dedupe_window_secs
+}
+
+fn default_record_ttl_secs() -> u64 {
+    DEFAULT_NOTIFICATION_SETTINGS.record_ttl_secs
+}
+
+fn default_record_sweep_interval_secs() -> u64 {
+    DEFAULT_NOTIFICATION_SETTINGS.record_sweep_interval_secs
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_record_sweep_interval_secs(value: &u64) -> bool {
+    *value == default_record_sweep_interval_secs()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_attention_debounce_secs(value: &u64) -> bool {
+    *value == default_attention_debounce_secs()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_attention_dedupe_window_secs(value: &u64) -> bool {
+    *value == default_attention_dedupe_window_secs()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_record_ttl_secs(value: &u64) -> bool {
+    *value == default_record_ttl_secs()
+}
+
 impl RawInventory {
     /// Whether every key equals its default, so the whole table is omitted.
     fn is_default(&self) -> bool {
@@ -2398,6 +2577,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
+                notifications: RawNotifications::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
@@ -2425,6 +2605,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
+                notifications: RawNotifications::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
@@ -2448,6 +2629,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
+                notifications: RawNotifications::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 5);
@@ -2471,6 +2653,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
+                notifications: RawNotifications::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 6);
@@ -2498,6 +2681,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 checkout_trust: RawCheckoutTrust::default(),
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
+                notifications: RawNotifications::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
@@ -2581,6 +2765,7 @@ impl RawConfig {
             checkout_trust: RawCheckoutTrust::known_keys_sample(),
             inventory: RawInventory::known_keys_sample(),
             worker_journals: RawWorkerJournals::known_keys_sample(),
+            notifications: RawNotifications::known_keys_sample(),
             limits: RawLimits { open_files: 0 },
         }
     }
@@ -2916,6 +3101,12 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             parallelism: raw.inventory.probe_parallelism,
         },
         worker_journal_max_age: Duration::from_secs(journal_age_days * SECONDS_PER_DAY),
+        notifications: NotificationSettings {
+            attention_debounce_secs: raw.notifications.attention_debounce_secs,
+            attention_dedupe_window_secs: raw.notifications.attention_dedupe_window_secs,
+            record_ttl_secs: raw.notifications.record_ttl_secs,
+            record_sweep_interval_secs: raw.notifications.record_sweep_interval_secs,
+        },
         open_files: raw.limits.open_files,
     })
 }
@@ -3174,6 +3365,55 @@ fn validate_worker_journal_max_age(max_age: Duration) -> Result<(), ConfigError>
             min: MIN_WORKER_JOURNAL_AGE_DAYS,
             max: MAX_WORKER_JOURNAL_AGE_DAYS,
         });
+    }
+    Ok(())
+}
+
+/// Validates the lifetimes of the event journal, the worker journals and the
+/// notification inbox.
+fn validate_retention(spec: &ConfigSpec) -> Result<(), ConfigError> {
+    validate_event_retention(spec.event_retention)?;
+    validate_worker_journal_max_age(spec.worker_journal_max_age)?;
+    validate_notification_settings(spec.notifications)
+}
+
+/// Validates each `[notifications]` bound.
+fn validate_notification_settings(settings: NotificationSettings) -> Result<(), ConfigError> {
+    let bounds = [
+        (
+            "notifications.attention_debounce_secs",
+            settings.attention_debounce_secs,
+            1,
+            MAX_ATTENTION_DEBOUNCE_SECS,
+        ),
+        (
+            "notifications.attention_dedupe_window_secs",
+            settings.attention_dedupe_window_secs,
+            1,
+            MAX_ATTENTION_DEDUPE_WINDOW_SECS,
+        ),
+        (
+            "notifications.record_ttl_secs",
+            settings.record_ttl_secs,
+            MIN_NOTIFICATION_RECORD_TTL_SECS,
+            MAX_NOTIFICATION_RECORD_TTL_SECS,
+        ),
+        (
+            "notifications.record_sweep_interval_secs",
+            settings.record_sweep_interval_secs,
+            MIN_NOTIFICATION_SWEEP_INTERVAL_SECS,
+            MAX_NOTIFICATION_SWEEP_INTERVAL_SECS,
+        ),
+    ];
+    for (key, value, min, max) in bounds {
+        if !(min..=max).contains(&value) {
+            return Err(ConfigError::OutOfRange {
+                key,
+                value,
+                min,
+                max,
+            });
+        }
     }
     Ok(())
 }

@@ -179,7 +179,7 @@ completed, so inspect the current session before deciding whether to resend.
 ## Turn Waits
 
 `client.sessionWaitTurn(params)` waits for the next `turn_completed`,
-`agent_blocked`, `approval_required`, or `exited` event of up to
+`turn_error`, `agent_blocked`, `approval_required`, or `exited` event of up to
 `MAX_SESSION_WAIT_TURN_TARGETS` sessions after an opaque cursor. Pass the
 returned `cursor` as `after` to the next wait so no event is missed between
 calls, and branch on `reason` (`event`, `timeout`, `cursor_reset`,
@@ -190,7 +190,13 @@ let after: string | undefined;
 for (;;) {
   const result = await client.sessionWaitTurn({
     session_ids: ["s-41", "s-42"],
-    until: ["turn_completed", "agent_blocked", "approval_required", "exited"],
+    until: [
+      "turn_completed",
+      "turn_error",
+      "agent_blocked",
+      "approval_required",
+      "exited",
+    ],
     ...(after === undefined ? {} : { after }),
     timeout_ms: 300_000,
   });
@@ -214,10 +220,8 @@ The call runs on a dedicated connection whose response deadline is
 when `timeout_ms` is omitted and the daemon default applies, so the client's
 `requestTimeoutMs` never cuts a valid wait short. Generic typed
 `call("session.wait_turn", ...)` takes the same path. A `timeout_ms` that is not
-a nonzero `u32` fails with `daemon/bad_request` before anything is sent. A
-daemon of the previous protocol version makes the call fail with
-`daemon_protocol_too_old` before it is sent; `host.inspect` reports
-`session_wait_turn_supported` on daemons that serve it. See
+a nonzero `u32` fails with `daemon/bad_request` before anything is sent.
+`host.inspect` reports `session_wait_turn_supported` on daemons that serve it. See
 [Turn Waits](../../../docs/public-api.md#turn-waits) for the full contract.
 
 ## Attach
@@ -301,9 +305,7 @@ try {
 
 The daemon applies the CLI's selector rules, including this machine's own
 overlay name (`local`) and the typed `host_unknown` and `overlay_host_ambiguous`
-errors. `host.resolve` exists from protocol 4 and is served on the local socket
-only; against a daemon of the previous release the calls fail with
-`daemon_protocol_too_old`.
+errors. `host.resolve` is served on the local socket only.
 
 ## WebSocket Relay
 

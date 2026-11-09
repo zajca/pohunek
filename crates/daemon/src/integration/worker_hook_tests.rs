@@ -45,19 +45,14 @@ impl DaemonStub {
     /// Like [`Self::spawn`], but dispatches every request `reply_delay` after
     /// it was received, which holds back the reply the caller waits for.
     fn spawn_delaying(root: &Path, notification_dir: &Path, reply_delay: Duration) -> Self {
-        let notifications = crate::notifications::NotificationService::open(notification_dir)
-            .expect("notification service");
-        let mut policy = crate::notifications::default_policy();
-        policy.enabled = protocol::NotificationKindPolicy::from_flags([
-            (protocol::NotificationKind::AgentBlocked, true),
-            (protocol::NotificationKind::ApprovalRequired, true),
-            (protocol::NotificationKind::TurnCompleted, true),
-            (protocol::NotificationKind::SessionFinished, true),
-            (protocol::NotificationKind::Error, true),
-            (protocol::NotificationKind::System, true),
-        ]);
-        policy.providers.clear();
-        notifications.set_policy(policy).expect("enable all kinds");
+        let notifications = crate::notifications::NotificationService::open_with_settings(
+            notification_dir,
+            pohunek_service_config::NotificationSettings {
+                attention_debounce_secs: 0,
+                ..pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS
+            },
+        )
+        .expect("notification service");
         let sessions =
             crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig {
                 shell_command: crate::session::ShellCommand::new(
@@ -370,6 +365,17 @@ async fn deliver(
     ))
     .await;
 
+    if daemon
+        .reply_lines()
+        .iter()
+        .any(|reply| reply["ok"]["created"] == json!(true))
+    {
+        Box::pin(pohunek_test_support::wait::wait_until(
+            "the debounced attention record is stored",
+            || async { (!daemon.records().is_empty()).then_some(()) },
+        ))
+        .await;
+    }
     let delivery = Delivery {
         session,
         requests: daemon.request_lines(),
@@ -390,7 +396,7 @@ const REPLY_DELAY_PAST_HOOK_TIMEOUT: Duration = Duration::from_millis(1_200);
 async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notification() {
     let delivery = deliver(
         "claude",
-        "notification auth_success",
+        "notification permission_prompt",
         protocol::PROTOCOL_VERSION.get(),
         REPLY_DELAY_PAST_HOOK_TIMEOUT,
         2,
@@ -414,12 +420,14 @@ async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notificatio
         delivery.requests[0]["params"]["source_id"], delivery.requests[1]["params"]["source_id"],
         "both deliveries name the same source"
     );
-    let created = delivery
-        .replies
-        .iter()
-        .filter(|reply| reply["ok"]["created"] == json!(true))
-        .count();
-    assert_eq!(created, 1, "one delivery creates: {:?}", delivery.replies);
+    assert!(
+        delivery
+            .replies
+            .iter()
+            .all(|reply| reply["ok"]["record"]["kind"] == json!("approval_required")),
+        "both deliveries report the approval: {:?}",
+        delivery.replies
+    );
     assert_eq!(
         delivery.records.len(),
         1,
@@ -432,7 +440,7 @@ async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notificatio
 async fn notify_hook_delivers_through_the_worker_socket_to_a_created_notification() {
     let current = protocol::PROTOCOL_VERSION.get();
     let (request, reply, session) =
-        deliver_through_worker("claude", "notification auth_success", current).await;
+        deliver_through_worker("claude", "notification permission_prompt", current).await;
     assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
     assert!(
         request["id"]
@@ -444,38 +452,6 @@ async fn notify_hook_delivers_through_the_worker_socket_to_a_created_notificatio
     assert_eq!(reply["ok"]["created"], json!(true), "{reply}");
     assert_eq!(reply["ok"]["record"]["agent_kind"], json!("claude"));
     assert_eq!(reply["ok"]["record"]["session_id"], json!(session));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn worker_forwards_notifications_in_the_version_its_session_launched_with() {
-    const PREVIOUS: u32 = 3;
-    let cases = [
-        ("claude", "notification auth_success"),
-        ("claude", "stop"),
-        ("codex", "permission_request"),
-        ("codex", "stop"),
-    ];
-    for (agent, args) in cases {
-        let (request, reply, session) = deliver_through_worker(agent, args, PREVIOUS).await;
-        assert_eq!(
-            request["v"],
-            json!({"minimum": PREVIOUS, "maximum": PREVIOUS}),
-            "{agent} {args}: {request}"
-        );
-        assert!(
-            request["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("worker-hook:")),
-            "{agent} {args}: {request}"
-        );
-        assert_eq!(reply["v"], json!(PREVIOUS), "{agent} {args}: {reply}");
-        assert_eq!(
-            reply["ok"]["created"],
-            json!(true),
-            "{agent} {args}: {reply}"
-        );
-        assert_eq!(reply["ok"]["record"]["session_id"], json!(session));
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -577,7 +553,7 @@ async fn notify_hook_falls_back_to_the_daemon_when_the_worker_refuses_or_is_abse
             name,
             reply,
             "claude",
-            &["notification", "auth_success"],
+            &["notification", "permission_prompt"],
             protocol::PROTOCOL_VERSION.get(),
         )
         .await;
@@ -588,33 +564,6 @@ async fn notify_hook_falls_back_to_the_daemon_when_the_worker_refuses_or_is_abse
                 .is_some_and(|id| id.starts_with("hook:claude:")),
             "{name}: the hook dials the daemon itself: {}",
             requests[0]
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn prebump_notify_hooks_fall_back_to_the_daemon_in_their_launch_version() {
-    const PREVIOUS: u32 = 3;
-    let cases: [(&str, &[&str]); 2] = [
-        ("claude", &["notification", "auth_success"]),
-        ("codex", &["permission_request"]),
-    ];
-    for (agent, args) in cases {
-        let (requests, replies) =
-            run_hook_with_worker_reply("ph-notify-prebump-", None, agent, args, PREVIOUS).await;
-        assert_eq!(requests.len(), 1, "{agent}: {requests:?}");
-        assert_eq!(
-            requests[0]["v"],
-            json!({"minimum": PREVIOUS, "maximum": PREVIOUS}),
-            "{agent}: {}",
-            requests[0]
-        );
-        assert_eq!(replies[0]["v"], json!(PREVIOUS), "{agent}: {}", replies[0]);
-        assert_eq!(
-            replies[0]["ok"]["created"],
-            json!(true),
-            "{agent}: {}",
-            replies[0]
         );
     }
 }

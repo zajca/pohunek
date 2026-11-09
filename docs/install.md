@@ -81,7 +81,7 @@ runtime packages are refused with `official_trust_unavailable`.
 Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
 transition, every CLI, SDK, custom client, and local or remote
 daemon had to cross together. The legacy integer-v1 envelope and fixed
-`codex`/`claude` notification-policy fields have no compatibility shim. Once a
+`codex`/`claude` notification-policy fields have no compatibility shim (the notification policy itself is gone since protocol 5). Once a
 fleet is on v2, peers negotiate their highest overlap: M2 and this M3 plugin do
 not raise the public protocol version or require a second coordinated boundary.
 Do not binary-downgrade a host after it has persisted Hermes enum values or the

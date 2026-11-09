@@ -237,20 +237,6 @@ fn session_turn_progress_bases() -> Vec<Value> {
     vec![turn_progress_document()]
 }
 
-fn notification_policy_document() -> Value {
-    json!({
-        "attention_dedupe_window_secs": 90,
-        "enabled": {
-            "agent_blocked": true, "approval_required": true, "turn_completed": true,
-            "session_finished": true, "error": true, "system": true,
-        },
-    })
-}
-
-fn notification_policy_result_bases() -> Vec<Value> {
-    vec![json!({"policy": notification_policy_document()})]
-}
-
 fn session_capabilities_bases() -> Vec<Value> {
     vec![json!({"resume": true, "fork": false})]
 }
@@ -259,31 +245,6 @@ fn session_retention_policy_bases() -> Vec<Value> {
     vec![
         serde_json::to_value(protocol::SessionRetentionPolicy::default())
             .expect("serialize the default session retention policy"),
-    ]
-}
-
-fn notification_policy_bases() -> Vec<Value> {
-    vec![notification_policy_document()]
-}
-
-fn notification_kind_policy_bases() -> Vec<Value> {
-    vec![
-        json!({
-            "agent_blocked": true,
-            "approval_required": true,
-            "turn_completed": false,
-            "session_finished": false,
-            "error": true,
-            "system": false,
-        }),
-        json!({"turn_completed": true}),
-    ]
-}
-
-fn notification_retention_policy_bases() -> Vec<Value> {
-    vec![
-        serde_json::to_value(protocol::NotificationRetentionPolicy::default())
-            .expect("serialize the default notification retention policy"),
     ]
 }
 
@@ -394,13 +355,6 @@ const ROWS: &[Row] = &[
         Probe::Documents(session_turn_progress_bases),
         WIRE_ONLY
     ),
-    row!(
-        NotificationPolicyResult,
-        Relax,
-        [],
-        Probe::Documents(notification_policy_result_bases),
-        WIRE_ONLY
-    ),
     // Strict: envelope framing.
     row!(
         Request,
@@ -436,27 +390,6 @@ const ROWS: &[Row] = &[
         Scoped,
         [],
         Probe::Documents(session_retention_policy_bases),
-        DUAL_USE
-    ),
-    row!(
-        NotificationPolicy,
-        Scoped,
-        [],
-        Probe::Documents(notification_policy_bases),
-        DUAL_USE
-    ),
-    row!(
-        NotificationRetentionPolicy,
-        Scoped,
-        [],
-        Probe::Documents(notification_retention_policy_bases),
-        DUAL_USE
-    ),
-    row!(
-        NotificationKindPolicy,
-        Scoped,
-        [],
-        Probe::Documents(notification_kind_policy_bases),
         DUAL_USE
     ),
     // Strict: signed, cross-validated or identity documents.
@@ -518,7 +451,6 @@ const ROWS: &[Row] = &[
     row!(IntegrationStatusParams, Strict, PARAMS_STRICT),
     row!(IntegrationUninstallParams, Strict, PARAMS_STRICT),
     row!(IntegrationDoctorParams, Strict, PARAMS_STRICT),
-    row!(NotificationPolicyParams, Strict, PARAMS_STRICT),
     row!(PackageInstallParams, Strict, PARAMS_STRICT),
     row!(PackageLinkParams, Strict, PARAMS_STRICT),
     row!(PackageSetEnabledParams, Strict, PARAMS_STRICT),
@@ -584,15 +516,9 @@ const ROWS: &[Row] = &[
     row!(NotificationCreateParams, Lenient, LENIENT_PARAMS),
     row!(NotificationCreateResult, Lenient, LENIENT_RESULT),
     row!(NotificationCreatedEvent, Lenient, LENIENT_EVENT),
-    row!(NotificationDeleteParams, Lenient, LENIENT_PARAMS),
-    row!(NotificationDeleteResult, Lenient, LENIENT_RESULT),
     row!(NotificationDeletedEvent, Lenient, LENIENT_EVENT),
     row!(NotificationListParams, Lenient, LENIENT_PARAMS),
     row!(NotificationListResult, Lenient, LENIENT_RESULT),
-    row!(NotificationRetentionParams, Lenient, LENIENT_PARAMS),
-    row!(NotificationRetentionResult, Lenient, LENIENT_RESULT),
-    row!(NotificationUpdateParams, Lenient, LENIENT_PARAMS),
-    row!(NotificationUpdateResult, Lenient, LENIENT_RESULT),
     row!(NotificationUpdatedEvent, Lenient, LENIENT_EVENT),
     row!(PackageBindProfileResult, Lenient, LENIENT_RESULT),
     row!(PackageChangeResult, Lenient, LENIENT_RESULT),
@@ -741,44 +667,6 @@ fn a_scoped_type_writes_back_the_keys_it_kept() {
             );
         }
     }
-}
-
-/// The per-kind policy is a map: a flag must be a boolean and a kind may
-/// appear once, in both decodes, and a kind the document leaves out stays out.
-#[test]
-fn a_notification_kind_policy_keeps_a_map_shape() {
-    for text in [
-        r#"{"agent_blocked": "yes"}"#,
-        r#"{"agent_blocked": 1}"#,
-        r#"{"agent_blocked": true, "agent_blocked": false}"#,
-    ] {
-        assert!(
-            serde_json::from_str::<protocol::NotificationKindPolicy>(text).is_err(),
-            "plain decode must refuse {text}"
-        );
-        assert!(
-            protocol::tolerant::from_str::<protocol::NotificationKindPolicy>(text).is_err(),
-            "tolerant decode must refuse {text}"
-        );
-    }
-    let text = r#"{"system":true,"error":false}"#;
-    let policy: protocol::NotificationKindPolicy =
-        serde_json::from_str(text).expect("a document may leave kinds out");
-    assert_eq!(policy.get(protocol::NotificationKind::Error), Some(false));
-    assert_eq!(policy.get(protocol::NotificationKind::AgentBlocked), None);
-    assert_eq!(
-        serde_json::to_string(&policy).expect("serialize"),
-        r#"{"error":false,"system":true}"#,
-        "known kinds serialize in declaration order and absent ones stay absent"
-    );
-    let kept: protocol::NotificationKindPolicy =
-        protocol::tolerant::from_str(r#"{"zzz_future": true, "error": true, "aaa_future": 2}"#)
-            .expect("tolerant decode keeps unknown kinds");
-    assert_eq!(
-        serde_json::to_string(&kept).expect("serialize"),
-        r#"{"error":true,"aaa_future":2,"zzz_future":true}"#,
-        "unknown kinds follow the known ones in key order"
-    );
 }
 
 #[test]

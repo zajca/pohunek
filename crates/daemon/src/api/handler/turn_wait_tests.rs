@@ -16,28 +16,27 @@ use std::time::Duration;
 
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use pohunek_test_support::wait::{guard, wait_until};
-use protocol::{method, NotificationKindPolicy, NotificationPolicy, ProtocolError, Request};
+use protocol::{method, ProtocolError, Request};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
 use super::{handle_request, DaemonState, HealthInfo};
 use crate::agent::host::fixture::{official_host, official_profile_pin};
-use crate::notifications::{
-    default_policy, spawn_projector, AttentionCoordinator, NotificationService,
-    DEFAULT_ATTENTION_DEBOUNCE_SECS,
-};
-use crate::session::{SessionRegistry, SessionRegistryConfig};
+use crate::notifications::{spawn_projector, AttentionCoordinator, NotificationService};
+use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 /// Name of the host profile every scenario session launches.
 pub(super) const AGENT: &str = "turn-agent";
 
 /// Launch keys of a profile over the official Claude package, so Claude hook
 /// reports are admitted for the session, running a shell that prints `tick`
-/// whenever a `go` file appears in its working directory. The loop ends by
+/// whenever a `go` file appears in its working directory, and an `OSC 9`
+/// approval notice (`notice` file) or a plain `OSC 9` notice (`other` file)
+/// followed by `noticed`. The loop ends by
 /// itself after 2,400 polls of 50 ms, the two-minute test hang guard, so a
 /// failed stop cannot leave it running.
 const AGENT_LAUNCH: &str = r#"program = "/bin/sh"
-args = ["-c", "printf ready; i=0; while [ $i -lt 2400 ] && sleep 0.05; do i=$((i+1)); if [ -e go ]; then rm -f go; printf tick; fi; done"]
+args = ["-c", "printf ready; i=0; while [ $i -lt 2400 ] && sleep 0.05; do i=$((i+1)); if [ -e go ]; then rm -f go; printf tick; fi; if [ -e notice ]; then rm -f notice; printf '\\033]9;Approval requested\\007noticed'; fi; if [ -e other ]; then rm -f other; printf '\\033]9;Agent turn complete\\007other-noticed'; fi; done"]
 "#;
 
 /// Name of the host profile whose sessions run [`HOOK_AGENT_SCRIPT`].
@@ -67,9 +66,11 @@ while IFS= read -r line; do
 done
 "#;
 
-/// Debounce window of the default notification policy.
+/// Debounce window of the default notification settings.
 pub(super) fn debounce() -> Duration {
-    Duration::from_secs(u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS))
+    Duration::from_secs(
+        pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS.attention_debounce_secs,
+    )
 }
 
 /// A wait duration no scenario reaches unless it advances the clock to it.
@@ -104,61 +105,23 @@ pub(super) struct Fixture {
     state: DaemonState,
     pub(super) sessions: SessionRegistry,
     pub(super) root: Arc<tempfile::TempDir>,
-    projector: std::sync::Mutex<Option<crate::shutdown::DriverHandle>>,
+    _projector: crate::shutdown::DriverHandle,
     _coordinator: crate::shutdown::DriverHandle,
 }
 
 impl Fixture {
-    /// The notification service the daemon components share.
-    pub(super) fn notifications(&self) -> &crate::notifications::NotificationService {
-        self.state.notifications.as_ref().expect("notifications")
-    }
-
-    /// The debounce coordinator the daemon components share.
-    pub(super) fn attention(&self) -> &crate::notifications::AttentionCoordinator {
-        self.state
-            .attention
-            .as_ref()
-            .expect("attention coordinator")
-    }
-
-    /// Ends the projector as a daemon shutdown does: it drains what it was
-    /// sent and stops.
-    pub(super) async fn end_projector(&self) {
-        let projector = self
-            .projector
-            .lock()
-            .expect("projector slot is never poisoned")
-            .take()
-            .expect("the projector runs");
-        projector.stop().await;
-    }
-
-    /// Builds the daemon components with the default notification policy.
+    /// Builds the daemon components with the default notification settings.
     pub(super) fn new(config: SessionRegistryConfig) -> Self {
-        Self::with_policy(config, None)
-    }
-
-    /// Builds the daemon components with `policy` replacing the default
-    /// notification policy.
-    pub(super) fn with_policy(
-        config: SessionRegistryConfig,
-        policy: Option<NotificationPolicy>,
-    ) -> Self {
-        Self::build(config, policy, false)
+        Self::build(config, false)
     }
 
     /// Builds the daemon components over a notification store written in a
     /// newer format, which this build leaves unavailable.
     pub(super) fn with_unavailable_store(config: SessionRegistryConfig) -> Self {
-        Self::build(config, None, true)
+        Self::build(config, true)
     }
 
-    fn build(
-        config: SessionRegistryConfig,
-        policy: Option<NotificationPolicy>,
-        unavailable_store: bool,
-    ) -> Self {
+    fn build(config: SessionRegistryConfig, unavailable_store: bool) -> Self {
         let root =
             Arc::new(pohunek_test_support::tempdir_with_prefix("ph-turn-").expect("fixture root"));
         if unavailable_store {
@@ -185,22 +148,19 @@ impl Fixture {
             },
             official_host(),
         );
-        Self::assemble(root, sessions, policy)
+        Self::assemble(root, sessions)
     }
 
-    fn assemble(
-        root: Arc<tempfile::TempDir>,
-        sessions: SessionRegistry,
-        policy: Option<NotificationPolicy>,
-    ) -> Self {
+    fn assemble(root: Arc<tempfile::TempDir>, sessions: SessionRegistry) -> Self {
         let notifications = NotificationService::open(&root.path().join("data"))
             .expect("notification service opens");
-        if let Some(policy) = policy {
-            notifications.set_policy(policy).expect("set the policy");
-        }
         let tasks = crate::shutdown::DaemonShutdown::default();
         let (attention, coordinator) =
             AttentionCoordinator::spawn(&tasks, notifications.clone(), &sessions);
+        sessions.bind_approval_notice_sink(crate::notifications::ApprovalNoticeSink::new(
+            notifications.clone(),
+            attention.clone(),
+        ));
         let projector =
             spawn_projector(&tasks, &sessions, notifications.clone(), attention.clone());
         let state = DaemonState::new(
@@ -216,7 +176,7 @@ impl Fixture {
             state,
             sessions,
             root,
-            projector: std::sync::Mutex::new(Some(projector)),
+            _projector: projector,
             _coordinator: coordinator,
         }
     }
@@ -232,6 +192,30 @@ impl Fixture {
             )
             .await);
         created["id"].as_str().expect("session id").to_owned()
+    }
+
+    /// Makes the session started with `tag` print the terminal notice named by
+    /// `trigger` (`notice` or `other`) and waits until its marker is on screen.
+    pub(super) async fn emit_notice(&self, session: &str, tag: &str, trigger: &str, marker: &str) {
+        std::fs::write(self.cwd(tag).join(trigger), b"").expect("ask the agent for a notice");
+        // Yields instead of sleeping: the scenarios hold a paused clock, on
+        // which a sleep would not end.
+        Box::pin(guard("the notice marker is on screen", async {
+            loop {
+                let screen = ok(self
+                    .call(method::SESSION_SCREEN, json!({"session_id": session}))
+                    .await);
+                if screen["visible_lines"].as_array().is_some_and(|lines| {
+                    lines
+                        .iter()
+                        .any(|line| line.as_str().is_some_and(|line| line.contains(marker)))
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }))
+        .await;
     }
 
     pub(super) fn cwd(&self, tag: &str) -> PathBuf {
@@ -272,24 +256,36 @@ impl Fixture {
         session: &str,
         seq: u32,
     ) -> Result<Value, ProtocolError> {
-        self.call(
-            method::NOTIFICATION_CREATE,
-            json!({
-                "source": {
-                    "provider": provider,
-                    "provider_event": "Stop",
-                    "host_local_source_id": format!("{provider}-stop-{session}-{seq}")
-                },
-                "kind": "turn_completed",
-                "severity": "info",
-                "title": "Turn completed",
-                "body": "Claude completed a turn.",
-                "session_id": session,
-                "source_id": format!("{provider}:{session}:stop:{seq}"),
-                "dedupe_key": format!("turn:{session}")
-            }),
-        )
-        .await
+        self.report_kind(provider, "turn_completed", session, seq)
+            .await
+    }
+
+    /// Reports a hook notification of `kind` for `session` from `provider`.
+    pub(super) async fn report_kind(
+        &self,
+        provider: &str,
+        kind: &str,
+        session: &str,
+        seq: u32,
+    ) -> Result<Value, ProtocolError> {
+        let mut params = json!({
+            "source": {
+                "provider": provider,
+                "provider_event": "Stop",
+                "host_local_source_id": format!("{provider}-stop-{session}-{seq}")
+            },
+            "kind": kind,
+            "severity": "info",
+            "title": "Turn report",
+            "body": "Claude reported the end of a turn.",
+            "session_id": session,
+            "source_id": format!("{provider}:{session}:stop:{seq}"),
+        });
+        // The reserved turn key belongs to `turn_completed` reports only.
+        if kind == "turn_completed" {
+            params["dedupe_key"] = json!(format!("turn:{session}"));
+        }
+        self.call(method::NOTIFICATION_CREATE, params).await
     }
 
     /// Reports the active agent's activity, as the managed identity hook does.
@@ -317,11 +313,6 @@ impl Fixture {
             .as_array()
             .expect("notification list")
             .clone()
-    }
-
-    /// How often the coordinator evaluated a held provider report again.
-    pub(super) fn held_rechecks(&self) -> u64 {
-        self.sessions.turn_events().held_rechecks()
     }
 
     pub(super) async fn stop_all(&self, sessions: &[&str]) {
@@ -364,14 +355,6 @@ fn write_hook_agent(root: &std::path::Path, agents: &std::path::Path) {
     .expect("write the hook agent profile");
 }
 
-/// The default policy with `enabled` as the per-kind switches of every provider.
-pub(super) fn every_provider(enabled: NotificationKindPolicy) -> NotificationPolicy {
-    let mut policy = default_policy();
-    policy.enabled = enabled;
-    policy.providers.clear();
-    policy
-}
-
 pub(super) fn ok(result: Result<Value, ProtocolError>) -> Value {
     result.unwrap_or_else(|error| panic!("expected a success result: {error:?}"))
 }
@@ -399,6 +382,25 @@ pub(super) async fn pause_clock() -> AutoAdvanceInhibitor {
     tokio::time::advance(debounce() + TIMER_TICK).await;
     settle().await;
     inhibitor
+}
+
+/// Moves the paused clock in [`CLOCK_STEP`] increments until the inbox holds a
+/// record, and returns the inbox.
+///
+/// The step yields to the scheduler instead of sleeping, so a debounce window
+/// passes in virtual time and the wait costs no real time.
+pub(super) async fn surfaced_inbox(fixture: &Fixture) -> Vec<Value> {
+    Box::pin(guard("a record to surface", async {
+        loop {
+            tokio::time::advance(CLOCK_STEP).await;
+            settle().await;
+            let inbox = fixture.inbox().await;
+            if !inbox.is_empty() {
+                return inbox;
+            }
+        }
+    }))
+    .await
 }
 
 /// Waits until `count` turn waits hold slots, so their deadlines are armed
@@ -519,22 +521,22 @@ fn assert_progress_fields(progress: &Value, session: &str) {
 }
 
 #[tokio::test]
-async fn disabled_hook_turn_wakes_the_wait_without_an_inbox_record_and_chains() {
+async fn a_hook_turn_wakes_the_wait_without_an_inbox_record_and_chains() {
     let fixture = Fixture::new(SessionRegistryConfig::default());
     let session = fixture.session("disabled").await;
     fixture.activity(&session, "idle").await;
     let start = fresh_cursor(&fixture, &session).await;
     let _inhibitor = pause_clock().await;
 
-    // A disabled turn report still answers with the policy refusal, and after
-    // the debounce window it completes the wait.
+    // A turn report answers that it stored nothing, and after the debounce
+    // window it completes the wait.
     let wait = fixture.spawn_wait(json!({
         "session_ids": [session], "until": ["turn_completed"],
         "after": start, "timeout_ms": LONG_WAIT_MS
     }));
     parked(&fixture, 1).await;
-    let refused = err(fixture.turn_completed(&session, 1).await);
-    assert_eq!(refused.code, "notification_kind_disabled");
+    let answered = ok(fixture.turn_completed(&session, 1).await);
+    assert_eq!(answered["created"], false);
     settle().await;
     tokio::time::advance(debounce().saturating_sub(Duration::from_millis(1))).await;
     settle().await;
@@ -594,37 +596,6 @@ async fn disabled_hook_turn_wakes_the_wait_without_an_inbox_record_and_chains() 
 }
 
 #[tokio::test]
-async fn enabled_turn_names_its_inbox_record() {
-    let fixture = Fixture::with_policy(
-        SessionRegistryConfig::default(),
-        Some(every_provider({
-            let mut policy = default_policy().enabled;
-            policy.set(protocol::NotificationKind::TurnCompleted, true);
-            policy
-        })),
-    );
-    let session = fixture.session("enabled").await;
-    fixture.activity(&session, "idle").await;
-    let cursor = fresh_cursor(&fixture, &session).await;
-    let _inhibitor = pause_clock().await;
-
-    let wait = fixture.spawn_wait(json!({
-        "session_ids": [session], "until": ["turn_completed"],
-        "after": cursor, "timeout_ms": LONG_WAIT_MS
-    }));
-    parked(&fixture, 1).await;
-    let created = ok(fixture.turn_completed(&session, 1).await);
-    advance_until_finished(&wait, debounce() + FLUSH_SLACK).await;
-    let result = ok(joined(wait).await);
-    assert_eq!(result["reason"], "event");
-    assert_eq!(result["event"]["notification_id"], created["record"]["id"]);
-    let inbox = fixture.inbox().await;
-    assert_eq!(inbox.len(), 1);
-    assert_eq!(inbox[0]["id"], created["record"]["id"]);
-    fixture.stop_all(&[&session]).await;
-}
-
-#[tokio::test]
 async fn a_stop_resolved_by_resumed_work_inside_the_window_never_fires() {
     let fixture = Fixture::new(SessionRegistryConfig::default());
     let session = fixture.session("resolved").await;
@@ -659,123 +630,25 @@ async fn a_stop_resolved_by_resumed_work_inside_the_window_never_fires() {
 }
 
 #[tokio::test]
-async fn a_blocked_agent_fires_through_the_projector_whatever_the_policy() {
-    for blocked_inbox in [true, false] {
-        let fixture = Fixture::with_policy(
-            SessionRegistryConfig::default(),
-            Some(every_provider({
-                let mut policy = default_policy().enabled;
-                policy.set(protocol::NotificationKind::AgentBlocked, blocked_inbox);
-                policy
-            })),
-        );
-        let session = fixture.session("blocked").await;
-        fixture.activity(&session, "working").await;
-        let inhibitor = pause_clock().await;
-
-        let wait = fixture.spawn_wait(json!({
-            "session_ids": [session], "until": ["agent_blocked"], "timeout_ms": LONG_WAIT_MS
-        }));
-        parked(&fixture, 1).await;
-        fixture.activity(&session, "blocked").await;
-        advance_until_finished(&wait, debounce() + FLUSH_SLACK).await;
-        let result = ok(joined(wait).await);
-        assert_eq!(result["reason"], "event", "inbox enabled: {blocked_inbox}");
-        assert_eq!(result["event"]["kind"], "agent_blocked");
-        assert_eq!(result["progress"][0]["activity"], "blocked");
-        let inbox = fixture.inbox().await;
-        if blocked_inbox {
-            assert_eq!(inbox.len(), 1);
-            assert_eq!(result["event"]["notification_id"], inbox[0]["id"]);
-        } else {
-            assert!(inbox.is_empty(), "a disabled kind creates no inbox record");
-            assert!(result["event"].get("notification_id").is_none());
-        }
-        fixture.stop_all(&[&session]).await;
-        inhibitor.release().await;
-        tokio::time::resume();
-    }
-}
-
-#[tokio::test]
-async fn a_dropped_provider_report_keeps_the_inbox_record_and_its_deadline() {
-    let mut policy = default_policy();
-    let claude = {
-        let mut policy = policy.enabled.clone();
-        policy.set(protocol::NotificationKind::ApprovalRequired, false);
-        policy
-    };
-    policy.providers.insert("claude".to_owned(), claude);
-    let fixture = Fixture::with_policy(SessionRegistryConfig::default(), Some(policy));
-    let session = fixture.session("outranked").await;
+async fn a_blocked_agent_fires_through_the_projector_and_names_its_inbox_record() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("blocked").await;
     fixture.activity(&session, "working").await;
-    let cursor = fresh_cursor(&fixture, &session).await;
     let _inhibitor = pause_clock().await;
 
     let wait = fixture.spawn_wait(json!({
-        "session_ids": [session], "until": ["agent_blocked", "approval_required"],
-        "after": cursor, "timeout_ms": LONG_WAIT_MS
+        "session_ids": [session], "until": ["agent_blocked"], "timeout_ms": LONG_WAIT_MS
     }));
     parked(&fixture, 1).await;
-    // The projector's agent_blocked is kept by the policy and arms the window.
     fixture.activity(&session, "blocked").await;
-    settle().await;
-    let head_start = Duration::from_secs(2);
-    tokio::time::advance(head_start).await;
-    // A Claude approval report for the same moment is dropped by the policy.
-    let refused = err(fixture
-        .call(
-            method::NOTIFICATION_CREATE,
-            json!({
-                "source": {
-                    "provider": "claude",
-                    "provider_event": "PermissionRequest",
-                    "host_local_source_id": format!("claude-permission-{session}")
-                },
-                "kind": "approval_required",
-                "severity": "action_required",
-                "title": "Approval required",
-                "body": "Claude waits for a tool approval.",
-                "session_id": session,
-                "source_id": format!("claude:{session}:permission:1"),
-                "dedupe_key": format!("attention:{session}")
-            }),
-        )
-        .await);
-    assert_eq!(refused.code, "notification_kind_disabled");
-    settle().await;
-    tokio::time::advance(
-        debounce()
-            .saturating_sub(head_start)
-            .saturating_sub(Duration::from_millis(1)),
-    )
-    .await;
-    settle().await;
-    assert!(
-        !wait.is_finished(),
-        "nothing flushes before the original deadline"
-    );
-    // The dropped report did not re-arm the window: the flush follows the
-    // projector's deadline, far sooner than another full window.
-    advance_until_finished(&wait, FLUSH_SLACK).await;
+    advance_until_finished(&wait, debounce() + FLUSH_SLACK).await;
     let result = ok(joined(wait).await);
     assert_eq!(result["reason"], "event");
-    assert_eq!(
-        result["event"]["kind"], "approval_required",
-        "the provider report outranks the projector for the turn event"
-    );
-    assert!(
-        result["event"].get("notification_id").is_none(),
-        "the inbox kept a record of another kind"
-    );
+    assert_eq!(result["event"]["kind"], "agent_blocked");
+    assert_eq!(result["progress"][0]["activity"], "blocked");
     let inbox = fixture.inbox().await;
-    assert_eq!(
-        inbox.len(),
-        1,
-        "the dropped report does not displace the kept record"
-    );
-    assert_eq!(inbox[0]["kind"], "agent_blocked");
-    assert_eq!(inbox[0]["source"]["provider"], "pohunek");
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(result["event"]["notification_id"], inbox[0]["id"]);
     fixture.stop_all(&[&session]).await;
 }
 
@@ -842,10 +715,10 @@ async fn a_timeout_reports_every_progress_field_and_output_since_the_cursor() {
         "session_ids": [first, second], "until": ["turn_completed"],
         "after": cursor, "timeout_ms": 1
     });
-    let result = wait_until("output after the cursor", || async {
+    let result = Box::pin(wait_until("output after the cursor", || async {
         let result = ok(joined(fixture.spawn_wait(since.clone())).await);
         (result["progress"][1]["output_advanced"] == true).then_some(result)
-    })
+    }))
     .await;
     assert_eq!(result["reason"], "timeout");
     assert!(result.get("event").is_none());
@@ -1162,10 +1035,10 @@ async fn hook_turn_wakes_the_wait_while_the_notification_store_is_unavailable() 
         "after": start, "timeout_ms": LONG_WAIT_MS
     }));
     parked(&fixture, 1).await;
-    // The report is refused because the store is unavailable, and its turn
-    // signal still completes the wait after the debounce window.
-    let refused = err(fixture.turn_completed(&session, 1).await);
-    assert_eq!(refused.code, "notifications_unavailable");
+    // The report stores nothing whether or not the store is usable, and its
+    // turn signal completes the wait after the debounce window.
+    let answered = ok(fixture.turn_completed(&session, 1).await);
+    assert_eq!(answered["created"], false);
     settle().await;
     tokio::time::advance(debounce().saturating_sub(Duration::from_millis(1))).await;
     settle().await;
@@ -1231,8 +1104,8 @@ async fn untrusted_turn_reports_neither_wake_a_wait_nor_flood_the_journal() {
     }));
     parked(&fixture, 1).await;
     // A producer without a hook schema claims the session's turn ended.
-    let forged = err(fixture.turn_report("any-tool", &session, 1).await);
-    assert_eq!(forged.code, "notification_kind_disabled");
+    let forged = ok(fixture.turn_report("any-tool", &session, 1).await);
+    assert_eq!(forged["created"], false);
     // A hook provider reports turns for sessions this daemon does not hold.
     for seq in 0..FLOOD_REPORTS {
         let flood = err(fixture
@@ -1346,14 +1219,7 @@ async fn a_stale_stop_during_the_next_turn_is_dropped() {
 
 #[tokio::test]
 async fn a_flap_between_two_hook_stops_inside_the_window_is_one_logical_turn() {
-    let fixture = Fixture::with_policy(
-        SessionRegistryConfig::default(),
-        Some(every_provider({
-            let mut policy = default_policy().enabled;
-            policy.set(protocol::NotificationKind::TurnCompleted, true);
-            policy
-        })),
-    );
+    let fixture = Fixture::new(SessionRegistryConfig::default());
     let session = fixture.session("two-quick").await;
     fixture.activity(&session, "idle").await;
     let cursor = fresh_cursor(&fixture, &session).await;
@@ -1384,10 +1250,8 @@ async fn a_flap_between_two_hook_stops_inside_the_window_is_one_logical_turn() {
     let result = ok(joined(wait).await);
     assert_eq!(result["reason"], "event");
     assert_eq!(result["event"]["kind"], "turn_completed");
-    // The flap is one logical turn: one inbox record, and the event names it.
-    let inbox = fixture.inbox().await;
-    assert_eq!(inbox.len(), 1, "{inbox:?}");
-    assert_eq!(result["event"]["notification_id"], inbox[0]["id"]);
+    // The flap is one logical turn and leaves no inbox record.
+    assert!(result["event"].get("notification_id").is_none());
 
     let again = fixture.spawn_wait(json!({
         "session_ids": [session], "until": ["turn_completed"], "after": result["cursor"],
@@ -1400,6 +1264,217 @@ async fn a_flap_between_two_hook_stops_inside_the_window_is_one_logical_turn() {
         "timeout",
         "recorded once"
     );
+    assert!(fixture.inbox().await.is_empty());
+    fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn a_hook_error_report_wakes_the_wait_with_a_turn_error_and_stores_nothing() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("turn-error").await;
+    fixture.activity(&session, "idle").await;
+    let cursor = fresh_cursor(&fixture, &session).await;
+    let _inhibitor = pause_clock().await;
+
+    let wait = fixture.spawn_wait(json!({
+        "session_ids": [session], "until": ["turn_error"], "after": cursor,
+        "timeout_ms": LONG_WAIT_MS
+    }));
+    parked(&fixture, 1).await;
+    let answered = ok(fixture.report_kind("claude", "error", &session, 1).await);
+    assert_eq!(answered["created"], false);
+    advance_until_finished(&wait, debounce() + FLUSH_SLACK).await;
+    let result = ok(joined(wait).await);
+    assert_eq!(result["reason"], "event");
+    assert_eq!(result["event"]["kind"], "turn_error");
+    assert!(result["event"].get("notification_id").is_none());
+    assert!(fixture.inbox().await.is_empty());
+    fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn kinds_the_inbox_does_not_hold_are_accepted_and_neither_listed_nor_waited_for() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("dropped-kinds").await;
+    fixture.activity(&session, "idle").await;
+    let cursor = fresh_cursor(&fixture, &session).await;
+    let _inhibitor = pause_clock().await;
+
+    let wait = fixture.spawn_wait(json!({
+        "session_ids": [session],
+        "until": ["turn_completed", "turn_error", "agent_blocked", "approval_required"],
+        "after": cursor, "timeout_ms": 20_000
+    }));
+    parked(&fixture, 1).await;
+    for (seq, kind) in ["system", "session_finished"].into_iter().enumerate() {
+        let answered = ok(fixture
+            .report_kind("claude", kind, &session, u32::try_from(seq).expect("small"))
+            .await);
+        assert_eq!(answered["created"], false, "{kind}");
+        assert_eq!(answered["record"]["kind"], kind);
+    }
+    let mut moved = Duration::ZERO;
+    while moved < debounce() + FLUSH_SLACK {
+        tokio::time::advance(CLOCK_STEP).await;
+        moved += CLOCK_STEP;
+        settle().await;
+        assert!(!wait.is_finished(), "a dropped kind wakes no wait");
+    }
+    tokio::time::advance(Duration::from_secs(20)).await;
+    assert_eq!(ok(joined(wait).await)["reason"], "timeout");
+    assert!(fixture.inbox().await.is_empty());
+    fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn an_approval_notice_creates_one_approval_record_and_nothing_else() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("notice").await;
+    let _inhibitor = pause_clock().await;
+
+    Box::pin(fixture.emit_notice(&session, "notice", "notice", "noticed")).await;
+    let records = Box::pin(surfaced_inbox(&fixture)).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["kind"], "approval_required");
+    assert_eq!(records[0]["dedupe_key"], format!("attention:{session}"));
+    assert_eq!(records[0]["metadata"]["reason"], "terminal_notice");
+
+    // A notice with other text is no attention.
+    Box::pin(fixture.emit_notice(&session, "notice", "other", "other-noticed")).await;
+    tokio::time::advance(debounce() + FLUSH_SLACK).await;
+    settle().await;
     assert_eq!(fixture.inbox().await.len(), 1);
     fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn an_approval_notice_is_ignored_once_a_hook_spoke_for_the_session() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("hook-first").await;
+    fixture.activity(&session, "working").await;
+    let _inhibitor = pause_clock().await;
+
+    Box::pin(fixture.emit_notice(&session, "hook-first", "notice", "noticed")).await;
+    let mut moved = Duration::ZERO;
+    while moved < debounce() + FLUSH_SLACK {
+        tokio::time::advance(CLOCK_STEP).await;
+        moved += CLOCK_STEP;
+        settle().await;
+    }
+    assert!(
+        fixture.inbox().await.is_empty(),
+        "the hook already covers the session"
+    );
+    fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn a_notice_and_a_hook_approval_for_one_moment_are_one_record() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("both").await;
+    let _inhibitor = pause_clock().await;
+
+    Box::pin(fixture.emit_notice(&session, "both", "notice", "noticed")).await;
+    let approval = ok(fixture
+        .call(
+            method::NOTIFICATION_CREATE,
+            json!({
+                "source": {
+                    "provider": "claude",
+                    "provider_event": "Notification.permission_prompt",
+                    "host_local_source_id": "claude-approval-1"
+                },
+                "kind": "approval_required",
+                "severity": "action_required",
+                "title": "Approval required",
+                "body": "Claude is waiting for approval.",
+                "session_id": session,
+                "source_id": format!("claude:{session}:approval:1"),
+                "dedupe_key": format!("attention:{session}")
+            }),
+        )
+        .await);
+    assert_eq!(approval["created"], true);
+    let records = Box::pin(surfaced_inbox(&fixture)).await;
+    tokio::time::advance(debounce() + FLUSH_SLACK).await;
+    settle().await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(fixture.inbox().await.len(), 1);
+    fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn a_blocked_agent_that_resumes_inside_the_window_leaves_no_record() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("resumed").await;
+    fixture.activity(&session, "working").await;
+    let _inhibitor = pause_clock().await;
+
+    fixture.activity(&session, "blocked").await;
+    settle().await;
+    tokio::time::advance(debounce() / 2).await;
+    fixture.activity(&session, "working").await;
+    let mut moved = Duration::ZERO;
+    while moved < debounce() + FLUSH_SLACK {
+        tokio::time::advance(CLOCK_STEP).await;
+        moved += CLOCK_STEP;
+        settle().await;
+    }
+    assert!(fixture.inbox().await.is_empty());
+    fixture.stop_all(&[&session]).await;
+}
+
+#[tokio::test]
+async fn a_session_that_stops_while_blocked_resolves_its_attention_record() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("stopped-blocked").await;
+    fixture.activity(&session, "working").await;
+    let _inhibitor = pause_clock().await;
+
+    fixture.activity(&session, "blocked").await;
+    let records = Box::pin(surfaced_inbox(&fixture)).await;
+    assert_eq!(records[0]["kind"], "agent_blocked");
+    assert_eq!(records[0]["status"], "unread");
+
+    fixture.stop_all(&[&session]).await;
+    let resolved = Box::pin(wait_until("the record resolves", || async {
+        settle().await;
+        let inbox = fixture.inbox().await;
+        (inbox
+            .first()
+            .is_some_and(|record| record["status"] == "acknowledged"))
+        .then_some(inbox)
+    }))
+    .await;
+    assert_eq!(resolved.len(), 1);
+}
+
+#[tokio::test]
+async fn a_session_that_fails_leaves_no_notification_record_of_any_kind() {
+    let fixture = Fixture::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 3"]),
+        ..SessionRegistryConfig::default()
+    });
+    let cwd = fixture.cwd("failing");
+    std::fs::create_dir_all(&cwd).expect("create the session working directory");
+    let created = ok(fixture
+        .call(
+            method::SESSION_NEW,
+            json!({"agent": "shell", "cwd": cwd, "cols": 80, "rows": 24}),
+        )
+        .await);
+    let session = created["id"].as_str().expect("session id").to_owned();
+    let _inhibitor = pause_clock().await;
+
+    Box::pin(wait_until("the session fails", || async {
+        let info = ok(fixture.call(method::SESSION_INSPECT, json!(session)).await);
+        (info["state"] == "failed").then_some(())
+    }))
+    .await;
+    tokio::time::advance(debounce() + FLUSH_SLACK).await;
+    settle().await;
+    assert!(
+        fixture.inbox().await.is_empty(),
+        "a failed session is visible in `session list` only"
+    );
 }

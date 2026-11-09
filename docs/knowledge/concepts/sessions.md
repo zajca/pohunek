@@ -45,7 +45,7 @@ To follow agents across turns, a client runs `pohunek session wait <target>...
 also the mode with no flags) or calls the protocol method `session.wait_turn`
 (Rust SDK `Client::session_wait_turn`, TypeScript SDK `client.sessionWaitTurn`).
 It waits for the
-next turn event of one or more sessions, `turn_completed`, `agent_blocked`,
+next turn event of one or more sessions, `turn_completed`, `turn_error`, `agent_blocked`,
 `approval_required`, or `exited`, newer than an opaque cursor (or newer than
 the call when no cursor is given), bounded by an agent-chosen `timeout_ms`
 (daemon default 5 minutes, ceiling 30 minutes, both set by `service.toml`
@@ -58,9 +58,10 @@ came from another daemon instance or lies outside what the in-memory journal ret
 (also while waiting); take the fresh cursor and inspect the sessions.
 `targets_ended` means every target is terminal and nothing newer is pending.
 Turn events come only from admitted provider hook reports for sessions the
-daemon holds and from the daemon's own projector, and are independent of the
-notification policy: a `turn_completed` the inbox drops (the default) still
-completes the wait. An event is recorded when the attention debounce window
+daemon holds and from the daemon's own projector. A turn end (`turn_completed`)
+and a turn error (`turn_error`) are never notification records; only an
+`agent_blocked` or `approval_required` event names the attention record it
+belongs to. An event is recorded when the attention debounce window
 (5 seconds by default) has passed since the last report, so it arrives no
 earlier than that after the agent stops. A `turn_completed` report that names no turn
 is a stale stop and is dropped when the session is `working` as its window
@@ -76,8 +77,8 @@ resumed or re-adopted session, is therefore no turn.
 
 The CLI turn mode takes up to 32 targets that must all be on one host (targets
 on different hosts are a usage error before any request; run one wait per
-host). `--until` is a comma list or repeated flag and defaults to all four
-kinds; `--timeout` needs a unit (`90s`, `5m`) and defaults to the daemon
+host). `--until` is a comma list or repeated flag and defaults to every
+kind; `--timeout` needs a unit (`90s`, `5m`) and defaults to the daemon
 default. `--json` prints the daemon result as one document; the human form
 prints the event (`<session> <kind> <at>`) or the reason, one `progress:` line
 per target, and `cursor: <cursor>` last. Every reason exits 0, a timeout
@@ -345,8 +346,8 @@ the session it references.
 Session attention notifications use the source-independent dedupe key
 `attention:<session_id>`. That lets a daemon projector `agent_blocked` record
 and a provider-hook approval record refer to the same waiting-for-input moment
-without sharing a producer-specific source id. Within the policy's attention
-dedupe window, provider hook records outrank daemon projector records for the
+without sharing a producer-specific source id. Within the attention
+dedupe window (`attention_dedupe_window_secs` of `service.toml`), provider hook records outrank daemon projector records for the
 same session attention key, and while reports are held pending in the debounce
 window a provider hook record outranks a user or external record. A provider
 ranks as a hook provider when a registered hook schema lists it as an identity
@@ -363,61 +364,47 @@ stored whatever the session id.
 
 Session notifications self-resolve. When the daemon observes a session enter
 `working`, or the session reaches a terminal lifecycle state, the projector
-acknowledges any `unread` or `read`
-`agent_blocked` and `approval_required` records for that session's
-`attention:<session_id>` key and any `turn_completed` records for
-`turn:<session_id>`. This keeps transient waiting-for-input and completed-turn
-signals from lingering as unread after the agent has resumed; other kinds such
-as `error` and `session_finished` are never auto-resolved and wait for explicit
-owner action. An `idle` observation alone does not resolve attention because an
-approval prompt can be technically idle while still requiring owner input.
-A session whose runtime is lost also resolves its attention records, because no
-terminal is left to answer them. The projector reports the loss itself as an
-`error` record: "Session crashed" when the daemon proved it (`failed` with a
-lost runtime) and "Session runtime lost" when it did not (`running` with a lost
-runtime); a proof that follows an unproven report adds no second record, also across
-daemon restarts and a start that could not classify the record; a report
-counts until the runtime answers again, and a runtime that answers again and is
-lost again is reported again. The cause rides
-in the body and in the `cause`, `oom_killer`, `memory_peak_bytes` and
-`loss_cause` metadata keys.
+acknowledges any `unread` `agent_blocked` and `approval_required` records for
+that session's `attention:<session_id>` key and drops the pending turn signal
+for `turn:<session_id>`. An `idle` observation alone does not resolve attention
+because an approval prompt can be technically idle while still requiring owner
+input. A session whose runtime is lost also resolves its attention records,
+because no terminal is left to answer them. The projector derives no record for
+the loss or for any other state of the session (`session list` shows a failed,
+done or lost session). Resolved records are removed after `record_ttl_secs`
+(14 days by default).
 
 Session notifications are also debounced before they ever become visible. An
-`agent_blocked`, `approval_required`, or session-scoped `turn_completed` create
-carrying `attention:<session_id>` or `turn:<session_id>` is held pending in
-memory by the daemon for the policy's `attention_debounce_secs` window (5
-seconds by default) instead of being persisted immediately; `notification.create`
-still reports `created: true` with a minted id, but the record does not appear
-in `notification.list` and no `notification_created` event fires while it is
-pending. If the session enters `working` or reaches a terminal lifecycle state
-inside that window, a pending record that is not tied to a turn the daemon runs
-is dropped entirely and nothing is ever created (the reports of a running turn
-follow that turn instead, see below) — the same self-resolve edge described above, applied before the record
-surfaces rather than after. Only a genuinely outstanding session signal, still unresolved once
-the window elapses, is committed and broadcast. This is distinct from
-`attention_dedupe_window_secs`, which merges duplicate attention reports across
-producers rather than delaying when a session notification surfaces. When the
-window elapses the daemon also records the session turn event that
-`session.wait_turn` returns, whether or not the policy keeps an inbox record for
-the kind, when the report came from the projector or from an admitted provider
-hook for a session the daemon holds; a create whose kind the policy disables
-still answers `notification_kind_disabled`. The turn event does not use the
-inbox's stale-stop suppression after resumed work: a `turn_completed` that
-names no turn is dropped instead when the session is `working` as its window
-ends.
+`agent_blocked` or `approval_required` create carrying `attention:<session_id>`
+is held pending in memory by the daemon for `attention_debounce_secs` (5
+seconds by default) instead of being persisted immediately;
+`notification.create` still reports `created: true` with a minted id, but the
+record does not appear in `notification.list` and no `notification_created`
+event fires while it is pending. If the session enters `working` or reaches a
+terminal lifecycle state inside that window, the pending record is dropped
+entirely and nothing is ever created. Only a genuinely outstanding signal,
+still unresolved once the window elapses, is committed and broadcast. This is
+distinct from `attention_dedupe_window_secs`, which merges duplicate attention
+reports across producers rather than delaying when a session notification
+surfaces. When the window elapses the daemon also records the session turn
+event that `session.wait_turn` returns, when the report came from the projector
+or from an admitted provider hook for a session the daemon holds. A
+`turn_completed` or `error` report is only that turn event: `notification.create`
+answers `created: false` and stores nothing. A `turn_completed` that names no
+turn is dropped when the session is `working` as its window ends.
 
-The projector emits a `turn_completed` for every session whose activity goes
-`working` to `idle`, so runtimes without managed hooks report turns too. It
-reports nothing for a turn that ends `blocked`, for an idle that no `working`
-preceded, or when the session works again inside the debounce window. The
-daemon stamps the record with `turn_started_at`, `turn_duration_ms` and a copy
-of the session metadata (`session_metadata`) that stays readable after
-`session rm`; a hook report of the same turn is merged with the projector's, and
-one that arrives after its turn was reported, within twice the debounce window
-(at least 2 seconds) of the record reaching the inbox, adds no second inbox record
-(a waiting `session.wait_turn` may still see one more turn event). The kind stays
-disabled for the inbox by default; enable it with `notifications policy set` for
-a manager that follows many sessions. The projector reads a session's stored
+The projector emits a `turn_completed` turn event for every session whose
+activity goes `working` to `idle`, so runtimes without managed hooks report
+turns too. It reports nothing for a turn that ends `blocked`, for an idle that
+no `working` preceded, or when the session works again inside the debounce
+window. A hook report of the same turn may add one more turn event for a waiting
+`session.wait_turn`.
+
+A terminal approval notice (`OSC 9`, `OSC 777 notify`, `OSC 99`) beginning with
+`Approval requested` is a fallback attention source: it creates one
+`approval_required` record when no OSC 7501 program-status record is held and no
+provider hook has spoken for the session in its current runtime generation.
+The projector reads a session's stored
 records once before it projects the session's first input, so its keys continue
 those of the store. When that read fails, the session's inputs (events,
 snapshots and turn changes) wait in order and are projected after a retry that
@@ -431,12 +418,6 @@ just before it reads the registry. A record that a provider hook created after t
 a later hook report merged into, stays as it is (a record is ordered by its newest
 contribution), whether the input waited in a backlog or was only handled late behind a slow
 seed.
-
-Unread `turn_completed` rows are bounded per session. A newer
-`turn:<session_id>` record acknowledges any older unread turn for that key with
-`superseded_by` pointing at the newer record, and a visible attention record for
-the same session supersedes the unread turn twin because waiting-for-owner
-attention includes the fact that the turn completed.
 
 Notification policy is provider-keyed. `enabled` is the complete base per-kind
 policy, while the deterministically ordered `providers` object holds complete

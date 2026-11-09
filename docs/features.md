@@ -102,9 +102,10 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   resolves itself, and resolve-on-resume so stale "blocked" entries disappear
   when the agent returns to working or its normal ready prompt.
 - `pohunek notifications list|watch --all-hosts` fans out across every
-  reachable host client-side. Per-kind/provider policy, automatic age retention,
-  and physical JSONL compaction are daemon-enforced; unresolved actions and
-  errors never expire automatically.
+  reachable host client-side. The inbox holds attention (`agent_blocked`,
+  `approval_required`) only; resolved records expire after `record_ttl_secs`
+  (14 days) and open records never do. A finished turn is a
+  `pohunek session wait` event, not a record.
 
 **Terminal UX**
 

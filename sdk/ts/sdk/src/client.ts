@@ -292,8 +292,6 @@ export class Client {
    * ceiling no daemon setting may exceed. A `timeout_ms` that is not a nonzero
    * `u32` is refused before sending, because JSON would turn `NaN` or
    * `Infinity` into `null`, which the daemon reads as "use the default".
-   * Against a daemon of the previous protocol version the call fails with
-   * `daemon_protocol_too_old` before anything is sent.
    */
   public async sessionWaitTurn(params: SessionWaitTurnParams): Promise<SessionWaitTurnResult> {
     const timeoutMs = params.timeout_ms;
@@ -313,11 +311,8 @@ export class Client {
   /**
    * Sends one request and returns the `ok` payload in the current shape.
    *
-   * When the daemon negotiated the previous protocol version the request is
-   * translated into it before sending and the payload is translated back. A
-   * request whose translation depends on the version first sends `daemon.health`
-   * to learn it. A method the previous version never defined fails with a
-   * `daemonProtocolTooOld` error before anything is sent.
+   * The request is written in the current protocol version; a reply that
+   * selects another version fails the call with a `versionMismatch` error.
    */
   public async request(req: Request): Promise<unknown> {
     this.ensureOpen();
@@ -485,7 +480,7 @@ export class Client {
     const allowed = request.v;
     let version = connection.selectedVersion;
     if (version === undefined) {
-      if (requestIsVersionIndependent(request.method, request.params)) {
+      if (requestIsVersionIndependent()) {
         return request;
       }
       const probeRange = narrowToWindow(allowed);

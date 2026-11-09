@@ -15,28 +15,25 @@ use crate::{
     IntegrationDoctorResult, IntegrationInstallParams, IntegrationInstallResult,
     IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
     IntegrationUninstallResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
-    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult,
-    NotificationRetentionParams, NotificationRetentionResult, NotificationUpdateParams,
-    NotificationUpdateResult, PackageBindProfileParams, PackageBindProfileResult,
-    PackageChangeResult, PackageDoctorParams, PackageDoctorResult, PackageInspectParams,
-    PackageInspectResult, PackageInstallParams, PackageInstallResult, PackageLinkParams,
-    PackageListResult, PackageSelectParams, PackageSetEnabledParams, PackageUninstallParams,
-    PackageUninstallResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionDiffParams, SessionDiffResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionResumeResult, SessionRetentionParams, SessionRetentionResult, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
-    SessionWaitParams, SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
-    WorktreeRemoveParams, WorktreeRemoveResult,
+    NotificationListParams, NotificationListResult, PackageBindProfileParams,
+    PackageBindProfileResult, PackageChangeResult, PackageDoctorParams, PackageDoctorResult,
+    PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
+    PackageLinkParams, PackageListResult, PackageSelectParams, PackageSetEnabledParams,
+    PackageUninstallParams, PackageUninstallResult, ProjectActionParams, ProjectActionResult,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
+    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    ProjectRenameParams, ProjectShowParams, ProjectShowResult, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionOutputParams, SessionOutputResult, SessionReadParams, SessionReadResult,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
+    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
+    SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -475,51 +472,6 @@ method_table!(
     NotificationListResult,
     "NotificationListParams",
     "NotificationListResult";
-
-    /// Update a notification lifecycle status.
-    NotificationUpdate,
-    NOTIFICATION_UPDATE,
-    "notification.update",
-    NotificationUpdateParams,
-    NotificationUpdateResult,
-    "NotificationUpdateParams",
-    "NotificationUpdateResult";
-
-    /// Delete a notification record.
-    NotificationDelete,
-    NOTIFICATION_DELETE,
-    "notification.delete",
-    NotificationDeleteParams,
-    NotificationDeleteResult,
-    "NotificationDeleteParams",
-    "NotificationDeleteResult";
-
-    /// Read the notification policy.
-    NotificationPolicyGet,
-    NOTIFICATION_POLICY_GET,
-    "notification.policy.get",
-    (),
-    NotificationPolicyResult,
-    "null",
-    "NotificationPolicyResult";
-
-    /// Replace the notification policy.
-    NotificationPolicySet,
-    NOTIFICATION_POLICY_SET,
-    "notification.policy.set",
-    NotificationPolicyParams,
-    NotificationPolicyResult,
-    "NotificationPolicyParams",
-    "NotificationPolicyResult";
-
-    /// Prune notifications through the retention policy.
-    NotificationRetentionPrune,
-    NOTIFICATION_RETENTION_PRUNE,
-    "notification.retention.prune",
-    NotificationRetentionParams,
-    NotificationRetentionResult,
-    "NotificationRetentionParams",
-    "NotificationRetentionResult";
 
     /// List known projects on the target host.
     ProjectList,

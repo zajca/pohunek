@@ -2881,49 +2881,6 @@ async fn wait_turn_progress_follows_the_last_transition_into_working() {
 }
 
 #[tokio::test]
-async fn turn_starts_never_decrease_when_the_wall_clock_steps_back_after_a_takeover() {
-    let registry = turn_registry();
-    registry
-        .turn_events()
-        .flap_window_handle()
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    let mut edges = registry
-        .turn_events()
-        .take_edge_receiver()
-        .expect("the first taker");
-    let created = registry.create(params()).await.expect("create session");
-
-    registry.turn_events().pin_wall_clock(100);
-    hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
-    // The agent changes while working: the restated report opens the next
-    // turn at a later wall time, which the transition clock does not record.
-    registry.turn_events().pin_wall_clock(200);
-    let mut sessions = registry.inner.sessions.lock().await;
-    sessions
-        .get_mut(&created.id)
-        .expect("the session")
-        .agent_left(&registry.inner.turns);
-    drop(sessions);
-    hook_report(&registry, &created.id, 2, Some(AgentActivity::Working)).await;
-    hook_report(&registry, &created.id, 3, Some(AgentActivity::Idle)).await;
-    let takeover = ended_turns(&mut edges);
-    assert_eq!(takeover.len(), 1);
-
-    registry.turn_events().pin_wall_clock(150);
-    hook_report(&registry, &created.id, 4, Some(AgentActivity::Working)).await;
-    hook_report(&registry, &created.id, 5, Some(AgentActivity::Idle)).await;
-    let later = ended_turns(&mut edges);
-    assert_eq!(later.len(), 1);
-    let owner = registry.turn_owner(&created.id).await;
-    let start = |id| match registry.turn_events().settle(&created.id, id, owner) {
-        TurnVerdict::Surface(snapshot) => snapshot.started_nanos.expect("observed start"),
-        other => panic!("the turn ended: {other:?}"),
-    };
-    assert!(start(later[0]) > start(takeover[0]));
-    registry.stop(&created.id).await.expect("stop the session");
-}
-
-#[tokio::test]
 async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
     let registry = turn_registry();
     let mut edges = registry
@@ -3070,59 +3027,6 @@ async fn another_process_of_the_same_agent_does_not_inherit_the_turn_of_the_one_
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert!(ended_turns(&mut edges).is_empty(), "the replaced turn");
-    registry.stop(&created.id).await.expect("stop the session");
-}
-
-/// A shell session whose client submitted `codex exec ...`: the output after
-/// Enter opens the turn, and the agent is observed only afterwards. The
-/// agent's own work, which keeps the session working, must end in a turn
-/// without any further input.
-#[tokio::test]
-async fn an_agent_observed_after_the_opening_working_still_has_its_turn_reported() {
-    let (registry, inspector, created) = mock_procwatch_registry("turn-agent-after-open").await;
-    let mut edges = registry
-        .turn_events()
-        .take_edge_receiver()
-        .expect("the first taker");
-    registry
-        .turn_events()
-        .flap_window_handle()
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    registry.turn_events().pin_wall_clock(10_000);
-    registry.note_input(&created.id);
-    registry
-        .record_activity(&created.id, transition(AgentActivity::Working))
-        .await;
-    assert_eq!(started_turns(&mut edges).len(), 1);
-    registry.turn_events().pin_wall_clock(20_000);
-
-    inspector.set_descendants(created.pid, vec![codex_fact(300, created.pid)]);
-    inspector.set_cwd(300, temp_dir("turn-agent-after-open"));
-    inspector.set_foreground_group(created.pid, Some(300));
-    registry
-        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
-        .await;
-    registry
-        .record_activity(&created.id, transition(AgentActivity::Working))
-        .await;
-    registry
-        .record_activity(&created.id, transition(AgentActivity::Idle))
-        .await;
-    let ended = ended_turns(&mut edges);
-    assert_eq!(
-        ended.len(),
-        1,
-        "the turn the user asked for was lost when the agent appeared"
-    );
-    // The turn that took over the input reports the start of the line the
-    // user submitted.
-    let owner = registry.turn_owner(&created.id).await;
-    let TurnVerdict::Surface(snapshot) =
-        registry.turn_events().settle(&created.id, ended[0], owner)
-    else {
-        panic!("the turn ended");
-    };
-    assert_eq!(snapshot.started_nanos, Some(10_000));
     registry.stop(&created.id).await.expect("stop the session");
 }
 
@@ -3483,14 +3387,12 @@ async fn a_re_adopted_working_session_runs_its_own_unobserved_turn() {
         .record_activity(&created.id, transition(AgentActivity::Idle))
         .await;
     assert_eq!(ended_turns(&mut edges), adopted);
-    let TurnVerdict::Surface(snapshot) =
+    assert!(matches!(
         registry
             .turn_events()
-            .settle(&created.id, adopted[0], owner)
-    else {
-        panic!("the adopted turn ended");
-    };
-    assert_eq!((snapshot.started_nanos, snapshot.length), (None, None));
+            .settle(&created.id, adopted[0], owner),
+        TurnVerdict::Surface(_)
+    ));
     registry.stop(&created.id).await.expect("stop the session");
 }
 
@@ -7514,6 +7416,55 @@ async fn attach_from_inside_the_same_session_is_rejected() {
         .expect("attach with no origin is allowed");
 
     registry.stop(&created.id).await.expect("stop session");
+}
+
+#[tokio::test]
+async fn a_hook_that_spoke_covers_only_its_own_runtime_generation() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    });
+    let root = pohunek_test_support::tempdir_with_prefix("ph-notice-").expect("fixture root");
+    let notifications = crate::notifications::NotificationService::open(root.path())
+        .expect("notification service opens");
+    let (attention, mut probe) = crate::notifications::AttentionCoordinator::probed();
+    registry.bind_approval_notice_sink(crate::notifications::ApprovalNoticeSink::new(
+        notifications,
+        attention,
+    ));
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    // A notice with no hook is attention.
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("live detector identity");
+    registry
+        .record_approval_notice(&created.id, &expected, 0)
+        .await;
+    assert_eq!(probe.defers(), 1);
+
+    // The hook that spoke in this generation covers the notice.
+    registry.note_hook_spoke(&created.id).await;
+    registry
+        .record_approval_notice(&created.id, &expected, 0)
+        .await;
+    assert_eq!(probe.defers(), 0);
+
+    // A new runtime generation starts without the hook having spoken.
+    let replaced = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        let runtime = entry.info.runtime.as_mut().expect("runtime projection");
+        runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        RuntimeWatchIdentity::from_info(&entry.info).expect("replacement identity")
+    };
+    registry
+        .record_approval_notice(&created.id, &replaced, 0)
+        .await;
+    assert_eq!(probe.defers(), 1);
+
+    registry.stop(&created.id).await.expect("stop the session");
 }
 
 #[tokio::test]
@@ -23172,12 +23123,9 @@ async fn a_failed_create_releases_its_hook_admission_reservation() {
         .await
         .into_result()
         .expect("a launching session admits the hook notification");
-    assert_eq!(admitted["created"], true, "{admitted}");
-    let stored = records();
-    let [record] = stored.as_slice() else {
-        panic!("the admitted create is stored: {stored:?}");
-    };
-    assert_eq!(record.session_id.as_ref(), Some(&held.id));
+    assert_eq!(admitted["created"], false, "{admitted}");
+    assert_eq!(admitted["record"]["session_id"], held.id.0, "{admitted}");
+    assert!(records().is_empty(), "a turn report stores nothing");
 
     held.fail_entry_commit();
     held.release.notify_one();
@@ -23188,12 +23136,7 @@ async fn a_failed_create_releases_its_hook_admission_reservation() {
         .into_result()
         .expect_err("the failed create's id is refused again");
     assert_eq!(refused.code, "hook_not_admitted", "{refused:?}");
-    assert_eq!(
-        records().len(),
-        1,
-        "the refused create stores nothing: {:?}",
-        records()
-    );
+    assert!(records().is_empty(), "the refused create stores nothing");
 }
 
 #[tokio::test]

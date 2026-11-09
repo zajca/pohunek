@@ -658,10 +658,11 @@ async fn run() -> Result<(), DaemonError> {
         "loaded session retention policy"
     );
     let notifications =
-        NotificationService::open(&paths.data_dir).map_err(|source| DaemonError::Directory {
-            path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
-            source: std::io::Error::other(source),
-        })?;
+        NotificationService::open_with_settings(&paths.data_dir, sessions.notification_settings())
+            .map_err(|source| DaemonError::Directory {
+                path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
+                source: std::io::Error::other(source),
+            })?;
 
     // 7. Start the append-only event log before anything emits, so worker
     //    reconciliation events are captured too. The log drains
@@ -675,8 +676,8 @@ async fn run() -> Result<(), DaemonError> {
     spawn_notification_retention(&tasks, notifications.clone());
     spawn_session_retention(&tasks, sessions.clone());
     // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
-    // agent_blocked/approval_required and turn_completed notifications, holding
-    // them for the policy debounce window so transient signals never surface,
+    // agent_blocked/approval_required notifications and of the turn signals,
+    // holding them for the debounce window so transient signals never surface,
     // and records the surviving signals as turn events for session.wait_turn.
     // Both producers (the notification.create handler and the projector) route
     // debounced notifications through its clonable command handle.
@@ -688,6 +689,10 @@ async fn run() -> Result<(), DaemonError> {
         notifications.clone(),
         attention_coordinator.clone(),
     );
+    sessions.bind_approval_notice_sink(pohunek_daemon::notifications::ApprovalNoticeSink::new(
+        notifications.clone(),
+        attention_coordinator.clone(),
+    ));
     sessions.spawn_agent_state_hooks_in(&tasks);
 
     // 7. Adopt exact surviving worker runtimes before exposing the public API.
@@ -925,6 +930,7 @@ fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceC
     config.event_retention = service.event_retention();
     config.inventory_probe = service.inventory_probe();
     config.worker_journal_max_age = service.worker_journal_max_age();
+    config.notification_settings = service.notifications();
 }
 
 /// Applies the validated `session.wait_turn` default and ceiling and the

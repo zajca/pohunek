@@ -87,6 +87,8 @@ fn parse_bounded_wait_timeout_ms(value: &str, flag: &str) -> Result<u32, String>
 pub(crate) enum TurnKindArg {
     /// The agent finished a turn.
     TurnCompleted,
+    /// The agent's turn ended in an error.
+    TurnError,
     /// The agent is blocked on the owner.
     AgentBlocked,
     /// The agent waits for an approval decision.
@@ -99,6 +101,7 @@ impl From<TurnKindArg> for SessionTurnEventKind {
     fn from(kind: TurnKindArg) -> Self {
         match kind {
             TurnKindArg::TurnCompleted => Self::TurnCompleted,
+            TurnKindArg::TurnError => Self::TurnError,
             TurnKindArg::AgentBlocked => Self::AgentBlocked,
             TurnKindArg::ApprovalRequired => Self::ApprovalRequired,
             TurnKindArg::Exited => Self::Exited,
@@ -110,8 +113,9 @@ impl From<TurnKindArg> for SessionTurnEventKind {
 ///
 /// Every normal end of a turn is included: a wait that leaves one out times
 /// out when the agent ends its turn that way.
-const ALL_TURN_KINDS: [SessionTurnEventKind; 4] = [
+const ALL_TURN_KINDS: [SessionTurnEventKind; 5] = [
     SessionTurnEventKind::TurnCompleted,
+    SessionTurnEventKind::TurnError,
     SessionTurnEventKind::AgentBlocked,
     SessionTurnEventKind::ApprovalRequired,
     SessionTurnEventKind::Exited,
@@ -817,10 +821,7 @@ pub(crate) async fn run_new(
         if let (true, Some(object)) = (replayed, value.as_object_mut()) {
             object.insert("replayed".to_owned(), serde_json::Value::Bool(true));
         }
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_NEW, &value)?
-        );
+        print!("{}", crate::commands::render_json(&value)?);
     } else {
         print!(
             "{}",
@@ -896,10 +897,7 @@ pub(crate) async fn run_inspect(
         .await?;
 
     if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_INSPECT, &info)?
-        );
+        print!("{}", crate::commands::render_json(&info)?);
     } else {
         print!("{}", render_inspect_human(&info));
     }
@@ -1390,10 +1388,7 @@ pub(crate) async fn run_wait(
         return Err(CliError::UnknownWaitReason);
     }
     if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_WAIT, &result)?
-        );
+        print!("{}", crate::commands::render_json(&result)?);
     } else {
         println!(
             "{:?}\t{}\t{}\t{}",
@@ -1541,10 +1536,7 @@ pub(crate) async fn run_resume(
     )
     .await?;
     if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_RESUME, &result)?
-        );
+        print!("{}", crate::commands::render_json(&result)?);
     } else {
         println!("resumed {}", result.session.id.0);
     }
@@ -1590,10 +1582,7 @@ pub(crate) async fn run_resize(
         })
         .await?;
     if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_RESIZE, &result)?
-        );
+        print!("{}", crate::commands::render_json(&result)?);
     } else {
         println!(
             "resized {} to {}x{}",
@@ -1619,10 +1608,7 @@ pub(crate) async fn run_metadata(
         })
         .await?;
     if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_SET_METADATA, &result)?
-        );
+        print!("{}", crate::commands::render_json(&result)?);
     } else {
         println!("updated metadata for {}", target.session_id);
     }
@@ -1643,10 +1629,7 @@ pub(crate) async fn run_rename(
         .await?;
 
     if json {
-        print!(
-            "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_RENAME, &renamed)?
-        );
+        print!("{}", crate::commands::render_json(&renamed)?);
     } else {
         print!("{}", render_rename_human(&renamed.session));
     }
@@ -2252,9 +2235,7 @@ fn render_list_output(
 
     match output_mode {
         ListOutputMode::Human => Ok(render_list_human(&filtered)),
-        ListOutputMode::Json => {
-            crate::commands::render_json_with_v3_identity(method::SESSION_LIST, &filtered)
-        }
+        ListOutputMode::Json => crate::commands::render_json(&filtered),
         ListOutputMode::Quiet => Ok(render_list_quiet(&filtered)),
     }
 }

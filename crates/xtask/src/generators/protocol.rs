@@ -66,31 +66,11 @@ static METHODS: &[MethodDescriptor] = &[
     },
     MethodDescriptor {
         wire_name: "notification.create",
-        description: "Create or dedupe a durable host-local notification record.",
-    },
-    MethodDescriptor {
-        wire_name: "notification.delete",
-        description: "Logically delete one durable notification record.",
+        description: "Create or dedupe a durable host-local attention record; turn reports are accepted and not stored.",
     },
     MethodDescriptor {
         wire_name: "notification.list",
-        description: "List durable notification records with filters and cursor pagination.",
-    },
-    MethodDescriptor {
-        wire_name: "notification.policy.get",
-        description: "Read the daemon notification policy.",
-    },
-    MethodDescriptor {
-        wire_name: "notification.policy.set",
-        description: "Replace and persist the daemon notification policy.",
-    },
-    MethodDescriptor {
-        wire_name: "notification.retention.prune",
-        description: "Prune notification records selected by retention filters.",
-    },
-    MethodDescriptor {
-        wire_name: "notification.update",
-        description: "Update one notification's lifecycle status.",
+        description: "List durable attention records with filters and cursor pagination.",
     },
     MethodDescriptor {
         wire_name: "project.action",

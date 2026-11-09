@@ -85,30 +85,26 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
 For durable notification issues:
 
 1. Run `pohunek notifications list --json` to inspect visible local records.
-2. Run `pohunek notifications list --status deleted --json` when a record may
-   have been logically deleted.
+2. Run `pohunek notifications list --status acknowledged --json` for records
+   that already resolved.
 3. Run `pohunek notifications list --host <host> --json` to query a specific
    remote daemon, or `pohunek notifications list --all-hosts --json` to compare
    local plus reachable hosts.
-4. Run `pohunek notifications policy get --json` and confirm the notification
-   kind is enabled for the producer provider. Policy is enforced by the daemon
-   for hooks, projectors, and any direct `notification.create` caller.
-5. Run `pohunek notifications policy set --provider default --kind turn_completed --enabled --json`
-   only when intentionally enabling noisy turn-completion records. A policy
-   saved by an earlier release can still hold `codex`, `claude`, and `hermes`
-   overrides that shadow the default flags; set each kind of such an override
-   to the wanted value with the same command and `--provider <runtime-id>`.
-6. Run `pohunek notifications retention prune --dry-run --status archived --json`
-   before applying retention cleanup. Use `--apply` only after reviewing the
-   dry-run ids.
-7. Run `pohunek notifications watch --json` in one terminal, then reproduce the
-   event. A create should emit `notification_created`; read, acknowledge,
-   archive, provider upgrade, or dedupe upgrade should emit
-   `notification_updated`; delete should emit `notification_deleted`.
+4. The daemon creates an attention record for `agent_blocked` and
+   `approval_required` only. A turn end or turn error is never a record: use
+   `pohunek session wait <target>` for it. The debounce, dedupe window and record
+   lifetime are the `[notifications]` keys of `service.toml`.
+5. A record that resolved is removed after `record_ttl_secs` (14 days by
+   default); there is no manual prune command. The sweep keeps the old log as
+   `notifications.jsonl.pre-format-3` once.
+6. Run `pohunek notifications watch --json` in one terminal, then reproduce the
+   event. A create should emit `notification_created`; a resolve, provider upgrade, or
+   dedupe upgrade should emit `notification_updated`; the retention sweep
+   emits `notification_deleted` for each attention record it removes.
    To follow one session, add `--session <id>`, `--kind <kind>`, or
    `--status <status>` (`--unread`); these filter the record in each create or
    update event client-side and drop delete events, so leave them off while
-   checking that a delete is emitted.
+   checking that a sweep deletes.
 8. If a provider approval prompt does not appear, reinstall hooks with
    `pohunek integration install --agent <codex-or-claude>` and confirm the
    provider build supports the modern hook surface. Codex approval notifications
@@ -356,25 +352,23 @@ For durable notification issues:
 10. If duplicate attention notifications appear, compare each record's
     `dedupe_key`, `source.provider`, `source.provider_event`, and `created_at`.
     Session attention dedupe uses `attention:<session_id>` and only applies
-    inside the policy's `attention_dedupe_window_secs`.
-11. If stale `agent_blocked`, `approval_required`, or `turn_completed` records
-    stay `unread` after the agent already resumed, check that the daemon still
-    observes the session returning to `working` activity. Session notifications
-    auto-resolve to `acknowledged` when the projector sees the transition into
-    `working`, keyed by `attention:<session_id>` and `turn:<session_id>`, so
-    hook- and projector-produced records are cleared together. A record that
-    never self-resolves usually means no `working` activity edge reached the
-    projector (for example a session whose activity is not being reported).
-12. If repeated `turn_completed` rows appear for one session, inspect their
-    `dedupe_key`. Modern hooks send `turn:<session_id>` for `Stop`; a newer
-    unread turn supersedes older unread turns for the same key, and a visible
-    attention record supersedes the unread turn twin. Missing `turn:` keys mean
-    the host likely needs `pohunek integration install` so managed hooks refresh.
-13. If an expected `agent_blocked`, `approval_required`, or `turn_completed`
+    inside `attention_dedupe_window_secs`.
+7. If stale `agent_blocked` or `approval_required` records stay `unread` after
+   the agent already resumed, check that the daemon still observes the session
+   returning to `working` activity. Session notifications auto-resolve to
+   `acknowledged` when the projector sees the transition into `working`, keyed
+   by `attention:<session_id>`. A record that never self-resolves usually means
+   no `working` activity edge reached the projector (for example a session
+   whose activity is not being reported).
+8. A `turn_completed` or `error` hook report creates no record: look for the
+   turn event with `pohunek session wait <target>`, and for the info log
+   `notification.dropped_kind` when a report of another kind was accepted and
+   dropped.
+9. If an expected `agent_blocked` or `approval_required`
     notification does not (yet) show up in `pohunek notifications list --json`
     or `pohunek notifications watch --json`, it may simply be debounced: the
     daemon holds session creates pending in memory for `attention_debounce_secs`
-    (5 seconds by default, see `pohunek notifications policy get --json`) before
+    (5 seconds by default, `[notifications]` in `service.toml`) before
     committing and emitting `notification_created`. Wait past the configured
     window and re-check; if the session resolved back to `working` inside the
     window, the pending record was dropped and will never appear — that is the
@@ -384,10 +378,11 @@ For durable notification issues:
     and is not a data loss bug worth chasing.
 
 The durable store is under the daemon data directory in `notifications/`.
-`notifications.jsonl` is append-only record history, while `policy.json` is the
-current persisted notification policy; `format.json` records the format version
-the store was written in. A store this build cannot use (a newer
-`format_version`, an unreadable marker, an action or policy it cannot decode) is
+`notifications.jsonl` is append-only record history that the retention sweep
+rewrites atomically; `format.json` records the format version the store was
+written in (format 3; a `policy.json` of an earlier release is ignored). A store
+this build cannot use (a newer `format_version`, an unreadable marker, an action
+it cannot decode) is
 left untouched and the daemon keeps running with notifications unavailable:
 `notification.*` calls answer `notifications_unavailable`, the daemon log says
 "notifications are unavailable", turn signals for `session.wait_turn` still

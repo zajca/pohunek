@@ -18,13 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use futures::{SinkExt, StreamExt};
 use pohunek_client::Client;
-use pohunek_test_support::wait::{guard, wait_until};
+use pohunek_test_support::wait::wait_until;
 use protocol::{method, Request};
 use serde_json::{json, Value};
-use tokio::net::UnixStream;
-use tokio_util::codec::{Framed, LinesCodec};
 
 #[path = "../../daemon/tests/support/official_runtimes.rs"]
 mod official_runtimes;
@@ -76,9 +73,6 @@ fn forget_stored_background(root: &Path, id: &str) {
 
 /// Event name of the marker a collector appends when its stream ends.
 const STREAM_ENDED: &str = "stream_ended";
-
-/// Protocol version of the withholding client, the previous public version.
-const PREVIOUS_VERSION: u32 = 3;
 
 /// The fake agent. It runs the installed state hook as its direct child for
 /// each `hook:<action>:<fixture>` line, feeding it the named fixture file, and
@@ -612,127 +606,6 @@ async fn ending_the_agent_clears_the_background_and_publishes_null() {
     assert_eq!(
         cleared["runtime"]["runtime_generation"],
         held["runtime"]["runtime_generation"]
-    );
-    harness.stop().await;
-}
-
-/// Connects a protocol 3 client to the daemon socket.
-async fn connect_previous(socket: &Path) -> Framed<UnixStream, LinesCodec> {
-    wait_until("the daemon socket to accept a connection", || async {
-        UnixStream::connect(socket)
-            .await
-            .ok()
-            .map(|stream| Framed::new(stream, LinesCodec::new()))
-    })
-    .await
-}
-
-/// A hand-built protocol 3 request line.
-fn previous_request(id: &str, method: &str, params: &Value) -> String {
-    json!({
-        "v": {"minimum": PREVIOUS_VERSION, "maximum": PREVIOUS_VERSION},
-        "id": id,
-        "method": method,
-        "params": params,
-    })
-    .to_string()
-}
-
-/// Sends one line and reads the reply line, which must come back as JSON.
-async fn exchange(client: &mut Framed<UnixStream, LinesCodec>, line: &str) -> Value {
-    client.send(line.to_owned()).await.expect("send a request");
-    let reply = guard("a protocol 3 response", client.next())
-        .await
-        .expect("a response line")
-        .expect("line framing");
-    serde_json::from_str(&reply).expect("the daemon writes JSON lines")
-}
-
-#[tokio::test]
-async fn a_protocol_3_subscriber_never_receives_background_state_or_the_key() {
-    let harness = start_serving_claude(false).await;
-    let current = subscribe(&harness).await;
-
-    let mut previous_stream = connect_previous(&harness.socket()).await;
-    let subscribed = exchange(
-        &mut previous_stream,
-        &previous_request("previous-subscribe", method::SUBSCRIBE, &Value::Null),
-    )
-    .await;
-    assert!(subscribed.get("error").is_none(), "{subscribed}");
-    let previous_events: Collected = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&previous_events);
-    tokio::spawn(async move {
-        let reason = loop {
-            match previous_stream.next().await {
-                Some(Ok(line)) => {
-                    let event: Value = serde_json::from_str(&line).expect("an event line is JSON");
-                    sink.lock().expect("event sink").push(event);
-                }
-                None => break "the daemon closed the protocol 3 subscription".to_owned(),
-                Some(Err(error)) => {
-                    break format!("the protocol 3 subscription failed: {error}");
-                }
-            }
-        };
-        sink.lock().expect("event sink").push(stream_ended(&reason));
-    });
-
-    let (id, _) = start_agent_session(&harness).await;
-    send_hook(&harness, &id, "stop:stop-one").await;
-    wait_for_background_state(&current, &id, "the current snapshot event", |bg| {
-        bg.is_object()
-    })
-    .await;
-    wait_until(
-        "the protocol 3 subscriber to see the session update",
-        || async {
-            named(&previous_events, "session_updated")
-                .iter()
-                .any(|event| event["session"]["id"] == id.as_str())
-                .then_some(())
-        },
-    )
-    .await;
-
-    let mut inspecting = connect_previous(&harness.socket()).await;
-    let reply = exchange(
-        &mut inspecting,
-        &previous_request("previous-inspect", method::SESSION_INSPECT, &json!(id)),
-    )
-    .await;
-    let info = &reply["ok"];
-    assert!(info.is_object(), "{reply}");
-    assert!(
-        info.get("background").is_none(),
-        "a protocol 3 inspect carries no background key: {reply}"
-    );
-
-    let (code, quit) = harness.json(&["session", "input", &id, "quit"]).await;
-    assert_eq!(code, 0, "{quit}");
-    wait_for_background_state(
-        &current,
-        &id,
-        "the cleared background_state",
-        Value::is_null,
-    )
-    .await;
-    wait_until(
-        "the protocol 3 subscriber to see the runtime end",
-        || async {
-            named(&previous_events, "session_updated")
-                .iter()
-                .any(|event| {
-                    event["session"]["id"] == id.as_str() && event["session"]["state"] != "running"
-                })
-                .then_some(())
-        },
-    )
-    .await;
-
-    assert!(
-        named(&previous_events, "background_state").is_empty(),
-        "a protocol 3 subscriber never receives background_state"
     );
     harness.stop().await;
 }

@@ -743,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_and_classification_follow_the_requested_range() {
-        let previous = protocol::MIN_PROTOCOL_VERSION;
+        let previous = version(PROTOCOL_VERSION.get() - 1);
         let reachable = HostClass::ReachableDaemon {
             daemon_version: "stub".to_owned(),
         };
@@ -794,30 +794,6 @@ mod tests {
             .await,
             reachable
         );
-
-        // A requester that speaks the whole window reaches both.
-        let v3_only = single_version_stub(previous).await;
-        assert_eq!(
-            classify(
-                v3_only,
-                DEFAULT_PROBE_TIMEOUT,
-                None,
-                CLIENT_PROTOCOL_VERSIONS
-            )
-            .await,
-            reachable
-        );
-        let v4_only = single_version_stub(PROTOCOL_VERSION).await;
-        assert_eq!(
-            classify(
-                v4_only,
-                DEFAULT_PROBE_TIMEOUT,
-                None,
-                CLIENT_PROTOCOL_VERSIONS
-            )
-            .await,
-            reachable
-        );
     }
 
     #[test]
@@ -828,9 +804,9 @@ mod tests {
         );
         assert_eq!(
             DiscoveryOptions::new()
-                .with_protocol_range(exact(version(3)))
+                .with_protocol_range(exact(version(4)))
                 .protocol_range(),
-            exact(version(3))
+            exact(version(4))
         );
     }
 

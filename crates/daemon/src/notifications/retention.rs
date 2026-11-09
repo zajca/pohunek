@@ -1,4 +1,4 @@
-//! Daemon-owned automatic notification retention.
+//! Daemon-owned notification retention sweep.
 
 // Rust guideline compliant 2026-08-13
 
@@ -10,13 +10,13 @@ use tracing::{info, warn};
 use super::NotificationService;
 use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 
-/// Spawns automatic notification maintenance.
+/// Spawns the retention sweep.
 ///
-/// The first sweep runs immediately so an upgraded daemon cleans stale
-/// records without waiting a full interval. Each later delay is loaded from
-/// the current policy, allowing policy changes without restarting. The task is
-/// a driver of `tasks`: daemon shutdown cancels it and waits for an in-flight
-/// sweep, which only touches the owner-private local JSONL store.
+/// The first sweep runs immediately so an upgraded daemon removes the records
+/// the inbox does not hold without waiting a full interval. The interval is
+/// the service's `record_sweep_interval_secs`. The task is a driver of `tasks`:
+/// daemon shutdown cancels it and waits for an in-flight sweep, which only
+/// touches the owner-private local JSONL store.
 #[expect(
     clippy::must_use_candidate,
     reason = "the handle only stops the task before daemon shutdown does"
@@ -32,33 +32,30 @@ pub fn spawn_notification_retention(
         Stage::Driver,
         move || shutdown.cancel(),
         async move {
+            let interval = Duration::from_secs(notifications.settings().record_sweep_interval_secs);
             loop {
                 let service = notifications.clone();
                 match tokio::task::spawn_blocking(move || {
-                    service.run_auto_retention_at(time::OffsetDateTime::now_utc())
+                    service.run_retention_at(time::OffsetDateTime::now_utc())
                 })
                 .await
                 {
-                    Ok(Ok(result)) => {
-                        if result.pruned > 0 || result.compacted {
+                    Ok(Ok(outcome)) => {
+                        if outcome.removed > 0 {
                             info!(
-                                notification.pruned = result.pruned,
-                                notification.compacted = result.compacted,
-                                "completed automatic notification retention"
+                                notification.removed = outcome.removed,
+                                notification.announced = outcome.announced,
+                                "completed notification retention sweep"
                             );
                         }
                     }
                     Ok(Err(err)) => {
-                        warn!(error = %err, "automatic notification retention failed");
+                        warn!(error = %err, "notification retention sweep failed");
                     }
                     Err(err) => {
-                        warn!(error = %err, "automatic notification retention task panicked");
+                        warn!(error = %err, "notification retention task panicked");
                     }
                 }
-
-                let interval = Duration::from_secs(u64::from(
-                    notifications.policy().retention.sweep_interval_secs,
-                ));
                 tokio::select! {
                     () = task_shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}

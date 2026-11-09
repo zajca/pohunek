@@ -117,12 +117,9 @@ pub use method::Method;
 #[doc(inline)]
 pub use notification::{
     NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, NotificationUpdatedEvent,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationListParams,
+    NotificationListResult, NotificationRecord, NotificationSeverity, NotificationSource,
+    NotificationStatus, NotificationUpdatedEvent,
 };
 #[doc(inline)]
 pub use package::{

@@ -69,23 +69,6 @@ function requestReaching(daemon: MockDaemon, call: Promise<unknown>): Promise<st
   ]);
 }
 
-/**
- * The `daemon.health` reply that selects the current protocol version. A
- * delayed step leaves the connection open, so the request that follows the
- * probe is served on it.
- */
-function healthStep(): ScriptStep {
-  return {
-    kind: "delay",
-    ms: 0,
-    line: (line) => okResponseLine(requestIdFromLine(line), {
-      status: "ok",
-      daemon_version: "test",
-      protocol_version: PROTOCOL_VERSION,
-    }),
-  };
-}
-
 // A failing await between useFakeTimers and useRealTimers must not leave fake
 // timers installed for the next test.
 afterEach(() => {
@@ -364,56 +347,6 @@ describe("Client request/response", () => {
       const structured = error.toProtocolError();
       expect("recover" in structured).toBe(false);
       expect(structured.recover).toBeUndefined();
-    } finally {
-      await daemon.close();
-    }
-  });
-
-  test("previous-version translation leaves owner metadata keys untouched", async () => {
-    const session = {
-      ...minimalSessionInfo(),
-      metadata: { runtime_id: "owner-value" },
-      runtime: {
-        state: "live",
-        runtime_id: "runtime-1",
-        runtime_generation: "1",
-        worker_id: "worker-1",
-      },
-    };
-    const previousReply = (requestLine: string, ok: unknown): string => JSON.stringify({
-      v: MIN_PROTOCOL_VERSION,
-      id: requestIdFromLine(requestLine),
-      ok,
-    });
-    const daemon = await startTcpDaemon([
-      {
-        kind: "gate",
-        ready: Promise.resolve(),
-        line: (requestLine) => previousReply(requestLine, {
-          status: "ok",
-          daemon_version: "0.33.0",
-          protocol_version: MIN_PROTOCOL_VERSION,
-        }),
-      },
-      { kind: "reply", line: (requestLine) => previousReply(requestLine, { session }) },
-    ]);
-    try {
-      const client = await connectClient(daemon, "previous-host");
-      expect(await client.handshake()).toBe(MIN_PROTOCOL_VERSION);
-      const result = await client.call("session.set_metadata", {
-        session_id: session.id,
-        metadata: { worker_instance_id: "owner-value" },
-      });
-      expect(result.session.metadata?.["runtime_id"]).toBe("owner-value");
-      expect(result.session.runtime?.worker_instance_id).toBe("runtime-1");
-      const probe = parseRequestLine(await daemon.nextRequest());
-      expect(probe["method"]).toBe("daemon.health");
-      const sent = parseRequestLine(await daemon.nextRequest());
-      expect(sent["params"]).toEqual({
-        session_id: session.id,
-        metadata: { worker_instance_id: "owner-value" },
-      });
-      await client.close();
     } finally {
       await daemon.close();
     }
@@ -1124,7 +1057,6 @@ describe("Client request/response", () => {
       activity_epoch: "d-epoch-1",
     } as const;
     const daemon = await startUnixDaemon([
-      healthStep(),
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), promptOnly) },
     ]);
     try {
@@ -1136,7 +1068,6 @@ describe("Client request/response", () => {
         wait: { until: ["working"], allow_prompt_accepted: true },
       })).toEqual(promptOnly);
 
-      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
       const sent = parseRequestLine(await daemon.nextRequest());
       expect(sent["method"]).toBe("session.input");
       expect(sent["params"]).toEqual({
@@ -1163,24 +1094,23 @@ describe("Client request/response", () => {
     const unclaimed: Record<string, unknown> = { ...promptOnly };
     delete unclaimed["prompt_accepted"];
     const cases = [
-      { name: "not opted in", result: promptOnly, until: ["working"], optIn: undefined, probes: false },
-      { name: "an idle wait", result: promptOnly, until: ["idle"], optIn: true, probes: true },
-      { name: "no acceptance claimed", result: unclaimed, until: ["working"], optIn: true, probes: true },
+      { name: "not opted in", result: promptOnly, until: ["working"], optIn: undefined },
+      { name: "an idle wait", result: promptOnly, until: ["idle"], optIn: true },
+      { name: "no acceptance claimed", result: unclaimed, until: ["working"], optIn: true },
       {
         name: "partial activity evidence",
         result: { ...promptOnly, activity_revision: "3" },
         until: ["working"],
         optIn: true,
-        probes: true,
       },
-      { name: "no epoch", result: unscoped, until: ["working"], optIn: true, probes: true },
+      { name: "no epoch", result: unscoped, until: ["working"], optIn: true },
     ] as const;
-    for (const { name, result, until, optIn, probes } of cases) {
+    for (const { name, result, until, optIn } of cases) {
       const reply: ScriptStep = {
         kind: "reply",
         line: (line) => okResponseLine(requestIdFromLine(line), result),
       };
-      const daemon = await startUnixDaemon(probes ? [healthStep(), reply] : [reply]);
+      const daemon = await startUnixDaemon([reply]);
       try {
         const client = await connectClient(daemon);
         const error = await expectClientError(client.sessionInput({

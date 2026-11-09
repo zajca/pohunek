@@ -64,6 +64,9 @@ pub enum SessionTurnEventKind {
     AgentBlocked,
     /// The agent waits for an approval decision.
     ApprovalRequired,
+    /// The agent's turn ended in an error. Reported to waiters only; no
+    /// notification record exists for it.
+    TurnError,
     /// The session entered a terminal lifecycle state.
     Exited,
 }
@@ -76,6 +79,7 @@ impl SessionTurnEventKind {
             Self::TurnCompleted => "turn_completed",
             Self::AgentBlocked => "agent_blocked",
             Self::ApprovalRequired => "approval_required",
+            Self::TurnError => "turn_error",
             Self::Exited => "exited",
         }
     }

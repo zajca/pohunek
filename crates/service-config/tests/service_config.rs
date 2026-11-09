@@ -15,9 +15,10 @@ use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, InputTiming, InventoryProbe, KeepaliveTiming, RequiredHook,
     ServiceConfig, WaitTiming, DEFAULT_CREATE_DRAIN, DEFAULT_EVENT_RETENTION,
     DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE,
-    DEFAULT_KEEPALIVE_TIMING, DEFAULT_REGISTRY_SHUTDOWN, DEFAULT_WAIT_TIMING,
-    DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE,
-    MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES, MIN_WORKER_ANSWER,
+    DEFAULT_KEEPALIVE_TIMING, DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_REGISTRY_SHUTDOWN,
+    DEFAULT_WAIT_TIMING, DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
+    MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    MIN_WORKER_ANSWER,
 };
 use tempfile::TempDir;
 
@@ -189,6 +190,7 @@ fn spec() -> ConfigSpec {
         event_retention: DEFAULT_EVENT_RETENTION,
         inventory_probe: DEFAULT_INVENTORY_PROBE,
         worker_journal_max_age: DEFAULT_WORKER_JOURNAL_MAX_AGE,
+        notifications: DEFAULT_NOTIFICATION_SETTINGS,
         open_files: 8192,
     }
 }
@@ -3218,5 +3220,113 @@ fn worker_journal_ages_outside_their_bounds_are_refused_by_key() {
         fixture
             .load(&with_worker_journals(&format!("max_age_days = {days}")))
             .expect("the bounds are inclusive");
+    }
+}
+
+/// Appends a `[notifications]` table with `lines` to the golden file, before `[limits]`.
+fn with_notifications(lines: &str) -> String {
+    replace(
+        GOLDEN,
+        "[limits]",
+        &format!("[notifications]\n{lines}\n\n[limits]"),
+    )
+}
+
+/// A file without `[notifications]` means the documented defaults, and a
+/// rewrite does not add the table.
+#[test]
+fn a_file_without_notifications_loads_the_defaults_and_rewrites_unchanged() {
+    let fixture = Fixture::new();
+    let loaded = fixture.load(GOLDEN).expect("load the golden file");
+    assert_eq!(loaded.notifications(), DEFAULT_NOTIFICATION_SETTINGS);
+    let rendered = loaded.to_toml();
+    assert!(!rendered.contains("[notifications]"), "{rendered}");
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+}
+
+/// Custom values are loaded, known, and written back; an unset key keeps its
+/// default.
+#[test]
+fn custom_notification_settings_round_trip_and_are_not_unknown() {
+    let fixture = Fixture::new();
+    let loaded = fixture
+        .load(&with_notifications(
+            "attention_debounce_secs = 2\nrecord_ttl_secs = 7200",
+        ))
+        .expect("load custom settings");
+    let settings = loaded.notifications();
+    assert_eq!(settings.attention_debounce_secs, 2);
+    assert_eq!(settings.record_ttl_secs, 7200);
+    assert_eq!(
+        settings.attention_dedupe_window_secs,
+        DEFAULT_NOTIFICATION_SETTINGS.attention_dedupe_window_secs
+    );
+    assert!(
+        loaded.unknown_keys().is_empty(),
+        "{:?}",
+        loaded.unknown_keys()
+    );
+    let rendered = loaded.to_toml();
+    assert!(
+        rendered.contains("attention_debounce_secs = 2"),
+        "{rendered}"
+    );
+    assert_eq!(fixture.load(&rendered).expect("reload"), loaded);
+}
+
+/// A value outside its bounds fails startup and names the key.
+#[test]
+fn notification_settings_outside_their_bounds_are_refused_by_key() {
+    let fixture = Fixture::new();
+    for (line, key, value, min, max) in [
+        (
+            "attention_debounce_secs = 301",
+            "notifications.attention_debounce_secs",
+            301,
+            1,
+            300,
+        ),
+        (
+            "attention_debounce_secs = 0",
+            "notifications.attention_debounce_secs",
+            0,
+            1,
+            300,
+        ),
+        (
+            "attention_dedupe_window_secs = 0",
+            "notifications.attention_dedupe_window_secs",
+            0,
+            1,
+            3_600,
+        ),
+        (
+            "record_ttl_secs = 59",
+            "notifications.record_ttl_secs",
+            59,
+            60,
+            365 * 86_400,
+        ),
+        (
+            "record_sweep_interval_secs = 0",
+            "notifications.record_sweep_interval_secs",
+            0,
+            1,
+            86_400,
+        ),
+    ] {
+        match fixture.load(&with_notifications(line)) {
+            Err(ConfigError::OutOfRange {
+                key: found_key,
+                value: found_value,
+                min: found_min,
+                max: found_max,
+            }) => assert_eq!(
+                (found_key, found_value, found_min, found_max),
+                (key, value, min, max),
+                "{line}"
+            ),
+            other => panic!("{line} must be refused, got {other:?}"),
+        }
     }
 }

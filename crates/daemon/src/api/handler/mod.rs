@@ -25,7 +25,6 @@ mod package;
 mod project;
 mod session;
 #[cfg(test)]
-mod turn_completed_projection_tests;
 #[cfg(test)]
 mod turn_wait_tests;
 mod util;
@@ -518,23 +517,6 @@ async fn handle_negotiated(
         }
         method::NOTIFICATION_LIST => {
             notification::handle_notification_list(request, state.notifications.as_ref()).await
-        }
-        method::NOTIFICATION_UPDATE => {
-            notification::handle_notification_update(request, state.notifications.as_ref()).await
-        }
-        method::NOTIFICATION_DELETE => {
-            notification::handle_notification_delete(request, state.notifications.as_ref()).await
-        }
-        method::NOTIFICATION_POLICY_GET => {
-            notification::handle_notification_policy_get(request, state.notifications.as_ref())
-        }
-        method::NOTIFICATION_POLICY_SET => {
-            notification::handle_notification_policy_set(request, state.notifications.as_ref())
-                .await
-        }
-        method::NOTIFICATION_RETENTION_PRUNE => {
-            notification::handle_notification_retention_prune(request, state.notifications.as_ref())
-                .await
         }
         method::PROJECT_LIST => project::handle_project_list(request, &state.sessions).await,
         method::PROJECT_ADD => project::handle_project_add(request, &state.sessions).await,
@@ -1095,17 +1077,17 @@ mod tests {
         )
     }
 
-    fn hook_error_params(host_local_source_id: &str) -> protocol::NotificationCreateParams {
+    fn hook_approval_params(host_local_source_id: &str) -> protocol::NotificationCreateParams {
         protocol::NotificationCreateParams {
             source: protocol::NotificationSource {
                 provider: "codex".to_owned(),
-                provider_event: "Error".to_owned(),
+                provider_event: "PermissionRequest".to_owned(),
                 host_local_source_id: host_local_source_id.to_owned(),
             },
-            kind: protocol::NotificationKind::Error,
-            severity: protocol::NotificationSeverity::Error,
-            title: "Agent error".to_owned(),
-            body: "Codex reported an error.".to_owned(),
+            kind: protocol::NotificationKind::ApprovalRequired,
+            severity: protocol::NotificationSeverity::ActionRequired,
+            title: "Approval required".to_owned(),
+            body: "Codex is waiting for a tool approval.".to_owned(),
             metadata: BTreeMap::new(),
             session_id: None,
             agent_kind: None,
@@ -1168,20 +1150,6 @@ mod tests {
         )
     }
 
-    fn enable_all_notification_kinds(notifications: &crate::notifications::NotificationService) {
-        let mut policy = crate::notifications::default_policy();
-        policy.enabled = protocol::NotificationKindPolicy::from_flags([
-            (protocol::NotificationKind::AgentBlocked, true),
-            (protocol::NotificationKind::ApprovalRequired, true),
-            (protocol::NotificationKind::TurnCompleted, true),
-            (protocol::NotificationKind::SessionFinished, true),
-            (protocol::NotificationKind::Error, true),
-            (protocol::NotificationKind::System, true),
-        ]);
-        policy.providers.clear();
-        notifications.set_policy(policy).expect("set policy");
-    }
-
     async fn create_result(
         state: &DaemonState,
         request: &Request,
@@ -1216,7 +1184,6 @@ mod tests {
             pohunek_test_support::tempdir_with_prefix("ph-notify-").expect("notification dir");
         let notifications =
             NotificationService::open(notification_dir.path()).expect("notification service opens");
-        enable_all_notification_kinds(&notifications);
         let sessions = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
             ..SessionRegistryConfig::default()
@@ -1268,7 +1235,7 @@ mod tests {
             "the entry is not installed yet"
         );
 
-        let mut params = hook_error_params("window-report");
+        let mut params = hook_approval_params("window-report");
         params.session_id = Some(launching.clone());
         let created = create_result(
             &state,
@@ -1297,7 +1264,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn notification_create_defers_session_notifications_but_lists_others_immediately() {
+    async fn notification_create_defers_attention_and_stores_no_turn_report() {
         use crate::notifications::{AttentionCoordinator, NotificationService};
         use protocol::NotificationKind;
 
@@ -1305,7 +1272,6 @@ mod tests {
             pohunek_test_support::tempdir_with_prefix("ph-notify-").expect("notification dir");
         let notifications =
             NotificationService::open(notification_dir.path()).expect("notification service opens");
-        enable_all_notification_kinds(&notifications);
         let sessions = SessionRegistry::new(SessionRegistryConfig::default());
         let (attention, _task) = AttentionCoordinator::spawn(
             &crate::shutdown::DaemonShutdown::default(),
@@ -1326,33 +1292,26 @@ mod tests {
             "an attention create must be debounced, not immediately listable"
         );
 
-        // Turn create: it is session-scoped and follows the same debounce window.
+        // A turn report is never stored: the answer carries the minted record
+        // with `created: false`, now and after the debounce window.
         let turn = create_result(&state, &turn_create_request("turn-create")).await;
-        assert!(turn.created);
+        assert!(!turn.created);
         assert_eq!(turn.record.kind, NotificationKind::TurnCompleted);
+
+        // Any other kind is accepted and dropped.
+        let error = create_result(&state, &error_create_request("error-create")).await;
+        assert!(!error.created);
         assert!(
             list_records(&state).await.is_empty(),
-            "a turn_completed create must also be debounced, not immediately listable"
+            "neither a turn report nor a dropped kind is listable"
         );
-
-        // A non-attention create persists and is listable immediately.
-        let error = create_result(&state, &error_create_request("error-create")).await;
-        assert!(error.created);
-        let listed = list_records(&state).await;
-        assert_eq!(
-            listed.len(),
-            1,
-            "the non-attention create is listable while the attention one stays pending"
-        );
-        assert_eq!(listed[0].kind, NotificationKind::Error);
-        assert_eq!(listed[0].id, error.record.id);
 
         // After the debounce window the held attention record surfaces too.
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(Duration::from_secs(
-            u64::from(crate::notifications::DEFAULT_ATTENTION_DEBOUNCE_SECS) + 1,
+            pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS.attention_debounce_secs + 1,
         ))
         .await;
         for _ in 0..64 {
@@ -1362,15 +1321,11 @@ mod tests {
         let flushed = list_records(&state).await;
         assert_eq!(
             flushed.len(),
-            3,
-            "the debounced session notifications flush"
+            1,
+            "only the debounced attention record flushes"
         );
         assert!(flushed.iter().any(|record| record.id == created.record.id
             && record.kind == NotificationKind::ApprovalRequired));
-        assert!(flushed
-            .iter()
-            .any(|record| record.id == turn.record.id
-                && record.kind == NotificationKind::TurnCompleted));
     }
 
     /// A shell session body that stays alive without a `PATH` lookup, so a test
@@ -1410,63 +1365,11 @@ mod tests {
         );
     }
 
-    /// Builds a request line of the previous public protocol version.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "test helper takes the json! literal by value to keep call sites terse"
-    )]
-    fn previous_version_request(method: &str, params: serde_json::Value) -> Request {
-        let previous = protocol::MIN_PROTOCOL_VERSION.get();
-        serde_json::from_value(serde_json::json!({
-            "v": {"minimum": previous, "maximum": previous},
-            "id": "previous-1",
-            "method": method,
-            "params": params,
-        }))
-        .expect("valid previous-version request")
-    }
-
     fn idle_state() -> DaemonState {
         daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         )
-    }
-
-    #[tokio::test]
-    async fn previous_version_host_inspect_reports_the_negotiated_version() {
-        let response = handle_request(
-            &previous_version_request(method::HOST_INSPECT, serde_json::Value::Null),
-            &idle_state(),
-        )
-        .await;
-
-        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
-        let ok = ok_value(response, "host.inspect");
-        assert_eq!(ok["protocol_version"], protocol::MIN_PROTOCOL_VERSION.get());
-    }
-
-    #[tokio::test]
-    async fn previous_version_request_with_the_current_key_is_a_typed_bad_request() {
-        let params = serde_json::json!({
-            "session_id": "s-missing",
-            "worker_instance_id": "worker-instance-1",
-            "agent": "claude",
-            "pid": 42,
-            "pid_start_identity": "7",
-            "sequence": "1",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "native_session_id": "native-1",
-        });
-        let response = handle_request(
-            &previous_version_request(method::SESSION_REPORT_NATIVE_ID, params),
-            &idle_state(),
-        )
-        .await;
-
-        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
-        let error = error_value(response, "session.report_native_id");
-        assert_eq!(error.code, "bad_request");
     }
 
     #[tokio::test]

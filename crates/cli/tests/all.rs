@@ -56,10 +56,10 @@ mod integration_hooks;
 mod json_usage_errors;
 #[path = "newer_daemon.rs"]
 mod newer_daemon;
+#[path = "notification_lifecycle_cut.rs"]
+mod notification_lifecycle_cut;
 #[path = "notifications_list_paging.rs"]
 mod notifications_list_paging;
-#[path = "notifications_policy.rs"]
-mod notifications_policy;
 #[path = "notifications_watch.rs"]
 mod notifications_watch;
 #[path = "overlay_config.rs"]

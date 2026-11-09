@@ -8,16 +8,16 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use protocol::{
-    NotificationId, NotificationKind, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationRecord, NotificationStatus,
+    NotificationKind, NotificationListParams, NotificationListResult, NotificationRecord,
+    NotificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
     apply_status, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
-    is_turn_dedupe_key, is_valid_status_transition, parse_timestamp, same_source_namespace,
-    source_priority, NotificationError, ResolveAsOf, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
+    parse_timestamp, same_source_namespace, source_priority, NotificationError, ResolveAsOf,
+    SourcePriority,
 };
 
 /// Directory under the daemon data dir holding notification state.
@@ -26,8 +26,14 @@ pub const NOTIFICATIONS_SUBDIR: &str = "notifications";
 /// File name of the append-only notification action log.
 const NOTIFICATIONS_LOG_NAME: &str = "notifications.jsonl";
 
-/// Temporary log name used for atomic notification-store compaction.
-const NOTIFICATIONS_COMPACTION_NAME: &str = "notifications.jsonl.tmp";
+/// Temporary log name used for the atomic rewrite of the notification store.
+const NOTIFICATIONS_REWRITE_NAME: &str = "notifications.jsonl.tmp";
+
+/// Copy of the log kept before the first rewrite by a format-3 build.
+pub(crate) const PRE_FORMAT_3_COPY_NAME: &str = "notifications.jsonl.pre-format-3";
+
+/// Temporary name of the pre-format-3 copy while it is written.
+const PRE_FORMAT_3_COPY_TEMP_NAME: &str = "notifications.jsonl.pre-format-3.tmp";
 
 /// File name of the notification format marker.
 ///
@@ -35,19 +41,12 @@ const NOTIFICATIONS_COMPACTION_NAME: &str = "notifications.jsonl.tmp";
 /// ignore the file, and a build that meets a newer value stops using the store.
 const FORMAT_FILE_NAME: &str = "format.json";
 
-/// Format of the notification action log and policy this build writes; it
-/// reads this format and every earlier one.
+/// Format of the notification action log this build writes; it reads this
+/// format and every earlier one. Format 3 has no policy document.
 ///
 /// Raise it, together with a snapshot in `format_guard`, when a key or enum
-/// value of `StoreAction`, `NotificationRecord` or `NotificationPolicy` changes.
-pub(crate) const NOTIFICATIONS_FORMAT_VERSION: u32 = 2;
-
-/// File name of the durable notification policy.
-///
-/// Policy is singleton configuration state, not notification audit history, so
-/// it is atomically replaced beside the append-only action log instead of being
-/// replayed from notification actions.
-const POLICY_FILE_NAME: &str = "policy.json";
+/// value of `StoreAction` or `NotificationRecord` changes.
+pub(crate) const NOTIFICATIONS_FORMAT_VERSION: u32 = 3;
 
 #[cfg(unix)]
 const OWNER_PRIVATE_DIR_MODE: u32 = 0o700;
@@ -74,7 +73,6 @@ const TOLERATE_TRAILING_EOF_ACTION: bool = true;
 pub(crate) struct NotificationStore {
     dir: PathBuf,
     path: PathBuf,
-    sources: crate::store::Store,
     state: Mutex<StoreState>,
     /// Why this build does not use the store. The files stay as they are, no
     /// append handle is open and every operation that needs the store fails.
@@ -87,7 +85,6 @@ struct StoreState {
     file: Option<File>,
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
-    source_warning_logged: bool,
     /// When another producer than the projector last contributed to a record:
     /// created it, or had a report merge into it. In memory only; a record
     /// without an entry counts as contributed to before any moment.
@@ -98,6 +95,9 @@ struct StoreState {
 struct ReplayState {
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
+    /// Length of the log up to its last complete action, set when an
+    /// unterminated partial last line was ignored.
+    valid_len: Option<u64>,
 }
 
 #[cfg(test)]
@@ -124,18 +124,8 @@ enum StoreAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CreateOutcome {
     Created(NotificationRecord),
-    CreatedWithUpdates {
-        record: NotificationRecord,
-        updated: Vec<NotificationRecord>,
-    },
     Existing(NotificationRecord),
     Updated(NotificationRecord),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UpdateOutcome {
-    Updated(NotificationRecord),
-    Deleted(NotificationRecord),
 }
 
 impl NotificationStore {
@@ -151,12 +141,8 @@ impl NotificationStore {
         let dir = data_dir.join(NOTIFICATIONS_SUBDIR);
         create_private_dir(&dir)?;
         let path = dir.join(NOTIFICATIONS_LOG_NAME);
-        let sources = crate::store::Store::new(data_dir.join(pohunek_paths::METADATA_STORE_NAME));
         if let Some(reason) = unsupported_format(&dir)? {
-            return Ok(Self::unavailable(dir, path, sources, reason));
-        }
-        if let Some(reason) = unreadable_policy(&dir)? {
-            return Ok(Self::unavailable(dir, path, sources, reason));
+            return Ok(Self::unavailable(dir, path, reason));
         }
         let file = owner_private_append_options()
             .open(&path)
@@ -169,32 +155,32 @@ impl NotificationStore {
                 | NotificationError::Unavailable { .. }),
             ) => {
                 drop(file);
-                return Ok(Self::unavailable(dir, path, sources, error.to_string()));
+                return Ok(Self::unavailable(dir, path, error.to_string()));
             }
             Err(error) => return Err(error),
         };
+        if let Some(valid_len) = replayed.valid_len {
+            // An append after the partial last line would glue onto it.
+            file.set_len(valid_len)
+                .map_err(|source| NotificationError::io(&path, source))?;
+            file.sync_all()
+                .map_err(|source| NotificationError::io(&path, source))?;
+        }
         write_format_marker(&dir)?;
         Ok(Self {
             dir,
             path,
-            sources,
             state: Mutex::new(StoreState {
                 file: Some(file),
                 records: replayed.records,
                 action_count: replayed.action_count,
-                source_warning_logged: false,
                 contributions: HashMap::new(),
             }),
             unavailable: None,
         })
     }
 
-    fn unavailable(
-        dir: PathBuf,
-        path: PathBuf,
-        sources: crate::store::Store,
-        reason: String,
-    ) -> Self {
+    fn unavailable(dir: PathBuf, path: PathBuf, reason: String) -> Self {
         warn!(
             file.path = %path.display(),
             reason = %reason,
@@ -205,12 +191,10 @@ impl NotificationStore {
         Self {
             dir,
             path,
-            sources,
             state: Mutex::new(StoreState {
                 file: None,
                 records: BTreeMap::new(),
                 action_count: 0,
-                source_warning_logged: false,
                 contributions: HashMap::new(),
             }),
             unavailable: Some(reason),
@@ -293,46 +277,68 @@ impl NotificationStore {
         })
     }
 
-    /// Rewrite current records and bounded deleted terminal evidence atomically.
+    /// Removes the records that do not belong in the store and rewrites the
+    /// log atomically when there are any.
     ///
-    /// Compaction is skipped below `minimum_actions` and when it would not
-    /// remove an update or tombstone. The replacement file is fully flushed and
-    /// opened for future appends before its atomic rename, so a crash leaves
-    /// either the old replayable log or the complete compacted log.
+    /// Removed: every record of a kind the inbox does not hold, every deleted
+    /// record, and every resolved attention record whose resolution is at least
+    /// `ttl_secs` old at `now`. Open attention records are never removed. The
+    /// replacement file is fully flushed and opened for future appends before
+    /// its atomic rename, so a crash leaves either the old replayable log or the
+    /// complete new one. Before the first rewrite the old log is copied to
+    /// [`PRE_FORMAT_3_COPY_NAME`].
     ///
     /// # Errors
     ///
-    /// Returns [`NotificationError`] when serialization, file I/O, atomic
-    /// replacement, or parent-directory syncing fails.
-    pub(crate) fn compact_if_needed(
+    /// Returns [`NotificationError`] when a timestamp cannot be read, or when
+    /// serialization, file I/O, atomic replacement or parent-directory syncing
+    /// fails. The old log is intact in every error case.
+    pub(crate) fn sweep(
         &self,
-        minimum_actions: u32,
-    ) -> Result<bool, NotificationError> {
-        let minimum_actions = usize::try_from(minimum_actions).unwrap_or(usize::MAX);
+        now: time::OffsetDateTime,
+        ttl_secs: u64,
+    ) -> Result<Vec<NotificationRecord>, NotificationError> {
+        self.ensure_available()?;
+        let ttl = time::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut retained_records: Vec<NotificationRecord> = state
-            .records
-            .values()
-            .filter(|record| record.status != NotificationStatus::Deleted)
-            .cloned()
-            .collect();
-        if state.action_count < minimum_actions || state.action_count <= retained_records.len() {
-            return Ok(false);
+        let mut removed = Vec::new();
+        let mut retained = Vec::new();
+        for record in state.records.values() {
+            if record_expired(record, now, ttl)? {
+                removed.push(record.clone());
+            } else {
+                retained.push(record.clone());
+            }
+        }
+        if removed.is_empty() && state.action_count <= retained.len() {
+            return Ok(removed);
         }
 
-        retained_records.extend(self.terminal_tombstones(&mut state));
-        if state.action_count <= retained_records.len() {
-            return Ok(false);
+        let backup_path = self.dir.join(PRE_FORMAT_3_COPY_NAME);
+        if !backup_path.exists() {
+            // Copied through a synced temporary file, so a crash never leaves a
+            // truncated copy that the existence check would keep.
+            let backup_temp = self.dir.join(PRE_FORMAT_3_COPY_TEMP_NAME);
+            fs::copy(&self.path, &backup_temp)
+                .map_err(|source| NotificationError::io(&backup_temp, source))?;
+            set_owner_private_file_permissions(&backup_temp)?;
+            File::open(&backup_temp)
+                .and_then(|copy| copy.sync_all())
+                .map_err(|source| NotificationError::io(&backup_temp, source))?;
+            fs::rename(&backup_temp, &backup_path)
+                .map_err(|source| NotificationError::io(&backup_path, source))?;
+            File::open(&self.dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| NotificationError::io(&self.dir, source))?;
         }
-
-        let temp_path = self.dir.join(NOTIFICATIONS_COMPACTION_NAME);
+        let temp_path = self.dir.join(NOTIFICATIONS_REWRITE_NAME);
         let mut replacement = owner_private_write_options()
             .open(&temp_path)
             .map_err(|source| NotificationError::io(&temp_path, source))?;
-        for record in &retained_records {
+        for record in &retained {
             let mut line = serde_json::to_string(&StoreAction::Created {
                 record: record.clone(),
             })
@@ -357,64 +363,15 @@ impl NotificationStore {
             .map_err(|source| NotificationError::io(&self.path, source))?;
 
         state.file = Some(replacement);
-        state.action_count = retained_records.len();
-        state.records = retained_records
+        state.action_count = retained.len();
+        state.records = retained
             .into_iter()
             .map(|record| (record.id.0.clone(), record))
             .collect();
         File::open(&self.dir)
             .and_then(|directory| directory.sync_all())
             .map_err(|source| NotificationError::io(&self.dir, source))?;
-        Ok(true)
-    }
-
-    /// Select replay evidence while holding the notification-state lock.
-    fn terminal_tombstones(&self, state: &mut StoreState) -> Vec<NotificationRecord> {
-        let deleted: Vec<_> = state
-            .records
-            .values()
-            .filter(|record| super::projector::is_terminal_tombstone(record))
-            .collect();
-        if deleted.is_empty() {
-            return Vec::new();
-        }
-        // Reading before the notification lock could erase a newer generation's
-        // tombstone. Rejected metadata is uncertainty, never proof of absence.
-        let snapshot = self.sources.load_notification_sources();
-        let Some(sources) = snapshot.as_ref().ok().and_then(Option::as_ref) else {
-            if !state.source_warning_logged {
-                warn!(file.path = %self.sources.path().display(), error = ?snapshot.as_ref().err(),
-                    "notification compaction retained all terminal tombstones because source metadata is incomplete");
-                state.source_warning_logged = true;
-            }
-            return deleted.into_iter().cloned().collect();
-        };
-        let sources: BTreeMap<_, _> = sources
-            .iter()
-            .filter(|source| source.desired_state != crate::store::DesiredState::Removed)
-            .map(|source| (source.session_id.as_str(), &source.info))
-            .collect();
-        let mut terminal: BTreeMap<_, &NotificationRecord> = BTreeMap::new();
-        for record in deleted {
-            let Some(session) = record
-                .session_id
-                .as_ref()
-                .and_then(|id| sources.get(id.0.as_str()))
-            else {
-                continue;
-            };
-            if !super::projector::terminal_tombstone_matches(record, session) {
-                continue;
-            }
-            let key = (session.id.0.as_str(), record.kind.as_str());
-            let newer = terminal.get(&key).is_none_or(|existing| {
-                (&record.created_at, &record.id.0) > (&existing.created_at, &existing.id.0)
-            });
-            if newer {
-                terminal.insert(key, record);
-            }
-        }
-        terminal.into_values().cloned().collect()
+        Ok(removed)
     }
 
     /// Create a record or return/update a deduped visible record atomically.
@@ -437,16 +394,6 @@ impl NotificationStore {
 
         if let Some(existing) = find_existing_source(&state.records, &candidate) {
             return Ok(CreateOutcome::Existing(existing));
-        }
-
-        if let Some(dedupe_key) = candidate
-            .dedupe_key
-            .as_deref()
-            .filter(|dedupe_key| is_turn_dedupe_key(dedupe_key))
-            .filter(|_| candidate.kind == NotificationKind::TurnCompleted)
-        {
-            let dedupe_key = dedupe_key.to_owned();
-            return self.create_superseding_turns(&mut state, candidate, &dedupe_key, minted);
         }
 
         if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
@@ -508,262 +455,12 @@ impl NotificationStore {
         Ok(CreateOutcome::Created(candidate))
     }
 
-    /// Creates a `turn_completed` record that supersedes the unread ones of its
-    /// session key.
-    fn create_superseding_turns(
-        &self,
-        state: &mut StoreState,
-        candidate: NotificationRecord,
-        dedupe_key: &str,
-        minted: Instant,
-    ) -> Result<CreateOutcome, NotificationError> {
-        let updated = supersede_unread_records(
-            &state.records,
-            dedupe_key,
-            candidate.kind,
-            &candidate.id,
-            &candidate.created_at,
-        );
-        if updated.is_empty() {
-            append_action_locked(
-                &self.path,
-                state,
-                StoreAction::Created {
-                    record: candidate.clone(),
-                },
-            )?;
-            note_contribution(state, &candidate, &candidate.id.0, minted);
-            return Ok(CreateOutcome::Created(candidate));
-        }
-        append_action_locked(
-            &self.path,
-            state,
-            StoreAction::CreatedWithUpdates {
-                record: candidate.clone(),
-                updated: updated.clone(),
-            },
-        )?;
-        note_contribution(state, &candidate, &candidate.id.0, minted);
-        Ok(CreateOutcome::CreatedWithUpdates {
-            record: candidate,
-            updated,
-        })
-    }
-
-    /// Supersede unread `turn_completed` records consumed by visible attention.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when appending an update action fails.
-    pub(crate) fn supersede_turns_for_attention(
-        &self,
-        attention: &NotificationRecord,
-        now: &str,
-    ) -> Result<Vec<NotificationRecord>, NotificationError> {
-        if !is_attention_kind(attention.kind) {
-            return Ok(Vec::new());
-        }
-        if !matches!(
-            attention.status,
-            NotificationStatus::Unread | NotificationStatus::Read
-        ) {
-            return Ok(Vec::new());
-        }
-        let Some(session_id) = attention.session_id.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let turn_key = format!("{TURN_DEDUPE_KEY_PREFIX}:{}", session_id.0);
-        supersede_unread_records_locked(
-            &self.path,
-            &mut state,
-            &turn_key,
-            NotificationKind::TurnCompleted,
-            &attention.id,
-            now,
-        )
-    }
-
-    /// Load the persisted notification policy or return `fallback`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when the policy file cannot be read or
-    /// parsed.
-    pub(crate) fn load_policy(
-        &self,
-        fallback: NotificationPolicy,
-    ) -> Result<NotificationPolicy, NotificationError> {
-        if self.unavailable.is_some() {
-            return Ok(fallback);
-        }
-        let path = self.policy_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content)
-                .map_err(|source| NotificationError::policy_parse(path, source)),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(fallback),
-            Err(source) => Err(NotificationError::io(path, source)),
-        }
-    }
-
-    /// Atomically persist the notification policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when serialization or writing fails.
-    pub(crate) fn write_policy(
-        &self,
-        policy: &NotificationPolicy,
-    ) -> Result<(), NotificationError> {
-        self.ensure_available()?;
-        let path = self.policy_path();
-        let temp_path = self.dir.join("policy.json.tmp");
-        let mut file = owner_private_write_options()
-            .open(&temp_path)
-            .map_err(|source| NotificationError::io(&temp_path, source))?;
-        serde_json::to_writer_pretty(&mut file, policy).map_err(NotificationError::serialize)?;
-        file.write_all(b"\n")
-            .map_err(|source| NotificationError::io(&temp_path, source))?;
-        file.flush()
-            .map_err(|source| NotificationError::io(&temp_path, source))?;
-        set_owner_private_file_permissions(&temp_path)?;
-        fs::rename(&temp_path, &path).map_err(|source| NotificationError::io(&path, source))?;
-        set_owner_private_file_permissions(&path)?;
-        Ok(())
-    }
-
-    /// Append a created action.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when serialization or writing fails.
-    #[cfg(test)]
-    pub(crate) fn append_created(
-        &self,
-        record: NotificationRecord,
-    ) -> Result<(), NotificationError> {
-        self.append_action(StoreAction::Created { record })
-    }
-
-    /// Append an updated action.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when serialization or writing fails.
-    #[cfg(test)]
-    pub(crate) fn append_updated(
-        &self,
-        record: NotificationRecord,
-    ) -> Result<(), NotificationError> {
-        self.append_action(StoreAction::Updated { record })
-    }
-
-    /// Append a deleted action.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when serialization or writing fails.
-    #[cfg(test)]
-    pub(crate) fn append_deleted(
-        &self,
-        record: NotificationRecord,
-    ) -> Result<(), NotificationError> {
-        self.append_action(StoreAction::Deleted { record })
-    }
-
-    /// Atomically validate, apply, and append an update transition.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when the id is unknown, the transition is
-    /// invalid, or the append fails.
-    pub(crate) fn update_transition(
-        &self,
-        id: NotificationId,
-        status: NotificationStatus,
-        now: &str,
-    ) -> Result<UpdateOutcome, NotificationError> {
-        self.ensure_available()?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(mut record) = state.records.get(&id.0).cloned() else {
-            return Err(NotificationError::NotFound { id });
-        };
-        if !is_valid_status_transition(record.status, status) {
-            return Err(NotificationError::InvalidTransition {
-                id,
-                from: record.status,
-                to: status,
-            });
-        }
-
-        apply_status(&mut record, status, now);
-        if record.status == NotificationStatus::Deleted {
-            append_action_locked(
-                &self.path,
-                &mut state,
-                StoreAction::Deleted {
-                    record: record.clone(),
-                },
-            )?;
-            Ok(UpdateOutcome::Deleted(record))
-        } else {
-            append_action_locked(
-                &self.path,
-                &mut state,
-                StoreAction::Updated {
-                    record: record.clone(),
-                },
-            )?;
-            Ok(UpdateOutcome::Updated(record))
-        }
-    }
-
-    /// Atomically apply and append a delete transition.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when the append fails.
-    pub(crate) fn delete_transition(
-        &self,
-        id: &NotificationId,
-        now: &str,
-    ) -> Result<Option<NotificationRecord>, NotificationError> {
-        self.ensure_available()?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(mut record) = state.records.get(&id.0).cloned() else {
-            return Ok(None);
-        };
-        if record.status == NotificationStatus::Deleted {
-            return Ok(None);
-        }
-
-        apply_status(&mut record, NotificationStatus::Deleted, now);
-        append_action_locked(
-            &self.path,
-            &mut state,
-            StoreAction::Deleted {
-                record: record.clone(),
-            },
-        )?;
-        Ok(Some(record))
-    }
-
     /// Acknowledge active session notifications sharing `dedupe_key`.
     ///
     /// For `attention:<session_id>`, marks `unread` and `read`
-    /// `agent_blocked`/`approval_required` records as `acknowledged`. For
-    /// `turn:<session_id>`, marks `unread` and `read` `turn_completed` records
-    /// as `acknowledged`. Records already acknowledged, archived, deleted, or
-    /// unrelated to the key prefix are left untouched, so repeated calls are
+    /// `agent_blocked`/`approval_required` records as `acknowledged`. Records
+    /// already acknowledged, archived, deleted, or unrelated to the key prefix
+    /// are left untouched, so repeated calls are
     /// idempotent. With `as_of`, records that other producers created, or merged
     /// a report into, after that moment are left untouched too.
     ///
@@ -855,6 +552,7 @@ impl NotificationStore {
         let mut records: Vec<NotificationRecord> = self
             .all()
             .into_iter()
+            .filter(|record| is_attention_kind(record.kind))
             .filter(|record| {
                 status.map_or(record.status != NotificationStatus::Deleted, |status| {
                     record.status == status
@@ -893,19 +591,6 @@ impl NotificationStore {
             notifications: records,
             next_cursor,
         })
-    }
-
-    #[cfg(test)]
-    fn append_action(&self, action: StoreAction) -> Result<(), NotificationError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        append_action_locked(&self.path, &mut state, action)
-    }
-
-    fn policy_path(&self) -> PathBuf {
-        self.dir.join(POLICY_FILE_NAME)
     }
 }
 
@@ -976,55 +661,26 @@ fn find_existing_source(
     })
 }
 
-fn supersede_unread_records_locked(
-    path: &Path,
-    state: &mut StoreState,
-    dedupe_key: &str,
-    kind: NotificationKind,
-    superseded_by: &NotificationId,
-    now: &str,
-) -> Result<Vec<NotificationRecord>, NotificationError> {
-    let updated = supersede_unread_records(&state.records, dedupe_key, kind, superseded_by, now);
-    for record in &updated {
-        append_action_locked(
-            path,
-            state,
-            StoreAction::Updated {
-                record: record.clone(),
-            },
-        )?;
-    }
-    Ok(updated)
-}
-
-fn supersede_unread_records(
-    records: &BTreeMap<String, NotificationRecord>,
-    dedupe_key: &str,
-    kind: NotificationKind,
-    superseded_by: &NotificationId,
-    now: &str,
-) -> Vec<NotificationRecord> {
-    records
-        .values()
-        .filter(|record| {
-            record.kind == kind
-                && record.status == NotificationStatus::Unread
-                && record.dedupe_key.as_deref() == Some(dedupe_key)
-        })
-        .cloned()
-        .map(|mut record| {
-            apply_status(&mut record, NotificationStatus::Acknowledged, now);
-            record.superseded_by = Some(superseded_by.clone());
-            record
-        })
-        .collect()
-}
-
 fn resolve_key_matches_kind(dedupe_key: &str, kind: NotificationKind) -> bool {
-    if is_attention_dedupe_key(dedupe_key) {
-        return is_attention_kind(kind);
+    is_attention_dedupe_key(dedupe_key) && is_attention_kind(kind)
+}
+
+/// Whether the sweep removes `record` at `now`.
+fn record_expired(
+    record: &NotificationRecord,
+    now: time::OffsetDateTime,
+    ttl: time::Duration,
+) -> Result<bool, NotificationError> {
+    if !is_attention_kind(record.kind) || record.status == NotificationStatus::Deleted {
+        return Ok(true);
     }
-    is_turn_dedupe_key(dedupe_key) && kind == NotificationKind::TurnCompleted
+    let resolved_at = match record.status {
+        NotificationStatus::Acknowledged => record.acked_at.as_deref(),
+        NotificationStatus::Archived => record.archived_at.as_deref(),
+        _ => return Ok(false),
+    };
+    let resolved_at = parse_timestamp(resolved_at.unwrap_or(&record.created_at))?;
+    Ok(resolved_at + ttl <= now)
 }
 
 fn upgrade_projector(
@@ -1079,33 +735,6 @@ fn unsupported_format(dir: &Path) -> Result<Option<String>, NotificationError> {
         )));
     }
     Ok(None)
-}
-
-/// Why `policy.json` in `dir` cannot be read by this build, if it cannot.
-fn unreadable_policy(dir: &Path) -> Result<Option<String>, NotificationError> {
-    let path = dir.join(POLICY_FILE_NAME);
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) if source.kind() == io::ErrorKind::InvalidData => {
-            return Ok(Some(format!(
-                "the notification policy {} is not text",
-                path.display()
-            )))
-        }
-        Err(source) => return Err(NotificationError::io(&path, source)),
-    };
-    let policy = match serde_json::from_str::<NotificationPolicy>(&content) {
-        Ok(policy) => policy,
-        Err(error) => {
-            return Ok(Some(
-                NotificationError::policy_parse(&path, error).to_string(),
-            ))
-        }
-    };
-    Ok(super::validate_policy(&policy)
-        .err()
-        .map(|error| error.to_string()))
 }
 
 /// Writes the format marker atomically when it is missing or names an older
@@ -1166,7 +795,11 @@ fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
     })?;
     let mut records = BTreeMap::new();
     let mut action_count = 0;
+    let mut valid_len = None;
+    let mut offset: u64 = 0;
     for (index, raw_line) in content.split_inclusive('\n').enumerate() {
+        let line_start = offset;
+        offset += raw_line.len() as u64;
         let line_number = index + 1;
         let terminated = raw_line.ends_with('\n');
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
@@ -1186,6 +819,7 @@ fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
                     line.number = line_number,
                     "ignoring truncated trailing notification-store action"
                 );
+                valid_len = Some(line_start);
             }
             Err(err) => return Err(NotificationError::store_parse(path, line_number, err)),
         }
@@ -1193,6 +827,7 @@ fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
     Ok(ReplayState {
         records,
         action_count,
+        valid_len,
     })
 }
 
@@ -1327,480 +962,4 @@ fn set_owner_private_file_permissions(path: &Path) -> Result<(), NotificationErr
 #[cfg(not(unix))]
 fn set_owner_private_file_permissions(_path: &Path) -> Result<(), NotificationError> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::io::Write;
-
-    use protocol::{
-        NotificationId, NotificationKind, NotificationSeverity, NotificationSource,
-        NotificationStatus,
-    };
-
-    use super::NotificationStore;
-
-    fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-        // The directory lives until the test's thread ends; the path below it
-        // does not exist yet.
-        crate::test_support::thread_scoped_dir(&format!("pohunek-notifications-store-{tag}-"))
-            .join("data")
-    }
-
-    fn record(id: &str, created_at: &str) -> protocol::NotificationRecord {
-        protocol::NotificationRecord {
-            id: NotificationId(id.to_owned()),
-            source: NotificationSource {
-                provider: "codex".to_owned(),
-                provider_event: "PermissionRequest".to_owned(),
-                host_local_source_id: format!("source-{id}"),
-            },
-            kind: NotificationKind::ApprovalRequired,
-            severity: NotificationSeverity::ActionRequired,
-            status: NotificationStatus::Unread,
-            title: format!("Title {id}"),
-            body: format!("Body {id}"),
-            metadata: BTreeMap::new(),
-            created_at: created_at.to_owned(),
-            session_id: None,
-            agent_kind: None,
-            source_id: Some(format!("source-id-{id}")),
-            dedupe_key: None,
-            project_id: None,
-            read_at: None,
-            acked_at: None,
-            archived_at: None,
-            deleted_at: None,
-            superseded_by: None,
-            turn_started_at: None,
-            turn_duration_ms: None,
-            session_metadata: BTreeMap::new(),
-            hook_admitted: false,
-        }
-    }
-
-    #[test]
-    fn resolve_attention_acknowledges_matching_attention_records() {
-        let data_dir = temp_data_dir("resolve-attention");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-
-        let mut blocked = record("n-1", "2026-07-03T10:00:00Z");
-        blocked.kind = NotificationKind::AgentBlocked;
-        blocked.dedupe_key = Some("attention:s-1".to_owned());
-        store.append_created(blocked).expect("append blocked");
-
-        let mut approval = record("n-2", "2026-07-03T10:00:01Z");
-        approval.kind = NotificationKind::ApprovalRequired;
-        approval.dedupe_key = Some("attention:s-1".to_owned());
-        store.append_created(approval).expect("append approval");
-
-        // A different session must not be acknowledged.
-        let mut other = record("n-3", "2026-07-03T10:00:02Z");
-        other.kind = NotificationKind::AgentBlocked;
-        other.dedupe_key = Some("attention:s-2".to_owned());
-        store.append_created(other).expect("append other session");
-
-        let resolved = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z", None)
-            .expect("resolve attention");
-
-        assert_eq!(resolved.len(), 2);
-        assert!(resolved.iter().all(|record| {
-            record.status == NotificationStatus::Acknowledged
-                && record.acked_at.as_deref() == Some("2026-07-03T10:05:00Z")
-        }));
-
-        let statuses: BTreeMap<String, NotificationStatus> = store
-            .all()
-            .into_iter()
-            .map(|record| (record.id.0, record.status))
-            .collect();
-        assert_eq!(statuses["n-1"], NotificationStatus::Acknowledged);
-        assert_eq!(statuses["n-2"], NotificationStatus::Acknowledged);
-        assert_eq!(statuses["n-3"], NotificationStatus::Unread);
-    }
-
-    #[test]
-    fn resolve_attention_skips_non_attention_kinds_and_is_idempotent() {
-        let data_dir = temp_data_dir("resolve-attention-idempotent");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-
-        let mut blocked = record("n-1", "2026-07-03T10:00:00Z");
-        blocked.kind = NotificationKind::AgentBlocked;
-        blocked.dedupe_key = Some("attention:s-1".to_owned());
-        store.append_created(blocked).expect("append blocked");
-
-        // An error notification shares the dedupe key but must not auto-resolve.
-        let mut errored = record("n-2", "2026-07-03T10:00:01Z");
-        errored.kind = NotificationKind::Error;
-        errored.dedupe_key = Some("attention:s-1".to_owned());
-        store.append_created(errored).expect("append error");
-
-        let first = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z", None)
-            .expect("first resolve");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].id.0, "n-1");
-
-        let second = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:06:00Z", None)
-            .expect("second resolve");
-        assert!(second.is_empty());
-
-        let statuses: BTreeMap<String, NotificationStatus> = store
-            .all()
-            .into_iter()
-            .map(|record| (record.id.0, record.status))
-            .collect();
-        assert_eq!(statuses["n-1"], NotificationStatus::Acknowledged);
-        assert_eq!(statuses["n-2"], NotificationStatus::Unread);
-    }
-
-    #[test]
-    fn second_unread_turn_supersedes_previous_turn_without_time_window() {
-        let data_dir = temp_data_dir("turn-supersede");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-
-        let mut first = record("n-1", "2026-07-03T10:00:00Z");
-        first.kind = NotificationKind::TurnCompleted;
-        first.dedupe_key = Some("turn:s-1".to_owned());
-        store
-            .create_or_dedupe(first, 120, std::time::Instant::now())
-            .expect("first turn create");
-
-        let mut second = record("n-2", "2026-07-03T11:00:00Z");
-        second.kind = NotificationKind::TurnCompleted;
-        second.dedupe_key = Some("turn:s-1".to_owned());
-        store
-            .create_or_dedupe(second, 120, std::time::Instant::now())
-            .expect("second turn create");
-
-        let log = std::fs::read_to_string(store.path()).expect("read notification log");
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "second turn supersede and replacement must be one durable action"
-        );
-
-        let reopened = NotificationStore::open(&data_dir).expect("reopen store");
-        let records: BTreeMap<String, protocol::NotificationRecord> = store
-            .all()
-            .into_iter()
-            .map(|record| (record.id.0.clone(), record))
-            .collect();
-        let replayed: BTreeMap<String, protocol::NotificationRecord> = reopened
-            .all()
-            .into_iter()
-            .map(|record| (record.id.0.clone(), record))
-            .collect();
-        assert_eq!(records, replayed);
-        assert_eq!(records["n-1"].status, NotificationStatus::Acknowledged);
-        assert_eq!(
-            records["n-1"].superseded_by,
-            Some(NotificationId("n-2".to_owned()))
-        );
-        assert_eq!(records["n-2"].status, NotificationStatus::Unread);
-        assert_eq!(records["n-2"].superseded_by, None);
-    }
-
-    #[test]
-    fn resolve_session_notifications_acknowledges_turn_keyed_turns_only() {
-        let data_dir = temp_data_dir("resolve-turn");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-
-        let mut turn = record("n-1", "2026-07-03T10:00:00Z");
-        turn.kind = NotificationKind::TurnCompleted;
-        turn.dedupe_key = Some("turn:s-1".to_owned());
-        store.append_created(turn).expect("append turn");
-
-        let mut attention = record("n-2", "2026-07-03T10:00:01Z");
-        attention.kind = NotificationKind::AgentBlocked;
-        attention.dedupe_key = Some("turn:s-1".to_owned());
-        store.append_created(attention).expect("append attention");
-
-        let resolved = store
-            .resolve_session_notifications("turn:s-1", "2026-07-03T10:05:00Z", None)
-            .expect("resolve turn");
-
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].id.0, "n-1");
-        assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
-
-        let statuses: BTreeMap<String, NotificationStatus> = store
-            .all()
-            .into_iter()
-            .map(|record| (record.id.0, record.status))
-            .collect();
-        assert_eq!(statuses["n-1"], NotificationStatus::Acknowledged);
-        assert_eq!(statuses["n-2"], NotificationStatus::Unread);
-    }
-
-    #[test]
-    fn open_creates_notifications_directory_and_file_owner_private() {
-        let data_dir = temp_data_dir("permissions");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-
-        assert!(data_dir.join("notifications").is_dir());
-        assert!(store.path().is_file());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let dir_mode = std::fs::metadata(data_dir.join("notifications"))
-                .expect("dir metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            let file_mode = std::fs::metadata(store.path())
-                .expect("file metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(dir_mode, 0o700);
-            assert_eq!(file_mode, 0o600);
-        }
-    }
-
-    #[test]
-    fn append_create_update_archive_delete_replays_after_reopen() {
-        let data_dir = temp_data_dir("replay");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let mut first = record("n-1", "2026-07-03T10:00:00Z");
-        store.append_created(first.clone()).expect("append created");
-
-        first.status = NotificationStatus::Read;
-        first.read_at = Some("2026-07-03T10:05:00Z".to_owned());
-        store.append_updated(first.clone()).expect("append updated");
-
-        first.status = NotificationStatus::Archived;
-        first.archived_at = Some("2026-07-03T10:10:00Z".to_owned());
-        store
-            .append_updated(first.clone())
-            .expect("append archived");
-
-        first.status = NotificationStatus::Deleted;
-        first.deleted_at = Some("2026-07-03T10:15:00Z".to_owned());
-        store.append_deleted(first.clone()).expect("append deleted");
-
-        let reopened = NotificationStore::open(&data_dir).expect("reopen store");
-        let records = reopened.all();
-
-        assert_eq!(records, vec![first]);
-        let lines = std::fs::read_to_string(reopened.path())
-            .expect("read log")
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count();
-        assert_eq!(lines, 4);
-    }
-
-    #[test]
-    fn compaction_removes_history_and_tombstones_and_keeps_append_handle_live() {
-        let data_dir = temp_data_dir("compaction");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let mut retained = record("n-1", "2026-07-03T10:00:00Z");
-        store
-            .append_created(retained.clone())
-            .expect("append retained record");
-        retained.status = NotificationStatus::Read;
-        retained.read_at = Some("2026-07-03T10:01:00Z".to_owned());
-        store
-            .append_updated(retained.clone())
-            .expect("append retained update");
-
-        let mut deleted = record("n-2", "2026-07-03T10:02:00Z");
-        store
-            .append_created(deleted.clone())
-            .expect("append deleted record");
-        deleted.status = NotificationStatus::Deleted;
-        deleted.deleted_at = Some("2026-07-03T10:03:00Z".to_owned());
-        store
-            .append_deleted(deleted)
-            .expect("append delete tombstone");
-
-        assert!(store.compact_if_needed(1).expect("compact store"));
-        assert_eq!(
-            std::fs::read_to_string(store.path())
-                .expect("read compacted log")
-                .lines()
-                .count(),
-            1
-        );
-
-        let appended = record("n-3", "2026-07-03T10:04:00Z");
-        store
-            .append_created(appended.clone())
-            .expect("append after compaction");
-        let reopened = NotificationStore::open(&data_dir).expect("reopen compacted store");
-
-        assert_eq!(reopened.all(), vec![retained, appended]);
-    }
-
-    #[test]
-    fn replay_tolerates_truncated_trailing_action_and_keeps_prior_records() {
-        let data_dir = temp_data_dir("trailing-partial");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let first = record("n-1", "2026-07-03T10:00:00Z");
-        store
-            .append_created(first.clone())
-            .expect("append created record");
-        let path = store.path().to_path_buf();
-        drop(store);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open log for trailing partial")
-            .write_all(br#"{"action":"updated""#)
-            .expect("write trailing partial");
-
-        let reopened = NotificationStore::open(&data_dir).expect("reopen with trailing partial");
-
-        assert_eq!(reopened.all(), vec![first]);
-    }
-
-    #[test]
-    fn a_corrupt_mid_file_action_makes_the_store_unavailable_and_leaves_the_log() {
-        let data_dir = temp_data_dir("mid-file-corrupt");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let first = record("n-1", "2026-07-03T10:00:00Z");
-        let second = record("n-2", "2026-07-03T10:05:00Z");
-        store
-            .append_created(first)
-            .expect("append first created record");
-        store
-            .append_created(second)
-            .expect("append second created record");
-        let path = store.path().to_path_buf();
-        drop(store);
-        let content = std::fs::read_to_string(&path).expect("read original log");
-        let mut lines = content.lines();
-        let first_line = lines.next().expect("first log line");
-        let second_line = lines.next().expect("second log line");
-        std::fs::write(
-            &path,
-            format!("{first_line}\n{{not-json}}\n{second_line}\n"),
-        )
-        .expect("write corrupt mid-file log");
-
-        let corrupt = std::fs::read(&path).expect("read corrupt log");
-
-        let store = NotificationStore::open(&data_dir)
-            .expect("a mid-file corrupt action leaves the daemon able to start");
-
-        let err = store.ensure_available().expect_err("the store is not used");
-        assert_eq!(err.to_protocol_error().code, "notifications_unavailable");
-        assert_eq!(
-            std::fs::read(&path).expect("read log again"),
-            corrupt,
-            "the log is left as it was"
-        );
-    }
-
-    #[test]
-    fn list_filters_by_status_kind_severity_provider_session_and_time_range() {
-        let data_dir = temp_data_dir("filters");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let mut first = record("n-1", "2026-07-03T10:00:00Z");
-        first.session_id = Some(protocol::SessionId("s-1".to_owned()));
-        store.append_created(first.clone()).expect("append first");
-        let mut second = record("n-2", "2026-07-03T11:00:00Z");
-        second.status = NotificationStatus::Archived;
-        second.kind = NotificationKind::Error;
-        second.severity = NotificationSeverity::Error;
-        second.source.provider = "claude".to_owned();
-        second.session_id = Some(protocol::SessionId("s-2".to_owned()));
-        store.append_created(second).expect("append second");
-
-        let listed = store
-            .list(protocol::NotificationListParams {
-                status: Some(NotificationStatus::Unread),
-                kind: Some(NotificationKind::ApprovalRequired),
-                severity: Some(NotificationSeverity::ActionRequired),
-                provider: Some("codex".to_owned()),
-                session_id: Some(protocol::SessionId("s-1".to_owned())),
-                created_after: Some("2026-07-03T09:00:00Z".to_owned()),
-                created_before: Some("2026-07-03T10:30:00Z".to_owned()),
-                limit: None,
-                cursor: None,
-            })
-            .expect("list");
-
-        assert_eq!(listed.notifications, vec![first]);
-        assert_eq!(listed.next_cursor, None);
-    }
-
-    #[test]
-    fn list_cursor_orders_by_created_at_desc_then_id() {
-        let data_dir = temp_data_dir("cursor");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        for id in ["n-2", "n-1", "n-3"] {
-            store
-                .append_created(record(id, "2026-07-03T10:00:00Z"))
-                .expect("append");
-        }
-        store
-            .append_created(record("n-4", "2026-07-03T11:00:00Z"))
-            .expect("append newer");
-
-        let first_page = store
-            .list(protocol::NotificationListParams {
-                limit: Some(2),
-                ..protocol::NotificationListParams::default()
-            })
-            .expect("first page");
-        let second_page = store
-            .list(protocol::NotificationListParams {
-                limit: Some(10),
-                cursor: first_page.next_cursor.clone(),
-                ..protocol::NotificationListParams::default()
-            })
-            .expect("second page");
-
-        let first_ids: Vec<_> = first_page
-            .notifications
-            .iter()
-            .map(|record| record.id.0.as_str())
-            .collect();
-        let second_ids: Vec<_> = second_page
-            .notifications
-            .iter()
-            .map(|record| record.id.0.as_str())
-            .collect();
-        assert_eq!(first_ids, vec!["n-4", "n-1"]);
-        assert_eq!(second_ids, vec!["n-2", "n-3"]);
-    }
-
-    #[test]
-    fn list_default_excludes_deleted_unless_status_filter_requests_deleted() {
-        let data_dir = temp_data_dir("list-deleted");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let mut deleted = record("n-1", "2026-07-03T10:00:00Z");
-        store
-            .append_created(deleted.clone())
-            .expect("append deleted record");
-        deleted.status = NotificationStatus::Deleted;
-        deleted.deleted_at = Some("2026-07-03T10:05:00Z".to_owned());
-        store
-            .append_deleted(deleted.clone())
-            .expect("append delete action");
-        let visible = record("n-2", "2026-07-03T11:00:00Z");
-        store
-            .append_created(visible.clone())
-            .expect("append visible record");
-
-        let default_list = store
-            .list(protocol::NotificationListParams::default())
-            .expect("default list");
-        let deleted_list = store
-            .list(protocol::NotificationListParams {
-                status: Some(NotificationStatus::Deleted),
-                ..protocol::NotificationListParams::default()
-            })
-            .expect("deleted list");
-
-        assert_eq!(default_list.notifications, vec![visible]);
-        assert_eq!(deleted_list.notifications, vec![deleted]);
-    }
 }

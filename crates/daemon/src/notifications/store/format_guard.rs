@@ -1,8 +1,7 @@
 //! Guard against notification store changes that skip a format bump.
 //!
 //! The recursive key set and the serialized enum value sets of the action log
-//! lines (`StoreAction`, `NotificationRecord`) and of `policy.json`
-//! (`NotificationPolicy`) are compared with the checked-in snapshot
+//! lines (`StoreAction`, `NotificationRecord`) are compared with the checked-in snapshot
 //! `fixtures/format-<N>.txt` for the current [`NOTIFICATIONS_FORMAT_VERSION`].
 //! A build meets a key or value it does not know only in a store a newer build
 //! wrote, and then declines to use the store instead of reading part of it, so
@@ -25,10 +24,10 @@ use persisted_shape::{
     unit_values, EnumEntry, Leaves, SnapshotGuard,
 };
 use protocol::{
-    NotificationKind, NotificationPolicy, NotificationRecord, NotificationRetentionPolicy,
-    NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
+    NotificationStatus,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::{StoreAction, NOTIFICATIONS_FORMAT_VERSION};
 
@@ -36,6 +35,7 @@ use super::{StoreAction, NOTIFICATIONS_FORMAT_VERSION};
 const SNAPSHOTS: &[(u32, &str)] = &[
     (1, include_str!("../fixtures/format-1.txt")),
     (2, include_str!("../fixtures/format-2.txt")),
+    (3, include_str!("../fixtures/format-3.txt")),
 ];
 
 /// Locations of a record inside a serialized action.
@@ -81,7 +81,7 @@ fn full_record() -> NotificationRecord {
     clippy::unneeded_field_pattern,
     reason = "naming every field with `_` is what makes a field change a compile error"
 )]
-fn assert_every_field_is_reviewed(record: &NotificationRecord, policy: &NotificationPolicy) {
+fn assert_every_field_is_reviewed(record: &NotificationRecord) {
     let NotificationRecord {
         id: _,
         source:
@@ -112,25 +112,6 @@ fn assert_every_field_is_reviewed(record: &NotificationRecord, policy: &Notifica
         session_metadata: _,
         hook_admitted: _,
     } = record;
-    let NotificationPolicy {
-        attention_dedupe_window_secs: _,
-        attention_debounce_secs: _,
-        enabled: _,
-        providers: _,
-        // Serializes no key while empty, so the document keeps its format-1 keys.
-        unknown_fields: _,
-        retention:
-            NotificationRetentionPolicy {
-                sweep_interval_secs: _,
-                info_ttl_secs: _,
-                warning_ttl_secs: _,
-                resolved_attention_ttl_secs: _,
-                resolved_error_ttl_secs: _,
-                archived_ttl_secs: _,
-                compaction_min_actions: _,
-                unknown_fields: _,
-            },
-    } = policy;
 }
 
 fn actions() -> Vec<StoreAction> {
@@ -229,7 +210,7 @@ fn free_text() -> Vec<Vec<String>> {
 /// Collapses the keys of an open map to `*`, so a sample key is not pinned.
 fn collapse_maps(path: &str) -> String {
     let segments: Vec<&str> = path.split('.').collect();
-    for map in ["metadata", "session_metadata", "providers"] {
+    for map in ["metadata", "session_metadata"] {
         if let Some(index) = segments.iter().position(|segment| *segment == map) {
             if index + 1 < segments.len() {
                 let mut collapsed = segments[..=index].join(".");
@@ -246,7 +227,7 @@ fn collapse_maps(path: &str) -> String {
 }
 
 /// The serialized values of `NotificationKind`. A variant missing here fails to
-/// compile, and the policy sample must carry exactly one flag per value.
+/// compile.
 fn kind_values() -> Vec<String> {
     unit_values!(
         NotificationKind: AgentBlocked, ApprovalRequired, TurnCompleted, SessionFinished,
@@ -254,28 +235,9 @@ fn kind_values() -> Vec<String> {
     )
 }
 
-/// The sample policy: every key populated, with one provider override, and one
-/// flag per notification kind.
-fn policy_document() -> Value {
-    let mut policy = crate::notifications::default_policy();
-    policy
-        .providers
-        .insert("codex".to_owned(), policy.enabled.clone());
-    let document = serde_json::to_value(policy).expect("policy json");
-    let flags = document["enabled"].as_object().expect("policy flags");
-    let flagged: BTreeSet<&str> = flags.keys().map(String::as_str).collect();
-    let kinds = kind_values();
-    let kinds: BTreeSet<&str> = kinds.iter().map(String::as_str).collect();
-    assert_eq!(
-        flagged, kinds,
-        "the policy sample must carry exactly one flag per notification kind"
-    );
-    document
-}
-
 /// Key and `path=value` lines of the notification store.
 fn current_shape() -> BTreeSet<String> {
-    assert_every_field_is_reviewed(&full_record(), &crate::notifications::default_policy());
+    assert_every_field_is_reviewed(&full_record());
     let mut shape = BTreeSet::new();
     let mut leaves = Leaves::new();
     for action in actions() {
@@ -296,21 +258,7 @@ fn current_shape() -> BTreeSet<String> {
                 .extend(values);
         }
     }
-    let mut paths = BTreeSet::new();
-    collect_paths("", &policy_document(), &mut paths);
-    shape.extend(
-        paths
-            .into_iter()
-            .map(|path| collapse_maps(&format!("policy.{path}"))),
-    );
     shape.insert("store".to_owned());
-    shape.insert("policy".to_owned());
-    let mut found = Leaves::new();
-    collect_string_leaves("", &policy_document(), &mut found);
-    assert!(
-        found.is_empty(),
-        "policy.json gained a string leaf: classify it in free_text or enums: {found:?}"
-    );
     shape.extend(
         classify_leaves(&leaves, &enums(), &free_text())
             .unwrap_or_else(|message| panic!("{message}")),
@@ -353,11 +301,6 @@ fn a_changed_notification_shape_is_reported_as_an_unformatted_change() {
         message.contains("store.record.status=suspended"),
         "{message}"
     );
-
-    let mut shape = current_shape();
-    shape.insert("policy.new_key".to_owned());
-    check_format(NOTIFICATIONS_FORMAT_VERSION, &shape)
-        .expect_err("an added policy key must fail the guard");
 }
 
 #[test]

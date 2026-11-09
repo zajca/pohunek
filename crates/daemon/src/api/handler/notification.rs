@@ -6,15 +6,15 @@
 //! with. Store mutations run off the async runtime via [`run_notification_blocking`].
 
 use protocol::{
-    NotificationCreateParams, NotificationCreateResult, NotificationDeleteParams,
-    NotificationListParams, NotificationPolicyParams, NotificationPolicyResult,
-    NotificationRetentionParams, NotificationUpdateParams, ProtocolError, Request, Response,
+    NotificationCreateParams, NotificationCreateResult, NotificationKind, NotificationListParams,
+    ProtocolError, Request, Response,
 };
+use tracing::info;
 
-use super::util::{error_value, ok_value, parse_optional_params, parse_params};
+use super::util::{error_value, parse_optional_params, parse_params};
 use crate::notifications::{
-    is_debounced_create, is_hook_provider, stored_provider, AttentionCoordinator,
-    NotificationService,
+    is_attention_kind, is_debounced_create, is_hook_provider, stored_provider, turn_dedupe_key,
+    AttentionCoordinator, NotificationService,
 };
 use crate::session::{HookAdmissionError, SessionRegistry};
 
@@ -74,16 +74,21 @@ where
     .await
 }
 
-/// `notification.create`: create or dedupe a durable notification record.
+/// `notification.create`: create or dedupe a durable attention record.
 ///
-/// Session-scoped attention and turn-completion creates are routed to the
-/// debounce coordinator: the id is minted and `created: true` is returned, but
-/// the record is held pending and only becomes visible in `notification.list`
-/// after the debounce window (or never, if the session resumes first). A
-/// create that is an admitted provider hook claim for a session the registry
-/// holds is also a turn signal: the coordinator records the matching turn
-/// event, including for a kind the policy disables, which still answers
-/// `notification_kind_disabled`. Every other create persists immediately.
+/// Session-scoped attention creates are routed to the debounce coordinator: the
+/// id is minted and `created: true` is returned, but the record is held pending
+/// and only becomes visible in `notification.list` after the debounce window
+/// (or never, if the session resumes first). A create that is an admitted
+/// provider hook claim for a session the registry holds is also a turn signal:
+/// the coordinator records the matching turn event. Every other attention
+/// create persists immediately.
+///
+/// A turn report (`turn_completed`, `error`) is never stored: an admitted hook
+/// claim for a held session becomes a turn signal for `session.wait_turn`, and
+/// the answer carries the minted record with `created: false`. Any other kind
+/// is accepted and dropped, so a hook of an earlier release never sees an
+/// error for a report this daemon does not keep.
 pub(super) async fn handle_notification_create(
     request: &Request,
     notifications: Option<&NotificationService>,
@@ -119,7 +124,21 @@ pub(super) async fn handle_notification_create(
         (true, Some(session_id)) => sessions.holds(session_id).await,
         _ => false,
     };
+    if let (true, Some(session_id)) = (turn_signal, params.session_id.as_ref()) {
+        sessions.note_hook_spoke(session_id).await;
+    }
     let params = enrich_notification_session_context(params, sessions).await;
+
+    if !is_attention_kind(params.kind) {
+        return handle_turn_report(
+            request,
+            notifications,
+            attention,
+            params,
+            (hook_claim, turn_signal, turn),
+        )
+        .await;
+    }
 
     if is_debounced_create(params.kind, params.dedupe_key.as_deref()) {
         let attention = match require_attention(request, attention) {
@@ -129,18 +148,15 @@ pub(super) async fn handle_notification_create(
         return run_notification_blocking(request, move || {
             // Preparing the record does no store I/O; the coordinator commits it
             // after the debounce window. The response still returns the minted
-            // record with `created: true`. A turn signal whose kind the policy
-            // disables still reaches the coordinator for `session.wait_turn`,
-            // and the caller gets the policy refusal an immediate create reports.
+            // record with `created: true`. A turn signal still reaches the
+            // coordinator for `session.wait_turn` when the store is unavailable,
+            // and the caller gets the refusal an immediate create reports.
             let mut deferred = notifications
                 .prepare_deferred(params)
                 .map_err(|err| err.to_protocol_error())?;
             deferred.signal = turn_signal;
             deferred.record.hook_admitted = hook_claim;
-            if let Some(turn) = turn {
-                deferred = deferred.for_turn(turn);
-            }
-            let refusal = deferred.policy_refusal();
+            let refusal = deferred.store_refusal();
             let record = deferred.record.clone();
             if deferred.inbox || deferred.signal {
                 attention.defer(deferred);
@@ -337,115 +353,54 @@ pub(super) async fn handle_notification_list(
     .await
 }
 
-/// `notification.update`: update notification lifecycle status.
-pub(super) async fn handle_notification_update(
+/// Answers a create of a kind the inbox does not hold.
+///
+/// An admitted hook claim for a held session records the turn event its kind
+/// stands for (`turn_completed`, `error`); every other kind is only logged.
+/// Nothing is persisted either way.
+async fn handle_turn_report(
     request: &Request,
-    notifications: Option<&NotificationService>,
+    notifications: NotificationService,
+    attention: Option<&AttentionCoordinator>,
+    params: NotificationCreateParams,
+    (hook_claim, turn_signal, turn): (bool, bool, Option<crate::session::TurnId>),
 ) -> Response {
-    let params = match parse_params::<NotificationUpdateParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    let notifications = match require_notifications(request, notifications) {
-        Ok(notifications) => notifications,
-        Err(resp) => return resp,
-    };
-    run_notification_blocking(request, move || {
-        notifications
-            .update(params)
-            .map_err(|err| err.to_protocol_error())
-    })
-    .await
-}
-
-/// `notification.delete`: logically delete a notification.
-pub(super) async fn handle_notification_delete(
-    request: &Request,
-    notifications: Option<&NotificationService>,
-) -> Response {
-    let params = match parse_params::<NotificationDeleteParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    let notifications = match require_notifications(request, notifications) {
-        Ok(notifications) => notifications,
-        Err(resp) => return resp,
-    };
-    run_notification_blocking(request, move || {
-        notifications
-            .delete(params)
-            .map_err(|err| err.to_protocol_error())
-    })
-    .await
-}
-
-/// `notification.policy.get`: return the current notification policy.
-pub(super) fn handle_notification_policy_get(
-    request: &Request,
-    notifications: Option<&NotificationService>,
-) -> Response {
-    if !request.params().is_null() {
-        return error_value(
-            request,
-            ProtocolError::bad_request("notification.policy.get does not accept params"),
+    let kind = params.kind;
+    let signals = matches!(
+        kind,
+        NotificationKind::TurnCompleted | NotificationKind::Error
+    );
+    // Without a coordinator (a daemon built without notifications) the report
+    // has nowhere to be recorded and is dropped like any other kind.
+    let attention = (signals && turn_signal)
+        .then(|| attention.cloned())
+        .flatten();
+    if attention.is_none() {
+        info!(
+            name: "notification.dropped_kind",
+            kind = kind.as_str(),
+            provider = %stored_provider(&params.source.provider),
+            "a notification kind the inbox does not hold was accepted and dropped"
         );
     }
-    let notifications = match require_notifications(request, notifications) {
-        Ok(notifications) => notifications,
-        Err(resp) => return resp,
-    };
-    if let Err(error) = notifications.ensure_available() {
-        return error_value(request, error.to_protocol_error());
-    }
-    ok_value(
-        request,
-        &NotificationPolicyResult {
-            policy: notifications.policy(),
-        },
-    )
-}
-
-/// `notification.policy.set`: persist a replacement notification policy.
-pub(super) async fn handle_notification_policy_set(
-    request: &Request,
-    notifications: Option<&NotificationService>,
-) -> Response {
-    let params = match parse_params::<NotificationPolicyParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    let notifications = match require_notifications(request, notifications) {
-        Ok(notifications) => notifications,
-        Err(resp) => return resp,
-    };
-    let mut policy = params.policy;
-    crate::notifications::complete_kind_flags(&mut policy);
     run_notification_blocking(request, move || {
-        notifications
-            .set_policy(policy.clone())
+        let mut deferred = notifications
+            .prepare_deferred(params)
             .map_err(|err| err.to_protocol_error())?;
-        Ok(NotificationPolicyResult { policy })
-    })
-    .await
-}
-
-/// `notification.retention.prune`: delete records selected by retention params.
-pub(super) async fn handle_notification_retention_prune(
-    request: &Request,
-    notifications: Option<&NotificationService>,
-) -> Response {
-    let params = match parse_optional_params::<NotificationRetentionParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    let notifications = match require_notifications(request, notifications) {
-        Ok(notifications) => notifications,
-        Err(resp) => return resp,
-    };
-    run_notification_blocking(request, move || {
-        notifications
-            .prune_retention(&params)
-            .map_err(|err| err.to_protocol_error())
+        let record = deferred.record.clone();
+        if let (Some(attention), Some(session_id)) = (attention, record.session_id.clone()) {
+            deferred.signal = true;
+            deferred.record.hook_admitted = hook_claim;
+            deferred.record.dedupe_key = Some(turn_dedupe_key(&session_id));
+            attention.defer(match turn {
+                Some(turn) => deferred.for_turn(turn),
+                None => deferred,
+            });
+        }
+        Ok(NotificationCreateResult {
+            created: false,
+            record,
+        })
     })
     .await
 }

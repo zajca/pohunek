@@ -24,8 +24,7 @@ export class Subscription {
   /**
    * Returns the next event line, or `null` when the daemon closes.
    *
-   * A connection that selected the previous protocol version yields each event
-   * translated to the current shape and re-serialized.
+   * Lines are returned as the daemon wrote them.
    */
   public async nextLine(): Promise<string | null> {
     const line = await this.nextRawLine();
