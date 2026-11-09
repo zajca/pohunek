@@ -1237,9 +1237,11 @@ the screen rules stay the fallback.
   "<MAJOR.MINOR.PATCH>"`. The records are authoritative only while the release
   the session's launch probed (the `version_probe` of the exact executable it
   runs, held in memory for the runtime generation) is at or above it. Below it,
-  or with the release unknown (for example a session re-attached after a daemon
-  restart), the worker does not answer the probe, a record that arrives anyway
-  is ignored, and the title and screen rules decide; no evidence leaves the
+  or with the release unknown, a record that arrives anyway is ignored and the
+  title and screen rules decide. A launch below or with an unknown release gets
+  no probe answer from the worker. A session re-attached after a daemon restart
+  has an unknown release; its worker keeps the probe flag it was spawned with,
+  so it may still answer the probe while its records are ignored; no evidence leaves the
   activity unset, never idle. A manifest without `authority_from` is
   authoritative for every release, and an agent of another runtime than the
   session's own (a Codex started below a shell) is not gated. Each gate
@@ -1257,8 +1259,8 @@ the screen rules stay the fallback.
   | held record | screen winner | result | source |
   |---|---|---|---|
   | none, or no `[program_status]` | any | the screen winner, as without the layer | as without |
-  | `blocked` (any kind) | a visible-blocker rule | that screen `blocked` | `screen` |
-  | `blocked` (any kind) | anything else | `blocked`, a visible blocker | `osc_progress` |
+  | `blocked` (any kind) | a visible-blocker rule on the screen (a dialog) | that screen `blocked` | `screen` |
+  | `blocked` (any kind) | a title blocker, or anything else | `blocked`, a visible blocker | `osc_progress` |
   | `working`, `done`, `idle`, `error` | a visible-blocker rule | that screen `blocked` | `screen` |
   | `working`, `done`, `idle`, `error` | a rule with `overrides_program_status = true` | that screen result | `screen` |
   | `working` | anything else | `working` | `osc_progress` |

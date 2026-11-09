@@ -642,9 +642,10 @@ evaluate it. The `status` object (printed first by the human output) names
 what decided the activity: `state_source`, whether a program-status record is
 held, the release gate (`open` or `closed` with its reason, the runtime release
 and `authority_from`), whether the worker answered the probe (`unanswered,
-screen only` when the gate is declared and closed) and the age of the last
-applied evidence. A closed gate with an unknown release is the state of a
-session reattached after a daemon restart. Empty text is meaningful: for example,
+screen only` when the gate is declared and closed; `not reported` when the
+release is unknown) and the age of the last applied evidence. A closed gate
+with an unknown release is the state of a session reattached after a daemon
+restart: its worker may still answer the probe, and its records are ignored. Empty text is meaningful: for example,
 `last_non_empty_above_prompt_box` is empty without a complete prompt box. The
 preview waits for accepted agent/configuration changes before rendering.
 `session_detection_response_too_large` means the complete diagnostic would

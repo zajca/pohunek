@@ -1279,6 +1279,9 @@ fn render_detection_status(status: &protocol::DetectionStatus) -> String {
     );
     let probe = match (status.probe_answered, gate.declared && !gate.open) {
         (true, _) => "answered",
+        (false, true) if gate.reason == protocol::AuthorityGateReason::VersionUnknown => {
+            "not reported (release unknown), screen only"
+        }
         (false, true) => "unanswered, screen only",
         (false, false) => "unanswered",
     };
