@@ -823,41 +823,18 @@ impl ProtocolError {
         )
     }
 
-    /// The canonical `runtime/assistant_bundle_mismatch` error for remote
-    /// materialization that returned a bundle from a different binary build.
-    ///
-    /// Code is stable: `assistant_bundle_mismatch`.
-    #[must_use]
-    pub fn assistant_bundle_mismatch(
-        expected_version: &str,
-        expected_hash: &str,
-        actual_version: &str,
-        actual_hash: &str,
-    ) -> Self {
-        Self::new(
-            ErrorClass::Runtime,
-            "assistant_bundle_mismatch",
-            format!(
-                "remote assistant bundle {actual_version}/{actual_hash} does not match local binary {expected_version}/{expected_hash}"
-            ),
-            Some("upgrade the older pohunek side so the CLI and daemon use the same assistant knowledge bundle".to_owned()),
-        )
-    }
-
     /// The canonical `runtime/assistant_package_missing` error.
     ///
     /// Raised by `assistant.materialize` when the assistant context package is
     /// not installed, not selected or disabled on the daemon host. Code is
     /// stable: `assistant_package_missing`.
     #[must_use]
-    pub fn assistant_package_missing(package_id: &str, detail: &str) -> Self {
+    pub fn assistant_package_missing(package_id: &str, detail: &str, remedy: &str) -> Self {
         Self::new(
             ErrorClass::Runtime,
             "assistant_package_missing",
             format!("the assistant context package `{package_id}` cannot be used: {detail}"),
-            Some(format!(
-                "install the assistant package on that host with `pohunek plugin install <archive> --sha256 <digest>` (id `{package_id}`; see the plugin-assistant release), then retry"
-            )),
+            Some(remedy.to_owned()),
         )
     }
 

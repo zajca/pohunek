@@ -15,15 +15,20 @@ export type AssistantMaterializeResult = {
    */
   snapshot_path: string;
   /**
-   * Pohunek version that produced the embedded bundle.
+   * Version of the assistant context package that holds the bundle.
    */
   version: string;
   /**
-   * Stable content hash for the materialized bundle.
+   * Archive digest of the assistant context package.
    */
   content_hash: string;
   /**
    * Allowlisted concept metadata used by callers to build the assistant TOC.
    */
   concepts: Array<ConceptMeta>;
+  /**
+   * Text of the assistant prompt contract (`assistant/system.md`) read from
+   * the bundle. Empty from a daemon that predates the package-based bundle.
+   */
+  prompt_contract?: string;
 };

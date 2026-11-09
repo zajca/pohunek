@@ -8,4 +8,9 @@ export type AssistantMaterializeParams = {
    * Launch-metadata snapshot JSON to persist beside the materialized bundle.
    */
   snapshot: string;
+  /**
+   * Caller-chosen idempotency key: a repeat under the same key keeps the
+   * first snapshot and returns the same snapshot path.
+   */
+  request_id?: string;
 };

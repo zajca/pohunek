@@ -332,10 +332,7 @@ async fn create_session(
     let Some(request_id) = params.client_request_id.as_deref() else {
         return attempt(config, params, options).await;
     };
-    let resume = ResumeHint {
-        request_id,
-        resumable: !is_remote(config),
-    };
+    let resume = ResumeHint { request_id };
     let started = tokio::time::Instant::now();
     let deadline = session_new_request_deadline(params, options.request_timeout);
     let reserve = DEFAULT_REQUEST_TIMEOUT.min(deadline / 2);
@@ -413,10 +410,6 @@ const RECORDED_CODES: [&str; 2] = [
 /// back.
 struct ResumeHint<'a> {
     request_id: &'a str,
-    /// A new process renders the same opening prompt under the id, so the daemon
-    /// replays. A remote daemon picks a different snapshot path for every launch,
-    /// so only the retry inside the launch can replay there.
-    resumable: bool,
 }
 
 impl ResumeHint<'_> {
@@ -432,7 +425,6 @@ impl ResumeHint<'_> {
         error.msg = format!("{} (request id `{}`)", error.msg, self.request_id);
         let resume = self.recover_text();
         let recorded = RECORDED_CODES.contains(&error.code.as_str());
-        let conflict = !self.resumable && error.code == protocol::SESSION_REQUEST_CONFLICT_CODE;
         error.recover = match (unknown, recorded, error.recover.take()) {
             (true, _, Some(own)) => Some(format!(
                 "{own}; if the daemon created the session anyway, {resume}"
@@ -441,11 +433,6 @@ impl ResumeHint<'_> {
             (true, _, None) | (false, true, None) => {
                 Some(format!("the daemon may have created the session: {resume}"))
             }
-            (false, false, Some(own)) if conflict => Some(format!(
-                "{own}; on a remote host a repeated launch of the same request lands here, \
-                 because its opening prompt differs: `details.session_id` names the session the \
-                 first request created, so do not start another"
-            )),
             (false, false, own) => own,
         };
         AssistantError::Protocol(error)
@@ -453,23 +440,12 @@ impl ResumeHint<'_> {
 
     fn recover_text(&self) -> String {
         let id = self.request_id;
-        if self.resumable {
-            format!(
-                "rerun the same command with `--request-id {id}` to get it back (the daemon \
-                 answers with the same session, or with `session_request_in_progress` while it \
-                 is still being created); the request, target and `--meta` flags and the agent \
-                 must be unchanged"
-            )
-        } else {
-            format!(
-                "a new launch cannot replay request id `{id}` on a remote host, because the \
-                 opening prompt names a snapshot path that host picks for every launch: if the \
-                 first request created the session, rerunning with `--request-id {id}` answers \
-                 `session_request_conflict` and its `details.session_id` names the session; \
-                 otherwise the rerun creates it. You can also look for it with `pohunek session \
-                 list`, filtered by the `--meta` key you passed"
-            )
-        }
+        format!(
+            "rerun the same command with `--request-id {id}` to get it back (the daemon \
+             answers with the same session, or with `session_request_in_progress` while it \
+             is still being created); the request, target and `--meta` flags and the agent \
+             must be unchanged"
+        )
     }
 }
 

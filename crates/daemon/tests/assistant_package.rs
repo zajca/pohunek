@@ -350,6 +350,13 @@ async fn a_disabled_package_is_refused_until_it_is_enabled_again() {
         .expect_err("a disabled package is not used");
     assert_eq!(error.code, "assistant_package_missing", "{error:?}");
     assert!(error.msg.contains("disabled"), "{error:?}");
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("plugin enable")),
+        "{error:?}"
+    );
 
     exchange(
         &mut client,

@@ -198,7 +198,7 @@ impl PackageService {
             .await
             .map_err(|error| {
                 warn!(%error, "a context package lookup task failed");
-                ContextError::NotInstalled
+                ContextError::LookupFailed
             })?
     }
 

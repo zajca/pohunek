@@ -947,9 +947,15 @@ pub enum ContextError {
     /// No package of the id is installed and selected.
     #[error("the context package is not installed")]
     NotInstalled,
+    /// A package of the id is installed but none is selected.
+    #[error("the context package is installed but not selected")]
+    NotSelected,
     /// The selected package is disabled.
     #[error("the context package is disabled")]
     Disabled,
+    /// The lookup task failed before it answered.
+    #[error("the context package lookup failed")]
+    LookupFailed,
     /// The package root or descriptor cannot be used.
     #[error("the context package cannot be used: {0}")]
     Rejected(PackageRejection),
@@ -994,7 +1000,17 @@ impl PackageSource {
             .find(|record| {
                 &record.identity().id == id && state.selected(id) == Some(record.digest())
             })
-            .ok_or(ContextError::NotInstalled)?;
+            .ok_or_else(|| {
+                if state
+                    .packages()
+                    .iter()
+                    .any(|record| &record.identity().id == id)
+                {
+                    ContextError::NotSelected
+                } else {
+                    ContextError::NotInstalled
+                }
+            })?;
         if !record.enabled() {
             return Err(ContextError::Disabled);
         }

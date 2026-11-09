@@ -803,7 +803,7 @@ fn conflict() -> ProtocolError {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_remote_launch_that_loses_its_reply_is_not_told_to_rerun_under_its_key() {
+async fn a_remote_launch_that_loses_its_reply_is_told_to_rerun_under_its_key() {
     let daemon = Daemon::start_remote(vec![Step::Drop, Step::Drop]).await;
     let inhibitor = AutoAdvanceInhibitor::new();
     let prepared = prepare(&daemon, None).await.expect("the launch prepares");
@@ -821,48 +821,8 @@ async fn a_remote_launch_that_loses_its_reply_is_not_told_to_rerun_under_its_key
     assert!(error.msg.contains(&key), "{}", error.msg);
     let recover = error.recover.expect("a recovery hint");
     assert!(
-        recover.contains(&format!(
-            "cannot replay request id `{key}` on a remote host"
-        )),
-        "{recover}"
-    );
-    assert!(recover.contains("session_request_conflict"), "{recover}");
-    assert!(
-        !recover.contains("rerun the same command"),
-        "a remote rerun renders another opening prompt, so it is not a replay: {recover}"
-    );
-    inhibitor.release().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_remote_conflict_points_at_the_session_the_first_request_created() {
-    let daemon = Daemon::start_remote(vec![Step::Error(conflict())]).await;
-    let inhibitor = AutoAdvanceInhibitor::new();
-    let prepared = prepare(&daemon, Some("remote-key"))
-        .await
-        .expect("the launch prepares");
-
-    let error = protocol_error(
-        finished(start(&daemon, prepared))
-            .await
-            .expect_err("the daemon refuses the repeat"),
-    );
-
-    assert_eq!(error.code, protocol::SESSION_REQUEST_CONFLICT_CODE);
-    assert_eq!(daemon.keys().len(), 1, "a typed error is not retried");
-    let recover = error.recover.expect("a recovery hint");
-    assert!(
-        recover.starts_with("use a new client_request_id"),
-        "the daemon's own recovery stays first: {recover}"
-    );
-    assert!(
-        recover.contains("on a remote host a repeated launch of the same request lands here"),
-        "{recover}"
-    );
-    assert_eq!(
-        error.details.and_then(|details| details.session_id),
-        Some(protocol::SessionId(SESSION_ID.to_owned())),
-        "the conflict names the session the first request created"
+        recover.contains(&format!("--request-id {key}")),
+        "the daemon derives the snapshot path from the id, so a remote rerun replays: {recover}"
     );
     inhibitor.release().await;
 }

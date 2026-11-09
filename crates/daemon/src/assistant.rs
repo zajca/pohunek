@@ -40,12 +40,35 @@ pub async fn materialize_assistant(
         ProtocolError::materialization_failed("assistant package id", &error.to_string())
     })?;
     let context = packages.context_dir(id).await.map_err(|error| {
-        let detail = match &error {
-            ContextError::NotInstalled => "it is not installed and selected".to_owned(),
-            ContextError::Disabled => "it is disabled".to_owned(),
-            ContextError::Rejected(rejection) => rejection.to_string(),
+        let (detail, remedy) = match &error {
+            ContextError::NotInstalled => (
+                "it is not installed".to_owned(),
+                format!(
+                    "install the assistant package on that host with `pohunek plugin install <archive> --sha256 <digest>` (id `{ASSISTANT_CONTEXT_PACKAGE_ID}`; see the plugin-assistant release), then retry"
+                ),
+            ),
+            ContextError::NotSelected => (
+                "it is installed but not selected".to_owned(),
+                format!(
+                    "select it with `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID}` (see `pohunek plugin list`), then retry"
+                ),
+            ),
+            ContextError::Disabled => (
+                "it is disabled".to_owned(),
+                format!(
+                    "enable it with `pohunek plugin enable {ASSISTANT_CONTEXT_PACKAGE_ID}` (see `pohunek plugin list`), then retry"
+                ),
+            ),
+            ContextError::LookupFailed => (
+                "the package lookup failed".to_owned(),
+                "retry the launch; if it repeats, inspect the daemon log".to_owned(),
+            ),
+            ContextError::Rejected(rejection) => (
+                rejection.to_string(),
+                "run `pohunek plugin doctor` for the package, then reinstall it (`plugin uninstall --remove-modified`, then `plugin install ... --sha256 <digest>`)".to_owned(),
+            ),
         };
-        ProtocolError::assistant_package_missing(ASSISTANT_CONTEXT_PACKAGE_ID, &detail)
+        ProtocolError::assistant_package_missing(ASSISTANT_CONTEXT_PACKAGE_ID, &detail, &remedy)
     })?;
     let paths = paths.clone();
     tokio::task::spawn_blocking(move || {
@@ -60,6 +83,7 @@ pub async fn materialize_assistant(
             ProtocolError::assistant_package_missing(
                 ASSISTANT_CONTEXT_PACKAGE_ID,
                 &format!("its prompt contract is unusable: {err}"),
+                "install a package version whose assistant/system.md has the required Safety and Navigation sections",
             )
         })?;
         let launch_id = match params.request_id.as_deref() {

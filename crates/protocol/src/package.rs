@@ -590,8 +590,8 @@ pub struct PackageInspectResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<CommandInfo>>", optional))]
     pub commands: Vec<CommandInfo>,
-    /// Set when the descriptor loaded and exports commands only, so a missing
-    /// `runtime` is not a fault. A reply without it says nothing about the
+    /// Set when the descriptor loaded and exports no runtime (commands only,
+    /// or a context directory), so a missing `runtime` is not a fault. A reply without it says nothing about the
     /// descriptor.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]

@@ -895,13 +895,16 @@ dir = "bundle"   # package-relative directory that holds the files
 - The package serves no runtime and declares no command, so it installs by
   digest (`--sha256`) or `link`, never through the catalog, needs no command
   opt-in, and never appears among the supported agents.
-- The daemon re-verifies the package root against its archive digest on every
-  use of the files, and uses only the selected, enabled package of the id.
+- The daemon verifies the package root against its archive digest each time it
+  resolves the files for a request, and uses only the selected, enabled package
+  of the id. The files are then read by path: a session that already started
+  keeps reading them, and uninstalling the package removes them under it.
 - For the assistant, `dir` holds `index.md`, `assistant/system.md` (the prompt
   contract) and the concept files; the daemon answers `assistant.materialize`
   with the directory, its concept index and the contract text, and
   `assistant_package_missing` while no package is installed, selected and
-  enabled.
+  enabled; its recovery names the step that fits the cause (install, select,
+  enable, or reinstall after a modified root).
 
 ## Declaring a version probe
 
