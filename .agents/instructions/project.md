@@ -7,9 +7,9 @@ session registry and public API on each host; one isolated
 (`pohunek`) drives the daemon locally over a Unix socket and remotely over the
 configured overlay address (NetBird by default, Tailscale opt-in). This repository ships no user interface: every GUI,
 web control center, and launcher is a separate client in
-[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). The accepted
-future direction adds an optional trusted team relay without replacing these
-direct owner paths; it is not implemented yet.
+[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). The optional trusted team relay, developed in its own repository
+(`pohunekd/pohunek-relay`), is additive and does not replace these direct owner
+paths.
 
 It is pre-1.0 and experimental: wire shapes, config files, and on-disk metadata
 may change freely. **Do not add backward-compatibility shims** unless asked,
@@ -195,7 +195,7 @@ collection, the enum registry classification, the snapshot comparison, and the
 exhaustive `match` from one variant list. It is a dev-dependency of the daemon
 and the package crate only and must never become a normal dependency of a
 shipped binary (`cargo tree -e normal` for `pohunek`, `pohunekd`,
-`pohunek-sessiond` and `pohunek-relayd` does not list it). A `data_values!`
+and `pohunek-sessiond` does not list it). A `data_values!`
 entry names exactly one variant, `Type::Variant` with an optional `(..)` or
 `{ .. }` tail; an or-pattern or `_` does not compile.
 
@@ -225,17 +225,17 @@ Hard constraints, decided on purpose — respect them in every change:
   external client (`zajca/pohunek-work`) that reaches the owner protocol through
   a private local/NetBird gateway. It is not replaced by the relay and must
   never become a second team-auth or relay-routing authority.
-- **The optional team relay is additive.** The accepted design introduces one
+- **The optional team relay is additive.** The accepted design, kept in the relay repository, introduces one
   trusted Rust `pohunek-relayd` authority for teams, end-user authorization,
   routing, audit, and quotas. Each host remains authoritative for its PTYs,
   processes, worktrees, session origin, and locally approved `HostShare`
   ceilings. The first release trusts collaborators at the host Unix-account
   boundary: relay ACLs constrain relay actions but are not workload isolation;
   [#88](https://github.com/zajca/pohunek/issues/88) owns that later boundary.
-  See the [accepted RFC](../../docs/design/team-relay-control-plane-rfc.md), especially
+  See the [accepted RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md), especially
   its identity, recovery, scheduling, catalog, audit, and dependency sections,
-  and [#85](https://github.com/zajca/pohunek/issues/85); neither the relay binary
-  nor team mode is shipped yet.
+  neither the relay binary
+  nor team mode is shipped with core.
 - **PTY/TUI-first.** Agents run in real terminals (Codex, Claude Code, and the
   pinned local Hermes Agent runtime are first-class). Not a re-rendered control
   plane.
@@ -243,8 +243,7 @@ Hard constraints, decided on purpose — respect them in every change:
   default, Tailscale opt-in), never SSH bridging. Relay
   transport is the separate host-initiated path defined by the accepted RFC.
 - **Core ships no UI.** The deliverables are the daemon (`pohunekd`), the
-  session worker (`pohunek-sessiond`), the CLI (`pohunek`), the relay
-  (`pohunek-relayd`), the Rust crates, and the TypeScript SDK workspace
+  session worker (`pohunek-sessiond`), the CLI (`pohunek`), the Rust crates, and the TypeScript SDK workspace
   (`sdk/ts/`). No GUI, web frontend or backend, desktop launcher, or UI
   packaging belongs here; they live in `zajca/pohunek-work`.
 - **The contract boundary is public contracts only.** A client reaches core

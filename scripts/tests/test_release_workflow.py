@@ -1534,10 +1534,8 @@ class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
         self.assertIsNotNone(loop, "the gate has no shard loop")
         self.assertEqual(loop.group(1).split(), self.partition_shards())
 
-    def test_only_the_relay_db_shard_sees_the_database(self):
-        uses = [m.start() for m in re.finditer(r"POHUNEK_RELAY_TEST_DATABASE_URL", self.gate)]
-        self.assertEqual(len(uses), 1)
-        self.assertIn('[ "$shard" = relay-db ]', self.gate[uses[0] - 120 : uses[0]])
+    def test_no_shard_sees_a_database(self):
+        self.assertNotIn("DATABASE_URL", self.gate)
 
     def test_a_failed_shard_does_not_hide_the_others(self):
         self.assertIn('failed+=("$shard")', self.gate)
@@ -1547,17 +1545,17 @@ class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
 
     def test_every_shard_runs_from_the_archive_after_the_check(self):
         runs = re.findall(r"scripts/test-partitions (.*?) (?:run|check)\b", self.gate)
-        self.assertEqual(len(runs), 3, "the check and the two shard runs")
+        self.assertEqual(len(runs), 2, "the check and the shard run")
         for arguments in runs:
             self.assertRegex(arguments, r'--archive-file "\$(?:archive|RUNNER_TEMP/nextest-archive\.tar\.zst)"')
         self.assertLess(self.gate.index("Verify exhaustive disjoint"), self.gate.index("      - name: Test\n"))
         self.assertLess(self.gate.index("cargo nextest archive"), self.gate.index("Verify exhaustive disjoint"))
 
     def test_the_flaky_summary_reads_the_report_of_each_profile(self):
-        for report in ("heavy/junit.xml", "relay-db/junit.xml", "ci/junit.xml"):
+        for report in ("heavy/junit.xml", "ci/junit.xml"):
             self.assertIn(f"target/nextest/{report}", self.gate)
         junit = (ROOT / ".config" / "nextest.toml").read_text()
-        self.assertIn("[profile.relay-db.junit]", junit)
+        self.assertIn("[profile.ci.junit]", junit)
 
     def test_the_gate_leaves_no_ambient_test_thread_limit(self):
         self.assertNotIn("RUST_TEST_THREADS", self.gate)
@@ -1613,19 +1611,8 @@ class SharedGateTests(ReleaseWorkflowFiles):
         job = self.gate_tests_jobs["tests"]
         self.assertRegex(job + "\n", READ_BLOCK)
         self.assertIn("runs-on: ubuntu-24.04", job)
-        self.assertIn("postgres:17-alpine", job)
-        self.assertIn("POSTGRES_DB: pohunek_test\n", job)
-        self.assertIn('--health-cmd "pg_isready -U postgres -d pohunek_test"', job)
-        # The URL is resolved at step level: the `job` context is not
-        # available in job-level `env`.
-        step = re.search(r"(?m)^      - name: Test\n(?:        .*\n|\n)*", job)
-        self.assertIsNotNone(step)
-        self.assertIn(
-            "          RELAY_DATABASE_URL: postgresql://postgres@127.0.0.1:"
-            "${{ job.services.postgres.ports['5432'] }}/pohunek_test\n",
-            step.group(0),
-        )
-        self.assertNotRegex(job.partition("    steps:\n")[0], r"RELAY_DATABASE_URL")
+        self.assertNotIn("services:", job)
+        self.assertNotIn("postgres", job)
 
     def test_ci_runs_the_gate_in_the_nightly_tier_and_on_a_pull_request_that_changes_it(self):
         block = jobs(self.ci)["release-gate"]

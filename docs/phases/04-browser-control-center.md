@@ -4,7 +4,7 @@
 > behind the shipped owner-only, mesh-local Bun browser backend. It is not the
 > design for the accepted public team relay. The future trusted Rust relay,
 > host-initiated userspace WireGuard path, and multi-team authorization are
-> specified by the [team-relay RFC](../design/team-relay-control-plane-rfc.md)
+> specified by the [team-relay RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md)
 > and [#56](https://github.com/zajca/pohunek/issues/56). The existing Bun
 > backend remains the supported owner-path WebUI after
 > [#86](https://github.com/zajca/pohunek/issues/86) adds a separate team relay

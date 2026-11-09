@@ -71,7 +71,7 @@ class Workspace:
             directory.mkdir(parents=True)
         (self.docs / "offline" / "index.html").write_text("<html></html>\n")
         (self.docs / "manifest.json").write_text("{}\n")
-        for name in ("pohunekd", "pohunek-sessiond", "pohunek-relayd"):
+        for name in ("pohunekd", "pohunek-sessiond"):
             self.executable(name, "#!/bin/sh\nexit 0\n")
         self.executable("pohunek", FAKE_POHUNEK)
         (self.root / "README.md").write_text("readme\n")
@@ -322,11 +322,10 @@ class StageArchiveTest(unittest.TestCase):
         self.assertEqual(staged.read_bytes(), ANCHOR_BYTES)
         self.assertEqual(staged.stat().st_mode & 0o777, 0o644)
 
-    def test_cli_and_relay_archives_carry_no_catalog_anchor(self):
-        for component in ("cli", "relay"):
-            ws = Workspace(self)
-            staging = ws.out / ws.stage(component)
-            self.assertFalse(list(staging.rglob(ANCHOR_NAME)), component)
+    def test_cli_archive_carries_no_catalog_anchor(self):
+        ws = Workspace(self)
+        staging = ws.out / ws.stage("cli")
+        self.assertFalse(list(staging.rglob(ANCHOR_NAME)))
 
     def test_daemon_archive_carries_the_index_channel_unmodified_and_not_executable(self):
         ws = Workspace(self)
@@ -334,11 +333,10 @@ class StageArchiveTest(unittest.TestCase):
         self.assertEqual(staged.read_bytes(), CHANNEL_BYTES)
         self.assertEqual(staged.stat().st_mode & 0o777, 0o644)
 
-    def test_cli_and_relay_archives_carry_no_index_channel(self):
-        for component in ("cli", "relay"):
-            ws = Workspace(self)
-            staging = ws.out / ws.stage(component)
-            self.assertFalse(list(staging.rglob(CHANNEL_NAME)), component)
+    def test_cli_archive_carries_no_index_channel(self):
+        ws = Workspace(self)
+        staging = ws.out / ws.stage("cli")
+        self.assertFalse(list(staging.rglob(CHANNEL_NAME)))
 
     def test_a_daemon_archive_without_the_index_channel_is_refused_before_staging(self):
         ws = Workspace(self)
@@ -375,13 +373,11 @@ class StageArchiveTest(unittest.TestCase):
         self.assertFalse((staging / "packaging").exists())
 
     def test_every_archive_carries_the_release_pages(self):
-        for component in ("cli", "daemon", "relay"):
+        for component in ("cli", "daemon"):
             ws = Workspace(self)
             staging = ws.out / ws.stage(component)
             for page in RELEASE_PAGES:
                 self.assertTrue((staging / page).is_file(), (component, page))
-            if component == "relay":
-                self.assertTrue((staging / "pohunek-relayd").is_file())
 
     def test_a_missing_release_page_is_refused_before_staging(self):
         ws = Workspace(self)

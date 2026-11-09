@@ -323,16 +323,10 @@ fn a_manifest_that_omits_a_required_binary_is_refused() {
 
 #[test]
 fn another_components_archive_is_refused() {
-    for component in ["cli", "relay"] {
-        let fixture = Fixture::new();
-        seal_manifest(&fixture.archive, &host_target(), component);
-        let output = fixture.run(&[], &[]);
-        assert_refused_untouched(
-            &fixture,
-            &output,
-            &format!("this is the {component} archive"),
-        );
-    }
+    let fixture = Fixture::new();
+    seal_manifest(&fixture.archive, &host_target(), "cli");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "this is the cli archive");
 }
 
 #[test]

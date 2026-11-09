@@ -49,7 +49,6 @@ const ATTESTATION_SUFFIX: &str = ".json";
 pub(crate) enum Component {
     Cli,
     Daemon,
-    Relay,
 }
 
 impl Component {
@@ -57,7 +56,6 @@ impl Component {
         match self {
             Self::Cli => "pohunek-cli",
             Self::Daemon => "pohunek-daemon",
-            Self::Relay => "pohunek-relay",
         }
     }
 }

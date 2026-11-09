@@ -599,8 +599,8 @@ def junit_step_seconds(document,
     nextest runs tests in parallel, so the *sum* of JUnit testcase times is
     not wall-clock time; only the CI step's own start/end timestamps give a
     comparable test share. Patterns match the workflow's test steps by exact
-    substring ("Run fast shard", the bounded-concurrency heavy/relay-db
-    steps, "Documentation tests"); install steps that merely mention nextest
+    substring ("Run fast shard", the bounded-concurrency heavy
+    step, "Documentation tests"); install steps that merely mention nextest
     never match. Jobs without a matching step map to None.
     """
     durations = {}

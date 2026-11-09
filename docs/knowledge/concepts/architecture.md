@@ -178,28 +178,15 @@ previous version), and the core
 crates they link are a pinned, not a stable, API. Issue and PR providers live
 only in `zajca/pohunek-work`.
 
-Pohunek has an [optional team-relay design](team-relay.md) with an implemented
-reduced foundation. The PostgreSQL-backed relay provides fencing, recovery,
-protected initial provisioning, generic OIDC browser/device authentication,
-bounded HTTPS account and credential lifecycle, account linking, and Google and
-GitHub team admission with bounded revalidation. Standalone and direct overlay
-modes remain independent. Host links, `HostShare`, session origin, routing,
-attach, team administration, and the team WebUI remain deferred. The relay has
-no local mode; its future team WebUI and any owner-path browser client use
-separate explicit API adapters, credentials, state, and origins.
+The optional team relay lives in its own repository ([team-relay](team-relay.md));
+this build ships no relay surface. Standalone and direct overlay modes remain
+independent. Host links, `HostShare`, session origin, routing, attach, team
+administration, and the team WebUI remain deferred. The relay has no local
+mode; its future team WebUI and any owner-path browser client use separate
+explicit API adapters, credentials, state, and origins.
 
-Protocol v4 and the typed host/team API will arrive only through their linked
-implementation issues. The current bounded foundation API and native relay CLI
-do not imply a host or team surface. Assistants must not infer future commands
-or fields from the RFC; verify currently available behavior in
-`docs/public-api.md` through the [source map](../assistant/source-map.md).
-
-The planned relay contract is normative only in the RFC sections on identity,
-recovery, scheduling, resources, snapshots, catalog, audit, and dependencies.
-Its implementation path is completed reduced #85 → #107/#108/#92 → complete
-#72 → #70/#82/#83/#84/#71 → #86 and #87, then
-post-release #73/#88. The first relay release trusts collaborators at the host
-Unix-account boundary; its ACLs do not provide workload isolation.
+Assistants must not infer relay commands or fields; verify currently available
+behavior in `docs/public-api.md` through the [source map](../assistant/source-map.md).
 
 Related concepts:
 

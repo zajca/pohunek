@@ -201,8 +201,7 @@ newest push waits behind it. Merges that land during a run share the next run,
 which tests the newest of them, so `main` gets a verdict without merge pauses;
 a merge that a later push replaced while pending gets no run of its own. A
 daily 05:00 UTC nightly run includes the main tier, the release rehearsal, the
-cold rebuild comparison in the `macos-15` package job, and the nightly-only
-relay database suite. Nightly CI evidence requires that job's install, upgrade,
+cold rebuild comparison in the `macos-15` package job. Nightly CI evidence requires that job's install, upgrade,
 and uninstall step and its cold rebuild step. macOS 15 is the only macOS version
 CI runs; macOS 14 is a supported build target (deployment target 14.0) without
 CI acceptance (#1224). Manual
@@ -216,7 +215,7 @@ runs its `cargo xtask affected ci` against the head
 lockfile judges only the pull requests after it lands, and a path the base
 rules do not know selects every test. `scripts/test-partitions plan
 --selection` turns the selection into the fast shards to start and whether
-the heavy and relay DB jobs run. The archive stays the whole workspace; each
+the heavy job runs. The archive stays the whole workspace; each
 job runs its shard narrowed to the selection (`run <shard> --selection`, which
 is `-E '(<shard>) and (<filterset>)'`), and the `test selection check` job
 proves with `check --selection` that the planned shards hold every selected
@@ -307,8 +306,8 @@ workflow files included, then re-creates the change on a maintainer branch and
 dispatches that branch (`tier=nightly` for the release rehearsal and the other
 nightly-only jobs, `tier=main` for the rest), or relies on a later run on
 `main`. The post-merge `main` run is the main tier and includes `cargo-udeps`;
-the release rehearsal, the release gate, `test selection audit (G3)` and
-`tests (relay DB, PostgreSQL)` get their evidence only from the scheduled
+the release rehearsal, the release gate and `test selection audit (G3)`
+get their evidence only from the scheduled
 nightly run or a `tier=nightly` dispatch of `main` or of a maintainer branch.
 `scripts/release` requires that evidence on the release commit and, when it
 pushes the candidate, dispatches the missing tier itself. Fork-provided workflow YAML runs only in the approved, read-only
@@ -445,16 +444,11 @@ the measurement path behind
 The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI compiles the workspace test binaries
 once in `build-tests` (`cargo nextest archive --workspace --all-features`) and
-runs four fast matrix shards, the heavy job, and the relay DB job from that
+runs three fast matrix shards and the heavy job from that
 archive, independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
-all discovered tests, including ignored ones, are assigned exactly once. The
-`relay-db` shard needs the real worker binary and a disposable PostgreSQL URL in
-`POHUNEK_RELAY_TEST_DATABASE_URL` (`python3 scripts/test-partitions run
-relay-db`); `cargo t`/`cargo ti` do not. Without that URL the relay
-PostgreSQL tests fail locally by design: they are CI-only evidence from the
-`tests (relay DB, PostgreSQL)` job, not regressions.
+all discovered tests, including ignored ones, are assigned exactly once.
 `cargo tw` remains unfiltered at four test processes. Archive jobs install only
 `cargo-nextest` (no rust-cache; the heavy job adds a Clippy toolchain and
 `cargo fetch --locked` for `xtask::dependency_policy`) and call
@@ -469,9 +463,6 @@ so an archive runs from any absolute path (the CI test jobs check out into
 `pohunek-sessiond` is missing, so daemon tests never run without their worker.
 `build-bins` remains a separate default-feature build for the SDK job, because
 the archive's `--all-features` build enables cli's `test-util`.
-In CI, the Postgres-backed
-relay job is gated by a paths filter and does not run (its PostgreSQL service
-never starts) for non-relay changes.
 
 The CI workflow's PR/macOS path ownership and tier conditions are guarded by
 `scripts/tests/test_ci_tiers.py`; run
@@ -603,9 +594,9 @@ right in both layouts; `crates/xtask/tests/exact_filter_guard.rs` refuses a
 literal `--exact` in integration test code.
 
 Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
-`profile.default`, so every profile inherits it. Only `heavy` and `relay-db`
-retry (`count = 2`, fixed 1s delay): PTY, socket, worker-process, and
-PostgreSQL fixtures. `ci`/`fast` never retry, because a fast test that fails
+`profile.default`, so every profile inherits it. Only `heavy`
+retries (`count = 2`, fixed 1s delay): PTY, socket, and worker-process
+fixtures. `ci`/`fast` never retry, because a fast test that fails
 intermittently is a bug; `package` (the runtime package jobs' real-upstream
 tests) never retries either, because a failure there is a behavior change of
 the locked release or a bug. A test that passes only on a retry is reported as
@@ -625,7 +616,7 @@ and leaves no load behind even when it is killed. Build first
 Never start a detached load or test process (`nohup`, a trailing `&`, `setsid`,
 `disown`) and never load every host CPU; a process you started is yours to stop
 before you finish. Before push, `scripts/stress-changed-tests` stress-runs the
-tests a diff adds or changes in the heavy, relay-db and macOS lanes (the
+tests a diff adds or changes in the heavy and macOS lanes (the
 "Stress the changed tests" step of the gates skill); a failure there is a FLAKY
 result, never retried to green.
 
@@ -715,7 +706,7 @@ cargo xtask package affected --json          # official runtime packages a chang
 cargo t -p pohunek-daemon                     # fast tests in one crate (alias takes -p)
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
-python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/relay/cli/relay-db/heavy
+python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/cli/heavy
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
 python3 scripts/test-partitions --archive-file A check-macos   # 14-package macOS set: exact lane/tier/bucket partition
@@ -869,9 +860,7 @@ installer for the pin), `scripts` (`python3`; optional `shellcheck` and, on
 Linux, `dash`, checked by presence only because it has no version flag),
 `macos-lint` (the `aarch64-apple-darwin` rustup target and `zig` for
 `scripts/darwin-check`; `not-applicable` on macOS, which lints natively),
-`relay-db` (`POHUNEK_RELAY_TEST_DATABASE_URL`, reported only as set or
-`unset`, never its value, and removed from the environment of every command
-the script runs) and `native` (on Linux a systemd user manager in `running` or
+and `native` (on Linux a systemd user manager in `running` or
 `degraded` state, whose row names the per-command `POHUNEK_SYSTEMD_E2E=1`
 opt-in the suites run with; on macOS the launchd `gui/<uid>` domain; a suite
 the host cannot run is `unavailable`, or `ci-only` with the CI job that runs
@@ -880,8 +869,7 @@ reported once, under the first selected path. Each path also names its
 checks, which the script lists and never runs: `focused` commands for the
 inner loop (docs `cargo xtask docs check`; rust `cargo xtask affected` and `cargo t -p <crate>`; sdk the Bun
 gates; scripts the `scripts/tests` unittests; macos-lint
-`scripts/darwin-check`; relay-db `python3 scripts/test-partitions run
-relay-db`; native the binary build, then the six real-systemd suites on
+`scripts/darwin-check`; native the binary build, then the six real-systemd suites on
 Linux, or the `pohunek-platform`, `pohunek-daemon` and `pohunek-cli` tests
 that drive launchd on macOS), a `final` pointer to the gate set in
 `.agents/skills/gates/SKILL.md` and this guide (never a copy), and `ci-only`

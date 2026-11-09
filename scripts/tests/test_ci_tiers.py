@@ -59,8 +59,6 @@ MACOS_PATH_OWNERSHIP = {
             ".config/nextest.toml",
             ".github/actions/hermes-test-python/**",
             ".github/actions/setup-uv/**",
-            "crates/relay-client/**",
-            "crates/relay-protocol/**",
             "Cargo.lock",
             ".cargo/**",
             ".github/workflows/ci.yml",
@@ -113,8 +111,6 @@ MACOS_PATH_OWNERSHIP = {
             "crates/overlay/**",
             "crates/overlay-tailscale/**",
             "crates/prompt/**",
-            "crates/relay-client/**",
-            "crates/relay-protocol/**",
         },
     },
     "hermes-compatibility-macos": {
@@ -187,8 +183,6 @@ MACOS_PATH_OWNERSHIP = {
             "crates/overlay-tailscale/**",
             "crates/hostcheck/**",
             "crates/knowledge/**",
-            "crates/relay-client/**",
-            "crates/relay-protocol/**",
         },
     },
 }
@@ -461,7 +455,7 @@ class CiTierWorkflowTests(unittest.TestCase):
             with self.subTest(event=event):
                 self.assertEqual(cancel.group(1) == event, cancels)
 
-    def test_macos_package_runs_on_macos_15_and_nightly_adds_cold_rebuild_and_relay_suite(self):
+    def test_macos_package_runs_on_macos_15_and_nightly_adds_cold_rebuild(self):
         jobs = workflow_jobs()
         package = jobs["macos-package"]
         condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", package)
@@ -491,11 +485,6 @@ class CiTierWorkflowTests(unittest.TestCase):
         assert cold_rebuild is not None
         self.assertIn("github.event_name == 'schedule'", cold_rebuild.group(1))
         self.assertIn("inputs.tier == 'nightly'", cold_rebuild.group(1))
-
-        relay = jobs["integration-relay"]
-        self.assertIn("github.event_name == 'schedule'", relay)
-        self.assertIn("inputs.tier == 'nightly'", relay)
-        self.assertIn("needs.changes.outputs.relay == 'true'", relay)
 
     def test_reviewed_macos_input_inventory_has_pr_or_main_tier_coverage(self):
         jobs = workflow_jobs()
@@ -790,7 +779,6 @@ REHEARSAL_FILTER_EXCEPTIONS = {
     "crates/cli/**": "product crate; pull-request CI builds and tests it",
     "crates/daemon/**": "product crate; pull-request CI builds and tests it",
     "crates/session-worker/**": "product crate; pull-request CI builds and tests it",
-    "crates/relay/**": "product crate; pull-request CI builds and tests it",
     "docs/knowledge/**": (
         "read by `cargo xtask docs site`; `docs check` runs the same bundle build "
         "on every pull request, and the site renderer is in crates/xtask, which "
@@ -1375,7 +1363,7 @@ class FailFastTests(unittest.TestCase):
 
     def test_every_required_job_ends_with_the_step_and_its_exact_condition(self):
         direct = self.direct_jobs()
-        self.assertGreater(len(direct), 30)
+        self.assertGreaterEqual(len(direct), 30)
         for name, job in direct.items():
             with self.subTest(job=name):
                 steps = list(job_steps(job).items())
@@ -1396,7 +1384,7 @@ class FailFastTests(unittest.TestCase):
                 relocated.add(name)
             elif re.search(r"(?m)^ +sparse-checkout:", job):
                 sparse.add(name)
-        self.assertGreaterEqual(relocated, {"fast-tests", "integration", "integration-relay", "test-selection-check"})
+        self.assertGreaterEqual(relocated, {"fast-tests", "integration", "test-selection-check"})
         self.assertEqual(sparse, {"test-duplicates"})
         for name, job in self.direct_jobs().items():
             steps = job_steps(job)
@@ -2377,9 +2365,8 @@ TEST_VERDICT = "test-selection-verdict"
 NARROWED_TEST_JOBS = {
     "fast-tests": ("fast_shards", "[]"),
     "integration": ("heavy", "false"),
-    "integration-relay": ("relay_db", "false"),
 }
-EVERY_FAST_SHARD = ["core", "daemon", "relay", "cli"]
+EVERY_FAST_SHARD = ["core", "daemon", "cli"]
 # The condition under which a job may read the selection and narrow on it.
 NARROWED = (
     "github.event_name == 'pull_request' && needs.test-selection.result == 'success' "
@@ -2498,10 +2485,10 @@ class TestSelectionWiringTests(unittest.TestCase):
     """The Linux test jobs narrow only on a narrowed selection of a pull request."""
 
     def runs(self, job, *, event="pull_request", cancelled=False, build="success",
-             selection="success", plan=None, relay_changed=True):
+             selection="success", plan=None):
         return bool(evaluate_needs_expression(
             job_condition(job), event=event, cancelled=cancelled,
-            changes={"relay": "true" if relay_changed else "false"},
+            changes={},
             results={"build-tests": build, TEST_SELECTOR: selection},
             outputs={TEST_SELECTOR: plan or {}},
         ))
@@ -2540,7 +2527,7 @@ class TestSelectionWiringTests(unittest.TestCase):
         outputs = block(job, "outputs", indent=4)
         for name in ("mode", "docs_only", "script_tests", "sdk_gates"):
             self.assertIn(f"      {name}: ${{{{ steps.select.outputs.{name} }}}}\n", outputs)
-        for name in ("fast_shards", "heavy", "relay_db"):
+        for name in ("fast_shards", "heavy"):
             self.assertIn(f"      {name}: ${{{{ steps.plan.outputs.{name} }}}}\n", outputs)
         # Only the ci.yml step writes `narrowed`; no head script sets it.
         self.assertIn("      narrowed: ${{ steps.narrow.outputs.narrowed }}\n", outputs)
@@ -2677,8 +2664,6 @@ class TestSelectionWiringTests(unittest.TestCase):
                 ("pull_request", True, "success", "success", {output: "true"}, False),
             )
             for event, cancelled, build, selection, plan, runs in scenarios:
-                if job == "integration-relay" and event == "schedule":
-                    continue
                 with self.subTest(job=job, event=event, cancelled=cancelled, build=build,
                                   selection=selection, plan=plan):
                     self.assertEqual(
@@ -2686,11 +2671,6 @@ class TestSelectionWiringTests(unittest.TestCase):
                                   selection=selection, plan=plan),
                         runs,
                     )
-        # The relay DB job keeps its paths filter: a selection only narrows it.
-        self.assertFalse(self.runs("integration-relay", relay_changed=False,
-                                   plan={"relay_db": "true", **NARROWED_PLAN}))
-        self.assertTrue(self.runs("integration-relay", event="schedule", relay_changed=False,
-                                  plan={"relay_db": "false", **NARROWED_PLAN}))
 
     def test_the_fast_shards_are_the_planned_ones_or_every_shard(self):
         matrix = block(workflow_jobs()["fast-tests"], "matrix", indent=6)
@@ -2734,7 +2714,7 @@ class TestSelectionWiringTests(unittest.TestCase):
             ("pull_request", "success", "success", NARROWED_PLAN, True),
             # Whatever test jobs the selection starts.
             ("pull_request", "success", "success",
-             {"fast_shards": "[]", "heavy": "false", "relay_db": "false", **NARROWED_PLAN}, True),
+             {"fast_shards": "[]", "heavy": "false", **NARROWED_PLAN}, True),
             ("pull_request", "success", "success", {"narrowed": "false"}, False),
             ("pull_request", "success", "failure", NARROWED_PLAN, False),
             ("push", "success", "success", NARROWED_PLAN, False),
@@ -2756,7 +2736,7 @@ class TestSelectionWiringTests(unittest.TestCase):
 
         def fails(results, plan=None, selection="success", event="pull_request", narrowed=True):
             every = {"build-tests": "success", "fast-tests": "success", "integration": "success",
-                     "integration-relay": "success", TEST_SELECTOR: selection,
+                     TEST_SELECTOR: selection,
                      TEST_CHECK: "success" if narrowed else "skipped"}
             outputs = {**(NARROWED_PLAN if narrowed else {}), **(plan or {})}
             return bool(evaluate_needs_expression(
@@ -2767,12 +2747,10 @@ class TestSelectionWiringTests(unittest.TestCase):
         self.assertFalse(fails({}))
         self.assertFalse(fails({}, narrowed=False))
         self.assertFalse(fails({}, event="push", narrowed=False))
-        self.assertFalse(fails({"integration-relay": "skipped"}))
         self.assertFalse(fails({"fast-tests": "skipped"}, {"fast_shards": "[]"}))
         self.assertFalse(fails({"integration": "skipped"}, {"heavy": "false"}))
-        self.assertFalse(fails({"fast-tests": "skipped", "integration": "skipped",
-                                "integration-relay": "skipped"},
-                               {"fast_shards": "[]", "heavy": "false", "relay_db": "false"}))
+        self.assertFalse(fails({"fast-tests": "skipped", "integration": "skipped"},
+                               {"fast_shards": "[]", "heavy": "false"}))
         for results, plan, selection, event, narrowed in (
             ({"build-tests": "failure", "fast-tests": "skipped", "integration": "skipped"}, {},
              "success", "pull_request", True),
@@ -2794,8 +2772,6 @@ class TestSelectionWiringTests(unittest.TestCase):
             ({"integration": "skipped"}, {}, "success", "pull_request", True),
             ({"integration": "skipped"}, {"heavy": "false"}, "skipped", "pull_request", True),
             ({"integration": "failure"}, {"heavy": "false"}, "success", "pull_request", True),
-            ({"integration-relay": "failure"}, {}, "success", "pull_request", True),
-            ({"integration-relay": "cancelled"}, {}, "success", "pull_request", True),
             # The selection check must pass on every narrowed selection.
             ({TEST_CHECK: "skipped"}, {}, "success", "pull_request", True),
             ({TEST_CHECK: "failure"}, {}, "success", "pull_request", True),
@@ -3146,7 +3122,7 @@ class ArchiveToolchainTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertTrue(setup, f"{name} runs archive tests without setup-rust")
                 self.assertLess(min(setup), min(runs))
-        self.assertTrue({"fast-tests", "integration", "integration-relay",
+        self.assertTrue({"fast-tests", "integration",
                          "test-selection-audit"} <= set(checked), checked)
 
 
@@ -3373,15 +3349,6 @@ class SelectionAuditTests(unittest.TestCase):
         self.assertIn(f"    name: {name}\n", workflow_jobs()[AUDIT_JOB])
         self.assertIn(name, config["required_jobs"]["nightly"])
         self.assertNotIn(name, config["required_jobs"]["main"])
-
-    def test_the_audit_runs_the_relay_database_tests_against_the_relay_service(self):
-        jobs = workflow_jobs()
-        self.assertEqual(block(jobs[AUDIT_JOB], "services", 4),
-                         block(jobs["integration-relay"], "services", 4))
-        run = job_steps(jobs[AUDIT_JOB])["Run every package from its own sparse tree"]
-        self.assertIn(
-            "POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:"
-            "${{ job.services.postgres.ports['5432'] }}/pohunek_test", run)
 
     def test_the_audit_runs_the_archive_with_the_selector_of_its_tree(self):
         steps = job_steps(workflow_jobs()[AUDIT_JOB])

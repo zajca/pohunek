@@ -63,11 +63,10 @@ const CONSUMER_SCRIPT = `
 import { Client } from "@pohunek/sdk";
 import * as browser from "@pohunek/sdk/browser";
 import * as protocol from "@pohunek/protocol";
-import * as relay from "@pohunek/protocol/relay";
 import * as testkit from "@pohunek/testkit";
 import fixture from "@pohunek/protocol/fixtures/session-info-minimal.json" with { type: "json" };
 
-const surfaces = { sdk: Client, browser, protocol, relay, testkit };
+const surfaces = { sdk: Client, browser, protocol, testkit };
 for (const [name, surface] of Object.entries(surfaces)) {
   if (surface === undefined || (typeof surface === "object" && Object.keys(surface).length === 0)) {
     throw new Error("empty import surface: " + name);
@@ -197,7 +196,6 @@ import {
 } from "@pohunek/sdk";
 import * as browser from "@pohunek/sdk/browser";
 import { MAX_CONTROL_LINE_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION } from "@pohunek/protocol";
-import * as relay from "@pohunek/protocol/relay";
 import * as testkit from "@pohunek/testkit";
 import fixture from "@pohunek/protocol/fixtures/session-info-minimal.json" with { type: "json" };
 
@@ -218,7 +216,6 @@ assert(Client.defaultOptions().requestTimeoutMs > 0, "default request timeout is
 assert(Client.defaultOptions().connectTimeoutMs === Client.defaultOptions().requestTimeoutMs, "connect and request timeouts do not default to the same value");
 assert(Number.isInteger(PROTOCOL_VERSION) && MIN_PROTOCOL_VERSION <= PROTOCOL_VERSION, "protocol versions are inconsistent");
 assert(MAX_CONTROL_LINE_BYTES > 0, "protocol line limit is not positive");
-assert(typeof relay.API_VERSION === "number", "relay constants did not load");
 assert(typeof testkit.startFixtureDaemon === "function", "testkit does not export startFixtureDaemon");
 assert(typeof fixture === "object" && fixture !== null, "fixture did not load");
 assert(!("startTestRelay" in testkit), "the testkit root entry exposes the Bun-only relay");
@@ -261,12 +258,10 @@ const TS_CONSUMER_SOURCE = `
 import { Client, connectLocal, nextRequestId, type Request } from "@pohunek/sdk";
 import { Client as BrowserClient } from "@pohunek/sdk/browser";
 import { PROTOCOL_VERSION, type SessionInfo } from "@pohunek/protocol";
-import { API_VERSION } from "@pohunek/protocol/relay";
 import { startFixtureDaemon } from "@pohunek/testkit";
 import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 
 export const version: number = PROTOCOL_VERSION;
-export const relayVersion: number = API_VERSION;
 export const requestId: string = nextRequestId("probe");
 export const sameClient: typeof Client = BrowserClient;
 export const dial: typeof connectLocal = connectLocal;

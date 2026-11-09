@@ -8,9 +8,7 @@ name: Gate tests
 #   evidence check;
 # - ci.yml `release-gate` runs it in the nightly tier and on a pull request
 #   that changes one of its inputs, so a break shows before the next tag.
-# The called workflow holds only `contents: read` and receives no secret. The
-# PostgreSQL service lives in the job because a called workflow cannot use its
-# caller's services.
+# The called workflow holds only `contents: read` and receives no secret.
 
 # The gate stays on ubuntu-24.04 (#1731), never ubuntu-latest, like the release
 # jobs it guards.
@@ -44,19 +42,6 @@ jobs:
       contents: read
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_DB: pohunek_test
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -U postgres -d pohunek_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -166,32 +151,22 @@ jobs:
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" check
 
       # Every shard runs before the step fails, so one red shard does not hide
-      # another. Only the relay-db shard sees the PostgreSQL service, as in CI.
+      # another.
       - name: Test
         shell: bash
-        env:
-          # Resolved at step level: the `job` context is not available in
-          # job-level `env`, where it makes the whole workflow invalid.
-          RELAY_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
         run: |
           set -uo pipefail
           archive="$RUNNER_TEMP/nextest-archive.tar.zst"
           failed=()
-          for shard in core daemon relay cli relay-db heavy; do
+          for shard in core daemon cli heavy; do
             rm -rf target/nextest
             echo "::group::shard $shard"
-            if [ "$shard" = relay-db ]; then
-              POHUNEK_RELAY_TEST_DATABASE_URL="$RELAY_DATABASE_URL" python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
-            else
-              python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
-            fi
+            python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
             echo "::endgroup::"
             echo "disk: after shard $shard"
             df -h / || true
             if [ "$shard" = heavy ]; then
               python3 scripts/junit-flaky-summary --label "$shard" target/nextest/heavy/junit.xml
-            elif [ "$shard" = relay-db ]; then
-              python3 scripts/junit-flaky-summary --label "$shard" target/nextest/relay-db/junit.xml
             else
               python3 scripts/junit-flaky-summary --label "$shard" target/nextest/ci/junit.xml
             fi

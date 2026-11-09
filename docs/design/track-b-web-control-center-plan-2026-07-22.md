@@ -4,7 +4,7 @@
 > mesh-local transparent Bun backend and remains documented here as current
 > behavior. This is not the accepted public team relay. The future trusted Rust
 > relay and its multi-team clients follow the
-> [team-relay RFC](team-relay-control-plane-rfc.md) and
+> [team-relay RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md) and
 > [#56](https://github.com/zajca/pohunek/issues/56). The Bun backend remains the
 > supported owner-path WebUI; [#86](https://github.com/zajca/pohunek/issues/86)
 > adds a separate team relay surface rather than replacing it.

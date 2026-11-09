@@ -21,7 +21,7 @@ here comes from issue state and sub-issue counts, not from Project board
 columns. The per-phase documents under [`docs/phases/`](phases/) and
 [`docs/design/`](design/) record product and architecture rationale.
 
-This repository is the core: daemon, session worker, CLI, relay, Rust crates,
+This repository is the core: daemon, session worker, CLI, Rust crates,
 and the TypeScript SDK workspace. It ships no UI. The native desktop app, the
 mesh-local browser control center, the rofi/sway launchers, and issue/PR
 providers live in [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work)
@@ -45,7 +45,7 @@ Last reconciled: 2026-10-14. A section that names an earlier date was last check
 | **Universal Assistant (P0–P11)** | `pohunek assistant`, the embedded knowledge bundle, the hook write gate, `cargo xtask eval`, and `cargo xtask docs site` with offline docs in each release tarball. | [`design/universal-assistant-plan.md`](design/universal-assistant-plan.md) |
 | **Track S — Public API + SDKs** | S.1 Rust SDK (`crates/client`); S.2 versioned public API with version negotiation ([`public-api.md`](public-api.md)); S.3 TypeScript SDK (`sdk/ts/`) with `ts-rs` generated types, a CI drift check, and a WebSocket transport tested against the loopback relay in `@pohunek/testkit`. | `crates/client`, `sdk/ts/` |
 | **Track H — Hermes runtime and operator plugin** | Local Hermes Agent runtime (verified on `0.20.0`, accepted up to the next major) in Pohunek-owned PTYs, exact native resume, and the operator plugin for a selected Hermes profile with an external access policy. Both are served only by the official `pohunek.runtime.hermes` package (#147, Linux x86_64; Apple Silicon archive since #929). | [operator guide](knowledge/guides/hermes-operator.md), [runbook](runbooks/hermes-operator-plugin.md), [migration](migrations/hermes-operator-plugin.md) |
-| **Track B / Track D — browser control center and native desktop app** | Browser M1 (multi-host sessions workspace, notifications inbox, in-browser terminal) and the Iced desktop control plane are clients maintained in `zajca/pohunek-work`. Core keeps the shared contracts: the protocol, both SDKs, `crates/prompt` (`pohunek prompt render`), opaque `link.*` session metadata, and `session new --input`. The browser M2/M3 plan to grow into a public multi-user backend is superseded by the [team-relay RFC](design/team-relay-control-plane-rfc.md). | [`phases/04`](phases/04-browser-control-center.md), [Track B plan](design/track-b-web-control-center-plan-2026-07-22.md), [Track D design](design/track-d-native-app.md) |
+| **Track B / Track D — browser control center and native desktop app** | Browser M1 (multi-host sessions workspace, notifications inbox, in-browser terminal) and the Iced desktop control plane are clients maintained in `zajca/pohunek-work`. Core keeps the shared contracts: the protocol, both SDKs, `crates/prompt` (`pohunek prompt render`), opaque `link.*` session metadata, and `session new --input`. The browser M2/M3 plan to grow into a public multi-user backend is superseded by the [team-relay RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md). | [`phases/04`](phases/04-browser-control-center.md), [Track B plan](design/track-b-web-control-center-plan-2026-07-22.md), [Track D design](design/track-d-native-app.md) |
 | **Test performance milestone** | Milestone "Test performance" (13/13 closed) and project 3 (13/13 Done). | [milestone 1](https://github.com/zajca/pohunek/milestone/1) |
 
 **Public API stability.** There is no compatibility promise before 1.0. SDK
@@ -116,7 +116,7 @@ are open and follow the chain in section 3.
 ### Relay dark factory — [#185](https://github.com/zajca/pohunek/issues/185) (milestone E)
 
 Unattended manager/auditor delegation over the team relay, built as a relay
-client. [RFC](design/relay-dark-factory-rfc.md). **0/8.** FS0
+client. [RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/relay-dark-factory-rfc.md) (relay repository). **0/8.** FS0
 [#233](https://github.com/zajca/pohunek/issues/233) (amend the team relay RFC
 for `task.*`) is in progress; FS2–FS8
 ([#234](https://github.com/zajca/pohunek/issues/234)–[#240](https://github.com/zajca/pohunek/issues/240))
@@ -192,30 +192,17 @@ owner web control center are tracked in `zajca/pohunek-work`.
 
 ### Optional team relay — [#56](https://github.com/zajca/pohunek/issues/56) (project 2)
 
-One trusted, public, PostgreSQL-backed `pohunek-relayd`; hosts initiate an
-embedded userspace WireGuard tunnel; the relay adds principals, teams, session
-ACLs, routing, aggregation, audit, and quotas. Standalone and direct NetBird
-operation stay first-class. [RFC](design/team-relay-control-plane-rfc.md).
-**4/14.** Landed: overlay abstraction (#69), architecture and threat model
-(#80), host identity and single-relay state (#81), relay foundation and
-authentication (#85); outside the sub-issue tree, RFC reconciliation (#91),
-Google/GitHub admission (#92), and account linking (#107). Open: enrollment and
-WireGuard transport [#72](https://github.com/zajca/pohunek/issues/72) (all
-native blockers closed), the v4 host link
-[#70](https://github.com/zajca/pohunek/issues/70), HostShare
-[#82](https://github.com/zajca/pohunek/issues/82), visibility and sharing
-[#83](https://github.com/zajca/pohunek/issues/83), snapshots
-[#84](https://github.com/zajca/pohunek/issues/84), routing core
-[#71](https://github.com/zajca/pohunek/issues/71), team surfaces
-[#86](https://github.com/zajca/pohunek/issues/86), operational hardening
-[#87](https://github.com/zajca/pohunek/issues/87), and post-release
-[#73](https://github.com/zajca/pohunek/issues/73) and
-[#88](https://github.com/zajca/pohunek/issues/88). Team administration API
-[#108](https://github.com/zajca/pohunek/issues/108) is open outside the epic and
-outside project 2. The relay stays in core for now and later moves, with the
-team web UI of #86, into a dedicated repository (owner decision on #415,
-2026-10-02); the trigger and cross-repository reuse are open in
-[#417](https://github.com/zajca/pohunek/issues/417).
+The relay lives in its own repository, [`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay), together
+with its open issues (the old core issue numbers #56, #70–#73, #82–#88, #108,
+#185, #233–#240, #417, #1575, #1699 and #1836 redirect there). One trusted,
+public, PostgreSQL-backed `pohunek-relayd`; hosts initiate an embedded userspace
+WireGuard tunnel; the relay adds principals, teams, session ACLs, routing,
+aggregation, audit, and quotas. Standalone and direct NetBird operation stay
+first-class. [RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md).
+Landed in core: overlay abstraction (#69), architecture and threat model (#80),
+host identity and single-relay state (#81); the relay foundation, Google/GitHub
+admission, and account linking (#85, #92, #107) landed in the relay code that
+moved out.
 
 ### UI move to `zajca/pohunek-work` — [#415](https://github.com/zajca/pohunek/issues/415)
 

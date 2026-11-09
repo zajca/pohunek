@@ -3,7 +3,7 @@
 #
 # usage: stage-archive <component> <version> <target> <bindir> <docs-dir> <output-dir>
 #
-# <component> is cli, daemon, or relay. <bindir> holds the built binaries;
+# <component> is cli or daemon. <bindir> holds the built binaries;
 # <docs-dir> is the `cargo xtask docs site` output with `offline/` and
 # `manifest.json`.
 # The staging directory <output-dir>/<name> is created
@@ -37,7 +37,6 @@ output=$6
 case $component in
     cli) prefix=pohunek-cli ;;
     daemon) prefix=pohunek-daemon ;;
-    relay) prefix=pohunek-relay ;;
     *) fail "unsupported component: $component" ;;
 esac
 case $version in
@@ -60,7 +59,7 @@ for extra in $release_files; do
 done
 # Only the daemon archive carries the catalog trust anchor and the plugin
 # index channel file, so they stay out of `release_files` (shared with the CLI
-# and relay archives).
+# archive).
 anchor_file=runtime-catalog-anchor.json
 anchor_source=packaging/$anchor_file
 channel_file=plugin-index-channel.json
@@ -103,9 +102,6 @@ case $component in
         # daemon resolves the plugin index endorser from it.
         cp "$channel_source" "$staging/$channel_file"
         chmod 0644 "$staging/$channel_file"
-        ;;
-    relay)
-        copy_binary pohunek-relayd
         ;;
 esac
 

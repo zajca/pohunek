@@ -10,7 +10,7 @@ agent-facing operating guide for the same commands.
 Every command accepts `--host <name>` (default `local`), and nearly all of
 them `--json` for machine-readable output.
 
-The commands without `--json` are `attach`, `completions`, `daemon start`, `prompt render`, `relay login`, `relay logout`, `relay resume-rotation`, `relay rotate` and `service lock`.
+The commands without `--json` are `attach`, `completions`, `daemon start`, `prompt render` and `service lock`.
 
 Session targets are `<session-id>` or
 `<host>/<session-id>`. A discovered route uses
@@ -136,11 +136,6 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
-| `pohunek relay login --origin <origin> [--ca-file <file>]` | Sign in to an optional team relay with the OIDC device flow and store the credential in the OS keyring. `--origin` is the exact HTTPS origin; `--ca-file` adds a public CA certificate for a privately operated relay. |
-| `pohunek relay status --origin <origin> [--ca-file <file>] [--json]` | Show the account that the stored credential of that origin authenticates. |
-| `pohunek relay logout --origin <origin> [--ca-file <file>]` | Revoke the stored credential, then delete it from the keyring. |
-| `pohunek relay rotate --origin <origin> [--ca-file <file>] [--expires-in-seconds <n>] [--overlap-seconds <n>]` | Replace the stored credential with explicit expiry and overlap limits. |
-| `pohunek relay resume-rotation --origin <origin> [--ca-file <file>]` | Reconcile an interrupted rotation using its original policy and request. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
 `--preflight-budget <SECONDS>` (1 to 300, default 20) sets the probe and reference-check budget of this release's upgrade preflight only. A rollback judges with the previous release's daemon, which does not take the flag, so the rollback's preflight always uses the default budget.

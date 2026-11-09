@@ -2,284 +2,41 @@
 type: Concept
 id: concept/team-relay
 title: Optional team relay
-description: Implemented relay foundation and deferred architecture for sharing explicitly approved host capacity through a trusted multi-team relay.
+description: The team relay lives in its own repository; this page states what Pohunek core keeps for it and how a host behaves with no relay configured.
 source_kind: manual
 intents: [setup, project, update, debug, help]
 ---
 
 # Optional Team Relay
 
-Status: the reduced relay foundation is implemented. It has PostgreSQL-backed
-lease fencing and recovery, protected stopped-lifecycle initial Owner and
-service-account provisioning, generic OIDC browser and device login, bounded
-HTTPS account and credential lifecycle, provider-neutral account linking,
-Google and GitHub team admission with bounded revalidation, and a
-native HTTPS/keyring CLI. It has no host link, team client or WebUI, routing,
-attach path, host enrollment, or complete team-administration API. Current
-Pohunek releases otherwise use public protocol v4 through an owner-only Unix
-socket or a direct configured overlay such as NetBird. A browser transport
-that bridges WebSockets to a daemon is an external client concern, not the team
-relay described here.
+The optional team relay is developed in its own private repository,
+`pohunekd/pohunek-relay`. It is not part of a Pohunek release: core ships no
+relay server (`pohunek-relayd`), no relay client library, and no relay CLI
+command group: invoking `relay` as a `pohunek` subcommand is an
+unknown-command usage error.
 
-## Local foundation provisioning
+## What a host needs from the relay
 
-`pohunek-relayd migrate` and `pohunek-relayd bootstrap` are protected local
-procedures. Bootstrap binds exactly one configured issuer and owner-private
-stable OIDC subject to an active infrastructure principal. It grants no team,
-session, or implicit administrative permission.
+Nothing. Current Pohunek releases use public protocol v4 through an owner-only
+Unix socket or a direct configured overlay such as NetBird or Tailscale. A host
+with no relay configured behaves identically: `pohunek host list`,
+`pohunek session list`, and `pohunek doctor` do not depend on a relay. A
+browser transport that bridges WebSockets to a daemon is an external client
+concern, not the team relay.
 
-While the relay is stopped, `pohunek-relayd provision` requires the same
-owner-private identity file, an explicit team name, service-account name,
-RFC 3339 expiry, and a new absolute `--credential-output` path. Its parent
-directory must be owner-owned mode 0700; the artifact is created once as a
-regular owner-owned mode 0600 file with no symlink following, file fsync, and
-parent-directory fsync. The artifact contains the sole service credential and
-is never printed, logged, returned in generic JSON output, or redelivered.
+## What core keeps
 
-The procedure explicitly assigns the bootstrap infrastructure principal as the
-new team's Owner, then creates one team-scoped service account with no grants.
-It creates an expiring service credential and records audit and independently
-signed witness coordinates. The command's normal result contains only durable
-IDs and expiry. A collision, unsafe artifact, owner mismatch, active serving
-lease, stale recovery state, or failed audit stops the operation.
+- Stable host identity, one exact principal-or-team owner, checked revisions,
+  and host-local governance (approval keys, quarantine, signed transfers). See
+  [Host governance](host-governance.md).
+- The `RelayId`, relay principal, and team identifier types in the protocol
+  crate, because host-local governance records name them.
+- The `LaunchSource::RelayProfile` seam in the daemon: a relay-selected launch
+  resolves only a profile the owner approved locally, and a profile that
+  declares `secret_env` slots is refused with `secret_env_missing`.
 
-An artifact written before a witness binding is an unbound orphan: it must not
-be adopted or deleted by a retry. The operator must resolve that collision
-manually after verifying it is safe. Once the witness binds the artifact hash,
-an exact retry may resume the stopped lifecycle and verify the same durable
-rows; it never creates a second credential or emits another secret.
+## Where the rest lives
 
-The shipped #81 host-local foundation is deliberately narrower. It persists a
-stable opaque host identity, one exact principal-or-team owner, at most one
-local enrollment record, checked revisions, quarantine state, and local
-transfer coordinates. Protocol v4 exposes only safe read-only inspection of
-that state. It does not connect to a relay, run OIDC, create a WireGuard key,
-publish a relay API, or provide a team UI.
-
-The owner path remains supported alongside the relay. An external owner-path
-browser client bridges WebSockets into the existing owner protocol.
-`pohunek-relayd` has no local mode; its future team WebUI will use a separate
-typed API, credential set, state adapter, and origin. Presentation components may be shared, but there is no
-cross-mode fallback or session aggregation.
-
-The accepted design adds one optional public Rust `pohunek-relayd` authority.
-Standalone and direct overlay operation remain first-class and never depend on
-the relay. A host may use either owner mode, enroll with the relay, or use both
-at the same time after enrollment is implemented. An overlay (NetBird or Tailscale) is neither replaced
-nor required by the relay.
-
-## Foundation authentication and native credentials
-
-The running relay serves a bounded HTTPS API for generic OpenID Connect browser
-Authorization Code with PKCE and device authorization. Browser and bearer
-authentication remain separate. Login transaction state is bound to its issuer,
-redirect URI, nonce, verifier, cookie binding, expiry, and recovery generation;
-browser and device transactions share one bounded pending-login capacity.
-
-The API exposes only account, human credential, and service-account credential
-lifecycle needed by this foundation. `pohunek relay login`, `status`, `logout`,
-`rotate`, and `resume-rotation` use an HTTPS-only native client and origin-bound
-OS-keyring storage. Credentials expire, are delivered once, and are never put in
-URLs, routine output, or logs. A keyring write failure attempts compensating
-revocation.
-
-The OIDC login itself is provider-neutral; Keycloak-brokered Google and GitHub
-team admission with bounded external-eligibility revalidation was delivered by
-[#92](https://github.com/zajca/pohunek/issues/92). Complete team administration
-is deferred to [#108](https://github.com/zajca/pohunek/issues/108).
-
-## Account linking
-
-An account can hold more than one OIDC identity so the same person reaches the
-same relay account through different providers. A relay identity is exactly the
-issuer plus the immutable subject. Email address, display name, Google `hd`,
-GitHub login and every other provider profile attribute are attributes of an
-identity, never a key: two accounts with the same email address stay two
-accounts, and no profile data can merge them.
-
-Linking is an explicit authenticated transaction, not a lookup. Both sides prove
-themselves: the caller must be a current relay actor with a stable OIDC identity,
-and the new identity must be proven through the same Authorization Code with PKCE
-or device authorization rules that a login uses. A service account has no OIDC
-identity and cannot link one. The transaction is completable only through the
-channel that opened it: a browser transaction by the same browser session through
-the registered callback, a device transaction by the same bearer credential
-through its bounded poll. An account has at most one open link transaction, and
-each one expires.
-
-The relay serves linking over HTTPS as start, poll, status, cancel and unlink
-operations on the account's own links. There is no `pohunek relay` subcommand for
-it, and no team WebUI. Safe status reads report the transaction's channel, state,
-revision, source and linked identity coordinates, account-link generation, and
-timestamps. One-use possession material is delivered once to the caller and kept
-only as a keyed digest, so a lost value cannot be re-read and a transaction
-cannot be re-armed; the caller cancels it and starts a new one.
-
-Every link and unlink takes effect on current authority immediately. Completing a
-link advances the account's account-link generation. That generation is the
-coordinate every sensitive decision re-checks, so an in-flight transaction bound
-to the previous value is no longer usable and must be started
-again. An unlink removes the identity, revokes the credentials and browser sessions
-that came from it, cancels the account's pending link transactions, and advances
-the account generation in the same audited transaction. An account cannot remove
-its last identity, because it would then be unable to authenticate at all;
-removing the final identity means deprovisioning the principal.
-
-Safety rules a user should know:
-
-- A link changes who can sign in as the account. Only link an identity you
-  control yourself, at a provider you trust for that account.
-- An identity already linked to another account is refused rather than moved. A
-  collision means someone else's account holds that identity; resolve the
-  ownership question instead of retrying.
-- Unlinking signs out that identity everywhere at once. Any CLI credential or
-  browser session obtained through it stops working immediately, so keep a
-  working second identity before removing one.
-- Unlinking is not a ban. It removes that identity's authority over the account,
-  but the same issuer and subject can sign in again and gets a brand-new
-  principal with no team, so it authorizes nothing and cannot reach the account
-  it left. Barring an identity from the relay is a separate administrative
-  decision.
-- A cancelled, expired or completed transaction is terminal. Nothing revives it:
-  not a retry, not a restore, not a cached provider session, not provider profile
-  data.
-- Recovery quarantine blocks link changes and cancels pending transactions. Wait
-  until the relay leaves quarantine rather than retrying against a stale
-  recovery generation.
-- Never paste a link's one-use possession value into a chat, an issue, a log or a
-  URL. It proves possession on its own for as long as the transaction is open.
-
-## Topology and connection direction
-
-After the host-link work lands, `pohunekd` will embed the host connector. It will
-initiate a userspace WireGuard tunnel
-to the relay's public UDP endpoint and then initiates every control and attach
-TCP stream inside that tunnel. The relay never dials a host, and neither side
-needs a kernel WireGuard interface or `CAP_NET_ADMIN`. One host can have at most
-one active relay enrollment. Human CLI authorization and host enrollment use
-OIDC device flow; browser login uses Authorization Code with PKCE. There is no
-loopback login fallback.
-
-The planned transport has a pinned BoringTun/smoltcp evaluation profile.
-Padding, connectivity, MTU, rekey, NAT, idle, buffer, timer, privilege, and
-exact-version claims remain evidence to verify, not shipped capabilities or test
-results. RFC §10 assigns the contract and #72 owns implementation. Protocol v4
-will reuse typed NDJSON operations and separate raw attach streams; there is no
-v4 compatibility shim for that relay path.
-
-## Ownership and sharing
-
-A host has exactly one registered owner: a principal or a team. The shipped
-host-local record already stores that opaque owner without resolving relay users
-or memberships. The later relay lifecycle will let a same-UID local host
-operator confirm an exact, short-lived transfer proposal; the daemon will
-durably change the owner, sign the outcome, and suspend every share before the
-relay conditionally updates its projection. An enrolled host may later be
-shared with multiple teams through independent `HostShare` records.
-The relay is multi-tenant and scopes every lookup, grant, cache entry, and audit
-record to a team before authorization.
-
-A team administrator may request a share, but the request grants nothing until
-the same-UID local host operator approves it on behalf of the registered owner.
-Each revisioned, default-deny share can
-limit operations, registered projects and canonical worktree roots,
-owner-authored agent profiles, concurrent sessions, terminal access, resource
-usage, and future container or VM execution backends. Reversible suspension or
-terminal revocation removes relay access immediately without stopping existing
-sessions. A revoked `HostShareId` is never reused; a later approval gets a new
-ID and cannot republish sessions carrying the revoked origin.
-
-The first relay release trusts collaborators at the host Unix-account boundary.
-Relay API ACLs restrict relay actions but do not isolate commands or hostile
-workloads running under the daemon owner. #88 owns profile-backed container and
-VM isolation after release. RFC §12 defines immutable approved resources,
-revalidation, and session origin; this concept does not define a second resource
-or authorization contract.
-
-The daemon authenticates the enrolled relay and enforces the local share and
-session-origin ceiling. It does not know or authorize end users, service
-accounts, groups, roles, or session ACLs. Those belong exclusively to the
-relay. Principal identity may reach the daemon only as bounded attribution
-metadata and is never an authorization input.
-
-## Session boundary
-
-Session origin is immutable. Local and direct-overlay sessions are never
-relay-visible or relay-controllable and cannot later be published into a
-share. Only sessions created through an active `HostShare` can use the relay
-path. The host owner can still manage relay-created sessions through an owner
-path.
-
-Every active team member can see only that a relay-created team session exists.
-Metadata, terminal observation, input, lifecycle operations, sharing, and
-removal require relay-side permission. The creator and built-in team Owner and
-Admin roles receive expanded authority. Custom roles and grants can apply to
-human principals, service accounts, and groups. Service credentials are
-expiring and rotatable; they contain no authorization scope, and the relay
-stores only a keyed digest.
-
-## Trust, persistence, and recovery
-
-The relay process and its operator are trusted for transient terminal plaintext
-and the full authority of all active shares. A compromised relay can exercise
-every permission those shares allow. Application RBAC prevents an ordinary
-infrastructure-administrator account from reading team sessions, but it cannot
-protect against an operator with process access. Direct-host profiles also run
-under the daemon owner's account and are not hostile-workload isolation;
-container and VM isolation remains separate future work.
-
-The implemented relay foundation stores its identity, authentication,
-credentials, recovery state, and structured audit metadata in PostgreSQL. It
-fails stopped on fencing, database, witness, audit, or recovery failure. #87
-supplies operational retention and load evidence. PTY output,
-input, prompts, terminal snapshots, file contents, and raw secrets are never
-persisted by the relay or included in its logs or audit records. RFC §19 defines
-recovery generation, while §17 defines catalog retention, audit, and admission.
-
-Recovery uses one host-scoped subscription and the relay must discard its live
-cache after a gap, overflow, epoch change, malformed event, or reconnect. The
-ordered-writer, bounded in-flight, cancellation, fairness, snapshot installation,
-and convergence rules are in RFC §§11 and 16. A snapshot is not offline history.
-Relay outages do not stop host sessions or affect local and overlay owner
-operation; revoked-share sessions continue permanently as owner-only.
-
-## Planned unattended factory extension (design only)
-
-The accepted relay dark factory RFC (`docs/design/relay-dark-factory-rfc.md`,
-[#185](https://github.com/zajca/pohunek/issues/185)) adds an unattended
-Manage–Execute–Audit mode above this relay design; it is not implemented and
-ships no relay surface yet. It adds task-layer ACLs and delegation budgets,
-attention escalation to human principals, and — in its 2026-10-08 amendment —
-six contracts: durable client work items, a client acceptance policy,
-host-enforced human input control (`task.input_control`), protected
-audit-reserve accounting, the versioned FactorySpec run manifest, and bounded
-progress diagnostics. Factory task and run state stays client-owned; the
-relay persists only bounded, content-free metadata inside the classification
-rules above. The relay RFC reconciliation is tracked by
-[#233](https://github.com/zajca/pohunek/issues/233); factory RFC section 3 maps
-the affected contracts. These are design obligations, not shipped capabilities.
-
-## Implementation references
-
-The complete normative contract is in
-`docs/design/team-relay-control-plane-rfc.md`, especially its identity,
-recovery, scheduling, resource, snapshot, catalog, audit, and dependency
-sections; use the
-[source map](../assistant/source-map.md) to locate it in a source checkout. The
-umbrella is [#56](https://github.com/zajca/pohunek/issues/56); implementation is
-split among completed host identity [#81](https://github.com/zajca/pohunek/issues/81),
-the reduced relay foundation [#85](https://github.com/zajca/pohunek/issues/85),
-account linking [#107](https://github.com/zajca/pohunek/issues/107), verified
-Keycloak-brokered external evidence [#92](https://github.com/zajca/pohunek/issues/92),
-team administration [#108](https://github.com/zajca/pohunek/issues/108), then
-transport [#72](https://github.com/zajca/pohunek/issues/72), protocol v4
-[#70](https://github.com/zajca/pohunek/issues/70), shares
-[#82](https://github.com/zajca/pohunek/issues/82), session authorization
-[#83](https://github.com/zajca/pohunek/issues/83), synchronization
-[#84](https://github.com/zajca/pohunek/issues/84), relay routing
-[#71](https://github.com/zajca/pohunek/issues/71), clients
-[#86](https://github.com/zajca/pohunek/issues/86), operations
-[#87](https://github.com/zajca/pohunek/issues/87), then provider delivery
-[#73](https://github.com/zajca/pohunek/issues/73) and workload isolation
-[#88](https://github.com/zajca/pohunek/issues/88). Until those issues land,
-`docs/public-api.md` is authoritative for shipped v4 behavior.
+The relay RFCs, the relay issues, and the relay code with its history are in
+the relay repository. Closed relay issues remain in the core repository and are
+listed in the relay repository README.

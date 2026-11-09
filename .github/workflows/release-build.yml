@@ -1,6 +1,6 @@
 name: Release build
 
-# Reusable producer half of the release: the Linux CLI, daemon and relay
+# Reusable producer half of the release: the Linux CLI and daemon
 # archives, the official runtime package archives and the TypeScript SDK
 # tarballs, all from the exact commit of the calling run. Called by
 # release.yml (mode `release`, a tag) and by ci.yml (mode `rehearsal`, the
@@ -101,7 +101,7 @@ jobs:
         include:
           # Dynamically linked glibc build (primary target).
           - target: x86_64-unknown-linux-gnu
-            components: cli daemon relay
+            components: cli daemon
           # Fully static musl CLI and daemon builds: self-contained binaries
           # that run on x86_64 Linux regardless of the host glibc version.
           - target: x86_64-unknown-linux-musl
@@ -203,9 +203,6 @@ jobs:
                   --bin pohunekd \
                   --bin pohunek-sessiond
                 ;;
-              relay)
-                cargo build "${build_args[@]}" -p pohunek-relay --bin pohunek-relayd
-                ;;
               *)
                 echo "::error::unsupported release component: $component"
                 exit 1
@@ -291,17 +288,6 @@ jobs:
           path: |
             dist/pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
             dist/pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
-          if-no-files-found: error
-          overwrite: true
-
-      - name: Upload the relay archive
-        if: ${{ contains(matrix.components, 'relay') }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: build-relay-${{ matrix.target }}
-          path: |
-            dist/pohunek-relay-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
-            dist/pohunek-relay-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
           overwrite: true
 

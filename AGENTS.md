@@ -17,8 +17,8 @@ secret-handling policy lives in
 
 Pohunek is an owner-first control plane for durable coding-agent sessions. The
 Rust daemon owns session state, isolated workers own live PTYs, and the CLI and
-versioned SDKs are the public client boundary. The core ships no UI; team relay
-is additive and not implied to be shipped. See [the authoritative architecture](docs/architecture.md)
+versioned SDKs are the public client boundary. The core ships no UI; the team relay
+lives in its own repository (`pohunekd/pohunek-relay`) and is not implied to be shipped. See [the authoritative architecture](docs/architecture.md)
 and [public API](docs/public-api.md).
 
 ## Required instruction routes
@@ -35,8 +35,8 @@ unrelated runbooks.
 - **Any implementation, wire-protocol, CLI, or public contract change**
   (including edits to `docs/public-api.md`, `docs/cli.md`, or `docs/knowledge/`):
   [.agents/instructions/coding.md](.agents/instructions/coding.md) for Rust,
-  security, configuration, protocol ripple, knowledge, CLI completion, and relay
-  constraints.
+  security, configuration, protocol ripple, knowledge, CLI completion, and the
+  host-side relay constraints.
 - **Issue, project, branch, commit, pull request, merge, or release work:**
   [.agents/instructions/workflow.md](.agents/instructions/workflow.md) and the
   [github-workflow skill](.agents/skills/github-workflow/SKILL.md). That skill

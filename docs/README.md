@@ -27,8 +27,8 @@ This directory turns the product idea into implementation-oriented planning.
 
 The shipped protocol v4 product is an **owner-operated personal multi-host
 tool**: durable coding-agent sessions across the owner's machines locally or on
-a NetBird (default) or Tailscale network. The accepted, not-yet-implemented
-[team relay RFC](design/team-relay-control-plane-rfc.md) adds an optional public
+a NetBird (default) or Tailscale network. The optional team relay, developed in its own
+repository ([`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay)), adds a public
 multi-team control plane without replacing either owner path.
 
 - CLI-first; Rust daemon + Rust CLI.
@@ -98,8 +98,8 @@ multi-team control plane without replacing either owner path.
   per-session rights (a guardrail, not a boundary); MCP now, an A2A gateway
   later. Amends the delegated task runs RFC (owner answers, routed asks as the
   addressed answer path, the shared MCP server).
-- [Relay dark factory RFC](design/relay-dark-factory-rfc.md) — accepted:
-  relay authorization, budgets, audit, task projections and escalation for
+- [Relay dark factory RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/relay-dark-factory-rfc.md) — accepted
+  (in the relay repository): relay authorization, budgets, audit, task projections and escalation for
   unattended manager/auditor delegation over the team relay; the factory is a
   client, never relay or daemon logic. Amended 2026-10-08 (design-only):
   protected audit reserves, the versioned FactorySpec run manifest, and a

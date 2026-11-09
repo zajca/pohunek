@@ -32,9 +32,6 @@ Contribution paths (`--path NAME`, repeatable; `rust` when none is given):
 * macos-lint -- `scripts/darwin-check` on a non-macOS host: the rustup target
   `aarch64-apple-darwin` and `zig` (required). A macOS host lints natively
   and needs neither, so there both rows are `not-applicable`.
-* relay-db -- the relay PostgreSQL tests: `POHUNEK_RELAY_TEST_DATABASE_URL`
-  (required), reported only as set or unset; its value is never read beyond
-  that and never printed.
 * native -- the real-supervisor E2E suites. On Linux the real-systemd suites
   need a systemd user manager (the row's detail names the per-command
   `POHUNEK_SYSTEMD_E2E=1` opt-in they are run with); on macOS the launchd
@@ -53,7 +50,7 @@ Each path also names its checks, which the script lists and never runs:
 * final -- a pointer to the final gate set (`.agents/skills/gates/SKILL.md`
   and `.agents/instructions/verification.md`), never a copy of it.
 * ci-only -- a CI job whose run is evidence the path's focused checks on
-  this host do not produce (the relay PostgreSQL job, the macOS SDK and
+  this host do not produce (the macOS SDK and
   platform jobs). It is never reported as run or passed. The other OS's
   native suites are not repeated here: their `ci-only` row names the job.
 
@@ -154,9 +151,6 @@ malformed repository input, or a Python without `tomllib`) and
 never values). Malformed flags keep argparse's own usage error on stderr.
 Without `--json`, the script's own exit-2 messages go to stdout.
 
-`POHUNEK_RELAY_TEST_DATABASE_URL` is removed from the environment of every
-command the script runs, so no child diagnostic quoted into a row can carry
-its value.
 
 Exit status: 0 when every row that counts passes, 1 otherwise, 2 on an
 unsupported `--path`, an internal error under `--json`, or a configuration
@@ -268,11 +262,6 @@ VERSION_TIMEOUT_SECONDS = 30
 
 # The Apple target `scripts/darwin-check` lints; it names the same target.
 DARWIN_TARGET = "aarch64-apple-darwin"
-# Variable the relay PostgreSQL tests read their disposable database from.
-RELAY_DB_VARIABLE = "POHUNEK_RELAY_TEST_DATABASE_URL"
-# Variables never passed to the commands the script runs: a failing
-# command's diagnostic is quoted into the report, and these hold secrets.
-CHILD_ENV_EXCLUDED = (RELAY_DB_VARIABLE,)
 # The real-systemd suites are `#[ignore]`d and opt in per command. The
 # `privileged_` scenarios start a bystander through `sudo` and run in CI only
 # (`POHUNEK_PRIVILEGED_E2E`), so a local run skips them.
@@ -352,7 +341,6 @@ NATIVE_BUILD_COMMAND = (
 # cannot run locally.
 CI_JOB_SYSTEMD = "real systemd supervision"
 CI_JOB_LAUNCHD = "platform contracts (arm64)"
-CI_JOB_RELAY_DB = "tests (relay DB, PostgreSQL)"
 CI_JOB_SDK_MACOS = "SDK workspace (macOS arm64)"
 VERIFICATION_DOC = ".agents/instructions/verification.md"
 GATES_SKILL = ".agents/skills/gates/SKILL.md"
@@ -363,7 +351,7 @@ GATES_SKILL = ".agents/skills/gates/SKILL.md"
 # or changing what a value means, bumps the version.
 SCHEMA = "pohunek.dev-bootstrap"
 SCHEMA_VERSION = 1
-PATHS = ("docs", "rust", "sdk", "scripts", "macos-lint", "relay-db", "native")
+PATHS = ("docs", "rust", "sdk", "scripts", "macos-lint", "native")
 DEFAULT_PATHS = ("rust",)
 ERROR_UNSUPPORTED_PATH = "unsupported-path"
 ERROR_CONFIG = "config-error"
@@ -876,26 +864,6 @@ def macos_lint_tools(root, system):
     ]
 
 
-def relay_db_tools(root, system):
-    """The relay-db path: the disposable PostgreSQL database variable."""
-    return [
-        Tool(
-            name=RELAY_DB_VARIABLE,
-            version_args=(),
-            min_version=None,
-            required=True,
-            probe=check_variable_set,
-            manual=(
-                f"export {RELAY_DB_VARIABLE} pointing at a disposable PostgreSQL "
-                "database, then run `python3 scripts/test-partitions run relay-db` "
-                f"(see the `relay-db` shard in {VERIFICATION_DOC}); "
-                "without it the relay PostgreSQL tests are CI-only evidence "
-                f"(CI job `{CI_JOB_RELAY_DB}`)"
-            ),
-        ),
-    ]
-
-
 def native_tools(root, system):
     """The native path: the real-supervisor suites this host can run."""
     systemd_ci = Tool(
@@ -958,7 +926,6 @@ PATH_TOOLS = {
     "sdk": sdk_tools,
     "scripts": scripts_tools,
     "macos-lint": macos_lint_tools,
-    "relay-db": relay_db_tools,
     "native": native_tools,
 }
 
@@ -1055,20 +1022,6 @@ PATH_CHECKS = {
             "macOS code that scripts/darwin-check only lints",
         ),
     ),
-    "relay-db": (
-        Check(
-            FOCUSED, "python3 scripts/test-partitions run relay-db",
-            f"with {RELAY_DB_VARIABLE} exported to a disposable PostgreSQL "
-            "database; the shard also needs the built worker binary (see the "
-            f"`relay-db` shard in {VERIFICATION_DOC})",
-        ),
-        FINAL_GATES,
-        Check(
-            CI_ONLY, None,
-            f"CI job `{CI_JOB_RELAY_DB}`: the relay PostgreSQL tests, the "
-            "evidence on a host without a disposable database",
-        ),
-    ),
     "native": (
         Check(
             FOCUSED, NATIVE_BUILD_COMMAND,
@@ -1147,11 +1100,7 @@ def cargo_bin_dir(environ):
 
 def child_env(environ):
     """The environment of every command the script runs."""
-    kept = {
-        name: value for name, value in environ.items()
-        if name not in CHILD_ENV_EXCLUDED
-    }
-    return {**kept, **VERSION_ENV}
+    return {**environ, **VERSION_ENV}
 
 
 def run_version(argv, cwd, environ):
@@ -1477,13 +1426,6 @@ def check_rustup_target(tool, host):
         tool, MISSING, path=rustup,
         detail="rustup lists the target as not installed",
     )
-
-
-def check_variable_set(tool, host):
-    """Set or unset only: the value is never read beyond being non-empty."""
-    if host.environ.get(tool.name):
-        return Result(tool, OK, detail="set")
-    return Result(tool, UNSET)
 
 
 def check_hermes_interpreter(tool, host):

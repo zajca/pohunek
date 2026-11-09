@@ -83,15 +83,6 @@ crates/platform/src/supervisor/systemd/unit_file.rs 4
 crates/platform/tests/launchd.rs 11
 crates/platform/tests/process_lineage.rs 1
 crates/platform/tests/systemd.rs 6
-crates/relay-client/tests/https.rs 6
-crates/relay/src/admission/mod.rs 3
-crates/relay/src/auth/parent_integrity_tests.rs 2
-crates/relay/src/auth/service.rs 1
-crates/relay/src/authorization/admin_tests.rs 2
-crates/relay/src/config.rs 2
-crates/relay/src/runtime/tests.rs 1
-crates/relay/src/runtime/tests/ingress.rs 3
-crates/relay/src/server/transport.rs 3
 crates/service-config/tests/service_config.rs 7
 crates/session-worker/src/pty.rs 8
 crates/session-worker/src/server.rs 17

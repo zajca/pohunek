@@ -5,7 +5,7 @@
 > WebSocket transport. References below to `@pohunek/relay` describe that
 > historical package role, not the accepted public team relay. The future Rust
 > `pohunek-relayd` and its client API follow the
-> [team-relay RFC](team-relay-control-plane-rfc.md),
+> [team-relay RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md),
 > [#71](https://github.com/zajca/pohunek/issues/71), and
 > [#86](https://github.com/zajca/pohunek/issues/86). The Bun backend remains the
 > supported owner-path WebUI; #86 adds a separate typed team-relay client.

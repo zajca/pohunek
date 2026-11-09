@@ -95,8 +95,6 @@ SHELLCHECK_VERSION = (
     "website: https://www.shellcheck.net\n"
 )
 ZIG_VERSION = "0.13.0\n"
-# A distinctive fake database URL; it must never reach any output.
-FAKE_DATABASE_URL = "postgresql://sentinel-user:s3cr3t-Pa55@db.invalid:5432/never-print-me"
 
 SYSTEM = platform.system()
 IS_LINUX = SYSTEM == "Linux"
@@ -972,13 +970,13 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.write_bun_config()
         status, doc, _ = self.run_json(
             "--strict", "--path", "docs", "--path", "rust", "--path", "sdk",
-            "--path", "scripts", "--path", "macos-lint", "--path", "relay-db",
+            "--path", "scripts", "--path", "macos-lint",
             "--path", "native",
         )
         self.assertEqual(status, 1, doc)
         self.assertEqual(
             doc["paths"],
-            ["docs", "rust", "sdk", "scripts", "macos-lint", "relay-db", "native"],
+            ["docs", "rust", "sdk", "scripts", "macos-lint", "native"],
         )
         names = [row["name"] for row in doc["rows"]]
         self.assertEqual(len(names), len(set(names)), names)
@@ -995,12 +993,12 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             expected = [
                 "cargo-nextest", "bacon", "hyperfine", "mold", "bun", "dash",
                 "shellcheck", "aarch64-apple-darwin", "zig",
-                "POHUNEK_RELAY_TEST_DATABASE_URL", "systemd-user-manager",
+                "systemd-user-manager",
             ]
         elif IS_DARWIN:
             expected = [
                 "cargo-nextest", "bacon", "hyperfine", "bun", "shellcheck",
-                "POHUNEK_RELAY_TEST_DATABASE_URL", "launchd-gui-domain",
+                "launchd-gui-domain",
             ]
         else:
             self.skipTest("the expected rows cover Linux and macOS hosts")
@@ -1015,7 +1013,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertEqual(doc["result"], "error")
         self.assertEqual(doc["error"], "unsupported-path")
         self.assertIn("'gui'", doc["message"])
-        self.assertIn("rust, sdk, scripts, macos-lint, relay-db, native", doc["message"])
+        self.assertIn("rust, sdk, scripts, macos-lint, native", doc["message"])
         self.assertEqual(doc["rows"], [])
         self.assertEqual(doc["schema"], "pohunek.dev-bootstrap")
         self.assertEqual(doc["version"], 1)
@@ -1293,58 +1291,6 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             output,
         )
 
-    # -- relay-db ------------------------------------------------------------
-
-    def test_relay_db_variable_is_reported_as_set_without_its_value(self):
-        env = {"POHUNEK_RELAY_TEST_DATABASE_URL": FAKE_DATABASE_URL}
-        for args in (("--path", "relay-db"), ("--json", "--path", "relay-db"),
-                     ("--json", "--strict", "--path", "relay-db", "--path", "rust")):
-            with self.subTest(args):
-                status, stdout, stderr = self.run_full(*args, extra_env=env)
-                for fragment in (FAKE_DATABASE_URL, "sentinel-user", "s3cr3t-Pa55",
-                                 "db.invalid", "never-print-me"):
-                    self.assertNotIn(fragment, stdout)
-                    self.assertNotIn(fragment, stderr)
-                self.assertIn("POHUNEK_RELAY_TEST_DATABASE_URL", stdout)
-        status, doc, _ = self.run_json("--path", "relay-db", extra_env=env)
-        self.assertEqual(status, 0, doc)
-        row = doc["rows"][0]
-        self.assertEqual(row["status"], "ok")
-        self.assertEqual(row["detail"], "set")
-        self.assertIsNone(row["version"])
-        self.assertIsNone(row["location"])
-
-    def test_relay_db_value_never_reaches_a_child_diagnostic(self):
-        # A failing tool that echoes the variable: its diagnostic is quoted
-        # into the row, so the script must not hand the value to children.
-        self.write_bun_config()
-        echo = 'echo "db=$POHUNEK_RELAY_TEST_DATABASE_URL" >&2; exit 1'
-        self.write_tool("bun", None, body=echo)
-        self.write_all_tools()
-        self.write_tool("bacon", None, body=echo)
-        env = {"POHUNEK_RELAY_TEST_DATABASE_URL": FAKE_DATABASE_URL}
-        for args in (("--path", "sdk", "--path", "relay-db"),
-                     ("--json", "--path", "sdk", "--path", "relay-db"),
-                     ("--json", "--strict", "--path", "rust")):
-            with self.subTest(args):
-                status, stdout, stderr = self.run_full(*args, extra_env=env)
-                self.assertIn("db=", stdout)
-                for fragment in ("sentinel-user", "s3cr3t-Pa55", "never-print-me"):
-                    self.assertNotIn(fragment, stdout)
-                    self.assertNotIn(fragment, stderr)
-
-    def test_relay_db_variable_unset_or_empty_fails_with_the_fix(self):
-        for env in ({}, {"POHUNEK_RELAY_TEST_DATABASE_URL": ""}):
-            with self.subTest(env):
-                status, doc, _ = self.run_json("--path", "relay-db", extra_env=env)
-                self.assertEqual(status, 1, doc)
-                row = doc["rows"][0]
-                self.assertEqual(row["status"], "unset")
-                self.assertEqual(row["category"], "required")
-                self.assertIn(".agents/instructions/verification.md", row["fix"])
-                self.assertIn("tests (relay DB, PostgreSQL)", row["fix"])
-                self.assertEqual(doc["failing"], ["POHUNEK_RELAY_TEST_DATABASE_URL"])
-
     # -- native ----------------------------------------------------------------
 
     def test_native_suites_this_host_cannot_run_are_never_ok(self):
@@ -1430,9 +1376,8 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
                 "python3 -m unittest discover -s scripts/tests -p test_<name>.py",
             ],
             "macos-lint": ["scripts/darwin-check"],
-            "relay-db": ["python3 scripts/test-partitions run relay-db"],
         }
-        for path in ("docs", "rust", "sdk", "scripts", "macos-lint", "relay-db", "native"):
+        for path in ("docs", "rust", "sdk", "scripts", "macos-lint", "native"):
             with self.subTest(path):
                 checks, doc = self.checks_of(path)
                 self.assertEqual(doc["version"], 1)
@@ -1471,7 +1416,6 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             "rust": [],
             "scripts": [],
             "macos-lint": ["platform contracts (arm64)"],
-            "relay-db": ["tests (relay DB, PostgreSQL)"],
             "native": [],
         }
         if IS_LINUX:
@@ -1529,27 +1473,28 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
     def test_checks_are_listed_for_every_selected_path_whatever_the_result(self):
         # Nothing but rustc and python3 on PATH: not ready, checks still listed,
         # and a pointer shared by two paths appears under each.
-        status, doc, _ = self.run_json("--path", "rust", "--path", "relay-db")
+        self.write_bun_config()
+        status, doc, _ = self.run_json("--path", "rust", "--path", "sdk")
         self.assertEqual(status, 1, doc)
         self.assertEqual(doc["result"], "not-ready")
-        self.assertEqual(
-            [check["path"] for check in doc["checks"]],
-            ["rust", "rust", "rust", "relay-db", "relay-db", "relay-db"],
-        )
+        paths = [check["path"] for check in doc["checks"]]
+        self.assertEqual(paths[:3], ["rust"] * 3)
+        self.assertEqual(set(paths[3:]), {"sdk"})
         finals = [check["path"] for check in doc["checks"] if check["kind"] == "final"]
-        self.assertEqual(finals, ["rust", "relay-db"])
+        self.assertEqual(sorted(set(finals)), ["rust", "sdk"])
 
     def test_human_report_lists_checks_only_for_an_explicit_path(self):
         self.write_all_tools()
+        self.write_bun_config()
         status, default = self.run_script()
         self.assertEqual(status, 0, default)
         self.assertNotIn("checks:", default)
         self.assertNotIn("cargo xtask affected", default)
 
-        status, explicit = self.run_script("--path", "rust", "--path", "relay-db")
+        status, explicit = self.run_script("--path", "rust", "--path", "sdk")
         self.assertEqual(status, 1, explicit)
         # Each path: heading, rows, then its checks; the summary line stays last.
-        rust_block = explicit.split("path rust:\n", 1)[1].split("path relay-db:\n", 1)[0]
+        rust_block = explicit.split("path rust:\n", 1)[1].split("path sdk:\n", 1)[0]
         self.assertIn(
             "  checks:\n"
             "    focused  cargo xtask affected\n"
@@ -1563,17 +1508,9 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         )
         self.assertLess(rust_block.index("ok       cargo-nextest"),
                         rust_block.index("  checks:"))
-        relay_block = explicit.split("path relay-db:\n", 1)[1]
-        self.assertIn(
-            "    focused  python3 scripts/test-partitions run relay-db\n", relay_block
-        )
-        self.assertIn(
-            "    ci-only  CI job `tests (relay DB, PostgreSQL)`: ", relay_block
-        )
-        self.assertTrue(
-            explicit.endswith("dev-bootstrap: failing: POHUNEK_RELAY_TEST_DATABASE_URL\n"),
-            explicit,
-        )
+        sdk_block = explicit.split("path sdk:\n", 1)[1]
+        self.assertIn("    focused  bun install --frozen-lockfile\n", sdk_block)
+        self.assertIn("dev-bootstrap: failing: ", explicit.splitlines()[-1])
 
     def test_error_documents_carry_no_checks(self):
         status, doc, _ = self.run_json("--path", "rust", "--path", "gui")

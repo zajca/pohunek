@@ -35,12 +35,6 @@ crates/platform/src/shell_env/policy.rs 1
 crates/platform/src/supervisor/launchd/launchctl.rs 1
 crates/platform/tests/launchd.rs 4
 crates/platform/tests/systemd.rs 9
-crates/relay/src/admission/mod.rs 6
-crates/relay/src/auth/service.rs 3
-crates/relay/src/authorization/admin_tests.rs 1
-crates/relay/src/runtime/tests.rs 3
-crates/relay/src/server/limits.rs 1
-crates/relay/src/server/transport.rs 1
 crates/session-worker/src/identity.rs 1
 crates/session-worker/src/pty.rs 1
 crates/session-worker/src/server.rs 1

@@ -19,7 +19,6 @@ node_modules/
 
 # ts-rs default export directory; committed bindings live under sdk/ts/protocol.
 crates/protocol/bindings/
-crates/relay-protocol/bindings/
 
 # Local agent memory written by Claude Code subagents (per-machine; not shared)
 /.claude/agent-memory

@@ -1,15 +1,19 @@
 # pohunek Architecture
 
-This document describes the shipped owner architecture and the accepted
-optional team-relay direction for `pohunek`.
+This document describes the shipped owner architecture and the host-side contract
+of the optional team relay for `pohunek`. The team relay itself (server, API,
+client library and design documents) lives in its own private repository,
+[`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay); this repository keeps only the host-local
+identity and governance foundation the relay builds on.
 
 ## Status and Scope of This Revision
 
 `idea.md` captures the original, broad product brainstorm. This document is the
 **authoritative current direction**. Where this document and `idea.md` disagree,
 this document wins. Detailed relay decisions are authoritative in the
-[accepted team-relay RFC](design/team-relay-control-plane-rfc.md), tracked by
-[#56](https://github.com/zajca/pohunek/issues/56).
+[accepted team-relay RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md)
+of the relay repository, tracked there by its issue 1 (formerly
+[#56](https://github.com/zajca/pohunek/issues/56)).
 The accepted complete macOS contract lives in the
 [macOS support RFC](design/macos-support-rfc.md). Its delivery source of truth is
 the issue hierarchy rooted at [#94](https://github.com/zajca/pohunek/issues/94),
@@ -23,13 +27,12 @@ Pohunek has two explicit trust domains:
   NetBird is the default overlay and Tailscale a supported opt-in overlay. These
   paths require no central service and remain supported when no relay is
   configured.
-- **Optional team relay, reduced foundation implemented.** `pohunek-relayd`
-  provides PostgreSQL-backed fenced authority, recovery, protected local
-  provisioning, generic OIDC authentication, bounded HTTPS account and
-  credential operations, account linking, and Google and GitHub team admission
-  with bounded revalidation. Host enrollment, shares, routing, attach, team
-  clients, and team administration remain deferred. Enrolling does not replace or require
-  an overlay.
+- **Optional team relay, separate repository.** The relay server
+  (`pohunek-relayd`), its typed API and its client library are developed in
+  [`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay) and are not part of a core release. A host
+  needs nothing from it to run: enrolling does not replace or require an
+  overlay, and the host-local identity and governance described below work with
+  no relay configured.
 
 The following invariants span both domains:
 
@@ -55,7 +58,7 @@ The following invariants span both domains:
 | Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped; Linux and Apple Silicon macOS (deployment target 14.0, tested on macOS 15) are supported platforms | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); open macOS follow-ups [#100](https://github.com/zajca/pohunek/issues/100) and [#102](https://github.com/zajca/pohunek/issues/102)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay browser client transport | External client in `zajca/pohunek-work`; the SDK ships the `WsTransport` client and a loopback test relay | Team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v4 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
-| Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, provider-neutral account linking, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107); follow-up [#108](https://github.com/zajca/pohunek/issues/108) and [#86](https://github.com/zajca/pohunek/issues/86) |
+| Rust relay server, HTTPS auth/account/credential API, provider-neutral account linking, and credential CLI | Moved to the separate [`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay) repository; the relay CLI command group no longer exists in core | History preserved there; closed issues [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107) stay here, open follow-ups live in the relay repository |
 | Verified Keycloak-brokered social identity and bounded external eligibility | Implemented | [#92](https://github.com/zajca/pohunek/issues/92) |
 | Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
 | Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
@@ -63,7 +66,7 @@ The following invariants span both domains:
 | Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
 | Relay routing, aggregation, attach proxy, host/team API, and team clients | Accepted, not implemented; the bounded foundation HTTPS API is not a host or team surface | [#71](https://github.com/zajca/pohunek/issues/71), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87) |
 | Delegated task layer (`task.*`, causal settlement, worker evidence journal, checks, OpenCode adapter) | Accepted, not implemented; design in `docs/design/delegated-task-runs-rfc.md`; amended 2026-10-08 with `task.input_control` human control (8.9) and the client work-item/acceptance contracts (16.5, 16.6) | [#182](https://github.com/zajca/pohunek/issues/182) and its sub-issues #219–#232 |
-| Relay dark factory (task ACLs, delegation budgets, escalation, factory client contract) | Accepted, not implemented; design in `docs/design/relay-dark-factory-rfc.md`; amends the relay RFC via [#233](https://github.com/zajca/pohunek/issues/233); amended 2026-10-08 with protected audit reserves (8.5), the FactorySpec run manifest (12.5) and bounded progress policy (12.6) | [#185](https://github.com/zajca/pohunek/issues/185) and its sub-issues #233–#240 |
+| Relay dark factory (task ACLs, delegation budgets, escalation, factory client contract) | Accepted, not implemented; design in `docs/design/relay-dark-factory-rfc.md` of the [relay repository](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/relay-dark-factory-rfc.md); amends the relay RFC via [#233](https://github.com/zajca/pohunek/issues/233); amended 2026-10-08 with protected audit reserves (8.5), the FactorySpec run manifest (12.5) and bounded progress policy (12.6) | [#185](https://github.com/zajca/pohunek/issues/185) and its sub-issues #233–#240 |
 
 ## Goals
 
@@ -77,7 +80,7 @@ The following invariants span both domains:
   available for local-daemon and direct-overlay access independently of the
   team relay.
 - Ship no user interface in core: the deliverables are the daemon, session
-  worker, CLI, relay, Rust crates, and TypeScript SDK; every UI and launcher is
+  worker, CLI, Rust crates, and TypeScript SDK; every UI and launcher is
   an external client (see "Client boundary").
 - Make each host authoritative for its own PTYs, agent processes, state, logs,
   and worktrees.
@@ -226,7 +229,7 @@ owner paths, or create a relay-local mode.
 
 ### Deferred optional relay topologies
 
-The relay design adds two topologies without changing the two owner topologies:
+The relay is developed in [`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay). Its design adds two topologies without changing the two owner topologies:
 
 ```text
 1. Standalone
@@ -264,9 +267,9 @@ WireGuard and bounded IPv4/TCP in process, with no kernel interface, system
 route, privileged helper, or `CAP_NET_ADMIN`. This transport belongs to
 [#72](https://github.com/zajca/pohunek/issues/72).
 
-The implemented relay foundation is a PostgreSQL-backed, fenced HTTPS authority
-for generic authentication and credential lifecycle. The planned production
-relay extends it with routing, aggregation, team authorization, audit, and quota
+The relay repository holds a PostgreSQL-backed, fenced HTTPS authority for
+generic authentication and credential lifecycle. The planned production relay
+extends it with routing, aggregation, team authorization, audit, and quota
 authority. The
 external owner-path browser gateway (maintained in `zajca/pohunek-work`)
 remains the production gateway for its local daemon and direct-overlay peers.
@@ -2250,7 +2253,7 @@ Only relay-created session traffic may pass through the relay. The relay never
 persists PTY output, input, prompts, terminal snapshots, file contents, or raw
 secrets; audit and PostgreSQL contain bounded structured metadata only. The full
 claims, non-claims, data classification, and revocation model are specified in
-the [team-relay RFC](design/team-relay-control-plane-rfc.md).
+the [team-relay RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md).
 
 ## Observability
 
@@ -2534,7 +2537,7 @@ Integration and E2E obligations:
 | Remote transport | SSH bridge | Direct over the configured overlay (NetBird default, Tailscale opt-in) |
 | Discovery | Tailscale + NetBird + signed manifests | Overlay-local status + live capability query |
 | Mesh trust | Signed manifests, key rotation, snapshot sync | Owner paths use overlay + filesystem permissions; relay uses explicit enrollment and local `HostShare` ceilings |
-| Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation implemented in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
+| Audit | Tamper-evident considered | Plain local event log today; the durable relay audit and admission foundation lives in the relay repository |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity for parent state; hooks capture recovery identity and durable Claude/Codex subagent lifecycle |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
 | GUI | libghostty client (MVP5) + spike (MVP0) | Mesh-local browser client shipped (the browser and native desktop clients live in `zajca/pohunek-work`); the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |

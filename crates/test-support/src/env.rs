@@ -571,7 +571,7 @@ mod tests {
     const SCRUBBED_HOST_VALUES: [&str; 25] = [
         HOST_SESSION_ID,
         "/run/host/pohunek.sock",
-        "postgres://host/db",
+        "/host/setting",
         "/run/user/1000",
         "/host/share",
         "/home/host",
@@ -631,7 +631,7 @@ mod tests {
         vec![
             pair("POHUNEK_SESSION_ID", HOST_SESSION_ID),
             pair("POHUNEK_SOCKET_PATH", "/run/host/pohunek.sock"),
-            pair("POHUNEK_RELAY_TEST_DATABASE_URL", "postgres://host/db"),
+            pair("POHUNEK_HOST_ONLY_SETTING", "/host/setting"),
             pair("XDG_RUNTIME_DIR", "/run/user/1000"),
             pair("XDG_DATA_DIRS", "/host/share"),
             pair("HOME", "/home/host"),

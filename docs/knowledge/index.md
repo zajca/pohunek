@@ -8,8 +8,8 @@ Start here:
 
 - [Architecture](concepts/architecture.md) explains the assistant model and data
   flow.
-- [Optional team relay](concepts/team-relay.md) records the implemented reduced
-  relay foundation and the deferred multi-team design, clearly separated from
+- [Optional team relay](concepts/team-relay.md) records that the relay lives in
+  its own repository and what a host keeps for it, clearly separated from
   shipped protocol v4.
 - [Host identity and local governance](concepts/host-governance.md) describes
   the shipped stable host ID, safe v4 inspection result, and owner-private

@@ -80,8 +80,6 @@ not (
   (package(=pohunek-daemon) and
     (kind(test) or test(/^(api::handler::tests::|session::|runtime::client::|governance::owner_path_tests::|capabilities::|external::)/)))
   or (package(=pohunek-session-worker) and (kind(test) or test(/^(pty|server)::/)))
-  or (package(=pohunek-relay) and
-    (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
   or (package(=pohunek-cli) and
     (test(/^hermes_integration::/) or (binary(=all) and test(/^hermes_/)) or (binary(=all) and test(/^session_process_api::/)) or (binary(=all) and test(/^plugin_catalog_install::/)) or (binary(=all) and test(/^doctor_worker_compat::/)) or (binary(=all) and test(/^session_background::/)) or (binary(=all) and test(/^session_background_work::/)) or (binary(=all) and test(/^overlay_tailscale_daemon::/))))
   or (package(=pohunek-client) and binary(=netbird_cancellation))
@@ -103,18 +101,6 @@ test-threads = 4
 retries = { backoff = "fixed", count = 2, delay = "1s" }
 # The heavy filter is the exact complement of profile.fast, supplied by
 # scripts/test-partitions. Keep `ci` and `local` unfiltered full-suite profiles.
-
-[profile.relay-db]
-inherits = "ci"
-# Relay PostgreSQL tests each open dedicated schema-scoped pools; unbounded
-# num-cpus concurrency exhausts the fixture server's connection limit.
-test-threads = 4
-# Same diagnostic-only retry policy as profile.heavy: a FLAKY PostgreSQL test
-# still fails the run through flaky-result = "fail" (profile.default).
-retries = { backoff = "fixed", count = 2, delay = "1s" }
-
-[profile.relay-db.junit]
-path = "junit.xml"
 
 # Runtime package jobs of ci.yml (`pi-package`, `codex-package`,
 # `claude-package`, `hermes-package`): one `<runtime>_package` test binary with

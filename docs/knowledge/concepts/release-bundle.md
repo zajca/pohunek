@@ -27,7 +27,7 @@ source of the expected inventory:
   expires (365).
 - `archives`: every `{component, target}` a release contains. `cli` and
   `daemon` for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
-  `x86_64-unknown-linux-musl`, and `relay` for `x86_64-unknown-linux-gnu`.
+  `x86_64-unknown-linux-musl`.
   The archive name is `pohunek-<component>-<version>-<target>.tar.gz`, the
   names `packaging/stage-archive` produces.
 - `sdk_packages`: `protocol`, `sdk` and `testkit`, shipped as
@@ -76,7 +76,7 @@ this order and naming only the file class and name:
 
 ## Layout
 
-The bundle holds the policy archives (CLI and relay unchanged), the SDK
+The bundle holds the policy archives (CLI unchanged), the SDK
 tarballs, their `.sha256` files, `runtime-catalog.json`, every package archive,
 every attestation and `release-inventory.sha256`. Each daemon archive keeps the
 producer tree and adds `runtime/runtime-catalog.json`, plus, for the packages

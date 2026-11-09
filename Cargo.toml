@@ -11,9 +11,6 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/package",
-    "crates/relay-protocol",
-    "crates/relay",
-    "crates/relay-client",
     "crates/knowledge",
     "crates/hostcheck",
     "crates/logging",
@@ -69,8 +66,6 @@ pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-service-config = { path = "crates/service-config" }
 pohunek-protocol = { path = "crates/protocol" }
-pohunek-relay-protocol = { path = "crates/relay-protocol" }
-pohunek-relay-client = { path = "crates/relay-client" }
 pohunek-terminal = { path = "crates/terminal" }
 pohunek-test-support = { path = "crates/test-support" }
 # Dev-dependency only: the persisted-shape guard tests (never a normal dependency).
@@ -85,7 +80,7 @@ httparse = "1.10"
 include_dir = "0.7"
 sha2 = "0.10"
 # Git blob ids of SHA-1 repositories (`package build --evidence-dir` compares the
-# archived bytes with the blobs `HEAD` stores); already in the lock through axum.
+# archived bytes with the blobs `HEAD` stores).
 sha1 = "0.10"
 # Pure-Rust zstd codec: the package archive builder and reader stay C-free so MUSL
 # release builds need no C toolchain, and the encoder output is pinned by the
@@ -100,7 +95,6 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # Per-socket TCP keepalive options and their read-back on accepted overlay connections.
 socket2 = { version = "0.6", features = ["all"] }
 futures = "0.3"
-keyring = { version = "3", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
@@ -132,18 +126,8 @@ pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.
 ulid = "1"
 zeroize = "1"
-axum = { version = "0.8.9", features = ["json", "macros", "ws"] }
-# Reuse the ring provider selected by reqwest/SQLx; enabling AWS-LC too makes
-# rustls default-provider selection ambiguous at native TLS startup.
-axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
-http = "1"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "time", "uuid", "tls-rustls"] }
-openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest"] }
 hmac = "0.12"
-hkdf = "0.12"
 subtle = "2"
-tower = "0.5"
-url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 
 # Single source of truth for the released version. Every crate opts in via

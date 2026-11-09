@@ -60,26 +60,25 @@ it for every change; it is mandatory when the change touches anything under
 ## Stress the changed tests
 
 Mandatory when the diff (committed, staged or unstaged) adds or changes a Rust
-test in a heavy, relay-db or macOS-lane package or file: any test outside the
+test in a heavy or macOS-lane package or file: any test outside the
 `profile.fast` default-filter in `.config/nextest.toml` (the complement of its
 `not ( ... )` expression is the heavy partition). Run it after the core gate
 set passes and before push, with the profile that owns the tests:
 
 ```bash
 scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy
-scripts/stress-changed-tests --base origin/main --count 20 --deadline 45m --profile relay-db   # needs the relay database fixture
 scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile macos --unpinned   # macOS hosts
 ```
 
 It builds the test binaries first (`cargo nextest list`), then runs exactly the
 changed tests N times under `scripts/stress-run` (4 pinned CPUs, no retries).
-Counts are lane suggestions, not defaults: 50 for heavy, 20 for relay-db; pick
+Counts are lane suggestions, not defaults: 50 for heavy; pick
 the deadline from the measured cost of one iteration. On macOS there is no CPU
 affinity, so the run needs `--unpinned` and the contention is host-wide; say so
 in the report. Both cargo calls share one `-p` package set, taken from the full
 selection, so the run does not rebuild with a different feature unification.
 They build with `--all-features`, like CI's Linux test archive, so
-feature-gated tests (relay `postgres-tests`) run. CI's macOS lane and tier
+feature-gated tests run. CI's macOS lane and tier
 archives build default features, so under `--profile macos` the step builds
 default features too: a test that exists only behind a Cargo feature is not in
 the list, because CI's macOS lane never builds it either. Without

@@ -465,7 +465,7 @@ class CiEvidenceCliTests(unittest.TestCase):
                 continue
             name = name_match.group(1)
             if name == "tests (${{ matrix.shard }}, fast)":
-                workflow_names.update(f"tests ({shard}, fast)" for shard in ("core", "daemon", "relay", "cli"))
+                workflow_names.update(f"tests ({shard}, fast)" for shard in ("core", "daemon", "cli"))
             else:
                 workflow_names.add(name)
         for tier in ("main", "nightly"):
@@ -484,8 +484,6 @@ class CiEvidenceCliTests(unittest.TestCase):
             },
             config["required_steps"]["nightly"],
         )
-        self.assertNotIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["main"])
-        self.assertIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["nightly"])
         macos_job = workflow.split("  macos-package:\n", 1)[1].split("\n  test:\n", 1)[0]
         self.assertNotIn("continue-on-error", macos_job)
 
@@ -531,9 +529,8 @@ class CiEvidenceCliTests(unittest.TestCase):
             [],
         )
         # Apart from the rehearsal, the nightly tier differs from main only by
-        # its nightly-only relay database suite, the G3 test selection audit and the release gate's test steps.
+        # the G3 test selection audit and the release gate's test steps.
         nightly_only = {
-            "tests (relay DB, PostgreSQL)",
             "test selection audit (G3)",
             "release gate (full test set) / fmt + clippy + test",
         }
@@ -563,7 +560,6 @@ class CiEvidenceCliTests(unittest.TestCase):
         skipped = {job["name"] for job in fixture["jobs"] if job["conclusion"] == "skipped"}
         self.assertFalse(set(config["required_jobs"]["main"]) - successful)
         self.assertTrue(skipped)
-        self.assertNotIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["main"])
         self.write_fixture(
             run_pages=[page([run_doc(sha="a3523d7365677852cf9321499e9f4cfa65a749fd")])],
             jobs_page=fixture,
@@ -1035,14 +1031,14 @@ class CiEvidenceCliTests(unittest.TestCase):
     def test_failed_conditionally_selected_job_cannot_be_ignored(self):
         jobs = jobs_page()
         jobs["jobs"].append({
-            "name": "tests (relay DB, PostgreSQL)",
+            "name": "tests (conditional example)",
             "status": "completed",
             "conclusion": "failure",
         })
         self.write_fixture(run_pages=[page([run_doc()])], jobs_page=jobs)
         result = self.invoke()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("additional job tests (relay DB, PostgreSQL): failure", result.stderr)
+        self.assertIn("additional job tests (conditional example): failure", result.stderr)
 
     def test_missing_job_conclusion_does_not_use_success_status_as_fallback(self):
         jobs = jobs_page()
